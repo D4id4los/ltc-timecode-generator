@@ -1,0 +1,6 @@
+{
+  "name": "LTC Timecode Generator",
+  "description": "A high-precision Linear Timecode (LTC) audio signal generator and touchscreen-optimized digital clapper-board for multi-camera video recording tests.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

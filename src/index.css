@@ -1,0 +1,53 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Theme variables mapped to CSS variables */
+  --color-app-bg: var(--bg-app);
+  --color-card-bg: var(--bg-card);
+  --color-deep-bg: var(--bg-deep);
+  --color-nested-bg: var(--bg-nested);
+  --color-nested-hover: var(--bg-nested-hover);
+  --color-text-main: var(--text-main);
+  --color-text-title: var(--text-title);
+  --color-text-muted: var(--text-muted);
+  --color-text-secondary: var(--text-secondary);
+  --color-border-main: var(--border-main);
+  --color-btn-bg: var(--btn-bg);
+  --color-clock-sep: var(--clock-sep);
+}
+
+:root, :root.dark {
+  --bg-app: #0A0A0B;
+  --bg-card: #1A1A1E;
+  --bg-deep: #0A0A0B;
+  --bg-nested: #141416;
+  --bg-nested-hover: #1C1C20;
+  --text-main: #E0E0E0;
+  --text-title: #FFFFFF;
+  --text-muted: #8E9299;
+  --text-secondary: #CCCCCC;
+  --border-main: #2A2A2E;
+  --btn-bg: #1A1A1E;
+  --clock-sep: #3F3F46;
+}
+
+:root.light {
+  --bg-app: #F4F4F6;
+  --bg-card: #FFFFFF;
+  --bg-deep: #EBEBEF;
+  --bg-nested: #F4F4F6;
+  --bg-nested-hover: #E2E2E7;
+  --text-main: #27272A;
+  --text-title: #09090B;
+  --text-muted: #71717A;
+  --text-secondary: #3F3F46;
+  --border-main: #E4E4E7;
+  --btn-bg: #FFFFFF;
+  --clock-sep: #D4D4D8;
+}
+
+
