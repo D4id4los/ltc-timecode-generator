@@ -1,6 +1,6 @@
 [package]
 name = "ltc-timecode-generator"
-version = "0.1.0"
+version = "0.2.0"
 description = "A LTC timecode generator with current timecode display and digital clapper board."
 authors = ["Daidalos"]
 license = ""

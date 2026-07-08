@@ -1,6 +1,6 @@
 [package]
 name = "audio-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Tauri-free LTC timecode + cpal audio core shared by the v2 and v1 (32-bit) frontends."
 authors = ["Daidalos"]
 edition = "2021"
