@@ -58,6 +58,7 @@ The app runs in **two modes**, detected at runtime via `window.__TAURI_INTERNALS
 - `initAudioOutput(deviceId, sampleRate, bufferSize)` — starts cpal stream
 - `pushAudioSamples(samples: Float32Array)` — sends stereo samples to Rust
 - `stopAudioOutput()` — drops cpal stream
+- `playBeep(sampleRate, freq, dur, vol, channel)` — triggers Rust-side beep generation (no audio data over IPC)
 - `requestAudioPermission()` — getUserMedia in web, no-op in Tauri
 - `selectAudioOutputNative()` — browser picker, no-op in Tauri
 - No `@tauri-apps/api` npm dependency — uses raw `window.__TAURI_INTERNALS__.invoke`
@@ -69,14 +70,17 @@ The app runs in **two modes**, detected at runtime via `window.__TAURI_INTERNALS
 | `init_audio_output` | `device_id`, `sample_rate`, `buffer_size` | `()` | Creates cpal 2-channel output stream, stores in AppState |
 | `push_audio_samples` | `samples: Vec<f32>` | `()` | Pushes stereo interleaved samples to mpsc channel |
 | `stop_audio_output` | none | `()` | Drops stream and sender |
+| `play_beep` | `sample_rate`, `frequency`, `duration`, `volume`, `channel` | `()` | Generates sine beep in Rust, mixed into output stream |
 
-**AppState** managed via `tauri::Builder::manage()`: `Mutex<Option<AudioOutputState>>` containing `(SyncSender<Vec<f32>>, Stream)`.
+**AppState** managed via `tauri::Builder::manage()`: `Mutex<Option<AudioOutputState>>` containing `(SyncSender<Vec<f32>>, Stream, Arc<Mutex<BeepState>>)`.
+
+**Beep mixing**: The audio callback reads from the LTC mpsc channel AND the `BeepState` buffer. Beep samples are generated in Rust via `generate_beep_samples()` with envelope (5ms attack, 20ms release) and channel routing (left/right/both). The callback sums `ltc_val + beep_val` per sample. This avoids sending audio data over IPC — the JS only sends a lightweight command with parameters.
 
 ## Key App.tsx Functions (branching on `isTauriMode`)
 - `initAudio()` — Tauri: calls `initAudioOutput()` + sets `tauriStartTimeRef`; Web: creates AudioContext + mixer graph
 - `startStreaming()` — Tauri: `generateLTCFrameSamples` → `monoToStereo` → `pushAudioSamples` loop (setInterval 30ms, schedules 500ms ahead); Web: `generateLTCFrameBuffer` → `AudioBufferSourceNode` loop (setInterval 50ms, schedules 1.5s ahead)
 - `stopStreaming()` — Tauri: `tauriStopAudio`; Web: stop all AudioBufferSourceNodes
-- `handleClapTriggered()` — Tauri: `generateBeepSamples` → `pushAudioSamples`; Web: `playClapperBeep` (OscillatorNode)
+- `handleClapTriggered()` — Tauri: `tauriPlayBeep` (lightweight IPC, no audio data); Web: `playClapperBeep` (OscillatorNode)
 - `handleReset()` — Tauri: clear scheduled frames + reset timer; Web: stop sources + reset nextFrameTime
 - `getCurrentTimecode()`, `updateVisualClock()` — both use `isTauriMode ? performance.now() : audioCtx.currentTime`
 - `monoToStereo(mono, channel)` — interleaves mono to stereo with L/R/both routing, used only in Tauri mode

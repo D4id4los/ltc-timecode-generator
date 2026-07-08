@@ -10,8 +10,6 @@ import {
   timecodeToString,
   timecodeToMillisecondsString,
   generateLTCFrameBuffer,
-  generateLTCFrameSamples,
-  generateBeepSamples,
   playClapperBeep,
 } from "./ltcGenerator";
 import TimecodeSettings from "./components/TimecodeSettings";
@@ -21,8 +19,11 @@ import {
   isTauri as isTauriApp,
   getAudioBackendType,
   initAudioOutput,
-  pushAudioSamples,
   stopAudioOutput as tauriStopAudio,
+  playBeep as tauriPlayBeep,
+  startLtcStream,
+  stopLtcStream,
+  resetLtcStream,
 } from "./utils/audioBackend";
 import { motion } from "motion/react";
 import {
@@ -101,6 +102,7 @@ export default function App() {
 
   const isTauriMode = getAudioBackendType() === "tauri";
   const tauriStartTimeRef = useRef<number>(0);
+  const tauriAudioInitRef = useRef<boolean>(false);
 
   // Helper to apply Web Audio Sink / Output Interface selection
   const applyAudioSink = async (audioCtx: AudioContext, sinkId: string) => {
@@ -231,36 +233,18 @@ export default function App() {
     let animId: number;
     const updateVisualClock = () => {
       if (isPlaying) {
-        const now = isTauriMode
-          ? (performance.now() - tauriStartTimeRef.current) / 1000
-          : (audioCtxRef.current?.currentTime ?? 0);
-        const frames = scheduledFramesRef.current;
+        const pad = (num: number) => num.toString().padStart(2, "0");
+        const separator = selectedFps.dropFrame ? ";" : ":";
 
-        // Locate the frame that is actively outputting right now on the DAC
-        let currentActiveFrame = null;
-        for (let i = 0; i < frames.length; i++) {
-          const f = frames[i];
-          if (now >= f.playTime && now < f.playTime + f.duration) {
-            currentActiveFrame = f;
-            break;
-          }
-        }
-
-        if (currentActiveFrame) {
-          // DIRECT DOM UPDATE: Bypass React state update during playback to eliminate the heavy React DOM
-          // reconciliation and components rendering loop (saving 95% of Chromium layout and scripting CPU).
-          const pad = (num: number) => num.toString().padStart(2, "0");
-          const separator = selectedFps.dropFrame ? ";" : ":";
-          
-          const hoursStr = pad(currentActiveFrame.tc.hours);
-          const minutesStr = pad(currentActiveFrame.tc.minutes);
-          const secondsStr = pad(currentActiveFrame.tc.seconds);
-          const framesStr = pad(currentActiveFrame.tc.frames);
-          
-          const ms = Math.floor((currentActiveFrame.tc.frames / selectedFps.fps) * 1000);
+        if (isTauriMode) {
+          const tc = currentStreamingTcRef.current;
+          const hoursStr = pad(tc.hours);
+          const minutesStr = pad(tc.minutes);
+          const secondsStr = pad(tc.seconds);
+          const framesStr = pad(tc.frames);
+          const ms = Math.floor((tc.frames / selectedFps.fps) * 1000);
           const msStr = `${hoursStr}:${minutesStr}:${secondsStr}.${ms.toString().padStart(3, "0")}`;
 
-          // Locate direct DOM elements by unique ID
           const elHours = document.getElementById("clock-hours");
           const elMinutes = document.getElementById("clock-minutes");
           const elSeconds = document.getElementById("clock-seconds");
@@ -278,6 +262,45 @@ export default function App() {
           if (elSep2) elSep2.textContent = separator;
           if (elSep3) elSep3.textContent = separator;
           if (elMs) elMs.textContent = msStr;
+        } else {
+          const now = audioCtxRef.current?.currentTime ?? 0;
+          const frames = scheduledFramesRef.current;
+
+          let currentActiveFrame = null;
+          for (let i = 0; i < frames.length; i++) {
+            const f = frames[i];
+            if (now >= f.playTime && now < f.playTime + f.duration) {
+              currentActiveFrame = f;
+              break;
+            }
+          }
+
+          if (currentActiveFrame) {
+            const hoursStr = pad(currentActiveFrame.tc.hours);
+            const minutesStr = pad(currentActiveFrame.tc.minutes);
+            const secondsStr = pad(currentActiveFrame.tc.seconds);
+            const framesStr = pad(currentActiveFrame.tc.frames);
+            const ms = Math.floor((currentActiveFrame.tc.frames / selectedFps.fps) * 1000);
+            const msStr = `${hoursStr}:${minutesStr}:${secondsStr}.${ms.toString().padStart(3, "0")}`;
+
+            const elHours = document.getElementById("clock-hours");
+            const elMinutes = document.getElementById("clock-minutes");
+            const elSeconds = document.getElementById("clock-seconds");
+            const elFrames = document.getElementById("clock-frames");
+            const elSep1 = document.getElementById("clock-sep1");
+            const elSep2 = document.getElementById("clock-sep2");
+            const elSep3 = document.getElementById("clock-sep3");
+            const elMs = document.getElementById("clock-ms");
+
+            if (elHours) elHours.textContent = hoursStr;
+            if (elMinutes) elMinutes.textContent = minutesStr;
+            if (elSeconds) elSeconds.textContent = secondsStr;
+            if (elFrames) elFrames.textContent = framesStr;
+            if (elSep1) elSep1.textContent = separator;
+            if (elSep2) elSep2.textContent = separator;
+            if (elSep3) elSep3.textContent = separator;
+            if (elMs) elMs.textContent = msStr;
+          }
         }
       }
       animId = requestAnimationFrame(updateVisualClock);
@@ -332,13 +355,24 @@ export default function App() {
     }
   }, [audioSettings, isTauriMode]);
 
-  // Initialize AudioContext and persistent mixer nodes on-demand
-  const initAudio = () => {
+  // Initialize AudioContext and persistent mixer nodes on-demand.
+  // In Tauri mode the cpal output stream is created exactly once and reused for
+  // the lifetime of the page; subsequent calls are no-ops. Re-creating the stream
+  // here would orphan the running LTC scheduler thread and silence timecode output
+  // (the original "beep kills LTC" bug).
+  const initAudio = async () => {
     if (isTauriMode) {
       const sampleRate = 16000;
       setActiveSampleRate(sampleRate);
-      tauriStartTimeRef.current = performance.now();
-      initAudioOutput(selectedSinkId, sampleRate, 0).catch(console.warn);
+      if (!tauriAudioInitRef.current) {
+        tauriStartTimeRef.current = performance.now();
+        try {
+          await initAudioOutput(selectedSinkId, sampleRate, 0);
+          tauriAudioInitRef.current = true;
+        } catch (err) {
+          console.warn("Failed to initialize Tauri audio output:", err);
+        }
+      }
       return;
     }
 
@@ -394,78 +428,36 @@ export default function App() {
     if (isPlaying) return;
 
     try {
-      initAudio();
-      const tauriNow = () => (performance.now() - tauriStartTimeRef.current) / 1000;
+      await initAudio();
       const audioCtx = audioCtxRef.current;
 
       if (isTauriMode) {
         setIsPlaying(true);
         currentStreamingTcRef.current = { ...currentTimecode };
-        const sampleRate = 16000;
+        scheduledFramesRef.current = [];
+        tauriStartTimeRef.current = performance.now();
+
+        startLtcStream(
+          currentTimecode,
+          selectedFps.fps,
+          selectedFps.dropFrame,
+          audioSettings.ltcChannel,
+          audioSettings.ltcVolume,
+        ).catch(console.warn);
+
         const fps = selectedFps.fps;
         const dropFrame = selectedFps.dropFrame;
-        const frameDuration = 1 / fps;
-        let nextFrameTime = tauriNow() + 0.20;
-        lastLevelRef.current = { raw: 1, filtered: 1.0 };
-        scheduledFramesRef.current = [];
-
-        const scheduleLoop = () => {
-          const now = tauriNow();
-          const ltcChannel = audioSettings.ltcChannel;
-          const ltcVolume = audioSettings.ltcVolume;
-
-          // Catch-up guard
-          if (nextFrameTime < now) {
-            const lateTime = now - nextFrameTime;
-            const framesToSkip = Math.ceil(lateTime / frameDuration);
-            nextFrameTime += framesToSkip * frameDuration;
-            for (let i = 0; i < framesToSkip; i++) {
-              currentStreamingTcRef.current = incrementTimecode(
-                currentStreamingTcRef.current,
-                fps,
-                dropFrame
-              );
-            }
+        const clockInterval = window.setInterval(() => {
+          const elapsed = (performance.now() - tauriStartTimeRef.current) / 1000;
+          const frameDuration = 1 / fps;
+          const totalFrames = Math.floor(elapsed / frameDuration);
+          let tc = { ...currentTimecode };
+          for (let i = 0; i < totalFrames; i++) {
+            tc = incrementTimecode(tc, fps, dropFrame);
           }
-
-          // Schedule frames up to 500ms ahead
-          while (nextFrameTime < now + 0.5) {
-            const tc = { ...currentStreamingTcRef.current };
-            const mono = generateLTCFrameSamples(
-              tc,
-              fps,
-              dropFrame,
-              sampleRate,
-              1.0,
-              lastLevelRef.current
-            );
-            const stereo = monoToStereo(mono, ltcChannel);
-            for (let i = 0; i < stereo.length; i++) {
-              stereo[i] *= ltcVolume;
-            }
-            pushAudioSamples(stereo).catch(() => {});
-
-            scheduledFramesRef.current.push({
-              playTime: nextFrameTime,
-              duration: frameDuration,
-              tc,
-            });
-
-            currentStreamingTcRef.current = incrementTimecode(
-              currentStreamingTcRef.current,
-              fps,
-              dropFrame
-            );
-            nextFrameTime += frameDuration;
-          }
-
-          scheduledFramesRef.current = scheduledFramesRef.current.filter(
-            (f) => f.playTime + f.duration >= now - 0.5
-          );
-        };
-
-        scheduleLoop();
-        schedulerTimerRef.current = window.setInterval(scheduleLoop, 30);
+          currentStreamingTcRef.current = tc;
+        }, 50);
+        schedulerTimerRef.current = clockInterval;
         return;
       }
 
@@ -579,10 +571,10 @@ export default function App() {
 
   const getCurrentTimecode = useCallback((): Timecode => {
     if (isPlaying) {
-      const now = isTauriMode
-        ? (performance.now() - tauriStartTimeRef.current) / 1000
-        : audioCtxRef.current?.currentTime ?? 0;
-
+      if (isTauriMode) {
+        return currentStreamingTcRef.current;
+      }
+      const now = audioCtxRef.current?.currentTime ?? 0;
       const frames = scheduledFramesRef.current;
       if (frames.length > 0) {
         if (now < frames[0].playTime) {
@@ -618,7 +610,7 @@ export default function App() {
     setIsPlaying(false);
 
     if (isTauriMode) {
-      tauriStopAudio().catch(console.warn);
+      stopLtcStream().catch(console.warn);
       scheduledFramesRef.current = [];
       setWebAudioStatus(`WEBAUDIO: STANDBY`);
       return;
@@ -643,8 +635,10 @@ export default function App() {
       currentStreamingTcRef.current = { ...startTimecode };
 
       if (isTauriMode) {
+        resetLtcStream(startTimecode).catch(console.warn);
         scheduledFramesRef.current = [];
         tauriStartTimeRef.current = performance.now();
+        currentStreamingTcRef.current = { ...startTimecode };
         return;
       }
 
@@ -667,24 +661,22 @@ export default function App() {
   };
 
   // Callback triggered from ClapperSlate component
-  const handleClapTriggered = useCallback((
+  const handleClapTriggered = useCallback(async (
     timestampString: string,
     timecodeStr: string,
     msStr: string,
     note: string
   ) => {
-    initAudio();
+    await initAudio();
 
     if (isTauriMode) {
-      const sampleRate = 16000;
-      const beepMono = generateBeepSamples(
-        sampleRate,
+      tauriPlayBeep(
+        16000,
         audioSettings.beepFrequency,
         0.15,
-        audioSettings.beepVolume * 0.5
-      );
-      const beepStereo = monoToStereo(beepMono, audioSettings.beepChannel);
-      pushAudioSamples(beepStereo).catch(console.warn);
+        audioSettings.beepVolume * 0.5,
+        audioSettings.beepChannel
+      ).catch(console.warn);
     } else {
       const audioCtx = audioCtxRef.current!;
 
