@@ -267,3 +267,95 @@ export function playClapperBeep(
   osc.start(audioCtx.currentTime);
   osc.stop(audioCtx.currentTime + duration);
 }
+
+/**
+ * Generates raw LTC frame samples as a Float32Array (no AudioContext needed).
+ * Used by the Tauri audio backend where AudioContext is not available.
+ */
+export function generateLTCFrameSamples(
+  tc: Timecode,
+  fps: number,
+  dropFrame: boolean,
+  sampleRate: number,
+  volume: number,
+  lastLevel: { raw: number; filtered: number }
+): Float32Array {
+  const frameDuration = 1 / fps;
+  const totalSamples = Math.round(sampleRate * frameDuration);
+  const data = new Float32Array(totalSamples);
+
+  const bits = getLTCBits(tc.hours, tc.minutes, tc.seconds, tc.frames, dropFrame);
+
+  const rawSamples = getRawSamplesArray(totalSamples);
+  let currentLevel = lastLevel.raw;
+
+  const samplesPerBit = totalSamples / 80;
+
+  for (let b = 0; b < 80; b++) {
+    const startSample = Math.round(b * samplesPerBit);
+    const endSample = Math.round((b + 1) * samplesPerBit);
+    const midSample = Math.round((b + 0.5) * samplesPerBit);
+    const bitVal = bits[b];
+
+    currentLevel = -currentLevel;
+
+    for (let s = startSample; s < midSample; s++) {
+      rawSamples[s] = currentLevel;
+    }
+
+    if (bitVal === 1) {
+      currentLevel = -currentLevel;
+    }
+
+    for (let s = midSample; s < endSample; s++) {
+      rawSamples[s] = currentLevel;
+    }
+  }
+
+  lastLevel.raw = currentLevel;
+
+  const alpha = 0.35;
+  let lastY = lastLevel.filtered;
+  for (let i = 0; i < totalSamples; i++) {
+    lastY += alpha * (rawSamples[i] - lastY);
+    data[i] = lastY * volume;
+  }
+
+  lastLevel.filtered = lastY;
+
+  return data;
+}
+
+/**
+ * Generates a beep tone as a Float32Array (no AudioContext needed).
+ * Used by the Tauri audio backend.
+ */
+export function generateBeepSamples(
+  sampleRate: number,
+  frequency: number,
+  duration: number,
+  volume: number
+): Float32Array {
+  const numSamples = Math.round(sampleRate * duration);
+  const samples = new Float32Array(numSamples);
+  const attackSamples = Math.max(1, Math.round(sampleRate * 0.005));
+  const releaseSamples = Math.max(1, Math.round(sampleRate * 0.02));
+
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / sampleRate;
+    const sample = Math.sin(2 * Math.PI * frequency * t);
+
+    let envelope: number;
+    if (i < attackSamples) {
+      envelope = i / attackSamples;
+    } else if (i > numSamples - releaseSamples) {
+      envelope = (numSamples - i) / releaseSamples;
+    } else {
+      envelope = 1.0;
+    }
+
+    samples[i] = sample * volume * envelope;
+  }
+
+  return samples;
+}

@@ -6,6 +6,13 @@
 import React from "react";
 import { Timecode, FrameRateOption, AudioSettings, AudioChannel } from "../types";
 import { Sliders, Volume2, Music, ToggleLeft, Activity, Info, Speaker, Laptop } from "lucide-react";
+import {
+  isTauri as isTauriApp,
+  getAudioDevices,
+  requestAudioPermission,
+  selectAudioOutputNative,
+  audioOutputSinkSupported,
+} from "../utils/audioBackend";
 
 interface TimecodeSettingsProps {
   startTimecode: Timecode;
@@ -62,51 +69,47 @@ function TimecodeSettings({
     });
   };
 
-  const [devices, setDevices] = React.useState<MediaDeviceInfo[]>([]);
+  const [devices, setDevices] = React.useState<{ id: string; name: string; is_default: boolean }[]>([]);
   const [permissionGranted, setPermissionGranted] = React.useState<boolean>(false);
   const [isRequestingPermission, setIsRequestingPermission] = React.useState<boolean>(false);
+  const isTauriMode = isTauriApp();
 
   React.useEffect(() => {
     let active = true;
     const getDevices = async () => {
       try {
-        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-          const allDevices = await navigator.mediaDevices.enumerateDevices();
-          const outputs = allDevices.filter((d) => d.kind === "audiooutput");
-          if (active) {
-            setDevices(outputs);
-            const hasLabels = outputs.some((d) => d.label);
-            setPermissionGranted(hasLabels);
-          }
+        const outputDevices = await getAudioDevices();
+        if (active) {
+          setDevices(outputDevices);
+          const hasLabels = outputDevices.some((d) => d.name && !d.name.startsWith("Output Device ("));
+          setPermissionGranted(hasLabels || isTauriMode);
         }
       } catch (err) {
-        console.warn("enumerateDevices failed:", err);
+        console.warn("getAudioDevices failed:", err);
       }
     };
 
     getDevices();
 
-    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    if (!isTauriMode && navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
       navigator.mediaDevices.addEventListener("devicechange", getDevices);
       return () => {
         active = false;
         navigator.mediaDevices.removeEventListener("devicechange", getDevices);
       };
     }
-  }, []);
+    return () => { active = false; };
+  }, [isTauriMode]);
 
-  const requestAudioPermission = async () => {
+  const requestAudioPermissionFn = async () => {
     setIsRequestingPermission(true);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((track) => track.stop());
-      
-      if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-        const allDevices = await navigator.mediaDevices.enumerateDevices();
-        const outputs = allDevices.filter((d) => d.kind === "audiooutput");
-        setDevices(outputs);
-        const hasLabels = outputs.some((d) => d.label);
-        setPermissionGranted(hasLabels);
+      const ok = await requestAudioPermission();
+      if (ok) {
+        const outputDevices = await getAudioDevices();
+        setDevices(outputDevices);
+        const hasLabels = outputDevices.some((d) => d.name && !d.name.startsWith("Output Device ("));
+        setPermissionGranted(hasLabels || isTauriMode);
       }
     } catch (err) {
       console.warn("Audio permission request failed:", err);
@@ -116,15 +119,9 @@ function TimecodeSettings({
   };
 
   const handleNativePicker = async () => {
-    if (navigator.mediaDevices && (navigator.mediaDevices as any).selectAudioOutput) {
-      try {
-        const device = await (navigator.mediaDevices as any).selectAudioOutput();
-        if (device) {
-          onSinkIdChange(device.deviceId);
-        }
-      } catch (err) {
-        console.log("Native output picker canceled or failed:", err);
-      }
+    const deviceId = await selectAudioOutputNative();
+    if (deviceId) {
+      onSinkIdChange(deviceId);
     }
   };
 
@@ -220,7 +217,7 @@ function TimecodeSettings({
             Output Audio Interface Selection
           </h3>
           <div className="flex flex-wrap gap-2">
-            {navigator.mediaDevices && (navigator.mediaDevices as any).selectAudioOutput && (
+            {!isTauriMode && navigator.mediaDevices && (navigator.mediaDevices as any).selectAudioOutput && (
               <button
                 id="btn-native-picker"
                 type="button"
@@ -230,11 +227,11 @@ function TimecodeSettings({
                 <Laptop className="w-3.5 h-3.5" /> Browser System Picker
               </button>
             )}
-            {!permissionGranted && (
+            {!isTauriMode && !permissionGranted && (
               <button
                 id="btn-request-audio-names"
                 type="button"
-                onClick={requestAudioPermission}
+                onClick={requestAudioPermissionFn}
                 disabled={isRequestingPermission}
                 className="px-3 py-1 bg-[#FF5F1F]/10 hover:bg-[#FF5F1F]/20 border border-[#FF5F1F]/20 text-[#FF5F1F] font-bold text-[10px] tracking-wider rounded-lg uppercase transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50 touch-manipulation shadow-sm"
               >
@@ -258,8 +255,9 @@ function TimecodeSettings({
               >
                 <option value="default">Default System Audio Output</option>
                 {devices.map((device, idx) => (
-                  <option key={device.deviceId || idx} value={device.deviceId}>
-                    {device.label || `Physical Output Device ${idx + 1} (Unrevealed)`}
+                  <option key={device.id || idx} value={device.id}>
+                    {device.name || `Physical Output Device ${idx + 1}`}
+                    {device.is_default ? " (Default)" : ""}
                   </option>
                 ))}
               </select>
@@ -273,7 +271,7 @@ function TimecodeSettings({
             <div className="w-1.5 h-1.5 rounded-full bg-[#FF5F1F] shrink-0 mt-1.5"></div>
             <div>
               <span className="text-text-title font-semibold">Active Mode:</span> Send linear timecode audio and clapper slates to specialized multi-channel mixers, USB-DAC sound cards, headphones, or sync adapters.
-              {!permissionGranted && (
+              {!isTauriMode && !permissionGranted && (
                 <p className="mt-1 text-amber-500 font-sans">
                   ⚠️ Physical hardware device names are currently masked by browser security. Click "Reveal Device Names" to list.
                 </p>

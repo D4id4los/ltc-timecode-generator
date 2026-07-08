@@ -1,4 +1,5 @@
 {
+  "exclude": ["src-tauri", "src-tauri-32bit", "dist"],
   "compilerOptions": {
     "target": "ES2022",
     "experimentalDecorators": true,

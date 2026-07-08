@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useEffect } from "react";
+import { isTauri as isTauriApp, getAudioDevices } from "../utils/audioBackend";
 
 interface FooterStatusBarProps {
   isWakeLockActive: boolean;
@@ -83,31 +84,31 @@ function FooterStatusBar({
   // 4. Audio output devices count
   useEffect(() => {
     let active = true;
-    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-      const checkDevices = () => {
-        navigator.mediaDevices
-          .enumerateDevices()
-          .then((devices) => {
-            if (!active) return;
-            const count = devices.filter((d) => d.kind === "audiooutput").length;
-            if (count > 0) {
-              setAudioOutputDevices(`AUDIO OUT: ${count} DEVICE${count > 1 ? "S" : ""} FOUND`);
-            } else {
-              setAudioOutputDevices("AUDIO OUT: LINE / JACK");
-            }
-          })
-          .catch(() => {
-            if (active) setAudioOutputDevices("AUDIO OUT: LINE / JACK");
-          });
-      };
+    const checkDevices = async () => {
+      try {
+        const devices = await getAudioDevices();
+        if (!active) return;
+        const count = devices.length;
+        if (count > 0) {
+          setAudioOutputDevices(`AUDIO OUT: ${count} DEVICE${count > 1 ? "S" : ""} FOUND`);
+        } else {
+          setAudioOutputDevices("AUDIO OUT: LINE / JACK");
+        }
+      } catch {
+        if (active) setAudioOutputDevices("AUDIO OUT: LINE / JACK");
+      }
+    };
 
-      checkDevices();
-      navigator.mediaDevices.addEventListener?.("devicechange", checkDevices);
+    checkDevices();
+
+    if (!isTauriApp() && navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+      navigator.mediaDevices.addEventListener("devicechange", checkDevices);
       return () => {
         active = false;
         navigator.mediaDevices.removeEventListener?.("devicechange", checkDevices);
       };
     }
+    return () => { active = false; };
   }, []);
 
   return (

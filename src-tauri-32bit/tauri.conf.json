@@ -14,7 +14,12 @@
       "active": true,
       "targets": "all",
       "identifier": "at.agere.ltc-timecode-generator-legacy",
-      "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
+      "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
+      "linux": {
+        "appimage": {
+          "bundleMediaFramework": true
+        }
+      }
     },
     "allowlist": {
       "all": true

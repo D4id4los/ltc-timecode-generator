@@ -10,11 +10,20 @@ import {
   timecodeToString,
   timecodeToMillisecondsString,
   generateLTCFrameBuffer,
+  generateLTCFrameSamples,
+  generateBeepSamples,
   playClapperBeep,
 } from "./ltcGenerator";
 import TimecodeSettings from "./components/TimecodeSettings";
 import ClapperSlate from "./components/ClapperSlate";
 import FooterStatusBar from "./components/FooterStatusBar";
+import {
+  isTauri as isTauriApp,
+  getAudioBackendType,
+  initAudioOutput,
+  pushAudioSamples,
+  stopAudioOutput as tauriStopAudio,
+} from "./utils/audioBackend";
 import { motion } from "motion/react";
 import {
   Play,
@@ -90,6 +99,9 @@ export default function App() {
   const [isWakeLockActive, setIsWakeLockActive] = useState<boolean>(false);
   const [selectedSinkId, setSelectedSinkId] = useState<string>("default");
 
+  const isTauriMode = getAudioBackendType() === "tauri";
+  const tauriStartTimeRef = useRef<number>(0);
+
   // Helper to apply Web Audio Sink / Output Interface selection
   const applyAudioSink = async (audioCtx: AudioContext, sinkId: string) => {
     if (audioCtx && typeof (audioCtx as any).setSinkId === "function") {
@@ -105,10 +117,16 @@ export default function App() {
 
   // Re-apply sink selection when it changes on an active context
   useEffect(() => {
-    if (audioCtxRef.current) {
-      applyAudioSink(audioCtxRef.current, selectedSinkId);
+    if (isTauriMode) {
+      if (audioCtxRef.current) {
+        applyAudioSink(audioCtxRef.current, selectedSinkId);
+      }
+    } else {
+      if (audioCtxRef.current) {
+        applyAudioSink(audioCtxRef.current, selectedSinkId);
+      }
     }
-  }, [selectedSinkId]);
+  }, [selectedSinkId, isTauriMode]);
 
   // Dynamic system and hardware state
   const [activeSampleRate, setActiveSampleRate] = useState<number>(48000);
@@ -212,8 +230,10 @@ export default function App() {
   useEffect(() => {
     let animId: number;
     const updateVisualClock = () => {
-      if (isPlaying && audioCtxRef.current) {
-        const now = audioCtxRef.current.currentTime;
+      if (isPlaying) {
+        const now = isTauriMode
+          ? (performance.now() - tauriStartTimeRef.current) / 1000
+          : (audioCtxRef.current?.currentTime ?? 0);
         const frames = scheduledFramesRef.current;
 
         // Locate the frame that is actively outputting right now on the DAC
@@ -265,7 +285,7 @@ export default function App() {
 
     animId = requestAnimationFrame(updateVisualClock);
     return () => cancelAnimationFrame(animId);
-  }, [isPlaying, selectedFps]);
+  }, [isPlaying, selectedFps, isTauriMode]);
 
   // Update persistent mixer routing on state or volume adjustments
   const updateMixerRouting = () => {
@@ -307,11 +327,21 @@ export default function App() {
 
   // Keep persistent mixer in sync with any slider adjustments in real-time
   useEffect(() => {
-    updateMixerRouting();
-  }, [audioSettings]);
+    if (!isTauriMode) {
+      updateMixerRouting();
+    }
+  }, [audioSettings, isTauriMode]);
 
   // Initialize AudioContext and persistent mixer nodes on-demand
   const initAudio = () => {
+    if (isTauriMode) {
+      const sampleRate = 16000;
+      setActiveSampleRate(sampleRate);
+      tauriStartTimeRef.current = performance.now();
+      initAudioOutput(selectedSinkId, sampleRate, 0).catch(console.warn);
+      return;
+    }
+
     if (!audioCtxRef.current) {
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
       let ctx: AudioContext;
@@ -349,24 +379,106 @@ export default function App() {
     updateMixerRouting();
   };
 
+  // Helper: convert mono samples to stereo interleaved with channel routing
+  const monoToStereo = (mono: Float32Array, channel: "left" | "right" | "both"): Float32Array => {
+    const stereo = new Float32Array(mono.length * 2);
+    for (let i = 0; i < mono.length; i++) {
+      if (channel === "both" || channel === "left") stereo[i * 2] = mono[i];
+      if (channel === "both" || channel === "right") stereo[i * 2 + 1] = mono[i];
+    }
+    return stereo;
+  };
+
   // Streaming toggle controllers
   const startStreaming = async () => {
     if (isPlaying) return;
 
     try {
       initAudio();
-      const audioCtx = audioCtxRef.current!;
+      const tauriNow = () => (performance.now() - tauriStartTimeRef.current) / 1000;
+      const audioCtx = audioCtxRef.current;
 
-      if (audioCtx.state === "suspended") {
-        await audioCtx.resume();
+      if (isTauriMode) {
+        setIsPlaying(true);
+        currentStreamingTcRef.current = { ...currentTimecode };
+        const sampleRate = 16000;
+        const fps = selectedFps.fps;
+        const dropFrame = selectedFps.dropFrame;
+        const frameDuration = 1 / fps;
+        let nextFrameTime = tauriNow() + 0.20;
+        lastLevelRef.current = { raw: 1, filtered: 1.0 };
+        scheduledFramesRef.current = [];
+
+        const scheduleLoop = () => {
+          const now = tauriNow();
+          const ltcChannel = audioSettings.ltcChannel;
+          const ltcVolume = audioSettings.ltcVolume;
+
+          // Catch-up guard
+          if (nextFrameTime < now) {
+            const lateTime = now - nextFrameTime;
+            const framesToSkip = Math.ceil(lateTime / frameDuration);
+            nextFrameTime += framesToSkip * frameDuration;
+            for (let i = 0; i < framesToSkip; i++) {
+              currentStreamingTcRef.current = incrementTimecode(
+                currentStreamingTcRef.current,
+                fps,
+                dropFrame
+              );
+            }
+          }
+
+          // Schedule frames up to 500ms ahead
+          while (nextFrameTime < now + 0.5) {
+            const tc = { ...currentStreamingTcRef.current };
+            const mono = generateLTCFrameSamples(
+              tc,
+              fps,
+              dropFrame,
+              sampleRate,
+              1.0,
+              lastLevelRef.current
+            );
+            const stereo = monoToStereo(mono, ltcChannel);
+            for (let i = 0; i < stereo.length; i++) {
+              stereo[i] *= ltcVolume;
+            }
+            pushAudioSamples(stereo).catch(() => {});
+
+            scheduledFramesRef.current.push({
+              playTime: nextFrameTime,
+              duration: frameDuration,
+              tc,
+            });
+
+            currentStreamingTcRef.current = incrementTimecode(
+              currentStreamingTcRef.current,
+              fps,
+              dropFrame
+            );
+            nextFrameTime += frameDuration;
+          }
+
+          scheduledFramesRef.current = scheduledFramesRef.current.filter(
+            (f) => f.playTime + f.duration >= now - 0.5
+          );
+        };
+
+        scheduleLoop();
+        schedulerTimerRef.current = window.setInterval(scheduleLoop, 30);
+        return;
       }
-      setWebAudioStatus(`WEBAUDIO: ${audioCtx.state.toUpperCase()}`);
+
+      if (audioCtx!.state === "suspended") {
+        await audioCtx!.resume();
+      }
+      setWebAudioStatus(`WEBAUDIO: ${audioCtx!.state.toUpperCase()}`);
 
       setIsPlaying(true);
 
       // Reset stream phase and load parameters from current displayed timecode
       currentStreamingTcRef.current = { ...currentTimecode };
-      nextFrameTimeRef.current = audioCtx.currentTime + 0.20; // 200ms startup padding to clear CPU bottlenecks during React render
+      nextFrameTimeRef.current = audioCtx!.currentTime + 0.20; // 200ms startup padding to clear CPU bottlenecks during React render
       lastLevelRef.current = { raw: 1, filtered: 1.0 };
       scheduledFramesRef.current = [];
 
@@ -374,13 +486,13 @@ export default function App() {
       const scheduleLoop = () => {
         const fps = selectedFps.fps;
         const dropFrame = selectedFps.dropFrame;
-        const sampleRate = audioCtx.sampleRate;
+        const sampleRate = audioCtx!.sampleRate;
         const frameDuration = 1 / fps;
 
         // Catch-up guard: if nextFrameTime is behind current audio time, skip the late blocks.
         // This prevents scheduling buffers in the past (which play simultaneously and stutter).
-        if (nextFrameTimeRef.current < audioCtx.currentTime) {
-          const lateTime = audioCtx.currentTime - nextFrameTimeRef.current;
+        if (nextFrameTimeRef.current < audioCtx!.currentTime) {
+          const lateTime = audioCtx!.currentTime - nextFrameTimeRef.current;
           const framesToSkip = Math.ceil(lateTime / frameDuration);
           
           // Jump next scheduled frame ahead in time
@@ -399,17 +511,17 @@ export default function App() {
 
         // Clean up historic active sources that have already finished playing on DAC
         activeSourcesRef.current = activeSourcesRef.current.filter((item) => {
-          return item.stopTime >= audioCtx.currentTime;
+          return item.stopTime >= audioCtx!.currentTime;
         });
 
         // Queue audio buffers up to 1.5 seconds ahead to prevent gaps due to heavy React re-renders / GC / clapper clicks
-        while (nextFrameTimeRef.current < audioCtx.currentTime + 1.5) {
+        while (nextFrameTimeRef.current < audioCtx!.currentTime + 1.5) {
           const tc = { ...currentStreamingTcRef.current };
 
           // Buffer is mono and peak volume is normalized to 1.0; actual master volume
           // is governed by the persistent, real-time-adjustable ltcGain node.
           const buffer = generateLTCFrameBuffer(
-            audioCtx,
+            audioCtx!,
             tc,
             fps,
             dropFrame,
@@ -418,7 +530,7 @@ export default function App() {
             lastLevelRef.current
           );
 
-          const source = audioCtx.createBufferSource();
+          const source = audioCtx!.createBufferSource();
           source.buffer = buffer;
           
           // Connect to the persistent LTC mixer input
@@ -453,7 +565,7 @@ export default function App() {
 
         // Clean up historic frames that have finished playing
         scheduledFramesRef.current = scheduledFramesRef.current.filter(
-          (f) => f.playTime + f.duration >= audioCtx.currentTime - 0.5
+          (f) => f.playTime + f.duration >= audioCtx!.currentTime - 0.5
         );
       };
 
@@ -467,31 +579,29 @@ export default function App() {
 
   const getCurrentTimecode = useCallback((): Timecode => {
     if (isPlaying) {
-      const audioCtx = audioCtxRef.current;
-      if (audioCtx) {
-        const now = audioCtx.currentTime;
-        const frames = scheduledFramesRef.current;
-        if (frames.length > 0) {
-          // If we haven't reached the first scheduled frame yet (during startup padding)
-          if (now < frames[0].playTime) {
-            return frames[0].tc;
+      const now = isTauriMode
+        ? (performance.now() - tauriStartTimeRef.current) / 1000
+        : audioCtxRef.current?.currentTime ?? 0;
+
+      const frames = scheduledFramesRef.current;
+      if (frames.length > 0) {
+        if (now < frames[0].playTime) {
+          return frames[0].tc;
+        }
+        for (let i = 0; i < frames.length; i++) {
+          const f = frames[i];
+          if (now >= f.playTime && now < f.playTime + f.duration) {
+            return f.tc;
           }
-          for (let i = 0; i < frames.length; i++) {
-            const f = frames[i];
-            if (now >= f.playTime && now < f.playTime + f.duration) {
-              return f.tc;
-            }
-          }
-          // If we are past all scheduled frames (buffer underrun fallback)
-          if (now >= frames[frames.length - 1].playTime + frames[frames.length - 1].duration) {
-            return frames[frames.length - 1].tc;
-          }
+        }
+        if (now >= frames[frames.length - 1].playTime + frames[frames.length - 1].duration) {
+          return frames[frames.length - 1].tc;
         }
       }
       return currentStreamingTcRef.current;
     }
     return currentTimecode;
-  }, [isPlaying, currentTimecode]);
+  }, [isPlaying, currentTimecode, isTauriMode]);
 
   const stopStreaming = () => {
     if (!isPlaying) return;
@@ -506,6 +616,13 @@ export default function App() {
     setCurrentTimecode(finalTc);
 
     setIsPlaying(false);
+
+    if (isTauriMode) {
+      tauriStopAudio().catch(console.warn);
+      scheduledFramesRef.current = [];
+      setWebAudioStatus(`WEBAUDIO: STANDBY`);
+      return;
+    }
 
     // Stop and cancel all future scheduled LTC audio buffers immediately
     activeSourcesRef.current.forEach((item) => {
@@ -523,9 +640,14 @@ export default function App() {
 
   const handleReset = () => {
     if (isPlaying) {
-      // Snappily reset stream timecode on the fly
       currentStreamingTcRef.current = { ...startTimecode };
-      
+
+      if (isTauriMode) {
+        scheduledFramesRef.current = [];
+        tauriStartTimeRef.current = performance.now();
+        return;
+      }
+
       // Stop and cancel all currently queued future frames to let the reset be audible instantly
       activeSourcesRef.current.forEach((item) => {
         try {
@@ -552,25 +674,38 @@ export default function App() {
     note: string
   ) => {
     initAudio();
-    const audioCtx = audioCtxRef.current!;
 
-    if (audioCtx.state === "suspended") {
-      audioCtx.resume().then(() => {
-        setWebAudioStatus(`WEBAUDIO: ${audioCtx.state.toUpperCase()}`);
-      });
-    }
-
-    // Trigger standard 1kHz clapper beep through persistent mixer input.
-    // Master volume routing and levels are controlled statically by beepGainNode,
-    // avoiding graph reconstruction glitches on slow cores.
-    if (beepGainNodeRef.current) {
-      playClapperBeep(
-        audioCtx,
-        beepGainNodeRef.current,
-        1.0, // envelope peak is normalized; overall volume is managed by persistent beepGainNode
+    if (isTauriMode) {
+      const sampleRate = 16000;
+      const beepMono = generateBeepSamples(
+        sampleRate,
         audioSettings.beepFrequency,
-        0.15
+        0.15,
+        audioSettings.beepVolume * 0.5
       );
+      const beepStereo = monoToStereo(beepMono, audioSettings.beepChannel);
+      pushAudioSamples(beepStereo).catch(console.warn);
+    } else {
+      const audioCtx = audioCtxRef.current!;
+
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume().then(() => {
+          setWebAudioStatus(`WEBAUDIO: ${audioCtx.state.toUpperCase()}`);
+        });
+      }
+
+      // Trigger standard 1kHz clapper beep through persistent mixer input.
+      // Master volume routing and levels are controlled statically by beepGainNode,
+      // avoiding graph reconstruction glitches on slow cores.
+      if (beepGainNodeRef.current) {
+        playClapperBeep(
+          audioCtx,
+          beepGainNodeRef.current,
+          1.0, // envelope peak is normalized; overall volume is managed by persistent beepGainNode
+          audioSettings.beepFrequency,
+          0.15
+        );
+      }
     }
 
     // Push clap to the synchronization tracker log
@@ -582,7 +717,7 @@ export default function App() {
       notes: note,
     };
     setLogs((prev) => [logItem, ...prev]);
-  }, [audioSettings.beepFrequency]);
+  }, [audioSettings.beepFrequency, audioSettings.beepVolume, audioSettings.beepChannel, isTauriMode]);
 
   // Formatting displays
   const formattedTimecode = timecodeToString(currentTimecode, selectedFps.dropFrame);
@@ -616,7 +751,7 @@ export default function App() {
             <div className="flex flex-col">
               <span className="text-text-muted">Interface</span>
               <span className={isPlaying ? "text-[#22C55E]" : "text-amber-500 font-semibold"}>
-                {isPlaying ? (audioCtxRef.current ? `WEBAUDIO ${audioCtxRef.current.destination.maxChannelCount}CH` : "WEBAUDIO ACTIVE") : "STANDBY"}
+                {isTauriMode ? "TAURI" : (isPlaying ? (audioCtxRef.current ? `WEBAUDIO ${audioCtxRef.current.destination.maxChannelCount}CH` : "WEBAUDIO ACTIVE") : "STANDBY")}
               </span>
             </div>
             <div className="flex flex-col">
