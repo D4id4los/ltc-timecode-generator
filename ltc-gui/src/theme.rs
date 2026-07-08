@@ -68,6 +68,7 @@ impl Theme {
     }
 }
 
+#[allow(dead_code)]
 pub struct ThemeColors {
     pub app_bg: Color32,
     pub card_bg: Color32,

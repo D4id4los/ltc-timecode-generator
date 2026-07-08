@@ -62,30 +62,41 @@ fn stepper_field(ui: &mut Ui, label: &str, value: &mut u32, max: u32) {
     } else {
         egui::Color32::from_rgb(0x09, 0x09, 0x0B)
     };
+    let muted_color = if visuals.dark_mode {
+        egui::Color32::from_rgb(0x8E, 0x92, 0x99)
+    } else {
+        egui::Color32::from_rgb(0x71, 0x71, 0x7A)
+    };
     ui.vertical(|ui| {
         ui.label(
             RichText::new(label)
                 .font(FontId::proportional(11.0))
-                .color(egui::Color32::from_gray(0x80)),
+                .color(muted_color),
         );
         ui.horizontal(|ui| {
-            if ui.button("▲").clicked() {
-                *value = (*value + 1) % max;
+            // Decrement button (left arrow bracket)
+            let dec_btn = egui::Button::new(RichText::new("<").font(FontId::proportional(16.0)).strong());
+            if ui.add(dec_btn).clicked() {
+                *value = if *value == 0 { max - 1 } else { *value - 1 };
             }
+            // Value display in the middle
             ui.label(
                 RichText::new(format!("{:02}", *value))
                     .font(FontId::proportional(24.0))
                     .color(text_color)
                     .strong(),
             );
-            if ui.button("▼").clicked() {
-                *value = if *value == 0 { max - 1 } else { *value - 1 };
+            // Increment button (right arrow bracket)
+            let inc_btn = egui::Button::new(RichText::new(">").font(FontId::proportional(16.0)).strong());
+            if ui.add(inc_btn).clicked() {
+                *value = (*value + 1) % max;
             }
         });
     });
 }
 
 fn render_frame_rate(ui: &mut Ui, state: &mut AppState) {
+    let colors = state.theme.colors();
     ui.horizontal_wrapped(|ui| {
         for (i, opt) in FRAME_RATE_OPTIONS.iter().enumerate() {
             let selected = i == state.fps_index;
@@ -103,7 +114,7 @@ fn render_frame_rate(ui: &mut Ui, state: &mut AppState) {
     ui.label(
         RichText::new(state.fps().description)
             .font(FontId::proportional(11.0))
-            .color(egui::Color32::from_gray(0x80)),
+            .color(colors.text_muted),
     );
 }
 

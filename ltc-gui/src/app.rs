@@ -8,8 +8,8 @@ use crate::theme::{Theme, ACCENT};
 use crate::widgets;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SAMPLE_RATE: u32 = 48000;
-const BUFFER_SIZE: u32 = 256;
+const SAMPLE_RATE: u32 = 16000;
+const BUFFER_SIZE: u32 = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioChannel {
@@ -81,6 +81,7 @@ pub const FRAME_RATE_OPTIONS: &[FrameRateOption] = &[
     },
 ];
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ClapLogItem {
     pub id: String,
@@ -143,7 +144,6 @@ pub struct AppState {
     // Status
     pub status_message: String,
     pub system_time: String,
-    pub battery_status: String,
 
     // Audio core
     pub audio_core: Mutex<AudioCore>,
@@ -182,7 +182,6 @@ impl Default for AppState {
             audio_initialized: false,
             status_message: "Ready".to_string(),
             system_time: String::new(),
-            battery_status: "Unknown".to_string(),
             audio_core: Mutex::new(AudioCore::new()),
         }
     }
@@ -286,7 +285,7 @@ impl AppState {
 
         // Trigger visual effects
         self.clap_flash_alpha = 1.0;
-        self.clap_arm_angle = -120.0; // snap open
+        self.clap_arm_angle = -90.0; // snap to upright (closed) position
 
         // Log the clap
         let fps = self.fps();
@@ -332,18 +331,58 @@ impl eframe::App for AppState {
         if self.clap_flash_alpha > 0.0 {
             self.clap_flash_alpha = (self.clap_flash_alpha - 0.08).max(0.0);
         }
-        if self.clap_arm_angle < 0.0 {
-            self.clap_arm_angle = (self.clap_arm_angle + 6.0).min(0.0);
+        // Clapper arm: starts at -90 (upright/closed), animates to 0 (horizontal/open)
+        // Use exponential decay for a quick snap that slows as it approaches 0
+        if self.clap_arm_angle < -0.5 {
+            // Move 15% of the remaining distance each frame
+            let target = 0.0;
+            let diff = target - self.clap_arm_angle;
+            self.clap_arm_angle += diff * 0.15;
+        } else if self.clap_arm_angle < 0.0 {
+            self.clap_arm_angle = 0.0;
         }
 
         // Poll current timecode when playing
         if self.is_playing {
             self.update_clock();
-            ctx.request_repaint_after(Duration::from_millis(16));
+            ctx.request_repaint_after(Duration::from_millis(16)); // ~60fps for smooth clock
+        } else {
+            // Slow repaint for system time clock (once per second)
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
 
         // Update system time
         self.system_time = chrono_now_string();
+
+        // Keyboard shortcuts (skip when a text field has focus)
+        let any_focused = ctx.memory(|m| m.focused().is_some());
+        let (toggle_play, do_clap, do_reset, do_lock) = if !any_focused {
+            ctx.input(|i| (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::R),
+                i.key_pressed(egui::Key::L),
+            ))
+        } else {
+            (false, false, false, false)
+        };
+
+        if toggle_play {
+            if self.is_playing {
+                self.stop_streaming();
+            } else if !self.is_locked {
+                self.start_streaming();
+            }
+        }
+        if do_clap && !self.is_locked {
+            self.trigger_clap();
+        }
+        if do_reset && !self.is_locked {
+            self.handle_reset();
+        }
+        if do_lock {
+            self.is_locked = !self.is_locked;
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -352,28 +391,42 @@ impl eframe::App for AppState {
         let clip_rect = ui.clip_rect();
         ui.painter().rect_filled(clip_rect, 0.0, bg);
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().inner_margin(egui::Margin::same(12)))
+        // ScrollArea::both() allows scrolling when content exceeds window size
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 8.0);
 
-                // ── Header ──
-                self.render_header(ui);
+                // Wrap content in a horizontal layout with left indent for centering
+                let max_width = 700.0;
+                let available = ui.available_width();
+                let indent = ((available - max_width) / 2.0).max(8.0);
 
-                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    // Explicitly allocate horizontal space (works in horizontal layout)
+                    ui.allocate_space(egui::vec2(indent, 0.0));
+                    ui.vertical(|ui| {
+                        ui.set_max_width(max_width);
 
-                // ── Section 1: Master Studio Time Clock ──
-                self.render_clock_section(ui);
+                        // ── Header ──
+                        self.render_header(ui);
 
-                ui.add_space(8.0);
+                        ui.add_space(4.0);
 
-                // ── Section 2: Tabbed deck ──
-                self.render_tabbed_deck(ui);
+                        // ── Section 1: Master Studio Time Clock ──
+                        self.render_clock_section(ui);
 
-                ui.add_space(4.0);
+                        ui.add_space(8.0);
 
-                // ── Footer status bar ──
-                self.render_status_bar(ui);
+                        // ── Section 2: Tabbed deck ──
+                        self.render_tabbed_deck(ui);
+
+                        ui.add_space(4.0);
+
+                        // ── Footer status bar ──
+                        self.render_status_bar(ui);
+                    });
+                });
             });
 
         // Flash overlay (drawn on top of everything)
@@ -419,47 +472,45 @@ impl AppState {
             .inner_margin(egui::Margin::same(16))
             .corner_radius(8.0);
         frame.show(ui, |ui| {
-            ui.vertical(|ui| {
+            ui.vertical_centered(|ui| {
                 // Big timecode display
                 widgets::clock::render(ui, self);
 
                 ui.add_space(8.0);
 
-                // Status pills
-                ui.horizontal(|ui| {
-                    let fps = self.fps();
-                    widgets::pill(ui, &format!("{} FPS", fps.name), ACCENT);
-                    ui.label(format!(
-                        "LTC: {} | Beep: {}",
-                        self.ltc_channel.label(),
-                        self.beep_channel.label()
-                    ));
-                });
+                // Status pills — centered
+                let fps = self.fps();
+                widgets::pill(ui, &format!("{} FPS", fps.name), ACCENT);
+                ui.label(format!(
+                    "LTC: {} | Beep: {}",
+                    self.ltc_channel.label(),
+                    self.beep_channel.label()
+                ));
 
                 ui.add_space(8.0);
 
-                // Control buttons
+                // Control buttons — centered
                 ui.horizontal(|ui| {
                     if !self.is_locked {
                         if self.is_playing {
-                            if ui.button("◼ Stop").clicked() {
+                            if ui.button("Stop").clicked() {
                                 self.stop_streaming();
                             }
                         } else {
-                            let btn = egui::Button::new("▶ Start")
+                            let btn = egui::Button::new("Start")
                                 .fill(ACCENT.linear_multiply(0.3));
                             if ui.add(btn).clicked() {
                                 self.start_streaming();
                             }
                         }
-                        if ui.button("🎬 Clap & Beep").clicked() {
+                        if ui.button("Clap & Beep").clicked() {
                             self.trigger_clap();
                         }
-                        if ui.button("↺ Reset").clicked() {
+                        if ui.button("Reset").clicked() {
                             self.handle_reset();
                         }
                     }
-                    let lock_label = if self.is_locked { "🔓 Unlock" } else { "🔒 Lock" };
+                    let lock_label = if self.is_locked { "Unlock" } else { "Lock" };
                     if ui.button(lock_label).clicked() {
                         self.is_locked = !self.is_locked;
                     }
@@ -524,12 +575,6 @@ pub fn timecode_to_ms_string(tc: Timecode, fps: f64) -> String {
 }
 
 pub fn chrono_now_string() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", h, m, s)
+    use chrono::Local;
+    Local::now().format("%H:%M:%S").to_string()
 }

@@ -30,6 +30,11 @@ pub fn render(ui: &mut Ui, state: &AppState) {
                     .color(colors.text_muted),
             );
             ui.separator();
+            ui.label(
+                RichText::new("[Space] Play/Stop  [C] Clap  [R] Reset  [L] Lock")
+                    .font(FontId::proportional(10.0))
+                    .color(colors.text_muted),
+            );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(

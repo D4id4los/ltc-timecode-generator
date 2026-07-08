@@ -25,6 +25,7 @@ Compilation:
   docker build --platform linux/386 -t ltc-debian11-builder -f Dockerfile.gui-build .
   docker run --rm \
          -v "$(pwd)":/app \
+         -v "$(pwd)/.cargo_cache:/usr/local/cargo/registry" \
          -w /app/ltc-gui \
          ltc-debian11-builder \
          cargo zigbuild --target i686-unknown-linux-gnu.2.31 --release

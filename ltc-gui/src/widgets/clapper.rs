@@ -19,7 +19,8 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 
 fn render_slate_board(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let board_bg = Color32::from_rgb(0x14, 0x14, 0x14);
+    let board_bg = colors.nested_bg;
+    let board_stripe = Color32::from_rgb(0xFF, 0xFF, 0xFF);
 
     let frame = egui::Frame::new()
         .fill(board_bg)
@@ -46,7 +47,7 @@ fn render_slate_board(ui: &mut Ui, state: &mut AppState) {
             // Diagonal stripes on the arm
             ui.painter().line_segment(
                 [arm_pivot, arm_end],
-                egui::Stroke::new(8.0, Color32::from_rgb(0xFF, 0xFF, 0xFF)),
+                egui::Stroke::new(8.0, board_stripe),
             );
 
             // Board text
@@ -94,11 +95,17 @@ fn render_scene_take_roll(ui: &mut Ui, state: &mut AppState) {
         ui.vertical(|ui| {
             ui.label("Scene");
             ui.horizontal(|ui| {
-                if ui.button("▲").clicked() {
-                    state.scene = state.scene.saturating_add(1);
-                }
-                if ui.button("▼").clicked() {
+                if ui.button(RichText::new("<").font(FontId::proportional(14.0)).strong()).clicked() {
                     state.scene = state.scene.saturating_sub(1);
+                }
+                ui.label(
+                    RichText::new(format!("{}", state.scene))
+                        .font(FontId::proportional(18.0))
+                        .color(state.theme.colors().text_title)
+                        .strong(),
+                );
+                if ui.button(RichText::new(">").font(FontId::proportional(14.0)).strong()).clicked() {
+                    state.scene = state.scene.saturating_add(1);
                 }
             });
         });
@@ -107,11 +114,17 @@ fn render_scene_take_roll(ui: &mut Ui, state: &mut AppState) {
         ui.vertical(|ui| {
             ui.label("Take");
             ui.horizontal(|ui| {
-                if ui.button("▲").clicked() {
-                    state.take = state.take.saturating_add(1);
-                }
-                if ui.button("▼").clicked() {
+                if ui.button(RichText::new("<").font(FontId::proportional(14.0)).strong()).clicked() {
                     state.take = state.take.saturating_sub(1);
+                }
+                ui.label(
+                    RichText::new(format!("{}", state.take))
+                        .font(FontId::proportional(18.0))
+                        .color(state.theme.colors().text_title)
+                        .strong(),
+                );
+                if ui.button(RichText::new(">").font(FontId::proportional(14.0)).strong()).clicked() {
+                    state.take = state.take.saturating_add(1);
                 }
             });
         });
@@ -129,7 +142,7 @@ fn render_scene_take_roll(ui: &mut Ui, state: &mut AppState) {
 
 fn render_clap_button(ui: &mut Ui, state: &mut AppState) {
     let available = ui.available_width();
-    let btn = egui::Button::new("🎬 CLAP & BEEP")
+    let btn = egui::Button::new("CLAP & BEEP")
         .min_size(Vec2::new(available, 40.0))
         .fill(crate::theme::ACCENT.linear_multiply(0.25));
     if ui.add(btn).clicked() {

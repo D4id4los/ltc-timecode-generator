@@ -123,15 +123,35 @@ impl AudioCore {
 
         let rx_clone = rx.clone();
         let beep_clone = beep.clone();
+        let last_err_log = Arc::new(Mutex::new(Instant::now()));
         let err_handler = move |err: cpal::Error| {
-            eprintln!("Audio output stream error: {}", err);
+            let now = Instant::now();
+            let mut last = last_err_log.lock().unwrap();
+            if now.duration_since(*last) > Duration::from_secs(1) {
+                eprintln!("Audio output stream error: {}", err);
+                *last = now;
+            }
         };
 
         let stream = device
             .build_output_stream::<f32, _, _>(
                 config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    for sample in data.iter_mut() {
+                    // Lock beep ONCE per callback (not per sample) to avoid
+                    // thousands of mutex lock/unlock cycles per second.
+                    let beep_guard = beep_clone.lock().ok();
+                    let beep_samples: &[f32] = match &beep_guard {
+                        Some(b) => &b.samples,
+                        None => &[],
+                    };
+                    let mut beep_idx = match &beep_guard {
+                        Some(b) => b.index,
+                        None => 0,
+                    };
+
+                    let n = data.len();
+                    for i in 0..n {
+                        // Refill pending LTC samples if exhausted
                         if pending_index >= pending_samples.len() {
                             if let Ok(rx) = rx_clone.lock() {
                                 if let Ok(samples) = rx.try_recv() {
@@ -149,19 +169,22 @@ impl AudioCore {
                             0.0
                         };
 
-                        let beep_val = if let Ok(mut beep) = beep_clone.lock() {
-                            if beep.index < beep.samples.len() {
-                                let val = beep.samples[beep.index];
-                                beep.index += 1;
-                                val
-                            } else {
-                                0.0
-                            }
+                        let beep_val = if beep_idx < beep_samples.len() {
+                            let val = beep_samples[beep_idx];
+                            beep_idx += 1;
+                            val
                         } else {
                             0.0
                         };
 
-                        *sample = ltc_val + beep_val;
+                        data[i] = ltc_val + beep_val;
+                    }
+
+                    // Drop beep lock, then re-lock to update index.
+                    // This avoids holding the lock during the second lock attempt.
+                    drop(beep_guard);
+                    if let Ok(mut beep) = beep_clone.lock() {
+                        beep.index = beep_idx;
                     }
                 },
                 err_handler,
