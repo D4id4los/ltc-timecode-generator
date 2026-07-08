@@ -8,7 +8,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist src-tauri/target src-tauri-32bit/target",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "version:sync": "node scripts/sync-version.js",
+    "version": "node scripts/sync-version.js"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

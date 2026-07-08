@@ -84,6 +84,20 @@ To build 32bit versions, make sure you have docker installed on you system, then
   ./build-32bit.sh
 #+end_src
 
+* Version Bumping
+
+#+begin_src bash
+  npm version patch    # 0.1.0 → 0.1.1, syncs all files, creates git tag v0.1.1
+  npm version minor    # 0.1.0 → 0.2.0, syncs all files, creates git tag v0.2.0
+  npm version major    # 0.1.0 → 1.0.0, syncs all files, creates git tag v1.0.0
+
+  npm run version:sync                 # manual re-sync without bumping
+#+end_src
+After =npm version=, run =npm install= and =cargo build= in each crate to
+update lock files.
+
+
+
 * Installing Docker
 
 ** Ubuntu

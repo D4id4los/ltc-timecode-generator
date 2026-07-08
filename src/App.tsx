@@ -729,7 +729,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight uppercase text-text-title">
-              LTC ENGINE <span className="text-[#FF5F1F] opacity-90">v2.4</span>
+              LTC ENGINE <span className="text-[#FF5F1F] opacity-90">v{import.meta.env.VITE_APP_VERSION}</span>
             </h1>
             <div className="text-[10px] text-text-muted font-mono tracking-widest uppercase">
               Linear Timecode Hub

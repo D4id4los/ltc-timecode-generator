@@ -95,6 +95,35 @@ The app runs in **two modes**, detected at runtime via `window.__TAURI_INTERNALS
 - `timecodeToString()`, `timecodeToMillisecondsString()` — formatting
 - Performance: cached arrays (`bitsCache`, `rawSamplesCache`), first-order IIR low-pass filter (alpha=0.35)
 
+## Version Management
+
+The **single source of truth** is `package.json`'s `"version"` field. All other files are derived from it.
+
+### How to bump the version
+```bash
+npm version patch    # 0.1.0 → 0.1.1 (syncs all files, creates git tag v0.1.1)
+npm version minor    # 0.1.0 → 0.2.0 (syncs all files, creates git tag v0.2.0)
+npm version major    # 0.1.0 → 1.0.0 (syncs all files, creates git tag v1.0.0)
+```
+
+The `"version"` npm lifecycle hook runs `scripts/sync-version.js` automatically during `npm version` — after bumping `package.json` but before the git commit and tag. The script propagates the version to:
+
+- `src-tauri/tauri.conf.json`
+- `src-tauri-32bit/tauri.conf.json`
+- `src-tauri/Cargo.toml`
+- `src-tauri-32bit/Cargo.toml`
+- `audio-core/Cargo.toml`
+
+After syncing, run `npm install` (to update `package-lock.json`) and `cargo build` in each crate (to update `Cargo.lock` files).
+
+### Manual sync (without bumping)
+```bash
+npm run version:sync
+```
+
+### UI Display
+The version is injected at build time via Vite's `define` (`import.meta.env.VITE_APP_VERSION`) and displayed in the app header as `LTC ENGINE v{version}`.
+
 ## Build & Run
 ```bash
 npm run dev          # Vite dev server on port 3000
