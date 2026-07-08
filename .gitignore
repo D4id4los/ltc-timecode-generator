@@ -10,6 +10,7 @@ coverage/
 # Rust/Cargo build artifacts
 src-tauri/target/
 src-tauri-32bit/target/
+audio-core/target/
 .cargo_cache/
 .rustup_cache/
 

@@ -25,6 +25,7 @@ docker run --rm \
   -e ARCH=i686 \
   --workdir /app \
   -v "$(pwd)/src-tauri-32bit:/app/src-tauri-32bit" \
+  -v "$(pwd)/audio-core:/app/audio-core:ro" \
   -v "$(pwd)/package.json:/app/package.json:ro" \
   -v "$(pwd)/vite.config.ts:/app/vite.config.ts:ro" \
   -v "$(pwd)/tsconfig.json:/app/tsconfig.json:ro" \

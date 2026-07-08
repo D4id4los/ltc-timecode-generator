@@ -12,18 +12,22 @@ export interface TimecodeData {
 }
 
 function tauriInvoke(cmd: string, args?: Record<string, unknown>): Promise<any> {
-  const internals = (window as any).__TAURI_INTERNALS__;
-  if (internals && typeof internals.invoke === 'function') {
-    return internals.invoke(cmd, args);
+  const w = window as any;
+  // Tauri v2: low-level internal IPC bridge (always injected, no npm dep).
+  if (w.__TAURI_INTERNALS__ && typeof w.__TAURI_INTERNALS__.invoke === 'function') {
+    return w.__TAURI_INTERNALS__.invoke(cmd, args);
+  }
+  // Tauri v1: global API exposed when build.withGlobalTauri is true.
+  if (w.__TAURI__ && typeof w.__TAURI__.invoke === 'function') {
+    return w.__TAURI__.invoke(cmd, args);
   }
   return Promise.reject(new Error('Not running in Tauri'));
 }
 
 export function isTauri(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    (window as any).__TAURI_INTERNALS__ !== undefined
-  );
+  if (typeof window === 'undefined') return false;
+  const w = window as any;
+  return w.__TAURI_INTERNALS__ !== undefined || w.__TAURI__ !== undefined;
 }
 
 export type AudioBackendType = 'tauri' | 'web';

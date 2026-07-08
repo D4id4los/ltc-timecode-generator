@@ -7,7 +7,8 @@
     "distDir": "../dist",
     "devPath": "http://localhost:3000",
     "beforeDevCommand": "",
-    "beforeBuildCommand": ""
+    "beforeBuildCommand": "",
+    "withGlobalTauri": true
   },
   "tauri": {
     "bundle": {
@@ -15,10 +16,8 @@
       "targets": "all",
       "identifier": "at.agere.ltc-timecode-generator-legacy",
       "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
-      "linux": {
-        "appimage": {
-          "bundleMediaFramework": true
-        }
+      "appimage": {
+        "bundleMediaFramework": true
       }
     },
     "allowlist": {
