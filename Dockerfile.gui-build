@@ -1,0 +1,34 @@
+# Force Docker to treat the base as a 32-bit platform
+FROM --platform=linux/386 i386/debian:11
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    gcc \
+    pkg-config \
+    libasound2-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure global Rust environment paths
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+# FORCE rustup to install the 32-bit (i686) compiler toolchain explicitly
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    --default-host i686-unknown-linux-gnu \
+    --no-modify-path
+
+# Install cargo-zigbuild
+RUN cargo install cargo-zigbuild
+
+# Install Zig (v0.13.0 or equivalent stable version)
+# We fetch the x86 (32-bit) version since the container platform is 32-bit
+RUN curl -L https://ziglang.org/download/0.13.0/zig-linux-x86-0.13.0.tar.xz -o zig.tar.xz && \
+    tar -xf zig.tar.xz && \
+    mv zig-linux-x86-0.13.0 /usr/local/zig && \
+    ln -s /usr/local/zig/zig /usr/local/bin/zig && \
+    rm zig.tar.xz
+
+WORKDIR /app

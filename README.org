@@ -2,9 +2,44 @@ A LTC timecode generator webapp that shows the currently running LTC time, and
 has a digital clapper funtion. Primarily vibecoded to be good enough for
 practical application.
 
+The webapp interface:
 [[file:./assets/ltc-timecode-generator-ui.png]]
 
-* Packaging & Deploying
+* Compiling the Rust GUI
+
+Setup:
+
+#+begin_src bash
+  cargo install cargo-zigbuild
+#+end_src
+
+Compilation:
+
+#+begin_src bash
+  cargo zigbuild --release
+#+end_src
+
+** Compiling the 32bit version
+
+#+begin_src bash
+  docker build --platform linux/386 -t ltc-debian11-builder -f Dockerfile.gui-build .
+  docker run --rm \
+         -v "$(pwd)":/app \
+         -w /app/ltc-gui \
+         ltc-debian11-builder \
+         cargo zigbuild --target i686-unknown-linux-gnu.2.31 --release
+#+end_src
+
+* Running the Rust GUI
+
+#+begin_src bash
+  cd ltc-gui
+  cargo run                    # Debug
+  cargo run --release          # Release (12MB stripped)
+  LIBGL_ALWAYS_SOFTWARE=1 cargo run  # Force software rendering for GPU-less testing
+#+end_src
+
+* Packaging & Deploying the Webapp as Standalone
 
 Packaging your React/Vite application into a native desktop app using Tauri is
 a highly efficient choice. Tauri utilizes the system's native webview (WebKit
