@@ -1,0 +1,18 @@
+[package]
+name = "ltc-gui"
+version = "0.2.0"
+description = "Native Rust GUI for the LTC Timecode Generator"
+authors = ["Daidalos"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[dependencies]
+audio-core = { path = "../audio-core" }
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.35"
+env_logger = "0.11"

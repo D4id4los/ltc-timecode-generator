@@ -1,18 +1,22 @@
 # LTC Timecode Generator — Project Guide
 
 ## Overview
-High-precision SMPTE Linear Timecode (LTC) audio signal generator + digital clapper-board for multi-camera video sync. Generates bi-phase mark modulated LTC audio and beep tones, routed to selectable stereo channels. Originally a pure webapp, now being migrated to Tauri v2 standalone desktop with cpal Rust backend for audio.
+High-precision SMPTE Linear Timecode (LTC) audio signal generator + digital clapper-board for multi-camera video sync. Generates bi-phase mark modulated LTC audio and beep tones, routed to selectable stereo channels. Three frontends share a common `audio-core` Rust crate:
+1. **Web app** (React + Vite, browser-based)
+2. **Tauri v2** desktop (WebKitGTK + Rust backend, being phased out)
+3. **ltc-gui** (native Rust egui/eframe app — the target for weak-GPU tablets)
 
 ## Tech Stack
 - **Frontend**: React 19 + TypeScript + Vite 6 + Tailwind CSS 4 + `lucide-react` icons + `motion` (framer-motion)
 - **Desktop**: Tauri v2 (`@tauri-apps/cli` v2.11.4)
 - **Rust Backend**: Tauri v2.11.3, cpal 0.18, serde/serde_json, tauri-plugin-log, std::sync::mpsc
-- **Build**: `npm run build` → `dist/`, `npx tauri build` → AppImage/deb/msi
+- **Native GUI**: egui 0.35 + eframe (glow backend), direct `audio-core` dependency, pure Rust
+- **Build**: `npm run build` → `dist/`, `npx tauri build` → AppImage/deb/msi, `cargo build` in `ltc-gui/` → native binary
 - **32-bit Legacy**: `src-tauri-32bit/` (Tauri v1, Docker cross-compile via `build-32bit.sh`)
 
 ## Project Structure
 ```
-├── src/                          # Frontend source
+├── src/                          # Frontend source (web app)
 │   ├── main.tsx                  # React entry point
 │   ├── App.tsx                   # Main component (1034 lines) — all audio logic, scheduling, UI
 │   ├── ltcGenerator.ts           # LTC signal generation, beep generation, timecode math
@@ -24,6 +28,21 @@ High-precision SMPTE Linear Timecode (LTC) audio signal generator + digital clap
 │   │   └── FooterStatusBar.tsx    # Status bar (OS, audio devices, wake lock, battery)
 │   └── utils/
 │       └── audioBackend.ts        # Tauri/Web abstraction layer (device detection, audio output)
+├── ltc-gui/                      # Native Rust GUI (egui/eframe) — target for weak-GPU tablets
+│   ├── Cargo.toml                # Deps: eframe 0.35 (glow), egui 0.35, audio-core
+│   └── src/
+│       ├── main.rs               # eframe::run_native() entry point
+│       ├── app.rs                # AppState struct + eframe::App impl + audio integration
+│       ├── theme.rs              # Dark/light theme colors (matches CSS custom properties)
+│       └── widgets/
+│           ├── mod.rs            # Shared widget helpers (pill)
+│           ├── clock.rs          # Glowing timecode display (large digits + milliseconds)
+│           ├── clapper.rs        # Clapper board + arm animation + scene/take/roll + sync log
+│           ├── settings.rs       # FPS selector, timecode steppers, device dropdown, routing, sliders
+│           └── status.rs         # OS, devices, audio status, system time, LIVE/IDLE indicator
+├── audio-core/                   # Shared Rust audio crate (LTC generation + cpal output + scheduler)
+│   ├── Cargo.toml                # Deps: cpal 0.18, serde, log
+│   └── src/lib.rs                # AudioCore struct, LTC/beep generation, cpal stream, scheduler thread
 ├── src-tauri/                    # Tauri v2 (main 64-bit) Rust backend
 │   ├── Cargo.toml                # Rust deps: tauri 2.11.3, cpal 0.18, serde, log
 │   ├── tauri.conf.json           # Window 800x800, resizable, CSP null, bundleMediaFramework
@@ -63,7 +82,40 @@ The app runs in **two modes**, detected at runtime via `window.__TAURI_INTERNALS
 - `selectAudioOutputNative()` — browser picker, no-op in Tauri
 - No `@tauri-apps/api` npm dependency — uses raw `window.__TAURI_INTERNALS__.invoke`
 
-## Rust Commands (`src-tauri/src/lib.rs`)
+## Native Rust GUI (`ltc-gui/`)
+
+The native GUI is built with **egui 0.35 + eframe** (glow backend) and talks directly to `audio-core` — no IPC, no serialization, no webview. This is the target frontend for weak-GPU tablets (Intel Atom + GMA 500) where WebKitGTK performance is unusable.
+
+### Architecture
+- **`AppState` struct** (`app.rs`): holds all UI state + `Mutex<AudioCore>`. Implements `eframe::App` with `logic()` (state updates, clock polling, animation) and `ui()` (rendering).
+- **Direct audio-core calls**: `self.audio_core.lock().unwrap().start_ltc(...)`, `.play_beep(...)`, `.current_timecode()` — no IPC overhead.
+- **Theme system** (`theme.rs`): Dark/light mode with `egui::Context::set_visuals()`. Colors match the CSS custom properties from `src/index.css` (e.g., `--bg-app: #0A0A0B`).
+- **Custom widgets** (`widgets/`): `clock` (large timecode display), `clapper` (animated slate board), `settings` (fps/device/routing), `status` (footer bar).
+
+### Rendering Backend
+- Uses `eframe` with `glow` (OpenGL) backend, `default-features = false`, features: `["default_fonts", "glow", "wayland", "x11"]`.
+- On hardware without GPU acceleration (GMA 500): Mesa's `llvmpipe` software OpenGL renderer provides fallback via `LIBGL_ALWAYS_SOFTWARE=1`.
+- No GPU required for acceptable performance — egui is immediate-mode, only visible widgets are drawn.
+
+### Build & Run
+```bash
+cd ltc-gui
+cargo run                           # Debug build (fast compile, slower runtime)
+cargo run --release                 # Release build (optimized, ~12MB stripped binary)
+LIBGL_ALWAYS_SOFTWARE=1 cargo run   # Force software OpenGL rendering (for testing on GPU-less systems)
+```
+
+### Key Differences from Web/Tauri Frontends
+| Aspect | Web/Tauri | ltc-gui |
+|--------|-----------|---------|
+| Audio IPC | JSON serialization over Tauri commands | Direct `AudioCore` method calls |
+| Timing | `performance.now()` / `audioCtx.currentTime` | `AudioCore::current_timecode()` polling |
+| UI framework | React 19 + Tailwind CSS | egui 0.35 (immediate mode) |
+| Rendering | WebKitGTK (WebView) | glow (OpenGL) / llvmpipe (software) |
+| Binary size | ~100MB+ (with WebKit runtime) | ~12MB stripped |
+| Target | Modern hardware | Weak-GPU tablets (Intel Atom) |
+
+
 | Command | Args | Returns | Description |
 |---------|------|---------|-------------|
 | `get_audio_devices` | none | `Vec<AudioDeviceInfo>` | Lists output devices via cpal |
@@ -113,6 +165,7 @@ The `"version"` npm lifecycle hook runs `scripts/sync-version.js` automatically 
 - `src-tauri/Cargo.toml`
 - `src-tauri-32bit/Cargo.toml`
 - `audio-core/Cargo.toml`
+- `ltc-gui/Cargo.toml`
 
 After syncing, run `npm install` (to update `package-lock.json`) and `cargo build` in each crate (to update `Cargo.lock` files).
 
@@ -132,6 +185,7 @@ npx tauri build      # Production build → src-tauri/target/release/bundle/
 npm run lint         # tsc --noEmit
 npm run clean        # rm -rf dist src-tauri/target src-tauri-32bit/target
 ./build-32bit.sh     # Docker cross-compile for i686 (Tauri v1 legacy)
+cd ltc-gui && cargo run --release  # Native Rust GUI (egui/eframe)
 ```
 
 ## Current State

@@ -53,6 +53,12 @@ cargo = cargo.replace(/^version = ".*?"/m, `version = "${version}"`);
 write('audio-core/Cargo.toml', cargo);
 console.log('  ✓ audio-core/Cargo.toml');
 
+// 6. ltc-gui/Cargo.toml
+cargo = read('ltc-gui/Cargo.toml');
+cargo = cargo.replace(/^version = ".*?"/m, `version = "${version}"`);
+write('ltc-gui/Cargo.toml', cargo);
+console.log('  ✓ ltc-gui/Cargo.toml');
+
 console.log(`\nAll files synced to version ${version}.`);
 console.log('Run `npm install` to update package-lock.json.');
 console.log('Run `cargo build` in each crate to update Cargo.lock files.');

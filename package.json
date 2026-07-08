@@ -7,7 +7,7 @@
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
     "preview": "vite preview",
-    "clean": "rm -rf dist src-tauri/target src-tauri-32bit/target",
+    "clean": "rm -rf dist src-tauri/target src-tauri-32bit/target ltc-gui/target",
     "lint": "tsc --noEmit",
     "version:sync": "node scripts/sync-version.js",
     "version": "node scripts/sync-version.js"
