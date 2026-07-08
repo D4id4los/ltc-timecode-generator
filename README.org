@@ -13,7 +13,7 @@ keeps the final binary size extremely small (around 5–10 MB) and uses very
 little memory compared to Electron.  Here is a step-by-step guide tailored to
 your specific React project to turn it into a standalone desktop application.
 
-** Step 1: Install Rust & System Prerequisites
+** Install Rust & System Prerequisites
 
 Before you begin, your local development machine needs the Rust compiler and system webview packages installed.
 
@@ -22,6 +22,9 @@ Before you begin, your local development machine needs the Rust compiler and sys
 #+begin_src bash
   sudo apt update
   sudo apt install -y libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev
+  # For 32 bit deployment
+  sudo apt install libwebkit2gtk-4.1-dev:armhf # ARMv7
+  sudo apt install libwebkit2gtk-4.1-dev:i386 # i686
 #+end_src
 
 *macOS*:
@@ -41,77 +44,13 @@ Once prerequisites are met, install Rust:
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 #+end_src
 
-** Step 2: Add Tauri to Your React Project
-Open your local terminal in your project’s root folder and install the Tauri CLI as a development dependency:
+** Install v2 tauri cli
 
 #+begin_src bash
-  npm install -D @tauri-apps/cli
+  cargo install tauri-cli --version "^2.0.0" --locked
 #+end_src
 
-** Step 3: Initialize Tauri
-Run the initialization wizard. This creates a src-tauri directory containing the Rust configuration:
-
-#+begin_src bash
-  npx tauri init
-#+end_src
-
-The wizard will ask you a few questions. Provide the following answers to match your Vite setup:
-- What is your app name? → Enter your desired app name (e.g., Timecode Clapper).
-- What is your window title? → Enter your desired window title.
-- Where are your web assets located (relative to src-tauri)? → Enter ../dist (This is where Vite outputs compiled files).
-- What is the URL of your dev server? → Enter http://localhost:3000 or your preferred local dev URL.
-- What is your frontend dev command? → Enter npm run dev.
-- What is your frontend build command? → Enter npm run build.
-
-** Step 4: Configure tauri.conf.json
-
-Tauri creates a file at src-tauri/tauri.conf.json. Ensure the build and bundle
-configurations align with your Vite project structure. Here is a standard
-configuration mapping:
-
-#+begin_src json
-
-  {
-  "build": {
-  "beforeDevCommand": "npm run dev",
-  "beforeBuildCommand": "npm run build",
-  "devUrl": "http://localhost:3000",
-  "distDir": "../dist"
-  },
-  "package": {
-  "productName": "Timecode Clapper",
-  "version": "1.0.0"
-  },
-  "tauri": {
-  "allowlist": {
-  "all": false
-  },
-  "bundle": {
-  "active": true,
-  "targets": "all",
-  "identifier": "com.example.timecodeclapper",
-  "icon": [
-  "icons/32x32.png",
-  "icons/128x128.png",
-  "icons/128x128@2x.png",
-  "icons/icon.icns",
-  "icons/icon.ico"
-  ]
-  },
-  "windows": [
-  {
-  "title": "Timecode Clapper",
-  "width": 1024,
-  "height": 768,
-  "resizable": true,
-  "fullscreen": false
-  }
-  ]
-  }
-  }
-#+end_src
-
-** Step 5: Test and Run Locally in Desktop Mode
+** Test and Run Locally in Desktop Mode
 
 You can now run your application in a local native desktop window. Tauri will
 start Vite in the background, spin up the Rust core, and display your React
@@ -121,12 +60,15 @@ interface inside the native webview:
   npx tauri dev
 #+end_src
 
-** Step 6: Build the Production Executable
+** Build the Production Executable
 
 When you are ready to package your application into a production-ready, standalone binary, run:
 
 #+begin_src bash
-  npx tauri build
+  npm run build
+  cd src-tauri
+  cargo tauri build
+  # npx tauri build
 #+end_src
 
 This command will:
@@ -137,14 +79,25 @@ This command will:
   Linux, .app / .dmg on macOS, .msi on Windows) inside
   src-tauri/target/release/bundle/.
 
-Key Desktop Considerations
-- Persistent Storage: Since the app runs locally, standard browser features
-  like localStorage work out of the box and persist across app restarts.
-- Offscreen & Hardware Audio/Video: Tauri uses the native web engine. If your
-  app generates LTC audio or runs precise timers, it will execute with native
-  clock performance because it is no longer restricted by background tab
-  throttles commonly found in standard web browsers.
-- Operating System APIs: If you ever need to access the filesystem directly,
-  open native OS save/load dialogs, or send custom notifications, you can
-  import @tauri-apps/api to securely bridge your React code with Tauri's Rust
-  backend.
+To build 32bit versions, make sure you have docker installed on you system, then:
+#+begin_src bash
+  ./build-32bit.sh
+#+end_src
+
+* Installing Docker
+
+** Ubuntu
+
+#+begin_src bash
+  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  sudo chmod a+r /etc/apt/keyrings/docker.asc
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt update
+  sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin  
+#+end_src
+
+Allow non root (i.e. you) users to run docker:
+#+begin_src bash
+  sudo usermod -aG docker $USER
+  newgrp docker
+#+end_src

@@ -1,8 +1,8 @@
 [package]
-name = "app"
+name = "ltc-timecode-generator"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "A LTC timecode generator with current timecode display and digital clapper board."
+authors = ["Daidalos"]
 license = ""
 repository = ""
 edition = "2021"

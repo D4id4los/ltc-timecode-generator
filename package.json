@@ -1,13 +1,13 @@
 {
-  "name": "react-example",
+  "name": "ltc-timecode-generator",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
+    "clean": "rm -rf dist src-tauri/target src-tauri-32bit/target",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
@@ -30,7 +30,6 @@
     "esbuild": "^0.25.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
-    "typescript": "~5.8.2",
-    "vite": "^6.2.3"
+    "typescript": "~5.8.2"
   }
 }

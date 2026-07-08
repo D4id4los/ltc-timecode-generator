@@ -1,0 +1,36 @@
+FROM ubuntu:20.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Combine architecture setup, base tools, and Node.js into a cleaner layer setup
+RUN dpkg --add-architecture i386 && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    curl wget build-essential pkg-config patchelf gcc-multilib ca-certificates \
+    file libfuse2:i386 \
+    libssl-dev:i386 libgtk-3-dev:i386 libwebkit2gtk-4.0-dev:i386 librsvg2-dev:i386 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js cleanly and clear apt caches immediately
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Setup global, immutable Rust paths
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable \
+    && rustup target add i686-unknown-linux-gnu \
+    && chmod -R a+rwX /usr/local/rustup /usr/local/cargo
+
+# Install tauri-cli to the global path.
+# We explicitly do NOT change cargo home later so this remains accessible.
+RUN cargo install tauri-cli --version "^1.6.0" --locked
+
+# Environment overrides for cross-compilation
+ENV PKG_CONFIG_ALLOW_CROSS=1
+ENV PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig
+
+# Ensure /app exists and can be written to by any runtime user ID
+RUN mkdir -p /app && chmod 777 /app
+WORKDIR /app

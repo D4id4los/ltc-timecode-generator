@@ -1,0 +1,14 @@
+# Rust compilation outputs
+**/target/
+.cargo_cache/
+.rustup_cache/
+
+# Node packages and build outputs
+node_modules/
+dist/
+.vite-temp/
+
+# Git and OS metadata
+.git
+.gitignore
+*.sh

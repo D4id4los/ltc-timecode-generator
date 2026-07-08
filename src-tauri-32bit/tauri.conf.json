@@ -1,0 +1,24 @@
+{
+  "package": {
+    "productName": "ltc-timecode-generator-32bit",
+    "version": "0.1.0"
+  },
+  "build": {
+    "distDir": "../dist",
+    "devPath": "http://localhost:3000",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "tauri": {
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "at.agere.ltc-timecode-generator-legacy",
+      "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
+    },
+    "allowlist": {
+      "all": true
+    },
+    "windows": [{ "title": "LTC Timecode Generator", "width": 800, "height": 800 }]
+  }
+}

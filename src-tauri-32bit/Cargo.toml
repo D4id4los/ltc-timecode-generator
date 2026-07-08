@@ -1,0 +1,25 @@
+[package]
+name = "ltc-timecode-generator-legacy"
+version = "0.1.0"
+description = "A LTC timecode generator with current timecode display and digital clapper board."
+authors = ["Daidalos"]
+edition = "2021"
+rust-version = "1.70.0"
+
+#[lib]
+#name = "app_lib"
+#crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "1.8", features = ["api-all", "custom-protocol"] }
+# log = "0.4"
+# tauri-plugin-log = "1"
+
+[features]
+# This points the package's "custom-protocol" feature directly to the tauri dependency's feature
+custom-protocol = ["tauri/custom-protocol"]
