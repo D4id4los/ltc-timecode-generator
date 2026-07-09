@@ -176,7 +176,7 @@ function ClapperSlate({
           {/* CINEMA SLATE METADATA GRID */}
           <div className="grid grid-cols-3 gap-3">
             {/* ROLL FIELD */}
-            <div className="bg-deep-bg rounded-xl p-3 border border-border-main flex flex-col justify-between h-24">
+            <div className="bg-deep-bg rounded-xl p-2 sm:p-3 border border-border-main flex flex-col justify-between h-20 sm:h-24">
               <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest block">
                 ROLL
               </span>
@@ -187,11 +187,11 @@ function ClapperSlate({
                 onChange={(e) => setRoll(e.target.value.toUpperCase())}
                 className="bg-transparent border-b border-border-main text-text-title font-mono text-xl font-bold focus:outline-none focus:border-[#FF5F1F] w-full text-center tracking-wide"
               />
-              <div className="h-4" /> {/* Spacer to align visually with steppers */}
+              <div className="h-2 sm:h-4" /> {/* Spacer to align visually with steppers */}
             </div>
 
             {/* SCENE FIELD */}
-            <div className="bg-deep-bg rounded-xl p-2 sm:p-3 border border-border-main flex flex-col justify-between h-24">
+            <div className="bg-deep-bg rounded-xl p-2 sm:p-3 border border-border-main flex flex-col justify-between h-20 sm:h-24">
               <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest text-center">
                 SCENE
               </span>
@@ -256,7 +256,7 @@ function ClapperSlate({
       </div>
 
       {/* RIGHT: SYNC MARKERS LOGS */}
-      <div className="xl:col-span-5 bg-card-bg border-2 border-border-main rounded-2xl p-6 shadow-2xl flex flex-col justify-between min-h-[400px]">
+      <div className="xl:col-span-5 bg-card-bg border-2 border-border-main rounded-2xl p-4 sm:p-6 shadow-2xl flex flex-col justify-between min-h-[280px] sm:min-h-[360px]">
         <div className="space-y-4 flex-1 flex flex-col">
           {/* Header */}
           <div className="flex items-center justify-between">
@@ -289,7 +289,7 @@ function ClapperSlate({
           </div>
 
           {/* Logs Area */}
-          <div className="flex-1 bg-deep-bg rounded-2xl border border-border-main p-4 font-mono text-xs overflow-y-auto max-h-[380px] min-h-[220px]">
+          <div className="flex-1 bg-deep-bg rounded-2xl border border-border-main p-3 sm:p-4 font-mono text-xs overflow-y-auto max-h-[380px] min-h-[160px] sm:min-h-[200px]">
             {logs.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-center text-zinc-600 space-y-2 py-10">
                 <Video className="w-8 h-8 text-zinc-700" />

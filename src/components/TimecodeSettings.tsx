@@ -143,7 +143,7 @@ function TimecodeSettings({
           )}
         </div>
 
-        <div className={`grid grid-cols-4 gap-3 md:gap-4 max-w-lg ${isPlaying ? "opacity-30 pointer-events-none" : ""}`}>
+        <div className={`grid grid-cols-2 sm:grid-cols-4 gap-2 md:gap-3 max-w-lg ${isPlaying ? "opacity-30 pointer-events-none" : ""}`}>
           {(["hours", "minutes", "seconds", "frames"] as const).map((field) => {
             const val = startTimecode[field];
             return (
@@ -288,7 +288,7 @@ function TimecodeSettings({
           Audio Routing & Settings (Dual-Channel Splits)
         </h3>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 bg-deep-bg p-5 rounded-2xl border border-border-main">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 bg-deep-bg p-3 sm:p-5 rounded-2xl border border-border-main">
           {/* Channel Selectors */}
           <div className="space-y-5">
             {/* LTC Target Routing */}
@@ -296,7 +296,7 @@ function TimecodeSettings({
               <label className="text-xs font-semibold text-text-muted block uppercase tracking-wider">
                 LTC Audio Output Route
               </label>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-3 gap-1.5 sm:gap-2">
                 {(["left", "right", "both"] as AudioChannel[]).map((ch) => {
                   const isActive = audioSettings.ltcChannel === ch;
                   return (
@@ -322,7 +322,7 @@ function TimecodeSettings({
               <label className="text-xs font-semibold text-text-muted block uppercase tracking-wider">
                 Digital Clapper Route
               </label>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-3 gap-1.5 sm:gap-2">
                 {(["left", "right", "both"] as AudioChannel[]).map((ch) => {
                   const isActive = audioSettings.beepChannel === ch;
                   return (
