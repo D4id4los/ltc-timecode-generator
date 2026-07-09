@@ -33,6 +33,7 @@ impl Theme {
         visuals.panel_fill = colors.app_bg;
         visuals.window_fill = colors.card_bg;
         visuals.window_stroke = Stroke::new(1.0, border);
+        visuals.window_corner_radius = egui::CornerRadius::same(12);
         visuals.faint_bg_color = nested;
         visuals.extreme_bg_color = colors.deep_bg;
 
@@ -40,20 +41,25 @@ impl Theme {
         w.noninteractive.bg_fill = nested;
         w.noninteractive.fg_stroke = Stroke::new(1.0, text_muted);
         w.noninteractive.bg_stroke = Stroke::new(1.0, border);
+        w.noninteractive.corner_radius = egui::CornerRadius::same(12);
 
         w.inactive.bg_fill = nested;
         w.inactive.weak_bg_fill = nested;
         w.inactive.fg_stroke = Stroke::new(1.0, text);
+        w.inactive.corner_radius = egui::CornerRadius::same(10);
 
         w.hovered.bg_fill = nested_hover;
         w.hovered.weak_bg_fill = nested_hover;
         w.hovered.fg_stroke = Stroke::new(1.0, text_title);
+        w.hovered.corner_radius = egui::CornerRadius::same(10);
 
         w.active.bg_fill = nested_hover;
         w.active.weak_bg_fill = nested_hover;
         w.active.fg_stroke = Stroke::new(1.0, ACCENT);
+        w.active.corner_radius = egui::CornerRadius::same(10);
 
         w.open.bg_fill = colors.card_bg;
+        w.open.corner_radius = egui::CornerRadius::same(10);
 
         visuals.selection.bg_fill = ACCENT.linear_multiply(0.3);
         visuals.selection.stroke = Stroke::new(1.0, ACCENT);

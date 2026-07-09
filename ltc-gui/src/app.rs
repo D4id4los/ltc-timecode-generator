@@ -135,6 +135,7 @@ pub struct AppState {
 
     // Tab state
     pub active_tab: Tab,
+    pub show_faq: bool,
 
     // Device state
     pub devices: Vec<AudioDeviceInfo>,
@@ -171,12 +172,13 @@ impl Default for AppState {
             beep_frequency: 1000.0,
             scene: 1,
             take: 1,
-            roll: String::new(),
+            roll: "A001".to_string(), // match webapp default Roll
             auto_increment_take: true,
             logs: Vec::new(),
             clap_flash_alpha: 0.0,
-            clap_arm_angle: 0.0,
+            clap_arm_angle: -25.0, // default open state
             active_tab: Tab::Clapper,
+            show_faq: false,
             devices: Vec::new(),
             selected_device: 0,
             audio_initialized: false,
@@ -285,7 +287,7 @@ impl AppState {
 
         // Trigger visual effects
         self.clap_flash_alpha = 1.0;
-        self.clap_arm_angle = -90.0; // snap to upright (closed) position
+        self.clap_arm_angle = 0.0; // snap to closed position
 
         // Log the clap
         let fps = self.fps();
@@ -331,15 +333,14 @@ impl eframe::App for AppState {
         if self.clap_flash_alpha > 0.0 {
             self.clap_flash_alpha = (self.clap_flash_alpha - 0.08).max(0.0);
         }
-        // Clapper arm: starts at -90 (upright/closed), animates to 0 (horizontal/open)
-        // Use exponential decay for a quick snap that slows as it approaches 0
-        if self.clap_arm_angle < -0.5 {
-            // Move 15% of the remaining distance each frame
-            let target = 0.0;
+        // Clapper arm: snaps to 0 (closed) and smoothly opens back to -25 (open)
+        if self.clap_arm_angle > -25.0 {
+            let target = -25.0;
             let diff = target - self.clap_arm_angle;
             self.clap_arm_angle += diff * 0.15;
-        } else if self.clap_arm_angle < 0.0 {
-            self.clap_arm_angle = 0.0;
+            if self.clap_arm_angle <= -24.8 {
+                self.clap_arm_angle = -25.0;
+            }
         }
 
         // Poll current timecode when playing
@@ -413,6 +414,11 @@ impl eframe::App for AppState {
 
                         ui.add_space(4.0);
 
+                        // ── FAQ Accordion Panel ──
+                        self.render_faq_panel(ui);
+
+                        ui.add_space(4.0);
+
                         // ── Section 1: Master Studio Time Clock ──
                         self.render_clock_section(ui);
 
@@ -468,93 +474,414 @@ pub fn centered_horizontal_row<R>(
 
 impl AppState {
     fn render_header(&mut self, ui: &mut Ui) {
+        let colors = self.theme.colors();
         ui.horizontal(|ui| {
-            // Logo dot
-            let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(12.0, 12.0), Sense::hover());
-            ui.painter().circle_filled(rect.center(), 6.0, ACCENT);
+            // Clapper logo (orange square with two black horizontal lines)
+            let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(34.0, 34.0), Sense::hover());
+            ui.painter().rect_filled(rect, 4.0, ACCENT);
+            let center_y = rect.center().y;
+            let line_w = 18.0;
+            let line_h = 2.0;
+            let line1 = egui::Rect::from_center_size(egui::pos2(rect.center().x, center_y - 3.5), egui::vec2(line_w, line_h));
+            let line2 = egui::Rect::from_center_size(egui::pos2(rect.center().x, center_y + 3.5), egui::vec2(line_w, line_h));
+            ui.painter().rect_filled(line1, 0.0, Color32::BLACK);
+            ui.painter().rect_filled(line2, 0.0, Color32::BLACK);
 
-            ui.label(
-                RichText::new(format!("LTC ENGINE v{}", APP_VERSION))
-                    .font(FontId::proportional(16.0))
-                    .strong(),
-            );
+            ui.add_space(4.0);
 
+            // Title and tagline
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("LTC ENGINE").font(FontId::proportional(16.0)).strong().color(colors.text_title));
+                    ui.label(RichText::new(format!("v{}", APP_VERSION)).font(FontId::proportional(16.0)).strong().color(ACCENT));
+                });
+                ui.label(RichText::new("LINEAR TIMECODE HUB").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
+            });
+
+            // Metadata indicators (responsive, shown if width > 500)
+            if ui.available_width() > 300.0 {
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    // Stats column 1: Interface
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("INTERFACE").font(FontId::proportional(8.0)).color(colors.text_muted).strong());
+                        let status_text = if self.is_playing { "NATIVE ACTIVE" } else { "STANDBY" };
+                        let status_color = if self.is_playing { Color32::from_rgb(0x22, 0xC5, 0x5E) } else { Color32::from_rgb(0xF5, 0x9E, 0x0B) };
+                        ui.label(RichText::new(status_text).font(FontId::proportional(10.0)).strong().color(status_color));
+                    });
+                    ui.add_space(10.0);
+                    // Stats column 2: Sample Rate
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("SAMPLE RATE").font(FontId::proportional(8.0)).color(colors.text_muted).strong());
+                        ui.label(RichText::new("16.0 KHZ").font(FontId::proportional(10.0)).strong().color(colors.text_title));
+                    });
+                    ui.add_space(10.0);
+                    // Stats column 3: Buffer
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("BUFFER").font(FontId::proportional(8.0)).color(colors.text_muted).strong());
+                        let buffer_smp = (16000.0 / self.fps().fps).round() as u32;
+                        ui.label(RichText::new(format!("{} SMP", buffer_smp)).font(FontId::proportional(10.0)).strong().color(colors.text_title));
+                    });
+                });
+            }
+
+            // Right side buttons
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Help button
+                let help_text = "?";
+                let help_btn = egui::Button::new(RichText::new(help_text).font(FontId::proportional(12.0)).strong())
+                    .fill(colors.nested_bg);
+                if ui.add(help_btn).clicked() {
+                    self.show_faq = !self.show_faq;
+                }
+
+                // Theme button
                 let icon = if self.theme == Theme::Dark { "☀" } else { "☾" };
-                if ui.button(icon).clicked() {
+                let theme_btn = egui::Button::new(RichText::new(icon).font(FontId::proportional(12.0)))
+                    .fill(colors.nested_bg);
+                if ui.add(theme_btn).clicked() {
                     self.theme = self.theme.toggle();
                 }
             });
         });
     }
 
-    fn render_clock_section(&mut self, ui: &mut Ui) {
-let frame = egui::Frame::group(ui.style())
+    fn render_faq_panel(&mut self, ui: &mut Ui) {
+        if !self.show_faq {
+            return;
+        }
+
+        let colors = self.theme.colors();
+        let frame = egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::same(16))
-            .corner_radius(8.0);
+            .corner_radius(12.0)
+            .fill(colors.card_bg)
+            .stroke(egui::Stroke::new(1.5, colors.border_main));
 
         frame.show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                widgets::clock::render(ui, self);
-            });
-            ui.add_space(8.0);
-            centered_horizontal_row(ui, "status_pills_row", 200.0, |ui| {
-                let fps = self.fps();
-                widgets::pill(ui, &format!("{} FPS", fps.name), ACCENT);
-                ui.label(format!(
-                    "LTC: {} | Beep: {}",
-                    self.ltc_channel.label(),
-                    self.beep_channel.label()
-                ));
-            });
-            ui.add_space(8.0);
-            centered_horizontal_row(ui, "control_buttons_row", 280.0, |ui| {
-                if !self.is_locked {
-                    if self.is_playing {
-                        if ui.button("Stop").clicked() { self.stop_streaming(); }
-                    } else {
-                        let btn = egui::Button::new("Start").fill(ACCENT.linear_multiply(0.3));
-                        if ui.add(btn).clicked() { self.start_streaming(); }
-                    }
-                    if ui.button("Clap & Beep").clicked() { self.trigger_clap(); }
-                    if ui.button("Reset").clicked() { self.handle_reset(); }
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("LTC & MULTI-CAM SYNC - QUICK GUIDE")
+                        .font(FontId::proportional(13.0))
+                        .color(colors.text_title)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+
+                let width = ui.available_width();
+                if width > 500.0 {
+                    ui.columns(3, |cols| {
+                        cols[0].vertical(|ui| {
+                            ui.label(RichText::new("📻 WHAT IS LINEAR TIMECODE?").font(FontId::proportional(10.0)).color(ACCENT).strong());
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(
+                                "Linear Timecode (LTC) is an analog audio signal encoding SMPTE timecode \
+                                (Hours:Minutes:Seconds:Frames) using Bi-Phase Mark Modulation. Cameras and \
+                                recorders listen to this audio signal to align footage in post."
+                            ).font(FontId::proportional(10.5)).color(colors.text_muted));
+                        });
+                        cols[1].vertical(|ui| {
+                            ui.label(RichText::new("🎥 CONNECTING CAMERAS").font(FontId::proportional(10.0)).color(ACCENT).strong());
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(
+                                "Connect your device's audio output (line/jack) \
+                                directly to the mic input of your cameras, or dedicated sync boxes \
+                                (Tentacle, Deity). Set camera audio gain manually to a medium level."
+                            ).font(FontId::proportional(10.5)).color(colors.text_muted));
+                        });
+                        cols[2].vertical(|ui| {
+                            ui.label(RichText::new("🔊 SYNCHRONIZING IN EDIT").font(FontId::proportional(10.0)).color(ACCENT).strong());
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(
+                                "Import all media files into DaVinci Resolve, Premiere, or Final Cut Pro. \
+                                Right-click files and choose 'Update Timecode from Audio Track'. \
+                                The software matches alignment instantly!"
+                            ).font(FontId::proportional(10.5)).color(colors.text_muted));
+                        });
+                    });
+                } else {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("📻 WHAT IS LINEAR TIMECODE?").font(FontId::proportional(10.0)).color(ACCENT).strong());
+                        ui.label(RichText::new(
+                            "Linear Timecode (LTC) is an analog audio signal encoding SMPTE timecode. \
+                            Cameras and recorders listen to this audio to align footage in post."
+                        ).font(FontId::proportional(10.5)).color(colors.text_muted));
+                        ui.add_space(6.0);
+
+                        ui.label(RichText::new("🎥 CONNECTING CAMERAS").font(FontId::proportional(10.0)).color(ACCENT).strong());
+                        ui.label(RichText::new(
+                            "Connect audio output to camera mic input or sync boxes. \
+                            Set gain manually to a medium level."
+                        ).font(FontId::proportional(10.5)).color(colors.text_muted));
+                        ui.add_space(6.0);
+
+                        ui.label(RichText::new("🔊 SYNCHRONIZING IN EDIT").font(FontId::proportional(10.0)).color(ACCENT).strong());
+                        ui.label(RichText::new(
+                            "In DaVinci Resolve or Premiere, right-click files and select \
+                            'Update Timecode from Audio Track' to auto-sync."
+                        ).font(FontId::proportional(10.5)).color(colors.text_muted));
+                    });
                 }
-                let lock_label = if self.is_locked { "Unlock" } else { "Lock" };
-                if ui.button(lock_label).clicked() { self.is_locked = !self.is_locked; }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Got it").clicked() {
+                            self.show_faq = false;
+                        }
+                    });
+                });
             });
         });
     }
 
-    fn render_tabbed_deck(&mut self, ui: &mut Ui) {
+    fn render_clock_section(&mut self, ui: &mut Ui) {
+        let colors = self.theme.colors();
         let frame = egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(12))
-            .corner_radius(8.0);
+            .inner_margin(egui::Margin::symmetric(20, 16))
+            .fill(colors.card_bg)
+            .stroke(egui::Stroke::new(1.5, colors.border_main))
+            .corner_radius(16.0);
+
         frame.show(ui, |ui| {
-            ui.vertical(|ui| {
-                // Tab bar
+            ui.set_min_width(ui.available_width());
+            
+            // Timecode Stream label with pulsing dot
+            ui.vertical_centered(|ui| {
                 ui.horizontal(|ui| {
-                    for tab in &[Tab::Clapper, Tab::Settings] {
-                        let selected = *tab == self.active_tab;
-                        let btn = if selected {
-                            egui::Button::new(tab.label())
-                                .fill(ACCENT.linear_multiply(0.2))
-                        } else {
-                            egui::Button::new(tab.label())
-                        };
-                        if ui.add(btn).clicked() {
-                            self.active_tab = *tab;
+                    // Center the header
+                    let text_w = 175.0;
+                    ui.add_space(((ui.available_width() - text_w) / 2.0).max(0.0));
+                    ui.label(
+                        RichText::new("LINEAR TIMECODE STREAM")
+                            .font(FontId::proportional(10.0))
+                            .color(ACCENT)
+                            .strong()
+                            .extra_letter_spacing(1.5),
+                    );
+                    
+                    // Pulsing dot
+                    let time = ui.ctx().input(|i| i.time);
+                    let alpha = if self.is_playing {
+                        (time * 4.0).sin() * 0.3 + 0.7
+                    } else {
+                        1.0
+                    };
+                    let dot_color = if self.is_playing {
+                        Color32::from_rgba_unmultiplied(0x22, 0xC5, 0x5E, (alpha * 255.0) as u8)
+                    } else {
+                        Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, 255)
+                    };
+                    
+                    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(8.0, 8.0), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.0, dot_color);
+                });
+            });
+            ui.add_space(4.0);
+
+            // Clock rendering
+            widgets::clock::render(ui, self);
+            
+            ui.add_space(8.0);
+
+            // Pills Row
+            let fps = self.fps();
+            ui.vertical_centered(|ui| {
+                ui.horizontal(|ui| {
+                    let total_pill_w = 330.0;
+                    ui.add_space(((ui.available_width() - total_pill_w) / 2.0).max(0.0));
+                    
+                    // Pill 1: FPS
+                    let pill1_frame = egui::Frame::new()
+                        .corner_radius(6.0)
+                        .fill(colors.nested_bg)
+                        .stroke(egui::Stroke::new(1.0, colors.border_main))
+                        .inner_margin(egui::Margin::symmetric(10, 4));
+                    pill1_frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("⚡").font(FontId::proportional(10.0)).color(ACCENT).strong());
+                            ui.label(RichText::new(format!("FPS: {} ({} FPS)", fps.fps, fps.name)).font(FontId::proportional(10.0)).color(colors.text_muted).strong());
+                        });
+                    });
+                    
+                    ui.add_space(8.0);
+
+                    // Pill 2: Routing
+                    let pill2_frame = egui::Frame::new()
+                        .corner_radius(6.0)
+                        .fill(colors.nested_bg)
+                        .stroke(egui::Stroke::new(1.0, colors.border_main))
+                        .inner_margin(egui::Margin::symmetric(10, 4));
+                    pill2_frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("🔊").font(FontId::proportional(10.0)).color(ACCENT).strong());
+                            ui.label(RichText::new(format!("ROUTE: LTC {} | CLAP {}", self.ltc_channel.label().to_uppercase(), self.beep_channel.label().to_uppercase())).font(FontId::proportional(10.0)).color(colors.text_muted).strong());
+                        });
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+
+            // Control buttons layout
+            let width = ui.available_width();
+            let spacing = 8.0;
+            let is_locked = self.is_locked;
+            
+            if width > 420.0 {
+                // Horizontal row layout
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::Vec2::new(spacing, 0.0);
+                    
+                    let primary_w = ((width - spacing * 3.0 - 40.0 * 2.0) / 2.0).max(100.0);
+                    
+                    // 1. Play/Stop Button
+                    if self.is_playing {
+                        let stop_btn = egui::Button::new(RichText::new("■ STOP").strong().color(Color32::WHITE))
+                            .fill(Color32::from_rgb(0xDC, 0x26, 0x26)) // Bold Red
+                            .min_size(egui::vec2(primary_w, 40.0));
+                        let resp = ui.add_enabled(!is_locked, stop_btn);
+                        if resp.clicked() {
+                            self.stop_streaming();
+                        }
+                    } else {
+                        let start_btn = egui::Button::new(RichText::new("▶ START").strong().color(colors.text_title))
+                            .fill(colors.nested_bg)
+                            .stroke(egui::Stroke::new(1.0, colors.border_main))
+                            .min_size(egui::vec2(primary_w, 40.0));
+                        let resp = ui.add_enabled(!is_locked, start_btn);
+                        if resp.clicked() {
+                            self.start_streaming();
                         }
                     }
+                    
+                    // 2. Clap & Beep Button (Prominent orange)
+                    let clap_btn = egui::Button::new(RichText::new("🎥 CLAP & BEEP").strong().color(Color32::BLACK))
+                        .fill(ACCENT)
+                        .min_size(egui::vec2(primary_w, 40.0));
+                    let resp = ui.add_enabled(!is_locked, clap_btn);
+                    if resp.clicked() {
+                        self.trigger_clap();
+                    }
+                    
+                    // 3. Reset Button (square)
+                    let reset_btn = egui::Button::new(RichText::new("⟲").font(FontId::proportional(16.0)).strong())
+                        .fill(colors.nested_bg)
+                        .stroke(egui::Stroke::new(1.0, colors.border_main))
+                        .min_size(egui::vec2(40.0, 40.0));
+                    let resp = ui.add_enabled(!is_locked, reset_btn);
+                    if resp.clicked() {
+                        self.handle_reset();
+                    }
+                    
+                    // 4. Lock Button (square)
+                    let lock_icon = if is_locked { "🔒" } else { "🔓" };
+                    let lock_fill = if is_locked { ACCENT } else { colors.nested_bg };
+                    let lock_text_color = if is_locked { Color32::BLACK } else { colors.text_muted };
+                    let lock_btn = egui::Button::new(RichText::new(lock_icon).font(FontId::proportional(16.0)).strong().color(lock_text_color))
+                        .fill(lock_fill)
+                        .stroke(egui::Stroke::new(1.0, if is_locked { ACCENT } else { colors.border_main }))
+                        .min_size(egui::vec2(40.0, 40.0));
+                    if ui.add(lock_btn).clicked() {
+                        self.is_locked = !self.is_locked;
+                    }
                 });
+            } else {
+                // Stacked layout for small screens
+                ui.vertical(|ui| {
+                    if self.is_playing {
+                        let stop_btn = egui::Button::new(RichText::new("■ STOP").strong().color(Color32::WHITE))
+                            .fill(Color32::from_rgb(0xDC, 0x26, 0x26))
+                            .min_size(egui::vec2(width, 36.0));
+                        if ui.add_enabled(!is_locked, stop_btn).clicked() {
+                            self.stop_streaming();
+                        }
+                    } else {
+                        let start_btn = egui::Button::new(RichText::new("▶ START").strong().color(colors.text_title))
+                            .fill(colors.nested_bg)
+                            .stroke(egui::Stroke::new(1.0, colors.border_main))
+                            .min_size(egui::vec2(width, 36.0));
+                        if ui.add_enabled(!is_locked, start_btn).clicked() {
+                            self.start_streaming();
+                        }
+                    }
+                    ui.add_space(4.0);
 
-                ui.separator();
+                    let clap_btn = egui::Button::new(RichText::new("🎥 CLAP & BEEP").strong().color(Color32::BLACK))
+                        .fill(ACCENT)
+                        .min_size(egui::vec2(width, 36.0));
+                    if ui.add_enabled(!is_locked, clap_btn).clicked() {
+                        self.trigger_clap();
+                    }
+                    ui.add_space(4.0);
 
-                match self.active_tab {
-                    Tab::Clapper => widgets::clapper::render(ui, self),
-                    Tab::Settings => widgets::settings::render(ui, self),
+                    ui.horizontal(|ui| {
+                        let inner_w = (width - spacing) / 2.0;
+                        let reset_btn = egui::Button::new(RichText::new("⟲ Reset").strong())
+                            .fill(colors.nested_bg)
+                            .stroke(egui::Stroke::new(1.0, colors.border_main))
+                            .min_size(egui::vec2(inner_w, 36.0));
+                        if ui.add_enabled(!is_locked, reset_btn).clicked() {
+                            self.handle_reset();
+                        }
+
+                        let lock_icon = if is_locked { "🔒 Locked" } else { "🔓 Unlocked" };
+                        let lock_fill = if is_locked { ACCENT } else { colors.nested_bg };
+                        let lock_text_color = if is_locked { Color32::BLACK } else { colors.text_muted };
+                        let lock_btn = egui::Button::new(RichText::new(lock_icon).strong().color(lock_text_color))
+                            .fill(lock_fill)
+                            .stroke(egui::Stroke::new(1.0, if is_locked { ACCENT } else { colors.border_main }))
+                            .min_size(egui::vec2(inner_w, 36.0));
+                        if ui.add(lock_btn).clicked() {
+                            self.is_locked = !self.is_locked;
+                        }
+                    });
+                });
+            }
+        });
+    }
+
+    fn render_tabbed_deck(&mut self, ui: &mut Ui) {
+        let colors = self.theme.colors();
+        ui.vertical(|ui| {
+            // Tab bar
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::new(20.0, 0.0);
+                for tab in &[Tab::Clapper, Tab::Settings] {
+                    let selected = *tab == self.active_tab;
+                    let text = if selected {
+                        RichText::new(tab.label())
+                            .font(FontId::proportional(12.0))
+                            .strong()
+                            .color(colors.text_title)
+                    } else {
+                        RichText::new(tab.label())
+                            .font(FontId::proportional(12.0))
+                            .color(colors.text_muted)
+                    };
+                    let resp = ui.add(egui::Button::new(text).frame(false).fill(Color32::TRANSPARENT));
+                    if resp.clicked() {
+                        self.active_tab = *tab;
+                    }
+                    if selected {
+                        // Draw orange underline
+                        let underline_y = resp.rect.bottom() + 4.0;
+                        let start = egui::pos2(resp.rect.left(), underline_y);
+                        let end = egui::pos2(resp.rect.right(), underline_y);
+                        ui.painter().line_segment([start, end], egui::Stroke::new(2.0, ACCENT));
+                    }
                 }
             });
+
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // Tab content
+            match self.active_tab {
+                Tab::Clapper => widgets::clapper::render(ui, self),
+                Tab::Settings => widgets::settings::render(ui, self),
+            }
         });
     }
 
