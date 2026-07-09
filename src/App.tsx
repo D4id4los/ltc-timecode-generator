@@ -87,8 +87,8 @@ export default function App() {
   });
   const [selectedFps, setSelectedFps] = useState<FrameRateOption>(FRAME_RATE_OPTIONS[1]); // 25 fps PAL by default
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({
-    ltcChannel: "right",
-    beepChannel: "left",
+    ltcChannel: "left",
+    beepChannel: "right",
     ltcVolume: 0.7,
     beepVolume: 0.8,
     beepFrequency: 1000,

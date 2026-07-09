@@ -165,8 +165,8 @@ impl Default for AppState {
             start_timecode: start_tc,
             current_timecode: start_tc,
             fps_index: 1, // 25 fps PAL
-            ltc_channel: AudioChannel::Right,
-            beep_channel: AudioChannel::Left,
+            ltc_channel: AudioChannel::Left,
+            beep_channel: AudioChannel::Right,
             ltc_volume: 0.7,
             beep_volume: 0.8,
             beep_frequency: 1000.0,
@@ -404,12 +404,12 @@ impl eframe::App for AppState {
             // but caps indentation so wide windows don't spread too much
             let avail_w = ui.available_width();
             let max_content = avail_w.min(720.0);
-            let indent = ((avail_w - max_content) / 2.0).max(8.0);
+            let indent = ((avail_w - max_content) / 2.0).max(0.0);
 
             ui.horizontal(|ui| {
                 ui.allocate_space(egui::vec2(indent, 0.0));
                 ui.vertical(|ui| {
-                    ui.set_min_width(max_content);
+                    ui.set_min_width((avail_w - indent).min(max_content));
 
                     // Header
                     self.render_header(ui);
