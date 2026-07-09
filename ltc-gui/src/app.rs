@@ -445,6 +445,27 @@ impl eframe::App for AppState {
     }
 }
 
+/// Centers a horizontal row of widgets perfectly using two-pass cross-frame memory.
+pub fn centered_horizontal_row<R>(
+    ui: &mut Ui,
+    unique_id_str: &str,
+    initial_guess: f32,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let row_id = ui.id().with(unique_id_str);
+    let row_width = ui.data_mut(|d| d.get_temp::<f32>(row_id).unwrap_or(initial_guess));
+    let mut result = None;
+    ui.horizontal(|ui| {
+        let center_space = (ui.available_width() - row_width) / 2.0;
+        ui.add_space(center_space.max(0.0));
+        let inner_response = ui.scope(|ui| {
+            result = Some(add_contents(ui));
+        }).response;
+        ui.data_mut(|d| d.insert_temp(row_id, inner_response.rect.width()));
+    });
+    result.expect("Inner contents closure must run exactly once")
+}
+
 impl AppState {
     fn render_header(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
@@ -468,17 +489,17 @@ impl AppState {
     }
 
     fn render_clock_section(&mut self, ui: &mut Ui) {
-        let frame = egui::Frame::group(ui.style())
+let frame = egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::same(16))
             .corner_radius(8.0);
+
         frame.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.vertical_centered(|ui| {
-                // Big timecode display
                 widgets::clock::render(ui, self);
-
-                ui.add_space(8.0);
-
-                // Status pills — centered
+            });
+            ui.add_space(8.0);
+            centered_horizontal_row(ui, "status_pills_row", 200.0, |ui| {
                 let fps = self.fps();
                 widgets::pill(ui, &format!("{} FPS", fps.name), ACCENT);
                 ui.label(format!(
@@ -486,35 +507,21 @@ impl AppState {
                     self.ltc_channel.label(),
                     self.beep_channel.label()
                 ));
-
-                ui.add_space(8.0);
-
-                // Control buttons — centered
-                ui.horizontal(|ui| {
-                    if !self.is_locked {
-                        if self.is_playing {
-                            if ui.button("Stop").clicked() {
-                                self.stop_streaming();
-                            }
-                        } else {
-                            let btn = egui::Button::new("Start")
-                                .fill(ACCENT.linear_multiply(0.3));
-                            if ui.add(btn).clicked() {
-                                self.start_streaming();
-                            }
-                        }
-                        if ui.button("Clap & Beep").clicked() {
-                            self.trigger_clap();
-                        }
-                        if ui.button("Reset").clicked() {
-                            self.handle_reset();
-                        }
+            });
+            ui.add_space(8.0);
+            centered_horizontal_row(ui, "control_buttons_row", 280.0, |ui| {
+                if !self.is_locked {
+                    if self.is_playing {
+                        if ui.button("Stop").clicked() { self.stop_streaming(); }
+                    } else {
+                        let btn = egui::Button::new("Start").fill(ACCENT.linear_multiply(0.3));
+                        if ui.add(btn).clicked() { self.start_streaming(); }
                     }
-                    let lock_label = if self.is_locked { "Unlock" } else { "Lock" };
-                    if ui.button(lock_label).clicked() {
-                        self.is_locked = !self.is_locked;
-                    }
-                });
+                    if ui.button("Clap & Beep").clicked() { self.trigger_clap(); }
+                    if ui.button("Reset").clicked() { self.handle_reset(); }
+                }
+                let lock_label = if self.is_locked { "Unlock" } else { "Lock" };
+                if ui.button(lock_label).clicked() { self.is_locked = !self.is_locked; }
             });
         });
     }
