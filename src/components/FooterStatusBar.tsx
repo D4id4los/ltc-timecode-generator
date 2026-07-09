@@ -9,16 +9,16 @@ import { isTauri as isTauriApp, getAudioDevices } from "../utils/audioBackend";
 interface FooterStatusBarProps {
   isWakeLockActive: boolean;
   webAudioStatus: string;
+  systemTime?: string;
 }
 
 function FooterStatusBar({
   isWakeLockActive,
   webAudioStatus,
 }: FooterStatusBarProps) {
-  const [systemTime, setSystemTime] = useState<string>(() => new Date().toLocaleTimeString());
   const [powerStatus, setPowerStatus] = useState<string>("POWER: DETECTING...");
-  const [audioOutputDevices, setAudioOutputDevices] = useState<string>("AUDIO OUT: LINE / JACK");
   const [osName, setOsName] = useState<string>("WEB OS");
+  const [audioOutputDevices, setAudioOutputDevices] = useState<string>("AUDIO OUT: LINE / JACK");
 
   // 1. Operating System Detection (Runs once on mount)
   useEffect(() => {
@@ -34,15 +34,7 @@ function FooterStatusBar({
     setOsName(getOSName());
   }, []);
 
-  // 2. System Clock ticker (Updates local state only, preserving main App component)
-  useEffect(() => {
-    const t = setInterval(() => {
-      setSystemTime(new Date().toLocaleTimeString());
-    }, 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  // 3. Power / Battery Status API
+  // 2. Power / Battery Status API
   useEffect(() => {
     let active = true;
     let batteryInstance: any = null;
@@ -81,7 +73,7 @@ function FooterStatusBar({
     };
   }, []);
 
-  // 4. Audio output devices count
+  // 3. Audio output devices count
   useEffect(() => {
     let active = true;
     const checkDevices = async () => {
@@ -112,8 +104,8 @@ function FooterStatusBar({
   }, []);
 
   return (
-    <footer className="pt-8 flex flex-col md:flex-row justify-between items-center text-text-muted font-mono text-[10px] tracking-widest gap-4 border-t border-border-main mt-8 w-full">
-      <div className="flex flex-wrap gap-6 items-center justify-center md:justify-start">
+    <footer className="pt-8 flex flex-col md:flex-row-reverse justify-between items-center text-text-muted font-mono text-[10px] tracking-widest gap-4 border-t border-border-main mt-8 w-full">
+      <div className="flex flex-wrap gap-6 items-center justify-center md:justify-end">
         <div className="flex items-center gap-2">
           <div className="w-1.5 h-1.5 rounded-full bg-[#22C55E]"></div>
           <span>
@@ -149,10 +141,12 @@ function FooterStatusBar({
             </span>
           </span>
         </div>
+        <div className="flex items-center gap-2">
+          <div className="w-1.5 h-1.5 rounded-full bg-[#22C55E]"></div>
+          <span className="text-text-title font-semibold">{powerStatus}</span>
+        </div>
       </div>
       <div className="text-center md:text-right uppercase">
-        SYSTEM TIME: <span className="text-text-title font-semibold">{systemTime}</span> |{" "}
-        <span className="text-text-title font-semibold">{powerStatus}</span>
       </div>
     </footer>
   );

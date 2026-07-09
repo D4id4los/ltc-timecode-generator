@@ -110,7 +110,7 @@ fn stepper_card(ui: &mut Ui, label: &str, value: &mut u32, max: u32, theme: crat
         ui.set_min_height(96.0);
         ui.vertical_centered(|ui| {
             // Up Button
-            let up_btn = egui::Button::new(RichText::new("▲").strong().font(FontId::proportional(14.0)))
+            let up_btn = egui::Button::new(RichText::new("^").strong())
                 .fill(Color32::TRANSPARENT);
             if ui.add(up_btn).clicked() {
                 *value = (*value + 1) % max;
@@ -137,7 +137,7 @@ fn stepper_card(ui: &mut Ui, label: &str, value: &mut u32, max: u32, theme: crat
             ui.add_space(2.0);
 
             // Down Button
-            let down_btn = egui::Button::new(RichText::new("▼").strong().font(FontId::proportional(14.0)))
+            let down_btn = egui::Button::new(RichText::new("v").strong())
                 .fill(Color32::TRANSPARENT);
             if ui.add(down_btn).clicked() {
                 *value = if *value == 0 { max - 1 } else { *value - 1 };

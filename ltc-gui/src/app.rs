@@ -392,48 +392,46 @@ impl eframe::App for AppState {
         let clip_rect = ui.clip_rect();
         ui.painter().rect_filled(clip_rect, 0.0, bg);
 
-        // ScrollArea::both() allows scrolling when content exceeds window size
-        egui::ScrollArea::both()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 8.0);
+        // Use the full available rect, no forced scrolling at initial layout pass
+        // ScrollOnly kicks in if content exceeds the window later
+        let area = egui::ScrollArea::both()
+            .auto_shrink([false, false]);
 
-                // Wrap content in a horizontal layout with left indent for centering
-                let max_width = 700.0;
-                let available = ui.available_width();
-                let indent = ((available - max_width) / 2.0).max(8.0);
+        area.show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 8.0);
 
-                ui.horizontal(|ui| {
-                    // Explicitly allocate horizontal space (works in horizontal layout)
-                    ui.allocate_space(egui::vec2(indent, 0.0));
-                    ui.vertical(|ui| {
-                        ui.set_max_width(max_width);
+            // Content container uses adaptive width (no fixed max)
+            // but caps indentation so wide windows don't spread too much
+            let avail_w = ui.available_width();
+            let max_content = avail_w.min(720.0);
+            let indent = ((avail_w - max_content) / 2.0).max(8.0);
 
-                        // ── Header ──
-                        self.render_header(ui);
+            ui.horizontal(|ui| {
+                ui.allocate_space(egui::vec2(indent, 0.0));
+                ui.vertical(|ui| {
+                    ui.set_min_width(max_content);
 
-                        ui.add_space(4.0);
+                    // Header
+                    self.render_header(ui);
+                    ui.add_space(4.0);
 
-                        // ── FAQ Accordion Panel ──
-                        self.render_faq_panel(ui);
+                    // FAQ accordion panel
+                    self.render_faq_panel(ui);
+                    ui.add_space(4.0);
 
-                        ui.add_space(4.0);
+                    // Section 1: Master studio time clock
+                    self.render_clock_section(ui);
+                    ui.add_space(8.0);
 
-                        // ── Section 1: Master Studio Time Clock ──
-                        self.render_clock_section(ui);
+                    // Section 2: Tabbed deck
+                    self.render_tabbed_deck(ui);
+                    ui.add_space(4.0);
 
-                        ui.add_space(8.0);
-
-                        // ── Section 2: Tabbed deck ──
-                        self.render_tabbed_deck(ui);
-
-                        ui.add_space(4.0);
-
-                        // ── Footer status bar ──
-                        self.render_status_bar(ui);
-                    });
+                    // Footer status bar
+                    self.render_status_bar(ui);
                 });
             });
+        });
 
         // Flash overlay (drawn on top of everything)
         if self.clap_flash_alpha > 0.01 {
@@ -525,8 +523,25 @@ impl AppState {
                 });
             }
 
-            // Right side buttons
+            // Right side buttons + system time
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // System clock
+                let time_str = format!("{} UTC", self.system_time);
+                if ui.available_width() > 180.0 {
+                    let sys_frame = egui::Frame::new()
+                        .fill(colors.nested_bg)
+                        .stroke(egui::Stroke::new(1.0, colors.border_main))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(8, 4));
+                    sys_frame.show(ui, |ui| {
+                        ui.label(
+                            RichText::new(time_str)
+                                .font(FontId::monospace(9.0))
+                                .color(colors.text_muted),
+                        );
+                    });
+                }
+
                 // Help button
                 let help_text = "?";
                 let help_btn = egui::Button::new(RichText::new(help_text).font(FontId::proportional(12.0)).strong())
@@ -536,7 +551,7 @@ impl AppState {
                 }
 
                 // Theme button
-                let icon = if self.theme == Theme::Dark { "☀" } else { "☾" };
+                let icon = if self.theme == Theme::Dark { "\u{2600}" } else { "\u{263E}" };
                 let theme_btn = egui::Button::new(RichText::new(icon).font(FontId::proportional(12.0)))
                     .fill(colors.nested_bg);
                 if ui.add(theme_btn).clicked() {

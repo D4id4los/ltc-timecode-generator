@@ -154,7 +154,7 @@ function TimecodeSettings({
                   className="w-full py-2.5 flex justify-center text-text-muted hover:text-[#FF5F1F] active:bg-card-bg hover:bg-nested-hover rounded-lg transition-all text-xl font-bold touch-manipulation cursor-pointer"
                   title={`Increase ${field}`}
                 >
-                  ▲
+                  ^
                 </button>
                 <div className="my-1 text-center">
                   <div className="text-3xl md:text-4xl font-mono font-bold text-text-title select-none">
@@ -170,7 +170,7 @@ function TimecodeSettings({
                   className="w-full py-2.5 flex justify-center text-text-muted hover:text-[#FF5F1F] active:bg-card-bg hover:bg-nested-hover rounded-lg transition-all text-xl font-bold touch-manipulation cursor-pointer"
                   title={`Decrease ${field}`}
                 >
-                  ▼
+                  v
                 </button>
               </div>
             );

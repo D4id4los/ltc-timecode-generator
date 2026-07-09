@@ -6,14 +6,14 @@ use crate::theme::ACCENT;
 /// Render the clapper slate tab: animated slate, scene/take/roll fields, sync log.
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let width = ui.available_width();
-    if width > 550.0 {
+    if width > 600.0 {
         // 2-column layout (Slate on left, Logs on right)
         ui.columns(2, |cols| {
             render_slate_card(&mut cols[0], state);
             render_logs_card(&mut cols[1], state);
         });
     } else {
-        // Vertical stacked layout
+        // Vertical stacked layout for narrow windows
         ui.vertical(|ui| {
             render_slate_card(ui, state);
             ui.add_space(12.0);

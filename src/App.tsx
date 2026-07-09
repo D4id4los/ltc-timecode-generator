@@ -133,6 +133,15 @@ export default function App() {
   // Dynamic system and hardware state
   const [activeSampleRate, setActiveSampleRate] = useState<number>(48000);
   const [webAudioStatus, setWebAudioStatus] = useState<string>("WEBAUDIO: STANDBY");
+  const [systemTime, setSystemTime] = useState<string>(() => new Date().toLocaleTimeString());
+
+  // System clock ticker
+  useEffect(() => {
+    const t = setInterval(() => {
+      setSystemTime(new Date().toLocaleTimeString());
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // Screen Wake Lock API ref
   const wakeLockRef = useRef<any>(null);
@@ -759,6 +768,10 @@ export default function App() {
             <div className="flex flex-col">
               <span className="text-text-muted">Buffer</span>
               <span className="text-text-title font-semibold">{Math.round(activeSampleRate / selectedFps.fps)} SMP</span>
+            </div>
+            <div className="flex flex-col">
+              <span className="text-text-muted">System Time</span>
+              <span className="text-text-title font-semibold">{systemTime}</span>
             </div>
           </div>
 

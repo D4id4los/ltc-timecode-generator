@@ -39,10 +39,10 @@ pub fn render(ui: &mut Ui, state: &AppState) {
                 // 4. Wake Lock status
                 dot_label(ui, "WAKE LOCK: N/A", colors.text_muted, &colors);
 
-                // Right side: Local system clock and power status
+                // Right side: power status
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format!("SYSTEM TIME: {} | POWER: AC / BATTERY CONNECTED", state.system_time))
+                        RichText::new("POWER: AC / BATTERY CONNECTED")
                             .font(FontId::monospace(10.0))
                             .color(colors.text_muted)
                             .strong()
@@ -62,13 +62,13 @@ pub fn render(ui: &mut Ui, state: &AppState) {
                     dot_label(ui, core_status, core_color, &colors);
                 });
                 
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(format!("TIME: {} | POWER: AC", state.system_time))
-                        .font(FontId::monospace(9.5))
-                        .color(colors.text_muted)
-                        .strong()
-                );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("POWER: AC")
+                            .font(FontId::monospace(9.5))
+                            .color(colors.text_muted)
+                            .strong()
+                    );
             });
         }
     });
