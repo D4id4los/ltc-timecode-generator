@@ -159,7 +159,7 @@ impl Default for AppState {
             frames: 0,
         };
         Self {
-            theme: Theme::Dark,
+            theme: Theme::Light,
             is_playing: false,
             is_locked: false,
             start_timecode: start_tc,
@@ -167,8 +167,8 @@ impl Default for AppState {
             fps_index: 1, // 25 fps PAL
             ltc_channel: AudioChannel::Left,
             beep_channel: AudioChannel::Right,
-            ltc_volume: 0.7,
-            beep_volume: 0.8,
+            ltc_volume: 0.5,
+            beep_volume: 0.5,
             beep_frequency: 1000.0,
             scene: 1,
             take: 1,
