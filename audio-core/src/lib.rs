@@ -1,4 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,6 +119,13 @@ impl AudioCore {
             scheduler_thread: None,
         }));
 
+        info!(
+            "Audio output initialized: device={}, sample_rate={}, buffer_size={}",
+            device.to_string(),
+            sample_rate,
+            buffer_size,
+        );
+
         let mut pending_samples: Vec<f32> = Vec::new();
         let mut pending_index: usize = 0;
 
@@ -126,9 +134,12 @@ impl AudioCore {
         let last_err_log = Arc::new(Mutex::new(Instant::now()));
         let err_handler = move |err: cpal::Error| {
             let now = Instant::now();
-            let mut last = last_err_log.lock().unwrap();
+            let mut last = last_err_log.lock().unwrap_or_else(|e| {
+                error!("Audio error handler mutex poisoned: {}", e);
+                e.into_inner()
+            });
             if now.duration_since(*last) > Duration::from_secs(1) {
-                eprintln!("Audio output stream error: {}", err);
+                error!("Audio output stream error: {}", err);
                 *last = now;
             }
         };
@@ -137,9 +148,13 @@ impl AudioCore {
             .build_output_stream::<f32, _, _>(
                 config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    // Lock beep ONCE per callback (not per sample) to avoid
-                    // thousands of mutex lock/unlock cycles per second.
-                    let beep_guard = beep_clone.lock().ok();
+                    let beep_guard = match beep_clone.lock() {
+                        Ok(g) => Some(g),
+                        Err(e) => {
+                            warn!("Audio callback: beep mutex poisoned: {}", e);
+                            None
+                        }
+                    };
                     let beep_samples: &[f32] = match &beep_guard {
                         Some(b) => &b.samples,
                         None => &[],
@@ -151,12 +166,20 @@ impl AudioCore {
 
                     let n = data.len();
                     for i in 0..n {
-                        // Refill pending LTC samples if exhausted
                         if pending_index >= pending_samples.len() {
-                            if let Ok(rx) = rx_clone.lock() {
-                                if let Ok(samples) = rx.try_recv() {
-                                    pending_samples = samples;
-                                    pending_index = 0;
+                            match rx_clone.lock() {
+                                Ok(rx) => match rx.try_recv() {
+                                    Ok(samples) => {
+                                        pending_samples = samples;
+                                        pending_index = 0;
+                                    }
+                                    Err(mpsc::TryRecvError::Disconnected) => {
+                                        error!("Audio callback: LTC channel disconnected (audio stream may have died)");
+                                    }
+                                    Err(mpsc::TryRecvError::Empty) => {}
+                                },
+                                Err(e) => {
+                                    warn!("Audio callback: rx mutex poisoned: {}", e);
                                 }
                             }
                         }
@@ -180,11 +203,14 @@ impl AudioCore {
                         data[i] = ltc_val + beep_val;
                     }
 
-                    // Drop beep lock, then re-lock to update index.
-                    // This avoids holding the lock during the second lock attempt.
                     drop(beep_guard);
-                    if let Ok(mut beep) = beep_clone.lock() {
-                        beep.index = beep_idx;
+                    match beep_clone.lock() {
+                        Ok(mut beep) => {
+                            beep.index = beep_idx;
+                        }
+                        Err(e) => {
+                            warn!("Audio callback: beep mutex poisoned on index update: {}", e);
+                        }
                     }
                 },
                 err_handler,
@@ -257,6 +283,7 @@ impl AudioCore {
             .spawn(move || ltc_scheduler_thread(sender, ltc_clone, stop_signal))
             .map_err(|e| format!("Failed to spawn LTC scheduler thread: {}", e))?;
 
+        info!("LTC scheduler thread spawned (tc={:?}, fps={}, drop_frame={})", tc, fps, drop_frame);
         ltc.scheduler_thread = Some(handle);
 
         Ok(())
@@ -275,7 +302,9 @@ impl AudioCore {
             ltc.running = false;
             ltc.stop_signal.store(true, Ordering::Relaxed);
             if let Some(handle) = ltc.scheduler_thread.take() {
-                let _ = handle.join();
+                if let Err(e) = handle.join() {
+                    warn!("LTC scheduler thread panicked on stop: {:?}", e);
+                }
             }
         }
         Ok(())
@@ -350,10 +379,22 @@ impl AudioCore {
     pub fn push_samples(&self, samples: Vec<f32>) {
         let audio = match self.audio.lock() {
             Ok(a) => a,
-            Err(_) => return,
+            Err(e) => {
+                warn!("push_samples: audio mutex poisoned: {}", e);
+                return;
+            }
         };
         if let Some(ref output) = *audio {
-            let _ = output.sender.try_send(samples);
+            if let Err(e) = output.sender.try_send(samples) {
+                match e {
+                    mpsc::TrySendError::Full(_) => {
+                        warn!("push_samples: channel full (audio callback can't keep up)");
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        error!("push_samples: channel disconnected (audio stream has died)");
+                    }
+                }
+            }
         }
     }
 
@@ -367,7 +408,9 @@ impl AudioCore {
             ltc.running = false;
             ltc.stop_signal.store(true, Ordering::Relaxed);
             if let Some(handle) = ltc.scheduler_thread.take() {
-                let _ = handle.join();
+                if let Err(e) = handle.join() {
+                    warn!("LTC scheduler thread panicked on stop_output: {:?}", e);
+                }
             }
             drop(output.stream);
         }
@@ -639,13 +682,23 @@ fn ltc_scheduler_thread(
     ltc: Arc<Mutex<LtcStreamState>>,
     stop_signal: Arc<AtomicBool>,
 ) {
+    info!("LTC scheduler thread started");
+
     loop {
         if stop_signal.load(Ordering::Relaxed) {
+            info!("LTC scheduler thread stopped via stop signal");
             return;
         }
 
         let (should_run, tc, fps, drop_frame, sample_rate, ltc_channel, ltc_volume, frame_dur) = {
-            let state = ltc.lock().unwrap();
+            let state = match ltc.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("LTC scheduler: state mutex poisoned: {}", e);
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            };
             if !state.running {
                 drop(state);
                 std::thread::sleep(Duration::from_millis(10));
@@ -676,17 +729,39 @@ fn ltc_scheduler_thread(
         }
 
         let mut last_level = {
-            let state = ltc.lock().unwrap();
+            let state = match ltc.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("LTC scheduler: state mutex poisoned reading last_level: {}", e);
+                    continue;
+                }
+            };
             state.last_level
         };
 
         let mono = generate_ltc_frame_samples(&tc, fps, drop_frame, sample_rate, 1.0, &mut last_level);
         let stereo = mono_to_stereo(&mono, &ltc_channel, ltc_volume);
 
-        let _ = sender.try_send(stereo);
+        if let Err(e) = sender.try_send(stereo) {
+            match e {
+                mpsc::TrySendError::Full(_) => {
+                    warn!("LTC scheduler: channel full (audio callback can't keep up, dropping frame)");
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    error!("LTC scheduler: channel disconnected (audio stream has died), stopping");
+                    return;
+                }
+            }
+        }
 
         {
-            let mut state = ltc.lock().unwrap();
+            let mut state = match ltc.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("LTC scheduler: state mutex poisoned updating state: {}", e);
+                    return;
+                }
+            };
             state.last_level = last_level;
             state.tc = increment_timecode(&state.tc, fps, drop_frame);
             state.next_frame_time += frame_dur;

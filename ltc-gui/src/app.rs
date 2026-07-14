@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, Timecode};
 use egui::{Color32, FontId, RichText, Sense, Ui};
+use log::{error, warn};
 
 use crate::theme::{Theme, ACCENT};
 use crate::widgets;
@@ -218,13 +219,20 @@ impl AppState {
             self.devices[self.selected_device].id.clone()
         };
 
-        let core = self.audio_core.lock().unwrap();
+        let core = match self.audio_core.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("ensure_audio_init: audio core mutex poisoned: {}", e);
+                return;
+            }
+        };
         match core.init_output(&device_id, SAMPLE_RATE, BUFFER_SIZE) {
             Ok(()) => {
                 self.audio_initialized = true;
                 self.status_message = "Audio initialized".to_string();
             }
             Err(e) => {
+                error!("ensure_audio_init: init_output failed: {}", e);
                 self.status_message = format!("Audio init failed: {}", e);
             }
         }
@@ -254,8 +262,16 @@ impl AppState {
     }
 
     pub fn stop_streaming(&mut self) {
-        let core = self.audio_core.lock().unwrap();
+        let core = match self.audio_core.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("stop_streaming: audio core mutex poisoned: {}", e);
+                self.is_playing = false;
+                return;
+            }
+        };
         if let Err(e) = core.stop_ltc() {
+            error!("stop_streaming: stop_ltc failed: {}", e);
             self.status_message = format!("Stop failed: {}", e);
         }
         drop(core);
@@ -264,8 +280,16 @@ impl AppState {
 
     pub fn handle_reset(&mut self) {
         let tc = self.start_timecode;
-        let core = self.audio_core.lock().unwrap();
-        let _ = core.reset_ltc(tc);
+        let core = match self.audio_core.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("handle_reset: audio core mutex poisoned: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = core.reset_ltc(tc) {
+            error!("handle_reset: reset_ltc failed: {}", e);
+        }
         drop(core);
         self.current_timecode = self.start_timecode;
         self.status_message = "Reset".to_string();
@@ -281,8 +305,16 @@ impl AppState {
         let volume = self.beep_volume;
         let channel = self.beep_channel.as_str();
 
-        let core = self.audio_core.lock().unwrap();
-        let _ = core.play_beep(SAMPLE_RATE, freq, 0.15, volume, channel);
+        let core = match self.audio_core.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("trigger_clap: audio core mutex poisoned: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = core.play_beep(SAMPLE_RATE, freq, 0.15, volume, channel) {
+            error!("trigger_clap: play_beep failed: {}", e);
+        }
         drop(core);
 
         // Trigger visual effects
@@ -319,7 +351,13 @@ impl AppState {
         if !self.is_playing {
             return;
         }
-        let core = self.audio_core.lock().unwrap();
+        let core = match self.audio_core.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("update_clock: audio core mutex poisoned: {}", e);
+                return;
+            }
+        };
         self.current_timecode = core.current_timecode();
     }
 }
