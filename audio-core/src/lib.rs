@@ -42,6 +42,8 @@ struct LtcStreamState {
     next_frame_time: Instant,
     stop_signal: Arc<AtomicBool>,
     scheduler_thread: Option<JoinHandle<()>>,
+    total_samples: usize,
+    samples_per_bit: f32,
 }
 
 struct AudioOutputState {
@@ -117,6 +119,8 @@ impl AudioCore {
             next_frame_time: Instant::now(),
             stop_signal: Arc::new(AtomicBool::new(false)),
             scheduler_thread: None,
+            total_samples: 0,
+            samples_per_bit: 0.0,
         }));
 
         info!(
@@ -253,6 +257,8 @@ impl AudioCore {
 
         let frame_duration_ns = (1.0 / fps * 1_000_000_000.0) as u64;
         let frame_duration = Duration::from_nanos(frame_duration_ns);
+        let total_samples = (ltc.sample_rate as f64 / fps).round() as usize;
+        let samples_per_bit = total_samples as f32 / 80.0;
         *ltc = LtcStreamState {
             running: true,
             tc,
@@ -266,6 +272,8 @@ impl AudioCore {
             next_frame_time: Instant::now() + Duration::from_millis(100),
             stop_signal: Arc::new(AtomicBool::new(false)),
             scheduler_thread: None,
+            total_samples,
+            samples_per_bit,
         };
 
         let stop_signal = ltc.stop_signal.clone();
@@ -565,72 +573,56 @@ fn increment_timecode(tc: &Timecode, fps: f64, drop_frame: bool) -> Timecode {
     }
 }
 
-fn generate_ltc_frame_samples(
+fn generate_ltc_frame_stereo(
     tc: &Timecode,
-    fps: f64,
     drop_frame: bool,
-    sample_rate: u32,
+    total_samples: usize,
+    samples_per_bit: f32,
     volume: f32,
+    channel: &str,
     last_level: &mut (f32, f32),
-) -> Vec<f32> {
-    let frame_duration = 1.0 / fps;
-    let total_samples = (sample_rate as f64 * frame_duration).round() as usize;
-    let mut data = vec![0.0f32; total_samples];
-
+    stereo_out: &mut [f32],
+) {
     let bits = get_ltc_bits(tc, drop_frame);
-
-    let mut raw = vec![0.0f32; total_samples];
+    let play_left = channel == "both" || channel == "left";
+    let play_right = channel == "both" || channel == "right";
+    let alpha = 0.35f32;
     let mut current_level = last_level.0;
+    let mut last_y = last_level.1;
 
-    let samples_per_bit = total_samples as f64 / 80.0;
-
-    for b in 0..80 {
-        let start_sample = (b as f64 * samples_per_bit).round() as usize;
-        let end_sample = ((b + 1) as f64 * samples_per_bit).round() as usize;
-        let mid_sample = ((b as f64 + 0.5) * samples_per_bit).round() as usize;
-        let bit_val = bits[b];
+    for b in 0..80u32 {
+        let bf = b as f32;
+        let start_sample = (bf * samples_per_bit).round() as usize;
+        let end_sample = ((bf + 1.0) * samples_per_bit).round() as usize;
+        let mid_sample = ((bf + 0.5) * samples_per_bit).round() as usize;
+        let bit_val = bits[b as usize];
 
         current_level = -current_level;
 
-        for s in start_sample..mid_sample.min(total_samples) {
-            raw[s] = current_level;
+        let mid = mid_sample.min(total_samples);
+        let end = end_sample.min(total_samples);
+
+        for s in start_sample..mid {
+            last_y += alpha * (current_level - last_y);
+            let val = last_y * volume;
+            stereo_out[s * 2] = if play_left { val } else { 0.0 };
+            stereo_out[s * 2 + 1] = if play_right { val } else { 0.0 };
         }
 
         if bit_val == 1 {
             current_level = -current_level;
         }
 
-        for s in mid_sample..end_sample.min(total_samples) {
-            raw[s] = current_level;
+        for s in mid..end {
+            last_y += alpha * (current_level - last_y);
+            let val = last_y * volume;
+            stereo_out[s * 2] = if play_left { val } else { 0.0 };
+            stereo_out[s * 2 + 1] = if play_right { val } else { 0.0 };
         }
     }
 
     last_level.0 = current_level;
-
-    let alpha = 0.35f32;
-    let mut last_y = last_level.1;
-    for i in 0..total_samples {
-        last_y += alpha * (raw[i] - last_y);
-        data[i] = last_y * volume;
-    }
-
     last_level.1 = last_y;
-
-    data
-}
-
-fn mono_to_stereo(mono: &[f32], channel: &str, volume: f32) -> Vec<f32> {
-    let play_left = channel == "both" || channel == "left";
-    let play_right = channel == "both" || channel == "right";
-    let mut stereo = Vec::with_capacity(mono.len() * 2);
-
-    for &val in mono {
-        let v = val * volume;
-        stereo.push(if play_left { v } else { 0.0 });
-        stereo.push(if play_right { v } else { 0.0 });
-    }
-
-    stereo
 }
 
 fn generate_beep_samples(
@@ -678,13 +670,15 @@ fn ltc_scheduler_thread(
 ) {
     info!("LTC scheduler thread started");
 
+    let mut frame_buf: Vec<f32> = Vec::new();
+
     loop {
         if stop_signal.load(Ordering::Relaxed) {
             info!("LTC scheduler thread stopped via stop signal");
             return;
         }
 
-        let (should_run, tc, fps, drop_frame, sample_rate, ltc_channel, ltc_volume, frame_dur) = {
+        let (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, mut last_level) = {
             let state = match ltc.lock() {
                 Ok(s) => s,
                 Err(e) => {
@@ -710,31 +704,34 @@ fn ltc_scheduler_thread(
             let tc = state.tc;
             let fps = state.fps;
             let drop_frame = state.drop_frame;
-            let sample_rate = state.sample_rate;
             let ltc_channel = state.ltc_channel.clone();
             let ltc_volume = state.ltc_volume;
             let frame_dur = state.frame_duration;
+            let total_samples = state.total_samples;
+            let samples_per_bit = state.samples_per_bit;
+            let last_level = state.last_level;
 
-            (true, tc, fps, drop_frame, sample_rate, ltc_channel, ltc_volume, frame_dur)
+            (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, last_level)
         };
 
-        if !should_run {
-            continue;
+        let needed = total_samples * 2;
+        if frame_buf.capacity() < needed {
+            frame_buf.reserve(needed - frame_buf.len());
         }
+        unsafe { frame_buf.set_len(needed); }
 
-        let mut last_level = {
-            let state = match ltc.lock() {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("LTC scheduler: state mutex poisoned reading last_level: {}", e);
-                    continue;
-                }
-            };
-            state.last_level
-        };
+        generate_ltc_frame_stereo(
+            &tc,
+            drop_frame,
+            total_samples,
+            samples_per_bit,
+            ltc_volume,
+            &ltc_channel,
+            &mut last_level,
+            &mut frame_buf[..needed],
+        );
 
-        let mono = generate_ltc_frame_samples(&tc, fps, drop_frame, sample_rate, 1.0, &mut last_level);
-        let stereo = mono_to_stereo(&mono, &ltc_channel, ltc_volume);
+        let stereo = frame_buf.clone();
 
         if let Err(e) = sender.try_send(stereo) {
             match e {
@@ -758,7 +755,7 @@ fn ltc_scheduler_thread(
             };
             state.last_level = last_level;
             state.tc = increment_timecode(&state.tc, fps, drop_frame);
-            state.next_frame_time += frame_dur;
+            state.next_frame_time = Instant::now() + frame_dur;
         }
     }
 }
