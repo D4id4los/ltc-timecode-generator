@@ -3,3 +3,7 @@ members = [
   "audio-core",
   "ltc-gui"
 ]
+exclude = [
+  "src-tauri",
+  "src-tauri-32bit"
+]
