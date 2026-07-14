@@ -384,7 +384,9 @@ impl eframe::App for AppState {
         // Poll current timecode when playing
         if self.is_playing {
             self.update_clock();
-            ctx.request_repaint_after(Duration::from_millis(16)); // ~60fps for smooth clock
+            // Repaint at the selected LTC frame rate (e.g. 25fps = 40ms)
+            let interval = Duration::from_secs_f64(1.0 / self.fps().fps);
+            ctx.request_repaint_after(interval);
         } else {
             // Slow repaint for system time clock (once per second)
             ctx.request_repaint_after(Duration::from_secs(1));

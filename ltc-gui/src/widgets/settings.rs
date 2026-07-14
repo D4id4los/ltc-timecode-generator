@@ -23,7 +23,6 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
                         .color(colors.text_muted)
                         .strong(),
                 );
-                
                 if state.is_playing {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let warn_frame = egui::Frame::new()

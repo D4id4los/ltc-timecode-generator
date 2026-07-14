@@ -17,6 +17,10 @@ fn main() -> eframe::Result {
             .with_inner_size([500.0, 400.0])
             .with_min_inner_size([300.0, 300.0])
             .with_title("LTC Timecode Generator"),
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
