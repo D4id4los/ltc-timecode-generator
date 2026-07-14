@@ -148,18 +148,18 @@ impl AudioCore {
             .build_output_stream::<f32, _, _>(
                 config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let beep_guard = match beep_clone.lock() {
+                    let mut beep_state = match beep_clone.lock() {
                         Ok(g) => Some(g),
                         Err(e) => {
                             warn!("Audio callback: beep mutex poisoned: {}", e);
                             None
                         }
                     };
-                    let beep_samples: &[f32] = match &beep_guard {
+                    let beep_samples: &[f32] = match &beep_state {
                         Some(b) => &b.samples,
                         None => &[],
                     };
-                    let mut beep_idx = match &beep_guard {
+                    let mut beep_idx = match &beep_state {
                         Some(b) => b.index,
                         None => 0,
                     };
@@ -203,14 +203,8 @@ impl AudioCore {
                         data[i] = ltc_val + beep_val;
                     }
 
-                    drop(beep_guard);
-                    match beep_clone.lock() {
-                        Ok(mut beep) => {
-                            beep.index = beep_idx;
-                        }
-                        Err(e) => {
-                            warn!("Audio callback: beep mutex poisoned on index update: {}", e);
-                        }
+                    if let Some(b) = &mut beep_state {
+                        b.index = beep_idx;
                     }
                 },
                 err_handler,
