@@ -470,14 +470,10 @@ impl eframe::App for AppState {
 
             // Content container uses adaptive width (no fixed max)
             // but caps indentation so wide windows don't spread too much
-            let avail_w = ui.available_width();
-            let max_content = avail_w.min(720.0);
-            let indent = ((avail_w - max_content) / 2.0).max(0.0);
+            let max_content = ui.available_width().min(720.0);
 
-            ui.horizontal(|ui| {
-                ui.allocate_space(egui::vec2(indent, 0.0));
-                ui.vertical(|ui| {
-                    ui.set_min_width((avail_w - indent).min(max_content));
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.set_max_width(max_content);
 
                     // Header
                     self.render_header(ui);
@@ -499,7 +495,6 @@ impl eframe::App for AppState {
                     self.render_status_bar(ui);
                 });
             });
-        });
 
         // Flash overlay (drawn on top of everything)
         if self.clap_flash_alpha > 0.01 {
