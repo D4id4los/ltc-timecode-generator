@@ -150,6 +150,9 @@ pub struct AppState {
     // Frame-rate independent animation
     last_frame_time: Option<Instant>,
 
+    // Flag so we only maximise app once
+    has_requested_maximize: bool,
+
     // Audio core
     pub audio_core: Mutex<AudioCore>,
 }
@@ -189,6 +192,7 @@ impl Default for AppState {
             status_message: "Ready".to_string(),
             system_time: String::new(),
             last_frame_time: None,
+            has_requested_maximize: false,
             audio_core: Mutex::new(AudioCore::new()),
         }
     }
@@ -305,6 +309,7 @@ impl AppState {
             return;
         }
 
+
         let freq = self.beep_frequency;
         let volume = self.beep_volume;
         let channel = self.beep_channel.as_str();
@@ -368,6 +373,10 @@ impl AppState {
 
 impl eframe::App for AppState {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.has_requested_maximize {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            self.has_requested_maximize = true;
+        }
         // Apply theme
         self.theme.apply(ctx);
 
