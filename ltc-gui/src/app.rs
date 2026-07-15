@@ -409,9 +409,9 @@ impl eframe::App for AppState {
         };
 
         if toggle_play {
-            if self.is_playing {
+            if self.is_playing && !self.is_locked {
                 self.stop_streaming();
-            } else if !self.is_locked {
+            } else if !self.is_playing && !self.is_locked {
                 self.start_streaming();
             }
         }
