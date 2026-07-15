@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, Timecode};
 use egui::{Color32, FontId, RichText, Sense, Ui};
@@ -147,6 +147,9 @@ pub struct AppState {
     pub status_message: String,
     pub system_time: String,
 
+    // Frame-rate independent animation
+    last_frame_time: Option<Instant>,
+
     // Audio core
     pub audio_core: Mutex<AudioCore>,
 }
@@ -185,6 +188,7 @@ impl Default for AppState {
             audio_initialized: false,
             status_message: "Ready".to_string(),
             system_time: String::new(),
+            last_frame_time: None,
             audio_core: Mutex::new(AudioCore::new()),
         }
     }
@@ -367,28 +371,43 @@ impl eframe::App for AppState {
         // Apply theme
         self.theme.apply(ctx);
 
-        // Animate clap effects
+        // Frame-rate independent delta time
+        let now = Instant::now();
+        let delta = self
+            .last_frame_time
+            .map(|t| (now - t).as_secs_f32())
+            .unwrap_or(0.0)
+            .min(0.1);
+        self.last_frame_time = Some(now);
+
+        // Animate clap effects using time-based deltas
+        // Flash overlay: decays at 2.0/s (0.08 per frame at 25fps = 2.0/s)
         if self.clap_flash_alpha > 0.0 {
-            self.clap_flash_alpha = (self.clap_flash_alpha - 0.08).max(0.0);
+            self.clap_flash_alpha = (self.clap_flash_alpha - 2.0 * delta).max(0.0);
         }
         // Clapper arm: snaps to 0 (closed) and smoothly opens back to -25 (open)
+        // Exponential decay at 4.0/s (per-frame factor 0.15 at 25fps ≈ 4.06/s)
         if self.clap_arm_angle > -25.0 {
             let target = -25.0;
             let diff = target - self.clap_arm_angle;
-            self.clap_arm_angle += diff * 0.15;
-            if self.clap_arm_angle <= -24.8 {
+            let decay_factor = 1.0 - (-4.0 * delta).exp();
+            self.clap_arm_angle += diff * decay_factor;
+            if self.clap_arm_angle > -24.9 {
                 self.clap_arm_angle = -25.0;
             }
         }
 
+        let has_active_animation = self.clap_flash_alpha > 0.0 || self.clap_arm_angle > -25.0;
+
         // Poll current timecode when playing
         if self.is_playing {
             self.update_clock();
-            // Repaint at the selected LTC frame rate (e.g. 25fps = 40ms)
             let interval = Duration::from_secs_f64(1.0 / self.fps().fps);
             ctx.request_repaint_after(interval);
+        } else if has_active_animation {
+            // Run at 60fps while animation is in progress
+            ctx.request_repaint_after(Duration::from_secs_f64(1.0 / 60.0));
         } else {
-            // Slow repaint for system time clock (once per second)
             ctx.request_repaint_after(Duration::from_secs(1));
         }
 
