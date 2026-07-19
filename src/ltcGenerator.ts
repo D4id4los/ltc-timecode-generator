@@ -162,6 +162,14 @@ export function timecodeToMillisecondsString(
 }
 
 /**
+ * Maps a linear 0–1 UI value to a perceptually logarithmic volume.
+ * Quadratic curve: 0→0, 0.5→0.25, 0.7→0.49, 1.0→1.0.
+ */
+function mapVolume(linear: number): number {
+  return linear * linear;
+}
+
+/**
  * Generates a mono AudioBuffer containing the LTC signal for a single frame.
  * Mono generation cuts the CPU workload and buffer allocation memory footprint by 50%.
  * Leverages cached scratch arrays to operate with ZERO allocations.
@@ -228,7 +236,7 @@ export function generateLTCFrameBuffer(
   let lastY = lastLevel.filtered;
   for (let i = 0; i < totalSamples; i++) {
     lastY += alpha * (rawSamples[i] - lastY);
-    data[i] = lastY * volume;
+    data[i] = lastY * mapVolume(volume);
   }
 
   // Preserve the last filtered level so the next low-pass filter starts with perfect continuity
@@ -256,9 +264,10 @@ export function playClapperBeep(
   osc.frequency.setValueAtTime(frequency, audioCtx.currentTime);
 
   // Apply a clean envelope: instant attack, immediate decay at the end of the duration
+  const mappedVolume = mapVolume(volume);
   gain.gain.setValueAtTime(0, audioCtx.currentTime);
-  gain.gain.linearRampToValueAtTime(volume, audioCtx.currentTime + 0.005);
-  gain.gain.setValueAtTime(volume, audioCtx.currentTime + duration - 0.02);
+  gain.gain.linearRampToValueAtTime(mappedVolume, audioCtx.currentTime + 0.005);
+  gain.gain.setValueAtTime(mappedVolume, audioCtx.currentTime + duration - 0.02);
   gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + duration);
 
   osc.connect(gain);
@@ -318,7 +327,7 @@ export function generateLTCFrameSamples(
   let lastY = lastLevel.filtered;
   for (let i = 0; i < totalSamples; i++) {
     lastY += alpha * (rawSamples[i] - lastY);
-    data[i] = lastY * volume;
+    data[i] = lastY * mapVolume(volume);
   }
 
   lastLevel.filtered = lastY;
@@ -354,7 +363,7 @@ export function generateBeepSamples(
       envelope = 1.0;
     }
 
-    samples[i] = sample * volume * envelope;
+    samples[i] = sample * mapVolume(volume) * envelope;
   }
 
   return samples;

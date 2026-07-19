@@ -406,7 +406,7 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState, space_tight: f32) {
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("LTC VOL").font(FontId::monospace(9.0)).color(colors.text_muted));
-        ui.add(egui::Slider::new(&mut state.ltc_volume, 0.0..=1.0).show_value(false));
+        ui.add(egui::Slider::new(&mut state.ltc_volume, 0.0..=1.0).step_by(0.01).show_value(false));
         ui.label(RichText::new(format!("{}%", (state.ltc_volume * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
@@ -414,7 +414,7 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState, space_tight: f32) {
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("BEEP VOL").font(FontId::monospace(9.0)).color(colors.text_muted));
-        ui.add(egui::Slider::new(&mut state.beep_volume, 0.0..=1.0).show_value(false));
+        ui.add(egui::Slider::new(&mut state.beep_volume, 0.0..=1.0).step_by(0.01).show_value(false));
         ui.label(RichText::new(format!("{}%", (state.beep_volume * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 

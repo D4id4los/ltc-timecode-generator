@@ -362,7 +362,7 @@ function TimecodeSettings({
                 type="range"
                 min="0"
                 max="1.0"
-                step="0.05"
+                step="0.01"
                 value={audioSettings.ltcVolume}
                 onChange={(e) => handleAudioSettingChange("ltcVolume", parseFloat(e.target.value))}
                 className="w-full h-1.5 bg-card-bg rounded-lg appearance-none cursor-pointer accent-[#FF5F1F] touch-manipulation"

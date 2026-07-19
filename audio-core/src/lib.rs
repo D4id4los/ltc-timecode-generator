@@ -491,6 +491,15 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     Ok(devices)
 }
 
+// ── Volume mapping ──────────────────────────────────────────────────────────
+
+/// Maps a linear 0–1 UI value to a perceptually logarithmic volume.
+/// Quadratic curve: 0→0, 0.5→0.25, 0.7→0.49, 1.0→1.0.
+/// Gives finer granularity at low perceived volumes.
+fn map_volume(linear: f32) -> f32 {
+    linear * linear
+}
+
 // ── LTC generation (ported from ltcGenerator.ts) ───────────────────────────
 
 fn write_val(bits: &mut [u8; 80], val: u32, start_bit: usize, length: usize) {
@@ -604,7 +613,7 @@ fn generate_ltc_frame_stereo(
 
         for s in start_sample..mid {
             last_y += alpha * (current_level - last_y);
-            let val = last_y * volume;
+            let val = last_y * map_volume(volume);
             stereo_out[s * 2] = if play_left { val } else { 0.0 };
             stereo_out[s * 2 + 1] = if play_right { val } else { 0.0 };
         }
@@ -615,7 +624,7 @@ fn generate_ltc_frame_stereo(
 
         for s in mid..end {
             last_y += alpha * (current_level - last_y);
-            let val = last_y * volume;
+            let val = last_y * map_volume(volume);
             stereo_out[s * 2] = if play_left { val } else { 0.0 };
             stereo_out[s * 2 + 1] = if play_right { val } else { 0.0 };
         }
@@ -642,7 +651,7 @@ fn generate_beep_samples(
 
     for i in 0..num_samples {
         let t = i as f32 / sample_rate as f32;
-        let val = (t * frequency * 2.0 * std::f32::consts::PI).sin() * volume;
+        let val = (t * frequency * 2.0 * std::f32::consts::PI).sin() * map_volume(volume);
 
         let envelope = if i < attack {
             i as f32 / attack.max(1) as f32
