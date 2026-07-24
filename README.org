@@ -31,6 +31,34 @@ Compilation:
          cargo zigbuild --target i686-unknown-linux-gnu.2.31 --release
 #+end_src
 
+** Cross compiling from linux to windows
+
+Install the windows target:
+#+begin_src bash
+  rustup target add x86_64-pc-windows-gnu
+#+end_src
+
+Install the cross-compilation linker:
+#+begin_src bash
+  sudo apt update
+  sudo apt install mingw-w64
+#+end_src
+
+Place the following toolchain config in =.cargo/config.toml= in the project
+root (this is a developer-local setting, so not committed to git):
+#+begin_src toml
+  [target.x86_64-pc-windows-gnu]
+  linker = "x86_64-w64-mingw32-gcc"
+#+end_src
+
+Now compile with:
+#+begin_src bash
+  # dev
+  cargo build --target x86_64-pc-windows-gnu
+  # release
+  cargo build --target x86_64-pc-windows-gnu --release
+#+end_src
+
 * Running the Rust GUI
 
 #+begin_src bash
