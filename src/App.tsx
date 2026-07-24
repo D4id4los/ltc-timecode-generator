@@ -89,7 +89,7 @@ export default function App() {
   const [audioSettings, setAudioSettings] = useState<AudioSettings>({
     ltcChannel: "left",
     beepChannel: "right",
-    ltcVolume: 0.7,
+    ltcVolume: 0.25,
     beepVolume: 0.8,
     beepFrequency: 1000,
   });

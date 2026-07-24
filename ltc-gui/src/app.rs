@@ -174,7 +174,7 @@ impl Default for AppState {
             fps_index: 1, // 25 fps PAL
             ltc_channel: AudioChannel::Left,
             beep_channel: AudioChannel::Right,
-            ltc_volume: 0.5,
+            ltc_volume: 0.25,
             beep_volume: 0.5,
             beep_frequency: 1000.0,
             scene: 1,

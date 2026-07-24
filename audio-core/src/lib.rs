@@ -112,7 +112,7 @@ impl AudioCore {
             fps: 25.0,
             drop_frame: false,
             ltc_channel: String::from("both"),
-            ltc_volume: 0.7,
+            ltc_volume: 0.25,
             sample_rate,
             last_level: (1.0, 1.0),
             frame_duration: Duration::from_millis(40),
