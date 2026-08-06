@@ -845,7 +845,7 @@ impl AppState {
                 }
 
                 // Theme button
-                let icon = if self.theme == Theme::Dark { "\u{2600}" } else { "\u{263E}" };
+                let icon = if self.theme == Theme::Dark { "\u{2600}\u{FE0F}" } else { "\u{1F319}" };
                 let theme_btn = egui::Button::new(RichText::new(icon).font(FontId::proportional(12.0)))
                     .fill(colors.nested_bg);
                 if ui.add(theme_btn).clicked() {
@@ -1236,10 +1236,10 @@ impl AppState {
                 + slide_offset;
 
             let (strip_color, icon) = match toast.notification_type {
-                NotificationType::Error => (colors.error_red, "✕"),
+                NotificationType::Error => (colors.error_red, "❌"),
                 NotificationType::Warning => (colors.warning_amber, "⚠"),
-                NotificationType::Success => (colors.success_green, "✓"),
-                NotificationType::Info => (colors.info_blue, "ℹ"),
+                NotificationType::Success => (colors.success_green, "✅"),
+                NotificationType::Info => (colors.info_blue, "ℹ\u{FE0F}"),
             };
 
             let toast_id = toast.id;
@@ -1307,7 +1307,7 @@ impl AppState {
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 let btn = egui::Button::new(
-                                    RichText::new("✕")
+                                    RichText::new("❌")
                                         .color(
                                             colors
                                                 .text_muted
