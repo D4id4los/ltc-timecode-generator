@@ -7,7 +7,9 @@ mod widgets;
 use app::AppState;
 
 fn main() -> eframe::Result {
-    env_logger::init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("ltc_gui=trace,audio_core=trace,info")
+    ).init();
 
     let mut state = AppState::default();
     state.refresh_devices();
