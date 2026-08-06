@@ -108,6 +108,22 @@ impl Tab {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationType {
+    Error,
+    Warning,
+    Success,
+    Info,
+}
+
+pub struct ToastNotification {
+    pub id: u64,
+    pub message: String,
+    pub notification_type: NotificationType,
+    pub created_at: Instant,
+    pub duration: Duration,
+}
+
 /// Main application state, equivalent to the React `App` component.
 pub struct AppState {
     pub theme: Theme,
@@ -142,7 +158,12 @@ pub struct AppState {
     // Device state
     pub devices: Vec<AudioDeviceInfo>,
     pub selected_device: usize,
+    pub previous_device: Option<usize>,
     pub audio_initialized: bool,
+
+    // Toast notifications
+    pub notifications: Vec<ToastNotification>,
+    next_notification_id: u64,
 
     // Status
     pub status_message: String,
@@ -196,7 +217,10 @@ impl AppState {
             show_faq: false,
             devices: Vec::new(),
             selected_device: 0,
+            previous_device: None,
             audio_initialized: false,
+            notifications: Vec::new(),
+            next_notification_id: 0,
             status_message: "Ready".to_string(),
             system_time: String::new(),
             last_frame_time: None,
@@ -248,6 +272,7 @@ impl AppState {
         let device_id = self.devices[index].id.clone();
         info!("Changing audio device to [{}] {} (id={})", index, device_name, device_id);
 
+        let prev_selected = self.previous_device;
         let was_playing = self.is_playing;
         if was_playing {
             info!("Device change: stopping LTC stream first");
@@ -277,31 +302,51 @@ impl AppState {
 
         self.ensure_audio_init();
 
-        if was_playing && self.audio_initialized {
-            info!("Device change: restarting LTC stream");
-            let tc = self.start_timecode;
-            let fps = self.fps();
-            let channel = self.ltc_channel.as_str().to_string();
-            let volume = self.ltc_volume;
-            let core = match self.audio_core.lock() {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("change_device: audio core mutex poisoned on restart: {}", e);
-                    self.status_message = "Device change: failed to restart stream".to_string();
-                    return;
-                }
-            };
-            match core.start_ltc(tc, fps.fps, fps.drop_frame, channel, volume) {
-                Ok(()) => {
-                    self.is_playing = true;
-                    self.status_message = format!("Streaming LTC on {}", device_name);
-                    info!("LTC stream restarted on new device: {}", device_name);
-                }
-                Err(e) => {
-                    error!("Failed to restart LTC on new device: {}", e);
-                    self.status_message = format!("Restart failed after device change: {}", e);
+        if self.audio_initialized {
+            self.previous_device = Some(self.selected_device);
+            if was_playing {
+                info!("Device change: restarting LTC stream");
+                let tc = self.start_timecode;
+                let fps = self.fps();
+                let channel = self.ltc_channel.as_str().to_string();
+                let volume = self.ltc_volume;
+                let core = match self.audio_core.lock() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("change_device: audio core mutex poisoned on restart: {}", e);
+                        self.status_message = "Device change: failed to restart stream".to_string();
+                        return;
+                    }
+                };
+                let restart_result = core.start_ltc(tc, fps.fps, fps.drop_frame, channel, volume);
+                drop(core);
+                match restart_result {
+                    Ok(()) => {
+                        self.is_playing = true;
+                        self.status_message = format!("Streaming LTC on {}", device_name);
+                        info!("LTC stream restarted on new device: {}", device_name);
+                    }
+                    Err(e) => {
+                        error!("Failed to restart LTC on new device: {}", e);
+                        self.status_message = format!("Restart failed after device change: {}", e);
+                        self.add_notification(NotificationType::Error, format!("Failed to restart LTC stream: {}", e));
+                    }
                 }
             }
+        } else {
+            // Initialization failed — revert to previous device
+            let fallback = prev_selected.unwrap_or(0);
+            let fallback_name = if fallback < self.devices.len() {
+                self.devices[fallback].name.clone()
+            } else {
+                "default".to_string()
+            };
+            self.selected_device = fallback;
+            self.status_message = format!("Audio device '{}' failed. Reverted to '{}'", device_name, fallback_name);
+            self.add_notification(
+                NotificationType::Error,
+                format!("Audio device '{}' failed to initialize. Reverted to '{}'.", device_name, fallback_name),
+            );
         }
     }
 
@@ -357,6 +402,13 @@ impl AppState {
                 Err(e) => {
                     let err_str = e.to_string();
                     let is_transient = audio_core::is_transient_audio_error(&err_str);
+                    let is_permanent = audio_core::is_permanent_device_error(&err_str);
+
+                    if is_permanent {
+                        error!("ensure_audio_init: permanent error (no retry): {}", err_str);
+                        self.status_message = format!("Audio init failed (permission): {}", err_str);
+                        break;
+                    }
 
                     if is_transient && attempt < max_retries - 1 {
                         warn!(
@@ -681,6 +733,9 @@ impl eframe::App for AppState {
                     ui.painter().rect_filled(screen, 0.0, color);
                 });
         }
+
+        // Toast notifications (on top of everything)
+        self.render_toasts(ui);
     }
 }
 
@@ -1136,6 +1191,162 @@ impl AppState {
                 Tab::Clapper => widgets::clapper::render(ui, self),
                 Tab::Settings => widgets::settings::render(ui, self),
             }
+        });
+    }
+
+    fn render_toasts(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx();
+        let now = Instant::now();
+
+        self.notifications.retain(|n| now - n.created_at < n.duration);
+
+        if self.notifications.is_empty() {
+            return;
+        }
+
+        let screen = ctx.viewport_rect();
+        let colors = self.theme.colors();
+        let toast_width = 380.0;
+        let toast_height = 46.0;
+        let spacing = 8.0;
+        let bottom_margin = 16.0;
+        let base_x = screen.center().x - toast_width / 2.0;
+        let slide_in_dur = 0.3;
+        let fade_out_dur = 0.5;
+
+        let mut to_remove = Vec::new();
+
+        for (i, toast) in self.notifications.iter().enumerate() {
+            let idx_from_bottom = self.notifications.len() - 1 - i;
+            let age = now - toast.created_at;
+            let age_secs = age.as_secs_f32();
+            let remaining = toast.duration.checked_sub(age).unwrap_or(Duration::ZERO);
+            let remaining_secs = remaining.as_secs_f32();
+
+            let slide_progress = (age_secs / slide_in_dur).min(1.0);
+            let slide_offset = (1.0 - slide_progress) * 20.0;
+
+            let entry_alpha = (age_secs / slide_in_dur).min(1.0);
+            let exit_alpha = (remaining_secs / fade_out_dur).min(1.0);
+            let alpha = entry_alpha * exit_alpha;
+
+            let y = screen.bottom()
+                - bottom_margin
+                - (idx_from_bottom as f32 * (toast_height + spacing))
+                + slide_offset;
+
+            let (strip_color, icon) = match toast.notification_type {
+                NotificationType::Error => (colors.error_red, "✕"),
+                NotificationType::Warning => (colors.warning_amber, "⚠"),
+                NotificationType::Success => (colors.success_green, "✓"),
+                NotificationType::Info => (colors.info_blue, "ℹ"),
+            };
+
+            let toast_id = toast.id;
+            let close_clicked = std::cell::Cell::new(false);
+
+            egui::Area::new(egui::Id::new(("toast", toast_id)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(base_x, y))
+                .show(ctx, |ui| {
+                    let bg = colors.card_bg;
+                    let bg_alpha = Color32::from_rgba_premultiplied(
+                        bg.r(),
+                        bg.g(),
+                        bg.b(),
+                        (alpha * 255.0) as u8,
+                    );
+                    let border = colors.border_main;
+                    let border_alpha = Color32::from_rgba_premultiplied(
+                        border.r(),
+                        border.g(),
+                        border.b(),
+                        (alpha * 255.0) as u8,
+                    );
+
+                    let frame = egui::Frame::new()
+                        .fill(bg_alpha)
+                        .stroke(egui::Stroke::new(1.0, border_alpha))
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::symmetric(8, 8));
+
+                    frame.show(ui, |ui| {
+                        let frame_rect = ui.max_rect();
+
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                frame_rect.min,
+                                egui::vec2(4.0, frame_rect.height()),
+                            ),
+                            egui::CornerRadius::same(4),
+                            strip_color.linear_multiply(alpha),
+                        );
+
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+
+                            ui.label(
+                                RichText::new(icon)
+                                    .color(strip_color.linear_multiply(alpha))
+                                    .size(16.0)
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
+
+                            let text_color = Color32::from_rgba_premultiplied(
+                                colors.text_main.r(),
+                                colors.text_main.g(),
+                                colors.text_main.b(),
+                                (alpha * 255.0) as u8,
+                            );
+                            ui.label(
+                                RichText::new(&toast.message)
+                                    .color(text_color)
+                                    .size(13.0),
+                            );
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let btn = egui::Button::new(
+                                    RichText::new("✕")
+                                        .color(
+                                            colors
+                                                .text_muted
+                                                .linear_multiply(alpha),
+                                        )
+                                        .size(14.0),
+                                )
+                                .frame(false);
+                                if ui.add(btn).clicked() {
+                                    close_clicked.set(true);
+                                }
+                            });
+                        });
+                    });
+                });
+
+            if close_clicked.get() {
+                to_remove.push(toast_id);
+            }
+        }
+
+        for id in to_remove {
+            self.notifications.retain(|n| n.id != id);
+        }
+    }
+
+    fn add_notification(&mut self, ntype: NotificationType, message: String) {
+        let id = self.next_notification_id;
+        self.next_notification_id += 1;
+        let duration = match ntype {
+            NotificationType::Error => Duration::from_secs(6),
+            _ => Duration::from_secs(4),
+        };
+        self.notifications.push(ToastNotification {
+            id,
+            message,
+            notification_type: ntype,
+            created_at: Instant::now(),
+            duration,
         });
     }
 

@@ -3,6 +3,12 @@ use egui::{Color32, Stroke, Vec2, Visuals};
 /// Accent color used for highlights, active buttons, clock digits glow.
 pub const ACCENT: Color32 = Color32::from_rgb(0xFF, 0x5F, 0x1F);
 
+/// Toast notification colors.
+pub const ERROR_RED: Color32 = Color32::from_rgb(0xEF, 0x44, 0x44);
+pub const WARNING_AMBER: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B);
+pub const SUCCESS_GREEN: Color32 = Color32::from_rgb(0x22, 0xC5, 0x5E);
+pub const INFO_BLUE: Color32 = Color32::from_rgb(0x3B, 0x82, 0xF6);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Theme {
     Dark,
@@ -88,6 +94,10 @@ pub struct ThemeColors {
     pub border_main: Color32,
     pub btn_bg: Color32,
     pub clock_sep: Color32,
+    pub error_red: Color32,
+    pub warning_amber: Color32,
+    pub success_green: Color32,
+    pub info_blue: Color32,
 }
 
 impl Theme {
@@ -106,6 +116,10 @@ impl Theme {
                 border_main: Color32::from_rgb(0x2A, 0x2A, 0x2E),
                 btn_bg: Color32::from_rgb(0x1A, 0x1A, 0x1E),
                 clock_sep: Color32::from_rgb(0x3F, 0x3F, 0x46),
+                error_red: ERROR_RED,
+                warning_amber: WARNING_AMBER,
+                success_green: SUCCESS_GREEN,
+                info_blue: INFO_BLUE,
             },
             Theme::Light => ThemeColors {
                 app_bg: Color32::from_rgb(0xF4, 0xF4, 0xF6),
@@ -120,6 +134,10 @@ impl Theme {
                 border_main: Color32::from_rgb(0xE4, 0xE4, 0xE7),
                 btn_bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
                 clock_sep: Color32::from_rgb(0xD4, 0xD4, 0xD8),
+                error_red: Color32::from_rgb(0xDC, 0x26, 0x26),
+                warning_amber: Color32::from_rgb(0xD9, 0x77, 0x06),
+                success_green: Color32::from_rgb(0x16, 0xA3, 0x4A),
+                info_blue: Color32::from_rgb(0x25, 0x63, 0xEB),
             },
         }
     }

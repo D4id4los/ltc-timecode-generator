@@ -619,7 +619,7 @@ pub fn is_transient_audio_error(err: &str) -> bool {
     keywords.iter().any(|kw| err.contains(kw))
 }
 
-fn is_permanent_device_error(err: &str) -> bool {
+pub fn is_permanent_device_error(err: &str) -> bool {
     let keywords = ["Permission denied", "Access denied"];
     keywords.iter().any(|kw| err.contains(kw))
 }
