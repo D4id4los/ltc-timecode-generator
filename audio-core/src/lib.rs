@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use log::{error, info, trace, warn};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +51,7 @@ struct AudioOutputState {
     stream: cpal::Stream,
     beep: Arc<Mutex<BeepState>>,
     ltc: Arc<Mutex<LtcStreamState>>,
+    streaming: Arc<AtomicBool>,
 }
 
 /// Tauri-free, Send+Sync audio core. Held by each Tauri frontend crate as
@@ -150,6 +151,8 @@ impl AudioCore {
             samples_per_bit: 0.0,
         }));
 
+        let streaming = Arc::new(AtomicBool::new(false));
+
         let last_err_log = Arc::new(Mutex::new(Instant::now()));
         let err_handler = move |err: cpal::Error| {
             let now = Instant::now();
@@ -169,6 +172,7 @@ impl AudioCore {
             sample_format,
             rx.clone(),
             beep.clone(),
+            streaming.clone(),
             err_handler,
         )?;
 
@@ -185,6 +189,7 @@ impl AudioCore {
             stream,
             beep,
             ltc,
+            streaming,
         });
 
         let mut fmt = self
@@ -238,6 +243,8 @@ impl AudioCore {
             samples_per_bit,
         };
 
+        output.streaming.store(true, Ordering::Relaxed);
+
         let stop_signal = ltc.stop_signal.clone();
         let sender = output.sender.clone();
         let ltc_clone = output.ltc.clone();
@@ -259,6 +266,7 @@ impl AudioCore {
             .lock()
             .map_err(|e| format!("State lock error: {}", e))?;
         if let Some(ref output) = *audio {
+            output.streaming.store(false, Ordering::Relaxed);
             let mut ltc = output
                 .ltc
                 .lock()
@@ -372,6 +380,7 @@ impl AudioCore {
             .lock()
             .map_err(|e| format!("State lock error: {}", e))?;
         if let Some(output) = audio.take() {
+            output.streaming.store(false, Ordering::Relaxed);
             let mut ltc = output.ltc.lock().map_err(|e| format!("LTC state lock error: {}", e))?;
             ltc.running = false;
             ltc.stop_signal.store(true, Ordering::Relaxed);
@@ -493,13 +502,14 @@ fn build_stream_for_format(
     sample_format: cpal::SampleFormat,
     rx: Arc<Mutex<mpsc::Receiver<Vec<f32>>>>,
     beep: Arc<Mutex<BeepState>>,
+    streaming: Arc<AtomicBool>,
     err_handler: impl Fn(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
     match sample_format {
-        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, rx, beep, err_handler),
-        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, rx, beep, err_handler),
-        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, rx, beep, err_handler),
-        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, rx, beep, err_handler),
+        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, rx, beep, streaming, err_handler),
+        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, rx, beep, streaming, err_handler),
+        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, rx, beep, streaming, err_handler),
+        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, rx, beep, streaming, err_handler),
         other => Err(format!("Unsupported sample format: {:?}", other)),
     }
 }
@@ -509,6 +519,7 @@ fn build_stream_generic<T>(
     config: &cpal::StreamConfig,
     rx: Arc<Mutex<mpsc::Receiver<Vec<f32>>>>,
     beep: Arc<Mutex<BeepState>>,
+    streaming: Arc<AtomicBool>,
     err_handler: impl Fn(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, String>
 where
@@ -516,6 +527,7 @@ where
 {
     let mut pending_samples: Vec<f32> = Vec::new();
     let mut pending_index: usize = 0;
+    let last_underrun_log = Arc::new(Mutex::new(Instant::now()));
 
     let stream = device
         .build_output_stream::<T, _, _>(
@@ -550,8 +562,16 @@ where
                                     error!("Audio callback: LTC channel disconnected (audio stream may have died)");
                                 }
                                 Err(mpsc::TryRecvError::Empty) => {
-                                    if pending_samples.is_empty() {
-                                        trace!("Audio callback: no samples available, writing silence");
+                                    if pending_samples.is_empty() && streaming.load(Ordering::Relaxed) {
+                                        let now = Instant::now();
+                                        let mut last = last_underrun_log.lock().unwrap_or_else(|e| {
+                                            error!("Audio callback: underrun log mutex poisoned: {}", e);
+                                            e.into_inner()
+                                        });
+                                        if now.duration_since(*last) > Duration::from_secs(1) {
+                                            warn!("Audio callback: LTC scheduler not keeping up — no samples available, writing silence");
+                                            *last = now;
+                                        }
                                     }
                                 }
                             },
