@@ -1,10 +1,11 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, Timecode};
 use egui::{Color32, FontId, RichText, Sense, Ui};
 use log::{error, warn};
 
+use crate::log_buffer::LogBuffer;
 use crate::theme::{Theme, ACCENT};
 use crate::widgets;
 
@@ -155,10 +156,16 @@ pub struct AppState {
 
     // Audio core
     pub audio_core: Mutex<AudioCore>,
+
+    // Debug log
+    pub show_debug_log: bool,
+    pub show_app_menu: bool,
+    pub app_menu_pos: Option<egui::Pos2>,
+    pub log_buffer: Arc<Mutex<LogBuffer>>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
+impl AppState {
+    pub fn new(log_buffer: Arc<Mutex<LogBuffer>>) -> Self {
         let start_tc = Timecode {
             hours: 1,
             minutes: 0,
@@ -179,11 +186,11 @@ impl Default for AppState {
             beep_frequency: 1000.0,
             scene: 1,
             take: 1,
-            roll: "A001".to_string(), // match webapp default Roll
+            roll: "A001".to_string(),
             auto_increment_take: true,
             logs: Vec::new(),
             clap_flash_alpha: 0.0,
-            clap_arm_angle: -25.0, // default open state
+            clap_arm_angle: -25.0,
             active_tab: Tab::Clapper,
             show_faq: false,
             devices: Vec::new(),
@@ -194,7 +201,17 @@ impl Default for AppState {
             last_frame_time: None,
             has_requested_maximize: false,
             audio_core: Mutex::new(AudioCore::new()),
+            show_debug_log: false,
+            show_app_menu: false,
+            app_menu_pos: None,
+            log_buffer,
         }
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new(Arc::new(Mutex::new(LogBuffer::new(1000))))
     }
 }
 
@@ -425,15 +442,16 @@ impl eframe::App for AppState {
 
         // Keyboard shortcuts (skip when a text field has focus)
         let any_focused = ctx.memory(|m| m.focused().is_some());
-        let (toggle_play, do_clap, do_reset, do_lock) = if !any_focused {
+        let (toggle_play, do_clap, do_reset, do_lock, toggle_debug) = if !any_focused {
             ctx.input(|i| (
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::C),
                 i.key_pressed(egui::Key::R),
                 i.key_pressed(egui::Key::L),
+                i.modifiers.ctrl && i.key_pressed(egui::Key::D),
             ))
         } else {
-            (false, false, false, false)
+            (false, false, false, false, false)
         };
 
         if toggle_play {
@@ -451,6 +469,9 @@ impl eframe::App for AppState {
         }
         if do_lock {
             self.is_locked = !self.is_locked;
+        }
+        if toggle_debug {
+            self.show_debug_log = !self.show_debug_log;
         }
     }
 
@@ -496,6 +517,12 @@ impl eframe::App for AppState {
                 });
             });
 
+        // App icon context menu
+        self.render_app_menu(ui);
+
+        // Debug log window
+        self.render_debug_log_window(ui);
+
         // Flash overlay (drawn on top of everything)
         if self.clap_flash_alpha > 0.01 {
             let ctx = ui.ctx();
@@ -537,8 +564,8 @@ impl AppState {
     fn render_header(&mut self, ui: &mut Ui) {
         let colors = self.theme.colors();
         ui.horizontal(|ui| {
-            // Clapper logo (orange square with two black horizontal lines)
-            let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(34.0, 34.0), Sense::hover());
+            // Clapper logo (orange square with two black horizontal lines) — clickable for app menu
+            let (rect, icon_response) = ui.allocate_exact_size(egui::Vec2::new(34.0, 34.0), Sense::click());
             ui.painter().rect_filled(rect, 4.0, ACCENT);
             let center_y = rect.center().y;
             let line_w = 18.0;
@@ -547,6 +574,10 @@ impl AppState {
             let line2 = egui::Rect::from_center_size(egui::pos2(rect.center().x, center_y + 3.5), egui::vec2(line_w, line_h));
             ui.painter().rect_filled(line1, 0.0, Color32::BLACK);
             ui.painter().rect_filled(line2, 0.0, Color32::BLACK);
+            if icon_response.clicked() || icon_response.secondary_clicked() {
+                self.show_app_menu = true;
+                self.app_menu_pos = Some(icon_response.rect.left_bottom());
+            }
 
             ui.add_space(4.0);
 
@@ -965,6 +996,87 @@ impl AppState {
 
     fn render_status_bar(&mut self, ui: &mut Ui) {
         widgets::status::render(ui, self);
+    }
+}
+
+impl AppState {
+    fn render_app_menu(&mut self, ui: &mut Ui) {
+        if !self.show_app_menu {
+            return;
+        }
+        let colors = self.theme.colors();
+        let pos = match self.app_menu_pos {
+            Some(p) => p,
+            None => {
+                self.show_app_menu = false;
+                return;
+            }
+        };
+
+        egui::Area::new("app_menu".into())
+            .fixed_pos(pos)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                let frame = egui::Frame::new()
+                    .fill(colors.card_bg)
+                    .stroke(egui::Stroke::new(1.0, colors.border_main))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(4, 4));
+                frame.show(ui, |ui| {
+                    ui.set_min_width(140.0);
+                    let debug_label = if self.show_debug_log {
+                        "✓ Debug Log"
+                    } else {
+                        "Debug Log"
+                    };
+                    if ui
+                        .add(egui::Button::new(RichText::new(debug_label).font(FontId::proportional(12.0)).color(colors.text_main)))
+                        .clicked()
+                    {
+                        self.show_debug_log = !self.show_debug_log;
+                        self.show_app_menu = false;
+                    }
+                });
+            });
+
+        // Close menu when clicking outside
+        let screen = ui.ctx().viewport_rect();
+        if ui.ctx().input(|i| i.pointer.any_click()) {
+            let click_pos = ui.ctx().pointer_interact_pos();
+            if let Some(click) = click_pos {
+                if !screen.contains(click) {
+                    self.show_app_menu = false;
+                }
+            }
+        }
+    }
+
+    fn render_debug_log_window(&mut self, ui: &mut Ui) {
+        if !self.show_debug_log {
+            return;
+        }
+
+        let ctx = ui.ctx().clone();
+
+        egui::Window::new("Debug Log")
+            .id("debug_log_window".into())
+            .default_size([600.0, 400.0])
+            .resizable(true)
+            .collapsible(false)
+            .show(&ctx, |ui| {
+                let mut log_text = {
+                    let buffer = self.log_buffer.lock().unwrap();
+                    buffer.entries.iter().cloned().collect::<Vec<_>>().join("\n")
+                };
+
+                let size = ui.available_size();
+                ui.add_sized(
+                    size,
+                    egui::TextEdit::multiline(&mut log_text)
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(true),
+                );
+            });
     }
 }
 

@@ -1,17 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod log_buffer;
 mod theme;
 mod widgets;
 
 use app::AppState;
 
 fn main() -> eframe::Result {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("ltc_gui=trace,audio_core=trace,info")
-    ).init();
+    let log_buffer = log_buffer::init_logger("ltc_gui=trace,audio_core=trace,info")
+        .expect("Failed to initialize logger");
 
-    let mut state = AppState::default();
+    let mut state = AppState::new(log_buffer);
     state.refresh_devices();
 
     let options = eframe::NativeOptions {
