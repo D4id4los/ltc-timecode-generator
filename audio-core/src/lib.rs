@@ -260,17 +260,51 @@ impl AudioCore {
             tc,
             fps,
             drop_frame,
-            ltc_channel,
+            ltc_channel: ltc_channel.clone(),
             ltc_volume,
             sample_rate: ltc.sample_rate,
             last_level: (1.0, 1.0),
             frame_duration,
-            next_frame_time: Instant::now() + Duration::from_millis(100),
+            next_frame_time: Instant::now(),
             stop_signal: Arc::new(AtomicBool::new(false)),
             scheduler_thread: None,
             total_samples,
             samples_per_bit,
         };
+
+        let prefill_count = 3;
+        let mut frame_buf = vec![0.0f32; total_samples * 2];
+        let mut prefill_tc = tc;
+        let mut prefill_level = (1.0f32, 1.0f32);
+        {
+            let mut producer = output
+                .ltc_producer
+                .lock()
+                .map_err(|e| format!("Producer lock error: {}", e))?;
+            for _ in 0..prefill_count {
+                frame_buf.fill(0.0);
+                generate_ltc_frame_stereo(
+                    &prefill_tc,
+                    drop_frame,
+                    total_samples,
+                    samples_per_bit,
+                    ltc_volume,
+                    &ltc_channel,
+                    &mut prefill_level,
+                    &mut frame_buf[..total_samples * 2],
+                );
+                let pushed = producer.push_slice(&frame_buf[..total_samples * 2]);
+                if pushed < total_samples * 2 {
+                    warn!(
+                        "LTC start: ring buffer full during prefill, dropped {} samples",
+                        total_samples * 2 - pushed
+                    );
+                }
+                prefill_tc = increment_timecode(&prefill_tc, fps, drop_frame);
+            }
+        }
+        ltc.tc = prefill_tc;
+        ltc.last_level = prefill_level;
 
         output.streaming.store(true, Ordering::Relaxed);
 
@@ -333,7 +367,7 @@ impl AudioCore {
                 .map_err(|e| format!("LTC state lock error: {}", e))?;
             ltc.tc = tc;
             ltc.last_level = (1.0, 1.0);
-            ltc.next_frame_time = Instant::now() + Duration::from_millis(50);
+            ltc.next_frame_time = Instant::now();
             info!("LTC reset to {:02}:{:02}:{:02}:{:02} (drop_frame={})",
                 tc.hours, tc.minutes, tc.seconds, tc.frames, ltc.drop_frame);
         } else {
