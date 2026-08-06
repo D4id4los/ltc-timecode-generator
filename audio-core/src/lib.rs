@@ -612,6 +612,18 @@ where
     Ok(stream)
 }
 
+// ── Error classification helpers ────────────────────────────────────────────
+
+pub fn is_transient_audio_error(err: &str) -> bool {
+    let keywords = ["temporarily busy", "already in use", "resource busy"];
+    keywords.iter().any(|kw| err.contains(kw))
+}
+
+fn is_permanent_device_error(err: &str) -> bool {
+    let keywords = ["Permission denied", "Access denied"];
+    keywords.iter().any(|kw| err.contains(kw))
+}
+
 // ── Device enumeration ─────────────────────────────────────────────────────
 
 const PLUGIN_KEYWORDS: &[&str] = &[
@@ -644,12 +656,29 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     if let Some(ref dev) = default_device {
         let name = dev.to_string();
         if !name.is_empty() {
-            seen.insert(name.clone());
-            devices.push(AudioDeviceInfo {
-                id: String::from("default"),
-                name: format!("{} (Default)", name),
-                is_default: true,
-            });
+            match dev.supported_output_configs() {
+                Ok(_) => {
+                    seen.insert(name.clone());
+                    devices.push(AudioDeviceInfo {
+                        id: String::from("default"),
+                        name: format!("{} (Default)", name),
+                        is_default: true,
+                    });
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if is_permanent_device_error(&err_str) {
+                        warn!("Skipping default device '{}': {}", name, err_str);
+                    } else {
+                        seen.insert(name.clone());
+                        devices.push(AudioDeviceInfo {
+                            id: String::from("default"),
+                            name: format!("{} (Default)", name),
+                            is_default: true,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -663,6 +692,16 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
         }
         if !seen.insert(name.clone()) {
             continue;
+        }
+        match device.supported_output_configs() {
+            Ok(_) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                if is_permanent_device_error(&err_str) {
+                    warn!("Skipping device '{}': {}", name, err_str);
+                    continue;
+                }
+            }
         }
         let is_default = default_name.as_deref() == Some(&name);
         devices.push(AudioDeviceInfo {

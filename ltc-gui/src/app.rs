@@ -269,6 +269,7 @@ impl AppState {
             }
             drop(core);
             self.audio_initialized = false;
+            std::thread::sleep(Duration::from_millis(50));
         }
 
         self.selected_device = index;
@@ -322,24 +323,67 @@ impl AppState {
 
         info!("Initializing audio on device: {} (id={})", device_name, device_id);
 
-        let core = match self.audio_core.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                error!("ensure_audio_init: audio core mutex poisoned: {}", e);
-                return;
-            }
-        };
-        match core.init_output(&device_id, SAMPLE_RATE, BUFFER_SIZE) {
-            Ok(()) => {
-                self.audio_initialized = true;
-                self.sample_format_name = core.sample_format_name();
-                let fmt = &self.sample_format_name;
-                self.status_message = format!("Audio initialized ({})", fmt);
-                info!("Audio initialized successfully on {} (format={})", device_name, fmt);
-            }
-            Err(e) => {
-                error!("ensure_audio_init: init_output failed: {}", e);
-                self.status_message = format!("Audio init failed: {}", e);
+        let max_retries = 3;
+        let mut delay_ms = 50u64;
+
+        for attempt in 0..max_retries {
+            let result = {
+                let core = match self.audio_core.lock() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("ensure_audio_init: audio core mutex poisoned: {}", e);
+                        return;
+                    }
+                };
+                core.init_output(&device_id, SAMPLE_RATE, BUFFER_SIZE)
+            };
+
+            match result {
+                Ok(()) => {
+                    let core = match self.audio_core.lock() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("ensure_audio_init: audio core mutex poisoned after init: {}", e);
+                            return;
+                        }
+                    };
+                    self.audio_initialized = true;
+                    self.sample_format_name = core.sample_format_name();
+                    let fmt = &self.sample_format_name;
+                    self.status_message = format!("Audio initialized ({})", fmt);
+                    info!("Audio initialized successfully on {} (format={})", device_name, fmt);
+                    return;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let is_transient = audio_core::is_transient_audio_error(&err_str);
+
+                    if is_transient && attempt < max_retries - 1 {
+                        warn!(
+                            "Audio init transient error (attempt {}/{}), retrying in {}ms: {}",
+                            attempt + 1,
+                            max_retries,
+                            delay_ms,
+                            err_str
+                        );
+                        self.status_message = format!(
+                            "Audio init busy, retrying... ({}/{})",
+                            attempt + 1,
+                            max_retries
+                        );
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                        delay_ms *= 2;
+                        continue;
+                    }
+
+                    error!(
+                        "ensure_audio_init: init_output failed{}: {}",
+                        if is_transient { " (retries exhausted)" } else { "" },
+                        err_str
+                    );
+                    self.status_message = format!("Audio init failed: {}", err_str);
+                    break;
+                }
             }
         }
     }
