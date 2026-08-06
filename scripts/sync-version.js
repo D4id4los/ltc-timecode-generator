@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from 'fs';
+import { execSync } from 'child_process';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -12,6 +13,13 @@ function read(path) {
 function write(path, content) {
   writeFileSync(resolve(ROOT, path), content);
 }
+
+function run(cmd, cwd) {
+  console.log(`  → ${cmd} (in ${resolve(ROOT, cwd)})`);
+  execSync(cmd, { cwd: resolve(ROOT, cwd), stdio: 'inherit' });
+}
+
+// --- Sync version fields ---
 
 const packageJson = JSON.parse(read('package.json'));
 const version = packageJson.version;
@@ -59,6 +67,20 @@ cargo = cargo.replace(/^version = ".*?"/m, `version = "${version}"`);
 write('ltc-gui/Cargo.toml', cargo);
 console.log('  ✓ ltc-gui/Cargo.toml');
 
-console.log(`\nAll files synced to version ${version}.`);
-console.log('Run `npm install` to update package-lock.json.');
-console.log('Run `cargo build` in each crate to update Cargo.lock files.');
+// --- Update lock files ---
+
+console.log('\nUpdating lock files...');
+
+run('npm install', '.');
+console.log('  ✓ package-lock.json');
+
+run('cargo generate-lockfile', '.');
+console.log('  ✓ Cargo.lock (workspace: audio-core + ltc-gui)');
+
+run('cargo generate-lockfile --manifest-path src-tauri/Cargo.toml', '.');
+console.log('  ✓ src-tauri/Cargo.lock');
+
+run('cargo generate-lockfile --manifest-path src-tauri-32bit/Cargo.toml', '.');
+console.log('  ✓ src-tauri-32bit/Cargo.lock');
+
+console.log(`\nAll files synced to version ${version}. Lock files are up to date.`);

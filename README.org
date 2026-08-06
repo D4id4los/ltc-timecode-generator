@@ -68,6 +68,15 @@ Now compile with:
   LIBGL_ALWAYS_SOFTWARE=1 cargo run  # Force software rendering for GPU-less testing
 #+end_src
 
+To run the rust GUI or the tauri webapp with debug output, use:
+#+begin_src bash
+  RUST_LOG=info cargo run --release
+  # with granular settings:
+  RUST_LOG=audio_core=info,ltc_gui=info cargo run --release
+  # For tauri:
+  RUST_LOG=info cargo tauri dev
+#+end_src
+
 * Packaging & Deploying the Webapp as Standalone
 
 Packaging your React/Vite application into a native desktop app using Tauri is
@@ -151,14 +160,14 @@ To build 32bit versions, make sure you have docker installed on you system, then
 * Version Bumping
 
 #+begin_src bash
-  npm version patch    # 0.1.0 → 0.1.1, syncs all files, creates git tag v0.1.1
-  npm version minor    # 0.1.0 → 0.2.0, syncs all files, creates git tag v0.2.0
-  npm version major    # 0.1.0 → 1.0.0, syncs all files, creates git tag v1.0.0
+  npm version patch    # 0.1.0 → 0.1.1, syncs all files, updates lock files, creates git commit + tag v0.1.1
+  npm version minor    # 0.1.0 → 0.2.0, syncs all files, updates lock files, creates git commit + tag v0.2.0
+  npm version major    # 0.1.0 → 1.0.0, syncs all files, updates lock files, creates git commit + tag v1.0.0
 
-  npm run version:sync                 # manual re-sync without bumping
+  node scripts/sync-version.js         # manual re-sync without bumping
 #+end_src
-After =npm version=, run =npm install= and =cargo build= in each crate to
-update lock files.
+The =npm version= command handles everything automatically: version sync, lock
+file updates, git commit, and git tag. No manual post-processing is needed.
 
 
 

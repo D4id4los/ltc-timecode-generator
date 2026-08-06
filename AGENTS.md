@@ -153,25 +153,22 @@ The **single source of truth** is `package.json`'s `"version"` field. All other 
 
 ### How to bump the version
 ```bash
-npm version patch    # 0.1.0 → 0.1.1 (syncs all files, creates git tag v0.1.1)
-npm version minor    # 0.1.0 → 0.2.0 (syncs all files, creates git tag v0.2.0)
-npm version major    # 0.1.0 → 1.0.0 (syncs all files, creates git tag v1.0.0)
+npm version patch    # 0.1.0 → 0.1.1 (syncs all files, updates lock files, creates git commit + tag v0.1.1)
+npm version minor    # 0.1.0 → 0.2.0 (syncs all files, updates lock files, creates git commit + tag v0.2.0)
+npm version major    # 0.1.0 → 1.0.0 (syncs all files, updates lock files, creates git commit + tag v1.0.0)
 ```
 
-The `"version"` npm lifecycle hook runs `scripts/sync-version.js` automatically during `npm version` — after bumping `package.json` but before the git commit and tag. The script propagates the version to:
+The `"version"` npm lifecycle hook runs `scripts/sync-version.js` automatically during `npm version` — after bumping `package.json` but before the git commit and tag. The script:
 
-- `src-tauri/tauri.conf.json`
-- `src-tauri-32bit/tauri.conf.json`
-- `src-tauri/Cargo.toml`
-- `src-tauri-32bit/Cargo.toml`
-- `audio-core/Cargo.toml`
-- `ltc-gui/Cargo.toml`
+1. Propagates the version to all Cargo.toml and tauri.conf.json files
+2. Runs `npm install` to update `package-lock.json`
+3. Runs `cargo generate-lockfile` in the workspace and each standalone crate to update `Cargo.lock` files
 
-After syncing, run `npm install` (to update `package-lock.json`) and `cargo build` in each crate (to update `Cargo.lock` files).
+All changes are included in the git commit that `npm version` creates, and a `v{version}` tag is added automatically. No manual post-processing is needed.
 
 ### Manual sync (without bumping)
 ```bash
-npm run version:sync
+node scripts/sync-version.js
 ```
 
 ### UI Display
