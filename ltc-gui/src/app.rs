@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, Timecode};
 use egui::{Color32, FontId, RichText, Sense, Ui};
-use log::{error, warn};
+use log::{error, info, trace, warn};
 
 use crate::log_buffer::LogBuffer;
 use crate::theme::{Theme, ACCENT};
@@ -227,9 +227,77 @@ impl AppState {
                 if self.selected_device >= self.devices.len() {
                     self.selected_device = 0;
                 }
+                info!("Refreshed devices: found {} audio devices", self.devices.len());
+                self.status_message = format!("{} devices found", self.devices.len());
             }
             Err(e) => {
+                error!("Failed to list audio devices: {}", e);
                 self.status_message = format!("Device error: {}", e);
+            }
+        }
+    }
+
+    pub fn change_device(&mut self, index: usize) {
+        if index >= self.devices.len() {
+            warn!("change_device: index {} out of range ({} devices)", index, self.devices.len());
+            return;
+        }
+        let device_name = self.devices[index].name.clone();
+        let device_id = self.devices[index].id.clone();
+        info!("Changing audio device to [{}] {} (id={})", index, device_name, device_id);
+
+        let was_playing = self.is_playing;
+        if was_playing {
+            info!("Device change: stopping LTC stream first");
+            self.stop_streaming();
+        }
+
+        if self.audio_initialized {
+            info!("Device change: stopping existing audio output");
+            let core = match self.audio_core.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("change_device: audio core mutex poisoned: {}", e);
+                    self.status_message = "Device change failed: mutex poisoned".to_string();
+                    return;
+                }
+            };
+            if let Err(e) = core.stop_output() {
+                error!("change_device: stop_output failed: {}", e);
+            }
+            drop(core);
+            self.audio_initialized = false;
+        }
+
+        self.selected_device = index;
+        self.status_message = format!("Device changed to: {}", device_name);
+
+        self.ensure_audio_init();
+
+        if was_playing && self.audio_initialized {
+            info!("Device change: restarting LTC stream");
+            let tc = self.start_timecode;
+            let fps = self.fps();
+            let channel = self.ltc_channel.as_str().to_string();
+            let volume = self.ltc_volume;
+            let core = match self.audio_core.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("change_device: audio core mutex poisoned on restart: {}", e);
+                    self.status_message = "Device change: failed to restart stream".to_string();
+                    return;
+                }
+            };
+            match core.start_ltc(tc, fps.fps, fps.drop_frame, channel, volume) {
+                Ok(()) => {
+                    self.is_playing = true;
+                    self.status_message = format!("Streaming LTC on {}", device_name);
+                    info!("LTC stream restarted on new device: {}", device_name);
+                }
+                Err(e) => {
+                    error!("Failed to restart LTC on new device: {}", e);
+                    self.status_message = format!("Restart failed after device change: {}", e);
+                }
             }
         }
     }
@@ -244,6 +312,14 @@ impl AppState {
             self.devices[self.selected_device].id.clone()
         };
 
+        let device_name = if self.devices.is_empty() {
+            "default".to_string()
+        } else {
+            self.devices[self.selected_device].name.clone()
+        };
+
+        info!("Initializing audio on device: {} (id={})", device_name, device_id);
+
         let core = match self.audio_core.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -255,6 +331,7 @@ impl AppState {
             Ok(()) => {
                 self.audio_initialized = true;
                 self.status_message = "Audio initialized".to_string();
+                info!("Audio initialized successfully on {}", device_name);
             }
             Err(e) => {
                 error!("ensure_audio_init: init_output failed: {}", e);
@@ -274,19 +351,26 @@ impl AppState {
         let channel = self.ltc_channel.as_str().to_string();
         let volume = self.ltc_volume;
 
+        info!("Starting LTC stream: tc={:02}:{:02}:{:02}:{:02}, fps={}, drop_frame={}, channel={}, volume={}",
+            tc.hours, tc.minutes, tc.seconds, tc.frames, fps.fps, fps.drop_frame, channel, volume);
+
         let core = self.audio_core.lock().unwrap();
         match core.start_ltc(tc, fps.fps, fps.drop_frame, channel, volume) {
             Ok(()) => {
                 self.is_playing = true;
                 self.status_message = "Streaming LTC".to_string();
+                info!("LTC stream started successfully");
             }
             Err(e) => {
+                error!("Failed to start LTC stream: {}", e);
                 self.status_message = format!("Start failed: {}", e);
             }
         }
     }
 
     pub fn stop_streaming(&mut self) {
+        info!("Stopping LTC stream");
+
         let core = match self.audio_core.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -301,10 +385,14 @@ impl AppState {
         }
         drop(core);
         self.is_playing = false;
+        self.status_message = "Stopped".to_string();
+        info!("LTC stream stopped");
     }
 
     pub fn handle_reset(&mut self) {
         let tc = self.start_timecode;
+        info!("Resetting LTC to {:02}:{:02}:{:02}:{:02}", tc.hours, tc.minutes, tc.seconds, tc.frames);
+
         let core = match self.audio_core.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -318,6 +406,7 @@ impl AppState {
         drop(core);
         self.current_timecode = self.start_timecode;
         self.status_message = "Reset".to_string();
+        info!("LTC reset complete");
     }
 
     pub fn trigger_clap(&mut self) {
@@ -326,6 +415,8 @@ impl AppState {
             return;
         }
 
+        info!("Clap triggered: scene={}, take={}, roll={}, freq={}Hz, volume={}, channel={}",
+            self.scene, self.take, self.roll, self.beep_frequency, self.beep_volume, self.beep_channel.as_str());
 
         let freq = self.beep_frequency;
         let volume = self.beep_volume;
@@ -384,7 +475,13 @@ impl AppState {
                 return;
             }
         };
+        let prev = self.current_timecode;
         self.current_timecode = core.current_timecode();
+        if self.current_timecode != prev {
+            trace!("Clock updated: {:02}:{:02}:{:02}:{:02}",
+                self.current_timecode.hours, self.current_timecode.minutes,
+                self.current_timecode.seconds, self.current_timecode.frames);
+        }
     }
 }
 

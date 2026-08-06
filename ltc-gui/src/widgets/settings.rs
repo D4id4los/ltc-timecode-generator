@@ -112,6 +112,7 @@ fn stepper_card(ui: &mut Ui, label: &str, value: &mut u32, max: u32, theme: crat
                 .fill(Color32::TRANSPARENT);
             if ui.add(up_btn).clicked() {
                 *value = (*value + 1) % max;
+                log::info!("Starting timecode {} changed to {:02} (up)", label, *value);
             }
 
             ui.add_space(1.0);
@@ -141,6 +142,7 @@ fn stepper_card(ui: &mut Ui, label: &str, value: &mut u32, max: u32, theme: crat
                 .fill(Color32::TRANSPARENT);
             if ui.add(down_btn).clicked() {
                 *value = if *value == 0 { max - 1 } else { *value - 1 };
+                log::info!("Starting timecode {} changed to {:02} (down)", label, *value);
             }
         });
     });
@@ -215,7 +217,11 @@ fn frame_rate_card(ui: &mut Ui, index: usize, opt: &crate::app::FrameRateOption,
 
     let click_sense = if state.is_playing { Sense::hover() } else { Sense::click() };
     if ui.interact(response.rect, response.id, click_sense).clicked() {
+        let prev = state.fps_index;
         state.fps_index = index;
+        if state.fps_index != prev {
+            log::info!("Frame rate changed to: {} ({} fps, drop_frame={})", opt.name, opt.fps, opt.drop_frame);
+        }
     }
 }
 
@@ -255,10 +261,11 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
                             for (i, name) in device_names.iter().enumerate() {
-                                let mut idx = i;
-                                ui.selectable_value(&mut idx, i, name);
-                                if idx != i {
-                                    state.selected_device = idx;
+                                let prev = state.selected_device;
+                                ui.selectable_value(&mut state.selected_device, i, name);
+                                if state.selected_device != prev {
+                                    log::info!("Device selected: {} (index {})", name, i);
+                                    state.change_device(state.selected_device);
                                 }
                             }
                         });
@@ -354,9 +361,9 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState, space_tight: f32, s
     let width = ui.available_width();
     let pills_horizontal = width > 300.0;
 
-    render_pill_set(ui, "LTC OUTPUT", AudioChannel::all(), &mut state.ltc_channel, &colors, pills_horizontal, space_tight);
+    render_pill_set(ui, "LTC OUTPUT", AudioChannel::all(), &mut state.ltc_channel, "ltc", &colors, pills_horizontal, space_tight);
     ui.add_space(space_norm);
-    render_pill_set(ui, "CLAPPER OUTPUT", AudioChannel::all(), &mut state.beep_channel, &colors, pills_horizontal, space_tight);
+    render_pill_set(ui, "CLAPPER OUTPUT", AudioChannel::all(), &mut state.beep_channel, "beep", &colors, pills_horizontal, space_tight);
 }
 
 fn render_pill_set(
@@ -364,6 +371,7 @@ fn render_pill_set(
     label: &str,
     channels: &[AudioChannel],
     active_channel: &mut AudioChannel,
+    log_label: &str,
     colors: &crate::theme::ThemeColors,
     horizontal: bool,
     space_tight: f32,
@@ -382,7 +390,10 @@ fn render_pill_set(
                         .stroke(egui::Stroke::new(0.5, colors.border_main))
                         .fill(colors.card_bg)
                 };
-                if ui.add(btn).clicked() { *active_channel = *ch; }
+                if ui.add(btn).clicked() {
+                    *active_channel = *ch;
+                    log::info!("{} channel changed to: {}", log_label.to_uppercase(), ch.label());
+                }
             }
         });
     } else {
@@ -395,7 +406,10 @@ fn render_pill_set(
                     .stroke(egui::Stroke::new(0.5, colors.border_main))
                     .fill(colors.card_bg)
             };
-            if ui.add(btn).clicked() { *active_channel = *ch; }
+            if ui.add(btn).clicked() {
+                *active_channel = *ch;
+                log::info!("{} channel changed to: {}", log_label.to_uppercase(), ch.label());
+            }
             ui.add_space(space_tight);
         }
     }
@@ -406,7 +420,10 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState, space_tight: f32) {
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("LTC VOL").font(FontId::monospace(9.0)).color(colors.text_muted));
-        ui.add(egui::Slider::new(&mut state.ltc_volume, 0.0..=1.0).step_by(0.01).show_value(false));
+        let resp = ui.add(egui::Slider::new(&mut state.ltc_volume, 0.0..=1.0).step_by(0.01).show_value(false));
+        if resp.changed() {
+            log::info!("LTC volume changed to: {:.0}%", state.ltc_volume * 100.0);
+        }
         ui.label(RichText::new(format!("{}%", (state.ltc_volume * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
@@ -414,7 +431,10 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState, space_tight: f32) {
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("BEEP VOL").font(FontId::monospace(9.0)).color(colors.text_muted));
-        ui.add(egui::Slider::new(&mut state.beep_volume, 0.0..=1.0).step_by(0.01).show_value(false));
+        let resp = ui.add(egui::Slider::new(&mut state.beep_volume, 0.0..=1.0).step_by(0.01).show_value(false));
+        if resp.changed() {
+            log::info!("Beep volume changed to: {:.0}%", state.beep_volume * 100.0);
+        }
         ui.label(RichText::new(format!("{}%", (state.beep_volume * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
@@ -422,7 +442,10 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState, space_tight: f32) {
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("PITCH").font(FontId::monospace(9.0)).color(colors.text_muted));
-        ui.add(egui::Slider::new(&mut state.beep_frequency, 400.0..=2000.0).show_value(false));
+        let resp = ui.add(egui::Slider::new(&mut state.beep_frequency, 400.0..=2000.0).show_value(false));
+        if resp.changed() {
+            log::info!("Beep frequency changed to: {:.0} Hz", state.beep_frequency);
+        }
         ui.label(RichText::new(format!("{} Hz", state.beep_frequency.round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 }

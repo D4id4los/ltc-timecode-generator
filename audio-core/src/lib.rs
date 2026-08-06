@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Timecode {
     pub hours: u32,
     pub minutes: u32,
@@ -180,7 +180,11 @@ impl AudioCore {
                                     Err(mpsc::TryRecvError::Disconnected) => {
                                         error!("Audio callback: LTC channel disconnected (audio stream may have died)");
                                     }
-                                    Err(mpsc::TryRecvError::Empty) => {}
+                                    Err(mpsc::TryRecvError::Empty) => {
+                                        if pending_samples.is_empty() {
+                                            trace!("Audio callback: no samples available, writing silence");
+                                        }
+                                    }
                                 },
                                 Err(e) => {
                                     warn!("Audio callback: rx mutex poisoned: {}", e);
@@ -325,6 +329,10 @@ impl AudioCore {
             ltc.tc = tc;
             ltc.last_level = (1.0, 1.0);
             ltc.next_frame_time = Instant::now() + Duration::from_millis(50);
+            info!("LTC reset to {:02}:{:02}:{:02}:{:02} (drop_frame={})",
+                tc.hours, tc.minutes, tc.seconds, tc.frames, ltc.drop_frame);
+        } else {
+            warn!("reset_ltc: audio not initialized");
         }
         Ok(())
     }
@@ -415,6 +423,9 @@ impl AudioCore {
                 }
             }
             drop(output.stream);
+            info!("Audio output stopped and stream dropped");
+        } else {
+            warn!("stop_output: no audio output to stop");
         }
         Ok(())
     }
@@ -487,6 +498,11 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     }
 
     devices.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
+
+    info!("Found {} audio devices", devices.len());
+    for d in &devices {
+        info!("  Device: id={}, name={}, default={}", d.id, d.name, d.is_default);
+    }
 
     Ok(devices)
 }
