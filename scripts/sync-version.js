@@ -83,4 +83,14 @@ console.log('  ✓ src-tauri/Cargo.lock');
 run('cargo generate-lockfile --manifest-path src-tauri-32bit/Cargo.toml', '.');
 console.log('  ✓ src-tauri-32bit/Cargo.lock');
 
+// --- Stage all changed files for the npm version commit ---
+
+console.log('\nStaging all changed files for git commit...');
+run('git add package.json package-lock.json Cargo.lock', '.');
+run('git add src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock', '.');
+run('git add src-tauri-32bit/tauri.conf.json src-tauri-32bit/Cargo.toml src-tauri-32bit/Cargo.lock', '.');
+run('git add audio-core/Cargo.toml', '.');
+run('git add ltc-gui/Cargo.toml', 'ltc-gui');
+console.log('  ✓ All files staged');
+
 console.log(`\nAll files synced to version ${version}. Lock files are up to date.`);
