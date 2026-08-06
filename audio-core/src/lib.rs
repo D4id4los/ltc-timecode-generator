@@ -1,11 +1,17 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::{error, info, warn};
+use ringbuf::{HeapRb, HeapProducer, HeapConsumer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+// ── Ring buffer capacities ─────────────────────────────────────────────────
+
+const LTC_RING_CAPACITY: usize = 262_144;   // 128K stereo samples (~2.7s at 48kHz, ~8s at 16kHz)
+const BEEP_RING_CAPACITY: usize = 32_768;    // 32K stereo samples (~0.34s at 48kHz, ~1s at 16kHz)
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -32,11 +38,6 @@ pub struct AudioDeviceInfo {
     pub is_default: bool,
 }
 
-struct BeepState {
-    samples: Vec<f32>,
-    index: usize,
-}
-
 struct LtcStreamState {
     running: bool,
     tc: Timecode,
@@ -55,11 +56,13 @@ struct LtcStreamState {
 }
 
 struct AudioOutputState {
-    sender: mpsc::SyncSender<Vec<f32>>,
+    ltc_producer: Arc<Mutex<HeapProducer<f32>>>,
     stream: cpal::Stream,
-    beep: Arc<Mutex<BeepState>>,
+    beep_producer: Arc<Mutex<HeapProducer<f32>>>,
     ltc: Arc<Mutex<LtcStreamState>>,
     streaming: Arc<AtomicBool>,
+    underrun_count: Arc<AtomicU64>,
+    callback_counter: Arc<AtomicU64>,
 }
 
 /// Tauri-free, Send+Sync audio core. Held by each Tauri frontend crate as
@@ -116,7 +119,6 @@ impl AudioCore {
             cpal::BufferSize::Default
         };
 
-        // Query supported configs and select the best match
         let (stream_config, sample_format) = select_best_config(
             &device,
             2,
@@ -140,12 +142,15 @@ impl AudioCore {
             fmt_name,
         );
 
-        let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(128);
-        let rx = Arc::new(Mutex::new(rx));
-        let beep = Arc::new(Mutex::new(BeepState {
-            samples: Vec::new(),
-            index: 0,
-        }));
+        // Lock-free LTC ring buffer: Producer shared via Arc<Mutex<>> (scheduler + push_samples),
+        // Consumer moved into audio callback (lock-free pop)
+        let ltc_rb = HeapRb::<f32>::new(LTC_RING_CAPACITY);
+        let (ltc_producer, ltc_consumer) = ltc_rb.split();
+
+        // Lock-free beep ring buffer: same pattern
+        let beep_rb = HeapRb::<f32>::new(BEEP_RING_CAPACITY);
+        let (beep_producer, beep_consumer) = beep_rb.split();
+
         let ltc = Arc::new(Mutex::new(LtcStreamState {
             running: false,
             tc: Timecode {
@@ -169,36 +174,33 @@ impl AudioCore {
         }));
 
         let streaming = Arc::new(AtomicBool::new(false));
+        let underrun_count = Arc::new(AtomicU64::new(0));
+        let callback_counter = Arc::new(AtomicU64::new(0));
 
         let last_err_log = Arc::new(Mutex::new(Instant::now()));
-        let events_clone = self.events.clone();
+        let events_for_err = self.events.clone();
         let err_handler = move |err: cpal::Error| {
             let now = Instant::now();
-            let mut last = last_err_log.lock().unwrap_or_else(|e| {
-                error!("Audio error handler mutex poisoned: {}", e);
-                e.into_inner()
-            });
+            let mut last = last_err_log.lock().unwrap_or_else(|e| e.into_inner());
             if now.duration_since(*last) > Duration::from_secs(1) {
                 error!("Audio output stream error: {}", err);
-                let mut ev = events_clone.lock().unwrap_or_else(|e| {
-                    error!("Audio error handler events mutex poisoned: {}", e);
-                    e.into_inner()
-                });
-                ev.push(AudioEvent::StreamError(err.to_string()));
+                if let Ok(mut ev) = events_for_err.lock() {
+                    ev.push(AudioEvent::StreamError(err.to_string()));
+                }
                 *last = now;
             }
         };
 
-        let events_for_stream = self.events.clone();
         let stream = build_stream_for_format(
             &device,
             &stream_config,
             sample_format,
-            rx.clone(),
-            beep.clone(),
+            ltc_consumer,
+            beep_consumer,
             streaming.clone(),
+            underrun_count.clone(),
+            callback_counter.clone(),
             err_handler,
-            events_for_stream,
         )?;
 
         stream
@@ -210,11 +212,13 @@ impl AudioCore {
             .lock()
             .map_err(|e| format!("State lock error: {}", e))?;
         *audio = Some(AudioOutputState {
-            sender: tx,
+            ltc_producer: Arc::new(Mutex::new(ltc_producer)),
             stream,
-            beep,
+            beep_producer: Arc::new(Mutex::new(beep_producer)),
             ltc,
             streaming,
+            underrun_count,
+            callback_counter,
         });
 
         let mut fmt = self
@@ -271,13 +275,22 @@ impl AudioCore {
         output.streaming.store(true, Ordering::Relaxed);
 
         let stop_signal = ltc.stop_signal.clone();
-        let sender = output.sender.clone();
+        let ltc_producer = output.ltc_producer.clone();
         let ltc_clone = output.ltc.clone();
+        let underrun_count = output.underrun_count.clone();
+        let callback_counter = output.callback_counter.clone();
         let events_for_scheduler = self.events.clone();
 
         let handle = std::thread::Builder::new()
             .name("ltc-scheduler".into())
-            .spawn(move || ltc_scheduler_thread(sender, ltc_clone, stop_signal, events_for_scheduler))
+            .spawn(move || ltc_scheduler_thread(
+                ltc_producer,
+                ltc_clone,
+                stop_signal,
+                underrun_count,
+                callback_counter,
+                events_for_scheduler,
+            ))
             .map_err(|e| format!("Failed to spawn LTC scheduler thread: {}", e))?;
 
         info!("LTC scheduler thread spawned (tc={:?}, fps={}, drop_frame={})", tc, fps, drop_frame);
@@ -368,12 +381,14 @@ impl AudioCore {
             .map_err(|e| format!("State lock error: {}", e))?;
         if let Some(ref output) = *audio {
             let samples = generate_beep_samples(sample_rate, frequency, duration, volume, channel);
-            let mut beep = output
-                .beep
+            let mut producer = output
+                .beep_producer
                 .lock()
-                .map_err(|e| format!("Beep lock error: {}", e))?;
-            beep.samples = samples;
-            beep.index = 0;
+                .map_err(|e| format!("Beep producer lock error: {}", e))?;
+            let pushed = producer.push_slice(&samples);
+            if pushed < samples.len() {
+                warn!("play_beep: ring buffer full, dropped {} beep samples", samples.len() - pushed);
+            }
         }
         Ok(())
     }
@@ -387,18 +402,16 @@ impl AudioCore {
             }
         };
         if let Some(ref output) = *audio {
-            if let Err(e) = output.sender.try_send(samples) {
-                match e {
-                    mpsc::TrySendError::Full(_) => {
-                        warn!("push_samples: channel full (audio callback can't keep up)");
-                    }
-                    mpsc::TrySendError::Disconnected(_) => {
-                        error!("push_samples: channel disconnected (audio stream has died)");
-                        if let Ok(mut ev) = self.events.lock() {
-                            ev.push(AudioEvent::StreamDied);
-                        }
-                    }
+            let mut producer = match output.ltc_producer.lock() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("push_samples: producer mutex poisoned: {}", e);
+                    return;
                 }
+            };
+            let pushed = producer.push_slice(&samples);
+            if pushed < samples.len() {
+                warn!("push_samples: ring buffer full, dropped {} samples", samples.len() - pushed);
             }
         }
     }
@@ -457,7 +470,6 @@ fn select_best_config(
         }
     };
 
-    // Try to find a config that supports our desired sample rate and channels
     let mut best_config: Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> = None;
 
     for cfg_range in supported {
@@ -489,7 +501,6 @@ fn select_best_config(
         }
     }
 
-    // Fallback: accept any config, just pick the highest priority format
     if best_config.is_none() {
         for cfg_range in device
             .supported_output_configs()
@@ -529,17 +540,18 @@ fn build_stream_for_format(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
-    rx: Arc<Mutex<mpsc::Receiver<Vec<f32>>>>,
-    beep: Arc<Mutex<BeepState>>,
+    ltc_consumer: HeapConsumer<f32>,
+    beep_consumer: HeapConsumer<f32>,
     streaming: Arc<AtomicBool>,
+    underrun_count: Arc<AtomicU64>,
+    callback_counter: Arc<AtomicU64>,
     err_handler: impl Fn(cpal::Error) + Send + 'static,
-    events: Arc<Mutex<Vec<AudioEvent>>>,
 ) -> Result<cpal::Stream, String> {
     match sample_format {
-        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, rx, beep, streaming, err_handler, events),
-        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, rx, beep, streaming, err_handler, events),
-        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, rx, beep, streaming, err_handler, events),
-        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, rx, beep, streaming, err_handler, events),
+        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, ltc_consumer, beep_consumer, streaming, underrun_count, callback_counter, err_handler),
+        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, ltc_consumer, beep_consumer, streaming, underrun_count, callback_counter, err_handler),
+        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, ltc_consumer, beep_consumer, streaming, underrun_count, callback_counter, err_handler),
+        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, ltc_consumer, beep_consumer, streaming, underrun_count, callback_counter, err_handler),
         other => Err(format!("Unsupported sample format: {:?}", other)),
     }
 }
@@ -547,98 +559,37 @@ fn build_stream_for_format(
 fn build_stream_generic<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    rx: Arc<Mutex<mpsc::Receiver<Vec<f32>>>>,
-    beep: Arc<Mutex<BeepState>>,
+    mut ltc_consumer: HeapConsumer<f32>,
+    mut beep_consumer: HeapConsumer<f32>,
     streaming: Arc<AtomicBool>,
+    underrun_count: Arc<AtomicU64>,
+    callback_counter: Arc<AtomicU64>,
     err_handler: impl Fn(cpal::Error) + Send + 'static,
-    events: Arc<Mutex<Vec<AudioEvent>>>,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
-    let mut pending_samples: Vec<f32> = Vec::new();
-    let mut pending_index: usize = 0;
-    let last_underrun_log = Arc::new(Mutex::new(Instant::now()));
-
     let stream = device
         .build_output_stream::<T, _, _>(
             config.clone(),
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                let mut beep_state = match beep.lock() {
-                    Ok(g) => Some(g),
-                    Err(e) => {
-                        warn!("Audio callback: beep mutex poisoned: {}", e);
-                        None
-                    }
-                };
-                let beep_samples: &[f32] = match &beep_state {
-                    Some(b) => &b.samples,
-                    None => &[],
-                };
-                let mut beep_idx = match &beep_state {
-                    Some(b) => b.index,
-                    None => 0,
-                };
+                callback_counter.fetch_add(1, Ordering::Relaxed);
 
-                let n = data.len();
-                for i in 0..n {
-                    if pending_index >= pending_samples.len() {
-                        match rx.lock() {
-                            Ok(rx) => match rx.try_recv() {
-                                Ok(samples) => {
-                                    pending_samples = samples;
-                                    pending_index = 0;
-                                }
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    error!("Audio callback: LTC channel disconnected (audio stream may have died)");
-                                    if let Ok(mut ev) = events.lock() {
-                                        ev.push(AudioEvent::StreamDied);
-                                    }
-                                }
-                                Err(mpsc::TryRecvError::Empty) => {
-                                    if pending_samples.is_empty() && streaming.load(Ordering::Relaxed) {
-                                        let now = Instant::now();
-                                        let mut last = last_underrun_log.lock().unwrap_or_else(|e| {
-                                            error!("Audio callback: underrun log mutex poisoned: {}", e);
-                                            e.into_inner()
-                                        });
-                                        if now.duration_since(*last) > Duration::from_secs(1) {
-                                            warn!("Audio callback: LTC scheduler not keeping up — no samples available, writing silence");
-                                            if let Ok(mut ev) = events.lock() {
-                                                ev.push(AudioEvent::Underrun);
-                                            }
-                                            *last = now;
-                                        }
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Audio callback: rx mutex poisoned: {}", e);
-                            }
+                let mut underrun_this_block = false;
+                for sample in data.iter_mut() {
+                    let ltc_val = match ltc_consumer.pop() {
+                        Some(v) => v,
+                        None => {
+                            underrun_this_block = true;
+                            0.0
                         }
-                    }
-
-                    let ltc_val = if pending_index < pending_samples.len() {
-                        let val = pending_samples[pending_index];
-                        pending_index += 1;
-                        val
-                    } else {
-                        0.0
                     };
-
-                    let beep_val = if beep_idx < beep_samples.len() {
-                        let val = beep_samples[beep_idx];
-                        beep_idx += 1;
-                        val
-                    } else {
-                        0.0
-                    };
-
-                    data[i] = T::from_sample(ltc_val + beep_val);
+                    let beep_val = beep_consumer.pop().unwrap_or(0.0);
+                    *sample = T::from_sample(ltc_val + beep_val);
                 }
 
-                if let Some(b) = &mut beep_state {
-                    b.index = beep_idx;
+                if underrun_this_block && streaming.load(Ordering::Relaxed) {
+                    underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
             },
             err_handler,
@@ -940,9 +891,11 @@ fn generate_beep_samples(
 // ── LTC scheduler thread ───────────────────────────────────────────────────
 
 fn ltc_scheduler_thread(
-    sender: mpsc::SyncSender<Vec<f32>>,
+    ltc_producer: Arc<Mutex<HeapProducer<f32>>>,
     ltc: Arc<Mutex<LtcStreamState>>,
     stop_signal: Arc<AtomicBool>,
+    underrun_count: Arc<AtomicU64>,
+    callback_counter: Arc<AtomicU64>,
     events: Arc<Mutex<Vec<AudioEvent>>>,
 ) {
     info!("LTC scheduler thread started");
@@ -951,6 +904,9 @@ fn ltc_scheduler_thread(
     let mut frame_count: u64 = 0;
     let mut drop_count: u64 = 0;
     let mut last_drop_event: u64 = 0;
+    let mut last_callback_value: u64 = 0;
+    let mut last_callback_check: Instant = Instant::now();
+    let mut last_underrun_value: u64 = 0;
 
     loop {
         if stop_signal.load(Ordering::Relaxed) {
@@ -994,6 +950,33 @@ fn ltc_scheduler_thread(
             (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, last_level)
         };
 
+        // ── Watchdog: check if audio callback is still alive ──
+        let current_callback = callback_counter.load(Ordering::Relaxed);
+        if current_callback == last_callback_value {
+            if last_callback_check.elapsed() > Duration::from_millis(500) {
+                error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
+                if let Ok(mut ev) = events.lock() {
+                    ev.push(AudioEvent::StreamDied);
+                }
+                return;
+            }
+        } else {
+            last_callback_value = current_callback;
+            last_callback_check = Instant::now();
+        }
+
+        // ── Watchdog: check for underruns ──
+        let current_underrun = underrun_count.load(Ordering::Relaxed);
+        if current_underrun > last_underrun_value {
+            let new_underruns = current_underrun - last_underrun_value;
+            warn!("LTC scheduler: detected {} callback underruns (total: {})", new_underruns, current_underrun);
+            if let Ok(mut ev) = events.lock() {
+                ev.push(AudioEvent::Underrun);
+            }
+            last_underrun_value = current_underrun;
+        }
+
+        // ── Generate LTC frame ──
         let needed = total_samples * 2;
         frame_buf.resize(needed, 0.0);
 
@@ -1008,28 +991,27 @@ fn ltc_scheduler_thread(
             &mut frame_buf[..needed],
         );
 
-        let stereo = frame_buf.clone();
-
-        if let Err(e) = sender.try_send(stereo) {
-            drop_count += 1;
-            match e {
-                mpsc::TrySendError::Full(_) => {
-                    if drop_count <= 1 || drop_count % 100 == 0 {
-                        warn!("LTC scheduler: channel full, dropped frame #{} (total drops: {})", frame_count, drop_count);
-                    }
-                    if drop_count - last_drop_event >= 100 {
-                        if let Ok(mut ev) = events.lock() {
-                            ev.push(AudioEvent::FramesDropped { total: drop_count });
-                        }
-                        last_drop_event = drop_count;
-                    }
-                }
-                mpsc::TrySendError::Disconnected(_) => {
-                    error!("LTC scheduler: channel disconnected (audio stream has died), stopping");
-                    if let Ok(mut ev) = events.lock() {
-                        ev.push(AudioEvent::StreamDied);
-                    }
+        // ── Push samples into lock-free ring buffer ──
+        {
+            let mut producer = match ltc_producer.lock() {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("LTC scheduler: producer mutex poisoned: {}", e);
                     return;
+                }
+            };
+            let pushed = producer.push_slice(&frame_buf[..needed]);
+            if pushed < needed {
+                drop_count += 1;
+                if drop_count <= 1 || drop_count % 100 == 0 {
+                    warn!("LTC scheduler: ring buffer full, dropped frame #{} (pushed {}/{}, total drops: {})",
+                        frame_count, pushed, needed, drop_count);
+                }
+                if drop_count - last_drop_event >= 100 {
+                    if let Ok(mut ev) = events.lock() {
+                        ev.push(AudioEvent::FramesDropped { total: drop_count });
+                    }
+                    last_drop_event = drop_count;
                 }
             }
         }
@@ -1051,7 +1033,7 @@ fn ltc_scheduler_thread(
             };
             state.last_level = last_level;
             state.tc = increment_timecode(&state.tc, fps, drop_frame);
-            state.next_frame_time = Instant::now() + frame_dur;
+            state.next_frame_time += frame_dur;
         }
     }
 }
