@@ -1,7 +1,7 @@
 // src-tauri-32bit/src/main.rs
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, Timecode};
+use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, AudioEvent, Timecode};
 use std::sync::Mutex;
 
 struct AppState {
@@ -90,6 +90,11 @@ fn stop_audio_output(state: tauri::State<'_, AppState>) -> Result<(), String> {
     core.stop_output()
 }
 
+#[tauri::command]
+fn drain_audio_events(state: tauri::State<'_, AppState>) -> Vec<AudioEvent> {
+    state.audio.lock().map(|c| c.drain_events()).unwrap_or_default()
+}
+
 // ── App entry point ────────────────────────────────────────────────────────
 
 fn main() {
@@ -107,6 +112,7 @@ fn main() {
             stop_ltc_stream,
             reset_ltc_stream,
             get_current_timecode,
+            drain_audio_events,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

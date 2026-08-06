@@ -1,4 +1,4 @@
-use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, Timecode};
+use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, AudioEvent, Timecode};
 
 struct AppState {
     audio: std::sync::Mutex<AudioCore>,
@@ -89,6 +89,11 @@ fn stop_audio_output(state: tauri::State<'_, AppState>) -> Result<(), String> {
     core.stop_output()
 }
 
+#[tauri::command]
+fn drain_audio_events(state: tauri::State<'_, AppState>) -> Vec<AudioEvent> {
+    state.audio.lock().map(|c| c.drain_events()).unwrap_or_default()
+}
+
 // ── App entry point ────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -117,6 +122,7 @@ pub fn run() {
             stop_ltc_stream,
             reset_ltc_stream,
             get_current_timecode,
+            drain_audio_events,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, Timecode};
+use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, AudioEvent, Timecode};
 use egui::{Color32, FontId, RichText, Sense, Ui};
 use log::{error, info, trace, warn};
 
@@ -636,6 +636,27 @@ impl eframe::App for AppState {
 
         // Update system time
         self.system_time = chrono_now_string();
+
+        // Drain audio events and surface as toast notifications
+        let events = self.audio_core.lock()
+            .map(|c| c.drain_events())
+            .unwrap_or_default();
+        for evt in events {
+            match evt {
+                AudioEvent::StreamError(msg) => {
+                    self.add_notification(NotificationType::Error, format!("Audio stream error: {}", msg));
+                }
+                AudioEvent::StreamDied => {
+                    self.add_notification(NotificationType::Error, "Audio stream has died — re-initialize device".to_string());
+                }
+                AudioEvent::Underrun => {
+                    self.add_notification(NotificationType::Warning, "Audio underrun — samples not keeping up".to_string());
+                }
+                AudioEvent::FramesDropped { total } => {
+                    self.add_notification(NotificationType::Warning, format!("{} frame(s) dropped — audio buffer overloaded", total));
+                }
+            }
+        }
 
         // Keyboard shortcuts (skip when a text field has focus)
         let any_focused = ctx.memory(|m| m.focused().is_some());

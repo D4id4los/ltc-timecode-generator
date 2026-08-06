@@ -17,6 +17,14 @@ pub struct Timecode {
     pub frames: u32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum AudioEvent {
+    StreamError(String),
+    StreamDied,
+    Underrun,
+    FramesDropped { total: u64 },
+}
+
 #[derive(Serialize)]
 pub struct AudioDeviceInfo {
     pub id: String,
@@ -59,6 +67,7 @@ struct AudioOutputState {
 pub struct AudioCore {
     audio: Mutex<Option<AudioOutputState>>,
     sample_format_name: Mutex<String>,
+    events: Arc<Mutex<Vec<AudioEvent>>>,
 }
 
 impl AudioCore {
@@ -66,7 +75,15 @@ impl AudioCore {
         Self {
             audio: Mutex::new(None),
             sample_format_name: Mutex::new(String::new()),
+            events: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn drain_events(&self) -> Vec<AudioEvent> {
+        self.events
+            .lock()
+            .map(|mut e| e.drain(..).collect())
+            .unwrap_or_default()
     }
 
     pub fn sample_format_name(&self) -> String {
@@ -154,6 +171,7 @@ impl AudioCore {
         let streaming = Arc::new(AtomicBool::new(false));
 
         let last_err_log = Arc::new(Mutex::new(Instant::now()));
+        let events_clone = self.events.clone();
         let err_handler = move |err: cpal::Error| {
             let now = Instant::now();
             let mut last = last_err_log.lock().unwrap_or_else(|e| {
@@ -162,10 +180,16 @@ impl AudioCore {
             });
             if now.duration_since(*last) > Duration::from_secs(1) {
                 error!("Audio output stream error: {}", err);
+                let mut ev = events_clone.lock().unwrap_or_else(|e| {
+                    error!("Audio error handler events mutex poisoned: {}", e);
+                    e.into_inner()
+                });
+                ev.push(AudioEvent::StreamError(err.to_string()));
                 *last = now;
             }
         };
 
+        let events_for_stream = self.events.clone();
         let stream = build_stream_for_format(
             &device,
             &stream_config,
@@ -174,6 +198,7 @@ impl AudioCore {
             beep.clone(),
             streaming.clone(),
             err_handler,
+            events_for_stream,
         )?;
 
         stream
@@ -248,10 +273,11 @@ impl AudioCore {
         let stop_signal = ltc.stop_signal.clone();
         let sender = output.sender.clone();
         let ltc_clone = output.ltc.clone();
+        let events_for_scheduler = self.events.clone();
 
         let handle = std::thread::Builder::new()
             .name("ltc-scheduler".into())
-            .spawn(move || ltc_scheduler_thread(sender, ltc_clone, stop_signal))
+            .spawn(move || ltc_scheduler_thread(sender, ltc_clone, stop_signal, events_for_scheduler))
             .map_err(|e| format!("Failed to spawn LTC scheduler thread: {}", e))?;
 
         info!("LTC scheduler thread spawned (tc={:?}, fps={}, drop_frame={})", tc, fps, drop_frame);
@@ -368,6 +394,9 @@ impl AudioCore {
                     }
                     mpsc::TrySendError::Disconnected(_) => {
                         error!("push_samples: channel disconnected (audio stream has died)");
+                        if let Ok(mut ev) = self.events.lock() {
+                            ev.push(AudioEvent::StreamDied);
+                        }
                     }
                 }
             }
@@ -504,12 +533,13 @@ fn build_stream_for_format(
     beep: Arc<Mutex<BeepState>>,
     streaming: Arc<AtomicBool>,
     err_handler: impl Fn(cpal::Error) + Send + 'static,
+    events: Arc<Mutex<Vec<AudioEvent>>>,
 ) -> Result<cpal::Stream, String> {
     match sample_format {
-        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, rx, beep, streaming, err_handler),
-        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, rx, beep, streaming, err_handler),
-        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, rx, beep, streaming, err_handler),
-        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, rx, beep, streaming, err_handler),
+        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, rx, beep, streaming, err_handler, events),
+        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, rx, beep, streaming, err_handler, events),
+        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, rx, beep, streaming, err_handler, events),
+        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, rx, beep, streaming, err_handler, events),
         other => Err(format!("Unsupported sample format: {:?}", other)),
     }
 }
@@ -521,6 +551,7 @@ fn build_stream_generic<T>(
     beep: Arc<Mutex<BeepState>>,
     streaming: Arc<AtomicBool>,
     err_handler: impl Fn(cpal::Error) + Send + 'static,
+    events: Arc<Mutex<Vec<AudioEvent>>>,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -560,6 +591,9 @@ where
                                 }
                                 Err(mpsc::TryRecvError::Disconnected) => {
                                     error!("Audio callback: LTC channel disconnected (audio stream may have died)");
+                                    if let Ok(mut ev) = events.lock() {
+                                        ev.push(AudioEvent::StreamDied);
+                                    }
                                 }
                                 Err(mpsc::TryRecvError::Empty) => {
                                     if pending_samples.is_empty() && streaming.load(Ordering::Relaxed) {
@@ -570,6 +604,9 @@ where
                                         });
                                         if now.duration_since(*last) > Duration::from_secs(1) {
                                             warn!("Audio callback: LTC scheduler not keeping up — no samples available, writing silence");
+                                            if let Ok(mut ev) = events.lock() {
+                                                ev.push(AudioEvent::Underrun);
+                                            }
                                             *last = now;
                                         }
                                     }
@@ -906,12 +943,14 @@ fn ltc_scheduler_thread(
     sender: mpsc::SyncSender<Vec<f32>>,
     ltc: Arc<Mutex<LtcStreamState>>,
     stop_signal: Arc<AtomicBool>,
+    events: Arc<Mutex<Vec<AudioEvent>>>,
 ) {
     info!("LTC scheduler thread started");
 
     let mut frame_buf: Vec<f32> = Vec::new();
     let mut frame_count: u64 = 0;
     let mut drop_count: u64 = 0;
+    let mut last_drop_event: u64 = 0;
 
     loop {
         if stop_signal.load(Ordering::Relaxed) {
@@ -978,9 +1017,18 @@ fn ltc_scheduler_thread(
                     if drop_count <= 1 || drop_count % 100 == 0 {
                         warn!("LTC scheduler: channel full, dropped frame #{} (total drops: {})", frame_count, drop_count);
                     }
+                    if drop_count - last_drop_event >= 100 {
+                        if let Ok(mut ev) = events.lock() {
+                            ev.push(AudioEvent::FramesDropped { total: drop_count });
+                        }
+                        last_drop_event = drop_count;
+                    }
                 }
                 mpsc::TrySendError::Disconnected(_) => {
                     error!("LTC scheduler: channel disconnected (audio stream has died), stopping");
+                    if let Ok(mut ev) = events.lock() {
+                        ev.push(AudioEvent::StreamDied);
+                    }
                     return;
                 }
             }
