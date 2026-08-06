@@ -21,3 +21,4 @@ src-tauri/gen/schemas/
 # Local Docker compilation cache folders
 .docker-cache/
 /.cargo/
+/target/
