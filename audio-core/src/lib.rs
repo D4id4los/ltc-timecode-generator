@@ -680,6 +680,8 @@ fn ltc_scheduler_thread(
     info!("LTC scheduler thread started");
 
     let mut frame_buf: Vec<f32> = Vec::new();
+    let mut frame_count: u64 = 0;
+    let mut drop_count: u64 = 0;
 
     loop {
         if stop_signal.load(Ordering::Relaxed) {
@@ -724,10 +726,7 @@ fn ltc_scheduler_thread(
         };
 
         let needed = total_samples * 2;
-        if frame_buf.capacity() < needed {
-            frame_buf.reserve(needed - frame_buf.len());
-        }
-        unsafe { frame_buf.set_len(needed); }
+        frame_buf.resize(needed, 0.0);
 
         generate_ltc_frame_stereo(
             &tc,
@@ -743,15 +742,25 @@ fn ltc_scheduler_thread(
         let stereo = frame_buf.clone();
 
         if let Err(e) = sender.try_send(stereo) {
+            drop_count += 1;
             match e {
                 mpsc::TrySendError::Full(_) => {
-                    warn!("LTC scheduler: channel full (audio callback can't keep up, dropping frame)");
+                    if drop_count <= 1 || drop_count % 100 == 0 {
+                        warn!("LTC scheduler: channel full, dropped frame #{} (total drops: {})", frame_count, drop_count);
+                    }
                 }
                 mpsc::TrySendError::Disconnected(_) => {
                     error!("LTC scheduler: channel disconnected (audio stream has died), stopping");
                     return;
                 }
             }
+        }
+
+        frame_count += 1;
+        if frame_count % 1000 == 0 {
+            info!("LTC scheduler: frame={}, drops={}, channel={}, fps={}, tc={:02}:{:02}:{:02}:{:02}",
+                frame_count, drop_count, ltc_channel,
+                fps, tc.hours, tc.minutes, tc.seconds, tc.frames);
         }
 
         {

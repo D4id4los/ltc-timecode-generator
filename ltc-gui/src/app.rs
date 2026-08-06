@@ -10,7 +10,7 @@ use crate::widgets;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SAMPLE_RATE: u32 = 16000;
-const BUFFER_SIZE: u32 = 512;
+const BUFFER_SIZE: u32 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioChannel {
