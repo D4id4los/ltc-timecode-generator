@@ -176,3 +176,19 @@ export async function getCurrentTimecode(): Promise<TimecodeData> {
   }
   return { hours: 0, minutes: 0, seconds: 0, frames: 0 };
 }
+
+// ── Audio events (Tauri backend) ───────────────────────────────────────────
+
+export interface AudioEvent {
+  StreamError?: string;
+  StreamDied?: null;
+  Underrun?: null;
+  FramesDropped?: { total: number };
+}
+
+export async function drainAudioEvents(): Promise<AudioEvent[]> {
+  if (isTauri()) {
+    return await tauriInvoke('drain_audio_events');
+  }
+  return [];
+}

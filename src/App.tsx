@@ -24,7 +24,11 @@ import {
   startLtcStream,
   stopLtcStream,
   resetLtcStream,
+  drainAudioEvents,
 } from "./utils/audioBackend";
+import type { AudioEvent } from "./utils/audioBackend";
+import ToastContainer from "./components/ToastContainer";
+import type { ToastItem } from "./components/ToastContainer";
 import { motion } from "motion/react";
 import {
   Play,
@@ -99,6 +103,8 @@ export default function App() {
   const [showFaq, setShowFaq] = useState<boolean>(false);
   const [isWakeLockActive, setIsWakeLockActive] = useState<boolean>(false);
   const [selectedSinkId, setSelectedSinkId] = useState<string>("default");
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const toastIdRef = useRef(0);
 
   const isTauriMode = getAudioBackendType() === "tauri";
   const tauriStartTimeRef = useRef<number>(0);
@@ -129,6 +135,49 @@ export default function App() {
       }
     }
   }, [selectedSinkId, isTauriMode]);
+
+  // Poll Tauri audio events and surface as toast notifications
+  useEffect(() => {
+    if (!isTauriMode) return;
+    const interval = setInterval(async () => {
+      try {
+        const events: AudioEvent[] = await drainAudioEvents();
+        if (events.length === 0) return;
+        const now = Date.now();
+        setToasts((prev) => {
+          let nextId = toastIdRef.current;
+          const newToasts: ToastItem[] = [];
+          for (const evt of events) {
+            nextId++;
+            if ("StreamError" in evt && evt.StreamError !== undefined) {
+              newToasts.push({ id: nextId, type: "error", message: `Audio stream error: ${evt.StreamError}`, createdAt: now, duration: 6000 });
+            } else if ("StreamDied" in evt) {
+              newToasts.push({ id: nextId, type: "error", message: "Audio stream has died — re-initialize device", createdAt: now, duration: 6000 });
+            } else if ("Underrun" in evt) {
+              newToasts.push({ id: nextId, type: "warning", message: "Audio underrun — samples not keeping up", createdAt: now, duration: 4000 });
+            } else if ("FramesDropped" in evt && evt.FramesDropped) {
+              newToasts.push({ id: nextId, type: "warning", message: `${evt.FramesDropped.total} frame(s) dropped — audio buffer overloaded`, createdAt: now, duration: 4000 });
+            }
+          }
+          toastIdRef.current = nextId;
+          return [...prev, ...newToasts];
+        });
+      } catch {
+        // backend not available
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [isTauriMode]);
+
+  // Auto-dismiss expired toasts
+  useEffect(() => {
+    if (toasts.length === 0) return;
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setToasts((prev) => prev.filter((t) => now - t.createdAt < t.duration));
+    }, 250);
+    return () => clearInterval(interval);
+  }, [toasts.length > 0]);
 
   // Dynamic system and hardware state
   const [activeSampleRate, setActiveSampleRate] = useState<number>(48000);
@@ -1034,6 +1083,11 @@ export default function App() {
           webAudioStatus={webAudioStatus}
         />
       </main>
+
+      <ToastContainer
+        toasts={toasts}
+        onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))}
+      />
     </div>
   );
 }
