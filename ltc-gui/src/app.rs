@@ -156,6 +156,7 @@ pub struct AppState {
 
     // Audio core
     pub audio_core: Mutex<AudioCore>,
+    pub sample_format_name: String,
 
     // Debug log
     pub show_debug_log: bool,
@@ -201,6 +202,7 @@ impl AppState {
             last_frame_time: None,
             has_requested_maximize: false,
             audio_core: Mutex::new(AudioCore::new()),
+            sample_format_name: String::new(),
             show_debug_log: false,
             show_app_menu: false,
             app_menu_pos: None,
@@ -330,8 +332,10 @@ impl AppState {
         match core.init_output(&device_id, SAMPLE_RATE, BUFFER_SIZE) {
             Ok(()) => {
                 self.audio_initialized = true;
-                self.status_message = "Audio initialized".to_string();
-                info!("Audio initialized successfully on {}", device_name);
+                self.sample_format_name = core.sample_format_name();
+                let fmt = &self.sample_format_name;
+                self.status_message = format!("Audio initialized ({})", fmt);
+                info!("Audio initialized successfully on {} (format={})", device_name, fmt);
             }
             Err(e) => {
                 error!("ensure_audio_init: init_output failed: {}", e);

@@ -35,6 +35,11 @@ pub fn render(ui: &mut Ui, state: &AppState) {
                 let core_status = if state.is_playing { "AUDIO CORE: RUNNING" } else { "AUDIO CORE: STANDBY" };
                 let core_color = if state.is_playing { Color32::from_rgb(0x22, 0xC5, 0x5E) } else { Color32::from_rgb(0xF5, 0x9E, 0x0B) };
                 dot_label(ui, core_status, core_color, &colors);
+
+                // 4. Sample format
+                if !state.sample_format_name.is_empty() {
+                    dot_label(ui, &format!("SAMPLE: {}", state.sample_format_name.to_uppercase()), Color32::from_rgb(0x22, 0xC5, 0x5E), &colors);
+                }
                 
                 // 4. Wake Lock status
                 dot_label(ui, "WAKE LOCK: N/A", colors.text_muted, &colors);
@@ -60,6 +65,10 @@ pub fn render(ui: &mut Ui, state: &AppState) {
                     let core_status = if state.is_playing { "RUNNING" } else { "STANDBY" };
                     let core_color = if state.is_playing { Color32::from_rgb(0x22, 0xC5, 0x5E) } else { Color32::from_rgb(0xF5, 0x9E, 0x0B) };
                     dot_label(ui, core_status, core_color, &colors);
+
+                    if !state.sample_format_name.is_empty() {
+                        dot_label(ui, &state.sample_format_name.to_uppercase(), Color32::from_rgb(0x22, 0xC5, 0x5E), &colors);
+                    }
                 });
                 
                     ui.add_space(4.0);

@@ -57,13 +57,22 @@ struct AudioOutputState {
 /// managed state; the `#[tauri::command]` wrappers just forward into here.
 pub struct AudioCore {
     audio: Mutex<Option<AudioOutputState>>,
+    sample_format_name: Mutex<String>,
 }
 
 impl AudioCore {
     pub fn new() -> Self {
         Self {
             audio: Mutex::new(None),
+            sample_format_name: Mutex::new(String::new()),
         }
+    }
+
+    pub fn sample_format_name(&self) -> String {
+        self.sample_format_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn init_output(
@@ -89,11 +98,29 @@ impl AudioCore {
             cpal::BufferSize::Default
         };
 
-        let config = cpal::StreamConfig {
-            channels: 2,
+        // Query supported configs and select the best match
+        let (stream_config, sample_format) = select_best_config(
+            &device,
+            2,
             sample_rate,
-            buffer_size: buf_size,
+            buf_size,
+        )?;
+
+        let fmt_name = match sample_format {
+            cpal::SampleFormat::F32 => "f32",
+            cpal::SampleFormat::I16 => "i16",
+            cpal::SampleFormat::I32 => "i32",
+            cpal::SampleFormat::U16 => "u16",
+            _ => "other",
         };
+
+        info!(
+            "Audio output initialized: device={}, sample_rate={}, buffer_size={}, format={}",
+            device.to_string(),
+            stream_config.sample_rate,
+            buffer_size,
+            fmt_name,
+        );
 
         let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(128);
         let rx = Arc::new(Mutex::new(rx));
@@ -113,7 +140,7 @@ impl AudioCore {
             drop_frame: false,
             ltc_channel: String::from("both"),
             ltc_volume: 0.25,
-            sample_rate,
+            sample_rate: stream_config.sample_rate,
             last_level: (1.0, 1.0),
             frame_duration: Duration::from_millis(40),
             next_frame_time: Instant::now(),
@@ -123,18 +150,6 @@ impl AudioCore {
             samples_per_bit: 0.0,
         }));
 
-        info!(
-            "Audio output initialized: device={}, sample_rate={}, buffer_size={}",
-            device.to_string(),
-            sample_rate,
-            buffer_size,
-        );
-
-        let mut pending_samples: Vec<f32> = Vec::new();
-        let mut pending_index: usize = 0;
-
-        let rx_clone = rx.clone();
-        let beep_clone = beep.clone();
         let last_err_log = Arc::new(Mutex::new(Instant::now()));
         let err_handler = move |err: cpal::Error| {
             let now = Instant::now();
@@ -148,77 +163,14 @@ impl AudioCore {
             }
         };
 
-        let stream = device
-            .build_output_stream::<f32, _, _>(
-                config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut beep_state = match beep_clone.lock() {
-                        Ok(g) => Some(g),
-                        Err(e) => {
-                            warn!("Audio callback: beep mutex poisoned: {}", e);
-                            None
-                        }
-                    };
-                    let beep_samples: &[f32] = match &beep_state {
-                        Some(b) => &b.samples,
-                        None => &[],
-                    };
-                    let mut beep_idx = match &beep_state {
-                        Some(b) => b.index,
-                        None => 0,
-                    };
-
-                    let n = data.len();
-                    for i in 0..n {
-                        if pending_index >= pending_samples.len() {
-                            match rx_clone.lock() {
-                                Ok(rx) => match rx.try_recv() {
-                                    Ok(samples) => {
-                                        pending_samples = samples;
-                                        pending_index = 0;
-                                    }
-                                    Err(mpsc::TryRecvError::Disconnected) => {
-                                        error!("Audio callback: LTC channel disconnected (audio stream may have died)");
-                                    }
-                                    Err(mpsc::TryRecvError::Empty) => {
-                                        if pending_samples.is_empty() {
-                                            trace!("Audio callback: no samples available, writing silence");
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    warn!("Audio callback: rx mutex poisoned: {}", e);
-                                }
-                            }
-                        }
-
-                        let ltc_val = if pending_index < pending_samples.len() {
-                            let val = pending_samples[pending_index];
-                            pending_index += 1;
-                            val
-                        } else {
-                            0.0
-                        };
-
-                        let beep_val = if beep_idx < beep_samples.len() {
-                            let val = beep_samples[beep_idx];
-                            beep_idx += 1;
-                            val
-                        } else {
-                            0.0
-                        };
-
-                        data[i] = ltc_val + beep_val;
-                    }
-
-                    if let Some(b) = &mut beep_state {
-                        b.index = beep_idx;
-                    }
-                },
-                err_handler,
-                None,
-            )
-            .map_err(|e| format!("Failed to build audio output stream: {}", e))?;
+        let stream = build_stream_for_format(
+            &device,
+            &stream_config,
+            sample_format,
+            rx.clone(),
+            beep.clone(),
+            err_handler,
+        )?;
 
         stream
             .play()
@@ -234,6 +186,12 @@ impl AudioCore {
             beep,
             ltc,
         });
+
+        let mut fmt = self
+            .sample_format_name
+            .lock()
+            .map_err(|e| format!("Sample format lock error: {}", e))?;
+        *fmt = fmt_name.to_string();
 
         Ok(())
     }
@@ -435,6 +393,203 @@ impl Default for AudioCore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Config selection & stream building ────────────────────────────────────
+
+fn select_best_config(
+    device: &cpal::Device,
+    desired_channels: u16,
+    desired_sample_rate: u32,
+    desired_buffer_size: cpal::BufferSize,
+) -> Result<(cpal::StreamConfig, cpal::SampleFormat), String> {
+    let supported = device
+        .supported_output_configs()
+        .map_err(|e| format!("Failed to query supported output configs: {}", e))?;
+
+    let format_priority = |fmt: cpal::SampleFormat| -> u8 {
+        match fmt {
+            cpal::SampleFormat::F32 => 5,
+            cpal::SampleFormat::I16 => 4,
+            cpal::SampleFormat::I32 => 3,
+            cpal::SampleFormat::U16 => 2,
+            cpal::SampleFormat::I8 => 1,
+            cpal::SampleFormat::U8 => 0,
+            _ => 0,
+        }
+    };
+
+    // Try to find a config that supports our desired sample rate and channels
+    let mut best_config: Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> = None;
+
+    for cfg_range in supported {
+        let fmt = cfg_range.sample_format();
+        let priority = format_priority(fmt);
+
+        if cfg_range.channels() >= desired_channels
+            && cfg_range.min_sample_rate() <= desired_sample_rate
+            && cfg_range.max_sample_rate() >= desired_sample_rate
+        {
+            let channels = desired_channels;
+            let raw_config = cfg_range
+                .with_sample_rate(desired_sample_rate)
+                .config();
+            let stream_config = cpal::StreamConfig {
+                channels,
+                sample_rate: raw_config.sample_rate,
+                buffer_size: desired_buffer_size,
+            };
+
+            let is_better = match &best_config {
+                None => true,
+                Some((_, _, best_prio)) => priority > *best_prio,
+            };
+
+            if is_better {
+                best_config = Some((stream_config, fmt, priority));
+            }
+        }
+    }
+
+    // Fallback: accept any config, just pick the highest priority format
+    if best_config.is_none() {
+        for cfg_range in device
+            .supported_output_configs()
+            .map_err(|e| format!("Failed to query configs: {}", e))?
+        {
+            let fmt = cfg_range.sample_format();
+            let priority = format_priority(fmt);
+            if cfg_range.channels() >= desired_channels {
+                let channels = desired_channels;
+                let rate = cfg_range
+                    .min_sample_rate()
+                    .max(desired_sample_rate)
+                    .min(cfg_range.max_sample_rate());
+                let raw_config = cfg_range.with_sample_rate(rate).config();
+                let stream_config = cpal::StreamConfig {
+                    channels,
+                    sample_rate: raw_config.sample_rate,
+                    buffer_size: desired_buffer_size,
+                };
+                let is_better = match &best_config {
+                    None => true,
+                    Some((_, _, best_prio)) => priority > *best_prio,
+                };
+                if is_better {
+                    best_config = Some((stream_config, fmt, priority));
+                }
+            }
+        }
+    }
+
+    best_config
+        .map(|(cfg, fmt, _)| (cfg, fmt))
+        .ok_or_else(|| "No supported audio output config found for this device".to_string())
+}
+
+fn build_stream_for_format(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    rx: Arc<Mutex<mpsc::Receiver<Vec<f32>>>>,
+    beep: Arc<Mutex<BeepState>>,
+    err_handler: impl Fn(cpal::Error) + Send + 'static,
+) -> Result<cpal::Stream, String> {
+    match sample_format {
+        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, rx, beep, err_handler),
+        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, rx, beep, err_handler),
+        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, rx, beep, err_handler),
+        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, rx, beep, err_handler),
+        other => Err(format!("Unsupported sample format: {:?}", other)),
+    }
+}
+
+fn build_stream_generic<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    rx: Arc<Mutex<mpsc::Receiver<Vec<f32>>>>,
+    beep: Arc<Mutex<BeepState>>,
+    err_handler: impl Fn(cpal::Error) + Send + 'static,
+) -> Result<cpal::Stream, String>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let mut pending_samples: Vec<f32> = Vec::new();
+    let mut pending_index: usize = 0;
+
+    let stream = device
+        .build_output_stream::<T, _, _>(
+            config.clone(),
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let mut beep_state = match beep.lock() {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        warn!("Audio callback: beep mutex poisoned: {}", e);
+                        None
+                    }
+                };
+                let beep_samples: &[f32] = match &beep_state {
+                    Some(b) => &b.samples,
+                    None => &[],
+                };
+                let mut beep_idx = match &beep_state {
+                    Some(b) => b.index,
+                    None => 0,
+                };
+
+                let n = data.len();
+                for i in 0..n {
+                    if pending_index >= pending_samples.len() {
+                        match rx.lock() {
+                            Ok(rx) => match rx.try_recv() {
+                                Ok(samples) => {
+                                    pending_samples = samples;
+                                    pending_index = 0;
+                                }
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    error!("Audio callback: LTC channel disconnected (audio stream may have died)");
+                                }
+                                Err(mpsc::TryRecvError::Empty) => {
+                                    if pending_samples.is_empty() {
+                                        trace!("Audio callback: no samples available, writing silence");
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                warn!("Audio callback: rx mutex poisoned: {}", e);
+                            }
+                        }
+                    }
+
+                    let ltc_val = if pending_index < pending_samples.len() {
+                        let val = pending_samples[pending_index];
+                        pending_index += 1;
+                        val
+                    } else {
+                        0.0
+                    };
+
+                    let beep_val = if beep_idx < beep_samples.len() {
+                        let val = beep_samples[beep_idx];
+                        beep_idx += 1;
+                        val
+                    } else {
+                        0.0
+                    };
+
+                    data[i] = T::from_sample(ltc_val + beep_val);
+                }
+
+                if let Some(b) = &mut beep_state {
+                    b.index = beep_idx;
+                }
+            },
+            err_handler,
+            None,
+        )
+        .map_err(|e| format!("Failed to build audio output stream: {}", e))?;
+
+    Ok(stream)
 }
 
 // ── Device enumeration ─────────────────────────────────────────────────────
