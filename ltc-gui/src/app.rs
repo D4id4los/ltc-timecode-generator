@@ -1441,18 +1441,27 @@ impl AppState {
             .resizable(true)
             .collapsible(false)
             .show(&ctx, |ui| {
-                let mut log_text = {
-                    let buffer = self.log_buffer.lock().unwrap();
-                    buffer.entries.iter().cloned().collect::<Vec<_>>().join("\n")
-                };
-
-                let size = ui.available_size();
-                ui.add_sized(
-                    size,
-                    egui::TextEdit::multiline(&mut log_text)
-                        .font(egui::TextStyle::Monospace)
-                        .interactive(true),
-                );
+                let buffer = self.log_buffer.lock().unwrap();
+                // Pre-allocate memory to avoid multiple reallocations
+                let estimated_size: usize = buffer.entries.iter().map(|s| s.len() + 1).sum();
+                let mut log_text = String::with_capacity(estimated_size);
+                for (i, entry) in buffer.entries.iter().enumerate() {
+                    if i > 0 {
+                        log_text.push('\n');
+                    }
+                    log_text.push_str(entry);
+                }
+                egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        ui.available_size(),
+                        egui::TextEdit::multiline(&mut log_text)
+                            .font(egui::TextStyle::Monospace)
+                            .interactive(true),
+                    );
+                });
             });
     }
 }
