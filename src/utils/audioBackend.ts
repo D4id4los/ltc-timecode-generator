@@ -2,6 +2,13 @@ export interface AudioDeviceInfo {
   id: string;
   name: string;
   is_default: boolean;
+  formats: string[];
+  channels_min: number;
+  channels_max: number;
+  sample_rate_min: number;
+  sample_rate_max: number;
+  buffer_min: number;
+  buffer_max: number;
 }
 
 export interface TimecodeData {
@@ -52,6 +59,13 @@ export async function getAudioDevices(): Promise<AudioDeviceInfo[]> {
           id: d.deviceId,
           name: d.label || `Output Device (${d.deviceId.slice(0, 8)}...)`,
           is_default: d.deviceId === 'default',
+          formats: [],
+          channels_min: 0,
+          channels_max: 0,
+          sample_rate_min: 0,
+          sample_rate_max: 0,
+          buffer_min: 0,
+          buffer_max: 0,
         }));
     }
   } catch (err) {

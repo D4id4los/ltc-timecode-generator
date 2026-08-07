@@ -36,6 +36,13 @@ pub struct AudioDeviceInfo {
     pub id: String,
     pub name: String,
     pub is_default: bool,
+    pub formats: Vec<String>,
+    pub channels_min: u16,
+    pub channels_max: u16,
+    pub sample_rate_min: u32,
+    pub sample_rate_max: u32,
+    pub buffer_min: u32,
+    pub buffer_max: u32,
 }
 
 struct LtcStreamState {
@@ -126,17 +133,12 @@ impl AudioCore {
             buf_size,
         )?;
 
-        let fmt_name = match sample_format {
-            cpal::SampleFormat::F32 => "f32",
-            cpal::SampleFormat::I16 => "i16",
-            cpal::SampleFormat::I32 => "i32",
-            cpal::SampleFormat::U16 => "u16",
-            _ => "other",
-        };
+        let fmt_name = sample_format_name(sample_format);
 
         info!(
-            "Audio output initialized: device={}, sample_rate={}, buffer_size={}, format={}",
+            "Audio output initialized: device={}, channels={}, sample_rate={}, buffer_size={}, format={}",
             device.to_string(),
+            stream_config.channels,
             stream_config.sample_rate,
             buffer_size,
             fmt_name,
@@ -482,6 +484,26 @@ impl Default for AudioCore {
 
 // ── Config selection & stream building ────────────────────────────────────
 
+fn sample_format_name(fmt: cpal::SampleFormat) -> &'static str {
+    match fmt {
+        cpal::SampleFormat::F32 => "f32",
+        cpal::SampleFormat::I16 => "i16",
+        cpal::SampleFormat::I32 => "i32",
+        cpal::SampleFormat::U16 => "u16",
+        cpal::SampleFormat::I8 => "i8",
+        cpal::SampleFormat::U8 => "u8",
+        cpal::SampleFormat::I24 => "i24",
+        cpal::SampleFormat::U24 => "u24",
+        cpal::SampleFormat::I64 => "i64",
+        cpal::SampleFormat::U32 => "u32",
+        cpal::SampleFormat::U64 => "u64",
+        cpal::SampleFormat::F64 => "f64",
+        cpal::SampleFormat::DsdU8 => "dsd_u8",
+        cpal::SampleFormat::DsdU16 => "dsd_u16",
+        _ => "other",
+    }
+}
+
 fn select_best_config(
     device: &cpal::Device,
     desired_channels: u16,
@@ -667,6 +689,103 @@ fn is_hardware_device(name: &str) -> bool {
     !PLUGIN_KEYWORDS.iter().any(|kw| name.contains(kw))
 }
 
+fn collect_device_configs(device: &cpal::Device) -> (Vec<String>, u16, u16, u32, u32, u32, u32) {
+    let configs: Vec<_> = device
+        .supported_output_configs()
+        .map(|c| c.collect())
+        .unwrap_or_default();
+    let mut formats: Vec<String> = Vec::new();
+    let mut min_channels = u16::MAX;
+    let mut max_channels = u16::MIN;
+    let mut min_rate = u32::MAX;
+    let mut max_rate = u32::MIN;
+    let mut min_buffer = u32::MAX;
+    let mut max_buffer = u32::MIN;
+    for cfg in &configs {
+        let f = sample_format_name(cfg.sample_format());
+        if !formats.iter().any(|x| x == f) {
+            formats.push(f.to_string());
+        }
+        min_channels = min_channels.min(cfg.channels());
+        max_channels = max_channels.max(cfg.channels());
+        min_rate = min_rate.min(cfg.min_sample_rate());
+        max_rate = max_rate.max(cfg.max_sample_rate());
+        match cfg.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                min_buffer = min_buffer.min(*min);
+                max_buffer = max_buffer.max(*max);
+            }
+            cpal::SupportedBufferSize::Unknown => {}
+        }
+    }
+    (formats, min_channels, max_channels, min_rate, max_rate, min_buffer, max_buffer)
+}
+
+fn log_device_supported_configs(device: &cpal::Device, label: &str) {
+    match device.supported_output_configs() {
+        Ok(configs) => {
+            let configs: Vec<_> = configs.collect();
+            let mut formats: Vec<&'static str> = Vec::new();
+            let mut min_channels = u16::MAX;
+            let mut max_channels = u16::MIN;
+            let mut min_rate = u32::MAX;
+            let mut max_rate = u32::MIN;
+            let mut min_buffer = u32::MAX;
+            let mut max_buffer = u32::MIN;
+            for cfg in &configs {
+                let f = sample_format_name(cfg.sample_format());
+                if !formats.contains(&f) {
+                    formats.push(f);
+                }
+                min_channels = min_channels.min(cfg.channels());
+                max_channels = max_channels.max(cfg.channels());
+                min_rate = min_rate.min(cfg.min_sample_rate());
+                max_rate = max_rate.max(cfg.max_sample_rate());
+                match cfg.buffer_size() {
+                    cpal::SupportedBufferSize::Range { min, max } => {
+                        min_buffer = min_buffer.min(*min);
+                        max_buffer = max_buffer.max(*max);
+                    }
+                    cpal::SupportedBufferSize::Unknown => {}
+                }
+            }
+            let ch_range = if min_channels == max_channels {
+                format!("{}", min_channels)
+            } else {
+                format!("{}-{}", min_channels, max_channels)
+            };
+            let rate_range = if min_rate == max_rate {
+                format!("{}", min_rate)
+            } else {
+                format!("{}-{}", min_rate, max_rate)
+            };
+            let buf = if min_buffer <= max_buffer && min_buffer != u32::MAX {
+                if min_buffer == max_buffer {
+                    format!("buffer={}", min_buffer)
+                } else {
+                    format!("buffer={}-{}", min_buffer, max_buffer)
+                }
+            } else {
+                String::from("buffer=unknown")
+            };
+            info!(
+                "  Device {}: formats=[{}], channels={}, rates={}, {}",
+                label,
+                formats.join(", "),
+                ch_range,
+                rate_range,
+                buf,
+            );
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            if is_permanent_device_error(&err_str) {
+                warn!("  Device {}: skipped (error: {})", label, err_str);
+            }
+        }
+    }
+}
+
 pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     let host = cpal::default_host();
     let default_device = host.default_output_device();
@@ -681,11 +800,20 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
             match dev.supported_output_configs() {
                 Ok(_) => {
                     seen.insert(name.clone());
+                    let (formats, ch_min, ch_max, rate_min, rate_max, buf_min, buf_max) = collect_device_configs(dev);
                     devices.push(AudioDeviceInfo {
                         id: String::from("default"),
                         name: format!("{} (Default)", name),
                         is_default: true,
+                        formats,
+                        channels_min: if ch_min != u16::MAX { ch_min } else { 0 },
+                        channels_max: if ch_max != u16::MIN { ch_max } else { 0 },
+                        sample_rate_min: if rate_min != u32::MAX { rate_min } else { 0 },
+                        sample_rate_max: if rate_max != u32::MIN { rate_max } else { 0 },
+                        buffer_min: if buf_min != u32::MAX { buf_min } else { 0 },
+                        buffer_max: if buf_max != u32::MIN { buf_max } else { 0 },
                     });
+                    log_device_supported_configs(dev, &format!("\"{}\" (Default)", name));
                 }
                 Err(e) => {
                     let err_str = e.to_string();
@@ -697,7 +825,15 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
                             id: String::from("default"),
                             name: format!("{} (Default)", name),
                             is_default: true,
+                            formats: Vec::new(),
+                            channels_min: 0,
+                            channels_max: 0,
+                            sample_rate_min: 0,
+                            sample_rate_max: 0,
+                            buffer_min: 0,
+                            buffer_max: 0,
                         });
+                        log_device_supported_configs(dev, &format!("\"{}\" (Default)", name));
                     }
                 }
             }
@@ -725,20 +861,26 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
                 }
             }
         }
+        log_device_supported_configs(&device, &format!("\"{}\"", name));
+        let (formats, ch_min, ch_max, rate_min, rate_max, buf_min, buf_max) = collect_device_configs(&device);
         let is_default = default_name.as_deref() == Some(&name);
         devices.push(AudioDeviceInfo {
             id: name.clone(),
             name,
             is_default,
+            formats,
+            channels_min: if ch_min != u16::MAX { ch_min } else { 0 },
+            channels_max: if ch_max != u16::MIN { ch_max } else { 0 },
+            sample_rate_min: if rate_min != u32::MAX { rate_min } else { 0 },
+            sample_rate_max: if rate_max != u32::MIN { rate_max } else { 0 },
+            buffer_min: if buf_min != u32::MAX { buf_min } else { 0 },
+            buffer_max: if buf_max != u32::MIN { buf_max } else { 0 },
         });
     }
 
     devices.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
 
     info!("Found {} audio devices", devices.len());
-    for d in &devices {
-        info!("  Device: id={}, name={}, default={}", d.id, d.name, d.is_default);
-    }
 
     Ok(devices)
 }
