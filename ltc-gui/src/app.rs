@@ -394,19 +394,40 @@ impl AppState {
             };
 
             match result {
-                Ok(()) => {
-                    let core = match self.audio_core.lock() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("ensure_audio_init: audio core mutex poisoned after init: {}", e);
-                            return;
-                        }
+                Ok(actual_rate) => {
+                    let fmt = {
+                        let core = match self.audio_core.lock() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("ensure_audio_init: audio core mutex poisoned after init: {}", e);
+                                return;
+                            }
+                        };
+                        let fmt = core.sample_format_name();
+                        self.sample_format_name = fmt.clone();
+                        fmt
                     };
                     self.audio_initialized = true;
-                    self.sample_format_name = core.sample_format_name();
-                    let fmt = &self.sample_format_name;
+                    if actual_rate != self.sample_rate {
+                        warn!(
+                            "Sample rate overridden: requested {} Hz, device uses {} Hz",
+                            self.sample_rate, actual_rate
+                        );
+                        self.add_notification(
+                            NotificationType::Warning,
+                            format!(
+                                "Sample rate overridden: {} Hz not supported by device, using {} Hz",
+                                self.sample_rate, actual_rate
+                            ),
+                        );
+                        self.sample_rate = actual_rate;
+                        self.sample_rate_index = audio_core::SAMPLE_RATE_OPTIONS
+                            .iter()
+                            .position(|&r| r == actual_rate)
+                            .unwrap_or(0);
+                    }
                     self.status_message = format!("Audio initialized ({})", fmt);
-                    info!("Audio initialized successfully on {} (format={})", device_name, fmt);
+                    info!("Audio initialized successfully on {} (format={}, sample_rate={})", device_name, fmt, actual_rate);
                     return;
                 }
                 Err(e) => {

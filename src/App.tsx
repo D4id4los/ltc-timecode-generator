@@ -434,12 +434,25 @@ export default function App() {
   // (the original "beep kills LTC" bug).
   const initAudio = async () => {
     if (isTauriMode) {
-      setActiveSampleRate(sampleRate);
       if (!tauriAudioInitRef.current) {
         tauriStartTimeRef.current = performance.now();
         try {
-          await initAudioOutput(selectedSinkId, sampleRate, 0);
+          const actualRate = await initAudioOutput(selectedSinkId, sampleRate, 0);
           tauriAudioInitRef.current = true;
+          setActiveSampleRate(actualRate);
+          if (actualRate !== sampleRate) {
+            setSampleRate(actualRate);
+            const idx = SAMPLE_RATE_OPTIONS.indexOf(actualRate);
+            if (idx >= 0) setSampleRateIndex(idx);
+            const id = ++toastIdRef.current;
+            setToasts((prev) => [...prev, {
+              id,
+              type: "warning",
+              message: `Sample rate overridden: ${sampleRate} Hz not supported by device, using ${actualRate} Hz`,
+              createdAt: Date.now(),
+              duration: 6000,
+            }]);
+          }
         } catch (err) {
           console.warn("Failed to initialize Tauri audio output:", err);
         }
@@ -474,7 +487,21 @@ export default function App() {
       beepGainNodeRef.current = beepGain;
       mixerMergerNodeRef.current = merger;
 
-      setActiveSampleRate(ctx.sampleRate);
+      const actualRate = ctx.sampleRate;
+      setActiveSampleRate(actualRate);
+      if (actualRate !== sampleRate) {
+        setSampleRate(actualRate);
+        const idx = SAMPLE_RATE_OPTIONS.indexOf(actualRate);
+        if (idx >= 0) setSampleRateIndex(idx);
+        const id = ++toastIdRef.current;
+        setToasts((prev) => [...prev, {
+          id,
+          type: "warning",
+          message: `Sample rate overridden: ${sampleRate} Hz not supported, using ${actualRate} Hz`,
+          createdAt: Date.now(),
+          duration: 6000,
+        }]);
+      }
       applyAudioSink(ctx, selectedSinkId);
     }
 

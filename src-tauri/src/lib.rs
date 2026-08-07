@@ -21,7 +21,7 @@ fn init_audio_output(
     device_id: String,
     sample_rate: u32,
     buffer_size: u32,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let core = state.audio.lock().map_err(lock_err)?;
     core.init_output(&device_id, sample_rate, buffer_size)
 }

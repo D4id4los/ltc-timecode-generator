@@ -128,14 +128,15 @@ export async function initAudioOutput(
   deviceId: string,
   sampleRate: number,
   bufferSize?: number
-): Promise<void> {
+): Promise<number> {
   if (isTauri()) {
-    await tauriInvoke('init_audio_output', {
+    return await tauriInvoke('init_audio_output', {
       deviceId,
       sampleRate,
       bufferSize: bufferSize ?? 0,
-    });
+    }) as number;
   }
+  return sampleRate;
 }
 
 export async function stopAudioOutput(): Promise<void> {

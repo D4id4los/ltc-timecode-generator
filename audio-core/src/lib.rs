@@ -111,7 +111,7 @@ impl AudioCore {
         device_id: &str,
         sample_rate: u32,
         buffer_size: u32,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         let host = cpal::default_host();
         let device = if device_id.is_empty() || device_id == "default" {
             host.default_output_device()
@@ -252,7 +252,8 @@ impl AudioCore {
             .map_err(|e| format!("Sample format lock error: {}", e))?;
         *fmt = fmt_name.to_string();
 
-        Ok(())
+        let actual_rate = stream_config.sample_rate;
+        Ok(actual_rate)
     }
 
     pub fn start_ltc(
