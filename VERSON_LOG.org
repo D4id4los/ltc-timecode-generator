@@ -1,0 +1,52 @@
+#+TITLE: Version History for LTC Timecode Generator
+
+* v0.3.1
+
+Primary focus in this release is to improve stability when working with direct
+device access for specific audio devices, instead of using the system
+default. Hopefully this will significantly reduce the number of crashes of
+audio output for directly selected devices.
+
+List of changes:
+
+- Fix the version bumping script to actually commit the files it changes.
+- Fix logging window resizing to allow arbitrary window sizes.
+- Improve the querying and logging of the system's audio device's supported
+  features.
+- Make the audio-core code more robust when directly accessing devices through
+  the cpal library, instead of using default audio devices that go through the
+  entire linux audio stack.
+- Make audio sample rate configurable between 16MHz and 48MHz, with the default
+  value being calculated depending on the device's CPU (week CPUs prefer lower
+  sample rate).
+- Change beep length default to 500ms and make it configurable in the GUI.
+- Added a version log file.
+- Added a build script that builds all supported Rust targets.
+- Created a local deploy to onedrive script, and added it to gitignore.
+- Use PipeWire by default, then fall back to PulseAudio, then to ALSA/JACK as
+  the audio backend. Allows detection of devices such as bluetooth headsets
+  that do not show in ALSA.
+
+
+* v0.3.0
+
+Mayor re-design of the rust audio backend to be more supportive of direct audio
+deivce access and support broader audio device requirements, instead of
+hard-coding stuff like the data format.
+
+Introduces a Rust-Based GUI for better performance on weaker devices.
+
+Also contains a number of smaller changes:
+
+- Create a Rust GUI.
+- Changes to the default settings for audio levels, output channels, etc.
+- Added logging to the Rust GUI & improved logging in the audio-core Rust backend.
+- Performance improvements to the Rust LTC generation code.
+- Make volume control more granular and weighted on a quadratic curve.
+- Remove unsafe block in audio backend.
+- Add windows cross compilation support.
+- Added an in-gui log viewer window.
+- Improve audio device selection error handling.
+- Add toast status messages to both Rust and Web GUIs.
+- Improve the version bumping script.
+- Fix a delay at LTC stream start causing buffer underfills.
