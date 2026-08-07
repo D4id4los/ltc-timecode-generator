@@ -974,7 +974,7 @@ fn write_val(bits: &mut [u8; 80], val: u32, start_bit: usize, length: usize) {
     }
 }
 
-fn get_ltc_bits(tc: &Timecode, drop_frame: bool) -> [u8; 80] {
+pub fn get_ltc_bits(tc: &Timecode, drop_frame: bool) -> [u8; 80] {
     let mut bits = [0u8; 80];
 
     write_val(&mut bits, tc.frames % 10, 0, 4);
@@ -1014,7 +1014,7 @@ fn get_ltc_bits(tc: &Timecode, drop_frame: bool) -> [u8; 80] {
     bits
 }
 
-fn increment_timecode(tc: &Timecode, fps: f64, drop_frame: bool) -> Timecode {
+pub fn increment_timecode(tc: &Timecode, fps: f64, drop_frame: bool) -> Timecode {
     let max_frames = fps.ceil() as u32;
     let mut h = tc.hours;
     let mut m = tc.minutes;
@@ -1048,7 +1048,7 @@ fn increment_timecode(tc: &Timecode, fps: f64, drop_frame: bool) -> Timecode {
     }
 }
 
-fn generate_ltc_frame_stereo(
+pub fn generate_ltc_frame_stereo(
     tc: &Timecode,
     drop_frame: bool,
     total_samples: usize,

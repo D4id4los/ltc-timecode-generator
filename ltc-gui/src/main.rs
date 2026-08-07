@@ -1,13 +1,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cli;
 mod log_buffer;
 mod theme;
 mod widgets;
 
 use app::AppState;
+use clap::Parser;
 
-fn main() -> eframe::Result {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = cli::Cli::parse();
+
+    if cli.list_devices {
+        cli::list_devices_and_exit();
+    }
+
+    if cli.output_to_file.is_some() {
+        return cli::generate_wav(cli);
+    }
+
+    if cli.headless {
+        return cli::run_headless(cli);
+    }
+
     let log_buffer = log_buffer::init_logger("ltc_gui=trace,audio_core=trace,info")
         .expect("Failed to initialize logger");
 
@@ -34,4 +50,5 @@ fn main() -> eframe::Result {
             Ok(Box::new(state))
         }),
     )
+    .map_err(|e| e.into())
 }
