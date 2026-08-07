@@ -1,5 +1,20 @@
 #+TITLE: Version History for LTC Timecode Generator
 
+* v0.3.2
+
+Main feature is a basic CLI interface that allows for headless running of the
+LTC generator.
+
+List of Changes:
+- Gracefully handle a case where the device does not support the selected
+  sample rate, and the audio-core chooses a different rate. The GUI will now
+  receive the actually selected rate and correctly present this information.
+- Fix the infinite loop of device reinitialisation after a audio devices
+  callback crashed and all attempts fail. It will now make 3 attempts and then
+  stop.
+- Added a basic CLI to the rust GUI that allows for headless runs, performance
+  testing, and creating WAV files with a LTC timecode.
+
 * v0.3.1
 
 Primary focus in this release is to improve stability when working with direct
@@ -7,7 +22,7 @@ device access for specific audio devices, instead of using the system
 default. Hopefully this will significantly reduce the number of crashes of
 audio output for directly selected devices.
 
-List of changes:
+List of Changes:
 
 - Fix the version bumping script to actually commit the files it changes.
 - Fix logging window resizing to allow arbitrary window sizes.
