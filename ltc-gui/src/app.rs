@@ -162,6 +162,7 @@ pub struct AppState {
     pub selected_device: usize,
     pub previous_device: Option<usize>,
     pub audio_initialized: bool,
+    pub recovery_attempt_count: u8,
 
     // Toast notifications
     pub notifications: Vec<ToastNotification>,
@@ -229,6 +230,7 @@ impl AppState {
             selected_device: 0,
             previous_device: None,
             audio_initialized: false,
+            recovery_attempt_count: 0,
             notifications: Vec::new(),
             next_notification_id: 0,
             status_message: "Ready".to_string(),
@@ -308,6 +310,7 @@ impl AppState {
         }
 
         self.selected_device = index;
+        self.recovery_attempt_count = 0;
         self.status_message = format!("Device changed to: {}", device_name);
 
         self.ensure_audio_init();
@@ -477,6 +480,8 @@ impl AppState {
             return;
         }
 
+        self.recovery_attempt_count = 0;
+
         let tc = self.start_timecode;
         let fps = self.fps();
         let channel = self.ltc_channel.as_str().to_string();
@@ -521,6 +526,22 @@ impl AppState {
     }
 
     pub fn attempt_recovery(&mut self) {
+        self.recovery_attempt_count += 1;
+
+        if self.recovery_attempt_count >= 3 {
+            error!(
+                "attempt_recovery: 3 recovery attempts exhausted — giving up"
+            );
+            self.is_playing = false;
+            self.audio_initialized = false;
+            self.status_message = "Recovery failed: device unreachable after 3 attempts".to_string();
+            self.add_notification(
+                NotificationType::Error,
+                "Audio recovery failed after 3 attempts — device may be unavailable. Re-select or re-connect audio device.".to_string(),
+            );
+            return;
+        }
+
         let was_playing = self.is_playing;
         if was_playing {
             info!("Recovery: stopping LTC stream");
@@ -560,6 +581,7 @@ impl AppState {
             };
             match core.start_ltc(tc, fps.fps, fps.drop_frame, channel, volume) {
                 Ok(()) => {
+                    self.recovery_attempt_count = 0;
                     self.is_playing = true;
                     self.status_message = "Recovery: stream restarted".to_string();
                     info!("Recovery: LTC stream restarted successfully");
