@@ -27,6 +27,9 @@ pub struct Timecode {
 pub enum AudioEvent {
     StreamError(String),
     StreamDied,
+    StreamRecovering { attempt: u8 },
+    StreamDead,
+    RecoveryNeeded { reason: String },
     Underrun,
     FramesDropped { total: u64 },
 }
@@ -123,7 +126,27 @@ impl AudioCore {
         let buf_size = if buffer_size > 0 {
             cpal::BufferSize::Fixed(buffer_size)
         } else {
-            cpal::BufferSize::Default
+            // Request a stable 1024-frame buffer; fall back to device max if unsupported
+            match device.supported_output_configs() {
+                Ok(configs) => {
+                    let mut min_buf = u32::MAX;
+                    let mut max_buf = u32::MIN;
+                    for cfg in configs {
+                        if let cpal::SupportedBufferSize::Range { min, max } = cfg.buffer_size() {
+                            min_buf = min_buf.min(*min);
+                            max_buf = max_buf.max(*max);
+                        }
+                    }
+                    if min_buf <= 1024 && 1024 <= max_buf {
+                        cpal::BufferSize::Fixed(1024)
+                    } else if max_buf > 0 {
+                        cpal::BufferSize::Fixed(max_buf)
+                    } else {
+                        cpal::BufferSize::Default
+                    }
+                }
+                Err(_) => cpal::BufferSize::Default,
+            }
         };
 
         let (stream_config, sample_format) = select_best_config(
@@ -274,7 +297,7 @@ impl AudioCore {
             samples_per_bit,
         };
 
-        let prefill_count = 3;
+        let prefill_count = 5;
         let mut frame_buf = vec![0.0f32; total_samples * 2];
         let mut prefill_tc = tc;
         let mut prefill_level = (1.0f32, 1.0f32);
@@ -504,16 +527,83 @@ fn sample_format_name(fmt: cpal::SampleFormat) -> &'static str {
     }
 }
 
+fn try_find_config(
+    device: &cpal::Device,
+    desired_channels: u16,
+    target_rate: u32,
+    desired_buffer_size: cpal::BufferSize,
+    format_priority: &impl Fn(cpal::SampleFormat) -> u8,
+) -> Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> {
+    let supported = device.supported_output_configs().ok()?;
+    let mut best: Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> = None;
+    for cfg_range in supported {
+        let fmt = cfg_range.sample_format();
+        let priority = format_priority(fmt);
+        if cfg_range.channels() >= desired_channels
+            && cfg_range.min_sample_rate() <= target_rate
+            && cfg_range.max_sample_rate() >= target_rate
+        {
+            let channels = desired_channels;
+            let raw_config = cfg_range.with_sample_rate(target_rate).config();
+            let stream_config = cpal::StreamConfig {
+                channels,
+                sample_rate: raw_config.sample_rate,
+                buffer_size: desired_buffer_size,
+            };
+            let is_better = match &best {
+                None => true,
+                Some((_, _, best_prio)) => priority > *best_prio,
+            };
+            if is_better {
+                best = Some((stream_config, fmt, priority));
+            }
+        }
+    }
+    best
+}
+
+fn try_fallback_config(
+    device: &cpal::Device,
+    desired_channels: u16,
+    target_rate: u32,
+    desired_buffer_size: cpal::BufferSize,
+    format_priority: &impl Fn(cpal::SampleFormat) -> u8,
+) -> Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> {
+    let supported = device.supported_output_configs().ok()?;
+    let mut best: Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> = None;
+    for cfg_range in supported {
+        let fmt = cfg_range.sample_format();
+        let priority = format_priority(fmt);
+        if cfg_range.channels() >= desired_channels {
+            let channels = desired_channels;
+            let rate = cfg_range
+                .min_sample_rate()
+                .max(target_rate)
+                .min(cfg_range.max_sample_rate());
+            let raw_config = cfg_range.with_sample_rate(rate).config();
+            let stream_config = cpal::StreamConfig {
+                channels,
+                sample_rate: raw_config.sample_rate,
+                buffer_size: desired_buffer_size,
+            };
+            let is_better = match &best {
+                None => true,
+                Some((_, _, best_prio)) => priority > *best_prio,
+            };
+            if is_better {
+                best = Some((stream_config, fmt, priority));
+            }
+        }
+    }
+    best
+}
+
 fn select_best_config(
     device: &cpal::Device,
     desired_channels: u16,
     desired_sample_rate: u32,
     desired_buffer_size: cpal::BufferSize,
 ) -> Result<(cpal::StreamConfig, cpal::SampleFormat), String> {
-    let supported = device
-        .supported_output_configs()
-        .map_err(|e| format!("Failed to query supported output configs: {}", e))?;
-
     let format_priority = |fmt: cpal::SampleFormat| -> u8 {
         match fmt {
             cpal::SampleFormat::F32 => 5,
@@ -526,65 +616,27 @@ fn select_best_config(
         }
     };
 
-    let mut best_config: Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> = None;
+    // First pass: exact match for the desired sample rate
+    let mut best_config = try_find_config(device, desired_channels, desired_sample_rate, desired_buffer_size, &format_priority);
 
-    for cfg_range in supported {
-        let fmt = cfg_range.sample_format();
-        let priority = format_priority(fmt);
-
-        if cfg_range.channels() >= desired_channels
-            && cfg_range.min_sample_rate() <= desired_sample_rate
-            && cfg_range.max_sample_rate() >= desired_sample_rate
-        {
-            let channels = desired_channels;
-            let raw_config = cfg_range
-                .with_sample_rate(desired_sample_rate)
-                .config();
-            let stream_config = cpal::StreamConfig {
-                channels,
-                sample_rate: raw_config.sample_rate,
-                buffer_size: desired_buffer_size,
-            };
-
-            let is_better = match &best_config {
-                None => true,
-                Some((_, _, best_prio)) => priority > *best_prio,
-            };
-
-            if is_better {
-                best_config = Some((stream_config, fmt, priority));
+    // Second pass: if desired rate is professional-grade (>=44100) and not found,
+    // try 48000 Hz, then 44100 Hz (industry standard chain)
+    if best_config.is_none() && desired_sample_rate >= 44100 {
+        let fallback_rates = [48000u32, 44100];
+        for &rate in &fallback_rates {
+            if rate == desired_sample_rate {
+                continue;
+            }
+            best_config = try_find_config(device, desired_channels, rate, desired_buffer_size, &format_priority);
+            if best_config.is_some() {
+                break;
             }
         }
     }
 
+    // Third pass: clamp to device's min/max range
     if best_config.is_none() {
-        for cfg_range in device
-            .supported_output_configs()
-            .map_err(|e| format!("Failed to query configs: {}", e))?
-        {
-            let fmt = cfg_range.sample_format();
-            let priority = format_priority(fmt);
-            if cfg_range.channels() >= desired_channels {
-                let channels = desired_channels;
-                let rate = cfg_range
-                    .min_sample_rate()
-                    .max(desired_sample_rate)
-                    .min(cfg_range.max_sample_rate());
-                let raw_config = cfg_range.with_sample_rate(rate).config();
-                let stream_config = cpal::StreamConfig {
-                    channels,
-                    sample_rate: raw_config.sample_rate,
-                    buffer_size: desired_buffer_size,
-                };
-                let is_better = match &best_config {
-                    None => true,
-                    Some((_, _, best_prio)) => priority > *best_prio,
-                };
-                if is_better {
-                    best_config = Some((stream_config, fmt, priority));
-                }
-            }
-        }
+        best_config = try_fallback_config(device, desired_channels, desired_sample_rate, desired_buffer_size, &format_priority);
     }
 
     best_config
@@ -667,6 +719,20 @@ pub fn is_permanent_device_error(err: &str) -> bool {
     let keywords = ["Permission denied", "Access denied"];
     keywords.iter().any(|kw| err.contains(kw))
 }
+
+/// Detects CPU capability and returns a sensible default sample rate.
+/// Returns 16000 Hz for weak/low-core-count CPUs, 48000 Hz for modern hardware.
+pub fn suggest_sample_rate() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let cpu_info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let is_weak = cpu_info.contains("Atom") || cpu_info.contains("N270") || cores < 4;
+    if is_weak { 16000 } else { 48000 }
+}
+
+/// Available sample rate options for UI display.
+pub const SAMPLE_RATE_OPTIONS: &[u32] = &[16000, 48000];
 
 // ── Device enumeration ─────────────────────────────────────────────────────
 
@@ -1076,6 +1142,15 @@ fn ltc_scheduler_thread(
 ) {
     info!("LTC scheduler thread started");
 
+    // Attempt to elevate thread priority for tighter scheduling
+    #[cfg(not(target_os = "macos"))]
+    match thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max) {
+        Ok(_) => info!("LTC scheduler thread priority elevated to Max"),
+        Err(e) => warn!("Could not set thread priority: {:?}", e),
+    }
+    #[cfg(target_os = "macos")]
+    info!("LTC scheduler thread priority not elevated (macOS)");
+
     let mut frame_buf: Vec<f32> = Vec::new();
     let mut frame_count: u64 = 0;
     let mut drop_count: u64 = 0;
@@ -1083,6 +1158,10 @@ fn ltc_scheduler_thread(
     let mut last_callback_value: u64 = 0;
     let mut last_callback_check: Instant = Instant::now();
     let mut last_underrun_value: u64 = 0;
+
+    // ── Watchdog recovery state (event-driven sliding window) ──
+    let mut recovery_attempts: u8 = 0;
+    let mut first_failure: Option<Instant> = None;
 
     loop {
         if stop_signal.load(Ordering::Relaxed) {
@@ -1108,8 +1187,15 @@ fn ltc_scheduler_thread(
             let now = Instant::now();
             if now < state.next_frame_time {
                 let sleep = state.next_frame_time - now;
+                let target = state.next_frame_time;
                 drop(state);
-                std::thread::sleep(sleep);
+                // Hybrid sleep: OS sleep until 2ms before deadline, then spin-loop
+                if sleep > Duration::from_millis(2) {
+                    std::thread::sleep(sleep - Duration::from_millis(2));
+                }
+                while Instant::now() < target {
+                    std::hint::spin_loop();
+                }
                 continue;
             }
 
@@ -1131,14 +1217,47 @@ fn ltc_scheduler_thread(
         if current_callback == last_callback_value {
             if last_callback_check.elapsed() > Duration::from_millis(500) {
                 error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
-                if let Ok(mut ev) = events.lock() {
-                    ev.push(AudioEvent::StreamDied);
+
+                // Sliding window: reset counter if last failure was >10s ago
+                let now = Instant::now();
+                if let Some(first) = first_failure {
+                    if now.duration_since(first) > Duration::from_secs(10) {
+                        recovery_attempts = 0;
+                        first_failure = None;
+                    }
                 }
-                return;
+
+                if recovery_attempts < 3 {
+                    recovery_attempts += 1;
+                    if first_failure.is_none() {
+                        first_failure = Some(now);
+                    }
+                    warn!("LTC scheduler: recovery attempt {}/3", recovery_attempts);
+                    if let Ok(mut ev) = events.lock() {
+                        ev.push(AudioEvent::RecoveryNeeded {
+                            reason: format!("callback stalled for 500ms (attempt {}/3)", recovery_attempts),
+                        });
+                    }
+                    // Reset watchdog timer so we don't immediately re-trigger
+                    last_callback_value = current_callback;
+                    last_callback_check = Instant::now();
+                    // Sleep a short time before checking again so the main thread can act
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                } else {
+                    error!("LTC scheduler: 3 recovery attempts exhausted — stream permanently dead");
+                    if let Ok(mut ev) = events.lock() {
+                        ev.push(AudioEvent::StreamDead);
+                    }
+                    return;
+                }
             }
         } else {
+            // Callback is alive — reset recovery state
             last_callback_value = current_callback;
             last_callback_check = Instant::now();
+            recovery_attempts = 0;
+            first_failure = None;
         }
 
         // ── Watchdog: check for underruns ──

@@ -43,6 +43,14 @@ export function getAudioBackendType(): AudioBackendType {
   return isTauri() ? 'tauri' : 'web';
 }
 
+export const SAMPLE_RATE_OPTIONS: number[] = [16000, 48000];
+
+export function suggestSampleRate(): number {
+  const cores = navigator.hardwareConcurrency || 2;
+  const isWeak = cores < 4;
+  return isWeak ? 16000 : 48000;
+}
+
 // ── Device enumeration ────────────────────────────────────────────────────
 
 export async function getAudioDevices(): Promise<AudioDeviceInfo[]> {
@@ -196,6 +204,9 @@ export async function getCurrentTimecode(): Promise<TimecodeData> {
 export interface AudioEvent {
   StreamError?: string;
   StreamDied?: null;
+  StreamRecovering?: { attempt: number };
+  StreamDead?: null;
+  RecoveryNeeded?: { reason: string };
   Underrun?: null;
   FramesDropped?: { total: number };
 }

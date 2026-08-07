@@ -10,7 +10,6 @@ use crate::theme::{Theme, ACCENT};
 use crate::widgets;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SAMPLE_RATE: u32 = 16000;
 const BUFFER_SIZE: u32 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +135,8 @@ pub struct AppState {
     pub fps_index: usize,
 
     // Audio settings
+    pub sample_rate: u32,
+    pub sample_rate_index: usize,
     pub ltc_channel: AudioChannel,
     pub beep_channel: AudioChannel,
     pub ltc_volume: f32,
@@ -194,6 +195,11 @@ impl AppState {
             seconds: 0,
             frames: 0,
         };
+        let default_rate = audio_core::suggest_sample_rate();
+        let rate_index = audio_core::SAMPLE_RATE_OPTIONS
+            .iter()
+            .position(|&r| r == default_rate)
+            .unwrap_or(0);
         Self {
             theme: Theme::Light,
             is_playing: false,
@@ -201,6 +207,8 @@ impl AppState {
             start_timecode: start_tc,
             current_timecode: start_tc,
             fps_index: 1, // 25 fps PAL
+            sample_rate: default_rate,
+            sample_rate_index: rate_index,
             ltc_channel: AudioChannel::Left,
             beep_channel: AudioChannel::Right,
             ltc_volume: 0.25,
@@ -380,7 +388,7 @@ impl AppState {
                         return;
                     }
                 };
-                core.init_output(&device_id, SAMPLE_RATE, BUFFER_SIZE)
+                core.init_output(&device_id, self.sample_rate, BUFFER_SIZE)
             };
 
             match result {
@@ -489,6 +497,58 @@ impl AppState {
         info!("LTC stream stopped");
     }
 
+    pub fn attempt_recovery(&mut self) {
+        let was_playing = self.is_playing;
+        if was_playing {
+            info!("Recovery: stopping LTC stream");
+            self.stop_streaming();
+        }
+
+        // Stop and re-init the audio output
+        info!("Recovery: re-initializing audio output");
+        let core = match self.audio_core.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                error!("attempt_recovery: audio core mutex poisoned: {}", e);
+                self.status_message = "Recovery failed: mutex poisoned".to_string();
+                return;
+            }
+        };
+        let _ = core.stop_output();
+        drop(core);
+        self.audio_initialized = false;
+        std::thread::sleep(Duration::from_millis(50));
+
+        self.ensure_audio_init();
+
+        if self.audio_initialized && was_playing {
+            info!("Recovery: restarting LTC stream");
+            let tc = self.start_timecode;
+            let fps = self.fps();
+            let channel = self.ltc_channel.as_str().to_string();
+            let volume = self.ltc_volume;
+            let core = match self.audio_core.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("attempt_recovery: audio core mutex poisoned on restart: {}", e);
+                    self.status_message = "Recovery: failed to restart stream".to_string();
+                    return;
+                }
+            };
+            match core.start_ltc(tc, fps.fps, fps.drop_frame, channel, volume) {
+                Ok(()) => {
+                    self.is_playing = true;
+                    self.status_message = "Recovery: stream restarted".to_string();
+                    info!("Recovery: LTC stream restarted successfully");
+                }
+                Err(e) => {
+                    error!("Recovery: failed to restart LTC stream: {}", e);
+                    self.status_message = format!("Recovery failed: {}", e);
+                }
+            }
+        }
+    }
+
     pub fn handle_reset(&mut self) {
         let tc = self.start_timecode;
         info!("Resetting LTC to {:02}:{:02}:{:02}:{:02}", tc.hours, tc.minutes, tc.seconds, tc.frames);
@@ -529,7 +589,7 @@ impl AppState {
                 return;
             }
         };
-        if let Err(e) = core.play_beep(SAMPLE_RATE, freq, 0.15, volume, channel) {
+        if let Err(e) = core.play_beep(self.sample_rate, freq, 0.15, volume, channel) {
             error!("trigger_clap: play_beep failed: {}", e);
         }
         drop(core);
@@ -648,6 +708,18 @@ impl eframe::App for AppState {
                 }
                 AudioEvent::StreamDied => {
                     self.add_notification(NotificationType::Error, "Audio stream has died — re-initialize device".to_string());
+                }
+                AudioEvent::StreamRecovering { attempt } => {
+                    self.add_notification(NotificationType::Warning, format!("Audio stream recovering (attempt {})", attempt));
+                }
+                AudioEvent::StreamDead => {
+                    self.add_notification(NotificationType::Error, "Fatal: audio device unreachable — stop and re-select device".to_string());
+                    self.is_playing = false;
+                    self.audio_initialized = false;
+                }
+                AudioEvent::RecoveryNeeded { reason } => {
+                    self.add_notification(NotificationType::Warning, format!("Audio recovery needed: {}", reason));
+                    self.attempt_recovery();
                 }
                 AudioEvent::Underrun => {
                     self.add_notification(NotificationType::Warning, "Audio underrun — samples not keeping up".to_string());
@@ -826,13 +898,14 @@ impl AppState {
                     // Stats column 2: Sample Rate
                     ui.vertical(|ui| {
                         ui.label(RichText::new("SAMPLE RATE").font(FontId::proportional(8.0)).color(colors.text_muted).strong());
-                        ui.label(RichText::new("16.0 KHZ").font(FontId::proportional(10.0)).strong().color(colors.text_title));
+                        let rate_khz = self.sample_rate as f32 / 1000.0;
+                        ui.label(RichText::new(format!("{:.1} KHZ", rate_khz)).font(FontId::proportional(10.0)).strong().color(colors.text_title));
                     });
                     ui.add_space(10.0);
                     // Stats column 3: Buffer
                     ui.vertical(|ui| {
                         ui.label(RichText::new("BUFFER").font(FontId::proportional(8.0)).color(colors.text_muted).strong());
-                        let buffer_smp = (16000.0 / self.fps().fps).round() as u32;
+                        let buffer_smp = (self.sample_rate as f64 / self.fps().fps).round() as u32;
                         ui.label(RichText::new(format!("{} SMP", buffer_smp)).font(FontId::proportional(10.0)).strong().color(colors.text_title));
                     });
                 });

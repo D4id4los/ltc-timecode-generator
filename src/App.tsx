@@ -25,6 +25,8 @@ import {
   stopLtcStream,
   resetLtcStream,
   drainAudioEvents,
+  suggestSampleRate,
+  SAMPLE_RATE_OPTIONS,
 } from "./utils/audioBackend";
 import type { AudioEvent } from "./utils/audioBackend";
 import ToastContainer from "./components/ToastContainer";
@@ -105,6 +107,11 @@ export default function App() {
   const [selectedSinkId, setSelectedSinkId] = useState<string>("default");
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const toastIdRef = useRef(0);
+  const [sampleRate, setSampleRate] = useState<number>(() => suggestSampleRate());
+  const [sampleRateIndex, setSampleRateIndex] = useState<number>(() => {
+    const rate = suggestSampleRate();
+    return SAMPLE_RATE_OPTIONS.indexOf(rate) >= 0 ? SAMPLE_RATE_OPTIONS.indexOf(rate) : 0;
+  });
 
   const isTauriMode = getAudioBackendType() === "tauri";
   const tauriStartTimeRef = useRef<number>(0);
@@ -153,6 +160,12 @@ export default function App() {
               newToasts.push({ id: nextId, type: "error", message: `Audio stream error: ${evt.StreamError}`, createdAt: now, duration: 6000 });
             } else if ("StreamDied" in evt) {
               newToasts.push({ id: nextId, type: "error", message: "Audio stream has died — re-initialize device", createdAt: now, duration: 6000 });
+            } else if ("StreamRecovering" in evt && evt.StreamRecovering !== undefined) {
+              newToasts.push({ id: nextId, type: "warning", message: `Audio stream recovering (attempt ${evt.StreamRecovering.attempt})`, createdAt: now, duration: 4000 });
+            } else if ("StreamDead" in evt) {
+              newToasts.push({ id: nextId, type: "error", message: "Fatal: audio device unreachable — stop and re-select device", createdAt: now, duration: 8000 });
+            } else if ("RecoveryNeeded" in evt && evt.RecoveryNeeded !== undefined) {
+              newToasts.push({ id: nextId, type: "warning", message: `Audio recovery needed: ${evt.RecoveryNeeded.reason}`, createdAt: now, duration: 4000 });
             } else if ("Underrun" in evt) {
               newToasts.push({ id: nextId, type: "warning", message: "Audio underrun — samples not keeping up", createdAt: now, duration: 4000 });
             } else if ("FramesDropped" in evt && evt.FramesDropped) {
@@ -420,7 +433,6 @@ export default function App() {
   // (the original "beep kills LTC" bug).
   const initAudio = async () => {
     if (isTauriMode) {
-      const sampleRate = 16000;
       setActiveSampleRate(sampleRate);
       if (!tauriAudioInitRef.current) {
         tauriStartTimeRef.current = performance.now();
@@ -438,11 +450,9 @@ export default function App() {
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
       let ctx: AudioContext;
       try {
-        // Create an optimized 16,000 Hz sample rate AudioContext to reduce JS generation load and memory by 3x on slow devices.
-        // It falls back to default settings gracefully if a system doesn't support the configuration.
-        ctx = new AudioCtxClass({ sampleRate: 16000 });
+        ctx = new AudioCtxClass({ sampleRate });
       } catch (e) {
-        console.warn("Could not create optimized 16kHz AudioContext, falling back to default constructor", e);
+        console.warn(`Could not create ${sampleRate}Hz AudioContext, falling back to default constructor`, e);
         ctx = new AudioCtxClass();
       }
       audioCtxRef.current = ctx;
@@ -812,11 +822,11 @@ export default function App() {
             </div>
             <div className="flex flex-col">
               <span className="text-text-muted">Sample Rate</span>
-              <span className="text-text-title font-semibold">{(activeSampleRate / 1000).toFixed(1)} kHz</span>
+              <span className="text-text-title font-semibold">{(sampleRate / 1000).toFixed(1)} kHz</span>
             </div>
             <div className="flex flex-col">
               <span className="text-text-muted">Buffer</span>
-              <span className="text-text-title font-semibold">{Math.round(activeSampleRate / selectedFps.fps)} SMP</span>
+              <span className="text-text-title font-semibold">{Math.round(sampleRate / selectedFps.fps)} SMP</span>
             </div>
             <div className="flex flex-col">
               <span className="text-text-muted">System Time</span>
@@ -1071,6 +1081,12 @@ export default function App() {
                   isPlaying={isPlaying}
                   selectedSinkId={selectedSinkId}
                   onSinkIdChange={setSelectedSinkId}
+                  sampleRate={sampleRate}
+                  sampleRateIndex={sampleRateIndex}
+                  onSampleRateChange={(i) => {
+                    setSampleRateIndex(i);
+                    setSampleRate(SAMPLE_RATE_OPTIONS[i]);
+                  }}
                 />
               </div>
             </div>

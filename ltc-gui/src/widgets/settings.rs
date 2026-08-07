@@ -56,7 +56,18 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             render_frame_rate(ui, state);
             ui.add_space(16.0);
 
-            // 3. Output Audio Interface
+            // 3. Sample Rate
+            ui.label(
+                RichText::new("🎛️ SAMPLE RATE")
+                    .font(FontId::proportional(11.0))
+                    .color(colors.text_muted)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            render_sample_rate(ui, state);
+            ui.add_space(16.0);
+
+            // 4. Output Audio Interface
             ui.label(
                 RichText::new("🔊 OUTPUT AUDIO INTERFACE SELECTION")
                     .font(FontId::proportional(11.0))
@@ -223,6 +234,56 @@ fn frame_rate_card(ui: &mut Ui, index: usize, opt: &crate::app::FrameRateOption,
             log::info!("Frame rate changed to: {} ({} fps, drop_frame={})", opt.name, opt.fps, opt.drop_frame);
         }
     }
+}
+
+fn render_sample_rate(ui: &mut Ui, state: &mut AppState) {
+    let colors = state.theme.colors();
+    let is_playing = state.is_playing;
+
+    ui.add_enabled_ui(!is_playing, |ui| {
+        let width = ui.available_width();
+        let rates = audio_core::SAMPLE_RATE_OPTIONS;
+        if width > 300.0 {
+            ui.horizontal(|ui| {
+                for (i, &rate) in rates.iter().enumerate() {
+                    let is_selected = i == state.sample_rate_index;
+                    let btn = if is_selected {
+                        egui::Button::new(
+                            RichText::new(format!("{} Hz", rate)).strong().color(Color32::BLACK)
+                        ).fill(crate::theme::ACCENT)
+                    } else {
+                        egui::Button::new(RichText::new(format!("{} Hz", rate)))
+                            .stroke(egui::Stroke::new(0.5, colors.border_main))
+                            .fill(colors.card_bg)
+                    };
+                    if ui.add(btn).clicked() {
+                        state.sample_rate_index = i;
+                        state.sample_rate = rate;
+                        log::info!("Sample rate changed to: {} Hz", rate);
+                    }
+                }
+            });
+        } else {
+            for (i, &rate) in rates.iter().enumerate() {
+                let is_selected = i == state.sample_rate_index;
+                let btn = if is_selected {
+                    egui::Button::new(
+                        RichText::new(format!("{} Hz", rate)).strong().color(Color32::BLACK)
+                    ).fill(crate::theme::ACCENT)
+                } else {
+                    egui::Button::new(RichText::new(format!("{} Hz", rate)))
+                        .stroke(egui::Stroke::new(0.5, colors.border_main))
+                        .fill(colors.card_bg)
+                };
+                if ui.add(btn).clicked() {
+                    state.sample_rate_index = i;
+                    state.sample_rate = rate;
+                    log::info!("Sample rate changed to: {} Hz", rate);
+                }
+                ui.add_space(6.0);
+            }
+        }
+    });
 }
 
 fn render_audio_device(ui: &mut Ui, state: &mut AppState) {

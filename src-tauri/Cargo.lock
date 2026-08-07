@@ -123,6 +123,7 @@ dependencies = [
  "log",
  "ringbuf",
  "serde",
+ "thread-priority",
 ]
 
 [[package]]
@@ -3505,6 +3506,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "thread-priority"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91ea89964abc1becbb0d7ad489328be89aff3bd3bc822a0005ac446bc19b067a"
+dependencies = [
+ "libc",
+ "log",
+ "winapi",
 ]
 
 [[package]]

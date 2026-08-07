@@ -5,13 +5,14 @@
 
 import React from "react";
 import { Timecode, FrameRateOption, AudioSettings, AudioChannel } from "../types";
-import { Sliders, Volume2, Music, ToggleLeft, Activity, Info, Speaker, Laptop } from "lucide-react";
+import { Sliders, Volume2, Music, ToggleLeft, Activity, Info, Speaker, Laptop, Radio } from "lucide-react";
 import {
   isTauri as isTauriApp,
   getAudioDevices,
   requestAudioPermission,
   selectAudioOutputNative,
   audioOutputSinkSupported,
+  SAMPLE_RATE_OPTIONS,
 } from "../utils/audioBackend";
 
 interface TimecodeSettingsProps {
@@ -25,6 +26,9 @@ interface TimecodeSettingsProps {
   isPlaying: boolean;
   selectedSinkId: string;
   onSinkIdChange: (sinkId: string) => void;
+  sampleRate: number;
+  sampleRateIndex: number;
+  onSampleRateChange: (index: number) => void;
 }
 
 function TimecodeSettings({
@@ -38,6 +42,9 @@ function TimecodeSettings({
   isPlaying,
   selectedSinkId,
   onSinkIdChange,
+  sampleRate,
+  sampleRateIndex,
+  onSampleRateChange,
 }: TimecodeSettingsProps) {
   const handleTimecodeChange = (field: keyof Timecode, val: number) => {
     if (isPlaying) return; // Prevent changing start time while streaming
@@ -209,7 +216,35 @@ function TimecodeSettings({
         </div>
       </div>
 
-      {/* 3. SELECT OUTPUT AUDIO INTERFACE */}
+      {/* 3. SAMPLE RATE SELECTION */}
+      <div className="space-y-4">
+        <h3 className="text-xs font-bold tracking-wider text-text-muted uppercase flex items-center gap-2">
+          <Radio className="w-4 h-4 text-[#FF5F1F]" />
+          Sample Rate
+        </h3>
+        <div className="flex flex-wrap gap-2">
+          {SAMPLE_RATE_OPTIONS.map((rate, i) => {
+            const isSelected = i === sampleRateIndex;
+            return (
+              <button
+                key={rate}
+                id={`btn-sample-rate-${rate}`}
+                onClick={() => !isPlaying && onSampleRateChange(i)}
+                disabled={isPlaying}
+                className={`px-4 py-2 text-sm font-mono font-bold rounded-lg border-2 transition-all touch-manipulation ${
+                  isSelected
+                    ? "bg-[#FF5F1F] text-black border-[#FF5F1F]"
+                    : "bg-card-bg text-text-muted border-border-main hover:border-text-muted hover:text-text-title"
+                } ${isPlaying ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
+              >
+                {rate} Hz
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 4. SELECT OUTPUT AUDIO INTERFACE */}
       <div className="space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <h3 className="text-xs font-bold tracking-wider text-text-muted uppercase flex items-center gap-2">
@@ -281,7 +316,7 @@ function TimecodeSettings({
         </div>
       </div>
 
-      {/* 4. AUDIO ROUTING & CHANNELS */}
+      {/* 5. AUDIO ROUTING & CHANNELS */}
       <div className="space-y-4">
         <h3 className="text-xs font-bold tracking-wider text-text-muted uppercase flex items-center gap-2">
           <ToggleLeft className="w-4 h-4 text-[#FF5F1F]" />
