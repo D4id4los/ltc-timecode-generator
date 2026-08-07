@@ -9,6 +9,13 @@ use audio_core::{
 use clap::Parser;
 use log::{error, info, warn};
 
+fn init_logger() {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("ltc_gui=trace,audio_core=trace,info"),
+    )
+    .try_init();
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "ltc-gui", about = "LTC Timecode Generator", version)]
 pub struct Cli {
@@ -63,6 +70,10 @@ pub struct Cli {
     /// Print timecode progression to stdout
     #[arg(long, short = 'v')]
     pub verbose: bool,
+
+    /// Enable debug log output to stderr
+    #[arg(long, short = 'd')]
+    pub debug: bool,
 }
 
 fn timecode_fmt(tc: &Timecode) -> String {
@@ -110,6 +121,7 @@ fn parse_timecode(s: &str) -> Result<Timecode, String> {
 }
 
 pub fn list_devices_and_exit() -> ! {
+    init_logger();
     match list_audio_devices() {
         Ok(devices) => {
             println!("Available audio output devices:");
@@ -182,6 +194,9 @@ fn resolve_device(devices: &[audio_core::AudioDeviceInfo], cli: &Cli) -> Result<
 }
 
 pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.debug {
+        init_logger();
+    }
     let start_tc = parse_timecode(&cli.start_timecode)?;
     let fps = cli.fps;
     let drop_frame = cli.drop_frame;
@@ -325,6 +340,9 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.debug {
+        init_logger();
+    }
     let path = cli
         .output_to_file
         .as_ref()
