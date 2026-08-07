@@ -5,9 +5,14 @@ FROM --platform=linux/386 i386/debian:11
 RUN apt-get update && apt-get install -y \
     curl \
     gcc \
+    clang \
+    libclang-dev \
+    llvm-dev \
     pkg-config \
     libasound2-dev \
     git \
+    libpipewire-0.3-dev \
+    libpulse-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure global Rust environment paths
