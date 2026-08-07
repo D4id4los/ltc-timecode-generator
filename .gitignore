@@ -22,3 +22,4 @@ src-tauri/gen/schemas/
 .docker-cache/
 /.cargo/
 /target/
+/deploy-to-onedrive.sh
