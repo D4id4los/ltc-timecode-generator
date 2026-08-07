@@ -5,6 +5,15 @@ practical application.
 The webapp interface:
 [[file:./assets/ltc-timecode-generator-ui.png]]
 
+* System Dependencies
+
+You need to have rust installed.
+
+For the audio backend, you will need the pipewire & pulseaudio dev libraries:
+- Debian/Ubuntu :: =sudo apt install libpipewire-0.3-dev libpulse-dev=
+- Fedora/RHEL :: =sudo dnf install pipewire-devel pulseaudio-libs-devel=
+- Arch Linux :: =sudo pacman -S pipewire libpulse=
+
 * Compiling the Rust GUI
 
 Setup:

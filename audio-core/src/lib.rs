@@ -751,7 +751,11 @@ const PLUGIN_KEYWORDS: &[&str] = &[
     "Plugin for",
 ];
 
-fn is_hardware_device(name: &str) -> bool {
+fn is_valid_device(name: &str, host_id: &cpal::HostId) -> bool {
+    let host_name = host_id.name();
+    if host_name == "pipewire" || host_name == "pulseaudio" {
+        return true;
+    }
     !PLUGIN_KEYWORDS.iter().any(|kw| name.contains(kw))
 }
 
@@ -854,6 +858,7 @@ fn log_device_supported_configs(device: &cpal::Device, label: &str) {
 
 pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     let host = cpal::default_host();
+    let host_id = host.id();
     let default_device = host.default_output_device();
     let default_name = default_device.as_ref().map(|d| d.to_string());
 
@@ -911,7 +916,7 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
         .map_err(|e| format!("Failed to enumerate output devices: {}", e))?
     {
         let name = device.to_string();
-        if name.is_empty() || !is_hardware_device(&name) {
+        if name.is_empty() || !is_valid_device(&name, &host_id) {
             continue;
         }
         if !seen.insert(name.clone()) {
