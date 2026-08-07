@@ -26,6 +26,7 @@ List of changes:
 - Use PipeWire by default, then fall back to PulseAudio, then to ALSA/JACK as
   the audio backend. Allows detection of devices such as bluetooth headsets
   that do not show in ALSA.
+- Small fix to the version bumping script which had a path problem.
 
 
 * v0.3.0
