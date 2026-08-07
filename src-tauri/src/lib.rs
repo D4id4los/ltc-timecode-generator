@@ -94,6 +94,11 @@ fn drain_audio_events(state: tauri::State<'_, AppState>) -> Vec<AudioEvent> {
     state.audio.lock().map(|c| c.drain_events()).unwrap_or_default()
 }
 
+#[tauri::command]
+fn get_wake_lock_status(state: tauri::State<'_, AppState>) -> bool {
+    state.audio.lock().map(|c| c.wake_lock_active()).unwrap_or(false)
+}
+
 // ── App entry point ────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -123,6 +128,7 @@ pub fn run() {
             reset_ltc_stream,
             get_current_timecode,
             drain_audio_events,
+            get_wake_lock_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

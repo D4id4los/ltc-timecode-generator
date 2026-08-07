@@ -181,6 +181,7 @@ pub struct AppState {
     // Audio core
     pub audio_core: Mutex<AudioCore>,
     pub sample_format_name: String,
+    pub wake_lock_active: bool,
 
     // Debug log
     pub show_debug_log: bool,
@@ -239,6 +240,7 @@ impl AppState {
             has_requested_maximize: false,
             audio_core: Mutex::new(AudioCore::new()),
             sample_format_name: String::new(),
+            wake_lock_active: false,
             show_debug_log: false,
             show_app_menu: false,
             app_menu_pos: None,
@@ -494,6 +496,7 @@ impl AppState {
         match core.start_ltc(tc, fps.fps, fps.drop_frame, channel, volume) {
             Ok(()) => {
                 self.is_playing = true;
+                self.wake_lock_active = core.wake_lock_active();
                 self.status_message = "Streaming LTC".to_string();
                 info!("LTC stream started successfully");
             }
@@ -519,6 +522,7 @@ impl AppState {
             error!("stop_streaming: stop_ltc failed: {}", e);
             self.status_message = format!("Stop failed: {}", e);
         }
+        self.wake_lock_active = core.wake_lock_active();
         drop(core);
         self.is_playing = false;
         self.status_message = "Stopped".to_string();

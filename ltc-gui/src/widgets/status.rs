@@ -42,7 +42,11 @@ pub fn render(ui: &mut Ui, state: &AppState) {
                 }
                 
                 // 4. Wake Lock status
-                dot_label(ui, "WAKE LOCK: N/A", colors.text_muted, &colors);
+                if state.wake_lock_active {
+                    dot_label(ui, "WAKE LOCK: ACTIVE", Color32::from_rgb(0x22, 0xC5, 0x5E), &colors);
+                } else {
+                    dot_label(ui, "WAKE LOCK: STANDBY", Color32::from_rgb(0x8E, 0x92, 0x99), &colors);
+                }
 
                 // Right side: power status
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

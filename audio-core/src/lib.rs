@@ -1,4 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use keepawake::{Builder as WakeBuilder, KeepAwake};
 use log::{error, info, warn};
 use ringbuf::{HeapRb, HeapProducer, HeapConsumer};
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,7 @@ pub struct AudioCore {
     audio: Mutex<Option<AudioOutputState>>,
     sample_format_name: Mutex<String>,
     events: Arc<Mutex<Vec<AudioEvent>>>,
+    wake_lock: Mutex<Option<KeepAwake>>,
 }
 
 impl AudioCore {
@@ -89,6 +91,7 @@ impl AudioCore {
             audio: Mutex::new(None),
             sample_format_name: Mutex::new(String::new()),
             events: Arc::new(Mutex::new(Vec::new())),
+            wake_lock: Mutex::new(None),
         }
     }
 
@@ -356,6 +359,25 @@ impl AudioCore {
         info!("LTC scheduler thread spawned (tc={:?}, fps={}, drop_frame={})", tc, fps, drop_frame);
         ltc.scheduler_thread = Some(handle);
 
+        // Acquire system wake lock to prevent sleep while LTC is streaming
+        if let Ok(mut wl) = self.wake_lock.lock() {
+            if wl.is_none() {
+                *wl = WakeBuilder::default()
+                    .display(true)
+                    .idle(true)
+                    .reason("LTC timecode generation")
+                    .app_name("LTC Timecode Generator")
+                    .app_reverse_domain("at.agere.ltc-timecode-generator")
+                    .create()
+                    .ok();
+                if wl.is_some() {
+                    info!("System wake lock acquired (display+idle)");
+                } else {
+                    warn!("Failed to acquire system wake lock (D-Bus/systemd not available?)");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -376,6 +398,14 @@ impl AudioCore {
                 if let Err(e) = handle.join() {
                     warn!("LTC scheduler thread panicked on stop: {:?}", e);
                 }
+            }
+        }
+        drop(audio);
+        // Release system wake lock
+        if let Ok(mut wl) = self.wake_lock.lock() {
+            if wl.is_some() {
+                *wl = None;
+                info!("System wake lock released (stop_ltc)");
             }
         }
         Ok(())
@@ -496,7 +526,23 @@ impl AudioCore {
         } else {
             warn!("stop_output: no audio output to stop");
         }
+        drop(audio);
+        // Release system wake lock
+        if let Ok(mut wl) = self.wake_lock.lock() {
+            if wl.is_some() {
+                *wl = None;
+                info!("System wake lock released (stop_output)");
+            }
+        }
         Ok(())
+    }
+
+    /// Returns whether the system wake lock is currently held (display+idle prevention).
+    pub fn wake_lock_active(&self) -> bool {
+        self.wake_lock
+            .lock()
+            .map(|wl| wl.is_some())
+            .unwrap_or(false)
     }
 }
 
