@@ -455,6 +455,28 @@ function TimecodeSettings({
                     className="w-full h-1.5 bg-card-bg rounded-lg appearance-none cursor-pointer accent-[#FF5F1F] touch-manipulation"
                   />
                 </div>
+
+                {/* Duration slider */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center text-[11px]">
+                    <span className="text-text-muted uppercase tracking-wider font-semibold flex items-center gap-1">
+                      <Activity className="w-3.5 h-3.5 text-[#FF5F1F]" /> Beep Length (Duration)
+                    </span>
+                    <span className="font-mono text-text-title font-bold text-xs bg-card-bg px-2 py-0.5 rounded border border-border-main">
+                      {Math.round(audioSettings.beepDuration * 1000)}ms
+                    </span>
+                  </div>
+                  <input
+                    id="slider-beep-duration"
+                    type="range"
+                    min="0.05"
+                    max="2.0"
+                    step="0.05"
+                    value={audioSettings.beepDuration}
+                    onChange={(e) => handleAudioSettingChange("beepDuration", parseFloat(e.target.value))}
+                    className="w-full h-1.5 bg-card-bg rounded-lg appearance-none cursor-pointer accent-[#FF5F1F] touch-manipulation"
+                  />
+                </div>
               </div>
             </div>
           </div>

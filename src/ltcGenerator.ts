@@ -255,7 +255,7 @@ export function playClapperBeep(
   beepDestination: AudioNode,
   volume: number,
   frequency: number = 1000,
-  duration: number = 0.15
+  duration: number = 0.5
 ): void {
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();

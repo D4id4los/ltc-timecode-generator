@@ -509,6 +509,17 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState, space_tight: f32) {
         }
         ui.label(RichText::new(format!("{} Hz", state.beep_frequency.round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
+
+    ui.add_space(space_tight);
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("DUR").font(FontId::monospace(9.0)).color(colors.text_muted));
+        let resp = ui.add(egui::Slider::new(&mut state.beep_duration, 0.05..=2.0).step_by(0.05).show_value(false));
+        if resp.changed() {
+            log::info!("Beep duration changed to: {:.0} ms", state.beep_duration * 1000.0);
+        }
+        ui.label(RichText::new(format!("{:.0} ms", state.beep_duration * 1000.0)).font(FontId::monospace(10.0)).color(colors.text_title));
+    });
 }
 
 // Stub functions retained for compatibility (no longer invoked from render())

@@ -142,6 +142,7 @@ pub struct AppState {
     pub ltc_volume: f32,
     pub beep_volume: f32,
     pub beep_frequency: f32,
+    pub beep_duration: f32,
 
     // Clapper state
     pub scene: u32,
@@ -214,6 +215,7 @@ impl AppState {
             ltc_volume: 0.25,
             beep_volume: 0.5,
             beep_frequency: 1000.0,
+            beep_duration: 0.5,
             scene: 1,
             take: 1,
             roll: "A001".to_string(),
@@ -589,7 +591,7 @@ impl AppState {
                 return;
             }
         };
-        if let Err(e) = core.play_beep(self.sample_rate, freq, 0.15, volume, channel) {
+        if let Err(e) = core.play_beep(self.sample_rate, freq, self.beep_duration, volume, channel) {
             error!("trigger_clap: play_beep failed: {}", e);
         }
         drop(core);

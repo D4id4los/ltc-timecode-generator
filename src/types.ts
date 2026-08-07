@@ -34,4 +34,5 @@ export interface AudioSettings {
   ltcVolume: number;
   beepVolume: number;
   beepFrequency: number;
+  beepDuration: number;
 }

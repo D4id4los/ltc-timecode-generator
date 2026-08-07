@@ -98,6 +98,7 @@ export default function App() {
     ltcVolume: 0.25,
     beepVolume: 0.8,
     beepFrequency: 1000,
+    beepDuration: 0.5,
   });
   const [logs, setLogs] = useState<ClapLogItem[]>([]);
   const [activeTab, setActiveTab] = useState<"clapper" | "settings">("clapper");
@@ -741,7 +742,7 @@ export default function App() {
       tauriPlayBeep(
         16000,
         audioSettings.beepFrequency,
-        0.15,
+        audioSettings.beepDuration,
         audioSettings.beepVolume * 0.5,
         audioSettings.beepChannel
       ).catch(console.warn);
@@ -763,7 +764,7 @@ export default function App() {
           beepGainNodeRef.current,
           1.0, // envelope peak is normalized; overall volume is managed by persistent beepGainNode
           audioSettings.beepFrequency,
-          0.15
+          audioSettings.beepDuration
         );
       }
     }
@@ -777,7 +778,7 @@ export default function App() {
       notes: note,
     };
     setLogs((prev) => [logItem, ...prev]);
-  }, [audioSettings.beepFrequency, audioSettings.beepVolume, audioSettings.beepChannel, isTauriMode]);
+  }, [audioSettings.beepFrequency, audioSettings.beepVolume, audioSettings.beepDuration, audioSettings.beepChannel, isTauriMode]);
 
   // Formatting displays
   const formattedTimecode = timecodeToString(currentTimecode, selectedFps.dropFrame);
