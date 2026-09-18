@@ -11,7 +11,7 @@ pub fn render(ui: &mut Ui, state: &AppState) {
     let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame);
     let ms_str = timecode::timecode_to_ms_string(s.current_timecode, s.fps);
 
-    let parts: Vec<&str> = tc_str.split(|c| c == ':' || c == ';').collect();
+    let parts: Vec<&str> = tc_str.split([':', ';']).collect();
     let digit_color = if s.is_playing { colors.text_title } else { colors.text_muted };
     let sep = if s.drop_frame { ";" } else { ":" };
 

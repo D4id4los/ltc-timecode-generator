@@ -382,7 +382,7 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let duration_secs = cli
         .duration
-        .ok_or_else(|| "--duration is required for WAV file output")?;
+        .ok_or("--duration is required for WAV file output")?;
 
     if duration_secs <= 0.0 {
         return Err("Duration must be positive".to_string().into());

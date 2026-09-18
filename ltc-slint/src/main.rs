@@ -77,7 +77,7 @@ fn push_toast(
 // ── Timecode segment helpers ────────────────────────────────────────────
 
 fn split_timecode_segments(tc_str: &str) -> [String; 7] {
-    let parts: Vec<&str> = tc_str.split(|c| c == ':' || c == ';').collect();
+    let parts: Vec<&str> = tc_str.split([':', ';']).collect();
     let sep = if tc_str.contains(';') { ';' } else { ':' };
     [
         parts[0].to_string(),
@@ -107,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = gui_engine::cli::parse_args();
 
     match gui_engine::cli::process_cli(cli) {
-        gui_engine::cli::CliOutcome::Done => return Ok(()),
+        gui_engine::cli::CliOutcome::Done => Ok(()),
         gui_engine::cli::CliOutcome::RunGui { cmd_tx, state } => {
             _run_gui(cmd_tx, state)
         }

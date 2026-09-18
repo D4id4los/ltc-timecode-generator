@@ -10,3 +10,10 @@ exclude = [
   "src-tauri",
   "src-tauri-32bit"
 ]
+
+[workspace.lints.clippy]
+# Levels for selected clippy lint groups. Add per-lint overrides here.
+style = "warn"
+correctness = "warn"
+complexity = "warn"
+perf = "warn"

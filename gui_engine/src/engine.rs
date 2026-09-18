@@ -11,7 +11,7 @@ use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(40);
-const TARGET_ARM_ANGLE: f32 = -25.0f32.to_radians();
+const TARGET_ARM_ANGLE: f32 = -25.0 * std::f32::consts::PI / 180.0;
 const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 const MAX_CLAP_LOGS: usize = 1000;
 const BUFFER_SIZE: u32 = 0;
@@ -305,7 +305,7 @@ fn stepper_second(state: &mut AppStateSnapshot, delta: i32) {
 
 fn stepper_frame(state: &mut AppStateSnapshot, delta: i32) {
     let mut tc = state.start_timecode;
-    let max_frame = (state.fps.round() as u32).saturating_sub(1).max(0);
+    let max_frame = (state.fps.round() as u32).saturating_sub(1);
     tc.frames = (tc.frames as i32 + delta).rem_euclid(max_frame as i32 + 1) as u32;
     state.start_timecode = tc;
 }
@@ -458,24 +458,24 @@ fn attempt_recovery(
     state.audio_initialized = false;
     state.is_playing = false;
 
-    if ensure_audio_init(core, state, &mut None, recovery_attempts) {
-        if was_playing {
-            let _ = core.reset_ltc(stored_tc);
-            match core.start_ltc(
-                stored_tc,
-                state.fps,
-                state.drop_frame,
-                state.ltc_channel.clone(),
-                state.ltc_volume,
-            ) {
-                Ok(()) => {
-                    state.is_playing = true;
-                    state.current_timecode = stored_tc;
-                    info!("Recovery succeeded");
-                }
-                Err(e) => {
-                    error!("Recovery start_ltc failed: {}", e);
-                }
+    if ensure_audio_init(core, state, &mut None, recovery_attempts)
+        && was_playing
+    {
+        let _ = core.reset_ltc(stored_tc);
+        match core.start_ltc(
+            stored_tc,
+            state.fps,
+            state.drop_frame,
+            state.ltc_channel.clone(),
+            state.ltc_volume,
+        ) {
+            Ok(()) => {
+                state.is_playing = true;
+                state.current_timecode = stored_tc;
+                info!("Recovery succeeded");
+            }
+            Err(e) => {
+                error!("Recovery start_ltc failed: {}", e);
             }
         }
     }

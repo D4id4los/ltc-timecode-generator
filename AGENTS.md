@@ -224,5 +224,6 @@ npm run clean                        # rm -rf dist src-tauri/target ...
 cargo build                          # Build all Rust crates (workspace)
 cd ltc-gui && cargo run --release    # Native Rust GUI (egui/eframe)
 cd ltc-slint && cargo run --release  # Slint-based GUI spike
+cargo clippy --all-targets            # Run clippy on all workspace crates
 ./build-32bit.sh                     # Docker cross-compile for i686
 ```

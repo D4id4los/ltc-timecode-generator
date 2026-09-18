@@ -162,7 +162,7 @@ impl AudioCore {
 
         info!(
             "Audio output initialized: device={}, channels={}, sample_rate={}, buffer_size={}, format={}",
-            device.to_string(),
+            device,
             stream_config.channels,
             stream_config.sample_rate,
             buffer_size,
@@ -723,7 +723,7 @@ where
 {
     let stream = device
         .build_output_stream::<T, _, _>(
-            config.clone(),
+            *config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 callback_counter.fetch_add(1, Ordering::Relaxed);
 
@@ -1048,8 +1048,8 @@ pub fn get_ltc_bits(tc: &Timecode, drop_frame: bool) -> [u8; 80] {
 
     bits[64] = 0;
     bits[65] = 0;
-    for i in 66..=77 {
-        bits[i] = 1;
+    for bit in bits.iter_mut().take(78).skip(66) {
+        *bit = 1;
     }
     bits[78] = 0;
     bits[79] = 1;
