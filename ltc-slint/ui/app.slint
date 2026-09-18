@@ -2064,6 +2064,9 @@ export component AppWindow inherits Window {
     callback refresh-devices;
     callback dismiss-toast(int);
 
+    // ── Tab navigation ──
+    callback tab-clicked(int);
+
     // ── Theme ──
     callback toggle-theme;
 
@@ -2388,7 +2391,7 @@ export component AppWindow inherits Window {
                     Rectangle {
                         width: 50%;
                         TouchArea {
-                            clicked => { root.active-tab = 0; }
+                            clicked => { root.tab-clicked(0); }
                         }
                         VerticalLayout {
                             alignment: center;
@@ -2409,7 +2412,7 @@ export component AppWindow inherits Window {
                     Rectangle {
                         width: 50%;
                         TouchArea {
-                            clicked => { root.active-tab = 1; }
+                            clicked => { root.tab-clicked(1); }
                         }
                         VerticalLayout {
                             alignment: center;

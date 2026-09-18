@@ -9,11 +9,11 @@ use audio_core::{
 };
 use chrono::Local;
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use slint::{ModelRc, SharedString, VecModel, Weak};
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 struct AudioInitOutcome {
@@ -50,6 +50,22 @@ const CHANNEL_NAMES: [ChannelName; 3] = [
     ChannelName::new("right"),
     ChannelName::new("both"),
 ];
+
+/// Time a mutex lock acquisition. Returns (guard, wait_us).
+/// If the wait exceeds 1000μs, the label is appended to slow_sections.
+fn time_lock<'a, T>(
+    label: &'static str,
+    mutex: &'a Mutex<T>,
+    slow_sections: &mut Vec<String>,
+) -> (std::sync::MutexGuard<'a, T>, u128) {
+    let start = Instant::now();
+    let guard = mutex.lock().unwrap();
+    let wait_us = start.elapsed().as_micros();
+    if wait_us > 1000 {
+        slow_sections.push(format!("{}.lock:{}μs", label, wait_us));
+    }
+    (guard, wait_us)
+}
 
 fn channel_to_str(index: usize) -> &'static str {
     CHANNEL_NAMES.get(index).map(|c| c.name).unwrap_or("both")
@@ -952,9 +968,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut log_vec = logs_clone.lock().unwrap();
             log_vec.push(entry);
 
-            // Update the model
+            // Update the model (timed)
+            let rebuild_start = Instant::now();
             let log_model = ModelRc::new(VecModel::<LogEntry>::from(log_vec.clone()));
+            let rebuild_us = rebuild_start.elapsed().as_micros();
             ui.set_logs(log_model);
+            if rebuild_us > 1000 {
+                info!(
+                    "[PERF] Log model rebuild took {}μs ({} entries)",
+                    rebuild_us,
+                    log_vec.len()
+                );
+            }
 
             if *auto_increment_clone.lock().unwrap() {
                 let mut t = take_clone.lock().unwrap();
@@ -1099,6 +1124,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.on_dismiss_toast(move |id| {
             if let Some(fui) = ui_weak.upgrade() {
                 dismiss_toast_by_id(&toasts_clone, &fui, id);
+            }
+        });
+    }
+
+    // ── Tab navigation ─────────────────────────────────────────────────────────
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_tab_clicked(move |new_tab| {
+            let tab_name = match new_tab {
+                0 => "Clapper Slate & Logs",
+                1 => "Signal & Audio Settings",
+                _ => "Unknown",
+            };
+            let click_time = Instant::now();
+            info!(
+                "[PERF] Tab clicked: tab={} ({}), t=+0μs",
+                new_tab, tab_name
+            );
+            if let Some(u) = ui_weak.upgrade() {
+                // Check if already on this tab (spurious click)
+                let prev = u.get_active_tab();
+                if prev == new_tab {
+                    info!(
+                        "[PERF] Tab {} already active, ignoring (t=+{}μs)",
+                        new_tab,
+                        click_time.elapsed().as_micros()
+                    );
+                    return;
+                }
+                u.set_active_tab(new_tab);
+                let elapsed = click_time.elapsed();
+                info!(
+                    "[PERF] Tab switch {}→{} complete: t=+{}μs",
+                    prev, new_tab, elapsed.as_micros()
+                );
+            } else {
+                warn!("tab_clicked: UI gone");
             }
         });
     }
@@ -1552,6 +1614,13 @@ fn stepper_handlers(
             slint::TimerMode::Repeated,
             Duration::from_millis(POLL_INTERVAL_MS),
             move || {
+                let poll_start = Instant::now();
+                let mut slow_sections: Vec<String> = Vec::new();
+
+                // Tick counter for periodic summaries
+                static POLL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tick = POLL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                 let ui = match ui_weak.upgrade() {
                     Some(u) => u,
                     None => return,
@@ -1637,7 +1706,7 @@ fn stepper_handlers(
 
                 // Poll timecode if playing
                 if *is_playing_clone.lock().unwrap() {
-                    let core = audio_core_clone.lock().unwrap();
+                    let (core, _lock_wait) = time_lock("audio_core.poll", &audio_core_clone, &mut slow_sections);
                     let tc = core.current_timecode();
                     let fi = *fps_index_clone.lock().unwrap();
                     let opt = &FPS_OPTIONS[fi];
@@ -1668,14 +1737,23 @@ fn stepper_handlers(
                     if current_count != *last_count {
                         let entries: Vec<SharedString> = log_entries.entries.iter().map(|s| SharedString::from(s.as_str())).collect();
                         drop(log_entries);
+                        let rebuild_start = Instant::now();
                         ui.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::from(entries)));
+                        let rebuild_us = rebuild_start.elapsed().as_micros();
+                        if rebuild_us > 1000 {
+                            info!(
+                                "[PERF] Debug log model rebuild took {}μs ({} entries)",
+                                rebuild_us,
+                                current_count
+                            );
+                        }
                         *last_count = current_count;
                     }
                 }
 
                 // Drain audio events (lock released before iteration so recovery can re-acquire)
                 let events = {
-                    let core = audio_core_clone.lock().unwrap();
+                    let (core, _lock_wait) = time_lock("audio_core.events", &audio_core_clone, &mut slow_sections);
                     core.drain_events()
                 };
                 let has_recovery_event = events.iter().any(|e| matches!(e, AudioEvent::StreamDied | AudioEvent::RecoveryNeeded { .. }));
@@ -1728,6 +1806,32 @@ fn stepper_handlers(
                         &ui_weak,
                         &toasts_clone,
                         &next_toast_id_clone,
+                    );
+                }
+
+                // ── Poll timing diagnostics ─────────────────────────────────────
+                let poll_elapsed = poll_start.elapsed();
+                if poll_elapsed.as_micros() > POLL_INTERVAL_MS as u128 * 1000 {
+                    warn!(
+                        "[PERF] Poll tick #{} exceeded interval: {}ms (interval={}ms). Slow sections: [{}]",
+                        tick,
+                        poll_elapsed.as_micros() as f64 / 1000.0,
+                        POLL_INTERVAL_MS,
+                        slow_sections.join(", ")
+                    );
+                } else if poll_elapsed.as_micros() > (POLL_INTERVAL_MS as u128 * 1000) / 2 {
+                    debug!(
+                        "[PERF] Poll tick #{} took {}ms (>50% of interval)",
+                        tick,
+                        poll_elapsed.as_micros() as f64 / 1000.0,
+                    );
+                }
+                if tick % 250 == 0 {
+                    info!(
+                        "[PERF] Poll tick #{} timing summary: {}ms total, slow sections: [{}]",
+                        tick,
+                        poll_elapsed.as_micros() as f64 / 1000.0,
+                        slow_sections.join(", ")
                     );
                 }
             },
