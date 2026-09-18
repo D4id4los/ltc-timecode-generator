@@ -31,6 +31,10 @@ pub enum GuiCommand {
     SetRoll(String),
     SetAutoIncrement(bool),
 
+    // ── Theme ───────────────────────────────────────────────────────────
+    SetTheme(bool),
+    ToggleTheme,
+
     // ── Logs ────────────────────────────────────────────────────────────
     ClearLogs,
 

@@ -57,7 +57,7 @@ pub struct Cli {
     pub drop_frame: bool,
 
     /// LTC audio channel: left, right, both
-    #[arg(long, default_value = "both")]
+    #[arg(long, default_value = "left")]
     pub channel: String,
 
     /// LTC volume (0.0 to 1.0)

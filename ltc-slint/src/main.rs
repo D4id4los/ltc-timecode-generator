@@ -220,12 +220,9 @@ fn _run_gui(
 
     // ── Theme toggle ───────────────────────────────────────────────────────
     {
-        let ui_weak = ui.as_weak();
+        let cmd = cmd_tx.clone();
         ui.on_toggle_theme(move || {
-            if let Some(u) = ui_weak.upgrade() {
-                let colors = AppColors::get(&u);
-                colors.set_theme_dark(!colors.get_theme_dark());
-            }
+            let _ = cmd.send(GuiCommand::ToggleTheme);
         });
     }
 
@@ -504,7 +501,10 @@ fn _run_gui(
                 // 2. System time
                 ui.set_system_time(SharedString::from(format!("{} UTC", timecode::chrono_now_string())));
 
-                // 3. Pulse phase animation (GUI-only, 4Hz sine)
+                // 3. Theme sync
+                AppColors::get(&ui).set_theme_dark(s.is_dark_theme);
+
+                // 4. Pulse phase animation (GUI-only, 4Hz sine)
                 let mut pp = pulse_phase_clone.lock().unwrap();
                 *pp += 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
                 if *pp > PI * 100.0 { *pp = 0.0; }

@@ -16,13 +16,6 @@ pub enum Theme {
 }
 
 impl Theme {
-    pub fn toggle(self) -> Self {
-        match self {
-            Theme::Dark => Theme::Light,
-            Theme::Light => Theme::Dark,
-        }
-    }
-
     pub fn apply(self, ctx: &egui::Context) {
         let colors = self.colors();
         let mut visuals = match self {

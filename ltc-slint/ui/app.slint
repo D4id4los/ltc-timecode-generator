@@ -3,7 +3,7 @@ import { ScrollView, ComboBox, Slider, ListView, StandardListView } from "std-wi
 // ── Constants ───────────────────────────────────────────────────────────────
 
 export global AppColors {
-    in-out property <bool> theme-dark: true;
+    in-out property <bool> theme-dark;
 
     // Dark theme source colors
     in property <color> dark-accent: #FF5F1F;
@@ -433,7 +433,7 @@ component ClapperSection {
     in-out property <string> roll;
     in-out property <bool> auto-increment;
     in-out property <[LogEntry]> logs;
-    in-out property <float> arm-angle: 0.0;
+    in-out property <float> arm-angle: -0.43633;
     in-out property <length> window-width: 800px;
     in-out property <bool> copy-confirmed: false;
 
@@ -1837,7 +1837,7 @@ export component AppWindow inherits Window {
     in-out property <string> roll: "A001";
     in-out property <bool> auto-increment: true;
     in-out property <[LogEntry]> logs: [];
-    in-out property <float> arm-angle: 0.0;
+    in-out property <float> arm-angle: -0.43633;
     in-out property <bool> copy-confirmed: false;
 
     // ── Flash overlay ──

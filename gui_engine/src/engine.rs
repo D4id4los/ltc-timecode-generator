@@ -257,6 +257,12 @@ fn process_command(
         GuiCommand::SetAutoIncrement(val) => {
             state.auto_increment_take = val;
         }
+        GuiCommand::SetTheme(dark) => {
+            state.is_dark_theme = dark;
+        }
+        GuiCommand::ToggleTheme => {
+            state.is_dark_theme = !state.is_dark_theme;
+        }
         GuiCommand::ClearLogs => {
             state.logs.clear();
         }

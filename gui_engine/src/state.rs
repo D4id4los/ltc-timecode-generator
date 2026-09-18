@@ -55,6 +55,9 @@ pub struct AppStateSnapshot {
     pub clap_flash_alpha: f32,
     pub clap_arm_angle: f32,
 
+    // Theme
+    pub is_dark_theme: bool,
+
     // Status
     pub status_message: String,
     pub system_time: String,
@@ -109,6 +112,7 @@ impl AppStateSnapshot {
             logs: Vec::new(),
             clap_flash_alpha: 0.0,
             clap_arm_angle: -25.0f32.to_radians(),
+            is_dark_theme: false,
             status_message: "Ready".to_string(),
             system_time: String::new(),
             events: Vec::new(),

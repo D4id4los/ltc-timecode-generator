@@ -51,7 +51,7 @@ pub struct AppState {
     engine_state: Arc<ArcSwap<AppStateSnapshot>>,
     pub latest: AppStateSnapshot,
 
-    // Theme
+    // Theme (derived from engine state each frame)
     pub theme: Theme,
 
     // Tab state
@@ -81,9 +81,9 @@ impl AppState {
         let initial = AppStateSnapshot::initial();
         Self {
             cmd_tx,
-            latest: initial,
+            latest: initial.clone(),
             engine_state,
-            theme: Theme::Light,
+            theme: if initial.is_dark_theme { Theme::Dark } else { Theme::Light },
             active_tab: Tab::Clapper,
             show_faq: false,
             notifications: Vec::new(),
@@ -116,7 +116,8 @@ impl eframe::App for AppState {
             self.has_requested_maximize = true;
         }
 
-        // 3. Apply theme
+        // 3. Derive theme from engine state and apply
+        self.theme = if self.latest.is_dark_theme { Theme::Dark } else { Theme::Light };
         self.theme.apply(ctx);
 
         // 4. Delta time
@@ -341,7 +342,7 @@ impl AppState {
                 let icon = if self.theme == Theme::Dark { "\u{2600}\u{FE0F}" } else { "\u{1F319}" };
                 let theme_btn = egui::Button::new(RichText::new(icon).font(FontId::proportional(12.0))).fill(colors.nested_bg);
                 if ui.add(theme_btn).clicked() {
-                    self.theme = self.theme.toggle();
+                    let _ = self.cmd_tx.send(GuiCommand::ToggleTheme);
                 }
             });
         });
