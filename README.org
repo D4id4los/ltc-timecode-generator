@@ -76,6 +76,12 @@ Now compile with:
   cargo run --release          # Release (12MB stripped)
   LIBGL_ALWAYS_SOFTWARE=1 cargo run  # Force software rendering for GPU-less testing
 #+end_src
+or in the project root:
+#+begin_src bash
+  cargo run --bin ltc-gui
+  cargo run --bin ltc-slint
+#+end_src
+
 
 To run the rust GUI or the tauri webapp with debug output, use:
 #+begin_src bash

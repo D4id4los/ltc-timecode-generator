@@ -34,6 +34,13 @@ export struct FrameRateOption {
     description: string,
 }
 
+export struct ToastData {
+    id: int,
+    message: string,
+    toast-type: string,
+    opacity: float,
+}
+
 // ── Pill box ────────────────────────────────────────────────────────────────
 
 component PillBox {
@@ -72,6 +79,7 @@ component ClockSection {
     in-out property <string> fps-name;
     in-out property <string> ltc-route;
     in-out property <string> beep-route;
+    in-out property <float> pulse-phase: 0.0;
 
     callback start-ltc;
     callback stop-ltc;
@@ -107,6 +115,7 @@ component ClockSection {
                     height: 8px;
                     border-radius: 4px;
                     background: root.is-playing ? AppColors.green : AppColors.amber;
+                    opacity: root.is-playing ? Math.sin(root.pulse-phase * 1rad) * 0.3 + 0.7 : 1.0;
                 }
             }
 
@@ -268,7 +277,7 @@ component ClapperSection {
     in-out property <string> roll;
     in-out property <bool> auto-increment;
     in-out property <[LogEntry]> logs;
-    in-out property <bool> flash-visible;
+    in-out property <float> arm-angle: 0.0;
 
     callback scene-up;
     callback scene-down;
@@ -291,12 +300,6 @@ component ClapperSection {
             border-width: 1px;
             border-color: AppColors.border-main;
 
-            if (root.flash-visible) : Rectangle {
-                background: white;
-                opacity: 0.8;
-                border-radius: 8px;
-            }
-
             VerticalLayout {
                 padding-left: 12px;
                 padding-right: 12px;
@@ -305,8 +308,35 @@ component ClapperSection {
                 spacing: 4px;
                 alignment: center;
 
+// Top bar (static hinge / fixed board)
+            Rectangle {
+                height: 20px;
+                background: AppColors.deep-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                border-radius: 2px;
+                HorizontalLayout {
+                    spacing: 0px;
+                    for stripe-index in [0, 1, 2, 3, 4, 5] : Rectangle {
+                        width: 1px;
+                        background: Math.mod(stripe-index, 2) == 0 ? AppColors.deep-bg : AppColors.accent;
+                        border-radius: 0px;
+                    }
+                }
+            }
+
+            // Hinge gap
+            Rectangle {
+                height: 2px;
+                background: AppColors.border-main;
+            }
+
+            // Bottom arm (vertical bounce on clap)
+            Rectangle {
+                height: 22px;
                 Rectangle {
                     height: 20px;
+                    y: 2px + root.arm-angle * 1px;
                     background: AppColors.deep-bg;
                     border-width: 1px;
                     border-color: AppColors.border-main;
@@ -320,27 +350,7 @@ component ClapperSection {
                         }
                     }
                 }
-
-                Rectangle {
-                    height: 2px;
-                    background: AppColors.border-main;
-                }
-
-                Rectangle {
-                    height: 20px;
-                    background: AppColors.deep-bg;
-                    border-width: 1px;
-                    border-color: AppColors.border-main;
-                    border-radius: 2px;
-                    HorizontalLayout {
-                        spacing: 0px;
-                        for stripe-index in [0, 1, 2, 3, 4, 5] : Rectangle {
-                            width: 1px;
-                            background: Math.mod(stripe-index, 2) == 0 ? AppColors.deep-bg : AppColors.accent;
-                            border-radius: 0px;
-                        }
-                    }
-                }
+            }
 
                 Text {
                     text: "Tap to clap";
@@ -1247,7 +1257,16 @@ export component AppWindow {
     in-out property <string> roll: "A001";
     in-out property <bool> auto-increment: true;
     in-out property <[LogEntry]> logs: [];
-    in-out property <bool> flash-visible: false;
+    in-out property <float> arm-angle: 0.0;
+
+    // ── Flash overlay ──
+    in-out property <float> flash-opacity: 0.0;
+
+    // ── Pulse animation ──
+    in-out property <float> pulse-phase: 0.0;
+
+    // ── Toasts ──
+    in-out property <[ToastData]> toasts: [];
 
     // ── Settings properties ──
     in-out property <int> hour: 1;
@@ -1316,6 +1335,28 @@ export component AppWindow {
     callback beep-frequency-changed(float);
     callback beep-duration-changed(float);
     callback refresh-devices;
+    callback dismiss-toast(int);
+
+    // ── Keyboard shortcuts ──
+    FocusScope {
+        key-pressed(event) => {
+            if (event.text == " ") {
+                if (root.is-playing) { root.stop-ltc(); } else { root.start-ltc(); }
+                accept
+            } else if (event.text == "c" || event.text == "C") {
+                if (!root.is-locked) { root.clap-beep(); }
+                accept
+            } else if (event.text == "r" || event.text == "R") {
+                if (!root.is-playing && !root.is-locked) { root.reset-tc(); }
+                accept
+            } else if (event.text == "l" || event.text == "L") {
+                root.toggle-lock();
+                accept
+            } else {
+                reject
+            }
+        }
+    }
 
     // ── Main Layout ──
     Rectangle {
@@ -1476,6 +1517,7 @@ export component AppWindow {
                     fps-name: root.fps-name;
                     ltc-route: root.ltc-route;
                     beep-route: root.beep-route;
+                    pulse-phase: root.pulse-phase;
                     start-ltc => { root.start-ltc(); }
                     stop-ltc => { root.stop-ltc(); }
                     clap-beep => { root.clap-beep(); }
@@ -1531,7 +1573,7 @@ export component AppWindow {
                     roll: root.roll;
                     auto-increment: root.auto-increment;
                     logs: root.logs;
-                    flash-visible: root.flash-visible;
+                    arm-angle: root.arm-angle;
                     scene-up => { root.scene-up(); }
                     scene-down => { root.scene-down(); }
                     take-up => { root.take-up(); }
@@ -1592,6 +1634,69 @@ export component AppWindow {
             wake-lock-active: root.wake-lock-active;
             status-message: root.status-message;
         }
-    }
+
+        }
+
+        // Full-screen flash overlay (outside layout, absolute positioning)
+        if (root.flash-opacity > 0.0) : Rectangle {
+            background: white;
+            opacity: root.flash-opacity;
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        // Toast notification overlay (outside layout, absolute positioning)
+        if (root.toasts.length > 0) : Rectangle {
+            background: transparent;
+            x: 0;
+            width: 100%;
+            y: parent.height - 140px;
+            height: 120px;
+            VerticalLayout {
+                alignment: end;
+                spacing: 6px;
+                for toast in root.toasts : Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    background: toast.toast-type == "error" ? rgba(220, 38, 38, 0.9) :
+                               (toast.toast-type == "warning" ? rgba(245, 158, 11, 0.9) :
+                               (toast.toast-type == "success" ? rgba(34, 197, 94, 0.9) :
+                               rgba(30, 30, 35, 0.95)));
+                    border-color: toast.toast-type == "error" ? AppColors.red :
+                                 (toast.toast-type == "warning" ? AppColors.amber :
+                                 (toast.toast-type == "success" ? AppColors.green :
+                                 AppColors.border-main));
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    min-height: 36px;
+                    max-width: 400px;
+                    opacity: toast.opacity;
+                    animate opacity { duration: 300ms; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: toast.toast-type == "error" ? "✕" :
+                                 (toast.toast-type == "warning" ? "⚠" :
+                                 (toast.toast-type == "success" ? "✓" : "ℹ"));
+                            color: white;
+                            font-weight: 700;
+                            font-size: 14px;
+                        }
+                        Text {
+                            text: toast.message;
+                            color: white;
+                            font-size: 11px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+                    }
+                    TouchArea { clicked => { root.dismiss-toast(toast.id); } }
+                }
+            }
+        }
     }
 }

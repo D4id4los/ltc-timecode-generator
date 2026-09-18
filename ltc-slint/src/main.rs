@@ -7,8 +7,16 @@ use audio_core::{
 use chrono::Local;
 use log::{error, info, warn};
 use slint::{ModelRc, SharedString, VecModel, Weak};
+use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[derive(Clone)]
+struct ToastItem {
+    id: i32,
+    message: String,
+    toast_type: String,
+}
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUFFER_SIZE: u32 = 0;
@@ -86,6 +94,64 @@ const FPS_OPTIONS: [FpsOption; 5] = [
     FpsOption { name: "30 fps", fps: 30.0, drop_frame: false, description: "High-definition video rate / digital audio standard." },
 ];
 
+fn update_toast_model(ui: &AppWindow, toasts: &[ToastItem]) {
+    let toast_data: Vec<ToastData> = toasts
+        .iter()
+        .map(|t| ToastData {
+            id: t.id,
+            message: SharedString::from(&t.message),
+            toast_type: SharedString::from(&t.toast_type),
+            opacity: 1.0,
+        })
+        .collect();
+    ui.set_toasts(ModelRc::new(VecModel::<ToastData>::from(toast_data)));
+}
+
+fn dismiss_toast_by_id(
+    toasts: &Arc<Mutex<Vec<ToastItem>>>,
+    ui: &AppWindow,
+    id: i32,
+) {
+    let mut toasts_vec = toasts.lock().unwrap();
+    if let Some(pos) = toasts_vec.iter().position(|t| t.id == id) {
+        toasts_vec.remove(pos);
+    }
+    update_toast_model(ui, &toasts_vec);
+}
+
+fn push_toast(
+    toasts: &Arc<Mutex<Vec<ToastItem>>>,
+    next_id: &Arc<Mutex<i32>>,
+    ui: &AppWindow,
+    message: &str,
+    toast_type: &str,
+) {
+    let mut toasts_vec = toasts.lock().unwrap();
+    let mut nid = next_id.lock().unwrap();
+    *nid += 1;
+    toasts_vec.push(ToastItem {
+        id: *nid,
+        message: message.to_string(),
+        toast_type: toast_type.to_string(),
+    });
+    update_toast_model(ui, &toasts_vec);
+
+    let dismiss_id = *nid;
+    let toasts_clone = toasts.clone();
+    let ui_weak = ui.as_weak();
+    let dismiss_timer = slint::Timer::default();
+    dismiss_timer.start(
+        slint::TimerMode::SingleShot,
+        Duration::from_millis(3000),
+        move || {
+            if let Some(fui) = ui_weak.upgrade() {
+                dismiss_toast_by_id(&toasts_clone, &fui, dismiss_id);
+            }
+        },
+    );
+    Box::leak(Box::new(dismiss_timer));
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
@@ -104,7 +170,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_rate: Arc<Mutex<u32>> = Arc::new(Mutex::new(suggest_sample_rate()));
     let devices: Arc<Mutex<Vec<AudioDeviceInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let flash_timer: Arc<Mutex<Option<slint::Timer>>> = Arc::new(Mutex::new(None));
     let is_playing: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let ltc_channel_index: Arc<Mutex<usize>> = Arc::new(Mutex::new(0)); // Left
     let beep_channel_index: Arc<Mutex<usize>> = Arc::new(Mutex::new(1)); // Right
@@ -123,6 +188,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frames: 0,
     }));
     let device_index: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let arm_angle: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    let flash_opacity: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    let pulse_phase: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    let toasts: Arc<Mutex<Vec<ToastItem>>> = Arc::new(Mutex::new(Vec::new()));
+    let next_toast_id: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
 
     // ── Populate FPS options model ─────────────────────────────────────────────
     {
@@ -271,6 +341,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ltc_volume_clone = ltc_volume.clone();
         let is_playing_clone = is_playing.clone();
         let start_timecode_clone = start_timecode.clone();
+        let toasts_clone = toasts.clone();
+        let next_toast_id_clone = next_toast_id.clone();
 
         ui.on_start_ltc(move || {
             let ui = match ui_weak.upgrade() {
@@ -294,10 +366,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_is_playing(true);
                     ui.set_status_message(SharedString::from("Streaming LTC"));
                     info!("LTC stream started");
+                    push_toast(&toasts_clone, &next_toast_id_clone, &ui, "LTC streaming started", "info");
                 }
                 Err(e) => {
                     error!("Failed to start LTC: {}", e);
                     ui.set_status_message(SharedString::from(format!("Start failed: {}", e)));
+                    push_toast(&toasts_clone, &next_toast_id_clone, &ui, &format!("LTC start failed: {}", e), "error");
                 }
             }
         });
@@ -307,6 +381,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui_weak = ui.as_weak();
         let audio_core_clone = audio_core.clone();
         let is_playing_clone = is_playing.clone();
+        let toasts_clone = toasts.clone();
+        let next_toast_id_clone = next_toast_id.clone();
 
         ui.on_stop_ltc(move || {
             info!("Stopping LTC stream");
@@ -323,6 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_wake_lock_active(false);
             ui.set_status_message(SharedString::from("Stopped"));
             info!("LTC stream stopped");
+            push_toast(&toasts_clone, &next_toast_id_clone, &ui, "LTC streaming stopped", "info");
         });
     }
 
@@ -374,7 +451,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let beep_channel_index_clone = beep_channel_index.clone();
         let logs_clone = logs.clone();
         let fps_index_clone = fps_index.clone();
-        let flash_timer_clone = flash_timer.clone();
+        let arm_angle_clone = arm_angle.clone();
+        let flash_opacity_clone = flash_opacity.clone();
+        let toasts_clone = toasts.clone();
+        let next_toast_id_clone = next_toast_id.clone();
+        let ui_weak_clone = ui_weak.clone();
         let scene_clone = scene.clone();
         let take_clone = take.clone();
         let roll_clone = roll.clone();
@@ -404,20 +485,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => return,
             };
 
-            // Flash effect
-            ui.set_flash_visible(true);
-            let flash_weak = ui.as_weak();
-            let ft = slint::Timer::default();
-            ft.start(
-                slint::TimerMode::SingleShot,
-                Duration::from_millis(200),
-                move || {
-                    if let Some(fui) = flash_weak.upgrade() {
-                        fui.set_flash_visible(false);
-                    }
-                },
-            );
-            *flash_timer_clone.lock().unwrap() = Some(ft);
+            // Arm animation: bounce up by 15px (exponential decay handled in poll timer)
+            *arm_angle_clone.lock().unwrap() = -15.0;
+            ui.set_arm_angle(-15.0_f32);
+
+            // Full-screen flash
+            *flash_opacity_clone.lock().unwrap() = 0.6;
+            ui.set_flash_opacity(0.6_f32);
+
+            // Toast notification
+            {
+                let mut toasts_vec = toasts_clone.lock().unwrap();
+                let mut next_id = next_toast_id_clone.lock().unwrap();
+                *next_id += 1;
+                let toast_id = *next_id;
+                let msg = format!("Clap captured at {}", ui.get_timecode_text());
+                toasts_vec.push(ToastItem {
+                    id: toast_id,
+                    message: msg.clone(),
+                    toast_type: "success".to_string(),
+                });
+                update_toast_model(&ui, &toasts_vec);
+                // Auto-dismiss after 3 seconds
+                let dismiss_weak = ui_weak_clone.clone();
+                let toasts_clone2 = toasts_clone.clone();
+                let dismiss_timer = slint::Timer::default();
+                dismiss_timer.start(
+                    slint::TimerMode::SingleShot,
+                    Duration::from_millis(3000),
+                    move || {
+                        if let Some(fui) = dismiss_weak.upgrade() {
+                            dismiss_toast_by_id(&toasts_clone2, &fui, toast_id);
+                        }
+                    },
+                );
+                // Leak timer so it lives independently
+                Box::leak(Box::new(dismiss_timer));
+            }
 
             // Log the clap
             let fi = *fps_index_clone.lock().unwrap();
@@ -556,6 +660,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .join("\n");
             if !text.is_empty() {
                 info!("Copied log text:\n{}", text);
+            }
+        });
+    }
+
+    // ── Toast dismiss ──────────────────────────────────────────────────────────
+    {
+        let toasts_clone = toasts.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_dismiss_toast(move |id| {
+            if let Some(fui) = ui_weak.upgrade() {
+                dismiss_toast_by_id(&toasts_clone, &fui, id);
             }
         });
     }
@@ -852,6 +967,11 @@ fn stepper_handlers(
         let audio_core_clone = audio_core.clone();
         let fps_index_clone = fps_index.clone();
         let is_playing_clone = is_playing.clone();
+        let arm_angle_clone = arm_angle.clone();
+        let flash_opacity_clone = flash_opacity.clone();
+        let pulse_phase_clone = pulse_phase.clone();
+        let toasts_clone = toasts.clone();
+        let next_toast_id_clone = next_toast_id.clone();
 
         let poll_timer = slint::Timer::default();
         poll_timer.start(
@@ -865,6 +985,40 @@ fn stepper_handlers(
 
                 // Update system time in header
                 ui.set_system_time(SharedString::from(format!("{} UTC", chrono_now_string())));
+
+                // Animate arm angle: exponential decay toward 0
+                {
+                    let mut angle = arm_angle_clone.lock().unwrap();
+                    if angle.abs() > 0.5 {
+                        *angle *= 0.852; // exp(-4.0 * 0.04) decay at 4.0/s
+                        if angle.abs() < 0.5 {
+                            *angle = 0.0;
+                        }
+                        ui.set_arm_angle(*angle as f32);
+                    }
+                }
+
+                // Animate flash opacity: decay from 0.6 to 0 over ~400ms
+                {
+                    let mut fo = flash_opacity_clone.lock().unwrap();
+                    if *fo > 0.0 {
+                        *fo -= 0.6 / 0.4 * (POLL_INTERVAL_MS as f64 / 1000.0);
+                        if *fo <= 0.0 {
+                            *fo = 0.0;
+                        }
+                        ui.set_flash_opacity(*fo as f32);
+                    }
+                }
+
+                // Advance pulse phase for dot animation (4Hz sine wave)
+                {
+                    let mut pp = pulse_phase_clone.lock().unwrap();
+                    *pp += 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
+                    if *pp > PI * 100.0 {
+                        *pp = 0.0;
+                    }
+                    ui.set_pulse_phase(*pp as f32);
+                }
 
                 // Poll timecode if playing
                 if *is_playing_clone.lock().unwrap() {
@@ -889,9 +1043,11 @@ fn stepper_handlers(
                     match evt {
                         AudioEvent::StreamError(msg) => {
                             error!("Audio stream error: {}", msg);
+                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, &msg, "error");
                         }
                         AudioEvent::StreamDied => {
                             warn!("Audio stream has died");
+                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, "Audio stream died — attempting recovery", "error");
                         }
                         AudioEvent::StreamRecovering { attempt } => {
                             info!("Audio stream recovering (attempt {})", attempt);
@@ -900,9 +1056,11 @@ fn stepper_handlers(
                             error!("Fatal: audio device unreachable");
                             *is_playing_clone.lock().unwrap() = false;
                             ui.set_is_playing(false);
+                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, "Audio device unreachable — LTC stopped", "error");
                         }
                         AudioEvent::RecoveryNeeded { reason } => {
                             warn!("Audio recovery needed: {}", reason);
+                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, &format!("Audio recovery needed: {}", reason), "warning");
                         }
                         AudioEvent::Underrun => {
                             warn!("Audio underrun detected");
