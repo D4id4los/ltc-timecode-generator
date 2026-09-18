@@ -5,35 +5,35 @@ import { ScrollView, ComboBox, Slider, ListView, StandardListView } from "std-wi
 export global AppColors {
     in-out property <bool> theme-dark;
 
-    // Dark theme source colors
-    in property <color> dark-accent: #FF5F1F;
-    in property <color> dark-app-bg: #0A0A0B;
-    in property <color> dark-card-bg: #1A1A1E;
-    in property <color> dark-deep-bg: #0A0A0B;
-    in property <color> dark-nested-bg: #141416;
-    in property <color> dark-text-main: #E0E0E0;
-    in property <color> dark-text-title: #FFFFFF;
-    in property <color> dark-text-muted: #8E9299;
-    in property <color> dark-border-main: #2A2A2E;
-    in property <color> dark-green: #22C55E;
-    in property <color> dark-red: #DC2626;
-    in property <color> dark-amber: #F59E0B;
-    in property <color> dark-clock-sep: #3F3F46;
+    // Dark theme source colors (set from Rust via gui_engine::theme::DARK)
+    in property <color> dark-accent;
+    in property <color> dark-app-bg;
+    in property <color> dark-card-bg;
+    in property <color> dark-deep-bg;
+    in property <color> dark-nested-bg;
+    in property <color> dark-text-main;
+    in property <color> dark-text-title;
+    in property <color> dark-text-muted;
+    in property <color> dark-border-main;
+    in property <color> dark-green;
+    in property <color> dark-red;
+    in property <color> dark-amber;
+    in property <color> dark-clock-sep;
 
-    // Light theme source colors
-    in property <color> light-accent: #FF5F1F;
-    in property <color> light-app-bg: #F4F4F6;
-    in property <color> light-card-bg: #FFFFFF;
-    in property <color> light-deep-bg: #EBEBEF;
-    in property <color> light-nested-bg: #F4F4F6;
-    in property <color> light-text-main: #27272A;
-    in property <color> light-text-title: #09090B;
-    in property <color> light-text-muted: #71717A;
-    in property <color> light-border-main: #E4E4E7;
-    in property <color> light-green: #16A34A;
-    in property <color> light-red: #DC2626;
-    in property <color> light-amber: #D97706;
-    in property <color> light-clock-sep: #D4D4D8;
+    // Light theme source colors (set from Rust via gui_engine::theme::LIGHT)
+    in property <color> light-accent;
+    in property <color> light-app-bg;
+    in property <color> light-card-bg;
+    in property <color> light-deep-bg;
+    in property <color> light-nested-bg;
+    in property <color> light-text-main;
+    in property <color> light-text-title;
+    in property <color> light-text-muted;
+    in property <color> light-border-main;
+    in property <color> light-green;
+    in property <color> light-red;
+    in property <color> light-amber;
+    in property <color> light-clock-sep;
 
     // Active colors (computed, used by all widgets)
     in-out property <color> accent: root.theme-dark ? root.dark-accent : root.light-accent;

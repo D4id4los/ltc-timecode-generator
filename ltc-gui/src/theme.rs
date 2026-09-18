@@ -1,13 +1,12 @@
 use egui::{Color32, Stroke, Vec2, Visuals};
+use gui_engine::theme::{self, Rgb};
+
+fn to_color32(rgb: Rgb) -> Color32 {
+    Color32::from_rgb(rgb.0, rgb.1, rgb.2)
+}
 
 /// Accent color used for highlights, active buttons, clock digits glow.
 pub const ACCENT: Color32 = Color32::from_rgb(0xFF, 0x5F, 0x1F);
-
-/// Toast notification colors.
-pub const ERROR_RED: Color32 = Color32::from_rgb(0xEF, 0x44, 0x44);
-pub const WARNING_AMBER: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B);
-pub const SUCCESS_GREEN: Color32 = Color32::from_rgb(0x22, 0xC5, 0x5E);
-pub const INFO_BLUE: Color32 = Color32::from_rgb(0x3B, 0x82, 0xF6);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Theme {
@@ -18,16 +17,17 @@ pub enum Theme {
 impl Theme {
     pub fn apply(self, ctx: &egui::Context) {
         let colors = self.colors();
-        let mut visuals = match self {
-            Theme::Dark => Visuals::dark(),
-            Theme::Light => Visuals::light(),
-        };
         let border = colors.border_main;
         let text = colors.text_main;
         let text_title = colors.text_title;
         let text_muted = colors.text_muted;
         let nested = colors.nested_bg;
         let nested_hover = colors.nested_hover;
+
+        let mut visuals = match self {
+            Theme::Dark => Visuals::dark(),
+            Theme::Light => Visuals::light(),
+        };
 
         visuals.panel_fill = colors.app_bg;
         visuals.window_fill = colors.card_bg;
@@ -95,43 +95,27 @@ pub struct ThemeColors {
 
 impl Theme {
     pub fn colors(self) -> ThemeColors {
-        match self {
-            Theme::Dark => ThemeColors {
-                app_bg: Color32::from_rgb(0x0A, 0x0A, 0x0B),
-                card_bg: Color32::from_rgb(0x1A, 0x1A, 0x1E),
-                deep_bg: Color32::from_rgb(0x0A, 0x0A, 0x0B),
-                nested_bg: Color32::from_rgb(0x14, 0x14, 0x16),
-                nested_hover: Color32::from_rgb(0x1C, 0x1C, 0x20),
-                text_main: Color32::from_rgb(0xE0, 0xE0, 0xE0),
-                text_title: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-                text_muted: Color32::from_rgb(0x8E, 0x92, 0x99),
-                text_secondary: Color32::from_rgb(0xCC, 0xCC, 0xCC),
-                border_main: Color32::from_rgb(0x2A, 0x2A, 0x2E),
-                btn_bg: Color32::from_rgb(0x1A, 0x1A, 0x1E),
-                clock_sep: Color32::from_rgb(0x3F, 0x3F, 0x46),
-                error_red: ERROR_RED,
-                warning_amber: WARNING_AMBER,
-                success_green: SUCCESS_GREEN,
-                info_blue: INFO_BLUE,
-            },
-            Theme::Light => ThemeColors {
-                app_bg: Color32::from_rgb(0xF4, 0xF4, 0xF6),
-                card_bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-                deep_bg: Color32::from_rgb(0xEB, 0xEB, 0xEF),
-                nested_bg: Color32::from_rgb(0xF4, 0xF4, 0xF6),
-                nested_hover: Color32::from_rgb(0xE2, 0xE2, 0xE7),
-                text_main: Color32::from_rgb(0x27, 0x27, 0x2A),
-                text_title: Color32::from_rgb(0x09, 0x09, 0x0B),
-                text_muted: Color32::from_rgb(0x71, 0x71, 0x7A),
-                text_secondary: Color32::from_rgb(0x3F, 0x3F, 0x46),
-                border_main: Color32::from_rgb(0xE4, 0xE4, 0xE7),
-                btn_bg: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-                clock_sep: Color32::from_rgb(0xD4, 0xD4, 0xD8),
-                error_red: Color32::from_rgb(0xDC, 0x26, 0x26),
-                warning_amber: Color32::from_rgb(0xD9, 0x77, 0x06),
-                success_green: Color32::from_rgb(0x16, 0xA3, 0x4A),
-                info_blue: Color32::from_rgb(0x25, 0x63, 0xEB),
-            },
+        let p = match self {
+            Theme::Dark => &theme::DARK,
+            Theme::Light => &theme::LIGHT,
+        };
+        ThemeColors {
+            app_bg: to_color32(p.app_bg),
+            card_bg: to_color32(p.card_bg),
+            deep_bg: to_color32(p.deep_bg),
+            nested_bg: to_color32(p.nested_bg),
+            nested_hover: to_color32(p.nested_hover),
+            text_main: to_color32(p.text_main),
+            text_title: to_color32(p.text_title),
+            text_muted: to_color32(p.text_muted),
+            text_secondary: to_color32(p.text_secondary),
+            border_main: to_color32(p.border_main),
+            btn_bg: to_color32(p.btn_bg),
+            clock_sep: to_color32(p.clock_sep),
+            error_red: to_color32(p.error_red),
+            warning_amber: to_color32(p.warning_amber),
+            success_green: to_color32(p.success_green),
+            info_blue: to_color32(p.info_blue),
         }
     }
 }
