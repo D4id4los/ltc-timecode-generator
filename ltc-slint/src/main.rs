@@ -1,8 +1,8 @@
 slint::include_modules!();
 
 use audio_core::{
-    list_audio_devices, suggest_sample_rate, AudioCore, AudioDeviceInfo, AudioEvent, Timecode,
-    SAMPLE_RATE_OPTIONS,
+    is_permanent_device_error, is_transient_audio_error, list_audio_devices, suggest_sample_rate,
+    AudioCore, AudioDeviceInfo, AudioEvent, Timecode, SAMPLE_RATE_OPTIONS,
 };
 use chrono::Local;
 use log::{error, info, warn};
@@ -152,6 +152,283 @@ fn push_toast(
     Box::leak(Box::new(dismiss_timer));
 }
 
+fn ensure_audio_init(
+    audio_core: &Arc<Mutex<AudioCore>>,
+    sample_rate: &Arc<Mutex<u32>>,
+    devices: &Arc<Mutex<Vec<AudioDeviceInfo>>>,
+    device_index: &Arc<Mutex<usize>>,
+    audio_initialized: &Arc<Mutex<bool>>,
+    ui_weak: &Weak<AppWindow>,
+    toasts: &Arc<Mutex<Vec<ToastItem>>>,
+    next_toast_id: &Arc<Mutex<i32>>,
+) -> bool {
+    {
+        let init = audio_initialized.lock().unwrap();
+        if *init {
+            return true;
+        }
+    }
+
+    let devs = devices.lock().unwrap();
+    let idx = *device_index.lock().unwrap();
+    let (device_id, device_name) = if devs.is_empty() || idx >= devs.len() {
+        (String::new(), "default".to_string())
+    } else {
+        (devs[idx].id.clone(), devs[idx].name.clone())
+    };
+    let rate = *sample_rate.lock().unwrap();
+    drop(devs);
+
+    info!(
+        "ensure_audio_init: device={} (id={}), rate={}",
+        device_name, device_id, rate
+    );
+
+    let max_retries = 3;
+    let mut delay_ms = 50u64;
+
+    for attempt in 0..max_retries {
+        let result = {
+            let core = audio_core.lock().unwrap();
+            core.init_output(&device_id, rate, BUFFER_SIZE)
+        };
+
+        match result {
+            Ok(actual_rate) => {
+                let fmt = {
+                    let core = audio_core.lock().unwrap();
+                    let fmt = core.sample_format_name().to_string();
+                    fmt
+                };
+                *audio_initialized.lock().unwrap() = true;
+                if actual_rate != *sample_rate.lock().unwrap() {
+                    warn!(
+                        "Sample rate overridden: requested {} Hz, device uses {} Hz",
+                        rate, actual_rate
+                    );
+                    *sample_rate.lock().unwrap() = actual_rate;
+                    if let Some(u) = ui_weak.upgrade() {
+                        let rate_idx = SAMPLE_RATE_OPTIONS
+                            .iter()
+                            .position(|&r| r == actual_rate)
+                            .unwrap_or(0);
+                        u.set_sample_rate_index(rate_idx as i32);
+                    }
+                }
+                info!(
+                    "Audio initialized successfully on {} (format={}, rate={})",
+                    device_name, fmt, actual_rate
+                );
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_sample_format(SharedString::from(fmt.to_uppercase()));
+                    u.set_status_message(SharedString::from(format!("Audio initialized ({})", fmt)));
+                }
+                return true;
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                let transient = is_transient_audio_error(&err_str);
+                let permanent = is_permanent_device_error(&err_str);
+
+                if permanent {
+                    error!("ensure_audio_init: permanent error (no retry): {}", err_str);
+                    if let Some(u) = ui_weak.upgrade() {
+                        u.set_status_message(SharedString::from(format!(
+                            "Audio init failed (permission): {}",
+                            err_str
+                        )));
+                    }
+                    push_toast(
+                        toasts,
+                        next_toast_id,
+                        &ui_weak.upgrade().unwrap(),
+                        &format!("Audio init failed: {} — permission denied", err_str),
+                        "error",
+                    );
+                    break;
+                }
+
+                if transient && attempt < max_retries - 1 {
+                    warn!(
+                        "Audio init transient error (attempt {}/{}), retrying in {}ms: {}",
+                        attempt + 1,
+                        max_retries,
+                        delay_ms,
+                        err_str
+                    );
+                    if let Some(u) = ui_weak.upgrade() {
+                        u.set_status_message(SharedString::from(format!(
+                            "Audio init busy, retrying... ({}/{})",
+                            attempt + 1,
+                            max_retries
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    delay_ms *= 2;
+                    continue;
+                }
+
+                error!(
+                    "ensure_audio_init: init_output failed{}: {}",
+                    if transient { " (retries exhausted)" } else { "" },
+                    err_str
+                );
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_status_message(SharedString::from(format!("Audio init failed: {}", err_str)));
+                }
+                push_toast(
+                    toasts,
+                    next_toast_id,
+                    &ui_weak.upgrade().unwrap(),
+                    &format!("Audio init failed: {}", err_str),
+                    "error",
+                );
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+fn attempt_recovery(
+    audio_core: &Arc<Mutex<AudioCore>>,
+    sample_rate: &Arc<Mutex<u32>>,
+    devices: &Arc<Mutex<Vec<AudioDeviceInfo>>>,
+    device_index: &Arc<Mutex<usize>>,
+    audio_initialized: &Arc<Mutex<bool>>,
+    is_playing: &Arc<Mutex<bool>>,
+    recovery_attempts: &Arc<Mutex<u8>>,
+    fps_index: &Arc<Mutex<usize>>,
+    ltc_channel_index: &Arc<Mutex<usize>>,
+    ltc_volume: &Arc<Mutex<f32>>,
+    start_timecode: &Arc<Mutex<Timecode>>,
+    ui_weak: &Weak<AppWindow>,
+    toasts: &Arc<Mutex<Vec<ToastItem>>>,
+    next_toast_id: &Arc<Mutex<i32>>,
+) {
+    let mut attempts = recovery_attempts.lock().unwrap();
+    *attempts += 1;
+
+    if *attempts >= 3 {
+        error!("attempt_recovery: 3 recovery attempts exhausted — giving up");
+        *is_playing.lock().unwrap() = false;
+        *audio_initialized.lock().unwrap() = false;
+        if let Some(u) = ui_weak.upgrade() {
+            u.set_is_playing(false);
+            u.set_status_message(SharedString::from(
+                "Recovery failed: device unreachable after 3 attempts",
+            ));
+        }
+        push_toast(
+            toasts,
+            next_toast_id,
+            &ui_weak.upgrade().unwrap(),
+            "Audio recovery failed after 3 attempts — device may be unavailable. \
+             Re-select or re-connect audio device.",
+            "error",
+        );
+        return;
+    }
+
+    let was_playing = *is_playing.lock().unwrap();
+    if was_playing {
+        info!("Recovery: stopping LTC stream");
+        let core = audio_core.lock().unwrap();
+        let _ = core.stop_ltc();
+        drop(core);
+    }
+
+    info!(
+        "Recovery: re-initializing audio output (attempt {}/3)",
+        *attempts
+    );
+    push_toast(
+        toasts,
+        next_toast_id,
+        &ui_weak.upgrade().unwrap(),
+        &format!("Audio recovery attempt {}/3 — re-initializing...", *attempts),
+        "warning",
+    );
+
+    {
+        let core = audio_core.lock().unwrap();
+        let _ = core.stop_output();
+        drop(core);
+    }
+    *audio_initialized.lock().unwrap() = false;
+    std::thread::sleep(Duration::from_millis(50));
+
+    let reinit_ok = ensure_audio_init(
+        audio_core,
+        sample_rate,
+        devices,
+        device_index,
+        audio_initialized,
+        ui_weak,
+        toasts,
+        next_toast_id,
+    );
+
+    if reinit_ok && was_playing {
+        info!("Recovery: restarting LTC stream");
+        let tc = *start_timecode.lock().unwrap();
+        let fi = *fps_index.lock().unwrap();
+        let opt = &FPS_OPTIONS[fi];
+        let channel = channel_to_str(*ltc_channel_index.lock().unwrap());
+        let vol = *ltc_volume.lock().unwrap();
+
+        let core = audio_core.lock().unwrap();
+        match core.start_ltc(tc, opt.fps, opt.drop_frame, channel.to_string(), vol) {
+            Ok(()) => {
+                *attempts = 0;
+                *is_playing.lock().unwrap() = true;
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_is_playing(true);
+                    u.set_status_message(SharedString::from("Recovery: stream restarted"));
+                }
+                info!("Recovery: LTC stream restarted successfully");
+                push_toast(
+                    toasts,
+                    next_toast_id,
+                    &ui_weak.upgrade().unwrap(),
+                    "Audio recovered and LTC stream restarted",
+                    "success",
+                );
+            }
+            Err(e) => {
+                error!("Recovery: failed to restart LTC stream: {}", e);
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_status_message(SharedString::from(format!("Recovery failed: {}", e)));
+                }
+                push_toast(
+                    toasts,
+                    next_toast_id,
+                    &ui_weak.upgrade().unwrap(),
+                    &format!("Recovery failed: could not restart LTC — {}", e),
+                    "error",
+                );
+            }
+        }
+    } else if reinit_ok {
+        *attempts = 0;
+        info!("Recovery: audio re-initialized (was not playing)");
+        push_toast(
+            toasts,
+            next_toast_id,
+            &ui_weak.upgrade().unwrap(),
+            "Audio re-initialized successfully",
+            "success",
+        );
+    } else {
+        error!("Recovery: re-initialization failed");
+        *is_playing.lock().unwrap() = false;
+        if let Some(u) = ui_weak.upgrade() {
+            u.set_is_playing(false);
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
@@ -193,6 +470,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pulse_phase: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let toasts: Arc<Mutex<Vec<ToastItem>>> = Arc::new(Mutex::new(Vec::new()));
     let next_toast_id: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
+
+    // ── Audio recovery state ───────────────────────────────────────────────────
+    let recovery_attempts: Arc<Mutex<u8>> = Arc::new(Mutex::new(0));
+    let audio_initialized: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     // ── Populate FPS options model ─────────────────────────────────────────────
     {
@@ -236,6 +517,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let devices_clone = devices.clone();
         let device_index_clone = device_index.clone();
         let sample_rate_clone = sample_rate.clone();
+        let toasts_clone = toasts.clone();
+        let next_toast_id_clone = next_toast_id.clone();
+        let audio_initialized_clone = audio_initialized.clone();
 
         let refresh = move || {
             let ui = match ui_weak.upgrade() {
@@ -259,6 +543,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .collect();
                     let name_model = ModelRc::new(VecModel::<SharedString>::from(device_names));
+                    drop(devs);
                     ui.set_device_names(name_model);
                     ui.set_device_count(count as i32);
 
@@ -269,53 +554,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             *idx = 0;
                         }
                         ui.set_device_index(*idx as i32);
+                        drop(idx);
 
-                        // Initialize audio output
-                        let device_id = if devs[*idx].id == "default" {
-                            String::new()
-                        } else {
-                            devs[*idx].id.clone()
-                        };
-                        let rate = *sample_rate_clone.lock().unwrap();
-                        info!(
-                            "Initializing audio on device: {} (id={}, rate={})",
-                            devs[*idx].name, device_id, rate
+                        ensure_audio_init(
+                            &audio_core_clone,
+                            &sample_rate_clone,
+                            &devices_clone,
+                            &device_index_clone,
+                            &audio_initialized_clone,
+                            &ui_weak,
+                            &toasts_clone,
+                            &next_toast_id_clone,
                         );
-                        let core = audio_core_clone.lock().unwrap();
-                        match core.init_output(&device_id, rate, BUFFER_SIZE) {
-                            Ok(actual_rate) => {
-                                let fmt = core.sample_format_name();
-                                info!(
-                                    "Audio initialized: rate={}, format={}",
-                                    actual_rate, fmt
-                                );
-                                ui.set_sample_format(SharedString::from(fmt.to_uppercase()));
-                                ui.set_status_message(SharedString::from(format!(
-                                    "Audio initialized ({})",
-                                    fmt
-                                )));
-                                let mut sr = sample_rate_clone.lock().unwrap();
-                                if actual_rate != *sr {
-                                    warn!(
-                                        "Sample rate overridden: {} -> {}",
-                                        *sr, actual_rate
-                                    );
-                                    *sr = actual_rate;
-                                    let rate_idx = SAMPLE_RATE_OPTIONS
-                                        .iter()
-                                        .position(|&r| r == actual_rate)
-                                        .unwrap_or(0);
-                                    ui.set_sample_rate_index(rate_idx as i32);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to initialize audio: {}", e);
-                                ui.set_status_message(SharedString::from(format!(
-                                    "Audio init failed: {}",
-                                    e
-                                )));
-                            }
-                        }
                     } else {
                         warn!("No audio devices found");
                         ui.set_status_message(SharedString::from("No audio devices found"));
@@ -343,12 +593,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start_timecode_clone = start_timecode.clone();
         let toasts_clone = toasts.clone();
         let next_toast_id_clone = next_toast_id.clone();
+        let sample_rate_clone = sample_rate.clone();
+        let devices_clone = devices.clone();
+        let device_index_clone = device_index.clone();
+        let audio_initialized_clone = audio_initialized.clone();
+        let recovery_attempts_clone = recovery_attempts.clone();
 
         ui.on_start_ltc(move || {
             let ui = match ui_weak.upgrade() {
                 Some(u) => u,
                 None => return,
             };
+
+            if !ensure_audio_init(
+                &audio_core_clone,
+                &sample_rate_clone,
+                &devices_clone,
+                &device_index_clone,
+                &audio_initialized_clone,
+                &ui_weak,
+                &toasts_clone,
+                &next_toast_id_clone,
+            ) {
+                error!("start_ltc: audio init failed, cannot start LTC");
+                push_toast(&toasts_clone, &next_toast_id_clone, &ui, "Cannot start LTC — audio not initialized", "error");
+                return;
+            }
+
             let fi = *fps_index_clone.lock().unwrap();
             let opt = &FPS_OPTIONS[fi];
             let tc = *start_timecode_clone.lock().unwrap();
@@ -363,6 +634,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match core.start_ltc(tc, opt.fps, opt.drop_frame, channel.to_string(), vol) {
                 Ok(()) => {
                     *is_playing_clone.lock().unwrap() = true;
+                    *recovery_attempts_clone.lock().unwrap() = 0;
                     ui.set_is_playing(true);
                     ui.set_status_message(SharedString::from("Streaming LTC"));
                     info!("LTC stream started");
@@ -460,8 +732,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let take_clone = take.clone();
         let roll_clone = roll.clone();
         let auto_increment_clone = auto_increment.clone();
+        let devices_clone = devices.clone();
+        let device_index_clone = device_index.clone();
+        let audio_initialized_clone = audio_initialized.clone();
 
         ui.on_clap_beep(move || {
+            if !ensure_audio_init(
+                &audio_core_clone,
+                &sample_rate_clone,
+                &devices_clone,
+                &device_index_clone,
+                &audio_initialized_clone,
+                &ui_weak,
+                &toasts_clone,
+                &next_toast_id_clone,
+            ) {
+                error!("clap_beep: audio not initialized, cannot play beep");
+                return;
+            }
+
             let sr = *sample_rate_clone.lock().unwrap();
             let vol = *beep_volume_clone.lock().unwrap();
             let freq = *beep_frequency_clone.lock().unwrap();
@@ -832,6 +1121,11 @@ fn stepper_handlers(
         let fps_index_clone = fps_index.clone();
         let ltc_channel_index_clone = ltc_channel_index.clone();
         let ltc_volume_clone = ltc_volume.clone();
+        let audio_initialized_clone = audio_initialized.clone();
+        let recovery_attempts_clone = recovery_attempts.clone();
+        let start_timecode_clone = start_timecode.clone();
+        let toasts_clone = toasts.clone();
+        let next_toast_id_clone = next_toast_id.clone();
 
         ui.on_device_selected(move |index| {
             let idx = index as usize;
@@ -841,6 +1135,7 @@ fn stepper_handlers(
                 return;
             }
             let device = &devs[idx];
+            let prev_idx = *device_index_clone.lock().unwrap();
             info!("Device selected: {} (index {})", device.name, idx);
 
             let was_playing = *is_playing_clone.lock().unwrap();
@@ -850,59 +1145,75 @@ fn stepper_handlers(
                 drop(core);
             }
 
-            // Re-init audio on new device
-            let core = audio_core_clone.lock().unwrap();
-            let _ = core.stop_output();
-            drop(core);
-
+            // Stop existing output
+            {
+                let core = audio_core_clone.lock().unwrap();
+                let _ = core.stop_output();
+                drop(core);
+            }
+            *audio_initialized_clone.lock().unwrap() = false;
+            *recovery_attempts_clone.lock().unwrap() = 0;
             *device_index_clone.lock().unwrap() = idx;
-            let device_id = if device.id == "default" {
-                String::new()
-            } else {
-                device.id.clone()
-            };
-            let rate = *sample_rate_clone.lock().unwrap();
-            let core = audio_core_clone.lock().unwrap();
-            match core.init_output(&device_id, rate, BUFFER_SIZE) {
-                Ok(actual_rate) => {
-                    let fmt = core.sample_format_name();
-                    info!("Audio re-initialized on {}: rate={}, format={}", device.name, actual_rate, fmt);
-                    if let Some(u) = ui_weak.upgrade() {
-                        u.set_device_index(idx as i32);
-                        u.set_sample_format(SharedString::from(fmt.to_uppercase()));
-                        u.set_status_message(SharedString::from(format!("Audio: {}", device.name)));
-                    }
-                    if actual_rate != rate {
-                        *sample_rate_clone.lock().unwrap() = actual_rate;
-                        let rate_idx = SAMPLE_RATE_OPTIONS.iter().position(|&r| r == actual_rate).unwrap_or(0);
-                        if let Some(u) = ui_weak.upgrade() {
-                            u.set_sample_rate_index(rate_idx as i32);
-                        }
-                    }
-                    if was_playing {
-                        let tc = Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 };
-                        let fi = *fps_index_clone.lock().unwrap();
-                        let opt = &FPS_OPTIONS[fi];
-                        let ch = channel_to_str(*ltc_channel_index_clone.lock().unwrap());
-                        let vol = *ltc_volume_clone.lock().unwrap();
-                        match core.start_ltc(tc, opt.fps, opt.drop_frame, ch.to_string(), vol) {
-                            Ok(()) => {
-                                *is_playing_clone.lock().unwrap() = true;
-                                if let Some(u) = ui_weak.upgrade() {
-                                    u.set_is_playing(true);
-                                }
-                                info!("LTC restarted on new device");
+
+            let reinit_ok = ensure_audio_init(
+                &audio_core_clone,
+                &sample_rate_clone,
+                &devices_clone,
+                &device_index_clone,
+                &audio_initialized_clone,
+                &ui_weak,
+                &toasts_clone,
+                &next_toast_id_clone,
+            );
+
+            if reinit_ok {
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_device_index(idx as i32);
+                    u.set_status_message(SharedString::from(format!("Audio: {}", device.name)));
+                }
+                if was_playing {
+let tc = *start_timecode_clone.lock().unwrap();
+                    let fi = *fps_index_clone.lock().unwrap();
+                    let opt = &FPS_OPTIONS[fi];
+                    let ch = channel_to_str(*ltc_channel_index_clone.lock().unwrap());
+                    let vol = *ltc_volume_clone.lock().unwrap();
+                    let core = audio_core_clone.lock().unwrap();
+                    match core.start_ltc(tc, opt.fps, opt.drop_frame, ch.to_string(), vol) {
+                        Ok(()) => {
+                            *is_playing_clone.lock().unwrap() = true;
+                            if let Some(u) = ui_weak.upgrade() {
+                                u.set_is_playing(true);
                             }
-                            Err(e) => error!("Failed to restart LTC on new device: {}", e),
+                            info!("LTC restarted on new device");
+                        }
+                        Err(e) => {
+                            error!("Failed to restart LTC on new device: {}", e);
+                            push_toast(&toasts_clone, &next_toast_id_clone, &ui_weak.upgrade().unwrap(),
+                                &format!("Failed to restart LTC on new device: {}", e), "error");
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Failed to init audio on new device: {}", e);
-                    if let Some(u) = ui_weak.upgrade() {
-                        u.set_status_message(SharedString::from(format!("Device init failed: {}", e)));
-                    }
+            } else {
+                // Revert to previous device
+                let fallback_name = if prev_idx < devs.len() {
+                    devs[prev_idx].name.clone()
+                } else {
+                    "default".to_string()
+                };
+                *device_index_clone.lock().unwrap() = prev_idx;
+                error!(
+                    "Device '{}' failed to initialize. Reverted to '{}'",
+                    device.name, fallback_name
+                );
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_device_index(prev_idx as i32);
+                    u.set_status_message(SharedString::from(format!(
+                        "Device '{}' failed. Reverted to '{}'",
+                        device.name, fallback_name
+                    )));
                 }
+                push_toast(&toasts_clone, &next_toast_id_clone, &ui_weak.upgrade().unwrap(),
+                    &format!("Audio device '{}' failed. Reverted to '{}'.", device.name, fallback_name), "error");
             }
         });
     }
@@ -973,6 +1284,16 @@ fn stepper_handlers(
         let toasts_clone = toasts.clone();
         let next_toast_id_clone = next_toast_id.clone();
 
+        // ── Recovery state clones ──
+        let sample_rate_clone = sample_rate.clone();
+        let devices_clone = devices.clone();
+        let device_index_clone = device_index.clone();
+        let audio_initialized_clone = audio_initialized.clone();
+        let recovery_attempts_clone = recovery_attempts.clone();
+        let ltc_channel_index_clone = ltc_channel_index.clone();
+        let ltc_volume_clone = ltc_volume.clone();
+        let start_timecode_clone = start_timecode.clone();
+
         let poll_timer = slint::Timer::default();
         poll_timer.start(
             slint::TimerMode::Repeated,
@@ -1036,9 +1357,12 @@ fn stepper_handlers(
                     ui.set_wake_lock_active(wake);
                 }
 
-                // Drain audio events
-                let core = audio_core_clone.lock().unwrap();
-                let events = core.drain_events();
+                // Drain audio events (lock released before iteration so recovery can re-acquire)
+                let events = {
+                    let core = audio_core_clone.lock().unwrap();
+                    core.drain_events()
+                };
+                let has_recovery_event = events.iter().any(|e| matches!(e, AudioEvent::StreamDied | AudioEvent::RecoveryNeeded { .. }));
                 for evt in events {
                     match evt {
                         AudioEvent::StreamError(msg) => {
@@ -1055,8 +1379,10 @@ fn stepper_handlers(
                         AudioEvent::StreamDead => {
                             error!("Fatal: audio device unreachable");
                             *is_playing_clone.lock().unwrap() = false;
+                            *audio_initialized_clone.lock().unwrap() = false;
                             ui.set_is_playing(false);
-                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, "Audio device unreachable — LTC stopped", "error");
+                            ui.set_status_message(SharedString::from("Fatal: audio device unreachable"));
+                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, "Audio device unreachable — LTC stopped. Re-select or re-connect device.", "error");
                         }
                         AudioEvent::RecoveryNeeded { reason } => {
                             warn!("Audio recovery needed: {}", reason);
@@ -1069,6 +1395,24 @@ fn stepper_handlers(
                             warn!("{} frame(s) dropped", total);
                         }
                     }
+                }
+                if has_recovery_event {
+                    attempt_recovery(
+                        &audio_core_clone,
+                        &sample_rate_clone,
+                        &devices_clone,
+                        &device_index_clone,
+                        &audio_initialized_clone,
+                        &is_playing_clone,
+                        &recovery_attempts_clone,
+                        &fps_index_clone,
+                        &ltc_channel_index_clone,
+                        &ltc_volume_clone,
+                        &start_timecode_clone,
+                        &ui_weak,
+                        &toasts_clone,
+                        &next_toast_id_clone,
+                    );
                 }
             },
         );
