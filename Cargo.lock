@@ -338,6 +338,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2315,6 +2324,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
+name = "gui-engine"
+version = "0.3.2"
+dependencies = [
+ "arc-swap",
+ "audio-core",
+ "chrono",
+ "clap",
+ "ctrlc",
+ "env_logger",
+ "hound",
+ "log",
+]
+
+[[package]]
 name = "guillotiere"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3425,15 +3448,9 @@ dependencies = [
 name = "ltc-gui"
 version = "0.3.2"
 dependencies = [
- "audio-core",
- "chrono",
- "clap",
- "ctrlc",
  "eframe",
  "egui",
- "env_logger",
- "hound",
- "log",
+ "gui-engine",
 ]
 
 [[package]]
@@ -3441,12 +3458,7 @@ name = "ltc-slint"
 version = "0.3.2"
 dependencies = [
  "arboard",
- "audio-core",
- "chrono",
- "clap",
- "ctrlc",
- "env_logger",
- "hound",
+ "gui-engine",
  "log",
  "slint",
  "slint-build",

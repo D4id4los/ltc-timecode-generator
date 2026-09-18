@@ -35,7 +35,7 @@ pub enum AudioEvent {
     FramesDropped { total: u64 },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AudioDeviceInfo {
     pub id: String,
     pub name: String,

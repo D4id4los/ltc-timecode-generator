@@ -9,16 +9,24 @@ use audio_core::{
 use clap::Parser;
 use log::{error, info, warn};
 
+use crate::command::GuiCommand;
+use crate::state::AppStateSnapshot;
+
+// ── Logger ──────────────────────────────────────────────────────────────
+
 fn init_logger() {
     let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
+        env_logger::Env::default().default_filter_or(
+            "ltc_gui=trace,audio_core=trace,info",
+        ),
     )
-    .format_timestamp_millis()
     .try_init();
 }
 
+// ── CLI struct ──────────────────────────────────────────────────────────
+
 #[derive(Parser, Debug)]
-#[command(name = "ltc-slint", about = "LTC Timecode Generator (Slint GUI)", version)]
+#[command(name = "ltc-timecode-generator", about = "LTC Timecode Generator", version)]
 pub struct Cli {
     /// List available audio devices and exit
     #[arg(long, short = 'l')]
@@ -77,6 +85,8 @@ pub struct Cli {
     pub debug: bool,
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────
+
 fn timecode_fmt(tc: &Timecode) -> String {
     format!(
         "{:02}:{:02}:{:02}:{:02}",
@@ -121,6 +131,8 @@ fn parse_timecode(s: &str) -> Result<Timecode, String> {
     })
 }
 
+// ── Device listing ──────────────────────────────────────────────────────
+
 pub fn list_devices_and_exit() -> ! {
     init_logger();
     match list_audio_devices() {
@@ -150,7 +162,10 @@ pub fn list_devices_and_exit() -> ! {
     std::process::exit(0);
 }
 
-fn resolve_device(devices: &[audio_core::AudioDeviceInfo], cli: &Cli) -> Result<String, String> {
+fn resolve_device(
+    devices: &[audio_core::AudioDeviceInfo],
+    cli: &Cli,
+) -> Result<String, String> {
     if let Some(ref id) = cli.device {
         for dev in devices {
             if dev.name == *id || dev.id == *id {
@@ -189,6 +204,8 @@ fn resolve_device(devices: &[audio_core::AudioDeviceInfo], cli: &Cli) -> Result<
         .map(|d| d.id.clone())
         .ok_or_else(|| "No audio devices available".to_string())
 }
+
+// ── Headless mode ───────────────────────────────────────────────────────
 
 pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.debug {
@@ -230,7 +247,8 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         volume
     );
 
-    let devices = list_audio_devices().map_err(|e| format!("Failed to list audio devices: {}", e))?;
+    let devices =
+        list_audio_devices().map_err(|e| format!("Failed to list audio devices: {}", e))?;
     let device_id = resolve_device(&devices, &cli)?;
     info!("Using audio device: id={}", device_id);
 
@@ -243,7 +261,7 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Audio output initialized at {} Hz", sample_rate);
 
-    core.start_ltc(start_tc, fps, drop_frame, channel.clone(), volume)
+    core.start_ltc(start_tc, fps, drop_frame, channel, volume)
         .map_err(|e| format!("Failed to start LTC stream: {}", e))?;
 
     info!("LTC stream started");
@@ -345,6 +363,8 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+// ── WAV generation ──────────────────────────────────────────────────────
 
 pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.debug {
@@ -450,4 +470,62 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("WAV generation complete: {}", path);
     Ok(())
+}
+
+// ── Convenience wrapper ──────────────────────────────────────────────────
+
+/// Parse CLI args using clap. Calling crates don't need `Parser` in scope.
+pub fn parse_args() -> Cli {
+    Cli::parse()
+}
+
+// ── Outcome enum + dispatch ─────────────────────────────────────────────
+
+pub enum CliOutcome {
+    /// App should exit (headless, WAV, list-devices, or error)
+    Done,
+    /// App should start GUI with this engine handle
+    RunGui {
+        cmd_tx: std::sync::mpsc::Sender<GuiCommand>,
+        state: Arc<arc_swap::ArcSwap<AppStateSnapshot>>,
+    },
+}
+
+pub fn process_cli(cli: Cli) -> CliOutcome {
+    if cli.list_devices {
+        list_devices_and_exit();
+    }
+
+    if let Some(_path) = &cli.output_to_file {
+        if let Err(e) = generate_wav(cli) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return CliOutcome::Done;
+    }
+
+    if cli.headless {
+        if let Err(e) = run_headless(cli) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return CliOutcome::Done;
+    }
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let init_state = AppStateSnapshot::initial();
+    let state = Arc::new(arc_swap::ArcSwap::new(Arc::new(init_state)));
+    let state_clone = Arc::clone(&state);
+
+    std::thread::Builder::new()
+        .name("gui-engine".to_string())
+        .spawn(move || {
+            crate::engine::engine_main(cmd_rx, state_clone);
+        })
+        .expect("failed to spawn gui-engine thread");
+
+    CliOutcome::RunGui {
+        cmd_tx,
+        state,
+    }
 }

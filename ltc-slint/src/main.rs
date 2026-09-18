@@ -1,28 +1,21 @@
 slint::include_modules!();
 
-mod cli;
-mod log_buffer;
-
-use audio_core::{
-    is_permanent_device_error, is_transient_audio_error, list_audio_devices, suggest_sample_rate,
-    AudioCore, AudioDeviceInfo, AudioEvent, Timecode, SAMPLE_RATE_OPTIONS,
-};
-use chrono::Local;
-use clap::Parser;
-use log::{debug, error, info, warn};
-use slint::{ModelRc, SharedString, VecModel, Weak};
 use std::f64::consts::PI;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Clone)]
-struct AudioInitOutcome {
-    success: bool,
-    fmt: String,
-    status_msg: String,
-    toast_msg: String,
-    toast_type: String,
-}
+use gui_engine::command::GuiCommand;
+use gui_engine::state::AppStateSnapshot;
+use gui_engine::timecode::{self, FPS_OPTIONS};
+use gui_engine::{ArcSwap, AudioEvent, SAMPLE_RATE_OPTIONS};
+use log::{debug, error, info, warn};
+use slint::{ModelRc, SharedString, VecModel, Weak};
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const POLL_INTERVAL_MS: u64 = 40;
+
+// ── Toast management ────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct ToastItem {
@@ -30,123 +23,6 @@ struct ToastItem {
     message: String,
     toast_type: String,
 }
-
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const BUFFER_SIZE: u32 = 0;
-const POLL_INTERVAL_MS: u64 = 40; // 25 fps
-
-struct ChannelName {
-    name: &'static str,
-}
-
-impl ChannelName {
-    const fn new(name: &'static str) -> Self {
-        Self { name }
-    }
-}
-
-const CHANNEL_NAMES: [ChannelName; 3] = [
-    ChannelName::new("left"),
-    ChannelName::new("right"),
-    ChannelName::new("both"),
-];
-
-/// Time a mutex lock acquisition. Returns (guard, wait_us).
-/// If the wait exceeds 1000μs, the label is appended to slow_sections.
-fn time_lock<'a, T>(
-    label: &'static str,
-    mutex: &'a Mutex<T>,
-    slow_sections: &mut Vec<String>,
-) -> (std::sync::MutexGuard<'a, T>, u128) {
-    let start = Instant::now();
-    let guard = mutex.lock().unwrap();
-    let wait_us = start.elapsed().as_micros();
-    if wait_us > 1000 {
-        slow_sections.push(format!("{}.lock:{}μs", label, wait_us));
-    }
-    (guard, wait_us)
-}
-
-fn channel_to_str(index: usize) -> &'static str {
-    CHANNEL_NAMES.get(index).map(|c| c.name).unwrap_or("both")
-}
-
-
-
-fn timecode_to_string(tc: Timecode, drop_frame: bool) -> String {
-    let sep = if drop_frame { ';' } else { ':' };
-    format!(
-        "{:02}:{:02}:{:02}{}{:02}",
-        tc.hours, tc.minutes, tc.seconds, sep, tc.frames
-    )
-}
-
-fn split_timecode_segments(tc_str: &str) -> [String; 7] {
-    let parts: Vec<&str> = tc_str.split(|c| c == ':' || c == ';').collect();
-    let sep = if tc_str.contains(';') { ';' } else { ':' };
-    [
-        parts[0].to_string(),
-        ":".to_string(),
-        parts[1].to_string(),
-        ":".to_string(),
-        parts[2].to_string(),
-        sep.to_string(),
-        parts[3].to_string(),
-    ]
-}
-
-fn set_tc_segments(ui: &AppWindow, tc_str: &str) {
-    let [hh, sep1, mm, sep2, ss, sep3, ff] = split_timecode_segments(tc_str);
-    ui.set_tc_hh(SharedString::from(hh));
-    ui.set_tc_sep1(SharedString::from(sep1));
-    ui.set_tc_mm(SharedString::from(mm));
-    ui.set_tc_sep2(SharedString::from(sep2));
-    ui.set_tc_ss(SharedString::from(ss));
-    ui.set_tc_sep3(SharedString::from(sep3));
-    ui.set_tc_ff(SharedString::from(ff));
-}
-
-fn timecode_to_ms_string(tc: Timecode, fps: f64) -> String {
-    let ms = (tc.frames as f64 / fps * 1000.0).round() as u32;
-    format!("{:02}:{:02}:{:02}.{:03}", tc.hours, tc.minutes, tc.seconds, ms)
-}
-
-fn chrono_now_string() -> String {
-    Local::now().format("%H:%M:%S").to_string()
-}
-
-fn make_fps_name(fps: f64, drop_frame: bool) -> &'static str {
-    if (fps - 24.0).abs() < 0.01 {
-        "24 fps"
-    } else if (fps - 25.0).abs() < 0.01 {
-        "25 fps"
-    } else if (fps - 29.97).abs() < 0.01 {
-        if drop_frame {
-            "29.97 DF"
-        } else {
-            "29.97 ND"
-        }
-    } else if (fps - 30.0).abs() < 0.01 {
-        "30 fps"
-    } else {
-        "25 fps"
-    }
-}
-
-struct FpsOption {
-    name: &'static str,
-    fps: f64,
-    drop_frame: bool,
-    description: &'static str,
-}
-
-const FPS_OPTIONS: [FpsOption; 5] = [
-    FpsOption { name: "24 fps", fps: 24.0, drop_frame: false, description: "Standard cinema & film frame rate." },
-    FpsOption { name: "25 fps", fps: 25.0, drop_frame: false, description: "PAL standard (Europe, UK, Australia, Africa, Asia)." },
-    FpsOption { name: "29.97 ND", fps: 29.97, drop_frame: false, description: "NTSC Non-Drop (broadcast video & web production)." },
-    FpsOption { name: "29.97 DF", fps: 29.97, drop_frame: true, description: "NTSC Drop Frame (syncs clock drift to wall-time)." },
-    FpsOption { name: "30 fps", fps: 30.0, drop_frame: false, description: "High-definition video rate / digital audio standard." },
-];
 
 fn update_toast_model(ui: &AppWindow, toasts: &[ToastItem]) {
     let toast_data: Vec<ToastData> = toasts
@@ -159,18 +35,6 @@ fn update_toast_model(ui: &AppWindow, toasts: &[ToastItem]) {
         })
         .collect();
     ui.set_toasts(ModelRc::new(VecModel::<ToastData>::from(toast_data)));
-}
-
-fn dismiss_toast_by_id(
-    toasts: &Arc<Mutex<Vec<ToastItem>>>,
-    ui: &AppWindow,
-    id: i32,
-) {
-    let mut toasts_vec = toasts.lock().unwrap();
-    if let Some(pos) = toasts_vec.iter().position(|t| t.id == id) {
-        toasts_vec.remove(pos);
-    }
-    update_toast_model(ui, &toasts_vec);
 }
 
 fn push_toast(
@@ -199,352 +63,78 @@ fn push_toast(
         Duration::from_millis(3000),
         move || {
             if let Some(fui) = ui_weak.upgrade() {
-                dismiss_toast_by_id(&toasts_clone, &fui, dismiss_id);
+                let mut tv = toasts_clone.lock().unwrap();
+                if let Some(pos) = tv.iter().position(|t| t.id == dismiss_id) {
+                    tv.remove(pos);
+                }
+                update_toast_model(&fui, &tv);
             }
         },
     );
     Box::leak(Box::new(dismiss_timer));
 }
 
-fn ensure_audio_init(
-    audio_core: &Arc<Mutex<AudioCore>>,
-    sample_rate: &Arc<Mutex<u32>>,
-    devices: &Arc<Mutex<Vec<AudioDeviceInfo>>>,
-    device_index: &Arc<Mutex<usize>>,
-    audio_initialized: &Arc<Mutex<bool>>,
-    ui_weak: &Weak<AppWindow>,
-    toasts: &Arc<Mutex<Vec<ToastItem>>>,
-    next_toast_id: &Arc<Mutex<i32>>,
-) -> bool {
-    {
-        let init = audio_initialized.lock().unwrap();
-        if *init {
-            return true;
-        }
-    }
+// ── Timecode segment helpers ────────────────────────────────────────────
 
-    let devs = devices.lock().unwrap();
-    let idx = *device_index.lock().unwrap();
-    let (device_id, device_name) = if devs.is_empty() || idx >= devs.len() {
-        (String::new(), "default".to_string())
-    } else {
-        (devs[idx].id.clone(), devs[idx].name.clone())
-    };
-    let rate = *sample_rate.lock().unwrap();
-    drop(devs);
-
-    info!(
-        "ensure_audio_init: device={} (id={}), rate={}",
-        device_name, device_id, rate
-    );
-
-    let max_retries = 3;
-    let mut delay_ms = 50u64;
-
-    for attempt in 0..max_retries {
-        let result = {
-            let core = audio_core.lock().unwrap();
-            core.init_output(&device_id, rate, BUFFER_SIZE)
-        };
-
-        match result {
-            Ok(actual_rate) => {
-                let fmt = {
-                    let core = audio_core.lock().unwrap();
-                    let fmt = core.sample_format_name().to_string();
-                    fmt
-                };
-                *audio_initialized.lock().unwrap() = true;
-                if actual_rate != *sample_rate.lock().unwrap() {
-                    warn!(
-                        "Sample rate overridden: requested {} Hz, device uses {} Hz",
-                        rate, actual_rate
-                    );
-                    *sample_rate.lock().unwrap() = actual_rate;
-                    if let Some(u) = ui_weak.upgrade() {
-                        let rate_idx = SAMPLE_RATE_OPTIONS
-                            .iter()
-                            .position(|&r| r == actual_rate)
-                            .unwrap_or(0);
-                        u.set_sample_rate_index(rate_idx as i32);
-                    }
-                }
-                info!(
-                    "Audio initialized successfully on {} (format={}, rate={})",
-                    device_name, fmt, actual_rate
-                );
-                if let Some(u) = ui_weak.upgrade() {
-                    u.set_sample_format(SharedString::from(fmt.to_uppercase()));
-                    u.set_status_message(SharedString::from(format!("Audio initialized ({})", fmt)));
-                    let rate_khz = format!("{:.1}", actual_rate as f32 / 1000.0);
-                    u.set_sample_rate_khz(SharedString::from(rate_khz));
-                }
-                return true;
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                let transient = is_transient_audio_error(&err_str);
-                let permanent = is_permanent_device_error(&err_str);
-
-                if permanent {
-                    error!("ensure_audio_init: permanent error (no retry): {}", err_str);
-                    if let Some(u) = ui_weak.upgrade() {
-                        u.set_status_message(SharedString::from(format!(
-                            "Audio init failed (permission): {}",
-                            err_str
-                        )));
-                    }
-                    push_toast(
-                        toasts,
-                        next_toast_id,
-                        &ui_weak.upgrade().unwrap(),
-                        &format!("Audio init failed: {} — permission denied", err_str),
-                        "error",
-                    );
-                    break;
-                }
-
-                if transient && attempt < max_retries - 1 {
-                    warn!(
-                        "Audio init transient error (attempt {}/{}), retrying in {}ms: {}",
-                        attempt + 1,
-                        max_retries,
-                        delay_ms,
-                        err_str
-                    );
-                    if let Some(u) = ui_weak.upgrade() {
-                        u.set_status_message(SharedString::from(format!(
-                            "Audio init busy, retrying... ({}/{})",
-                            attempt + 1,
-                            max_retries
-                        )));
-                    }
-                    std::thread::sleep(Duration::from_millis(delay_ms));
-                    delay_ms *= 2;
-                    continue;
-                }
-
-                error!(
-                    "ensure_audio_init: init_output failed{}: {}",
-                    if transient { " (retries exhausted)" } else { "" },
-                    err_str
-                );
-                if let Some(u) = ui_weak.upgrade() {
-                    u.set_status_message(SharedString::from(format!("Audio init failed: {}", err_str)));
-                }
-                push_toast(
-                    toasts,
-                    next_toast_id,
-                    &ui_weak.upgrade().unwrap(),
-                    &format!("Audio init failed: {}", err_str),
-                    "error",
-                );
-                break;
-            }
-        }
-    }
-
-    false
+fn split_timecode_segments(tc_str: &str) -> [String; 7] {
+    let parts: Vec<&str> = tc_str.split(|c| c == ':' || c == ';').collect();
+    let sep = if tc_str.contains(';') { ';' } else { ':' };
+    [
+        parts[0].to_string(),
+        ":".to_string(),
+        parts[1].to_string(),
+        ":".to_string(),
+        parts[2].to_string(),
+        sep.to_string(),
+        parts[3].to_string(),
+    ]
 }
 
-fn attempt_recovery(
-    audio_core: &Arc<Mutex<AudioCore>>,
-    sample_rate: &Arc<Mutex<u32>>,
-    devices: &Arc<Mutex<Vec<AudioDeviceInfo>>>,
-    device_index: &Arc<Mutex<usize>>,
-    audio_initialized: &Arc<Mutex<bool>>,
-    is_playing: &Arc<Mutex<bool>>,
-    recovery_attempts: &Arc<Mutex<u8>>,
-    fps_index: &Arc<Mutex<usize>>,
-    ltc_channel_index: &Arc<Mutex<usize>>,
-    ltc_volume: &Arc<Mutex<f32>>,
-    start_timecode: &Arc<Mutex<Timecode>>,
-    ui_weak: &Weak<AppWindow>,
-    toasts: &Arc<Mutex<Vec<ToastItem>>>,
-    next_toast_id: &Arc<Mutex<i32>>,
-) {
-    let mut attempts = recovery_attempts.lock().unwrap();
-    *attempts += 1;
-
-    if *attempts >= 3 {
-        error!("attempt_recovery: 3 recovery attempts exhausted — giving up");
-        *is_playing.lock().unwrap() = false;
-        *audio_initialized.lock().unwrap() = false;
-        if let Some(u) = ui_weak.upgrade() {
-            u.set_is_playing(false);
-            u.set_status_message(SharedString::from(
-                "Recovery failed: device unreachable after 3 attempts",
-            ));
-        }
-        push_toast(
-            toasts,
-            next_toast_id,
-            &ui_weak.upgrade().unwrap(),
-            "Audio recovery failed after 3 attempts — device may be unavailable. \
-             Re-select or re-connect audio device.",
-            "error",
-        );
-        return;
-    }
-
-    let was_playing = *is_playing.lock().unwrap();
-    if was_playing {
-        info!("Recovery: stopping LTC stream");
-        let core = audio_core.lock().unwrap();
-        let _ = core.stop_ltc();
-        drop(core);
-    }
-
-    info!(
-        "Recovery: re-initializing audio output (attempt {}/3)",
-        *attempts
-    );
-    push_toast(
-        toasts,
-        next_toast_id,
-        &ui_weak.upgrade().unwrap(),
-        &format!("Audio recovery attempt {}/3 — re-initializing...", *attempts),
-        "warning",
-    );
-
-    {
-        let core = audio_core.lock().unwrap();
-        let _ = core.stop_output();
-        drop(core);
-    }
-    *audio_initialized.lock().unwrap() = false;
-    std::thread::sleep(Duration::from_millis(50));
-
-    let reinit_ok = ensure_audio_init(
-        audio_core,
-        sample_rate,
-        devices,
-        device_index,
-        audio_initialized,
-        ui_weak,
-        toasts,
-        next_toast_id,
-    );
-
-    if reinit_ok && was_playing {
-        info!("Recovery: restarting LTC stream");
-        let tc = *start_timecode.lock().unwrap();
-        let fi = *fps_index.lock().unwrap();
-        let opt = &FPS_OPTIONS[fi];
-        let channel = channel_to_str(*ltc_channel_index.lock().unwrap());
-        let vol = *ltc_volume.lock().unwrap();
-
-        let core = audio_core.lock().unwrap();
-        match core.start_ltc(tc, opt.fps, opt.drop_frame, channel.to_string(), vol) {
-            Ok(()) => {
-                *attempts = 0;
-                *is_playing.lock().unwrap() = true;
-                if let Some(u) = ui_weak.upgrade() {
-                    u.set_is_playing(true);
-                    u.set_status_message(SharedString::from("Recovery: stream restarted"));
-                }
-                info!("Recovery: LTC stream restarted successfully");
-                push_toast(
-                    toasts,
-                    next_toast_id,
-                    &ui_weak.upgrade().unwrap(),
-                    "Audio recovered and LTC stream restarted",
-                    "success",
-                );
-            }
-            Err(e) => {
-                error!("Recovery: failed to restart LTC stream: {}", e);
-                if let Some(u) = ui_weak.upgrade() {
-                    u.set_status_message(SharedString::from(format!("Recovery failed: {}", e)));
-                }
-                push_toast(
-                    toasts,
-                    next_toast_id,
-                    &ui_weak.upgrade().unwrap(),
-                    &format!("Recovery failed: could not restart LTC — {}", e),
-                    "error",
-                );
-            }
-        }
-    } else if reinit_ok {
-        *attempts = 0;
-        info!("Recovery: audio re-initialized (was not playing)");
-        push_toast(
-            toasts,
-            next_toast_id,
-            &ui_weak.upgrade().unwrap(),
-            "Audio re-initialized successfully",
-            "success",
-        );
-    } else {
-        error!("Recovery: re-initialization failed");
-        *is_playing.lock().unwrap() = false;
-        if let Some(u) = ui_weak.upgrade() {
-            u.set_is_playing(false);
-        }
-    }
+fn set_tc_segments(ui: &AppWindow, tc_str: &str) {
+    let [hh, sep1, mm, sep2, ss, sep3, ff] = split_timecode_segments(tc_str);
+    ui.set_tc_hh(SharedString::from(hh));
+    ui.set_tc_sep1(SharedString::from(sep1));
+    ui.set_tc_mm(SharedString::from(mm));
+    ui.set_tc_sep2(SharedString::from(sep2));
+    ui.set_tc_ss(SharedString::from(ss));
+    ui.set_tc_sep3(SharedString::from(sep3));
+    ui.set_tc_ff(SharedString::from(ff));
 }
+
+// ── Main ────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = cli::Cli::parse();
+    let cli = gui_engine::cli::parse_args();
 
-    if cli.list_devices {
-        cli::list_devices_and_exit();
+    match gui_engine::cli::process_cli(cli) {
+        gui_engine::cli::CliOutcome::Done => return Ok(()),
+        gui_engine::cli::CliOutcome::RunGui { cmd_tx, state } => {
+            _run_gui(cmd_tx, state)
+        }
     }
-    if cli.output_to_file.is_some() {
-        return cli::generate_wav(cli);
-    }
-    if cli.headless {
-        return cli::run_headless(cli);
-    }
+}
 
-    let log_buffer = log_buffer::init_logger("info")?;
+fn _run_gui(
+    cmd_tx: mpsc::Sender<GuiCommand>,
+    engine_state: Arc<ArcSwap<AppStateSnapshot>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let log_buffer = gui_engine::log_buffer::init_logger(
+        "ltc_gui=trace,audio_core=trace,info",
+    )?;
 
     info!("LTC Slint GUI v{} starting...", APP_VERSION);
     let os_name = std::env::consts::OS.to_uppercase();
     info!("Operating system: {}", os_name);
-    info!("Default sample rate: {} Hz", suggest_sample_rate());
 
     let ui = AppWindow::new()?;
-    let audio_core = Arc::new(Mutex::new(AudioCore::new()));
 
-    // ── State ──────────────────────────────────────────────────────────────────
-    let fps_index: Arc<Mutex<usize>> = Arc::new(Mutex::new(1)); // 25 fps default
-    let sample_rate: Arc<Mutex<u32>> = Arc::new(Mutex::new(suggest_sample_rate()));
-    let devices: Arc<Mutex<Vec<AudioDeviceInfo>>> = Arc::new(Mutex::new(Vec::new()));
-    let logs: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let is_playing: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    let ltc_channel_index: Arc<Mutex<usize>> = Arc::new(Mutex::new(0)); // Left
-    let beep_channel_index: Arc<Mutex<usize>> = Arc::new(Mutex::new(1)); // Right
-    let ltc_volume: Arc<Mutex<f32>> = Arc::new(Mutex::new(0.25));
-    let beep_volume: Arc<Mutex<f32>> = Arc::new(Mutex::new(0.5));
-    let beep_frequency: Arc<Mutex<f32>> = Arc::new(Mutex::new(1000.0));
-    let beep_duration: Arc<Mutex<f32>> = Arc::new(Mutex::new(0.5));
-    let scene: Arc<Mutex<u32>> = Arc::new(Mutex::new(1));
-    let take: Arc<Mutex<u32>> = Arc::new(Mutex::new(1));
-    let roll: Arc<Mutex<String>> = Arc::new(Mutex::new("A001".to_string()));
-    let auto_increment: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
-    let start_timecode: Arc<Mutex<Timecode>> = Arc::new(Mutex::new(Timecode {
-        hours: 1,
-        minutes: 0,
-        seconds: 0,
-        frames: 0,
-    }));
-    let device_index: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-    let arm_angle: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
-    let flash_opacity: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
-    let pulse_phase: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    // ── Toast state ─────────────────────────────────────────────────────────
     let toasts: Arc<Mutex<Vec<ToastItem>>> = Arc::new(Mutex::new(Vec::new()));
     let next_toast_id: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
     let last_debug_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let pulse_phase: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
 
-    // ── Audio recovery state ───────────────────────────────────────────────────
-    let recovery_attempts: Arc<Mutex<u8>> = Arc::new(Mutex::new(0));
-    let audio_initialized: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    let audio_init_pending: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    let audio_init_outcome: Arc<Mutex<Option<AudioInitOutcome>>> = Arc::new(Mutex::new(None));
-
-    // ── Populate FPS options model ─────────────────────────────────────────────
+    // ── Populate FPS options model ─────────────────────────────────────────
     {
         let fps_model = ModelRc::new(VecModel::<FrameRateOption>::from(
             FPS_OPTIONS
@@ -560,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_fps_options(fps_model);
     }
 
-    // ── Populate sample rate options ───────────────────────────────────────────
+    // ── Populate sample rate options ───────────────────────────────────────
     {
         let rate_model = ModelRc::new(VecModel::<SharedString>::from(
             SAMPLE_RATE_OPTIONS
@@ -569,49 +159,408 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Vec<_>>(),
         ));
         ui.set_sample_rate_options(rate_model);
-        let rate_index = SAMPLE_RATE_OPTIONS
-            .iter()
-            .position(|&r| r == suggest_sample_rate())
-            .unwrap_or(0);
-        ui.set_sample_rate_index(rate_index as i32);
     }
 
-    // ── Set OS name ────────────────────────────────────────────────────────────
+    // ── Set OS name ────────────────────────────────────────────────────────
     ui.set_os_name(SharedString::from(os_name.clone()));
     ui.set_power_status(SharedString::from("AC"));
 
-    // ── Set initial metadata ───────────────────────────────────────────────────
+    // ── Initial state read ────────────────────────────────────────────────
     {
-        let rate = *sample_rate.lock().unwrap();
+        let s = engine_state.load();
+        let rate = s.sample_rate;
         let rate_khz = format!("{:.1}", rate as f32 / 1000.0);
         ui.set_sample_rate_khz(SharedString::from(rate_khz));
-        let buffer_smp = (rate as f64 / FPS_OPTIONS[*fps_index.lock().unwrap()].fps).round() as i32;
+        let buffer_smp = (rate as f64 / s.fps).round() as i32;
         ui.set_buffer_size(buffer_smp);
+        let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame);
+        set_tc_segments(&ui, &tc_str);
+        ui.set_ms_text(SharedString::from(timecode::timecode_to_ms_string(s.current_timecode, s.fps)));
+        ui.set_fps_name(SharedString::from(FPS_OPTIONS[s.fps_index].name));
     }
 
-    // ── Refresh devices ────────────────────────────────────────────────────────
+    // ── Refresh devices ───────────────────────────────────────────────────
     {
+        let state = engine_state.clone();
         let ui_weak = ui.as_weak();
-        let audio_core_clone = audio_core.clone();
-        let devices_clone = devices.clone();
-        let device_index_clone = device_index.clone();
-        let sample_rate_clone = sample_rate.clone();
         let toasts_clone = toasts.clone();
-        let next_toast_id_clone = next_toast_id.clone();
-        let audio_initialized_clone = audio_initialized.clone();
+        let next_id = next_toast_id.clone();
+        let cmd = cmd_tx.clone();
 
         let refresh = move || {
+            let _ = cmd.send(GuiCommand::RefreshDevices);
+            std::thread::sleep(Duration::from_millis(100));
+            let s = state.load();
             let ui = match ui_weak.upgrade() {
                 Some(u) => u,
                 None => return,
             };
-            let mut devs = devices_clone.lock().unwrap();
-            match list_audio_devices() {
-                Ok(device_list) => {
-                    *devs = device_list;
-                    let count = devs.len();
-                    info!("Found {} audio devices", count);
-                    let device_names: Vec<SharedString> = devs
+            let device_names: Vec<SharedString> = s.devices
+                .iter()
+                .map(|d| {
+                    if d.is_default {
+                        SharedString::from(format!("{} (Default)", d.name))
+                    } else {
+                        SharedString::from(d.name.clone())
+                    }
+                })
+                .collect();
+            ui.set_device_names(ModelRc::new(VecModel::<SharedString>::from(device_names)));
+            ui.set_device_count(s.devices.len() as i32);
+            ui.set_device_index(s.selected_device as i32);
+            if !s.devices.is_empty() {
+                push_toast(&toasts_clone, &next_id, &ui, &format!("{} devices found", s.devices.len()), "info");
+            }
+        };
+
+        refresh();
+        ui.on_refresh_devices(refresh);
+    }
+
+    // ── Theme toggle ───────────────────────────────────────────────────────
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_theme(move || {
+            if let Some(u) = ui_weak.upgrade() {
+                let colors = AppColors::get(&u);
+                colors.set_theme_dark(!colors.get_theme_dark());
+            }
+        });
+    }
+
+    // ── Debug log toggle ───────────────────────────────────────────────────
+    {
+        let log_buffer_clone = log_buffer.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_debug_log(move || {
+            if let Some(u) = ui_weak.upgrade() {
+                let new_val = !u.get_show_debug_log();
+                u.set_show_debug_log(new_val);
+                if new_val {
+                    let entries: Vec<SharedString> = log_buffer_clone
+                        .lock().unwrap()
+                        .entries.iter()
+                        .map(|s| SharedString::from(s.as_str()))
+                        .collect();
+                    u.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::from(entries)));
+                }
+            }
+        });
+    }
+
+    // ── Debug log clear ────────────────────────────────────────────────────
+    {
+        let log_buffer_clone = log_buffer.clone();
+        let last_count_clone = last_debug_log_count.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_clear_debug_log(move || {
+            log_buffer_clone.lock().unwrap().entries.clear();
+            *last_count_clone.lock().unwrap() = 0;
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::default()));
+            }
+        });
+    }
+
+    // ── Transport callbacks ───────────────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_start_ltc(move || { let _ = cmd.send(GuiCommand::StartLtc); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_stop_ltc(move || { let _ = cmd.send(GuiCommand::StopLtc); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_reset_tc(move || { let _ = cmd.send(GuiCommand::Reset); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_toggle_lock(move || { let _ = cmd.send(GuiCommand::ToggleLock); });
+    }
+
+    // ── Clapper callbacks ─────────────────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_clap_beep(move || { let _ = cmd.send(GuiCommand::Clap); });
+    }
+
+    // ── Scene / Take / Roll ───────────────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_scene_up(move || { let _ = cmd.send(GuiCommand::SceneUp); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_scene_down(move || { let _ = cmd.send(GuiCommand::SceneDown); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_take_up(move || { let _ = cmd.send(GuiCommand::TakeUp); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_take_down(move || { let _ = cmd.send(GuiCommand::TakeDown); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_roll_changed(move || {
+            if let Some(u) = ui_weak.upgrade() {
+                let _ = cmd.send(GuiCommand::SetRoll(u.get_roll().to_string()));
+            }
+        });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_auto_increment_toggled(move || {
+            if let Some(u) = ui_weak.upgrade() {
+                let _ = cmd.send(GuiCommand::SetAutoIncrement(u.get_auto_increment()));
+            }
+        });
+    }
+
+    // ── Logs ──────────────────────────────────────────────────────────────
+    // Copy logs: GUI-only, uses arboard
+    {
+        let state = engine_state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_copy_logs(move || {
+            let s = state.load();
+            let text = s.logs
+                .iter()
+                .map(|l| format!("[{}] LTC: {} | MS: {} | {}", l.timestamp, l.timecode, l.milliseconds, l.note))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Ok(mut ctx) = arboard::Clipboard::new() {
+                let _ = ctx.set_text(text);
+            }
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_copy_confirmed(true);
+            }
+        });
+    }
+
+    // ── Toast dismiss ─────────────────────────────────────────────────────
+    {
+        let toasts_clone = toasts.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_dismiss_toast(move |id| {
+            let mut tv = toasts_clone.lock().unwrap();
+            if let Some(pos) = tv.iter().position(|t| t.id == id) {
+                tv.remove(pos);
+            }
+            if let Some(u) = ui_weak.upgrade() {
+                update_toast_model(&u, &tv);
+            }
+        });
+    }
+
+    // ── Tab click ─────────────────────────────────────────────────────────
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_tab_clicked(move |index| {
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_active_tab(index);
+            }
+        });
+    }
+
+    // ── Timecode steppers ─────────────────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        let cmd2 = cmd_tx.clone();
+        ui.on_hour_up(move || { let _ = cmd.send(GuiCommand::HourUp); });
+        ui.on_hour_down(move || { let _ = cmd2.send(GuiCommand::HourDown); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        let cmd2 = cmd_tx.clone();
+        ui.on_minute_up(move || { let _ = cmd.send(GuiCommand::MinuteUp); });
+        ui.on_minute_down(move || { let _ = cmd2.send(GuiCommand::MinuteDown); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        let cmd2 = cmd_tx.clone();
+        ui.on_second_up(move || { let _ = cmd.send(GuiCommand::SecondUp); });
+        ui.on_second_down(move || { let _ = cmd2.send(GuiCommand::SecondDown); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        let cmd2 = cmd_tx.clone();
+        ui.on_frame_up(move || { let _ = cmd.send(GuiCommand::FrameUp); });
+        ui.on_frame_down(move || { let _ = cmd2.send(GuiCommand::FrameDown); });
+    }
+
+    // ── FPS selection ────────────────────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_fps_selected(move |index| { let _ = cmd.send(GuiCommand::SetFpsIndex(index as usize)); });
+    }
+
+    // ── Sample rate selection ────────────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_sample_rate_tapped(move |_val| {
+            if let Some(rate_str) = _val.split_whitespace().next() {
+                if let Ok(rate) = rate_str.parse::<u32>() {
+                    let _ = cmd.send(GuiCommand::SetSampleRate(rate));
+                }
+            }
+        });
+    }
+
+    // ── Device selection ─────────────────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_device_selected(move |index| { let _ = cmd.send(GuiCommand::SetDevice(index as usize)); });
+    }
+
+    // ── Routing ──────────────────────────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_ltc_channel_selected(move |index| {
+            let ch = ["left", "right", "both"][index as usize];
+            let _ = cmd.send(GuiCommand::SetLtcChannel(ch.to_string()));
+        });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_beep_channel_selected(move |index| {
+            let ch = ["left", "right", "both"][index as usize];
+            let _ = cmd.send(GuiCommand::SetBeepChannel(ch.to_string()));
+        });
+    }
+
+    // ── Volume / pitch / duration sliders ─────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_ltc_volume_changed(move |val| { let _ = cmd.send(GuiCommand::SetLtcVolume(val)); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_beep_volume_changed(move |val| { let _ = cmd.send(GuiCommand::SetBeepVolume(val)); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_beep_frequency_changed(move |val| { let _ = cmd.send(GuiCommand::SetBeepFrequency(val)); });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_beep_duration_changed(move |val| { let _ = cmd.send(GuiCommand::SetBeepDuration(val)); });
+    }
+
+    // ── Polling timer (25 fps) ─────────────────────────────────────────────
+    {
+        let state = engine_state.clone();
+        let ui_weak = ui.as_weak();
+        let toasts_clone = toasts.clone();
+        let next_toast_id_clone = next_toast_id.clone();
+        let log_buffer_clone = log_buffer.clone();
+        let last_count_clone = last_debug_log_count.clone();
+        let pulse_phase_clone = pulse_phase.clone();
+
+        let poll_timer = slint::Timer::default();
+        poll_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(POLL_INTERVAL_MS),
+            move || {
+                let poll_start = Instant::now();
+                static POLL_COUNTER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let tick = POLL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                let ui = match ui_weak.upgrade() {
+                    Some(u) => u,
+                    None => return,
+                };
+
+                // 1. Load latest state from engine
+                let s = state.load();
+
+                // 2. System time
+                ui.set_system_time(SharedString::from(format!("{} UTC", timecode::chrono_now_string())));
+
+                // 3. Pulse phase animation (GUI-only, 4Hz sine)
+                let mut pp = pulse_phase_clone.lock().unwrap();
+                *pp += 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
+                if *pp > PI * 100.0 { *pp = 0.0; }
+                ui.set_pulse_phase(*pp as f32);
+
+                // 4. Timecode display
+                let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame);
+                let ms_str = timecode::timecode_to_ms_string(s.current_timecode, s.fps);
+                set_tc_segments(&ui, &tc_str);
+                ui.set_ms_text(SharedString::from(ms_str));
+
+                // 5. Transport state
+                ui.set_is_playing(s.is_playing);
+                ui.set_is_locked(s.is_locked);
+                ui.set_wake_lock_active(s.wake_lock_active);
+                ui.set_status_message(SharedString::from(&s.status_message));
+
+                // 6. FPS name
+                ui.set_fps_name(SharedString::from(FPS_OPTIONS[s.fps_index].name));
+
+                // 7. Routing pills
+                ui.set_ltc_route(SharedString::from(s.ltc_channel.to_uppercase()));
+                ui.set_beep_route(SharedString::from(s.beep_channel.to_uppercase()));
+
+                // 8. Sample rate metadata
+                let rate_khz = format!("{:.1}", s.sample_rate as f32 / 1000.0);
+                ui.set_sample_rate_khz(SharedString::from(rate_khz));
+                let buffer_smp = (s.sample_rate as f64 / s.fps).round() as i32;
+                ui.set_buffer_size(buffer_smp);
+                ui.set_sample_format(SharedString::from(s.sample_format_name.to_uppercase()));
+
+                // 9. Clapper metadata
+                ui.set_scene(s.scene as i32);
+                ui.set_take(s.take as i32);
+                ui.set_auto_increment(s.auto_increment_take);
+
+                // 10. Arm angle and flash opacity (from engine)
+                ui.set_arm_angle(s.clap_arm_angle);
+                ui.set_flash_opacity(s.clap_flash_alpha);
+
+                // 11. Device selection sync
+                ui.set_device_index(s.selected_device as i32);
+
+                // 12. Volume / pitch / duration
+                ui.set_ltc_volume(s.ltc_volume);
+                ui.set_beep_volume(s.beep_volume);
+                ui.set_beep_frequency(s.beep_frequency);
+                ui.set_beep_duration(s.beep_duration);
+
+                // 13. Start timecode steppers
+                ui.set_hour(s.start_timecode.hours as i32);
+                ui.set_minute(s.start_timecode.minutes as i32);
+                ui.set_second(s.start_timecode.seconds as i32);
+                let max_frame = s.fps.round() as i32;
+                ui.set_max_frame(if max_frame > 0 { max_frame - 1 } else { 0 });
+                ui.set_frame(s.start_timecode.frames as i32);
+
+                // 14. FPS and sample rate index
+                ui.set_fps_index(s.fps_index as i32);
+
+                // 15. Log entries from engine
+                {
+                    let log_entries: Vec<LogEntry> = s.logs
+                        .iter()
+                        .map(|l| LogEntry {
+                            timestamp: SharedString::from(&l.timestamp),
+                            timecode: SharedString::from(&l.timecode),
+                            milliseconds: SharedString::from(&l.milliseconds),
+                            note: SharedString::from(&l.note),
+                        })
+                        .collect();
+                    ui.set_logs(ModelRc::new(VecModel::<LogEntry>::from(log_entries)));
+                }
+
+                // 16. Device names
+                {
+                    let device_names: Vec<SharedString> = s.devices
                         .iter()
                         .map(|d| {
                             if d.is_default {
@@ -621,1235 +570,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         })
                         .collect();
-                    let name_model = ModelRc::new(VecModel::<SharedString>::from(device_names));
-                    drop(devs);
-                    ui.set_device_names(name_model);
-                    ui.set_device_count(count as i32);
+                    ui.set_device_names(ModelRc::new(VecModel::<SharedString>::from(device_names)));
+                    ui.set_device_count(s.devices.len() as i32);
+                }
 
-                    // Auto-initialize audio on first device
-                    if count > 0 {
-                        let mut idx = device_index_clone.lock().unwrap();
-                        if *idx >= count {
-                            *idx = 0;
+                // 17. Process events into toasts
+                for event in &s.events {
+                    let (msg, typ) = match event {
+                        AudioEvent::StreamError(m) => (m.clone(), "error"),
+                        AudioEvent::StreamDied => ("Audio stream died".to_string(), "error"),
+                        AudioEvent::StreamRecovering { attempt } => {
+                            (format!("Stream recovering (attempt {})", attempt), "warning")
                         }
-                        ui.set_device_index(*idx as i32);
-                        drop(idx);
-
-                        ensure_audio_init(
-                            &audio_core_clone,
-                            &sample_rate_clone,
-                            &devices_clone,
-                            &device_index_clone,
-                            &audio_initialized_clone,
-                            &ui_weak,
-                            &toasts_clone,
-                            &next_toast_id_clone,
-                        );
-                    } else {
-                        warn!("No audio devices found");
-                        ui.set_status_message(SharedString::from("No audio devices found"));
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to list audio devices: {}", e);
-                    ui.set_status_message(SharedString::from(format!("Device error: {}", e)));
-                }
-            }
-        };
-
-        refresh();
-        ui.on_refresh_devices(refresh);
-    }
-
-    // ── Theme toggle ───────────────────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        ui.on_toggle_theme(move || {
-            let ui = match ui_weak.upgrade() {
-                Some(u) => u,
-                None => return,
-            };
-            let colors = AppColors::get(&ui);
-            let new_dark = !colors.get_theme_dark();
-            colors.set_theme_dark(new_dark);
-            info!("Theme switched to {}", if new_dark { "dark" } else { "light" });
-        });
-    }
-
-    // ── Debug log toggle ───────────────────────────────────────────────────────
-    {
-        let log_buffer_clone = log_buffer.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_toggle_debug_log(move || {
-            if let Some(u) = ui_weak.upgrade() {
-                let new_val = !u.get_show_debug_log();
-                u.set_show_debug_log(new_val);
-                if new_val {
-                    let log_entries = log_buffer_clone.lock().unwrap();
-                    let entries: Vec<SharedString> = log_entries.entries.iter().map(|s| SharedString::from(s.as_str())).collect();
-                    u.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::from(entries)));
-                }
-                info!("Debug log window {}", if new_val { "opened" } else { "closed" });
-            }
-        });
-    }
-
-    // ── Debug log clear ────────────────────────────────────────────────────────
-    {
-        let log_buffer_clone = log_buffer.clone();
-        let last_debug_log_count_clone = last_debug_log_count.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_clear_debug_log(move || {
-            {
-                let mut buf = log_buffer_clone.lock().unwrap();
-                buf.entries.clear();
-            }
-            *last_debug_log_count_clone.lock().unwrap() = 0;
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::default()));
-            }
-            info!("Debug log cleared");
-        });
-    }
-
-    // ── Clock callbacks ────────────────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        let audio_core_clone = audio_core.clone();
-        let fps_index_clone = fps_index.clone();
-        let ltc_channel_index_clone = ltc_channel_index.clone();
-        let ltc_volume_clone = ltc_volume.clone();
-        let is_playing_clone = is_playing.clone();
-        let start_timecode_clone = start_timecode.clone();
-        let toasts_clone = toasts.clone();
-        let next_toast_id_clone = next_toast_id.clone();
-        let sample_rate_clone = sample_rate.clone();
-        let devices_clone = devices.clone();
-        let device_index_clone = device_index.clone();
-        let audio_initialized_clone = audio_initialized.clone();
-        let recovery_attempts_clone = recovery_attempts.clone();
-
-        ui.on_start_ltc(move || {
-            let ui = match ui_weak.upgrade() {
-                Some(u) => u,
-                None => return,
-            };
-
-            if !ensure_audio_init(
-                &audio_core_clone,
-                &sample_rate_clone,
-                &devices_clone,
-                &device_index_clone,
-                &audio_initialized_clone,
-                &ui_weak,
-                &toasts_clone,
-                &next_toast_id_clone,
-            ) {
-                error!("start_ltc: audio init failed, cannot start LTC");
-                push_toast(&toasts_clone, &next_toast_id_clone, &ui, "Cannot start LTC — audio not initialized", "error");
-                return;
-            }
-
-            let fi = *fps_index_clone.lock().unwrap();
-            let opt = &FPS_OPTIONS[fi];
-            let tc = *start_timecode_clone.lock().unwrap();
-            let channel = channel_to_str(*ltc_channel_index_clone.lock().unwrap());
-            let vol = *ltc_volume_clone.lock().unwrap();
-
-            info!(
-                "Starting LTC: tc={:02}:{:02}:{:02}:{:02}, fps={}, drop_frame={}, channel={}, volume={}",
-                tc.hours, tc.minutes, tc.seconds, tc.frames, opt.fps, opt.drop_frame, channel, vol
-            );
-            let core = audio_core_clone.lock().unwrap();
-            match core.start_ltc(tc, opt.fps, opt.drop_frame, channel.to_string(), vol) {
-                Ok(()) => {
-                    *is_playing_clone.lock().unwrap() = true;
-                    *recovery_attempts_clone.lock().unwrap() = 0;
-                    ui.set_is_playing(true);
-                    ui.set_status_message(SharedString::from("Streaming LTC"));
-                    info!("LTC stream started");
-                    push_toast(&toasts_clone, &next_toast_id_clone, &ui, "LTC streaming started", "info");
-                }
-                Err(e) => {
-                    error!("Failed to start LTC: {}", e);
-                    ui.set_status_message(SharedString::from(format!("Start failed: {}", e)));
-                    push_toast(&toasts_clone, &next_toast_id_clone, &ui, &format!("LTC start failed: {}", e), "error");
-                }
-            }
-        });
-    }
-
-    {
-        let ui_weak = ui.as_weak();
-        let audio_core_clone = audio_core.clone();
-        let is_playing_clone = is_playing.clone();
-        let toasts_clone = toasts.clone();
-        let next_toast_id_clone = next_toast_id.clone();
-
-        ui.on_stop_ltc(move || {
-            info!("Stopping LTC stream");
-            let core = audio_core_clone.lock().unwrap();
-            if let Err(e) = core.stop_ltc() {
-                error!("Failed to stop LTC: {}", e);
-            }
-            *is_playing_clone.lock().unwrap() = false;
-            let ui = match ui_weak.upgrade() {
-                Some(u) => u,
-                None => return,
-            };
-            ui.set_is_playing(false);
-            ui.set_wake_lock_active(false);
-            ui.set_status_message(SharedString::from("Stopped"));
-            info!("LTC stream stopped");
-            push_toast(&toasts_clone, &next_toast_id_clone, &ui, "LTC streaming stopped", "info");
-        });
-    }
-
-    {
-        let ui_weak = ui.as_weak();
-        let audio_core_clone = audio_core.clone();
-        let start_timecode_clone = start_timecode.clone();
-
-        ui.on_reset_tc(move || {
-            let tc = *start_timecode_clone.lock().unwrap();
-            info!("Resetting LTC to {:02}:{:02}:{:02}:{:02}", tc.hours, tc.minutes, tc.seconds, tc.frames);
-            let core = audio_core_clone.lock().unwrap();
-            if let Err(e) = core.reset_ltc(tc) {
-                error!("Failed to reset LTC: {}", e);
-            }
-            let ui = match ui_weak.upgrade() {
-                Some(u) => u,
-                None => return,
-            };
-            ui.set_status_message(SharedString::from("Reset"));
-        });
-    }
-
-    {
-        let is_locked = Arc::new(Mutex::new(false));
-        let ui_weak = ui.as_weak();
-        let is_locked_clone = is_locked.clone();
-
-        ui.on_toggle_lock(move || {
-            let mut locked = is_locked_clone.lock().unwrap();
-            *locked = !*locked;
-            let ui = match ui_weak.upgrade() {
-                Some(u) => u,
-                None => return,
-            };
-            ui.set_is_locked(*locked);
-            info!("Controls {}", if *locked { "locked" } else { "unlocked" });
-        });
-    }
-
-    // ── Clapper callbacks ──────────────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        let audio_core_clone = audio_core.clone();
-        let sample_rate_clone = sample_rate.clone();
-        let beep_volume_clone = beep_volume.clone();
-        let beep_frequency_clone = beep_frequency.clone();
-        let beep_duration_clone = beep_duration.clone();
-        let beep_channel_index_clone = beep_channel_index.clone();
-        let logs_clone = logs.clone();
-        let fps_index_clone = fps_index.clone();
-        let arm_angle_clone = arm_angle.clone();
-        let flash_opacity_clone = flash_opacity.clone();
-        let toasts_clone = toasts.clone();
-        let next_toast_id_clone = next_toast_id.clone();
-        let ui_weak_clone = ui_weak.clone();
-        let scene_clone = scene.clone();
-        let take_clone = take.clone();
-        let roll_clone = roll.clone();
-        let auto_increment_clone = auto_increment.clone();
-        let devices_clone = devices.clone();
-        let device_index_clone = device_index.clone();
-        let audio_initialized_clone = audio_initialized.clone();
-
-        ui.on_clap_beep(move || {
-            if !ensure_audio_init(
-                &audio_core_clone,
-                &sample_rate_clone,
-                &devices_clone,
-                &device_index_clone,
-                &audio_initialized_clone,
-                &ui_weak,
-                &toasts_clone,
-                &next_toast_id_clone,
-            ) {
-                error!("clap_beep: audio not initialized, cannot play beep");
-                return;
-            }
-
-            let sr = *sample_rate_clone.lock().unwrap();
-            let vol = *beep_volume_clone.lock().unwrap();
-            let freq = *beep_frequency_clone.lock().unwrap();
-            let dur = *beep_duration_clone.lock().unwrap();
-            let ch = channel_to_str(*beep_channel_index_clone.lock().unwrap());
-
-            info!(
-                "Clap triggered: freq={}Hz, volume={}, duration={}s, channel={}",
-                freq, vol, dur, ch
-            );
-
-            {
-                let core = audio_core_clone.lock().unwrap();
-                if let Err(e) = core.play_beep(sr, freq, dur, vol, ch) {
-                    error!("Failed to play beep: {}", e);
-                }
-            }
-
-            let ui = match ui_weak.upgrade() {
-                Some(u) => u,
-                None => return,
-            };
-
-            // Arm animation: bounce up by 15px (exponential decay handled in poll timer)
-            *arm_angle_clone.lock().unwrap() = -15.0;
-            ui.set_arm_angle(-15.0_f32);
-
-            // Full-screen flash
-            *flash_opacity_clone.lock().unwrap() = 0.6;
-            ui.set_flash_opacity(0.6_f32);
-
-            // Toast notification
-            {
-                let mut toasts_vec = toasts_clone.lock().unwrap();
-                let mut next_id = next_toast_id_clone.lock().unwrap();
-                *next_id += 1;
-                let toast_id = *next_id;
-                let msg = format!("Clap captured at {}", ui.get_timecode_text());
-                toasts_vec.push(ToastItem {
-                    id: toast_id,
-                    message: msg.clone(),
-                    toast_type: "success".to_string(),
-                });
-                update_toast_model(&ui, &toasts_vec);
-                // Auto-dismiss after 3 seconds
-                let dismiss_weak = ui_weak_clone.clone();
-                let toasts_clone2 = toasts_clone.clone();
-                let dismiss_timer = slint::Timer::default();
-                dismiss_timer.start(
-                    slint::TimerMode::SingleShot,
-                    Duration::from_millis(3000),
-                    move || {
-                        if let Some(fui) = dismiss_weak.upgrade() {
-                            dismiss_toast_by_id(&toasts_clone2, &fui, toast_id);
+                        AudioEvent::StreamDead => {
+                            ("Audio device unreachable".to_string(), "error")
                         }
-                    },
-                );
-                // Leak timer so it lives independently
-                Box::leak(Box::new(dismiss_timer));
-            }
-
-            // Log the clap
-            let fi = *fps_index_clone.lock().unwrap();
-            let opt = &FPS_OPTIONS[fi];
-            let tc = audio_core_clone.lock().unwrap().current_timecode();
-            let tc_str = timecode_to_string(tc, opt.drop_frame);
-            let ms_str = timecode_to_ms_string(tc, opt.fps);
-            let timestamp = chrono_now_string();
-            let s = *scene_clone.lock().unwrap();
-            let t = *take_clone.lock().unwrap();
-            let r = roll_clone.lock().unwrap().clone();
-            let note = format!(
-                "Scene {} / Take {} / Roll {}",
-                s,
-                t,
-                if r.is_empty() { "—" } else { &r }
-            );
-            info!("Clap logged: {}", note);
-            let entry = LogEntry {
-                timestamp: SharedString::from(timestamp),
-                timecode: SharedString::from(tc_str),
-                milliseconds: SharedString::from(ms_str),
-                note: SharedString::from(note),
-            };
-            let mut log_vec = logs_clone.lock().unwrap();
-            log_vec.push(entry);
-
-            // Update the model (timed)
-            let rebuild_start = Instant::now();
-            let log_model = ModelRc::new(VecModel::<LogEntry>::from(log_vec.clone()));
-            let rebuild_us = rebuild_start.elapsed().as_micros();
-            ui.set_logs(log_model);
-            if rebuild_us > 1000 {
-                info!(
-                    "[PERF] Log model rebuild took {}μs ({} entries)",
-                    rebuild_us,
-                    log_vec.len()
-                );
-            }
-
-            if *auto_increment_clone.lock().unwrap() {
-                let mut t = take_clone.lock().unwrap();
-                *t += 1;
-                ui.set_take(*t as i32);
-            }
-        });
-    }
-
-    // ── Scene/Take/Roll callbacks ─────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        let scene_clone = scene.clone();
-        ui.on_scene_up(move || {
-            let mut s = scene_clone.lock().unwrap();
-            *s = s.saturating_add(1);
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_scene(*s as i32);
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        let scene_clone = scene.clone();
-        ui.on_scene_down(move || {
-            let mut s = scene_clone.lock().unwrap();
-            *s = s.saturating_sub(1);
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_scene(*s as i32);
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        let take_clone = take.clone();
-        ui.on_take_up(move || {
-            let mut t = take_clone.lock().unwrap();
-            *t = t.saturating_add(1);
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_take(*t as i32);
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        let take_clone = take.clone();
-        ui.on_take_down(move || {
-            let mut t = take_clone.lock().unwrap();
-            *t = t.saturating_sub(1);
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_take(*t as i32);
-            }
-        });
-    }
-    {
-        let roll_clone = roll.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_roll_changed(move || {
-            if let Some(u) = ui_weak.upgrade() {
-                let new_text = u.get_roll().to_string();
-                *roll_clone.lock().unwrap() = new_text.clone();
-                info!("Roll changed to: {}", new_text);
-            }
-        });
-    }
-    {
-        let auto_increment_clone = auto_increment.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_auto_increment_toggled(move || {
-            let mut ai = auto_increment_clone.lock().unwrap();
-            *ai = !*ai;
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_auto_increment(*ai);
-            }
-            info!("Auto-increment take: {}", if *ai { "on" } else { "off" });
-        });
-    }
-
-    // ── Log management ─────────────────────────────────────────────────────────
-    {
-        let logs_clone = logs.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_clear_logs(move || {
-            let mut log_vec = logs_clone.lock().unwrap();
-            log_vec.clear();
-            let empty_model: ModelRc<LogEntry> = ModelRc::new(VecModel::default());
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_logs(empty_model);
-            }
-            info!("Logs cleared");
-        });
-    }
-    {
-        let logs_clone = logs.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_copy_logs(move || {
-            let log_vec = logs_clone.lock().unwrap();
-            let text: String = log_vec
-                .iter()
-                .map(|l| {
-                    format!(
-                        "[{}] LTC: {} | MS: {} | {}",
-                        l.timestamp, l.timecode, l.milliseconds, l.note
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                match arboard::Clipboard::new() {
-                    Ok(mut cb) => {
-                        if cb.set_text(&text).is_ok() {
-                            info!("Copied {} log entries to clipboard", log_vec.len());
-                        } else {
-                            warn!("Clipboard: set_text failed");
+                        AudioEvent::RecoveryNeeded { reason } => {
+                            (format!("Audio recovery needed: {}", reason), "warning")
                         }
-                    }
-                    Err(e) => warn!("Clipboard error: {}", e),
-                }
-            }
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_copy_confirmed(true);
-                let weak = ui_weak.clone();
-                let reset_timer = slint::Timer::default();
-                reset_timer.start(
-                    slint::TimerMode::SingleShot,
-                    Duration::from_millis(1500),
-                    move || {
-                        if let Some(fu) = weak.upgrade() {
-                            fu.set_copy_confirmed(false);
+                        AudioEvent::Underrun => ("Audio underrun".to_string(), "warning"),
+                        AudioEvent::FramesDropped { total } => {
+                            (format!("{} frames dropped", total), "warning")
                         }
-                    },
-                );
-                Box::leak(Box::new(reset_timer));
-            }
-        });
-    }
-
-    // ── Toast dismiss ──────────────────────────────────────────────────────────
-    {
-        let toasts_clone = toasts.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_dismiss_toast(move |id| {
-            if let Some(fui) = ui_weak.upgrade() {
-                dismiss_toast_by_id(&toasts_clone, &fui, id);
-            }
-        });
-    }
-
-    // ── Tab navigation ─────────────────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        ui.on_tab_clicked(move |new_tab| {
-            let tab_name = match new_tab {
-                0 => "Clapper Slate & Logs",
-                1 => "Signal & Audio Settings",
-                _ => "Unknown",
-            };
-            let click_time = Instant::now();
-            info!(
-                "[PERF] Tab clicked: tab={} ({}), t=+0μs",
-                new_tab, tab_name
-            );
-            if let Some(u) = ui_weak.upgrade() {
-                // Check if already on this tab (spurious click)
-                let prev = u.get_active_tab();
-                if prev == new_tab {
-                    info!(
-                        "[PERF] Tab {} already active, ignoring (t=+{}μs)",
-                        new_tab,
-                        click_time.elapsed().as_micros()
-                    );
-                    return;
-                }
-                u.set_active_tab(new_tab);
-                let elapsed = click_time.elapsed();
-                info!(
-                    "[PERF] Tab switch {}→{} complete: t=+{}μs",
-                    prev, new_tab, elapsed.as_micros()
-                );
-            } else {
-                warn!("tab_clicked: UI gone");
-            }
-        });
-    }
-
-    // ── Settings callbacks ─────────────────────────────────────────────────────
-fn stepper_handlers(
-    ui_weak: &Weak<AppWindow>,
-    tc: &Arc<Mutex<Timecode>>,
-    field: fn(&mut Timecode) -> &mut u32,
-    max: u32,
-    direction: i32,
-    label: &str,
-) -> impl FnMut() {
-    let ui_weak = ui_weak.clone();
-    let tc_clone = tc.clone();
-    let label_str = label.to_string();
-    move || {
-        let mut t = tc_clone.lock().unwrap();
-        let val = field(&mut t);
-        if direction > 0 {
-            *val = (*val + 1) % max;
-        } else {
-            *val = if *val == 0 { max - 1 } else { *val - 1 };
-        }
-        info!("Starting timecode {} changed to {:02}", label_str, *val);
-        let ui = match ui_weak.upgrade() {
-            Some(u) => u,
-            None => return,
-        };
-        ui.set_hour(t.hours as i32);
-        ui.set_minute(t.minutes as i32);
-        ui.set_second(t.seconds as i32);
-        ui.set_frame(t.frames as i32);
-    }
-}
-
-    let st = start_timecode.clone();
-    let uiw = ui.as_weak();
-    ui.on_hour_up(stepper_handlers(&uiw, &st, |tc| &mut tc.hours, 24, 1, "hours"));
-    let st = start_timecode.clone();
-    let uiw = ui.as_weak();
-    ui.on_hour_down(stepper_handlers(&uiw, &st, |tc| &mut tc.hours, 24, -1, "hours"));
-    let st = start_timecode.clone();
-    let uiw = ui.as_weak();
-    ui.on_minute_up(stepper_handlers(&uiw, &st, |tc| &mut tc.minutes, 60, 1, "minutes"));
-    let st = start_timecode.clone();
-    let uiw = ui.as_weak();
-    ui.on_minute_down(stepper_handlers(&uiw, &st, |tc| &mut tc.minutes, 60, -1, "minutes"));
-    let st = start_timecode.clone();
-    let uiw = ui.as_weak();
-    ui.on_second_up(stepper_handlers(&uiw, &st, |tc| &mut tc.seconds, 60, 1, "seconds"));
-    let st = start_timecode.clone();
-    let uiw = ui.as_weak();
-    ui.on_second_down(stepper_handlers(&uiw, &st, |tc| &mut tc.seconds, 60, -1, "seconds"));
-    {
-        let ui_weak = ui.as_weak();
-        let tc_clone = start_timecode.clone();
-        let fps_idx = fps_index.clone();
-        ui.on_frame_up(move || {
-            let mut t = tc_clone.lock().unwrap();
-            let fi = *fps_idx.lock().unwrap();
-            let opt = &FPS_OPTIONS[fi];
-            let max = opt.fps.ceil() as u32;
-            t.frames = (t.frames + 1) % max;
-            info!("Starting timecode frames changed to {:02}", t.frames);
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_hour(t.hours as i32);
-                u.set_minute(t.minutes as i32);
-                u.set_second(t.seconds as i32);
-                u.set_frame(t.frames as i32);
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        let tc_clone = start_timecode.clone();
-        let fps_idx = fps_index.clone();
-        ui.on_frame_down(move || {
-            let mut t = tc_clone.lock().unwrap();
-            let fi = *fps_idx.lock().unwrap();
-            let opt = &FPS_OPTIONS[fi];
-            let max = opt.fps.ceil() as u32;
-            t.frames = if t.frames == 0 { max - 1 } else { t.frames - 1 };
-            info!("Starting timecode frames changed to {:02}", t.frames);
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_hour(t.hours as i32);
-                u.set_minute(t.minutes as i32);
-                u.set_second(t.seconds as i32);
-                u.set_frame(t.frames as i32);
-            }
-        });
-    }
-
-    // ── FPS selection ──────────────────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        let fps_index_clone = fps_index.clone();
-        let start_tc_clone = start_timecode.clone();
-        let sample_rate_clone = sample_rate.clone();
-        ui.on_fps_selected(move |fps_value_x100| {
-            let target_fps = fps_value_x100 as f64 / 100.0;
-            let mut fi = fps_index_clone.lock().unwrap();
-            if let Some(idx) = FPS_OPTIONS.iter().position(|opt| (opt.fps - target_fps).abs() < 0.01) {
-                *fi = idx;
-                let opt = &FPS_OPTIONS[idx];
-                info!(
-                    "Frame rate changed to: {} ({} fps, drop_frame={})",
-                    opt.name, opt.fps, opt.drop_frame
-                );
-                if let Some(u) = ui_weak.upgrade() {
-                    u.set_fps_index(idx as i32);
-                    u.set_fps_name(SharedString::from(make_fps_name(opt.fps, opt.drop_frame)));
-                    let max_frames = opt.fps.ceil() as i32;
-                    u.set_max_frame(max_frames);
-
-                    // Sync start_timecode Mutex from UI values
-                    let tc = Timecode {
-                        hours: u.get_hour() as u32,
-                        minutes: u.get_minute() as u32,
-                        seconds: u.get_second() as u32,
-                        frames: u.get_frame() as u32,
                     };
-                    *start_tc_clone.lock().unwrap() = tc;
-
-                    let tc_str = timecode_to_string(tc, opt.drop_frame);
-                    let ms_str = timecode_to_ms_string(tc, opt.fps);
-                    u.set_timecode_text(SharedString::from(&tc_str));
-                    set_tc_segments(&u, &tc_str);
-                    u.set_ms_text(SharedString::from(ms_str));
-                    let rate = *sample_rate_clone.lock().unwrap();
-                    let rate_khz = format!("{:.1}", rate as f32 / 1000.0);
-                    u.set_sample_rate_khz(SharedString::from(rate_khz));
-                    let buffer_smp = (rate as f64 / opt.fps).round() as i32;
-                    u.set_buffer_size(buffer_smp);
-                }
-            }
-        });
-    }
-
-    // ── Sample rate selection ──────────────────────────────────────────────────
-    {
-        let sample_rate_clone = sample_rate.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_sample_rate_tapped(move |rate_text| {
-            let rate_str = rate_text.trim_end_matches(" Hz");
-            if let Ok(rate) = rate_str.parse::<u32>() {
-                info!("Sample rate changed to: {} Hz", rate);
-                *sample_rate_clone.lock().unwrap() = rate;
-                if let Some(u) = ui_weak.upgrade() {
-                    if let Some(idx) = SAMPLE_RATE_OPTIONS.iter().position(|&r| r == rate) {
-                        u.set_sample_rate_index(idx as i32);
-                    }
-                    let rate_khz = format!("{:.1}", rate as f32 / 1000.0);
-                    u.set_sample_rate_khz(SharedString::from(rate_khz));
-                }
-            }
-        });
-    }
-// ── Device selection ───────────────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        let audio_core_clone = audio_core.clone();
-        let devices_clone = devices.clone();
-        let device_index_clone = device_index.clone();
-        let sample_rate_clone = sample_rate.clone();
-        let is_playing_clone = is_playing.clone();
-        let fps_index_clone = fps_index.clone();
-        let ltc_channel_index_clone = ltc_channel_index.clone();
-        let ltc_volume_clone = ltc_volume.clone();
-        let audio_initialized_clone = audio_initialized.clone();
-        let audio_init_pending_clone = audio_init_pending.clone();
-        let audio_init_outcome_clone = audio_init_outcome.clone();
-        let recovery_attempts_clone = recovery_attempts.clone();
-        let start_timecode_clone = start_timecode.clone();
-
-        ui.on_device_selected(move |index| {
-            let idx = index as usize;
-
-            // Bail if another init is already in flight
-            if *audio_init_pending_clone.lock().unwrap() {
-                warn!("Device selection ignored: audio init already in progress");
-                return;
-            }
-
-            let devs = devices_clone.lock().unwrap();
-            if idx >= devs.len() {
-                warn!("Device index {} out of range", idx);
-                return;
-            }
-            let device = &devs[idx];
-            let prev_idx = *device_index_clone.lock().unwrap();
-            let device_id = device.id.clone();
-            let device_name = device.name.clone();
-            let prev_device_name = if prev_idx < devs.len() {
-                devs[prev_idx].name.clone()
-            } else {
-                "default".to_string()
-            };
-            drop(devs); // release devices lock before expensive work
-
-            info!("Device selected: {} (index {})", device_name, idx);
-
-            let was_playing = *is_playing_clone.lock().unwrap();
-            if was_playing {
-                let core = audio_core_clone.lock().unwrap();
-                let _ = core.stop_ltc();
-                drop(core);
-            }
-
-            // Stop existing output
-            {
-                let core = audio_core_clone.lock().unwrap();
-                let _ = core.stop_output();
-                drop(core);
-            }
-            *audio_initialized_clone.lock().unwrap() = false;
-            *recovery_attempts_clone.lock().unwrap() = 0;
-            *device_index_clone.lock().unwrap() = idx;
-
-            // Show pending state immediately
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_status_message(SharedString::from(format!("Switching to {}...", device_name)));
-            }
-            *audio_init_pending_clone.lock().unwrap() = true;
-
-            // Capture values needed on background thread
-            let rate = *sample_rate_clone.lock().unwrap();
-            let tc = *start_timecode_clone.lock().unwrap();
-            let fi = *fps_index_clone.lock().unwrap();
-            let opt = &FPS_OPTIONS[fi];
-            let ch = channel_to_str(*ltc_channel_index_clone.lock().unwrap()).to_string();
-            let vol = *ltc_volume_clone.lock().unwrap();
-
-            let audio_core_bg = audio_core_clone.clone();
-            let audio_initialized_bg = audio_initialized_clone.clone();
-            let sample_rate_bg = sample_rate_clone.clone();
-            let device_index_bg = device_index_clone.clone();
-            let is_playing_bg = is_playing_clone.clone();
-            let audio_init_pending_bg = audio_init_pending_clone.clone();
-            let audio_init_outcome_bg = audio_init_outcome_clone.clone();
-
-            std::thread::Builder::new()
-                .name("init-device".into())
-                .spawn(move || {
-                    let max_retries = 3;
-                    let mut delay_ms = 50u64;
-                    let mut init_success = false;
-                    let mut fmt_name = String::new();
-
-                    for attempt in 0..max_retries {
-                        let result = {
-                            let core = audio_core_bg.lock().unwrap();
-                            core.init_output(&device_id, rate, BUFFER_SIZE)
-                        };
-
-                        match result {
-                            Ok(ar) => {
-                                fmt_name = {
-                                    let core = audio_core_bg.lock().unwrap();
-                                    core.sample_format_name()
-                                };
-                                *audio_initialized_bg.lock().unwrap() = true;
-                                if ar != *sample_rate_bg.lock().unwrap() {
-                                    warn!(
-                                        "Sample rate overridden: requested {} Hz, device uses {} Hz",
-                                        rate, ar
-                                    );
-                                    *sample_rate_bg.lock().unwrap() = ar;
-                                }
-                                init_success = true;
-                                break;
-                            }
-                            Err(e) => {
-                                let err_str = e.to_string();
-                                let transient = is_transient_audio_error(&err_str);
-                                let permanent = is_permanent_device_error(&err_str);
-
-                                if permanent {
-                                    error!("Device init: permanent error (no retry): {}", err_str);
-                                    *audio_init_outcome_bg.lock().unwrap() = Some(AudioInitOutcome {
-                                        success: false,
-                                        fmt: String::new(),
-                                        status_msg: format!("Audio init failed (permission): {}", err_str),
-                                        toast_msg: format!("Audio init failed: {} — permission denied", err_str),
-                                        toast_type: "error".to_string(),
-                                    });
-                                    break;
-                                }
-
-                                if transient && attempt < max_retries - 1 {
-                                    warn!(
-                                        "Audio init transient error (attempt {}/{}), retrying in {}ms: {}",
-                                        attempt + 1, max_retries, delay_ms, err_str
-                                    );
-                                    std::thread::sleep(Duration::from_millis(delay_ms));
-                                    delay_ms *= 2;
-                                    continue;
-                                }
-
-                                error!("Device init failed{}: {}",
-                                    if transient { " (retries exhausted)" } else { "" }, err_str);
-                                *audio_init_outcome_bg.lock().unwrap() = Some(AudioInitOutcome {
-                                    success: false,
-                                    fmt: String::new(),
-                                    status_msg: format!("Audio init failed: {}", err_str),
-                                    toast_msg: format!("Audio init failed: {}", err_str),
-                                    toast_type: "error".to_string(),
-                                });
-                                break;
-                            }
-                        }
-                    }
-
-                    if init_success {
-                        let mut restart_failed = false;
-                        if was_playing {
-                            let core = audio_core_bg.lock().unwrap();
-                            match core.start_ltc(tc, opt.fps, opt.drop_frame, ch, vol) {
-                                Ok(()) => {
-                                    *is_playing_bg.lock().unwrap() = true;
-                                    info!("LTC restarted on new device");
-                                }
-                                Err(e) => {
-                                    error!("Failed to restart LTC on new device: {}", e);
-                                    restart_failed = true;
-                                }
-                            }
-                        }
-
-                        let status = if restart_failed {
-                            "Restarted on new device, LTC restart failed".to_string()
-                        } else {
-                            format!("Audio: {}", device_name)
-                        };
-                        *audio_init_outcome_bg.lock().unwrap() = Some(AudioInitOutcome {
-                            success: true,
-                            fmt: fmt_name,
-                            status_msg: status,
-                            toast_msg: if restart_failed {
-                                format!("Device switched to '{}' but LTC restart failed", device_name)
-                            } else {
-                                String::new()
-                            },
-                            toast_type: if restart_failed { "warning".to_string() } else { String::new() },
-                        });
-                    } else {
-                        // Revert to previous device (only on non-permanent failures — permanent already reverted above)
-                        *device_index_bg.lock().unwrap() = prev_idx;
-                        let existing = audio_init_outcome_bg.lock().unwrap().take();
-                        if existing.is_none() {
-                            *audio_init_outcome_bg.lock().unwrap() = Some(AudioInitOutcome {
-                                success: false,
-                                fmt: String::new(),
-                                status_msg: format!("Device '{}' failed. Reverted to '{}'", device_name, prev_device_name),
-                                toast_msg: format!("Audio device '{}' failed. Reverted to '{}'.", device_name, prev_device_name),
-                                toast_type: "error".to_string(),
-                            });
-                        }
-                    }
-
-                    *audio_init_pending_bg.lock().unwrap() = false;
-                })
-                .expect("Failed to spawn device init thread");
-        });
-    }
-
-    // ── Channel routing callbacks ──────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        let ltc_channel_index_clone = ltc_channel_index.clone();
-        ui.on_ltc_channel_selected(move |index| {
-            let idx = index as usize;
-            *ltc_channel_index_clone.lock().unwrap() = idx;
-            let name = channel_to_str(idx).to_uppercase();
-            info!("LTC channel changed to: {}", name);
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_ltc_route(SharedString::from(name));
-            }
-        });
-    }
-    {
-        let ui_weak = ui.as_weak();
-        let beep_channel_index_clone = beep_channel_index.clone();
-        ui.on_beep_channel_selected(move |index| {
-            let idx = index as usize;
-            *beep_channel_index_clone.lock().unwrap() = idx;
-            let name = channel_to_str(idx).to_uppercase();
-            info!("Beep channel changed to: {}", name);
-            if let Some(u) = ui_weak.upgrade() {
-                u.set_beep_route(SharedString::from(name));
-            }
-        });
-    }
-
-    // ── Volume/frequency/duration sliders ──────────────────────────────────────
-    {
-        let ltc_volume_clone = ltc_volume.clone();
-        ui.on_ltc_volume_changed(move |val| {
-            *ltc_volume_clone.lock().unwrap() = val;
-        });
-    }
-    {
-        let beep_volume_clone = beep_volume.clone();
-        ui.on_beep_volume_changed(move |val| {
-            *beep_volume_clone.lock().unwrap() = val;
-        });
-    }
-    {
-        let beep_frequency_clone = beep_frequency.clone();
-        ui.on_beep_frequency_changed(move |val| {
-            *beep_frequency_clone.lock().unwrap() = val;
-        });
-    }
-    {
-        let beep_duration_clone = beep_duration.clone();
-        ui.on_beep_duration_changed(move |val| {
-            *beep_duration_clone.lock().unwrap() = val;
-        });
-    }
-
-    // ── Polling timer (25 fps) ─────────────────────────────────────────────────
-    {
-        let ui_weak = ui.as_weak();
-        let audio_core_clone = audio_core.clone();
-        let fps_index_clone = fps_index.clone();
-        let is_playing_clone = is_playing.clone();
-        let arm_angle_clone = arm_angle.clone();
-        let flash_opacity_clone = flash_opacity.clone();
-        let pulse_phase_clone = pulse_phase.clone();
-        let toasts_clone = toasts.clone();
-        let next_toast_id_clone = next_toast_id.clone();
-
-        // ── Recovery state clones ──
-        let sample_rate_clone = sample_rate.clone();
-        let devices_clone = devices.clone();
-        let device_index_clone = device_index.clone();
-        let audio_initialized_clone = audio_initialized.clone();
-        let audio_init_pending_clone = audio_init_pending.clone();
-        let audio_init_outcome_clone = audio_init_outcome.clone();
-        let recovery_attempts_clone = recovery_attempts.clone();
-        let ltc_channel_index_clone = ltc_channel_index.clone();
-        let ltc_volume_clone = ltc_volume.clone();
-        let start_timecode_clone = start_timecode.clone();
-
-        // ── Debug log buffer clone ──
-        let log_buffer_clone = log_buffer.clone();
-        let last_debug_log_count_clone = last_debug_log_count.clone();
-
-        let poll_timer = slint::Timer::default();
-        poll_timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(POLL_INTERVAL_MS),
-            move || {
-                let poll_start = Instant::now();
-                let mut slow_sections: Vec<String> = Vec::new();
-
-                // Tick counter for periodic summaries
-                static POLL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let tick = POLL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                let ui = match ui_weak.upgrade() {
-                    Some(u) => u,
-                    None => return,
-                };
-
-                // Update system time in header
-                ui.set_system_time(SharedString::from(format!("{} UTC", chrono_now_string())));
-
-                // Animate arm angle: exponential decay toward 0
-                {
-                    let mut angle = arm_angle_clone.lock().unwrap();
-                    if angle.abs() > 0.5 {
-                        *angle *= 0.852; // exp(-4.0 * 0.04) decay at 4.0/s
-                        if angle.abs() < 0.5 {
-                            *angle = 0.0;
-                        }
-                        ui.set_arm_angle(*angle as f32);
-                    }
+                    push_toast(&toasts_clone, &next_toast_id_clone, &ui, &msg, typ);
                 }
 
-                // Animate flash opacity: decay from 0.6 to 0 over ~400ms
-                {
-                    let mut fo = flash_opacity_clone.lock().unwrap();
-                    if *fo > 0.0 {
-                        *fo -= 0.6 / 0.4 * (POLL_INTERVAL_MS as f64 / 1000.0);
-                        if *fo <= 0.0 {
-                            *fo = 0.0;
-                        }
-                        ui.set_flash_opacity(*fo as f32);
-                    }
-                }
-
-                // Advance pulse phase for dot animation (4Hz sine wave)
-                {
-                    let mut pp = pulse_phase_clone.lock().unwrap();
-                    *pp += 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
-                    if *pp > PI * 100.0 {
-                        *pp = 0.0;
-                    }
-                    ui.set_pulse_phase(*pp as f32);
-                }
-
-                // Skip audio polling while device init is in progress on background thread
-                if *audio_init_pending_clone.lock().unwrap() {
-                    return;
-                }
-
-                // Apply pending init outcome (UI updates from background thread must happen on event loop)
-                {
-                    let outcome = audio_init_outcome_clone.lock().unwrap().take();
-                    if let Some(outcome) = outcome {
-                        if outcome.success {
-                            let rate = *sample_rate_clone.lock().unwrap();
-                            let rate_khz = format!("{:.1}", rate as f32 / 1000.0);
-                            let rate_idx = SAMPLE_RATE_OPTIONS.iter()
-                                .position(|&r| r == rate).unwrap_or(0);
-                            ui.set_sample_format(SharedString::from(outcome.fmt.to_uppercase()));
-                            ui.set_status_message(SharedString::from(&outcome.status_msg));
-                            ui.set_sample_rate_khz(SharedString::from(rate_khz));
-                            ui.set_sample_rate_index(rate_idx as i32);
-                            if *is_playing_clone.lock().unwrap() {
-                                ui.set_is_playing(true);
-                            }
-                            if !outcome.toast_msg.is_empty() {
-                                push_toast(&toasts_clone, &next_toast_id_clone, &ui, &outcome.toast_msg, &outcome.toast_type);
-                            }
-                        } else {
-                            let devs = devices_clone.lock().unwrap();
-                            let di = *device_index_clone.lock().unwrap();
-                            if di < devs.len() {
-                                ui.set_device_index(di as i32);
-                            }
-                            drop(devs);
-                            ui.set_status_message(SharedString::from(&outcome.status_msg));
-                            if outcome.toast_msg.is_empty() {
-                                push_toast(&toasts_clone, &next_toast_id_clone, &ui, &outcome.status_msg, "error");
-                            } else {
-                                push_toast(&toasts_clone, &next_toast_id_clone, &ui, &outcome.toast_msg, &outcome.toast_type);
-                            }
-                        }
-                    }
-                }
-
-                // Poll timecode if playing
-                if *is_playing_clone.lock().unwrap() {
-                    let (core, _lock_wait) = time_lock("audio_core.poll", &audio_core_clone, &mut slow_sections);
-                    let tc = core.current_timecode();
-                    let fi = *fps_index_clone.lock().unwrap();
-                    let opt = &FPS_OPTIONS[fi];
-                    let tc_str = timecode_to_string(tc, opt.drop_frame);
-                    let ms_str = timecode_to_ms_string(tc, opt.fps);
-                    let wake = core.wake_lock_active();
-                    drop(core);
-
-                    ui.set_timecode_text(SharedString::from(&tc_str));
-                    set_tc_segments(&ui, &tc_str);
-                    ui.set_ms_text(SharedString::from(ms_str));
-                    ui.set_wake_lock_active(wake);
-                }
-
-                // Update buffer size metadata
-                {
-                    let rate = *sample_rate_clone.lock().unwrap();
-                    let fi = *fps_index_clone.lock().unwrap();
-                    let buffer_smp = (rate as f64 / FPS_OPTIONS[fi].fps).round() as i32;
-                    ui.set_buffer_size(buffer_smp);
-                }
-
-                // Sync debug log entries to UI model (only when visible and changed)
+                // 18. Debug log sync
                 if ui.get_show_debug_log() {
-                    let log_entries = log_buffer_clone.lock().unwrap();
-                    let current_count = log_entries.entries.len();
-                    let mut last_count = last_debug_log_count_clone.lock().unwrap();
+                    let entries = log_buffer_clone.lock().unwrap();
+                    let current_count = entries.entries.len();
+                    let mut last_count = last_count_clone.lock().unwrap();
                     if current_count != *last_count {
-                        let entries: Vec<SharedString> = log_entries.entries.iter().map(|s| SharedString::from(s.as_str())).collect();
-                        drop(log_entries);
-                        let rebuild_start = Instant::now();
-                        ui.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::from(entries)));
-                        let rebuild_us = rebuild_start.elapsed().as_micros();
-                        if rebuild_us > 1000 {
-                            info!(
-                                "[PERF] Debug log model rebuild took {}μs ({} entries)",
-                                rebuild_us,
-                                current_count
-                            );
-                        }
+                        let model: Vec<SharedString> = entries.entries.iter()
+                            .map(|s| SharedString::from(s.as_str()))
+                            .collect();
+                        drop(entries);
+                        ui.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::from(model)));
                         *last_count = current_count;
                     }
                 }
 
-                // Drain audio events (lock released before iteration so recovery can re-acquire)
-                let events = {
-                    let (core, _lock_wait) = time_lock("audio_core.events", &audio_core_clone, &mut slow_sections);
-                    core.drain_events()
-                };
-                let has_recovery_event = events.iter().any(|e| matches!(e, AudioEvent::StreamDied | AudioEvent::RecoveryNeeded { .. }));
-                for evt in events {
-                    match evt {
-                        AudioEvent::StreamError(msg) => {
-                            error!("Audio stream error: {}", msg);
-                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, &msg, "error");
-                        }
-                        AudioEvent::StreamDied => {
-                            warn!("Audio stream has died");
-                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, "Audio stream died — attempting recovery", "error");
-                        }
-                        AudioEvent::StreamRecovering { attempt } => {
-                            info!("Audio stream recovering (attempt {})", attempt);
-                        }
-                        AudioEvent::StreamDead => {
-                            error!("Fatal: audio device unreachable");
-                            *is_playing_clone.lock().unwrap() = false;
-                            *audio_initialized_clone.lock().unwrap() = false;
-                            ui.set_is_playing(false);
-                            ui.set_status_message(SharedString::from("Fatal: audio device unreachable"));
-                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, "Audio device unreachable — LTC stopped. Re-select or re-connect device.", "error");
-                        }
-                        AudioEvent::RecoveryNeeded { reason } => {
-                            warn!("Audio recovery needed: {}", reason);
-                            push_toast(&toasts_clone, &next_toast_id_clone, &ui, &format!("Audio recovery needed: {}", reason), "warning");
-                        }
-                        AudioEvent::Underrun => {
-                            warn!("Audio underrun detected");
-                        }
-                        AudioEvent::FramesDropped { total } => {
-                            warn!("{} frame(s) dropped", total);
-                        }
-                    }
-                }
-                if has_recovery_event {
-                    attempt_recovery(
-                        &audio_core_clone,
-                        &sample_rate_clone,
-                        &devices_clone,
-                        &device_index_clone,
-                        &audio_initialized_clone,
-                        &is_playing_clone,
-                        &recovery_attempts_clone,
-                        &fps_index_clone,
-                        &ltc_channel_index_clone,
-                        &ltc_volume_clone,
-                        &start_timecode_clone,
-                        &ui_weak,
-                        &toasts_clone,
-                        &next_toast_id_clone,
-                    );
-                }
-
-                // ── Poll timing diagnostics ─────────────────────────────────────
+                // 19. Perf diagnostics
                 let poll_elapsed = poll_start.elapsed();
-                if poll_elapsed.as_micros() > POLL_INTERVAL_MS as u128 * 1000 {
-                    warn!(
-                        "[PERF] Poll tick #{} exceeded interval: {}ms (interval={}ms). Slow sections: [{}]",
-                        tick,
-                        poll_elapsed.as_micros() as f64 / 1000.0,
-                        POLL_INTERVAL_MS,
-                        slow_sections.join(", ")
-                    );
-                } else if poll_elapsed.as_micros() > (POLL_INTERVAL_MS as u128 * 1000) / 2 {
-                    debug!(
-                        "[PERF] Poll tick #{} took {}ms (>50% of interval)",
-                        tick,
-                        poll_elapsed.as_micros() as f64 / 1000.0,
-                    );
-                }
                 if tick % 250 == 0 {
-                    info!(
-                        "[PERF] Poll tick #{} timing summary: {}ms total, slow sections: [{}]",
-                        tick,
-                        poll_elapsed.as_micros() as f64 / 1000.0,
-                        slow_sections.join(", ")
-                    );
+                    info!("[PERF] Poll tick #{}: {}ms", tick, poll_elapsed.as_micros() as f64 / 1000.0);
                 }
             },
         );
 
-        // Leak the timer so it lives for the entire program lifetime
         Box::leak(Box::new(poll_timer));
     }
 
-    // ── Run the app ───────────────────────────────────────────────────────────
+    // ── Run ──────────────────────────────────────────────────────────────
     info!("LTC Slint GUI initialized, showing window");
     ui.run()?;
 
-    // Cleanup
-    let core = audio_core.lock().unwrap();
-    let _ = core.stop_output();
     info!("LTC Slint GUI shutting down");
-    drop(core);
-
     Ok(())
 }

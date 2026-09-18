@@ -1,42 +1,33 @@
 use egui::{Color32, FontId, RichText, Ui, Vec2, Sense};
+use gui_engine::command::GuiCommand;
+use gui_engine::timecode::FPS_OPTIONS;
 
-use crate::app::{AppState, AudioChannel, FRAME_RATE_OPTIONS};
+use crate::app::AppState;
 use crate::theme::ACCENT;
 
-/// Render the settings tab: frame rate, start timecode steppers, audio device, routing, volume.
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
+    let playing = state.latest.is_playing;
 
     let frame = egui::Frame::group(ui.style())
         .fill(colors.card_bg)
         .corner_radius(12.0)
         .stroke(egui::Stroke::new(1.5, colors.border_main))
         .inner_margin(egui::Margin::same(16));
-
     frame.show(ui, |ui| {
         ui.vertical(|ui| {
-            // 1. Start Timecode Steppers
+            // 1. Start Timecode
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("⚙️ SET STARTING TIMECODE")
-                        .font(FontId::proportional(11.0))
-                        .color(colors.text_muted)
-                        .strong(),
-                );
-                if state.is_playing {
+                ui.label(RichText::new("SET STARTING TIMECODE").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
+                if playing {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let warn_frame = egui::Frame::new()
+                        let warn = egui::Frame::new()
                             .fill(Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.1))
                             .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.2)))
                             .corner_radius(6.0)
                             .inner_margin(egui::Margin::symmetric(10, 4));
-                        warn_frame.show(ui, |ui| {
-                            ui.label(
-                                RichText::new("STOP STREAM TO EDIT STARTING TIME")
-                                    .color(Color32::from_rgb(0xF5, 0x9E, 0x0B))
-                                    .strong()
-                                    .font(FontId::proportional(9.0)),
-                            );
+                        warn.show(ui, |ui| {
+                            ui.label(RichText::new("STOP STREAM TO EDIT").color(Color32::from_rgb(0xF5, 0x9E, 0x0B)).strong().font(FontId::proportional(9.0)));
                         });
                     });
                 }
@@ -45,46 +36,22 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             render_timecode_steppers(ui, state);
             ui.add_space(16.0);
 
-            // 2. Select Frame Rate
-            ui.label(
-                RichText::new("📈 SELECT FRAME RATE")
-                    .font(FontId::proportional(11.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
+            ui.label(RichText::new("SELECT FRAME RATE").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
             ui.add_space(8.0);
             render_frame_rate(ui, state);
             ui.add_space(16.0);
 
-            // 3. Sample Rate
-            ui.label(
-                RichText::new("🎛️ SAMPLE RATE")
-                    .font(FontId::proportional(11.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
+            ui.label(RichText::new("SAMPLE RATE").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
             ui.add_space(8.0);
             render_sample_rate(ui, state);
             ui.add_space(16.0);
 
-            // 4. Output Audio Interface
-            ui.label(
-                RichText::new("🔊 OUTPUT AUDIO INTERFACE SELECTION")
-                    .font(FontId::proportional(11.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
+            ui.label(RichText::new("OUTPUT AUDIO INTERFACE SELECTION").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
             ui.add_space(8.0);
             render_audio_device(ui, state);
             ui.add_space(16.0);
 
-            // 4. Audio Routing & Settings
-            ui.label(
-                RichText::new("🎛️ AUDIO ROUTING & SETTINGS (DUAL-CHANNEL SPLITS)")
-                    .font(FontId::proportional(11.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
+            ui.label(RichText::new("AUDIO ROUTING & SETTINGS").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
             ui.add_space(8.0);
             render_routing_and_volume(ui, state);
         });
@@ -92,102 +59,66 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 }
 
 fn render_timecode_steppers(ui: &mut Ui, state: &mut AppState) {
-    let fps = state.fps();
-    let max_frames = fps.fps.ceil() as u32;
-    let theme = state.theme;
-    let is_playing = state.is_playing;
-    let tc = &mut state.start_timecode;
-    
+    let colors = state.theme.colors();
+    let max_frames = state.latest.fps.ceil() as u32;
+    let is_playing = state.latest.is_playing;
+    let tc = state.latest.start_timecode;
+
     ui.add_enabled_ui(!is_playing, |ui| {
         ui.columns(4, |cols| {
-            stepper_card(&mut cols[0], "HOURS", &mut tc.hours, 24, theme);
-            stepper_card(&mut cols[1], "MINUTES", &mut tc.minutes, 60, theme);
-            stepper_card(&mut cols[2], "SECONDS", &mut tc.seconds, 60, theme);
-            stepper_card(&mut cols[3], "FRAMES", &mut tc.frames, max_frames, theme);
+            stepper_card_col(&mut cols[0], "HOURS", tc.hours, 24, &colors, || state.send(GuiCommand::HourUp), || state.send(GuiCommand::HourDown));
+            stepper_card_col(&mut cols[1], "MINUTES", tc.minutes, 60, &colors, || state.send(GuiCommand::MinuteUp), || state.send(GuiCommand::MinuteDown));
+            stepper_card_col(&mut cols[2], "SECONDS", tc.seconds, 60, &colors, || state.send(GuiCommand::SecondUp), || state.send(GuiCommand::SecondDown));
+            stepper_card_col(&mut cols[3], "FRAMES", tc.frames, max_frames, &colors, || state.send(GuiCommand::FrameUp), || state.send(GuiCommand::FrameDown));
         });
     });
 }
 
-fn stepper_card(ui: &mut Ui, label: &str, value: &mut u32, max: u32, theme: crate::theme::Theme) {
-    let colors = theme.colors();
+fn stepper_card_col(
+    ui: &mut Ui, label: &str, value: u32, _max: u32,
+    colors: &crate::theme::ThemeColors,
+    on_up: impl FnOnce(), on_down: impl FnOnce(),
+) {
     let card = egui::Frame::new()
         .fill(colors.deep_bg)
         .stroke(egui::Stroke::new(1.0, colors.border_main))
         .corner_radius(8.0)
         .inner_margin(egui::Margin::symmetric(10, 8));
-
     card.show(ui, |ui| {
         ui.vertical_centered(|ui| {
-            // Up Button
-            let up_btn = egui::Button::new(RichText::new("^").strong())
-                .fill(Color32::TRANSPARENT);
-            if ui.add(up_btn).clicked() {
-                *value = (*value + 1) % max;
-                log::info!("Starting timecode {} changed to {:02} (up)", label, *value);
-            }
-
+            if ui.button(RichText::new("^").strong()).clicked() { on_up(); }
             ui.add_space(1.0);
-            
-            // Value
-            ui.label(
-                RichText::new(format!("{:02}", *value))
-                    .font(FontId::monospace(20.0))
-                    .color(colors.text_title)
-                    .strong(),
-            );
-            
+            ui.label(RichText::new(format!("{:02}", value)).font(FontId::monospace(20.0)).color(colors.text_title).strong());
             ui.add_space(1.0);
-
-            // Label
-            ui.label(
-                RichText::new(label)
-                    .font(FontId::proportional(7.5))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
-
+            ui.label(RichText::new(label).font(FontId::proportional(7.5)).color(colors.text_muted).strong());
             ui.add_space(1.0);
-
-            // Down Button
-            let down_btn = egui::Button::new(RichText::new("v").strong())
-                .fill(Color32::TRANSPARENT);
-            if ui.add(down_btn).clicked() {
-                *value = if *value == 0 { max - 1 } else { *value - 1 };
-                log::info!("Starting timecode {} changed to {:02} (down)", label, *value);
-            }
+            if ui.button(RichText::new("v").strong()).clicked() { on_down(); }
         });
     });
 }
 
 fn render_frame_rate(ui: &mut Ui, state: &mut AppState) {
     let width = ui.available_width();
-    let is_playing = state.is_playing;
-    
+    let is_playing = state.latest.is_playing;
     ui.add_enabled_ui(!is_playing, |ui| {
         if width > 520.0 {
             ui.columns(5, |cols| {
-                for (i, opt) in FRAME_RATE_OPTIONS.iter().enumerate() {
+                for (i, opt) in FPS_OPTIONS.iter().enumerate() {
                     frame_rate_card(&mut cols[i], i, opt, state);
                 }
             });
         } else {
-            // Flow layout with safe fallback for very narrow windows
             let usable = ((width - 32.0) / 2.0).max(1.0);
             if usable < 90.0 || width < 260.0 {
-                // Single column for very narrow windows
-                for (i, opt) in FRAME_RATE_OPTIONS.iter().enumerate() {
+                for (i, opt) in FPS_OPTIONS.iter().enumerate() {
                     frame_rate_card(ui, i, opt, state);
                     ui.add_space(6.0);
                 }
             } else {
-                // Two-column flow
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 8.0);
-                    for (i, opt) in FRAME_RATE_OPTIONS.iter().enumerate() {
-                        ui.scope(|ui| {
-                            ui.set_max_width(usable);
-                            frame_rate_card(ui, i, opt, state);
-                        });
+                    for (i, opt) in FPS_OPTIONS.iter().enumerate() {
+                        ui.scope(|ui| { ui.set_max_width(usable); frame_rate_card(ui, i, opt, state); });
                     }
                 });
             }
@@ -195,90 +126,60 @@ fn render_frame_rate(ui: &mut Ui, state: &mut AppState) {
     });
 }
 
-fn frame_rate_card(ui: &mut Ui, index: usize, opt: &crate::app::FrameRateOption, state: &mut AppState) {
+fn frame_rate_card(ui: &mut Ui, index: usize, opt: &gui_engine::timecode::FpsOption, state: &mut AppState) {
     let colors = state.theme.colors();
-    let is_selected = index == state.fps_index;
-    
+    let is_selected = index == state.latest.fps_index;
+    let is_playing = state.latest.is_playing;
     let card = egui::Frame::new()
         .fill(if is_selected { ACCENT.linear_multiply(0.08) } else { colors.deep_bg })
-        .stroke(egui::Stroke::new(
-            if is_selected { 1.5 } else { 1.0 },
-            if is_selected { ACCENT } else { colors.border_main }
-        ))
+        .stroke(egui::Stroke::new(if is_selected { 1.5 } else { 1.0 }, if is_selected { ACCENT } else { colors.border_main }))
         .corner_radius(8.0)
         .inner_margin(egui::Margin::same(10));
-
     let response = card.show(ui, |ui| {
         ui.set_min_height(60.0);
         ui.vertical(|ui| {
-            ui.label(
-                RichText::new(opt.name)
-                    .font(FontId::monospace(13.0))
-                    .color(if is_selected { ACCENT } else { colors.text_title })
-                    .strong(),
-            );
+            ui.label(RichText::new(opt.name).font(FontId::monospace(13.0)).color(if is_selected { ACCENT } else { colors.text_title }).strong());
             ui.add_space(2.0);
-            ui.label(
-                RichText::new(opt.description)
-                    .font(FontId::proportional(9.0))
-                    .color(colors.text_muted),
-            );
+            ui.label(RichText::new(opt.description).font(FontId::proportional(9.0)).color(colors.text_muted));
         });
     }).response;
-
-    let click_sense = if state.is_playing { Sense::hover() } else { Sense::click() };
+    let click_sense = if is_playing { Sense::hover() } else { Sense::click() };
     if ui.interact(response.rect, response.id, click_sense).clicked() {
-        let prev = state.fps_index;
-        state.fps_index = index;
-        if state.fps_index != prev {
-            log::info!("Frame rate changed to: {} ({} fps, drop_frame={})", opt.name, opt.fps, opt.drop_frame);
-        }
+        state.send(GuiCommand::SetFpsIndex(index));
     }
 }
 
 fn render_sample_rate(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let is_playing = state.is_playing;
-
+    let is_playing = state.latest.is_playing;
+    let rates = gui_engine::SAMPLE_RATE_OPTIONS;
+    let selected_rate = state.latest.sample_rate;
     ui.add_enabled_ui(!is_playing, |ui| {
         let width = ui.available_width();
-        let rates = audio_core::SAMPLE_RATE_OPTIONS;
         if width > 300.0 {
             ui.horizontal(|ui| {
-                for (i, &rate) in rates.iter().enumerate() {
-                    let is_selected = i == state.sample_rate_index;
+                for &rate in rates {
+                    let is_selected = rate == selected_rate;
                     let btn = if is_selected {
-                        egui::Button::new(
-                            RichText::new(format!("{} Hz", rate)).strong().color(Color32::BLACK)
-                        ).fill(crate::theme::ACCENT)
+                        egui::Button::new(RichText::new(format!("{} Hz", rate)).strong().color(Color32::BLACK)).fill(ACCENT)
                     } else {
-                        egui::Button::new(RichText::new(format!("{} Hz", rate)))
-                            .stroke(egui::Stroke::new(0.5, colors.border_main))
-                            .fill(colors.card_bg)
+                        egui::Button::new(RichText::new(format!("{} Hz", rate))).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
                     };
                     if ui.add(btn).clicked() {
-                        state.sample_rate_index = i;
-                        state.sample_rate = rate;
-                        log::info!("Sample rate changed to: {} Hz", rate);
+                        state.send(GuiCommand::SetSampleRate(rate));
                     }
                 }
             });
         } else {
-            for (i, &rate) in rates.iter().enumerate() {
-                let is_selected = i == state.sample_rate_index;
+            for &rate in rates {
+                let is_selected = rate == selected_rate;
                 let btn = if is_selected {
-                    egui::Button::new(
-                        RichText::new(format!("{} Hz", rate)).strong().color(Color32::BLACK)
-                    ).fill(crate::theme::ACCENT)
+                    egui::Button::new(RichText::new(format!("{} Hz", rate)).strong().color(Color32::BLACK)).fill(ACCENT)
                 } else {
-                    egui::Button::new(RichText::new(format!("{} Hz", rate)))
-                        .stroke(egui::Stroke::new(0.5, colors.border_main))
-                        .fill(colors.card_bg)
+                    egui::Button::new(RichText::new(format!("{} Hz", rate))).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
                 };
                 if ui.add(btn).clicked() {
-                    state.sample_rate_index = i;
-                    state.sample_rate = rate;
-                    log::info!("Sample rate changed to: {} Hz", rate);
+                    state.send(GuiCommand::SetSampleRate(rate));
                 }
                 ui.add_space(6.0);
             }
@@ -293,70 +194,44 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
         .stroke(egui::Stroke::new(1.0, colors.border_main))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(16));
-
     card.show(ui, |ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
-                let device_names: Vec<String> = state
-                    .devices
-                    .iter()
-                    .map(|d| {
-                        if d.is_default {
-                            format!("{} (Default)", d.name)
-                        } else {
-                            d.name.clone()
-                        }
-                    })
-                    .collect();
-
+                let device_names: Vec<String> = state.latest.devices.iter().map(|d| {
+                    if d.is_default { format!("{} (Default)", d.name) } else { d.name.clone() }
+                }).collect();
                 if device_names.is_empty() {
                     ui.label(RichText::new("No devices found — using default output").font(FontId::monospace(12.0)).color(colors.text_muted));
                 } else {
-                    let selected_text = device_names
-                        .get(state.selected_device)
-                        .cloned()
-                        .unwrap_or_else(|| "Default".to_string());
-                    
+                    let selected_text = device_names.get(state.latest.selected_device).cloned().unwrap_or_else(|| "Default".to_string());
                     ui.label(RichText::new("Interface:").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
                     egui::ComboBox::from_id_salt("settings_device_combo")
-                        .selected_text(selected_text)
+                        .selected_text(&selected_text)
                         .show_ui(ui, |ui| {
-                            for (i, name) in device_names.iter().enumerate() {
-                                let prev = state.selected_device;
-                                ui.selectable_value(&mut state.selected_device, i, name);
-                                if state.selected_device != prev {
-                                    log::info!("Device selected: {} (index {})", name, i);
-                                    state.change_device(state.selected_device);
+                            for (i, _name) in device_names.iter().enumerate() {
+                                if ui.selectable_label(false, &device_names[i]).clicked() {
+                                    state.send(GuiCommand::SetDevice(i));
                                 }
                             }
                         });
                 }
-
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh List").clicked() {
-                        state.refresh_devices();
+                        state.send(GuiCommand::RefreshDevices);
                     }
                 });
             });
-
             ui.add_space(8.0);
-            
-            // Helpful note inside device selection
             let info_frame = egui::Frame::new()
                 .fill(colors.card_bg)
                 .stroke(egui::Stroke::new(1.0, colors.border_main))
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(10, 6));
-            
             info_frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), Sense::hover());
                     ui.painter().circle_filled(rect.center(), 3.0, ACCENT);
-                    ui.label(
-                        RichText::new("Active Mode: Sends SMPTE Linear Timecode audio directly to mixers, USB-DAC, or sync adapters.")
-                            .font(FontId::proportional(10.0))
-                            .color(colors.text_muted)
-                    );
+                    ui.label(RichText::new("Sends SMPTE Linear Timecode audio to mixers, USB-DAC, or sync adapters.").font(FontId::proportional(10.0)).color(colors.text_muted));
                 });
             });
         });
@@ -366,162 +241,100 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
 fn render_routing_and_volume(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let width = ui.available_width();
-
-    let pad = ((width as i32 / 50).max(4)) as f32;
-
     let container = egui::Frame::new()
         .fill(colors.deep_bg)
         .stroke(egui::Stroke::new(1.0, colors.border_main))
         .corner_radius(10.0)
-        .inner_margin(egui::Margin::same((pad as i32).min(i8::MAX as i32) as i8));
-
-    const SPACE_TIGHT: f32 = 6.0;
-    const SPACE_NORM: f32 = 10.0;
-
+        .inner_margin(egui::Margin::same(8));
     container.show(ui, |ui| {
         if width > 500.0 {
             ui.columns(2, |cols| {
-                cols[0].vertical(|ui| {
-                    render_routing_buttons(ui, state, SPACE_TIGHT, SPACE_NORM);
-                });
-                cols[1].vertical(|ui| {
-                    render_sliders(ui, state, SPACE_TIGHT);
-                });
+                cols[0].vertical(|ui| { render_routing_buttons(ui, state); });
+                cols[1].vertical(|ui| { render_sliders(ui, state); });
             });
         } else {
-            render_routing_buttons(ui, state, SPACE_TIGHT, SPACE_NORM);
-            ui.add_space(SPACE_NORM);
-            render_sliders(ui, state, SPACE_TIGHT);
+            render_routing_buttons(ui, state);
+            ui.add_space(8.0);
+            render_sliders(ui, state);
+        }
+    });
+}
+
+fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
+    let colors = state.theme.colors();
+    let ltc_ch = &state.latest.ltc_channel;
+    let beep_ch = &state.latest.beep_channel;
+
+    ui.label(RichText::new("LTC OUTPUT").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        for (lbl, val) in &[("Left", "left"), ("Right", "right"), ("Both", "both")] {
+            let active = ltc_ch.as_str() == *val;
+            let btn = if active {
+                egui::Button::new(RichText::new(*lbl).strong().color(Color32::BLACK)).fill(ACCENT)
+            } else {
+                egui::Button::new(RichText::new(*lbl)).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
+            };
+            if ui.add(btn).clicked() {
+                state.send(GuiCommand::SetLtcChannel(val.to_string()));
+            }
         }
     });
 
     ui.add_space(8.0);
-
-    let tip_pad = (width as i32 / 120).max(4) as f32;
-    let tip_frame = egui::Frame::new()
-        .fill(colors.card_bg)
-        .stroke(egui::Stroke::new(1.0, colors.border_main))
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin::same((tip_pad as i32).min(i8::MAX as i32) as i8));
-
-    tip_frame.show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
-            ui.painter().circle_filled(rect.center(), 4.0, ACCENT);
-            ui.label(
-                RichText::new("LTC Right, Clapper Left into camera mic — Channel 1 Resolve, Channel 2 scratch.")
-                    .font(FontId::proportional(8.5))
-                    .color(colors.text_muted)
-            );
-        });
-    });
-}
-
-fn render_routing_buttons(ui: &mut Ui, state: &mut AppState, space_tight: f32, space_norm: f32) {
-    let colors = state.theme.colors();
-    let width = ui.available_width();
-    let pills_horizontal = width > 300.0;
-
-    render_pill_set(ui, "LTC OUTPUT", AudioChannel::all(), &mut state.ltc_channel, "ltc", &colors, pills_horizontal, space_tight);
-    ui.add_space(space_norm);
-    render_pill_set(ui, "CLAPPER OUTPUT", AudioChannel::all(), &mut state.beep_channel, "beep", &colors, pills_horizontal, space_tight);
-}
-
-fn render_pill_set(
-    ui: &mut Ui,
-    label: &str,
-    channels: &[AudioChannel],
-    active_channel: &mut AudioChannel,
-    log_label: &str,
-    colors: &crate::theme::ThemeColors,
-    horizontal: bool,
-    space_tight: f32,
-) {
-    ui.label(RichText::new(label).font(FontId::proportional(9.0)).color(colors.text_muted).strong());
-    ui.add_space(space_tight);
-
-    if horizontal {
-        ui.horizontal(|ui| {
-            for ch in channels {
-                let active = *active_channel == *ch;
-                let btn = if active {
-                    egui::Button::new(RichText::new(ch.label()).strong().color(Color32::BLACK)).fill(ACCENT)
-                } else {
-                    egui::Button::new(RichText::new(ch.label()))
-                        .stroke(egui::Stroke::new(0.5, colors.border_main))
-                        .fill(colors.card_bg)
-                };
-                if ui.add(btn).clicked() {
-                    *active_channel = *ch;
-                    log::info!("{} channel changed to: {}", log_label.to_uppercase(), ch.label());
-                }
-            }
-        });
-    } else {
-        for ch in channels {
-            let active = *active_channel == *ch;
+    ui.label(RichText::new("CLAPPER OUTPUT").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        for (lbl, val) in &[("Left", "left"), ("Right", "right"), ("Both", "both")] {
+            let active = beep_ch.as_str() == *val;
             let btn = if active {
-                egui::Button::new(RichText::new(ch.label()).strong().color(Color32::BLACK)).fill(ACCENT)
+                egui::Button::new(RichText::new(*lbl).strong().color(Color32::BLACK)).fill(ACCENT)
             } else {
-                egui::Button::new(RichText::new(ch.label()))
-                    .stroke(egui::Stroke::new(0.5, colors.border_main))
-                    .fill(colors.card_bg)
+                egui::Button::new(RichText::new(*lbl)).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
             };
             if ui.add(btn).clicked() {
-                *active_channel = *ch;
-                log::info!("{} channel changed to: {}", log_label.to_uppercase(), ch.label());
+                state.send(GuiCommand::SetBeepChannel(val.to_string()));
             }
-            ui.add_space(space_tight);
         }
-    }
+    });
 }
 
-fn render_sliders(ui: &mut Ui, state: &mut AppState, space_tight: f32) {
+fn render_sliders(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
 
+    let mut vol = state.latest.ltc_volume;
     ui.horizontal(|ui| {
         ui.label(RichText::new("LTC VOL").font(FontId::monospace(9.0)).color(colors.text_muted));
-        let resp = ui.add(egui::Slider::new(&mut state.ltc_volume, 0.0..=1.0).step_by(0.01).show_value(false));
-        if resp.changed() {
-            log::info!("LTC volume changed to: {:.0}%", state.ltc_volume * 100.0);
+        if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).step_by(0.01).show_value(false)).changed() {
+            state.send(GuiCommand::SetLtcVolume(vol));
         }
-        ui.label(RichText::new(format!("{}%", (state.ltc_volume * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
+        ui.label(RichText::new(format!("{}%", (vol * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
-    ui.add_space(space_tight);
-
+    let mut beep_vol = state.latest.beep_volume;
     ui.horizontal(|ui| {
         ui.label(RichText::new("BEEP VOL").font(FontId::monospace(9.0)).color(colors.text_muted));
-        let resp = ui.add(egui::Slider::new(&mut state.beep_volume, 0.0..=1.0).step_by(0.01).show_value(false));
-        if resp.changed() {
-            log::info!("Beep volume changed to: {:.0}%", state.beep_volume * 100.0);
+        if ui.add(egui::Slider::new(&mut beep_vol, 0.0..=1.0).step_by(0.01).show_value(false)).changed() {
+            state.send(GuiCommand::SetBeepVolume(beep_vol));
         }
-        ui.label(RichText::new(format!("{}%", (state.beep_volume * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
+        ui.label(RichText::new(format!("{}%", (beep_vol * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
-    ui.add_space(space_tight);
-
+    let mut freq = state.latest.beep_frequency;
     ui.horizontal(|ui| {
         ui.label(RichText::new("PITCH").font(FontId::monospace(9.0)).color(colors.text_muted));
-        let resp = ui.add(egui::Slider::new(&mut state.beep_frequency, 400.0..=2000.0).show_value(false));
-        if resp.changed() {
-            log::info!("Beep frequency changed to: {:.0} Hz", state.beep_frequency);
+        if ui.add(egui::Slider::new(&mut freq, 400.0..=2000.0).show_value(false)).changed() {
+            state.send(GuiCommand::SetBeepFrequency(freq));
         }
-        ui.label(RichText::new(format!("{} Hz", state.beep_frequency.round())).font(FontId::monospace(10.0)).color(colors.text_title));
+        ui.label(RichText::new(format!("{} Hz", freq.round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
-    ui.add_space(space_tight);
-
+    let mut dur = state.latest.beep_duration;
     ui.horizontal(|ui| {
         ui.label(RichText::new("DUR").font(FontId::monospace(9.0)).color(colors.text_muted));
-        let resp = ui.add(egui::Slider::new(&mut state.beep_duration, 0.05..=2.0).step_by(0.05).show_value(false));
-        if resp.changed() {
-            log::info!("Beep duration changed to: {:.0} ms", state.beep_duration * 1000.0);
+        if ui.add(egui::Slider::new(&mut dur, 0.05..=2.0).step_by(0.05).show_value(false)).changed() {
+            state.send(GuiCommand::SetBeepDuration(dur));
         }
-        ui.label(RichText::new(format!("{:.0} ms", state.beep_duration * 1000.0)).font(FontId::monospace(10.0)).color(colors.text_title));
+        ui.label(RichText::new(format!("{:.0} ms", dur * 1000.0)).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 }
-
-// Stub functions retained for compatibility (no longer invoked from render())
-fn _render_routing_column(_ui: &mut Ui, _state: &mut AppState) {}
-fn _render_volume_column(_ui: &mut Ui, _state: &mut AppState) {}
