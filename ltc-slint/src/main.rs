@@ -161,8 +161,9 @@ fn _run_gui(
         ui.set_sample_rate_options(rate_model);
     }
 
-    // ── Set OS name ────────────────────────────────────────────────────────
+    // ── Set OS name and version ────────────────────────────────────────────
     ui.set_os_name(SharedString::from(os_name.clone()));
+    ui.set_version(SharedString::from(format!("v{}", APP_VERSION)));
     ui.set_power_status(SharedString::from("AC"));
 
     // ── Initial state read ────────────────────────────────────────────────
@@ -323,6 +324,14 @@ fn _run_gui(
     }
 
     // ── Logs ──────────────────────────────────────────────────────────────
+    // Clear logs: sends ClearLogs to engine
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_clear_logs(move || {
+            let _ = cmd.send(GuiCommand::ClearLogs);
+        });
+    }
+
     // Copy logs: GUI-only, uses arboard
     {
         let state = engine_state.clone();
@@ -339,6 +348,18 @@ fn _run_gui(
             }
             if let Some(u) = ui_weak.upgrade() {
                 u.set_copy_confirmed(true);
+                let ui_weak2 = u.as_weak();
+                let reset_timer = slint::Timer::default();
+                reset_timer.start(
+                    slint::TimerMode::SingleShot,
+                    Duration::from_millis(2000),
+                    move || {
+                        if let Some(fui) = ui_weak2.upgrade() {
+                            fui.set_copy_confirmed(false);
+                        }
+                    },
+                );
+                Box::leak(Box::new(reset_timer));
             }
         });
     }
@@ -543,6 +564,10 @@ fn _run_gui(
 
                 // 14. FPS and sample rate index
                 ui.set_fps_index(s.fps_index as i32);
+                let sr_index = SAMPLE_RATE_OPTIONS.iter()
+                    .position(|&r| r == s.sample_rate)
+                    .unwrap_or(0);
+                ui.set_sample_rate_index(sr_index as i32);
 
                 // 15. Log entries from engine
                 {

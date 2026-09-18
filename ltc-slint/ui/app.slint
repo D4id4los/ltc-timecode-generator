@@ -1305,9 +1305,9 @@ component SettingsSection {
                     }
                     if (!root.settings-enabled) : Rectangle {
                         border-radius: 6px;
-                        background: rgba(245, 158, 11, 0.1);
+                        background: #F59E0B1A;
                         border-width: 1px;
-                        border-color: rgba(245, 158, 11, 0.2);
+                        border-color: #F59E0B33;
                         HorizontalLayout {
                             padding-left: 10px;
                             padding-right: 10px;
@@ -1519,8 +1519,8 @@ component SettingsSection {
                     border-width: 1px;
                     border-color: AppColors.border-main;
 
-                    // Responsive: 2-col routing+sliders when >= 500px
-                    if root.window-width >= 500px : HorizontalLayout {
+                    // 2-col routing+sliders
+                    HorizontalLayout {
                         padding-left: 12px;
                         padding-right: 12px;
                         padding-top: 12px;
@@ -1661,140 +1661,7 @@ component SettingsSection {
                             }
                         }
 
-                    // Narrow layout (< 500px) — single column
-                    if root.window-width < 500px : VerticalLayout {
-                        padding-left: 12px;
-                        padding-right: 12px;
-                        padding-top: 12px;
-                        padding-bottom: 12px;
-                        spacing: 10px;
-
-                        // LTC routing
-                        VerticalLayout {
-                            spacing: 6px;
-                            Text {
-                                text: "LTC OUTPUT";
-                                color: AppColors.text-muted;
-                                font-size: 9px;
-                                font-weight: 700;
-                            }
-                            HorizontalLayout {
-                                spacing: 6px;
-                                for ch-index in [0, 1, 2] : Rectangle {
-                                    min-width: 60px; min-height: 28px;
-                                    border-radius: 6px;
-                                    background: root.ltc-channel-index == ch-index ? AppColors.accent : AppColors.card-bg;
-                                    border-width: root.ltc-channel-index == ch-index ? 0px : 1px;
-                                    border-color: AppColors.border-main;
-                                    TouchArea {
-                                        clicked => { root.ltc-channel-selected(ch-index); }
-                                    }
-                                    Text {
-                                        text: ch-index == 0 ? "Left" : (ch-index == 1 ? "Right" : "Both");
-                                        color: root.ltc-channel-index == ch-index ? black : AppColors.text-title;
-                                        font-weight: 700;
-                                        font-size: 11px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Beep routing
-                        VerticalLayout {
-                            spacing: 6px;
-                            Text {
-                                text: "CLAPPER OUTPUT";
-                                color: AppColors.text-muted;
-                                font-size: 9px;
-                                font-weight: 700;
-                            }
-                            HorizontalLayout {
-                                spacing: 6px;
-                                for ch-index in [0, 1, 2] : Rectangle {
-                                    min-width: 60px; min-height: 28px;
-                                    border-radius: 6px;
-                                    background: root.beep-channel-index == ch-index ? AppColors.accent : AppColors.card-bg;
-                                    border-width: root.beep-channel-index == ch-index ? 0px : 1px;
-                                    border-color: AppColors.border-main;
-                                    TouchArea {
-                                        clicked => { root.beep-channel-selected(ch-index); }
-                                    }
-                                    Text {
-                                        text: ch-index == 0 ? "Left" : (ch-index == 1 ? "Right" : "Both");
-                                        color: root.beep-channel-index == ch-index ? black : AppColors.text-title;
-                                        font-weight: 700;
-                                        font-size: 11px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Sliders
-                        GridLayout {
-                            spacing: 6px;
-                            Row {
-                                Text { text: "LTC VOL"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
-                                Slider {
-                                    value: root.ltc-volume;
-                                    minimum: 0.0; maximum: 1.0;
-                                    changed(new_val) => { root.ltc-volume-changed(new_val); }
-                                }
-                                Text {
-                                    text: root.ltc-volume * 100;
-                                    color: AppColors.text-title;
-                                    font-size: 10px;
-                                    font-weight: 700;
-                                }
-                            }
-                            Row {
-                                Text { text: "BEEP VOL"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
-                                Slider {
-                                    value: root.beep-volume;
-                                    minimum: 0.0; maximum: 1.0;
-                                    changed(new_val) => { root.beep-volume-changed(new_val); }
-                                }
-                                Text {
-                                    text: root.beep-volume * 100;
-                                    color: AppColors.text-title;
-                                    font-size: 10px;
-                                    font-weight: 700;
-                                }
-                            }
-                            Row {
-                                Text { text: "PITCH"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
-                                Slider {
-                                    value: root.beep-frequency;
-                                    minimum: 400.0; maximum: 2000.0;
-                                    changed(new_val) => { root.beep-frequency-changed(new_val); }
-                                }
-                                Text {
-                                    text: root.beep-frequency;
-                                    color: AppColors.text-title;
-                                    font-size: 10px;
-                                    font-weight: 700;
-                                }
-                            }
-                            Row {
-                                Text { text: "DUR"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
-                                Slider {
-                                    value: root.beep-duration;
-                                    minimum: 0.05; maximum: 2.0;
-                                    changed(new_val) => { root.beep-duration-changed(new_val); }
-                                }
-                                Text {
-                                    text: root.beep-duration * 1000;
-                                    color: AppColors.text-title;
-                                    font-size: 10px;
-                                    font-weight: 700;
-                                }
-                            }
-                        }
                     }
-                }
 
                 // Tip
                 Rectangle {
@@ -1947,12 +1814,9 @@ component StatusBar {
 
 export component AppWindow inherits Window {
     title: "LTC Timecode Generator";
-    preferred-width: 800px;
-    preferred-height: 600px;
     maximized: true;
 
     // ── Clock properties ──
-    in-out property <string> timecode-text: "01:00:00:00";
     in-out property <string> tc-hh: "01";
     in-out property <string> tc-sep1: ":";
     in-out property <string> tc-mm: "00";
@@ -2024,6 +1888,9 @@ export component AppWindow inherits Window {
     // ── Tab state ──
     in-out property <int> active-tab: 0;
     in-out property <bool> show-faq: false;
+
+    // ── Version (set from Rust) ──
+    in-out property <string> version: "";
 
     // ── Clock callbacks ──
     callback start-ltc;
@@ -2099,6 +1966,8 @@ export component AppWindow inherits Window {
 
     // ── Main Layout ──
     Rectangle {
+        horizontal-stretch: 1;
+        vertical-stretch: 1;
         background: AppColors.app-bg;
         VerticalLayout {
         spacing: 0px;
@@ -2139,7 +2008,7 @@ export component AppWindow inherits Window {
                             font-weight: 700;
                         }
                         Text {
-                            text: "v0.3.2";
+                            text: root.version;
                             color: AppColors.accent;
                             font-size: 16px;
                             font-weight: 700;
@@ -2152,8 +2021,8 @@ export component AppWindow inherits Window {
                         font-weight: 700;
                     }
                 }
-                // Metadata indicators (responsive, shown when width >= 500px)
-                if root.width >= 500px : HorizontalLayout {
+                // Metadata indicators
+                HorizontalLayout {
                     spacing: 10px;
                     // Interface status
                     Rectangle {
@@ -2342,6 +2211,7 @@ export component AppWindow inherits Window {
 
         // Content area (fills remaining vertical space)
         Rectangle {
+            vertical-stretch: 1;
             HorizontalLayout {
                 Rectangle { horizontal-stretch: 1; background: transparent; }
                 Rectangle {
@@ -2531,10 +2401,10 @@ export component AppWindow inherits Window {
                 for toast in root.toasts : Rectangle {
                     border-radius: 8px;
                     border-width: 1px;
-                    background: toast.toast-type == "error" ? rgba(220, 38, 38, 0.9) :
-                               (toast.toast-type == "warning" ? rgba(245, 158, 11, 0.9) :
-                               (toast.toast-type == "success" ? rgba(34, 197, 94, 0.9) :
-                               (AppColors.theme-dark ? rgba(30, 30, 35, 0.95) : rgba(244, 244, 246, 0.95))));
+                    background: toast.toast-type == "error" ? #DC2626E6 :
+                               (toast.toast-type == "warning" ? #F59E0BE6 :
+                               (toast.toast-type == "success" ? #22C55EE6 :
+                               (AppColors.theme-dark ? #1E1E23F2 : #F4F4F6F2)));
                     border-color: toast.toast-type == "error" ? AppColors.red :
                                  (toast.toast-type == "warning" ? AppColors.amber :
                                  (toast.toast-type == "success" ? AppColors.green :

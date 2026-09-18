@@ -257,6 +257,9 @@ fn process_command(
         GuiCommand::SetAutoIncrement(val) => {
             state.auto_increment_take = val;
         }
+        GuiCommand::ClearLogs => {
+            state.logs.clear();
+        }
         GuiCommand::SceneUp => {
             state.scene = state.scene.saturating_add(1);
         }

@@ -31,6 +31,9 @@ pub enum GuiCommand {
     SetRoll(String),
     SetAutoIncrement(bool),
 
+    // ── Logs ────────────────────────────────────────────────────────────
+    ClearLogs,
+
     // ── Steppers ─────────────────────────────────────────────────────────
     SceneUp,
     SceneDown,
