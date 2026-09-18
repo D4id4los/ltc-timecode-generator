@@ -9,8 +9,8 @@ use gui_engine::command::GuiCommand;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::{ArcSwap, AudioEvent, SAMPLE_RATE_OPTIONS};
-use log::{debug, error, info, warn};
-use slint::{ModelRc, SharedString, VecModel, Weak};
+use log::info;
+use slint::{ModelRc, SharedString, VecModel};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const POLL_INTERVAL_MS: u64 = 40;

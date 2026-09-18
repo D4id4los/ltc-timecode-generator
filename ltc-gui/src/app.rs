@@ -34,12 +34,9 @@ impl Tab {
 pub enum NotificationType {
     Error,
     Warning,
-    Success,
-    Info,
 }
 
 pub struct ToastNotification {
-    pub id: u64,
     pub message: String,
     pub notification_type: NotificationType,
     pub created_at: Instant,
@@ -63,7 +60,6 @@ pub struct AppState {
 
     // Toast notifications
     pub notifications: Vec<ToastNotification>,
-    next_notification_id: u64,
 
     // Frame timing
     last_frame_time: Option<Instant>,
@@ -91,7 +87,6 @@ impl AppState {
             active_tab: Tab::Clapper,
             show_faq: false,
             notifications: Vec::new(),
-            next_notification_id: 0,
             last_frame_time: None,
             has_requested_maximize: false,
             show_debug_log: false,
@@ -105,9 +100,6 @@ impl AppState {
         let _ = self.cmd_tx.send(cmd);
     }
 
-    pub fn fps_option(&self) -> &'static gui_engine::timecode::FpsOption {
-        &FPS_OPTIONS[self.latest.fps_index]
-    }
 }
 
 // ── egui App ────────────────────────────────────────────────────────────
@@ -551,8 +543,6 @@ impl AppState {
                 let (r, g, b) = match toast.notification_type {
                     NotificationType::Error => (0xEF, 0x44, 0x44),
                     NotificationType::Warning => (0xF5, 0x9E, 0x0B),
-                    NotificationType::Success => (0x22, 0xC5, 0x5E),
-                    NotificationType::Info => (0x3B, 0x82, 0xF6),
                 };
 
                 let bg = Color32::from_rgba_unmultiplied(0x1A, 0x1A, 0x1E, alpha);
@@ -579,13 +569,11 @@ impl AppState {
     }
 
     fn add_notification(&mut self, nt: NotificationType, message: String) {
-        self.next_notification_id += 1;
         let duration = match nt {
             NotificationType::Error => Duration::from_secs(6),
             _ => Duration::from_secs(4),
         };
         self.notifications.push(ToastNotification {
-            id: self.next_notification_id,
             message,
             notification_type: nt,
             created_at: Instant::now(),

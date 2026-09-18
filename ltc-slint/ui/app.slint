@@ -123,7 +123,6 @@ component ClockSection {
     in-out property <string> beep-route;
     in-out property <float> pulse-phase: 0.0;
     in-out property <length> window-width: 800px;
-
     callback start-ltc;
     callback stop-ltc;
     callback clap-beep;
@@ -2374,7 +2373,6 @@ export component AppWindow inherits Window {
                     ltc-route: root.ltc-route;
                     beep-route: root.beep-route;
                     pulse-phase: root.pulse-phase;
-                    window-width: root.width;
                     start-ltc => { root.start-ltc(); }
                     stop-ltc => { root.stop-ltc(); }
                     clap-beep => { root.clap-beep(); }
@@ -2443,7 +2441,6 @@ export component AppWindow inherits Window {
                     logs: root.logs;
                     arm-angle: root.arm-angle;
                     copy-confirmed: root.copy-confirmed;
-                    window-width: root.width;
                     scene-up => { root.scene-up(); }
                     scene-down => { root.scene-down(); }
                     take-up => { root.take-up(); }
@@ -2473,7 +2470,6 @@ export component AppWindow inherits Window {
                     beep-frequency: root.beep-frequency;
                     beep-duration: root.beep-duration;
                     settings-enabled: !root.is-playing;
-                    window-width: root.width;
                     hour-up => { root.hour-up(); }
                     hour-down => { root.hour-down(); }
                     minute-up => { root.minute-up(); }
