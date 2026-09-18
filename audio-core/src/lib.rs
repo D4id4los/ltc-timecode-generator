@@ -126,34 +126,33 @@ impl AudioCore {
                 .ok_or_else(|| format!("Output device '{}' not found", device_id))?
         };
 
+        let configs: Vec<cpal::SupportedStreamConfigRange> = device
+            .supported_output_configs()
+            .map(|c| c.collect())
+            .unwrap_or_default();
+
         let buf_size = if buffer_size > 0 {
             cpal::BufferSize::Fixed(buffer_size)
         } else {
-            // Request a stable 1024-frame buffer; fall back to device max if unsupported
-            match device.supported_output_configs() {
-                Ok(configs) => {
-                    let mut min_buf = u32::MAX;
-                    let mut max_buf = u32::MIN;
-                    for cfg in configs {
-                        if let cpal::SupportedBufferSize::Range { min, max } = cfg.buffer_size() {
-                            min_buf = min_buf.min(*min);
-                            max_buf = max_buf.max(*max);
-                        }
-                    }
-                    if min_buf <= 1024 && 1024 <= max_buf {
-                        cpal::BufferSize::Fixed(1024)
-                    } else if max_buf > 0 {
-                        cpal::BufferSize::Fixed(max_buf)
-                    } else {
-                        cpal::BufferSize::Default
-                    }
+            let mut min_buf = u32::MAX;
+            let mut max_buf = u32::MIN;
+            for cfg in &configs {
+                if let cpal::SupportedBufferSize::Range { min, max } = cfg.buffer_size() {
+                    min_buf = min_buf.min(*min);
+                    max_buf = max_buf.max(*max);
                 }
-                Err(_) => cpal::BufferSize::Default,
+            }
+            if min_buf <= 1024 && 1024 <= max_buf {
+                cpal::BufferSize::Fixed(1024)
+            } else if max_buf > 0 {
+                cpal::BufferSize::Fixed(max_buf)
+            } else {
+                cpal::BufferSize::Default
             }
         };
 
         let (stream_config, sample_format) = select_best_config(
-            &device,
+            &configs,
             2,
             sample_rate,
             buf_size,
@@ -575,15 +574,14 @@ fn sample_format_name(fmt: cpal::SampleFormat) -> &'static str {
 }
 
 fn try_find_config(
-    device: &cpal::Device,
+    configs: &[cpal::SupportedStreamConfigRange],
     desired_channels: u16,
     target_rate: u32,
     desired_buffer_size: cpal::BufferSize,
     format_priority: &impl Fn(cpal::SampleFormat) -> u8,
 ) -> Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> {
-    let supported = device.supported_output_configs().ok()?;
     let mut best: Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> = None;
-    for cfg_range in supported {
+    for cfg_range in configs.iter() {
         let fmt = cfg_range.sample_format();
         let priority = format_priority(fmt);
         if cfg_range.channels() >= desired_channels
@@ -610,15 +608,14 @@ fn try_find_config(
 }
 
 fn try_fallback_config(
-    device: &cpal::Device,
+    configs: &[cpal::SupportedStreamConfigRange],
     desired_channels: u16,
     target_rate: u32,
     desired_buffer_size: cpal::BufferSize,
     format_priority: &impl Fn(cpal::SampleFormat) -> u8,
 ) -> Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> {
-    let supported = device.supported_output_configs().ok()?;
     let mut best: Option<(cpal::StreamConfig, cpal::SampleFormat, u8)> = None;
-    for cfg_range in supported {
+    for cfg_range in configs.iter() {
         let fmt = cfg_range.sample_format();
         let priority = format_priority(fmt);
         if cfg_range.channels() >= desired_channels {
@@ -646,7 +643,7 @@ fn try_fallback_config(
 }
 
 fn select_best_config(
-    device: &cpal::Device,
+    configs: &[cpal::SupportedStreamConfigRange],
     desired_channels: u16,
     desired_sample_rate: u32,
     desired_buffer_size: cpal::BufferSize,
@@ -664,7 +661,7 @@ fn select_best_config(
     };
 
     // First pass: exact match for the desired sample rate
-    let mut best_config = try_find_config(device, desired_channels, desired_sample_rate, desired_buffer_size, &format_priority);
+    let mut best_config = try_find_config(configs, desired_channels, desired_sample_rate, desired_buffer_size, &format_priority);
 
     // Second pass: if desired rate is professional-grade (>=44100) and not found,
     // try 48000 Hz, then 44100 Hz (industry standard chain)
@@ -674,7 +671,7 @@ fn select_best_config(
             if rate == desired_sample_rate {
                 continue;
             }
-            best_config = try_find_config(device, desired_channels, rate, desired_buffer_size, &format_priority);
+            best_config = try_find_config(configs, desired_channels, rate, desired_buffer_size, &format_priority);
             if best_config.is_some() {
                 break;
             }
@@ -683,7 +680,7 @@ fn select_best_config(
 
     // Third pass: clamp to device's min/max range
     if best_config.is_none() {
-        best_config = try_fallback_config(device, desired_channels, desired_sample_rate, desired_buffer_size, &format_priority);
+        best_config = try_fallback_config(configs, desired_channels, desired_sample_rate, desired_buffer_size, &format_priority);
     }
 
     best_config
