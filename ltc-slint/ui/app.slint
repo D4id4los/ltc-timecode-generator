@@ -1,0 +1,1597 @@
+import { ScrollView, ComboBox, Slider, ListView, StandardListView } from "std-widgets.slint";
+
+// ── Constants ───────────────────────────────────────────────────────────────
+
+export global AppColors {
+    in-out property <color> accent: #FF5F1F;
+    in-out property <color> app-bg: #0A0A0B;
+    in-out property <color> card-bg: #1A1A1E;
+    in-out property <color> deep-bg: #0A0A0B;
+    in-out property <color> nested-bg: #141416;
+    in-out property <color> text-main: #E0E0E0;
+    in-out property <color> text-title: #FFFFFF;
+    in-out property <color> text-muted: #8E9299;
+    in-out property <color> border-main: #2A2A2E;
+    in-out property <color> green: #22C55E;
+    in-out property <color> red: #DC2626;
+    in-out property <color> amber: #F59E0B;
+    in-out property <color> clock-sep: #3F3F46;
+}
+
+// ── Structs ─────────────────────────────────────────────────────────────────
+
+export struct LogEntry {
+    timestamp: string,
+    timecode: string,
+    milliseconds: string,
+    note: string,
+}
+
+export struct FrameRateOption {
+    name: string,
+    fps: float,
+    drop-frame: bool,
+    description: string,
+}
+
+// ── Pill box ────────────────────────────────────────────────────────────────
+
+component PillBox {
+    in-out property <string> pill-text;
+    in-out property <color> bg: AppColors.nested-bg;
+    in-out property <color> text-color: AppColors.text-muted;
+
+    Rectangle {
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: AppColors.border-main;
+        background: root.bg;
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        min-height: 20px;
+
+        Text {
+            text: root.pill-text;
+            color: root.text-color;
+            font-weight: 600;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── Clock Section ──────────────────────────────────────────────────────────
+
+component ClockSection {
+    in-out property <string> timecode-text;
+    in-out property <string> ms-text;
+    in-out property <bool> is-playing;
+    in-out property <bool> is-locked;
+    in-out property <string> fps-name;
+    in-out property <string> ltc-route;
+    in-out property <string> beep-route;
+
+    callback start-ltc;
+    callback stop-ltc;
+    callback clap-beep;
+    callback reset-tc;
+    callback toggle-lock;
+
+    Rectangle {
+        border-radius: 16px;
+        border-width: 1.5px;
+        border-color: AppColors.border-main;
+        background: AppColors.card-bg;
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-top: 16px;
+        padding-bottom: 16px;
+
+        VerticalLayout {
+            spacing: 8px;
+
+            // Header: "LINEAR TIMECODE STREAM" + pulsing dot
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+                Text {
+                    text: "LINEAR TIMECODE STREAM";
+                    color: AppColors.accent;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: root.is-playing ? AppColors.green : AppColors.amber;
+                }
+            }
+
+            // Large timecode digits
+            Text {
+                text: root.timecode-text;
+                color: root.is-playing ? AppColors.text-title : AppColors.text-muted;
+                font-size: 48px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+
+            // Millisecond display
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: center;
+                Text {
+                    text: "MS MATCH:";
+                    color: AppColors.text-muted;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.ms-text;
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+
+            // FPS and Routing pills
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+                PillBox {
+                    pill-text: "⚡ FPS: " + root.fps-name;
+                }
+                PillBox {
+                    pill-text: "🔊 ROUTE: LTC " + root.ltc-route + " | CLAP " + root.beep-route;
+                }
+            }
+
+            // Buttons row
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+
+                if (root.is-playing) : Rectangle {
+                    min-width: 160px;
+                    border-radius: 8px;
+                    background: AppColors.red;
+                    min-height: 40px;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.stop-ltc(); }
+                    }
+                    Text {
+                        text: "■ STOP";
+                        color: white;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if (!root.is-playing) : Rectangle {
+                    min-width: 160px;
+                    border-radius: 8px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    min-height: 40px;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.start-ltc(); }
+                    }
+                    Text {
+                        text: "▶ START";
+                        color: AppColors.text-title;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Clap & Beep accent button
+                Rectangle {
+                    min-width: 140px;
+                    min-height: 40px;
+                    border-radius: 8px;
+                    background: AppColors.accent;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.clap-beep(); }
+                    }
+                    Text {
+                        text: "🎥 CLAP & BEEP";
+                        color: black;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Reset button
+                Rectangle {
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.reset-tc(); }
+                    }
+                    Text {
+                        text: "⟲";
+                        color: AppColors.text-title;
+                        font-weight: 700;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Lock button
+                Rectangle {
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: root.is-locked ? AppColors.accent : AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: root.is-locked ? AppColors.accent : AppColors.border-main;
+                    TouchArea {
+                        clicked => { root.toggle-lock(); }
+                    }
+                    Text {
+                        text: root.is-locked ? "🔒" : "🔓";
+                        color: root.is-locked ? black : AppColors.text-muted;
+                        font-weight: 700;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Clapper Section ────────────────────────────────────────────────────────
+
+component ClapperSection {
+    in-out property <int> scene;
+    in-out property <int> take;
+    in-out property <string> roll;
+    in-out property <bool> auto-increment;
+    in-out property <[LogEntry]> logs;
+    in-out property <bool> flash-visible;
+
+    callback scene-up;
+    callback scene-down;
+    callback take-up;
+    callback take-down;
+    callback roll-changed;
+    callback auto-increment-toggled;
+    callback clap-beep;
+    callback clear-logs;
+    callback copy-logs;
+
+    VerticalLayout {
+        spacing: 12px;
+
+        // Clapper board drawing
+        Rectangle {
+            min-height: 100px;
+            background: AppColors.deep-bg;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: AppColors.border-main;
+
+            if (root.flash-visible) : Rectangle {
+                background: white;
+                opacity: 0.8;
+                border-radius: 8px;
+            }
+
+            VerticalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 4px;
+                alignment: center;
+
+                Rectangle {
+                    height: 20px;
+                    background: AppColors.deep-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    border-radius: 2px;
+                    HorizontalLayout {
+                        spacing: 0px;
+                        for stripe-index in [0, 1, 2, 3, 4, 5] : Rectangle {
+                            width: 1px;
+                            background: Math.mod(stripe-index, 2) == 0 ? AppColors.deep-bg : AppColors.accent;
+                            border-radius: 0px;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 2px;
+                    background: AppColors.border-main;
+                }
+
+                Rectangle {
+                    height: 20px;
+                    background: AppColors.deep-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    border-radius: 2px;
+                    HorizontalLayout {
+                        spacing: 0px;
+                        for stripe-index in [0, 1, 2, 3, 4, 5] : Rectangle {
+                            width: 1px;
+                            background: Math.mod(stripe-index, 2) == 0 ? AppColors.deep-bg : AppColors.accent;
+                            border-radius: 0px;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Tap to clap";
+                    color: AppColors.text-muted;
+                    font-size: 12px;
+                }
+            }
+
+            TouchArea {
+                clicked => { root.clap-beep(); }
+            }
+        }
+
+        // Roll, Scene, Take cards
+        HorizontalLayout {
+            spacing: 8px;
+
+            // Roll card
+            Rectangle {
+                border-radius: 8px;
+                background: AppColors.nested-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                min-height: 70px;
+                HorizontalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: "ROLL";
+                        color: AppColors.text-muted;
+                        font-size: 9px;
+                        font-weight: 700;
+                    }
+                    TextInput {
+                        text: root.roll;
+                        font-size: 14px;
+                        color: AppColors.text-title;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        edited => { root.roll-changed(); }
+                    }
+                }
+            }
+
+            // Scene card
+            Rectangle {
+                border-radius: 8px;
+                background: AppColors.nested-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                min-height: 70px;
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: center;
+                    Text {
+                        text: "SCENE";
+                        color: AppColors.text-muted;
+                        font-size: 9px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.scene;
+                        color: AppColors.text-title;
+                        font-size: 18px;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        alignment: center;
+                        Rectangle {
+                            width: 22px; height: 22px;
+                            border-radius: 4px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.scene-down(); } }
+                            Text { text: "-"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            width: 22px; height: 22px;
+                            border-radius: 4px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.scene-up(); } }
+                            Text { text: "+"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+
+            // Take card
+            Rectangle {
+                border-radius: 8px;
+                background: AppColors.nested-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                min-height: 70px;
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: center;
+                    Text {
+                        text: "TAKE";
+                        color: AppColors.text-muted;
+                        font-size: 9px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.take;
+                        color: AppColors.accent;
+                        font-size: 18px;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        alignment: center;
+                        Rectangle {
+                            width: 22px; height: 22px;
+                            border-radius: 4px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.take-down(); } }
+                            Text { text: "-"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            width: 22px; height: 22px;
+                            border-radius: 4px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.take-up(); } }
+                            Text { text: "+"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-increment checkbox
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: "Auto-Increment Take";
+                color: AppColors.text-muted;
+                font-size: 11px;
+            }
+            TouchArea {
+                clicked => { root.auto-increment-toggled(); }
+                Rectangle {
+                    width: 16px; height: 16px;
+                    border-radius: 3px;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    background: root.auto-increment ? AppColors.accent : AppColors.nested-bg;
+                    if (root.auto-increment) : Text {
+                        text: "✓";
+                        color: black;
+                        font-weight: 700;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Clap & Beep button
+        Rectangle {
+            min-height: 44px;
+            border-radius: 8px;
+            background: AppColors.accent;
+            TouchArea {
+                clicked => { root.clap-beep(); }
+            }
+            Text {
+                text: "CLAP & BEEP";
+                color: black;
+                font-weight: 700;
+                font-size: 14px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Logs section
+        Rectangle {
+            border-radius: 8px;
+            background: AppColors.card-bg;
+            border-width: 1.5px;
+            border-color: AppColors.border-main;
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 12px;
+            padding-bottom: 12px;
+
+            VerticalLayout {
+                spacing: 8px;
+
+                // Logs header
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "📋 SYNCHRONIZATION LOGS";
+                        color: AppColors.text-muted;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 4px;
+                        Rectangle {
+                            min-width: 50px; min-height: 24px;
+                            border-radius: 4px;
+                            background: AppColors.nested-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.copy-logs(); } }
+                            Text { text: "Copy"; color: AppColors.text-title; font-size: 10px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            min-width: 50px; min-height: 24px;
+                            border-radius: 4px;
+                            background: AppColors.nested-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.clear-logs(); } }
+                            Text { text: "Clear"; color: AppColors.text-title; font-size: 10px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                // Log entries list
+                if (root.logs.length == 0) : VerticalLayout {
+                    spacing: 4px;
+                    alignment: center;
+                    padding-top: 20px;
+                    padding-bottom: 20px;
+                    Text { text: "No clapper marks recorded yet."; color: AppColors.text-muted; font-weight: 700; }
+                    Text { text: "Tap CLAP & BEEP to capture markings."; color: AppColors.text-muted; font-size: 10px; }
+                }
+                if (root.logs.length > 0) : ListView {
+                    for log-entry in root.logs : Rectangle {
+                        border-radius: 6px;
+                        background: AppColors.nested-bg;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            HorizontalLayout {
+                                Text { text: log-entry.note; color: AppColors.accent; font-weight: 700; font-size: 12px; }
+                                HorizontalLayout { alignment: end; Text { text: log-entry.timestamp; color: AppColors.text-muted; font-size: 10px; } }
+                            }
+                            HorizontalLayout {
+                                Text { text: "LTC Timecode:"; color: AppColors.text-muted; font-size: 10.5px; }
+                                HorizontalLayout { alignment: end; Text { text: log-entry.timecode; color: AppColors.text-title; font-weight: 700; font-size: 10.5px; } }
+                            }
+                            HorizontalLayout {
+                                Text { text: "Milliseconds:"; color: AppColors.text-muted; font-size: 10.5px; }
+                                HorizontalLayout { alignment: end; Text { text: log-entry.milliseconds; color: AppColors.accent; font-weight: 700; font-size: 10.5px; } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Stepper card ────────────────────────────────────────────────────────────
+
+component StepperCard {
+    in-out property <string> label;
+    in-out property <int> value;
+    in-out property <bool> enabled: true;
+    callback up;
+    callback down;
+
+    Rectangle {
+        border-radius: 8px;
+        background: AppColors.deep-bg;
+        border-width: 1px;
+        border-color: AppColors.border-main;
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+
+        VerticalLayout {
+            spacing: 2px;
+            alignment: center;
+            Rectangle {
+                width: 24px; height: 20px;
+                border-radius: 4px;
+                background: AppColors.nested-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                TouchArea {
+                    enabled: root.enabled;
+                    clicked => { root.up(); }
+                }
+                Text { text: "^"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+            }
+            Text {
+                text: root.value;
+                color: AppColors.text-title;
+                font-size: 20px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.label;
+                color: AppColors.text-muted;
+                font-size: 7.5px;
+                font-weight: 700;
+            }
+            Rectangle {
+                width: 24px; height: 20px;
+                border-radius: 4px;
+                background: AppColors.nested-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                TouchArea {
+                    enabled: root.enabled;
+                    clicked => { root.down(); }
+                }
+                Text { text: "v"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+            }
+        }
+    }
+}
+
+// ── Settings Section ───────────────────────────────────────────────────────
+
+component SettingsSection {
+    in-out property <int> hour;
+    in-out property <int> minute;
+    in-out property <int> second;
+    in-out property <int> frame;
+    in-out property <int> max-frame;
+    in-out property <int> fps-index;
+    in-out property <[FrameRateOption]> fps-options;
+    in-out property <int> sample-rate-index;
+    in-out property <[string]> sample-rate-options;
+    in-out property <int> device-index;
+    in-out property <[string]> device-names;
+    in-out property <int> ltc-channel-index;
+    in-out property <int> beep-channel-index;
+    in-out property <float> ltc-volume;
+    in-out property <float> beep-volume;
+    in-out property <float> beep-frequency;
+    in-out property <float> beep-duration;
+    in-out property <bool> settings-enabled;
+
+    callback hour-up;
+    callback hour-down;
+    callback minute-up;
+    callback minute-down;
+    callback second-up;
+    callback second-down;
+    callback frame-up;
+    callback frame-down;
+    callback fps-selected(int);
+    callback sample-rate-tapped(string);
+    callback device-selected(int);
+    callback ltc-channel-selected(int);
+    callback beep-channel-selected(int);
+    callback ltc-volume-changed(float);
+    callback beep-volume-changed(float);
+    callback beep-frequency-changed(float);
+    callback beep-duration-changed(float);
+    callback refresh-devices;
+
+    Rectangle {
+        border-radius: 12px;
+        border-width: 1.5px;
+        border-color: AppColors.border-main;
+        background: AppColors.card-bg;
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 16px;
+        padding-bottom: 16px;
+
+        VerticalLayout {
+            spacing: 16px;
+
+            // 1. Start Timecode Steppers
+            VerticalLayout {
+                spacing: 8px;
+                HorizontalLayout {
+                    Text {
+                        text: "⚙️ SET STARTING TIMECODE";
+                        color: AppColors.text-muted;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+                    if (!root.settings-enabled) : Rectangle {
+                        border-radius: 6px;
+                        background: rgba(245, 158, 11, 0.1);
+                        border-width: 1px;
+                        border-color: rgba(245, 158, 11, 0.2);
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 4px;
+                        padding-bottom: 4px;
+                        Text {
+                            text: "STOP STREAM TO EDIT";
+                            color: AppColors.amber;
+                            font-weight: 700;
+                            font-size: 9px;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+                    StepperCard { label: "HOURS"; value: root.hour; enabled: root.settings-enabled; up => { root.hour-up(); } down => { root.hour-down(); } }
+                    StepperCard { label: "MINUTES"; value: root.minute; enabled: root.settings-enabled; up => { root.minute-up(); } down => { root.minute-down(); } }
+                    StepperCard { label: "SECONDS"; value: root.second; enabled: root.settings-enabled; up => { root.second-up(); } down => { root.second-down(); } }
+                    StepperCard { label: "FRAMES"; value: root.frame; enabled: root.settings-enabled; up => { root.frame-up(); } down => { root.frame-down(); } }
+                }
+            }
+
+            // 2. Frame Rate
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "📈 SELECT FRAME RATE";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    for fps-item in root.fps-options : Rectangle {
+                        min-width: 90px;
+                        min-height: 60px;
+                        border-radius: 8px;
+                        background: #FF5F1F;
+                        opacity: fps-item == root.fps-options[root.fps-index] ? 0.08 : 0.0;
+                        border-width: 1px;
+                        border-color: fps-item == root.fps-options[root.fps-index] ? AppColors.accent : AppColors.border-main;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        VerticalLayout {
+                            spacing: 2px;
+                            Text {
+                                text: fps-item.name;
+                                color: fps-item == root.fps-options[root.fps-index] ? AppColors.accent : AppColors.text-title;
+                                font-size: 13px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: fps-item.description;
+                                color: AppColors.text-muted;
+                                font-size: 9px;
+                            }
+                        }
+                        TouchArea {
+                            enabled: root.settings-enabled;
+                            clicked => { root.fps-selected(fps-item.fps * 100); }
+                        }
+                    }
+                }
+            }
+
+            // 3. Sample Rate
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "🎛️ SAMPLE RATE";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    for rate-text in root.sample-rate-options : Rectangle {
+                        min-width: 100px;
+                        min-height: 36px;
+                        border-radius: 8px;
+                        background: rate-text == root.sample-rate-options[root.sample-rate-index] ? AppColors.accent : AppColors.card-bg;
+                        border-width: rate-text == root.sample-rate-options[root.sample-rate-index] ? 0px : 1px;
+                        border-color: AppColors.border-main;
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        Text {
+                            text: rate-text;
+                            color: rate-text == root.sample-rate-options[root.sample-rate-index] ? black : AppColors.text-title;
+                            font-weight: 700;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            enabled: root.settings-enabled;
+                            clicked => { root.sample-rate-tapped(rate-text); }
+                        }
+                    }
+                }
+            }
+
+            // 4. Audio Device
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "🔊 OUTPUT AUDIO INTERFACE";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    background: AppColors.deep-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 12px;
+                    padding-bottom: 12px;
+                    VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Interface:";
+                                color: AppColors.text-muted;
+                                font-size: 11px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            if (root.device-names.length > 0) : ComboBox {
+                                current-index: root.device-index;
+                                model: root.device-names;
+                                selected => {
+                                    root.device-selected(self.current-index);
+                                }
+                            }
+                            if (root.device-names.length == 0) : Text {
+                                text: "No devices found — using default output";
+                                color: AppColors.text-muted;
+                                font-size: 12px;
+                            }
+                            Rectangle {
+                                min-width: 80px; min-height: 28px;
+                                border-radius: 6px;
+                                background: AppColors.card-bg;
+                                border-width: 1px;
+                                border-color: AppColors.border-main;
+                                TouchArea { clicked => { root.refresh-devices(); } }
+                                Text {
+                                    text: "Refresh List";
+                                    color: AppColors.text-muted;
+                                    font-size: 10px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 6px;
+                            padding-bottom: 6px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Rectangle {
+                                    width: 6px; height: 6px;
+                                    border-radius: 3px;
+                                    background: AppColors.accent;
+                                }
+                                Text {
+                                    text: "Sends SMPTE Linear Timecode audio directly to mixers, USB-DAC, or sync adapters.";
+                                    color: AppColors.text-muted;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. Routing & Volume
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "🎛️ AUDIO ROUTING & SETTINGS (DUAL-CHANNEL SPLITS)";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    background: AppColors.deep-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 12px;
+                    padding-bottom: 12px;
+                    VerticalLayout {
+                        spacing: 10px;
+
+                        // LTC routing
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: "LTC OUTPUT";
+                                color: AppColors.text-muted;
+                                font-size: 9px;
+                                font-weight: 700;
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for ch-index in [0, 1, 2] : Rectangle {
+                                    min-width: 60px; min-height: 28px;
+                                    border-radius: 6px;
+                                    background: root.ltc-channel-index == ch-index ? AppColors.accent : AppColors.card-bg;
+                                    border-width: root.ltc-channel-index == ch-index ? 0px : 1px;
+                                    border-color: AppColors.border-main;
+                                    TouchArea {
+                                        clicked => { root.ltc-channel-selected(ch-index); }
+                                    }
+                                    Text {
+                                        text: ch-index == 0 ? "Left" : (ch-index == 1 ? "Right" : "Both");
+                                        color: root.ltc-channel-index == ch-index ? black : AppColors.text-title;
+                                        font-weight: 700;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Beep routing
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: "CLAPPER OUTPUT";
+                                color: AppColors.text-muted;
+                                font-size: 9px;
+                                font-weight: 700;
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for ch-index in [0, 1, 2] : Rectangle {
+                                    min-width: 60px; min-height: 28px;
+                                    border-radius: 6px;
+                                    background: root.beep-channel-index == ch-index ? AppColors.accent : AppColors.card-bg;
+                                    border-width: root.beep-channel-index == ch-index ? 0px : 1px;
+                                    border-color: AppColors.border-main;
+                                    TouchArea {
+                                        clicked => { root.beep-channel-selected(ch-index); }
+                                    }
+                                    Text {
+                                        text: ch-index == 0 ? "Left" : (ch-index == 1 ? "Right" : "Both");
+                                        color: root.beep-channel-index == ch-index ? black : AppColors.text-title;
+                                        font-weight: 700;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Sliders
+                        GridLayout {
+                            spacing: 6px;
+                            Row {
+                                Text { text: "LTC VOL"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
+                                Slider {
+                                    value: root.ltc-volume;
+                                    minimum: 0.0; maximum: 1.0;
+                                    changed(new_val) => { root.ltc-volume-changed(new_val); }
+                                }
+                                Text {
+                                    text: root.ltc-volume * 100;
+                                    color: AppColors.text-title;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                }
+                            }
+                            Row {
+                                Text { text: "BEEP VOL"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
+                                Slider {
+                                    value: root.beep-volume;
+                                    minimum: 0.0; maximum: 1.0;
+                                    changed(new_val) => { root.beep-volume-changed(new_val); }
+                                }
+                                Text {
+                                    text: root.beep-volume * 100;
+                                    color: AppColors.text-title;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                }
+                            }
+                            Row {
+                                Text { text: "PITCH"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
+                                Slider {
+                                    value: root.beep-frequency;
+                                    minimum: 400.0; maximum: 2000.0;
+                                    changed(new_val) => { root.beep-frequency-changed(new_val); }
+                                }
+                                Text {
+                                    text: root.beep-frequency;
+                                    color: AppColors.text-title;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                }
+                            }
+                            Row {
+                                Text { text: "DUR"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
+                                Slider {
+                                    value: root.beep-duration;
+                                    minimum: 0.05; maximum: 2.0;
+                                    changed(new_val) => { root.beep-duration-changed(new_val); }
+                                }
+                                Text {
+                                    text: root.beep-duration * 1000;
+                                    color: AppColors.text-title;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Tip
+                Rectangle {
+                    border-radius: 6px;
+                    background: AppColors.card-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Rectangle {
+                            width: 8px; height: 8px;
+                            border-radius: 4px;
+                            background: AppColors.accent;
+                        }
+                        Text {
+                            text: "LTC Right, Clapper Left into camera mic — Channel 1 Resolve, Channel 2 scratch.";
+                            color: AppColors.text-muted;
+                            font-size: 8.5px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Status Bar ─────────────────────────────────────────────────────────────
+
+component StatusBar {
+    in-out property <string> os-name;
+    in-out property <int> device-count;
+    in-out property <bool> is-playing;
+    in-out property <string> sample-format;
+    in-out property <bool> wake-lock-active;
+    in-out property <string> status-message;
+
+    Rectangle {
+        background: AppColors.deep-bg;
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+
+        HorizontalLayout {
+            spacing: 16px;
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: AppColors.green;
+                }
+                Text {
+                    text: "OS: " + root.os-name;
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: AppColors.green;
+                }
+                Text {
+                    text: "AUDIO OUT: " + root.device-count + " DEVICES FOUND";
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: root.is-playing ? AppColors.green : AppColors.amber;
+                }
+                Text {
+                    text: root.is-playing ? "AUDIO CORE: RUNNING" : "AUDIO CORE: STANDBY";
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            if (root.sample-format != "") : HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: AppColors.green;
+                }
+                Text {
+                    text: "SAMPLE: " + root.sample-format;
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: root.wake-lock-active ? AppColors.green : AppColors.text-muted;
+                }
+                Text {
+                    text: root.wake-lock-active ? "WAKE LOCK: ACTIVE" : "WAKE LOCK: STANDBY";
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                alignment: end;
+                Text {
+                    text: root.status-message;
+                    color: AppColors.text-muted;
+                    font-size: 10px;
+                    font-weight: 600;
+                }
+            }
+        }
+    }
+}
+
+// ── Main App Window ────────────────────────────────────────────────────────
+
+export component AppWindow {
+    // ── Clock properties ──
+    in-out property <string> timecode-text: "01:00:00:00";
+    in-out property <string> ms-text: "01:00:00.000";
+    in-out property <bool> is-playing: false;
+    in-out property <bool> is-locked: false;
+    in-out property <string> fps-name: "25 fps";
+    in-out property <string> ltc-route: "LEFT";
+    in-out property <string> beep-route: "RIGHT";
+
+    // ── Clapper properties ──
+    in-out property <int> scene: 1;
+    in-out property <int> take: 1;
+    in-out property <string> roll: "A001";
+    in-out property <bool> auto-increment: true;
+    in-out property <[LogEntry]> logs: [];
+    in-out property <bool> flash-visible: false;
+
+    // ── Settings properties ──
+    in-out property <int> hour: 1;
+    in-out property <int> minute: 0;
+    in-out property <int> second: 0;
+    in-out property <int> frame: 0;
+    in-out property <int> max-frame: 25;
+    in-out property <int> fps-index: 1;
+    in-out property <[FrameRateOption]> fps-options: [];
+    in-out property <int> sample-rate-index: 0;
+    in-out property <[string]> sample-rate-options: ["16000 Hz", "48000 Hz"];
+    in-out property <int> device-index: 0;
+    in-out property <[string]> device-names: [];
+    in-out property <int> ltc-channel-index: 0;
+    in-out property <int> beep-channel-index: 1;
+    in-out property <float> ltc-volume: 0.25;
+    in-out property <float> beep-volume: 0.5;
+    in-out property <float> beep-frequency: 1000.0;
+    in-out property <float> beep-duration: 0.5;
+
+    // ── Status properties ──
+    in-out property <string> os-name: "LINUX";
+    in-out property <int> device-count: 0;
+    in-out property <string> sample-format: "";
+    in-out property <bool> wake-lock-active: false;
+    in-out property <string> system-time: "12:00:00 UTC";
+    in-out property <string> status-message: "Ready";
+
+    // ── Tab state ──
+    in-out property <int> active-tab: 0;
+    in-out property <bool> show-faq: false;
+
+    // ── Clock callbacks ──
+    callback start-ltc;
+    callback stop-ltc;
+    callback clap-beep;
+    callback reset-tc;
+    callback toggle-lock;
+
+    // ── Clapper callbacks ──
+    callback scene-up;
+    callback scene-down;
+    callback take-up;
+    callback take-down;
+    callback roll-changed;
+    callback auto-increment-toggled;
+    callback clear-logs;
+    callback copy-logs;
+
+    // ── Settings callbacks ──
+    callback hour-up;
+    callback hour-down;
+    callback minute-up;
+    callback minute-down;
+    callback second-up;
+    callback second-down;
+    callback frame-up;
+    callback frame-down;
+    callback fps-selected(int);
+    callback sample-rate-tapped(string);
+    callback device-selected(int);
+    callback ltc-channel-selected(int);
+    callback beep-channel-selected(int);
+    callback ltc-volume-changed(float);
+    callback beep-volume-changed(float);
+    callback beep-frequency-changed(float);
+    callback beep-duration-changed(float);
+    callback refresh-devices;
+
+    // ── Main Layout ──
+    Rectangle {
+        background: AppColors.app-bg;
+        VerticalLayout {
+        spacing: 0px;
+
+        // Header
+        Rectangle {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            min-height: 44px;
+            HorizontalLayout {
+                spacing: 4px;
+                // Logo
+                Rectangle {
+                    width: 34px; height: 34px;
+                    border-radius: 4px;
+                    background: AppColors.accent;
+                    VerticalLayout {
+                        spacing: 3px;
+                        alignment: center;
+                        Rectangle { width: 18px; height: 2px; background: black; }
+                        Rectangle { width: 18px; height: 2px; background: black; }
+                    }
+                }
+                // Title
+                VerticalLayout {
+                    spacing: 0px;
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: "LTC ENGINE";
+                            color: AppColors.text-title;
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "v0.3.2";
+                            color: AppColors.accent;
+                            font-size: 16px;
+                            font-weight: 700;
+                        }
+                    }
+                    Text {
+                        text: "LINEAR TIMECODE HUB";
+                        color: AppColors.text-muted;
+                        font-size: 9px;
+                        font-weight: 700;
+                    }
+                }
+                // Spacer + system time + ? button
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    Rectangle {
+                        border-radius: 6px;
+                        background: AppColors.nested-bg;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 4px;
+                        padding-bottom: 4px;
+                        Text {
+                            text: root.system-time;
+                            color: AppColors.text-muted;
+                            font-size: 9px;
+                            font-weight: 700;
+                        }
+                    }
+                    Rectangle {
+                        width: 24px; height: 24px;
+                        border-radius: 6px;
+                        background: AppColors.nested-bg;
+                        Text {
+                            text: "?";
+                            color: AppColors.text-title;
+                            font-weight: 700;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            clicked => { root.show-faq = !root.show-faq; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // FAQ panel (collapsible)
+        if (root.show-faq) : Rectangle {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            background: AppColors.card-bg;
+            border-radius: 12px;
+            border-width: 1.5px;
+            border-color: AppColors.border-main;
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "LTC & MULTI-CAM SYNC - QUICK GUIDE";
+                    color: AppColors.text-title;
+                    font-size: 13px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "📻 WHAT IS LINEAR TIMECODE?\nLinear Timecode (LTC) is an analog audio signal encoding SMPTE timecode (Hours:Minutes:Seconds:Frames) using Bi-Phase Mark Modulation. Cameras and recorders listen to this audio signal to align footage in post.";
+                    color: AppColors.text-muted;
+                    font-size: 10.5px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "🎥 CONNECTING CAMERAS\nConnect your device's audio output (line/jack) directly to the mic input of your cameras, or dedicated sync boxes (Tentacle, Deity). Set camera audio gain manually to a medium level.";
+                    color: AppColors.text-muted;
+                    font-size: 10.5px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "🔊 SYNCHRONIZING IN EDIT\nImport all media files into DaVinci Resolve, Premiere, or Final Cut Pro. Right-click files and choose 'Update Timecode from Audio Track'. The software matches alignment instantly!";
+                    color: AppColors.text-muted;
+                    font-size: 10.5px;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    min-width: 80px; min-height: 28px;
+                    border-radius: 6px;
+                    background: AppColors.card-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    TouchArea { clicked => { root.show-faq = false; } }
+                    Text { text: "Got it"; color: AppColors.text-title; font-weight: 600; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+
+        // Scrollable content area
+        ScrollView {
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            VerticalLayout {
+                spacing: 8px;
+                alignment: center;
+
+                // Clock section
+                ClockSection {
+                    timecode-text: root.timecode-text;
+                    ms-text: root.ms-text;
+                    is-playing: root.is-playing;
+                    is-locked: root.is-locked;
+                    fps-name: root.fps-name;
+                    ltc-route: root.ltc-route;
+                    beep-route: root.beep-route;
+                    start-ltc => { root.start-ltc(); }
+                    stop-ltc => { root.stop-ltc(); }
+                    clap-beep => { root.clap-beep(); }
+                    reset-tc => { root.reset-tc(); }
+                    toggle-lock => { root.toggle-lock(); }
+                }
+
+                // Tab bar
+                HorizontalLayout {
+                    spacing: 20px;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    Rectangle {
+                        TouchArea {
+                            clicked => { root.active-tab = 0; }
+                        }
+                        Text {
+                            text: "Clapper Slate & Logs";
+                            color: root.active-tab == 0 ? AppColors.text-title : AppColors.text-muted;
+                            font-size: 12px;
+                            font-weight: root.active-tab == 0 ? 700 : 400;
+                        }
+                        if (root.active-tab == 0) : Rectangle {
+                            height: 2px;
+                            background: AppColors.accent;
+                            y: parent.height + 4px;
+                        }
+                    }
+                    Rectangle {
+                        TouchArea {
+                            clicked => { root.active-tab = 1; }
+                        }
+                        Text {
+                            text: "Signal & Audio Settings";
+                            color: root.active-tab == 1 ? AppColors.text-title : AppColors.text-muted;
+                            font-size: 12px;
+                            font-weight: root.active-tab == 1 ? 700 : 400;
+                        }
+                        if (root.active-tab == 1) : Rectangle {
+                            height: 2px;
+                            background: AppColors.accent;
+                            y: parent.height + 4px;
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: AppColors.border-main; }
+
+                // Tab content
+                if (root.active-tab == 0) : ClapperSection {
+                    scene: root.scene;
+                    take: root.take;
+                    roll: root.roll;
+                    auto-increment: root.auto-increment;
+                    logs: root.logs;
+                    flash-visible: root.flash-visible;
+                    scene-up => { root.scene-up(); }
+                    scene-down => { root.scene-down(); }
+                    take-up => { root.take-up(); }
+                    take-down => { root.take-down(); }
+                    roll-changed => { root.roll-changed(); }
+                    auto-increment-toggled => { root.auto-increment-toggled(); }
+                    clap-beep => { root.clap-beep(); }
+                    clear-logs => { root.clear-logs(); }
+                    copy-logs => { root.copy-logs(); }
+                }
+                if (root.active-tab == 1) : SettingsSection {
+                    hour: root.hour;
+                    minute: root.minute;
+                    second: root.second;
+                    frame: root.frame;
+                    max-frame: root.max-frame;
+                    fps-index: root.fps-index;
+                    fps-options: root.fps-options;
+                    sample-rate-index: root.sample-rate-index;
+                    sample-rate-options: root.sample-rate-options;
+                    device-index: root.device-index;
+                    device-names: root.device-names;
+                    ltc-channel-index: root.ltc-channel-index;
+                    beep-channel-index: root.beep-channel-index;
+                    ltc-volume: root.ltc-volume;
+                    beep-volume: root.beep-volume;
+                    beep-frequency: root.beep-frequency;
+                    beep-duration: root.beep-duration;
+                    settings-enabled: !root.is-playing;
+                    hour-up => { root.hour-up(); }
+                    hour-down => { root.hour-down(); }
+                    minute-up => { root.minute-up(); }
+                    minute-down => { root.minute-down(); }
+                    second-up => { root.second-up(); }
+                    second-down => { root.second-down(); }
+                    frame-up => { root.frame-up(); }
+                    frame-down => { root.frame-down(); }
+                    fps-selected(val) => { root.fps-selected(val); }
+                    sample-rate-tapped(rate_text) => { root.sample-rate-tapped(rate_text); }
+                    device-selected(index) => { root.device-selected(index); }
+                    ltc-channel-selected(index) => { root.ltc-channel-selected(index); }
+                    beep-channel-selected(index) => { root.beep-channel-selected(index); }
+                    ltc-volume-changed(val) => { root.ltc-volume-changed(val); }
+                    beep-volume-changed(val) => { root.beep-volume-changed(val); }
+                    beep-frequency-changed(val) => { root.beep-frequency-changed(val); }
+                    beep-duration-changed(val) => { root.beep-duration-changed(val); }
+                    refresh-devices => { root.refresh-devices(); }
+                }
+            }
+        }
+
+        // Status bar
+        StatusBar {
+            os-name: root.os-name;
+            device-count: root.device-count;
+            is-playing: root.is-playing;
+            sample-format: root.sample-format;
+            wake-lock-active: root.wake-lock-active;
+            status-message: root.status-message;
+        }
+    }
+    }
+}

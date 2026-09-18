@@ -1,0 +1,17 @@
+[package]
+name = "ltc-slint"
+version = "0.3.2"
+description = "Slint-based GUI spike for the LTC Timecode Generator"
+authors = ["Daidalos"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[dependencies]
+audio-core = { path = "../audio-core" }
+slint = "1.17"
+chrono = "0.4"
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+slint-build = "1.17"

@@ -1,5 +1,19 @@
 #+TITLE: Version History for LTC Timecode Generator
 
+* v0.4
+
+Main feature is a new much more performant slint based GUI.
+
+List of Changes:
+- Added Slint based GUI.
+
+* v0.3.3
+
+List of Changes:
+- Added a command line argument flag to enable debug log output
+- Added a sleep prevention functionality to the rust gui and the rust
+  audio-core.
+
 * v0.3.2
 
 Main feature is a basic CLI interface that allows for headless running of the

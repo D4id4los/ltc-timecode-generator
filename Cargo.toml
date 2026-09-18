@@ -2,7 +2,8 @@
 resolver = "2"
 members = [
   "audio-core",
-  "ltc-gui"
+  "ltc-gui",
+  "ltc-slint"
 ]
 exclude = [
   "src-tauri",
