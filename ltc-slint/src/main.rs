@@ -52,6 +52,31 @@ fn timecode_to_string(tc: Timecode, drop_frame: bool) -> String {
     )
 }
 
+fn split_timecode_segments(tc_str: &str) -> [String; 7] {
+    let parts: Vec<&str> = tc_str.split(|c| c == ':' || c == ';').collect();
+    let sep = if tc_str.contains(';') { ';' } else { ':' };
+    [
+        parts[0].to_string(),
+        ":".to_string(),
+        parts[1].to_string(),
+        ":".to_string(),
+        parts[2].to_string(),
+        sep.to_string(),
+        parts[3].to_string(),
+    ]
+}
+
+fn set_tc_segments(ui: &AppWindow, tc_str: &str) {
+    let [hh, sep1, mm, sep2, ss, sep3, ff] = split_timecode_segments(tc_str);
+    ui.set_tc_hh(SharedString::from(hh));
+    ui.set_tc_sep1(SharedString::from(sep1));
+    ui.set_tc_mm(SharedString::from(mm));
+    ui.set_tc_sep2(SharedString::from(sep2));
+    ui.set_tc_ss(SharedString::from(ss));
+    ui.set_tc_sep3(SharedString::from(sep3));
+    ui.set_tc_ff(SharedString::from(ff));
+}
+
 fn timecode_to_ms_string(tc: Timecode, fps: f64) -> String {
     let ms = (tc.frames as f64 / fps * 1000.0).round() as u32;
     format!("{:02}:{:02}:{:02}.{:03}", tc.hours, tc.minutes, tc.seconds, ms)
@@ -222,6 +247,8 @@ fn ensure_audio_init(
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_sample_format(SharedString::from(fmt.to_uppercase()));
                     u.set_status_message(SharedString::from(format!("Audio initialized ({})", fmt)));
+                    let rate_khz = format!("{:.1}", actual_rate as f32 / 1000.0);
+                    u.set_sample_rate_khz(SharedString::from(rate_khz));
                 }
                 return true;
             }
@@ -509,6 +536,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Set OS name ────────────────────────────────────────────────────────────
     ui.set_os_name(SharedString::from(os_name.clone()));
+    ui.set_power_status(SharedString::from("AC"));
+
+    // ── Set initial metadata ───────────────────────────────────────────────────
+    {
+        let rate = *sample_rate.lock().unwrap();
+        let rate_khz = format!("{:.1}", rate as f32 / 1000.0);
+        ui.set_sample_rate_khz(SharedString::from(rate_khz));
+        let buffer_smp = (rate as f64 / FPS_OPTIONS[*fps_index.lock().unwrap()].fps).round() as i32;
+        ui.set_buffer_size(buffer_smp);
+    }
 
     // ── Refresh devices ────────────────────────────────────────────────────────
     {
@@ -935,6 +972,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         let logs_clone = logs.clone();
+        let ui_weak = ui.as_weak();
         ui.on_copy_logs(move || {
             let log_vec = logs_clone.lock().unwrap();
             let text: String = log_vec
@@ -949,6 +987,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .join("\n");
             if !text.is_empty() {
                 info!("Copied log text:\n{}", text);
+            }
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_copy_confirmed(true);
+                let weak = ui_weak.clone();
+                let reset_timer = slint::Timer::default();
+                reset_timer.start(
+                    slint::TimerMode::SingleShot,
+                    Duration::from_millis(1500),
+                    move || {
+                        if let Some(fu) = weak.upgrade() {
+                            fu.set_copy_confirmed(false);
+                        }
+                    },
+                );
+                Box::leak(Box::new(reset_timer));
             }
         });
     }
@@ -1058,6 +1111,7 @@ fn stepper_handlers(
         let ui_weak = ui.as_weak();
         let fps_index_clone = fps_index.clone();
         let start_tc_clone = start_timecode.clone();
+        let sample_rate_clone = sample_rate.clone();
         ui.on_fps_selected(move |fps_value_x100| {
             let target_fps = fps_value_x100 as f64 / 100.0;
             let mut fi = fps_index_clone.lock().unwrap();
@@ -1085,8 +1139,14 @@ fn stepper_handlers(
 
                     let tc_str = timecode_to_string(tc, opt.drop_frame);
                     let ms_str = timecode_to_ms_string(tc, opt.fps);
-                    u.set_timecode_text(SharedString::from(tc_str));
+                    u.set_timecode_text(SharedString::from(&tc_str));
+                    set_tc_segments(&u, &tc_str);
                     u.set_ms_text(SharedString::from(ms_str));
+                    let rate = *sample_rate_clone.lock().unwrap();
+                    let rate_khz = format!("{:.1}", rate as f32 / 1000.0);
+                    u.set_sample_rate_khz(SharedString::from(rate_khz));
+                    let buffer_smp = (rate as f64 / opt.fps).round() as i32;
+                    u.set_buffer_size(buffer_smp);
                 }
             }
         });
@@ -1105,6 +1165,8 @@ fn stepper_handlers(
                     if let Some(idx) = SAMPLE_RATE_OPTIONS.iter().position(|&r| r == rate) {
                         u.set_sample_rate_index(idx as i32);
                     }
+                    let rate_khz = format!("{:.1}", rate as f32 / 1000.0);
+                    u.set_sample_rate_khz(SharedString::from(rate_khz));
                 }
             }
         });
@@ -1352,9 +1414,18 @@ let tc = *start_timecode_clone.lock().unwrap();
                     let wake = core.wake_lock_active();
                     drop(core);
 
-                    ui.set_timecode_text(SharedString::from(tc_str));
+                    ui.set_timecode_text(SharedString::from(&tc_str));
+                    set_tc_segments(&ui, &tc_str);
                     ui.set_ms_text(SharedString::from(ms_str));
                     ui.set_wake_lock_active(wake);
+                }
+
+                // Update buffer size metadata
+                {
+                    let rate = *sample_rate_clone.lock().unwrap();
+                    let fi = *fps_index_clone.lock().unwrap();
+                    let buffer_smp = (rate as f64 / FPS_OPTIONS[fi].fps).round() as i32;
+                    ui.set_buffer_size(buffer_smp);
                 }
 
                 // Drain audio events (lock released before iteration so recovery can re-acquire)
