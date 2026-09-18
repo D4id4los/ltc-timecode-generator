@@ -1,10 +1,14 @@
 slint::include_modules!();
 
+mod cli;
+mod log_buffer;
+
 use audio_core::{
     is_permanent_device_error, is_transient_audio_error, list_audio_devices, suggest_sample_rate,
     AudioCore, AudioDeviceInfo, AudioEvent, Timecode, SAMPLE_RATE_OPTIONS,
 };
 use chrono::Local;
+use clap::Parser;
 use log::{error, info, warn};
 use slint::{ModelRc, SharedString, VecModel, Weak};
 use std::f64::consts::PI;
@@ -466,9 +470,19 @@ fn attempt_recovery(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    let cli = cli::Cli::parse();
+
+    if cli.list_devices {
+        cli::list_devices_and_exit();
+    }
+    if cli.output_to_file.is_some() {
+        return cli::generate_wav(cli);
+    }
+    if cli.headless {
+        return cli::run_headless(cli);
+    }
+
+    let log_buffer = log_buffer::init_logger("info")?;
 
     info!("LTC Slint GUI v{} starting...", APP_VERSION);
     let os_name = std::env::consts::OS.to_uppercase();
@@ -506,6 +520,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pulse_phase: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let toasts: Arc<Mutex<Vec<ToastItem>>> = Arc::new(Mutex::new(Vec::new()));
     let next_toast_id: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
+    let last_debug_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 
     // ── Audio recovery state ───────────────────────────────────────────────────
     let recovery_attempts: Arc<Mutex<u8>> = Arc::new(Mutex::new(0));
@@ -642,6 +657,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let new_dark = !colors.get_theme_dark();
             colors.set_theme_dark(new_dark);
             info!("Theme switched to {}", if new_dark { "dark" } else { "light" });
+        });
+    }
+
+    // ── Debug log toggle ───────────────────────────────────────────────────────
+    {
+        let log_buffer_clone = log_buffer.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_debug_log(move || {
+            if let Some(u) = ui_weak.upgrade() {
+                let new_val = !u.get_show_debug_log();
+                u.set_show_debug_log(new_val);
+                if new_val {
+                    let log_entries = log_buffer_clone.lock().unwrap();
+                    let entries: Vec<SharedString> = log_entries.entries.iter().map(|s| SharedString::from(s.as_str())).collect();
+                    u.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::from(entries)));
+                }
+                info!("Debug log window {}", if new_val { "opened" } else { "closed" });
+            }
+        });
+    }
+
+    // ── Debug log clear ────────────────────────────────────────────────────────
+    {
+        let log_buffer_clone = log_buffer.clone();
+        let last_debug_log_count_clone = last_debug_log_count.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_clear_debug_log(move || {
+            {
+                let mut buf = log_buffer_clone.lock().unwrap();
+                buf.entries.clear();
+            }
+            *last_debug_log_count_clone.lock().unwrap() = 0;
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::default()));
+            }
+            info!("Debug log cleared");
         });
     }
 
@@ -1012,7 +1063,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Vec<_>>()
                 .join("\n");
             if !text.is_empty() {
-                info!("Copied log text:\n{}", text);
+                match arboard::Clipboard::new() {
+                    Ok(mut cb) => {
+                        if cb.set_text(&text).is_ok() {
+                            info!("Copied {} log entries to clipboard", log_vec.len());
+                        } else {
+                            warn!("Clipboard: set_text failed");
+                        }
+                    }
+                    Err(e) => warn!("Clipboard error: {}", e),
+                }
             }
             if let Some(u) = ui_weak.upgrade() {
                 u.set_copy_confirmed(true);
@@ -1213,8 +1273,6 @@ fn stepper_handlers(
         let audio_init_outcome_clone = audio_init_outcome.clone();
         let recovery_attempts_clone = recovery_attempts.clone();
         let start_timecode_clone = start_timecode.clone();
-        let toasts_clone = toasts.clone();
-        let next_toast_id_clone = next_toast_id.clone();
 
         ui.on_device_selected(move |index| {
             let idx = index as usize;
@@ -1485,6 +1543,10 @@ fn stepper_handlers(
         let ltc_volume_clone = ltc_volume.clone();
         let start_timecode_clone = start_timecode.clone();
 
+        // ── Debug log buffer clone ──
+        let log_buffer_clone = log_buffer.clone();
+        let last_debug_log_count_clone = last_debug_log_count.clone();
+
         let poll_timer = slint::Timer::default();
         poll_timer.start(
             slint::TimerMode::Repeated,
@@ -1596,6 +1658,19 @@ fn stepper_handlers(
                     let fi = *fps_index_clone.lock().unwrap();
                     let buffer_smp = (rate as f64 / FPS_OPTIONS[fi].fps).round() as i32;
                     ui.set_buffer_size(buffer_smp);
+                }
+
+                // Sync debug log entries to UI model (only when visible and changed)
+                if ui.get_show_debug_log() {
+                    let log_entries = log_buffer_clone.lock().unwrap();
+                    let current_count = log_entries.entries.len();
+                    let mut last_count = last_debug_log_count_clone.lock().unwrap();
+                    if current_count != *last_count {
+                        let entries: Vec<SharedString> = log_entries.entries.iter().map(|s| SharedString::from(s.as_str())).collect();
+                        drop(log_entries);
+                        ui.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::from(entries)));
+                        *last_count = current_count;
+                    }
                 }
 
                 // Drain audio events (lock released before iteration so recovery can re-acquire)

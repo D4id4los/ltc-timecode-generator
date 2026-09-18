@@ -3440,9 +3440,13 @@ dependencies = [
 name = "ltc-slint"
 version = "0.3.2"
 dependencies = [
+ "arboard",
  "audio-core",
  "chrono",
+ "clap",
+ "ctrlc",
  "env_logger",
+ "hound",
  "log",
  "slint",
  "slint-build",

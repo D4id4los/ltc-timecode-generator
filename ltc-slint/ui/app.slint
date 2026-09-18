@@ -2018,6 +2018,10 @@ export component AppWindow inherits Window {
     in-out property <string> status-message: "Ready";
     in-out property <string> power-status: "AC";
 
+    // ── Debug log ──
+    in-out property <bool> show-debug-log: false;
+    in-out property <[string]> debug-log-entries: [];
+
     // ── Tab state ──
     in-out property <int> active-tab: 0;
     in-out property <bool> show-faq: false;
@@ -2063,6 +2067,10 @@ export component AppWindow inherits Window {
     // ── Theme ──
     callback toggle-theme;
 
+    // ── Debug log ──
+    callback toggle-debug-log;
+    callback clear-debug-log;
+
     // ── Keyboard shortcuts ──
     FocusScope {
         key-pressed(event) => {
@@ -2077,6 +2085,9 @@ export component AppWindow inherits Window {
                 accept
             } else if (event.text == "l" || event.text == "L") {
                 root.toggle-lock();
+                accept
+            } else if (event.modifiers.control && (event.text == "d" || event.text == "D")) {
+                root.toggle-debug-log();
                 accept
             } else {
                 reject
@@ -2099,7 +2110,7 @@ export component AppWindow inherits Window {
                 padding-top: 8px;
                 padding-bottom: 8px;
                 spacing: 4px;
-                // Logo
+                // Logo (click toggles debug log)
                 Rectangle {
                     width: 34px; height: 34px;
                     border-radius: 4px;
@@ -2109,6 +2120,9 @@ export component AppWindow inherits Window {
                         alignment: center;
                         Rectangle { width: 18px; height: 2px; background: black; }
                         Rectangle { width: 18px; height: 2px; background: black; }
+                    }
+                    TouchArea {
+                        clicked => { root.toggle-debug-log(); }
                     }
                 }
                 // Title
@@ -2553,6 +2567,83 @@ export component AppWindow inherits Window {
                         }
                     }
                     TouchArea { clicked => { root.dismiss-toast(toast.id); } }
+                }
+            }
+        }
+
+        // Debug log window overlay (outside layout, absolute positioning)
+        if (root.show-debug-log) : Rectangle {
+            x: parent.width - 420px;
+            y: 50px;
+            width: 400px;
+            height: 300px;
+            background: AppColors.card-bg;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: AppColors.border-main;
+            VerticalLayout {
+                spacing: 4px;
+                padding: 8px;
+                // Header
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "DEBUG LOG";
+                        color: AppColors.text-title;
+                        font-size: 12px;
+                        font-weight: 700;
+                        horizontal-stretch: 1;
+                    }
+                    Rectangle {
+                        width: 50px; height: 22px;
+                        border-radius: 4px;
+                        background: AppColors.nested-bg;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        TouchArea { clicked => { root.clear-debug-log(); } }
+                        Text {
+                            text: "Clear";
+                            color: AppColors.text-muted;
+                            font-size: 10px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle {
+                        width: 22px; height: 22px;
+                        border-radius: 4px;
+                        background: AppColors.nested-bg;
+                        TouchArea { clicked => { root.show-debug-log = false; } }
+                        Text {
+                            text: "✕";
+                            color: AppColors.text-muted;
+                            font-size: 11px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                // Log entries list
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 4px;
+                        spacing: 2px;
+                        if (root.debug-log-entries.length == 0) : Text {
+                            text: "No debug log entries yet.";
+                            color: AppColors.text-muted;
+                            font-size: 10px;
+                        }
+                        for entry in root.debug-log-entries : Text {
+                            text: entry;
+                            color: AppColors.text-main;
+                            font-size: 9px;
+                            font-family: "monospace";
+                            wrap: word-wrap;
+                        }
+                    }
                 }
             }
         }
