@@ -245,7 +245,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
         if ui
             .add_enabled(
                 button_enabled,
-                egui::Button::new(RichText::new(button_label).font(FontId::proportional(11.0)).strong())
+                egui::Button::new(RichText::new(button_label).font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
                     .fill(if button_enabled { ACCENT } else { colors.deep_bg })
                     .min_size(egui::vec2(100.0, 24.0)),
             )
