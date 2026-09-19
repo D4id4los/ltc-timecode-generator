@@ -215,15 +215,34 @@ node scripts/sync-version.js
 The version is injected at build time via Vite's `define` (`import.meta.env.VITE_APP_VERSION`) and displayed in the app header as `LTC ENGINE v{version}`.
 
 ## Build & Run
+
+**Important:** `libltc-rs` requires the system `libltc` library. Install it and set `PKG_CONFIG_PATH`:
+```bash
+sudo apt install libltc-dev
+export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
+```
+
 ```bash
 npm run dev                          # Vite dev server on port 3000
 npx tauri dev                        # Tauri dev mode (starts Vite + Rust)
 npx tauri build                      # Production build
 npm run lint                         # tsc --noEmit
 npm run clean                        # rm -rf dist src-tauri/target ...
-cargo build                          # Build all Rust crates (workspace)
+cargo build                          # Build all Rust crates (workspace; needs PKG_CONFIG_PATH)
 cd ltc-gui && cargo run --release    # Native Rust GUI (egui/eframe)
 cd ltc-slint && cargo run --release  # Slint-based GUI spike
 cargo clippy --all-targets            # Run clippy on all workspace crates
 ./build-32bit.sh                     # Docker cross-compile for i686
 ```
+
+### LTC Decoding (CLI)
+
+Two decoders are available, selectable via `--decoder`:
+```bash
+# builtin — pure Rust, accurate but slow (~74s for a 20s file)
+ltc-gui --decode file.wav --decoder builtin
+# libltc — C library, fast (~135ms for a 20s file)  
+ltc-gui --decode file.wav --decoder libltc
+```
+
+The `--decode` flag reads a WAV file, decodes all LTC frames, and prints a summary. Both decoders share the same `LtcDetectionResult` output type.

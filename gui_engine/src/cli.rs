@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::path::Path;
+
 use audio_core::{
     generate_ltc_frame_stereo, increment_timecode, list_audio_devices, AudioCore, Timecode,
 };
@@ -83,6 +85,14 @@ pub struct Cli {
     /// Enable debug log output to stderr
     #[arg(long, short = 'd')]
     pub debug: bool,
+
+    /// Decode LTC from a WAV file and print results (implies headless)
+    #[arg(long)]
+    pub decode: Option<String>,
+
+    /// Decoder implementation: "builtin" (default) or "libltc"
+    #[arg(long, default_value = "builtin", value_parser = clap::builder::PossibleValuesParser::new(["builtin", "libltc"]))]
+    pub decoder: String,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -479,6 +489,60 @@ pub fn parse_args() -> Cli {
     Cli::parse()
 }
 
+// ── LTC Decode mode ─────────────────────────────────────────────────────
+
+fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let path = cli
+        .decode
+        .as_ref()
+        .ok_or("--decode path required")?;
+    let use_libltc = cli.decoder == "libltc";
+
+    if cli.debug {
+        init_logger();
+    }
+
+    info!(
+        "Decoding LTC from '{}' with {} decoder",
+        path,
+        if use_libltc { "libltc" } else { "builtin" }
+    );
+
+    let result = audio_core::decode_ltc_with_decoder(Path::new(path), use_libltc)?;
+
+    println!();
+    println!("=== LTC Decode Results ===");
+    println!("  File:          {}", path);
+    println!("  Decoder:       {}", if use_libltc { "libltc (C library)" } else { "builtin (Rust)" });
+    println!("  Status:        {:?}", result.status);
+    println!("  Sample rate:   {} Hz", result.sample_rate);
+    println!("  Duration:      {:.3}s", result.total_audio_duration_secs);
+    println!("  Detected FPS:  {:.2}{}", result.detected_fps,
+        if result.drop_frame { " DF" } else { "" });
+    println!("  Valid frames:  {} / {} ({:.1}%)",
+        result.valid_frames, result.total_possible_frames, result.avg_confidence);
+    println!("  First TC at:   {:.3}s", result.first_ltc_timecode_secs);
+    println!("  Processing:    {:.1}ms", result.processing_time_ms);
+
+    if !result.timecodes.is_empty() {
+        let first = &result.timecodes[0];
+        let last = &result.timecodes[result.timecodes.len() - 1];
+        println!("  First TC:      {:02}:{:02}:{:02}:{:02}",
+            first.timecode.hours, first.timecode.minutes,
+            first.timecode.seconds, first.timecode.frames);
+        println!("  Last TC:       {:02}:{:02}:{:02}:{:02}",
+            last.timecode.hours, last.timecode.minutes,
+            last.timecode.seconds, last.timecode.frames);
+    }
+
+    for detail in &result.details {
+        println!("  {}", detail);
+    }
+    println!();
+
+    Ok(())
+}
+
 // ── Outcome enum + dispatch ─────────────────────────────────────────────
 
 pub enum CliOutcome {
@@ -494,6 +558,14 @@ pub enum CliOutcome {
 pub fn process_cli(cli: Cli) -> CliOutcome {
     if cli.list_devices {
         list_devices_and_exit();
+    }
+
+    if cli.decode.is_some() {
+        if let Err(e) = run_decode(cli) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return CliOutcome::Done;
     }
 
     if let Some(_path) = &cli.output_to_file {

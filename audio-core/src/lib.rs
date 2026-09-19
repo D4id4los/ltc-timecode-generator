@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub mod ltc_decoder;
+pub mod ltc_decoder_libltc;
 
 // ── Ring buffer capacities ─────────────────────────────────────────────────
 
@@ -784,6 +785,17 @@ pub const SAMPLE_RATE_OPTIONS: &[u32] = &[16000, 48000];
 pub use ltc_decoder::{
     decode_ltc_from_wav, quick_check_ltc, FrameTimecode, LtcDecodeStatus, LtcDetectionResult,
 };
+pub use ltc_decoder_libltc::decode_ltc_from_wav_libltc;
+
+/// Decode LTC from a WAV file, selecting the decoder implementation.
+/// Set `use_libltc = true` to use the libltc C library decoder.
+pub fn decode_ltc_with_decoder(path: &std::path::Path, use_libltc: bool) -> Result<LtcDetectionResult, String> {
+    if use_libltc {
+        decode_ltc_from_wav_libltc(path)
+    } else {
+        decode_ltc_from_wav(path)
+    }
+}
 
 // ── Device enumeration ─────────────────────────────────────────────────────
 

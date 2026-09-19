@@ -79,6 +79,8 @@ fn test_cli_generate_wav_roundtrip() {
         drop_frame: false,
         verbose: false,
         debug: false,
+        decode: None,
+        decoder: "builtin".to_string(),
     };
 
     gui_engine::cli::generate_wav(cli).expect("WAV generation failed");
@@ -115,6 +117,8 @@ fn test_engine_mpsc_parse_ltc_command() {
         drop_frame: false,
         verbose: false,
         debug: false,
+        decode: None,
+        decoder: "builtin".to_string(),
     };
     gui_engine::cli::generate_wav(cli).expect("WAV generation failed");
 
