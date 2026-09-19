@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +34,12 @@ pub fn setup_poll_timer(
     conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>>,
     conv_sanity_msg: Arc<Mutex<String>>,
     conv_output_path: Arc<Mutex<String>>,
+    conv_file_groups: Arc<Mutex<BTreeMap<String, Vec<PathBuf>>>>,
+    conv_selected_group_idx: Arc<Mutex<isize>>,
+    conv_container: Arc<Mutex<String>>,
+    conv_video_encoder: Arc<Mutex<String>>,
+    conv_audio_encoder: Arc<Mutex<String>>,
+    conv_selected_folder: Arc<Mutex<String>>,
 ) {
     let ui_weak = ui.as_weak();
     let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -230,6 +238,10 @@ pub fn setup_poll_timer(
             if tick % 10 == 0 {
                 let out = conv_output_path.lock().unwrap().clone();
                 let caps = conv_ffmpeg_caps.lock().unwrap().clone();
+                let container = conv_container.lock().unwrap().clone();
+                let venc = conv_video_encoder.lock().unwrap().clone();
+                let aenc = conv_audio_encoder.lock().unwrap().clone();
+                let folder = conv_selected_folder.lock().unwrap().clone();
                 let mut msg = String::new();
                 match caps {
                     Some(ref c) if !c.has_ffmpeg => {
@@ -238,19 +250,29 @@ pub fn setup_poll_timer(
                     Some(_) if out.is_empty() => {
                         msg = "No output file path specified.".to_string();
                     }
-                    Some(ref c) if ui.get_conv_selected_group_idx() >= 0 => {
-                        let container = gui_engine::converter::supported_containers()[0].0.to_string();
-                        let venc = gui_engine::converter::supported_video_encoders()[0].0.to_string();
-                        let aenc = gui_engine::converter::supported_audio_encoders()[0].0.to_string();
-                        let input_files: Vec<std::path::PathBuf> = Vec::new();
-                        let output_path = std::path::PathBuf::from(&out);
+                    Some(ref c) => {
+                        let sel_idx = *conv_selected_group_idx.lock().unwrap();
+                        let input_files: Vec<PathBuf> = if sel_idx >= 0 {
+                            let groups = conv_file_groups.lock().unwrap();
+                            let keys: Vec<String> = groups.keys().cloned().collect();
+                            if (sel_idx as usize) < keys.len() {
+                                let prefix = &keys[sel_idx as usize];
+                                let files = groups.get(prefix).cloned().unwrap_or_default();
+                                files.iter().map(|f| PathBuf::from(&folder).join(f)).collect()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let output_path = PathBuf::from(&out);
                         if let Err(e) = gui_engine::converter::conversion_sanity_check(
                             &container, &venc, &aenc, &input_files, &output_path, c,
                         ) {
                             msg = e;
                         }
                     }
-                    _ => {}
+                    None => {}
                 }
                 *conv_sanity_msg.lock().unwrap() = msg.clone();
                 ui.set_conv_sanity_msg(SharedString::from(msg));

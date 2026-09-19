@@ -110,6 +110,19 @@ fn _run_gui(
         ui.set_sample_rate_options(rate_model);
     }
 
+    // ── Populate converter format options ────────────────────────────────────
+    {
+        let container_options: Vec<SharedString> = gui_engine::converter::supported_containers()
+            .iter().map(|(key, _)| SharedString::from(*key)).collect();
+        ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(container_options)));
+        let video_options: Vec<SharedString> = gui_engine::converter::supported_video_encoders()
+            .iter().map(|(key, _)| SharedString::from(*key)).collect();
+        ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(video_options)));
+        let audio_options: Vec<SharedString> = gui_engine::converter::supported_audio_encoders()
+            .iter().map(|(key, _)| SharedString::from(*key)).collect();
+        ui.set_conv_audio_encoder_options(ModelRc::new(VecModel::<SharedString>::from(audio_options)));
+    }
+
     // ── Set OS name and version ─────────────────────────────────────────────
     ui.set_os_name(SharedString::from(os_name.clone()));
     ui.set_version(SharedString::from(format!("v{}", APP_VERSION)));
@@ -572,14 +585,84 @@ fn _run_gui(
     {
         let state = conv_state.clone();
         let cmap = conv_channel_map.clone();
+        let groups = conv_file_groups.clone();
+        let idx = conv_selected_group_idx.clone();
+        let out_path = conv_output_path.clone();
         let ui_weak = ui.as_weak();
         ui.on_conv_reset(move || {
             *state.lock().unwrap() = ConversionState::idle();
-drop(cmap.lock().unwrap());
+            *cmap.lock().unwrap() = ChannelMap::identity(0);
+            *groups.lock().unwrap() = BTreeMap::new();
+            *idx.lock().unwrap() = -1;
+            *out_path.lock().unwrap() = String::new();
             if let Some(u) = ui_weak.upgrade() {
                 u.set_conv_status(SharedString::from("idle"));
                 u.set_conv_progress(0.0);
                 u.set_conv_log(SharedString::from(""));
+                u.set_conv_selected_group_idx(-1);
+                u.set_conv_num_channels(0);
+                u.set_conv_channel_map(ModelRc::new(VecModel::<i32>::from(vec![])));
+                u.set_conv_output_path(SharedString::from(""));
+                u.set_conv_sanity_msg(SharedString::from(""));
+            }
+        });
+    }
+
+    {
+        let container = conv_container.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_container_selected(move |idx| {
+            let options = gui_engine::converter::supported_containers();
+            if idx >= 0 && (idx as usize) < options.len() {
+                let key = options[idx as usize].0.to_string();
+                *container.lock().unwrap() = key.clone();
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_container(SharedString::from(key));
+                }
+            }
+        });
+    }
+    {
+        let venc = conv_video_encoder.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_video_selected(move |idx| {
+            let options = gui_engine::converter::supported_video_encoders();
+            if idx >= 0 && (idx as usize) < options.len() {
+                let key = options[idx as usize].0.to_string();
+                *venc.lock().unwrap() = key.clone();
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_video_encoder(SharedString::from(key));
+                }
+            }
+        });
+    }
+    {
+        let aenc = conv_audio_encoder.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_audio_selected(move |idx| {
+            let options = gui_engine::converter::supported_audio_encoders();
+            if idx >= 0 && (idx as usize) < options.len() {
+                let key = options[idx as usize].0.to_string();
+                *aenc.lock().unwrap() = key.clone();
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_audio_encoder(SharedString::from(key));
+                }
+            }
+        });
+    }
+    {
+        let out_path = conv_output_path.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_select_output_path(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name("output.mkv")
+                .save_file()
+            {
+                let path_str = path.to_string_lossy().to_string();
+                *out_path.lock().unwrap() = path_str.clone();
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_output_path(SharedString::from(path_str));
+                }
             }
         });
     }
@@ -597,6 +680,12 @@ drop(cmap.lock().unwrap());
         conv_ffmpeg_caps,
         conv_sanity_msg,
         conv_output_path,
+        conv_file_groups,
+        conv_selected_group_idx,
+        conv_container,
+        conv_video_encoder,
+        conv_audio_encoder,
+        conv_selected_folder,
     );
 
     info!("LTC Slint GUI initialized, showing window");

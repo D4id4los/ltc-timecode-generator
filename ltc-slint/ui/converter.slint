@@ -19,6 +19,11 @@ export component ConverterSection {
     in-out property <string> conv-log: "";
     in-out property <string> sanity-msg: "";
 
+    in-out property <[string]> container-options: [];
+    in-out property <[string]> video-encoder-options: [];
+    in-out property <[string]> audio-encoder-options: [];
+    in-out property <int> open-popup: -1;
+
     callback select-folder;
     callback select-group(int);
     callback map-cell-clicked(int, int);
@@ -26,6 +31,10 @@ export component ConverterSection {
     callback cancel-convert;
     callback copy-log;
     callback reset-conv;
+    callback container-selected(int);
+    callback video-selected(int);
+    callback audio-selected(int);
+    callback select-output-path;
 
     Rectangle {
         border-radius: 12px;
@@ -153,32 +162,83 @@ export component ConverterSection {
                 }
 
                 // Container / Video / Audio selectors
-                HorizontalLayout { spacing: 8px;
+                HorizontalLayout { spacing: 8px; vertical-stretch: 0;
                     // Container
-                    Rectangle {
-                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
-                        background: AppColors.deep-bg; min-height: 28px; horizontal-stretch: 1;
-                        VerticalLayout { padding: 4px; spacing: 2px;
-                            Text { text: "Container"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
-                            Text { text: root.container; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                    VerticalLayout { horizontal-stretch: 1; spacing: 0px;
+                        Rectangle {
+                            border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                            background: AppColors.deep-bg; min-height: 28px;
+                            TouchArea { clicked => { root.open-popup = root.open-popup == 0 ? -1 : 0; } }
+                            VerticalLayout { padding: 4px; spacing: 2px;
+                                Text { text: "Container"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                Text { text: root.container; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                            }
+                        }
+                        if (root.open-popup == 0) : VerticalLayout { spacing: 1px; padding-top: 2px;
+                            for opt[idx] in root.container-options : Rectangle {
+                                border-radius: 4px; border-width: 1px; border-color: AppColors.border-main;
+                                background: AppColors.deep-bg; min-height: 24px;
+                                TouchArea {
+                                    clicked => {
+                                        root.open-popup = -1;
+                                        root.container-selected(idx);
+                                    }
+                                }
+                                Text { text: opt; color: AppColors.text-title; font-size: 9px; font-family: "monospace"; font-weight: 600;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
                         }
                     }
                     // Video encoder
-                    Rectangle {
-                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
-                        background: AppColors.deep-bg; min-height: 28px; horizontal-stretch: 1;
-                        VerticalLayout { padding: 4px; spacing: 2px;
-                            Text { text: "Video"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
-                            Text { text: root.video-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                    VerticalLayout { horizontal-stretch: 1; spacing: 0px;
+                        Rectangle {
+                            border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                            background: AppColors.deep-bg; min-height: 28px;
+                            TouchArea { clicked => { root.open-popup = root.open-popup == 1 ? -1 : 1; } }
+                            VerticalLayout { padding: 4px; spacing: 2px;
+                                Text { text: "Video"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                Text { text: root.video-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                            }
+                        }
+                        if (root.open-popup == 1) : VerticalLayout { spacing: 1px; padding-top: 2px;
+                            for opt[idx] in root.video-encoder-options : Rectangle {
+                                border-radius: 4px; border-width: 1px; border-color: AppColors.border-main;
+                                background: AppColors.deep-bg; min-height: 24px;
+                                TouchArea {
+                                    clicked => {
+                                        root.open-popup = -1;
+                                        root.video-selected(idx);
+                                    }
+                                }
+                                Text { text: opt; color: AppColors.text-title; font-size: 9px; font-family: "monospace"; font-weight: 600;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
                         }
                     }
                     // Audio encoder
-                    Rectangle {
-                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
-                        background: AppColors.deep-bg; min-height: 28px; horizontal-stretch: 1;
-                        VerticalLayout { padding: 4px; spacing: 2px;
-                            Text { text: "Audio"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
-                            Text { text: root.audio-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                    VerticalLayout { horizontal-stretch: 1; spacing: 0px;
+                        Rectangle {
+                            border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                            background: AppColors.deep-bg; min-height: 28px;
+                            TouchArea { clicked => { root.open-popup = root.open-popup == 2 ? -1 : 2; } }
+                            VerticalLayout { padding: 4px; spacing: 2px;
+                                Text { text: "Audio"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                Text { text: root.audio-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                            }
+                        }
+                        if (root.open-popup == 2) : VerticalLayout { spacing: 1px; padding-top: 2px;
+                            for opt[idx] in root.audio-encoder-options : Rectangle {
+                                border-radius: 4px; border-width: 1px; border-color: AppColors.border-main;
+                                background: AppColors.deep-bg; min-height: 24px;
+                                TouchArea {
+                                    clicked => {
+                                        root.open-popup = -1;
+                                        root.audio-selected(idx);
+                                    }
+                                }
+                                Text { text: opt; color: AppColors.text-title; font-size: 9px; font-family: "monospace"; font-weight: 600;
+                                       horizontal-alignment: center; vertical-alignment: center; }
+                            }
                         }
                     }
                 }
@@ -230,10 +290,11 @@ export component ConverterSection {
                 Rectangle {
                     border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                     background: AppColors.deep-bg; min-height: 28px;
+                    TouchArea { clicked => { root.select-output-path(); } }
                     HorizontalLayout { padding: 8px; spacing: 6px;
                         Text { text: "📁"; font-size: 12px; }
                         Text {
-                            text: root.output-path == "" ? "(No output path set)" : root.output-path;
+                            text: root.output-path == "" ? "(Click to set output path…)" : root.output-path;
                             color: root.output-path == "" ? AppColors.text-muted : AppColors.text-title;
                             font-size: 10px; font-family: "monospace"; horizontal-stretch: 1;
                             vertical-alignment: center;

@@ -97,6 +97,9 @@ export component AppWindow inherits Window {
     in-out property <float> conv-progress: 0.0;
     in-out property <string> conv-log: "";
     in-out property <string> conv-sanity-msg: "";
+    in-out property <[string]> conv-container-options: [];
+    in-out property <[string]> conv-video-encoder-options: [];
+    in-out property <[string]> conv-audio-encoder-options: [];
 
     // ── Tab state ──
     in-out property <int> active-tab: 0;
@@ -151,6 +154,10 @@ export component AppWindow inherits Window {
     callback conv-cancel;
     callback conv-copy-log;
     callback conv-reset;
+    callback conv-container-selected(int);
+    callback conv-video-selected(int);
+    callback conv-audio-selected(int);
+    callback conv-select-output-path;
 
     // ── Tab navigation ──
     callback tab-clicked(int);
@@ -618,6 +625,9 @@ export component AppWindow inherits Window {
                     conv-progress: root.conv-progress;
                     conv-log: root.conv-log;
                     sanity-msg: root.conv-sanity-msg;
+                    container-options: root.conv-container-options;
+                    video-encoder-options: root.conv-video-encoder-options;
+                    audio-encoder-options: root.conv-audio-encoder-options;
                     select-folder => { root.conv-select-folder(); }
                     select-group(idx) => { root.conv-select-group(idx); }
                     map-cell-clicked(row, col) => { root.conv-map-cell-clicked(row, col); }
@@ -625,6 +635,10 @@ export component AppWindow inherits Window {
                     cancel-convert => { root.conv-cancel(); }
                     copy-log => { root.conv-copy-log(); }
                     reset-conv => { root.conv-reset(); }
+                    container-selected(idx) => { root.conv-container-selected(idx); }
+                    video-selected(idx) => { root.conv-video-selected(idx); }
+                    audio-selected(idx) => { root.conv-audio-selected(idx); }
+                    select-output-path => { root.conv-select-output-path(); }
                 }
                     }
                 }
