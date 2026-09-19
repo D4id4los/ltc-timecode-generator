@@ -239,9 +239,9 @@ cargo clippy --all-targets            # Run clippy on all workspace crates
 
 Two decoders are available, selectable via `--decoder`:
 ```bash
-# builtin — pure Rust, accurate but slow (~74s for a 20s file)
+# builtin — pure Rust, accurate (~428ms for a 20s file; 173x faster after optimization)
 ltc-gui --decode file.wav --decoder builtin
-# libltc — C library, fast (~135ms for a 20s file)  
+# libltc — C library, very fast (~13ms for a 20s file)  
 ltc-gui --decode file.wav --decoder libltc
 ```
 

@@ -12,7 +12,7 @@ use gui_engine::{decode_ltc_from_wav, LtcDecodeStatus};
 const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-fn run_engine_with_command(cmd: GuiCommand) -> AppStateSnapshot {
+fn run_engine_with_command(cmd: GuiCommand, use_libltc: bool) -> AppStateSnapshot {
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -20,7 +20,7 @@ fn run_engine_with_command(cmd: GuiCommand) -> AppStateSnapshot {
     let handle = std::thread::Builder::new()
         .name("gui-engine-test".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone);
+            gui_engine::engine::engine_main(rx, state_clone, use_libltc);
         })
         .expect("failed to spawn engine thread");
 
@@ -123,9 +123,10 @@ fn test_engine_mpsc_parse_ltc_command() {
     gui_engine::cli::generate_wav(cli).expect("WAV generation failed");
 
     // Send the ParseLtcFile command through the engine's MPSC channel
-    let snapshot = run_engine_with_command(GuiCommand::ParseLtcFile(
-        wav_path.to_string_lossy().to_string(),
-    ));
+    let snapshot = run_engine_with_command(
+        GuiCommand::ParseLtcFile(wav_path.to_string_lossy().to_string()),
+        false,
+    );
 
     // Verify the decode result was stored in the snapshot fields
     assert!(
@@ -147,9 +148,10 @@ fn test_engine_mpsc_parse_ltc_command() {
 #[test]
 fn test_engine_mpsc_parse_invalid_file() {
     // Send ParseLtcFile for a non-existent file
-    let snapshot = run_engine_with_command(GuiCommand::ParseLtcFile(
-        "/tmp/nonexistent_ltc_test_file.wav".to_string(),
-    ));
+    let snapshot = run_engine_with_command(
+        GuiCommand::ParseLtcFile("/tmp/nonexistent_ltc_test_file.wav".to_string()),
+        false,
+    );
 
     assert!(
         snapshot.status_message.contains("Parse failed"),

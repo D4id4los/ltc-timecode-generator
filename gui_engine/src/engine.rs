@@ -17,8 +17,9 @@ const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 const MAX_CLAP_LOGS: usize = 1000;
 const BUFFER_SIZE: u32 = 0;
 
-pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnapshot>>) {
+pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnapshot>>, use_libltc: bool) {
     let mut current = AppStateSnapshot::initial();
+    current.use_libltc = use_libltc;
     let core = AudioCore::new();
     let mut last_tick = Instant::now();
 
@@ -349,17 +350,19 @@ fn process_command(
         }
 
         GuiCommand::ParseLtcFile(path) => {
-            info!("LTC decode requested for: {}", path);
+            let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
+            info!("LTC decode requested for: {} (decoder: {})", path, decoder_name);
             state.ltc_is_detecting = true;
             state.ltc_decode_result = None;
             state.ltc_decode_error = None;
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
-            state.status_message = format!("Decoding LTC from: {}", path);
+            state.status_message = format!("Decoding LTC from: {} [{}]", path, decoder_name);
             let capture_gen = state.ltc_decode_generation;
             let tx = decode_result_tx.clone();
+            let use_libltc = state.use_libltc;
             std::thread::spawn(move || {
-                debug!("LTC decode thread spawned for gen={}: {}", capture_gen, path);
-                let result = audio_core::decode_ltc_from_wav(Path::new(&path));
+                debug!("LTC decode thread spawned for gen={}: {} (decoder: {})", capture_gen, path, if use_libltc { "libltc" } else { "builtin" });
+                let result = audio_core::decode_ltc_with_decoder(Path::new(&path), use_libltc);
                 let _ = tx.send(LtcDecodeResult {
                     path,
                     generation: capture_gen,

@@ -585,14 +585,16 @@ pub fn process_cli(cli: Cli) -> CliOutcome {
     }
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-    let init_state = AppStateSnapshot::initial();
+    let use_libltc = cli.decoder == "libltc";
+    let mut init_state = AppStateSnapshot::initial();
+    init_state.use_libltc = use_libltc;
     let state = Arc::new(arc_swap::ArcSwap::new(Arc::new(init_state)));
     let state_clone = Arc::clone(&state);
 
     std::thread::Builder::new()
         .name("gui-engine".to_string())
         .spawn(move || {
-            crate::engine::engine_main(cmd_rx, state_clone);
+            crate::engine::engine_main(cmd_rx, state_clone, use_libltc);
         })
         .expect("failed to spawn gui-engine thread");
 
