@@ -79,7 +79,7 @@ fn _run_gui(
     let conv_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     let conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>> = Arc::new(Mutex::new(None));
     let conv_sanity_msg: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let conv_trim_to_first_ltc: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
+    let conv_trim_to_first_ltc: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_trim_offset_secs: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
 
     let conv_folder_for_group = conv_selected_folder.clone();
@@ -740,6 +740,7 @@ fn _run_gui(
         conv_audio_encoder,
         conv_selected_folder,
         conv_trim_offset_secs,
+        conv_trim_to_first_ltc,
     );
 
     info!("LTC Slint GUI initialized, showing window");

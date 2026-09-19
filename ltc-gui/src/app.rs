@@ -134,7 +134,7 @@ impl AppState {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             convert_handle: None,
             ffmpeg_caps: None,
-            trim_ltc_start: true,
+            trim_ltc_start: false,
             trim_offset_secs: 0.0,
         }
     }
@@ -157,6 +157,7 @@ impl eframe::App for AppState {
         if let Some(ref result) = self.latest.ltc_decode_result {
             if matches!(result.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence) {
                 self.trim_offset_secs = result.first_ltc_timecode_secs;
+                self.trim_ltc_start = true;
             }
         }
 

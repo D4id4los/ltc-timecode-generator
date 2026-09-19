@@ -62,6 +62,7 @@ interface ConversionProgressInfo {
 interface LtcFrameTimecode {
   frame_index: number;
   timecode: { hours: number; minutes: number; seconds: number; frames: number };
+  timecode_secs: number;
 }
 
 type LtcDecodeStatus =
@@ -158,7 +159,7 @@ function TauriConverter() {
   const [ltcError, setLtcError] = useState<string | null>(null);
 
   // Trim to first LTC
-  const [trimToFirstLtc, setTrimToFirstLtc] = useState(true);
+  const [trimToFirstLtc, setTrimToFirstLtc] = useState(false);
   const [trimOffsetSecs, setTrimOffsetSecs] = useState(0);
 
   // Sanity check
@@ -250,10 +251,17 @@ function TauriConverter() {
 
   // Derive trim offset from LTC result
   useEffect(() => {
-    if (ltcResult && ltcResult.status.type === "Success" && ltcResult.first_ltc_timecode_secs > 0) {
+    if (ltcResult && (ltcResult.status.type === "Success" || ltcResult.status.type === "LowConfidence") && ltcResult.first_ltc_timecode_secs > 0) {
       setTrimOffsetSecs(ltcResult.first_ltc_timecode_secs);
     } else if (!ltcResult) {
       setTrimOffsetSecs(0);
+    }
+  }, [ltcResult]);
+
+  // Auto-enable trim on successful/low-confidence LTC decode
+  useEffect(() => {
+    if (ltcResult && (ltcResult.status.type === "Success" || ltcResult.status.type === "LowConfidence")) {
+      setTrimToFirstLtc(true);
     }
   }, [ltcResult]);
 
@@ -654,7 +662,7 @@ function TauriConverter() {
         <input
           type="checkbox"
           checked={trimToFirstLtc}
-          disabled={!ltcResult || ltcResult.status.type !== "Success"}
+          disabled={ltcDetecting || (ltcResult === null && ltcError === null)}
           onChange={(e) => setTrimToFirstLtc(e.target.checked)}
           className="accent-[#FF5F1F]"
         />
@@ -664,6 +672,9 @@ function TauriConverter() {
             <span className="text-text-muted ml-1">
               (trim {trimOffsetSecs.toFixed(3)}s of silence)
             </span>
+          )}
+          {!ltcResult && !ltcError && !ltcDetecting && (
+            <span className="text-[10px] text-text-muted ml-1 italic">(Detect LTC first)</span>
           )}
         </label>
       </div>
@@ -923,7 +934,8 @@ function LtcResultDisplay({ result }: { result: LtcDetectionResult }) {
                 className="text-xs font-mono text-text-muted hover:text-text-title"
               >
                 [{String(ftc.frame_index).padStart(4, " ")}]{" "}
-                {formatTc(ftc.timecode, result.drop_frame ? ";" : ":")}
+                {formatTc(ftc.timecode, result.drop_frame ? ";" : ":")}{" "}
+                (+{ftc.timecode_secs.toFixed(3)}s)
               </div>
             ))}
           </div>

@@ -25,7 +25,7 @@ export component ConverterSection {
     in-out property <int> open-popup: -1;
 
     // ── Trim to first LTC ──
-    in-out property <bool> trim-to-first-ltc: true;
+    in-out property <bool> trim-to-first-ltc: false;
     in-out property <float> trim-offset-secs: 0.0;
     callback toggle-trim-ltc;
 
@@ -410,14 +410,15 @@ export component ConverterSection {
 
                 // ── Trim to first LTC ──
                 HorizontalLayout { spacing: 6px; padding-top: 4px;
+                    property <bool> ltc-done: root.ltc-status != "" && root.ltc-status != "detecting";
 Rectangle {
                             width: 16px; height: 16px; border-radius: 3px;
                             border-width: 1px;
                             border-color: root.trim-to-first-ltc ? AppColors.accent : AppColors.border-main;
                             background: root.trim-to-first-ltc ? AppColors.accent : transparent;
-                            opacity: root.ltc-status == "success" || root.ltc-status == "low_confidence" ? 1.0 : 0.4;
+                            opacity: ltc-done ? 1.0 : 0.4;
                             TouchArea {
-                                enabled: root.ltc-status == "success" || root.ltc-status == "low_confidence";
+                                enabled: ltc-done;
                             clicked => { root.toggle-trim-ltc(); }
                         }
                         Text {
@@ -428,12 +429,17 @@ Rectangle {
                     }
                     Text {
                         text: "Cut start to first LTC frame";
-                        color: root.ltc-status == "success" || root.ltc-status == "low_confidence" ? AppColors.text-title : AppColors.text-muted;
+                        color: ltc-done ? AppColors.text-title : AppColors.text-muted;
                         font-size: 10px; vertical-alignment: center;
                     }
                     Text {
                         visible: root.trim-to-first-ltc && root.trim-offset-secs > 0.001;
                         text: "(trim " + (root.trim-offset-secs * 1000) + "ms of silence)";
+                        color: AppColors.text-muted; font-size: 9px; vertical-alignment: center;
+                    }
+                    Text {
+                        visible: root.ltc-status == "";
+                        text: "(Detect LTC first)";
                         color: AppColors.text-muted; font-size: 9px; vertical-alignment: center;
                     }
                 }

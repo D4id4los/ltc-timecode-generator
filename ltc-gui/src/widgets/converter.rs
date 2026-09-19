@@ -432,10 +432,11 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                                     let sep = if result.drop_frame { ";" } else { ":" };
                                     ui.label(
                                         RichText::new(format!(
-                                            "[{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
+                                            "[{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  (+{:.3}s)",
                                             ftc.frame_index,
                                             ftc.timecode.hours, ftc.timecode.minutes,
                                             ftc.timecode.seconds, ftc.timecode.frames,
+                                            ftc.timecode_secs,
                                         ))
                                         .font(FontId::monospace(9.0))
                                         .color(colors.text_muted),
@@ -721,9 +722,8 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     });
 
     // Trim to first LTC checkbox
-    let ltc_available = state.latest.ltc_decode_result.as_ref()
-        .map(|r| matches!(r.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence))
-        .unwrap_or(false);
+    let ltc_available = !state.latest.ltc_is_detecting
+        && (state.latest.ltc_decode_result.is_some() || state.latest.ltc_decode_error.is_some());
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_enabled(ltc_available, egui::Checkbox::new(
@@ -733,6 +733,13 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
         if state.trim_ltc_start && state.trim_offset_secs > 0.001 {
             ui.label(
                 RichText::new(format!("(trim {:.3}s of silence)", state.trim_offset_secs))
+                    .font(FontId::proportional(10.0))
+                    .color(colors.text_muted),
+            );
+        }
+        if !ltc_available && !state.latest.ltc_is_detecting {
+            ui.label(
+                RichText::new("(Detect LTC first)")
                     .font(FontId::proportional(10.0))
                     .color(colors.text_muted),
             );

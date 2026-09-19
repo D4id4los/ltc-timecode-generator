@@ -19,6 +19,7 @@ pub enum LtcDecodeStatus {
 pub struct FrameTimecode {
     pub frame_index: u32,
     pub timecode: Timecode,
+    pub timecode_secs: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,6 +140,7 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                     .map(|(idx, &start)| FrameTimecode {
                         frame_index: idx as u32,
                         timecode: decode_timecode_from_bits(&bits, start),
+                        timecode_secs: (phase as f64 + start as f64 * spb) / sample_rate as f64,
                     })
                     .collect();
 
