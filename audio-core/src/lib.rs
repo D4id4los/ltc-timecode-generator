@@ -691,6 +691,7 @@ fn select_best_config(
         .ok_or_else(|| "No supported audio output config found for this device".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stream_for_format(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -711,6 +712,7 @@ fn build_stream_for_format(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stream_generic<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -1109,6 +1111,7 @@ pub fn increment_timecode(tc: &Timecode, fps: f64, drop_frame: bool) -> Timecode
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate_ltc_frame_stereo(
     tc: &Timecode,
     drop_frame: bool,

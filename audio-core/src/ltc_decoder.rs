@@ -222,7 +222,6 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                 valid_frames,
                 total_possible,
                 timecodes,
-                bits,
                 details_entry: format!(
                     "{}: {} valid / {} possible frames (single-pass, spb={:.2})",
                     fps_label, valid_frames, total_possible, r.spb
@@ -265,7 +264,6 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                         valid_frames,
                         total_possible,
                         timecodes,
-                        bits,
                         details_entry: format!(
                             "{}: {} valid / {} possible frames (ZC-single-pass, spb={:.2})",
                             fps_label, valid_frames, total_possible, r.spb
@@ -354,7 +352,7 @@ fn evaluate_on_slice(
 
         for &spb in &spb_variants {
             let max_phases = (spb / 4.0).round() as usize;
-            let phases_to_try = zc.iter().take(max_phases.max(5).min(12)).copied();
+            let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
 
             let half_spb = (spb * 0.5) as usize;
             for phase in phases_to_try {
@@ -384,7 +382,6 @@ fn evaluate_on_slice(
                             valid_frames,
                             total_possible,
                             timecodes,
-                            bits,
                             details_entry: format!(
                                 "{}: {} valid / {} possible frames (spb={:.2}, phase={})",
                                 fps_name, valid_frames, total_possible, spb, candidate_phase
@@ -414,7 +411,7 @@ fn evaluate_on_slice(
         };
 
         let max_phases = (best_spb / 4.0).round() as usize;
-        let phases_to_try = zc.iter().take(max_phases.max(5).min(12)).copied();
+        let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
         for phase in phases_to_try {
             if phase == best_phase { continue; }
             let bits = extract_bits_adaptive(samples, best_spb, phase, threshold, zc);
@@ -442,7 +439,6 @@ fn evaluate_on_slice(
                     valid_frames,
                     total_possible,
                     timecodes,
-                    bits,
                     details_entry: format!(
                         "{}: {} valid / {} possible frames (adaptive, phase={}, spb={:.2})",
                         fps_label, valid_frames, total_possible, phase, best_spb
@@ -787,11 +783,9 @@ fn decode_bits_synthetic_zc(zc: &[usize], spb: f64) -> Vec<u8> {
     let mut bits = Vec::with_capacity(zc.len() + 8);
 
     let first_zc = zc[0] as f64;
-    let leading = (first_zc / spb - 0.5).round() as i32;
+    let leading = (first_zc / spb - 0.5).round() as usize;
     if leading > 0 {
-        for _ in 0..leading {
-            bits.push(0);
-        }
+        bits.resize(bits.len() + leading, 0);
     }
     bits.push(1);
 
@@ -799,8 +793,8 @@ fn decode_bits_synthetic_zc(zc: &[usize], spb: f64) -> Vec<u8> {
         let interval = (zc[i] - zc[i - 1]) as f64;
         let n_periods = (interval / spb).round() as u32;
         let zeros = n_periods.saturating_sub(1);
-        for _ in 0..zeros {
-            bits.push(0);
+        if zeros > 0 {
+            bits.resize(bits.len() + zeros as usize, 0);
         }
         bits.push(1);
     }
@@ -881,7 +875,6 @@ fn try_decode_via_zc_intervals(zc: &[usize], sample_rate: u32) -> Option<ScoredR
                 valid_frames,
                 total_possible,
                 timecodes,
-                bits,
                 details_entry,
                 spb,
                 phase: zc[0],
@@ -1057,15 +1050,15 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         return (0, 0, Vec::new());
     }
 
-    let total_possible = if bits.len() > best_alignment as usize {
-        ((bits.len() - best_alignment as usize) / 80) as u32
+    let total_possible = if bits.len() > best_alignment {
+        ((bits.len() - best_alignment) / 80) as u32
     } else {
         0
     };
 
     // Walk through frames at the best alignment and verify each sync word
     let mut frame_starts = Vec::new();
-    let align = best_alignment as usize;
+    let align = best_alignment;
     for idx in 0.. {
         let frame_start = align + idx * 80;
         if frame_start + 80 > bits.len() {
@@ -1125,7 +1118,6 @@ struct ScoredResult {
     valid_frames: u32,
     total_possible: u32,
     timecodes: Vec<FrameTimecode>,
-    bits: Vec<u8>,
     details_entry: String,
     spb: f64,
     phase: usize,
@@ -1471,12 +1463,8 @@ mod tests {
             1 => {
                 // Mid-bit transition: flip at midpoint
                 let mid_level = -start_level;
-                for i in 0..half {
-                    buf[i] = start_level;
-                }
-                for i in half..samples_per_bit {
-                    buf[i] = mid_level;
-                }
+                buf[..half].fill(start_level);
+                buf[half..samples_per_bit].fill(mid_level);
                 (buf, mid_level)
             }
             _ => unreachable!(),
@@ -1593,11 +1581,11 @@ mod tests {
         let mut bits = vec![0u8; 320];
         // Fill with pseudo-random bits based on a seed
         let seed = 42u64;
-        for i in 0..bits.len() {
+        for (i, b) in bits.iter_mut().enumerate() {
             let mut h = DefaultHasher::new();
             (i as u64).hash(&mut h);
             seed.hash(&mut h);
-            bits[i] = (h.finish() & 1) as u8;
+            *b = (h.finish() & 1) as u8;
         }
         let (valid, _total, _) = find_frames(&bits);
         // With Hamming-distance tolerance of 2, random bits may produce
@@ -1629,6 +1617,7 @@ mod tests {
 
     // ── WAV generation helper ────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_test_wav(
         path: &Path,
         start_tc: Timecode,
@@ -1680,6 +1669,7 @@ mod tests {
         writer.finalize().unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_test_wav_with_prefix(
         path: &Path,
         silent_prefix_secs: f64,
@@ -1754,8 +1744,7 @@ mod tests {
         let path = dir.path().join("test_ltc.wav");
 
         generate_test_wav(&path, start_tc, fps, drop_frame, channel, volume, sample_rate, duration_secs);
-        let result = decode_ltc_from_wav(&path).unwrap();
-        result
+        decode_ltc_from_wav(&path).unwrap()
     }
 
     // ── WAV round-trip tests ─────────────────────────────────────────────
