@@ -508,6 +508,7 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         if use_libltc { "libltc" } else { "builtin" }
     );
 
+    info!("Starting LTC decode (this may take a while for large files)...");
     let result = audio_core::decode_ltc_with_decoder(Path::new(path), use_libltc)?;
 
     println!();

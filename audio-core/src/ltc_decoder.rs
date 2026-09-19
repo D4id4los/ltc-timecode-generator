@@ -93,6 +93,7 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
 
     info!("Decoding LTC from: {} ({} Hz, {} ch)", path.display(), sample_rate, channels);
 
+    info!("LTC decode (+{:.1}s): reading audio samples from disk...", start.elapsed().as_secs_f64());
     let samples = read_mono_samples(&mut reader, &spec)
         .map_err(|e| format!("Failed to read audio samples: {}", e))?;
 
@@ -116,6 +117,8 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
 
     let (best_result, zc) = if total_duration <= PREFIX_DURATION_SECS {
         debug!("LTC decode: file <= {}s prefix -- direct full search", PREFIX_DURATION_SECS);
+        info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (threshold={:.6})...",
+            start.elapsed().as_secs_f64(), samples.len(), threshold);
         let zc = find_zero_crossings(&samples, threshold);
         debug!("LTC decode: found {} zero-crossings", zc.len());
         if zc.len() < 8 {
@@ -134,11 +137,15 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
             prefix_len as f64 / sample_rate as f64, total_duration, prefix_len, threshold);
 
         let prefix = &samples[..prefix_len];
+        info!("LTC decode (+{:.1}s): scanning prefix ({} samples) for zero-crossings...",
+            start.elapsed().as_secs_f64(), prefix.len());
         let zc_prefix = find_zero_crossings(prefix, threshold);
         debug!("LTC decode: prefix -- found {} zero-crossings (need ≥8)", zc_prefix.len());
 
         if zc_prefix.len() < 8 {
             warn!("LTC decode: prefix has only {} zero-crossings -- signal may start past prefix, falling back to full-file search", zc_prefix.len());
+            info!("LTC decode (+{:.1}s): full-file zero-crossings scan ({} samples)...",
+                start.elapsed().as_secs_f64(), samples.len());
             let zc = find_zero_crossings(&samples, threshold);
             if zc.len() < 8 {
                 return Ok(LtcDetectionResult::error(format!(
@@ -183,10 +190,14 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
 
                 if bits.len() < 80 {
                     warn!("LTC decode: full decode -- fewer than 80 bits extracted, no frames possible");
+                    info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (fallback)...",
+                        start.elapsed().as_secs_f64(), samples.len());
                     let zc = find_zero_crossings(&samples, threshold);
                     return build_result(None, &zc, sample_rate, threshold, channels, total_duration, start);
                 }
 
+                info!("LTC decode (+{:.1}s): searching for sync words in {} bits...",
+                    start.elapsed().as_secs_f64(), bits.len());
                 let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
                 info!("LTC decode: full decode -- found {} valid / {} possible frames",
                     valid_frames, total_possible);
@@ -230,6 +241,8 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                     frame_starts,
                 };
 
+                info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (final pass)...",
+                    start.elapsed().as_secs_f64(), samples.len());
                 let zc = find_zero_crossings(&samples, threshold);
                 return build_result(Some(full_result), &zc, sample_rate, threshold, channels, total_duration, start);
             }
@@ -237,6 +250,8 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
             // Fallback: full-file candidate search
             info!("LTC decode: prefix confidence {:.1}% < {}% -- falling back to full-file candidate search on {:.2}s of audio",
                 confidence * 100.0, HIGH_CONFIDENCE_THRESHOLD * 100.0, total_duration);
+            info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (fallback full-file)...",
+                start.elapsed().as_secs_f64(), samples.len());
             let zc = find_zero_crossings(&samples, threshold);
             if zc.len() < 8 {
                 return Ok(LtcDetectionResult::error(format!(
@@ -265,15 +280,19 @@ fn evaluate_on_slice(
     sample_rate: u32,
     threshold: f32,
 ) -> (Option<ScoredResult>, u32) {
+    let eval_start = std::time::Instant::now();
     let mut best_valid = 0u32;
     let mut best_result: Option<ScoredResult> = None;
 
     info!("LTC evaluate: searching {} FPS candidates, {} ZCs over {:.2}s slice",
         CANDIDATES.len(), zc.len(), samples.len() as f64 / sample_rate as f64);
 
-    for &(fps, drop_frame, fps_name) in CANDIDATES {
+    for (candidate_idx, &(fps, drop_frame, fps_name)) in CANDIDATES.iter().enumerate() {
         let spb_nominal = sample_rate as f64 / (fps * 80.0);
         if spb_nominal < 0.5 { continue; }
+        debug!("LTC evaluate (+{:.1}s):  trying candidate {}/{}: {} (spb_nominal={:.2})",
+            eval_start.elapsed().as_secs_f64(), candidate_idx + 1, CANDIDATES.len(),
+            fps_name, spb_nominal);
 
         // Try SPB variants to compensate for clock drift
         let spb_variants = if spb_nominal >= 8.0 {
@@ -336,6 +355,8 @@ fn evaluate_on_slice(
     // Uses zero-crossing-snapped bit boundaries to improve decoding of
     // noisy/real-world LTC where timing jitter causes fixed-spb drift.
     if let Some(ref best) = best_result.clone() {
+        debug!("LTC evaluate (+{:.1}s): refinement phase for best candidate ({} fps, spb={:.2}, best_valid={})",
+            eval_start.elapsed().as_secs_f64(), best.fps, best.spb, best_valid);
         let best_spb = best.spb;
         let best_fps = best.fps;
         let best_drop_frame = best.drop_frame;

@@ -45,14 +45,26 @@ pub fn decode_ltc_from_wav_libltc(path: &Path) -> Result<LtcDetectionResult, Str
     let mut timecodes: Vec<FrameTimecode> = Vec::new();
     let mut frame_index: u32 = 0;
 
+    let progress_interval: usize;
     if channels == 1 {
+        info!("LTC decode (+{:.1}s): reading audio samples from disk...", start.elapsed().as_secs_f64());
         let all_samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
         total_samples = all_samples.len();
         if total_samples == 0 {
             warn!("LTC decode (libltc): audio file contains no samples: {}", path.display());
             return Ok(error_result("Audio file contains no samples"));
         }
-        for chunk in all_samples.chunks(chunk_size) {
+        let total_chunks = total_samples.div_ceil(chunk_size);
+        progress_interval = (total_chunks / 10).max(1);
+        info!("LTC decode (+{:.1}s): processing {} samples in {} chunks of {}...",
+            start.elapsed().as_secs_f64(), total_samples, total_chunks, chunk_size);
+        for (chunk_idx, chunk) in all_samples.chunks(chunk_size).enumerate() {
+            if chunk_idx % progress_interval == 0 {
+                debug!("LTC decode (+{:.1}s):  processed {:.0}% ({}/{})",
+                    start.elapsed().as_secs_f64(),
+                    (sample_pos as f64 / total_samples as f64) * 100.0,
+                    sample_pos, total_samples);
+            }
             decoder.write_i16(chunk, sample_pos);
             sample_pos += chunk.len() as i64;
             while let Some(frame_ext) = decoder.read() {
@@ -72,13 +84,24 @@ pub fn decode_ltc_from_wav_libltc(path: &Path) -> Result<LtcDetectionResult, Str
             }
         }
     } else {
+        info!("LTC decode (+{:.1}s): reading audio samples from disk...", start.elapsed().as_secs_f64());
         let sample_data: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
         total_samples = sample_data.len() / channels;
         if total_samples == 0 {
             warn!("LTC decode (libltc): audio file contains no samples: {}", path.display());
             return Ok(error_result("Audio file contains no samples"));
         }
-        for chunk_start in (0..sample_data.len()).step_by(chunk_size * channels) {
+        let total_chunks = total_samples.div_ceil(chunk_size);
+        progress_interval = (total_chunks / 10).max(1);
+        info!("LTC decode (+{:.1}s): processing {} samples in {} chunks of {} ({} ch)...",
+            start.elapsed().as_secs_f64(), total_samples, total_chunks, chunk_size, channels);
+        for (chunk_idx, chunk_start) in (0..sample_data.len()).step_by(chunk_size * channels).enumerate() {
+            if chunk_idx % progress_interval == 0 {
+                debug!("LTC decode (+{:.1}s):  processed {:.0}% ({}/{})",
+                    start.elapsed().as_secs_f64(),
+                    (sample_pos as f64 / total_samples as f64) * 100.0,
+                    sample_pos, total_samples);
+            }
             let chunk_end = (chunk_start + chunk_size * channels).min(sample_data.len());
             let raw_chunk = &sample_data[chunk_start..chunk_end];
             let left: Vec<i16> = raw_chunk.chunks(channels).map(|ch| ch[0]).collect();
@@ -103,6 +126,8 @@ pub fn decode_ltc_from_wav_libltc(path: &Path) -> Result<LtcDetectionResult, Str
     }
 
     // Drain any remaining frames
+    debug!("LTC decode (+{:.1}s): draining {} remaining decoded frames...",
+        start.elapsed().as_secs_f64(), decoder.queue_length());
     while let Some(frame_ext) = decoder.read() {
         let ltc = frame_ext.ltc();
         let tc = ltc.to_timecode(LtcBgFlags::default());
@@ -128,6 +153,8 @@ pub fn decode_ltc_from_wav_libltc(path: &Path) -> Result<LtcDetectionResult, Str
     let valid_count = timecodes.len() as u32;
     let processing_time_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+    info!("LTC decode (+{:.1}s): inferring FPS from {} decoded frames...",
+        start.elapsed().as_secs_f64(), valid_count);
     let (detected_fps, drop_frame, total_possible_frames, avg_confidence, details) =
         if valid_count >= 2 {
             let first_off = timecodes[0].timecode_secs;
