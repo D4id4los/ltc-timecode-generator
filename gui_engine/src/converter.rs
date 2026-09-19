@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use log::{debug, info, warn};
+
 // ── Channel mapping ──────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -361,6 +363,17 @@ pub type CancelFlag = Arc<AtomicBool>;
 fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
     let num_channels = settings.channel_map.num_channels;
     let mapping = settings.channel_map.mapping();
+    let trim_secs = settings.trim_start_secs;
+
+    debug!(
+        "Building ffmpeg args: {} input files, {} output channels, trim_start={:.3}s",
+        settings.input_files.len(),
+        num_channels,
+        trim_secs,
+    );
+    for (i, f) in settings.input_files.iter().enumerate() {
+        debug!("  input[{}]: {}", i, f.display());
+    }
 
     let mut args: Vec<String> = vec![
         "-y".to_string(),
@@ -370,13 +383,8 @@ fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
         "color=c=blue:s=1280x720:r=25".to_string(),
     ];
 
-    // Audio input files (with optional trim)
-    let trim_secs = settings.trim_start_secs;
+    // Audio input files (without -ss — atrim in filter complex handles trimming)
     for f in &settings.input_files {
-        if trim_secs > 0.001 {
-            args.push("-ss".to_string());
-            args.push(format!("{:.3}", trim_secs));
-        }
         args.push("-i".to_string());
         args.push(f.to_string_lossy().to_string());
     }
@@ -385,16 +393,28 @@ fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
     args.push("-map".to_string());
     args.push("0:v".to_string());
 
-    // Filter complex: route each input audio to its output channel label
+    // Filter complex: route each input audio to its output channel label,
+    // with sample-accurate trimming via atrim when enabled
+    let trim_enabled = trim_secs > 0.001;
     let mut filter_parts: Vec<String> = Vec::new();
     for (input_idx, &output_ch) in mapping.iter().enumerate().take(num_channels) {
-        filter_parts.push(format!(
-            "[{}:a]volume=0dB[a{}]",
-            input_idx + 1,
-            output_ch + 1,
-        ));
+        let idx = input_idx + 1;
+        let trim_filter = if trim_enabled {
+            format!("atrim=start={:.3}", trim_secs)
+        } else {
+            String::new()
+        };
+        if trim_filter.is_empty() {
+            filter_parts.push(format!("[{}:a]volume=0dB[a{}]", idx, output_ch + 1));
+        } else {
+            filter_parts.push(format!(
+                "[{}:a]{}[trimmed{}];[trimmed{}]volume=0dB[a{}]",
+                idx, trim_filter, idx, idx, output_ch + 1,
+            ));
+        }
     }
     let filter_complex = filter_parts.join(";");
+    debug!("  filter_complex: {}", filter_complex);
 
     args.push("-filter_complex".to_string());
     args.push(filter_complex);
@@ -460,6 +480,17 @@ pub fn spawn_conversion(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let args = build_ffmpeg_args(&settings);
+        let output = settings.output_path.clone();
+        let input_count = settings.input_files.len();
+
+        info!(
+            "Starting conversion: {} input(s) → {}, trim={:.3}s, encoders={}/{}",
+            input_count,
+            output.display(),
+            settings.trim_start_secs,
+            settings.video_encoder,
+            settings.audio_encoder,
+        );
 
         {
             let mut s = state.lock().unwrap();
@@ -476,9 +507,11 @@ pub fn spawn_conversion(
         {
             Ok(c) => c,
             Err(e) => {
+                let err_msg = format!("Failed to spawn ffmpeg: {}", e);
+                warn!("Conversion spawn failed: {}", err_msg);
                 let mut s = state.lock().unwrap();
                 s.status = ConversionStatus::Failed {
-                    error_log: format!("Failed to spawn ffmpeg: {}", e),
+                    error_log: err_msg,
                 };
                 return;
             }
@@ -491,6 +524,7 @@ pub fn spawn_conversion(
         let mut progress: f32 = 0.0;
         let duration_re = regex::Regex::new(r"time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
         let mut estimated_duration_secs: Option<f64> = None;
+        let mut last_logged_pct: u8 = 0;
 
         for line in reader.lines() {
             if cancel.load(Ordering::Relaxed) {
@@ -539,6 +573,14 @@ pub fn spawn_conversion(
                 } else {
                     progress = 0.0;
                 }
+
+                // Log progress at ~10% intervals
+                let pct = (progress * 100.0) as u8;
+                let bucket = (pct / 10) * 10;
+                if bucket > 0 && bucket != last_logged_pct {
+                    last_logged_pct = bucket;
+                    debug!("Conversion progress: {}%", pct);
+                }
             }
 
             {
@@ -553,30 +595,35 @@ pub fn spawn_conversion(
 
         let exit_status = child.wait();
 
-        let mut s = state.lock().unwrap();
-        match exit_status {
-            Ok(status) if status.success() => {
-                s.status = ConversionStatus::Completed;
-                s.ffmpeg_output = format!("{}\n\n--- CONVERSION COMPLETED SUCCESSFULLY ---", full_log);
-            }
-            Ok(status) => {
-                let code = status.code().map(|c| c.to_string()).unwrap_or("unknown".into());
-                s.status = ConversionStatus::Failed {
-                    error_log: format!(
+        {
+            let mut s = state.lock().unwrap();
+            match exit_status {
+                Ok(status) if status.success() => {
+                    info!("Conversion completed successfully: {}", output.display());
+                    s.status = ConversionStatus::Completed;
+                    s.ffmpeg_output = format!("{}\n\n--- CONVERSION COMPLETED SUCCESSFULLY ---", full_log);
+                }
+                Ok(status) => {
+                    let code = status.code().map(|c| c.to_string()).unwrap_or("unknown".into());
+                    warn!("Conversion failed (exit code {}): {}", code, output.display());
+                    s.status = ConversionStatus::Failed {
+                        error_log: format!(
+                            "{}\n\n--- FFMPEG EXITED WITH CODE {} ---",
+                            full_log, code
+                        ),
+                    };
+                    s.ffmpeg_output = format!(
                         "{}\n\n--- FFMPEG EXITED WITH CODE {} ---",
                         full_log, code
-                    ),
-                };
-                s.ffmpeg_output = format!(
-                    "{}\n\n--- FFMPEG EXITED WITH CODE {} ---",
-                    full_log, code
-                );
-            }
-            Err(e) => {
-                s.status = ConversionStatus::Failed {
-                    error_log: format!("{}\n\n--- FFMPEG ERROR: {} ---", full_log, e),
-                };
-                s.ffmpeg_output = format!("{}\n\n--- FFMPEG ERROR: {} ---", full_log, e);
+                    );
+                }
+                Err(e) => {
+                    warn!("Conversion error: {} — {}", e, output.display());
+                    s.status = ConversionStatus::Failed {
+                        error_log: format!("{}\n\n--- FFMPEG ERROR: {} ---", full_log, e),
+                    };
+                    s.ffmpeg_output = format!("{}\n\n--- FFMPEG ERROR: {} ---", full_log, e);
+                }
             }
         }
     })

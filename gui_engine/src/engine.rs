@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use audio_core::{AudioCore, AudioEvent, LtcDetectionResult};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::command::GuiCommand;
 use crate::state::{AppStateSnapshot, ClapLogItem};
@@ -77,6 +77,17 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
                         current.ltc_is_detecting = false;
                         match result {
                             Ok(r) => {
+                                let first_offset = r.first_ltc_timecode_secs;
+                                let tc0_secs = r.timecodes.first().map(|t| t.timecode_secs).unwrap_or(-1.0);
+                                info!(
+                                    "LTC decode result received: path={}, status={:?}, fps={:.2}, valid={}/{}, \
+                                     confidence={:.1}%, first_ltc_timecode_secs={:.3}s, timecodes[0].secs={:.3}s, \
+                                     diff={:.6}s, audio_duration={:.2}s",
+                                    path, r.status, r.detected_fps, r.valid_frames, r.total_possible_frames,
+                                    r.avg_confidence * 100.0, first_offset, tc0_secs,
+                                    (first_offset - tc0_secs).abs(), r.total_audio_duration_secs,
+                                );
+
                                 current.ltc_decode_result = Some(r.clone());
                                 current.ltc_decode_error = None;
                                 let summary = format!(
@@ -338,6 +349,7 @@ fn process_command(
         }
 
         GuiCommand::ParseLtcFile(path) => {
+            info!("LTC decode requested for: {}", path);
             state.ltc_is_detecting = true;
             state.ltc_decode_result = None;
             state.ltc_decode_error = None;
@@ -346,6 +358,7 @@ fn process_command(
             let capture_gen = state.ltc_decode_generation;
             let tx = decode_result_tx.clone();
             std::thread::spawn(move || {
+                debug!("LTC decode thread spawned for gen={}: {}", capture_gen, path);
                 let result = audio_core::decode_ltc_from_wav(Path::new(&path));
                 let _ = tx.send(LtcDecodeResult {
                     path,

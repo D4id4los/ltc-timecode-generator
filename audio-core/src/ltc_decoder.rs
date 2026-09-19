@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::Timecode;
@@ -82,27 +83,35 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
 
+    info!("Decoding LTC from: {} ({} Hz, {} ch)", path.display(), sample_rate, channels);
+
     let samples = read_mono_samples(&mut reader, &spec)
         .map_err(|e| format!("Failed to read audio samples: {}", e))?;
 
     if samples.is_empty() {
+        warn!("LTC decode: audio file contains no samples: {}", path.display());
         return Ok(LtcDetectionResult::error("Audio file contains no samples"));
     }
 
     let total_duration = samples.len() as f64 / sample_rate as f64;
+    debug!("LTC decode: read {:.2}s of audio", total_duration);
 
     let noise_floor = estimate_noise_floor(&samples);
     let threshold = (noise_floor * 0.5).max(0.005);
+    debug!("LTC decode: noise_floor={:.8}, threshold={:.8}", noise_floor, threshold);
 
     if threshold < 1e-8 {
+        warn!("LTC decode: signal is completely silent: {}", path.display());
         return Ok(LtcDetectionResult::error(
             "Audio signal is completely silent",
         ));
     }
 
     let zc = find_zero_crossings(&samples, threshold);
+    debug!("LTC decode: found {} zero-crossings", zc.len());
 
     if zc.len() < 8 {
+        warn!("LTC decode: only {} zero-crossings, signal may not be LTC: {}", zc.len(), path.display());
         return Ok(LtcDetectionResult::error(format!(
             "Only {} zero-crossings found (need ≥8) — signal may be silent or not LTC audio",
             zc.len()
@@ -143,6 +152,11 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                         timecode_secs: (phase as f64 + start as f64 * spb) / sample_rate as f64,
                     })
                     .collect();
+
+                debug!(
+                    "LTC candidate: {} — {} valid / {} possible (phase={}, spb={:.2}, best_valid now {})",
+                    fps_name, valid_frames, total_possible, phase, spb, valid_frames,
+                );
 
                 let details_entry = format!(
                     "{}: {} valid / {} possible frames (phase={}, spb={:.2})",
@@ -213,6 +227,21 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                 0.0
             };
 
+            let tc0_secs = timecodes.first().map(|t| t.timecode_secs).unwrap_or(-1.0);
+            let diff_with_tc0 = (first_ltc_timecode_secs - tc0_secs).abs();
+            if diff_with_tc0 > 0.001 && r.valid_frames > 0 {
+                warn!(
+                    "LTC decode: first_ltc_timecode_secs ({:.6}s) differs from timecodes[0].timecode_secs ({:.6}s) by {:.6}s",
+                    first_ltc_timecode_secs, tc0_secs, diff_with_tc0
+                );
+            }
+
+            info!(
+                "LTC decode result: status={:?}, fps={:.2}, valid={}/{}, confidence={:.1}%, first_offset={:.3}s, tc[0]={:.3}s",
+                status, r.fps, r.valid_frames, r.total_possible, confidence * 100.0,
+                first_ltc_timecode_secs, tc0_secs,
+            );
+
             Ok(LtcDetectionResult {
                 status,
                 detected_fps: r.fps as f32,
@@ -229,6 +258,10 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
             })
         }
         None => {
+            info!(
+                "LTC decode: no valid alignment found for any candidate ({} zero-crossings, threshold={:.6})",
+                zc.len(), threshold,
+            );
             let details = vec![
                 "No valid LTC frame alignment found across any candidate frame rate.".to_string(),
                 format!("Zero-crossings found: {} (threshold: {:.6})", zc.len(), threshold),
@@ -1255,6 +1288,47 @@ mod tests {
             assert_eq!(first.timecode.minutes, 0);
             assert_eq!(first.timecode.seconds, 0);
             assert_eq!(first.timecode.frames, 0);
+        }
+    }
+
+    // ── Edge case: first_ltc_timecode_secs with large silent prefix ──────
+
+    #[test]
+    fn test_wav_first_ltc_offset() {
+        for &silent_secs in &[0.0, 1.0, 30.0, 120.0] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("offset_test.wav");
+
+            generate_test_wav_with_prefix(
+                &path,
+                silent_secs,
+                Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 },
+                25.0, false, "both", 0.5, 48000, 1.0,
+            );
+
+            let result = decode_ltc_from_wav(&path).unwrap();
+            assert!(matches!(result.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence),
+                "silent_prefix={:.1}s: expected Success/LowConfidence, got {:?}",
+                silent_secs, result.status);
+
+            let expected_offset = silent_secs;
+            let tolerance = 0.05; // 50ms tolerance — initial transient may shift detection
+
+            let abs_diff = (result.first_ltc_timecode_secs - expected_offset).abs();
+            assert!(
+                abs_diff < tolerance,
+                "silent_prefix={:.1}s: first_ltc_timecode_secs={:.6}s, expected ≈{:.3}s (diff={:.6}s > {:.3}s)",
+                silent_secs, result.first_ltc_timecode_secs, expected_offset, abs_diff, tolerance,
+            );
+
+            if let Some(first_tc) = result.timecodes.first() {
+                let tc_diff = (result.first_ltc_timecode_secs - first_tc.timecode_secs).abs();
+                assert!(
+                    tc_diff < 0.001,
+                    "silent_prefix={:.1}s: first_ltc_timecode_secs ({:.6}s) != timecodes[0].timecode_secs ({:.6}s), diff={:.6}s",
+                    silent_secs, result.first_ltc_timecode_secs, first_tc.timecode_secs, tc_diff,
+                );
+            }
         }
     }
 
