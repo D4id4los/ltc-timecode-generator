@@ -8,7 +8,7 @@ use gui_engine::converter::{
     supported_audio_encoders, supported_containers, supported_video_encoders, ChannelMap,
     ConversionState, ConversionStatus, ConverterSettings,
 };
-use gui_engine::file_pattern::{default_output_filename, match_files_to_groups, BUILTIN_PATTERNS};
+use gui_engine::file_pattern::{default_output_filename, match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
 
 use crate::app::AppState;
 use crate::theme::ACCENT;
@@ -87,6 +87,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                         state.selected_pattern = i;
                         state.selected_group = None;
                         state.file_groups = None;
+                        state.selected_files = None;
                     }
                 }
             });
@@ -97,44 +98,89 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
         ui.add_space(4.0);
     }
 
-    // Folder selector
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Folder:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        let folder_label = match &state.selected_folder {
-            Some(p) => p.to_string_lossy().to_string(),
-            None => String::from("(No folder selected)"),
-        };
-        let mut display = folder_label;
-        ui.add_sized(
-            egui::vec2(ui.available_width() - 90.0, 20.0),
-            egui::TextEdit::singleline(&mut display)
-                .font(FontId::monospace(10.0))
-                .interactive(false),
-        );
-        if ui.button("Browse…").clicked() {
-            let folder = rfd::FileDialog::new().pick_folder();
-            if let Some(path) = folder {
-                state.selected_folder = Some(path.clone());
-                let pattern = &BUILTIN_PATTERNS[state.selected_pattern];
-                state.file_groups = Some(match_files_to_groups(&path, pattern));
-                state.selected_group = None;
-                if state.ffmpeg_caps.is_none() {
-                    let caps = query_ffmpeg_capabilities();
-                    state.ffmpeg_caps = Some(caps);
+    if state.selected_pattern == 0 {
+        // ── TASCAM: folder picker ──
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Folder:").font(FontId::proportional(10.0)).color(colors.text_muted));
+            let folder_label = match &state.selected_folder {
+                Some(p) => p.to_string_lossy().to_string(),
+                None => String::from("(No folder selected)"),
+            };
+            let mut display = folder_label;
+            ui.add_sized(
+                egui::vec2(ui.available_width() - 90.0, 20.0),
+                egui::TextEdit::singleline(&mut display)
+                    .font(FontId::monospace(10.0))
+                    .interactive(false),
+            );
+            if ui.button("Browse…").clicked() {
+                let folder = rfd::FileDialog::new().pick_folder();
+                if let Some(path) = folder {
+                    state.selected_folder = Some(path.clone());
+                    state.selected_files = None;
+                    let pattern = &BUILTIN_PATTERNS[state.selected_pattern];
+                    state.file_groups = Some(match_files_to_groups(&path, pattern));
+                    state.selected_group = None;
+                    if state.ffmpeg_caps.is_none() {
+                        let caps = query_ffmpeg_capabilities();
+                        state.ffmpeg_caps = Some(caps);
+                    }
                 }
             }
-        }
-    });
+        });
+    } else {
+        // ── * (any): file picker ──
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Files:").font(FontId::proportional(10.0)).color(colors.text_muted));
+            let file_label = match &state.selected_files {
+                Some(files) => format!("{} file(s) selected", files.len()),
+                None => String::from("(No files selected)"),
+            };
+            let mut display = file_label;
+            ui.add_sized(
+                egui::vec2(ui.available_width() - 90.0, 20.0),
+                egui::TextEdit::singleline(&mut display)
+                    .font(FontId::monospace(10.0))
+                    .interactive(false),
+            );
+            if ui.button("Browse…").clicked() {
+                let files = rfd::FileDialog::new()
+                    .add_filter("Audio", &["*"])
+                    .pick_files();
+                if let Some(paths) = files {
+                    if !paths.is_empty() {
+                        state.selected_files = Some(paths.clone());
+                        state.selected_folder = paths[0].parent().map(|p| p.to_path_buf());
+                        state.file_groups = Some(wrap_user_selected_files(paths));
+                        state.selected_group = None;
+                        if state.ffmpeg_caps.is_none() {
+                            let caps = query_ffmpeg_capabilities();
+                            state.ffmpeg_caps = Some(caps);
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // File group selector
     if let Some(groups) = &state.file_groups {
         if groups.is_empty() {
-            ui.label(RichText::new("No files matching the pattern were found in this folder.").font(FontId::proportional(10.0)).color(colors.error_red));
+            let msg = if state.selected_pattern == 0 {
+                "No files matching the TASCAM pattern were found in this folder."
+            } else {
+                "No files selected."
+            };
+            ui.label(RichText::new(msg).font(FontId::proportional(10.0)).color(colors.error_red));
         } else {
+            let is_any_pattern = state.selected_pattern == 1;
             let group_names: Vec<&String> = groups.keys().collect();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Recording:").font(FontId::proportional(10.0)).color(colors.text_muted));
-                let selected_text = state.selected_group.as_deref().unwrap_or("Select a recording…");
+                let label = if is_any_pattern { "Selected files:" } else { "Recording:" };
+                ui.label(RichText::new(label).font(FontId::proportional(10.0)).color(colors.text_muted));
+                let selected_text = state.selected_group.as_deref().unwrap_or(
+                    if is_any_pattern { "Select a group…" } else { "Select a recording…" }
+                );
                 egui::ComboBox::from_id_salt("group_combo")
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
@@ -145,7 +191,12 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                                 .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            if ui.selectable_label(false, format!("{}  ({} ch: {})", name, files.len(), detail)).clicked() {
+                            let label = if is_any_pattern {
+                                format!("{}  ({} file{}: {})", name, files.len(), if files.len() == 1 { "" } else { "s" }, detail)
+                            } else {
+                                format!("{}  ({} ch: {})", name, files.len(), detail)
+                            };
+                            if ui.selectable_label(false, label).clicked() {
                                 state.selected_group = Some(name.to_string());
                                 let num_ch = files.len();
                                 state.channel_map = ChannelMap::identity(num_ch);

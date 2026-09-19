@@ -12,7 +12,7 @@ use gui_engine::converter::{
     query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionState,
     FfmpegCapabilities,
 };
-use gui_engine::file_pattern::{match_files_to_groups, BUILTIN_PATTERNS};
+use gui_engine::file_pattern::{match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::{ArcSwap, SAMPLE_RATE_OPTIONS};
@@ -65,6 +65,8 @@ fn _run_gui(
     let pulse_phase: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
 
     // ── Converter state ─────────────────────────────────────────────────────
+    let conv_selected_pattern: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
+    let conv_selected_files: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
     let conv_selected_folder: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let conv_file_groups: Arc<Mutex<BTreeMap<String, Vec<PathBuf>>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
@@ -435,32 +437,70 @@ fn _run_gui(
     // ── Converter callbacks ──────────────────────────────────────────────────
     {
         let ui_weak = ui.as_weak();
+        let pattern_arc = conv_selected_pattern.clone();
+        let files_arc = conv_selected_files.clone();
         let folder = conv_selected_folder.clone();
         let groups = conv_file_groups.clone();
         let idx = conv_selected_group_idx.clone();
         ui.on_conv_select_folder(move || {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                let path_str = path.to_string_lossy().to_string();
-                *folder.lock().unwrap() = path_str.clone();
-                let pattern = &BUILTIN_PATTERNS[0];
-                let matched = match_files_to_groups(&path, pattern);
-                *groups.lock().unwrap() = matched.clone();
-                *idx.lock().unwrap() = -1;
+            let pat = *pattern_arc.lock().unwrap();
+            if pat == 0 {
+                // TASCAM: folder picker
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    let path_str = path.to_string_lossy().to_string();
+                    *folder.lock().unwrap() = path_str.clone();
+                    *files_arc.lock().unwrap() = Vec::new();
+                    let pattern = &BUILTIN_PATTERNS[0];
+                    let matched = match_files_to_groups(&path, pattern);
+                    *groups.lock().unwrap() = matched.clone();
+                    *idx.lock().unwrap() = -1;
 
-                if let Some(u) = ui_weak.upgrade() {
-                    u.set_conv_selected_folder(SharedString::from(path_str));
-                    let model: Vec<FileGroupInfo> = matched.iter().map(|(prefix, files)| {
-                        FileGroupInfo {
-                            prefix: SharedString::from(prefix),
-                            files: ModelRc::new(VecModel::<SharedString>::from(
-                                files.iter().map(|f| {
-                                    SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
-                                }).collect::<Vec<_>>()
-                            )),
-                            channel_count: files.len() as i32,
+                    if let Some(u) = ui_weak.upgrade() {
+                        u.set_conv_selected_folder(SharedString::from(path_str));
+                        let model: Vec<FileGroupInfo> = matched.iter().map(|(prefix, files)| {
+                            FileGroupInfo {
+                                prefix: SharedString::from(prefix),
+                                files: ModelRc::new(VecModel::<SharedString>::from(
+                                    files.iter().map(|f| {
+                                        SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+                                    }).collect::<Vec<_>>()
+                                )),
+                                channel_count: files.len() as i32,
+                            }
+                        }).collect();
+                        u.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(model)));
+                    }
+                }
+            } else {
+                // * (any): file picker
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("Audio", &["*"])
+                    .pick_files()
+                {
+                    if !paths.is_empty() {
+                        let parent = paths[0].parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                        *folder.lock().unwrap() = parent.clone();
+                        *files_arc.lock().unwrap() = paths.clone();
+                        let matched = wrap_user_selected_files(paths);
+                        *groups.lock().unwrap() = matched.clone();
+                        *idx.lock().unwrap() = -1;
+
+                        if let Some(u) = ui_weak.upgrade() {
+                            u.set_conv_selected_folder(SharedString::from(parent));
+                            let model: Vec<FileGroupInfo> = matched.iter().map(|(prefix, files)| {
+                                FileGroupInfo {
+                                    prefix: SharedString::from(prefix),
+                                    files: ModelRc::new(VecModel::<SharedString>::from(
+                                        files.iter().map(|f| {
+                                            SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+                                        }).collect::<Vec<_>>()
+                                    )),
+                                    channel_count: files.len() as i32,
+                                }
+                            }).collect();
+                            u.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(model)));
                         }
-                    }).collect();
-                    u.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(model)));
+                    }
                 }
             }
             let caps = conv_ffmpeg_caps_for_select.clone();
@@ -479,6 +519,32 @@ fn _run_gui(
                     }
                 }
             });
+        });
+    }
+    // ── Pattern selection callback ──
+    {
+        let pattern_arc = conv_selected_pattern.clone();
+        let files_arc = conv_selected_files.clone();
+        let folder = conv_selected_folder.clone();
+        let groups = conv_file_groups.clone();
+        let idx = conv_selected_group_idx.clone();
+        let out_path = conv_output_path.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_select_pattern(move |new_pattern| {
+            *pattern_arc.lock().unwrap() = new_pattern;
+            *files_arc.lock().unwrap() = Vec::new();
+            *folder.lock().unwrap() = String::new();
+            *groups.lock().unwrap() = BTreeMap::new();
+            *idx.lock().unwrap() = -1;
+            *out_path.lock().unwrap() = String::new();
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_selected_pattern(new_pattern);
+                u.set_conv_selected_folder(SharedString::from(""));
+                u.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(vec![])));
+                u.set_conv_selected_group_idx(-1);
+                u.set_conv_num_channels(0);
+                u.set_conv_output_path(SharedString::from(""));
+            }
         });
     }
     {

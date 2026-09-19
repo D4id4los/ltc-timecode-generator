@@ -22,4 +22,4 @@ pub use converter::{
     ChannelMap, ConversionState, ConversionStatus, ConverterSettings,
     FfmpegCapabilities, SharedConversionState, CancelFlag,
 };
-pub use file_pattern::{default_output_filename, match_files_to_groups, FileNamingPattern, BUILTIN_PATTERNS};
+pub use file_pattern::{default_output_filename, match_files_to_groups, wrap_user_selected_files, FileNamingPattern, BUILTIN_PATTERNS};

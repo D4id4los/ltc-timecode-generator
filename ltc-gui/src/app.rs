@@ -84,6 +84,7 @@ pub struct AppState {
     // ── Converter state (GUI-local) ──────────────────────────────────
     pub selected_pattern: usize,
     pub selected_folder: Option<PathBuf>,
+    pub selected_files: Option<Vec<PathBuf>>,
     pub file_groups: Option<BTreeMap<String, Vec<PathBuf>>>,
     pub selected_group: Option<String>,
     pub channel_map: ChannelMap,
@@ -123,6 +124,7 @@ impl AppState {
             ltc_file_idx: 0,
             selected_pattern: 0,
             selected_folder: None,
+            selected_files: None,
             file_groups: None,
             selected_group: None,
             channel_map: ChannelMap::identity(0),

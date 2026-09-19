@@ -19,6 +19,11 @@ import {
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
+const PATTERNS: { name: string; description: string }[] = [
+  { name: "TASCAM", description: "Tascam Portacapture X8 — name prefix + S<channel>" },
+  { name: "* (any)", description: "Any audio file — select files directly" },
+];
+
 interface FfmpegCaps {
   has_ffmpeg: boolean;
   available_encoders: string[];
@@ -130,6 +135,7 @@ function DesktopOnlyMessage() {
 
 function TauriConverter() {
   const [ffmpegCaps, setFfmpegCaps] = useState<FfmpegCaps | null>(null);
+  const [selectedPattern, setSelectedPattern] = useState<number>(0);
   const [selectedFolder, setSelectedFolder] = useState<string>("");
   const [fileGroups, setFileGroups] = useState<FileGroupInfo[]>([]);
   const [selectedGroupIdx, setSelectedGroupIdx] = useState<number>(-1);
@@ -296,6 +302,36 @@ function TauriConverter() {
     }
   }, []);
 
+  const handleSelectFiles = useCallback(async () => {
+    try {
+      const selected = await open({
+        multiple: true,
+        title: "Select audio files",
+        filters: [{ name: "Audio", extensions: ["*"] }],
+      });
+      if (!selected) return;
+      const filePaths = selected as string[];
+      if (filePaths.length === 0) return;
+
+      const firstStem = filePaths[0].split("/").pop()?.split(".").shift() || "selected";
+      const parent = filePaths[0].substring(0, filePaths[0].lastIndexOf("/")) || ".";
+      setSelectedFolder(parent);
+
+      const basenames = filePaths.map((fp) => fp.split("/").pop() || "?");
+      setFileGroups([{
+        prefix: firstStem,
+        files: basenames,
+        channel_count: filePaths.length,
+      }]);
+      setSelectedGroupIdx(0);
+      setOutputPath(`${parent}/${firstStem}-multi-audio-vid.${container}`);
+      setNumChannels(filePaths.length);
+      setChannelMap(Array.from({ length: filePaths.length }, (_, i) => i));
+    } catch (e) {
+      console.error("File selection failed:", e);
+    }
+  }, [container]);
+
   // Select a file group
   const handleSelectGroup = useCallback(
     (idx: number) => {
@@ -434,26 +470,52 @@ function TauriConverter() {
       <div className="space-y-4">
         <div className="flex items-center gap-2">
           <span className="text-xs text-text-muted font-semibold">Naming pattern:</span>
-          <span className="text-sm text-text-title font-mono">TASCAM</span>
+          <select
+            value={selectedPattern}
+            onChange={(e) => {
+              setSelectedPattern(Number(e.target.value));
+              setFileGroups([]);
+              setSelectedGroupIdx(-1);
+              setSelectedFolder("");
+              setOutputPath("");
+              setNumChannels(0);
+              setChannelMap([]);
+            }}
+            className="px-2 py-1 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
+          >
+            {PATTERNS.map((p, i) => (
+              <option key={i} value={i}>{p.name}</option>
+            ))}
+          </select>
           <span className="text-xs text-text-secondary">
-            — Tascam Portacapture X8: prefix + S&lt;channel&gt;
+            — {PATTERNS[selectedPattern].description}
           </span>
         </div>
 
-        <button
-          onClick={handleSelectFolder}
-          className="flex items-center gap-2 px-4 py-2 bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-sm text-text-title"
-        >
-          <FolderOpen className="w-4 h-4" />
-          {selectedFolder ? "Change Folder…" : "Select Folder…"}
-        </button>
+        {selectedPattern === 0 ? (
+          <button
+            onClick={handleSelectFolder}
+            className="flex items-center gap-2 px-4 py-2 bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-sm text-text-title"
+          >
+            <FolderOpen className="w-4 h-4" />
+            {selectedFolder ? "Change Folder…" : "Select Folder…"}
+          </button>
+        ) : (
+          <button
+            onClick={handleSelectFiles}
+            className="flex items-center gap-2 px-4 py-2 bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-sm text-text-title"
+          >
+            <FolderOpen className="w-4 h-4" />
+            {fileGroups.length > 0 ? "Change Files…" : "Select Files…"}
+          </button>
+        )}
         {selectedFolder && (
           <p className="text-xs text-text-muted font-mono truncate">{selectedFolder}</p>
         )}
 
         {fileGroups.length > 0 && (
           <div>
-            <label className="text-xs text-text-muted font-semibold block mb-1">Recording:</label>
+            <label className="text-xs text-text-muted font-semibold block mb-1">{selectedPattern === 0 ? "Recording:" : "Selected files:"}</label>
             <div className="space-y-1">
               {fileGroups.map((g, i) => (
                 <button
@@ -467,7 +529,7 @@ function TauriConverter() {
                 >
                   <span className="font-mono font-semibold">{g.prefix}</span>
                   <span className="text-xs ml-2">
-                    ({g.channel_count} ch: {g.files.join(", ")})
+                    ({g.channel_count} file{g.channel_count !== 1 ? "s" : ""}: {g.files.join(", ")})
                   </span>
                 </button>
               ))}
@@ -475,7 +537,7 @@ function TauriConverter() {
           </div>
         )}
 
-        {fileGroups.length === 0 && selectedFolder && (
+        {fileGroups.length === 0 && selectedFolder && selectedPattern === 0 && (
           <p className="text-xs text-[#EF4444]">
             No files matching the TASCAM pattern were found in this folder.
           </p>
@@ -707,7 +769,7 @@ function TauriConverter() {
         {!canConvert && convStatus !== "running" && (
           <p className="text-xs text-text-secondary mt-2 text-center">
             {!ffmpegCaps?.has_ffmpeg && "ffmpeg is not available. "}
-            {selectedGroupIdx < 0 && "Select a recording. "}
+            {selectedGroupIdx < 0 && "Select files. "}
             {!outputPath && "Set an output file path. "}
             {!!sanityMsg && "Fix the compatibility issue above. "}
           </p>

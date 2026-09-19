@@ -97,6 +97,7 @@ export component AppWindow inherits Window {
     in-out property <float> conv-progress: 0.0;
     in-out property <string> conv-log: "";
     in-out property <string> conv-sanity-msg: "";
+    in-out property <int> conv-selected-pattern: 0;
     in-out property <[string]> conv-container-options: [];
     in-out property <[string]> conv-video-encoder-options: [];
     in-out property <[string]> conv-audio-encoder-options: [];
@@ -170,6 +171,7 @@ export component AppWindow inherits Window {
     callback conv-video-selected(int);
     callback conv-audio-selected(int);
     callback conv-select-output-path;
+    callback conv-select-pattern(int);
     callback toggle-trim-ltc;
 
     // ── Tab navigation ──
@@ -647,6 +649,7 @@ export component AppWindow inherits Window {
                     container-options: root.conv-container-options;
                     video-encoder-options: root.conv-video-encoder-options;
                     audio-encoder-options: root.conv-audio-encoder-options;
+                    selected-pattern: root.conv-selected-pattern;
                     trim-to-first-ltc: root.trim-to-first-ltc;
                     trim-offset-secs: root.trim-offset-secs;
                     toggle-trim-ltc => { root.toggle-trim-ltc(); }
@@ -661,6 +664,7 @@ export component AppWindow inherits Window {
                     video-selected(idx) => { root.conv-video-selected(idx); }
                     audio-selected(idx) => { root.conv-audio-selected(idx); }
                     select-output-path => { root.conv-select-output-path(); }
+                    select-pattern(idx) => { root.conv-select-pattern(idx); }
                 }
                     }
                 }

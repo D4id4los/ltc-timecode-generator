@@ -11,12 +11,20 @@ pub struct FileNamingPattern {
     pub channel_group_index: usize,
 }
 
-pub static BUILTIN_PATTERNS: &[FileNamingPattern] = &[FileNamingPattern {
-    name: "TASCAM",
-    description: "Tascam Portacapture X8 — name prefix + S<channel>",
-    regex: r"^(.+?)S(\d+)$",
-    channel_group_index: 2,
-}];
+pub static BUILTIN_PATTERNS: &[FileNamingPattern] = &[
+    FileNamingPattern {
+        name: "TASCAM",
+        description: "Tascam Portacapture X8 — name prefix + S<channel>",
+        regex: r"^(.+?)S(\d+)$",
+        channel_group_index: 2,
+    },
+    FileNamingPattern {
+        name: "* (any)",
+        description: "Any audio file — select files directly",
+        regex: r"^.*$",
+        channel_group_index: 2,
+    },
+];
 
 pub fn match_files_to_groups(
     folder: &Path,
@@ -87,6 +95,25 @@ pub fn match_files_to_groups(
         });
     }
 
+    groups
+}
+
+pub fn wrap_user_selected_files(files: Vec<PathBuf>) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    if files.is_empty() {
+        return groups;
+    }
+
+    let mut sorted = files;
+    sorted.sort();
+
+    let prefix = sorted[0]
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("selected")
+        .to_string();
+
+    groups.insert(prefix, sorted);
     groups
 }
 

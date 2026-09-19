@@ -22,7 +22,10 @@ export component ConverterSection {
     in-out property <[string]> container-options: [];
     in-out property <[string]> video-encoder-options: [];
     in-out property <[string]> audio-encoder-options: [];
+    in-out property <[string]> pattern-options: ["TASCAM", "* (any)"];
+    in-out property <int> selected-pattern: 0;
     in-out property <int> open-popup: -1;
+    callback select-pattern(int);
 
     // ── Trim to first LTC ──
     in-out property <bool> trim-to-first-ltc: false;
@@ -74,7 +77,33 @@ export component ConverterSection {
 
                 HorizontalLayout { spacing: 6px;
                     Text { text: "Naming pattern:"; color: AppColors.text-muted; font-size: 10px; font-weight: 600; }
-                    Text { text: "TASCAM"; color: AppColors.text-title; font-size: 11px; font-family: "monospace"; font-weight: 700; }
+                    Rectangle {
+                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                        background: AppColors.deep-bg; min-height: 24px; max-width: 140px;
+                        TouchArea { clicked => { root.open-popup = root.open-popup == 3 ? -1 : 3; } }
+                        HorizontalLayout { padding: 4px; spacing: 4px;
+                            Text {
+                                text: root.pattern-options[root.selected-pattern];
+                                color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700;
+                                horizontal-stretch: 1; vertical-alignment: center;
+                            }
+                            Text { text: "▼"; color: AppColors.text-muted; font-size: 8px; vertical-alignment: center; }
+                        }
+                    }
+                    if (root.open-popup == 3) : VerticalLayout { spacing: 1px; padding-top: 2px;
+                        for opt[idx] in root.pattern-options : Rectangle {
+                            border-radius: 4px; border-width: 1px; border-color: AppColors.border-main;
+                            background: AppColors.deep-bg; min-height: 24px;
+                            TouchArea {
+                                clicked => {
+                                    root.open-popup = -1;
+                                    root.select-pattern(idx);
+                                }
+                            }
+                            Text { text: opt; color: AppColors.text-title; font-size: 9px; font-family: "monospace"; font-weight: 600;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
                 }
 
                 Rectangle {
@@ -86,7 +115,9 @@ export component ConverterSection {
                     HorizontalLayout { padding: 8px; spacing: 6px;
                         Text { text: "📂"; font-size: 12px; }
                         Text {
-                            text: root.selected-folder == "" ? "Select Folder…" : root.selected-folder;
+                            text: root.selected-pattern == 0
+                                ? (root.selected-folder == "" ? "Select Folder…" : root.selected-folder)
+                                : (root.file-groups.length > 0 ? root.selected-folder : "Select Files…");
                             color: root.selected-folder == "" ? AppColors.text-muted : AppColors.text-title;
                             font-size: 10px; font-family: "monospace";
                             horizontal-stretch: 1; vertical-alignment: center;
@@ -95,7 +126,10 @@ export component ConverterSection {
                 }
 
                 if (root.file-groups.length > 0) : VerticalLayout { spacing: 4px;
-                    Text { text: "Recording:"; color: AppColors.text-muted; font-size: 10px; font-weight: 600; }
+                    Text {
+                        text: root.selected-pattern == 0 ? "Recording:" : "Selected files:";
+                        color: AppColors.text-muted; font-size: 10px; font-weight: 600;
+                    }
                     for group[idx] in root.file-groups : Rectangle {
                         border-radius: 6px;
                         background: AppColors.accent;
@@ -107,7 +141,9 @@ export component ConverterSection {
                         HorizontalLayout { padding: 6px; spacing: 6px;
                             Text { text: group.prefix; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
                             Text {
-                                text: "(" + group.channel-count + " ch)";
+                                text: root.selected-pattern == 0
+                                    ? "(" + group.channel-count + " ch)"
+                                    : "(" + group.channel-count + " file" + (group.channel-count == 1 ? "" : "s") + ")";
                                 color: AppColors.text-muted; font-size: 9px;
                                 horizontal-stretch: 1; vertical-alignment: center;
                             }
