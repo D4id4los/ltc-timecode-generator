@@ -124,19 +124,23 @@ fn run_ffmpeg_list(args: &[&str]) -> BTreeSet<String> {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
             text.lines()
-                .filter_map(|line| {
+                .flat_map(|line| {
                     let trimmed = line.trim();
                     if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with("--") {
-                        return None;
+                        return Vec::new().into_iter();
                     }
                     if trimmed.starts_with("Encoders:") || trimmed.starts_with("File formats:") {
-                        return None;
+                        return Vec::new().into_iter();
                     }
                     let parts: Vec<&str> = trimmed.split_whitespace().collect();
                     if parts.len() >= 2 {
-                        Some(parts[1].to_string())
+                        parts[1]
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .collect::<Vec<_>>()
+                            .into_iter()
                     } else {
-                        None
+                        Vec::new().into_iter()
                     }
                 })
                 .collect()
@@ -197,8 +201,16 @@ fn encoder_available_in_ffmpeg(encoder: &str, caps: &FfmpegCapabilities) -> bool
     caps.available_encoders.contains(encoder)
 }
 
+fn container_to_ffmpeg_format(container: &str) -> &str {
+    match container {
+        "mkv" => "matroska",
+        _ => container,
+    }
+}
+
 fn format_available_in_ffmpeg(format: &str, caps: &FfmpegCapabilities) -> bool {
-    caps.available_formats.contains(format)
+    let ffmpeg_name = container_to_ffmpeg_format(format);
+    caps.available_formats.contains(ffmpeg_name)
 }
 
 /// Returns `Ok(())` or an user-facing error explaining *why* the combination
@@ -421,6 +433,11 @@ fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
 
     // Shortest: end when shortest input ends
     args.push("-shortest".to_string());
+
+    // Explicit container format
+    let container = container_to_ffmpeg_format(&settings.container).to_string();
+    args.push("-f".to_string());
+    args.push(container);
 
     // Output file
     args.push(settings.output_path.to_string_lossy().to_string());
