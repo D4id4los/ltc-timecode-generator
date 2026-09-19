@@ -78,6 +78,9 @@ pub struct AppState {
     pub app_menu_pos: Option<egui::Pos2>,
     pub log_buffer: Arc<Mutex<gui_engine::log_buffer::LogBuffer>>,
 
+    // ── LTC detection state (GUI-local) ──────────────────────────────
+    pub ltc_file_idx: usize,
+
     // ── Converter state (GUI-local) ──────────────────────────────────
     pub selected_pattern: usize,
     pub selected_folder: Option<PathBuf>,
@@ -115,6 +118,7 @@ impl AppState {
             show_app_menu: false,
             app_menu_pos: None,
             log_buffer,
+            ltc_file_idx: 0,
             selected_pattern: 0,
             selected_folder: None,
             file_groups: None,

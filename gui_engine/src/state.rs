@@ -1,4 +1,4 @@
-use audio_core::{AudioDeviceInfo, AudioEvent, Timecode};
+use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
 
 // ── Clap log entry ──────────────────────────────────────────────────────
 
@@ -64,6 +64,12 @@ pub struct AppStateSnapshot {
 
     // Events drained from AudioCore (to be surfaced as toasts by the GUI)
     pub events: Vec<AudioEvent>,
+
+    // LTC file decode result (set by engine via ParseLtcFile command)
+    pub ltc_decode_result: Option<LtcDetectionResult>,
+    pub ltc_decode_error: Option<String>,
+    pub ltc_is_detecting: bool,
+    pub ltc_decode_generation: u64,
 }
 
 impl AppStateSnapshot {
@@ -116,6 +122,10 @@ impl AppStateSnapshot {
             status_message: "Ready".to_string(),
             system_time: String::new(),
             events: Vec::new(),
+            ltc_decode_result: None,
+            ltc_decode_error: None,
+            ltc_is_detecting: false,
+            ltc_decode_generation: 0,
         }
     }
 }

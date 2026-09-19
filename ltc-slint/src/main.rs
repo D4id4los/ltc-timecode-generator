@@ -667,6 +667,43 @@ fn _run_gui(
         });
     }
 
+    // ── LTC detection callback ─────────────────────────────────────────────
+    {
+        let ui_weak = ui.as_weak();
+        let cmd = cmd_tx.clone();
+        let groups = conv_file_groups.clone();
+        let folder = conv_selected_folder.clone();
+        let sel_idx = conv_selected_group_idx.clone();
+        ui.on_ltc_detect(move || {
+            let g = groups.lock().unwrap();
+            let f = folder.lock().unwrap();
+            let idx = *sel_idx.lock().unwrap();
+            if idx < 0 { return; }
+            let keys: Vec<String> = g.keys().cloned().collect();
+            if (idx as usize) >= keys.len() { return; }
+            let prefix = &keys[idx as usize];
+            let files = g.get(prefix).cloned().unwrap_or_default();
+            let ltc_idx = 0; // Use first file as default
+            if ltc_idx >= files.len() { return; }
+            // files contains filenames only; the callback in Slint was set up
+            // with conv_file_groups = BTreeMap<String, Vec<PathBuf>> where values
+            // are just filenames, so we join with folder to get full path
+            let file_name = files[ltc_idx].file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let full_path = PathBuf::from(f.as_str()).join(&file_name);
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_ltc_status(SharedString::from("detecting"));
+                u.set_ltc_result_text(SharedString::from(""));
+                u.set_ltc_error(SharedString::from(""));
+            }
+            let _ = cmd.send(GuiCommand::ParseLtcFile(
+                full_path.to_string_lossy().to_string(),
+            ));
+        });
+    }
+
     // ── Poll timer — state sync ────────────────────────────────────────────
     setup_poll_timer(
         &ui,

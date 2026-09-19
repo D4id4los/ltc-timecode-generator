@@ -607,10 +607,12 @@ name = "audio-core"
 version = "0.3.2"
 dependencies = [
  "cpal",
+ "hound",
  "keepawake",
  "log",
  "ringbuf",
  "serde",
+ "tempfile",
  "thread-priority",
 ]
 
@@ -2381,6 +2383,7 @@ dependencies = [
  "log",
  "regex",
  "serde",
+ "tempfile",
 ]
 
 [[package]]

@@ -10,7 +10,10 @@ pub mod timecode;
 
 // Re-export commonly-used types so GUI crates don't need direct deps
 pub use arc_swap::ArcSwap;
-pub use audio_core::{AudioDeviceInfo, AudioEvent, Timecode, SAMPLE_RATE_OPTIONS};
+pub use audio_core::{
+    decode_ltc_from_wav, quick_check_ltc, AudioDeviceInfo, AudioEvent, FrameTimecode,
+    LtcDecodeStatus, LtcDetectionResult, Timecode, SAMPLE_RATE_OPTIONS,
+};
 
 // Re-export converter/file_pattern types for convenience
 pub use converter::{

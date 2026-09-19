@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub mod ltc_decoder;
+
 // ── Ring buffer capacities ─────────────────────────────────────────────────
 
 const LTC_RING_CAPACITY: usize = 262_144;   // 128K stereo samples (~2.7s at 48kHz, ~8s at 16kHz)
@@ -778,6 +780,11 @@ pub fn suggest_sample_rate() -> u32 {
 /// Available sample rate options for UI display.
 pub const SAMPLE_RATE_OPTIONS: &[u32] = &[16000, 48000];
 
+// Re-export LTC decoder types for convenience
+pub use ltc_decoder::{
+    decode_ltc_from_wav, quick_check_ltc, FrameTimecode, LtcDecodeStatus, LtcDetectionResult,
+};
+
 // ── Device enumeration ─────────────────────────────────────────────────────
 
 const PLUGIN_KEYWORDS: &[&str] = &[
@@ -1029,8 +1036,7 @@ pub fn get_ltc_bits(tc: &Timecode, drop_frame: bool) -> [u8; 80] {
 
     write_val(&mut bits, tc.seconds % 10, 16, 4);
     write_val(&mut bits, 0, 20, 4);
-    write_val(&mut bits, tc.seconds / 10, 24, 2);
-    bits[26] = 0;
+    write_val(&mut bits, tc.seconds / 10, 24, 3);
     write_val(&mut bits, 0, 27, 5);
 
     write_val(&mut bits, tc.minutes % 10, 32, 4);

@@ -1,9 +1,12 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use audio_core::{list_audio_devices, AudioCore, AudioDeviceInfo, AudioEvent, Timecode};
+use audio_core::{
+    list_audio_devices, ltc_decoder::LtcDetectionResult, AudioCore, AudioDeviceInfo, AudioEvent,
+    Timecode,
+};
 use gui_engine::converter::{
     self, query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionState,
     ConversionStatus, ConverterSettings, FfmpegCapabilities,
@@ -119,6 +122,13 @@ fn drain_audio_events(state: tauri::State<'_, AudioState>) -> Vec<AudioEvent> {
 #[tauri::command]
 fn get_wake_lock_status(state: tauri::State<'_, AudioState>) -> bool {
     state.audio.lock().map(|c| c.wake_lock_active()).unwrap_or(false)
+}
+
+// ── LTC detection command ──────────────────────────────────────────────────
+
+#[tauri::command]
+fn detect_ltc_in_file(path: String) -> Result<LtcDetectionResult, String> {
+    audio_core::decode_ltc_from_wav(Path::new(&path))
 }
 
 // ── Converter commands ─────────────────────────────────────────────────────
@@ -313,6 +323,7 @@ pub fn run() {
             get_wake_lock_status,
             scan_folder_for_groups,
             check_ffmpeg,
+            detect_ltc_in_file,
             start_convert,
             get_conversion_progress,
             cancel_conversion,

@@ -1,9 +1,10 @@
-use std::sync::mpsc::Receiver;
+use std::path::Path;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use audio_core::{AudioCore, AudioEvent};
+use audio_core::{AudioCore, AudioEvent, LtcDetectionResult};
 use log::{error, info, warn};
 
 use crate::command::GuiCommand;
@@ -26,22 +27,83 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
     let mut last_device_id: Option<String> = None;
     let mut previous_device: Option<usize> = None;
 
+    // Internal result channel for async decode operations
+    let (decode_result_tx, decode_result_rx) =
+        std::sync::mpsc::channel::<LtcDecodeResult>();
+
     loop {
         let now = Instant::now();
         let dt = (now - last_tick).as_secs_f32();
         last_tick = now;
 
         // 1. Drain all pending commands
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            process_command(
-                cmd,
-                &core,
-                &mut current,
-                &mut recovery_attempts,
-                &mut log_id_counter,
-                &mut last_device_id,
-                &mut previous_device,
-            );
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(GuiCommand::Shutdown) => {
+                    let _ = core.stop_ltc();
+                    let _ = core.stop_output();
+                    info!("Engine shutdown via Shutdown command");
+                    return;
+                }
+                Ok(cmd) => {
+                    process_command(
+                        cmd,
+                        &core,
+                        &mut current,
+                        &mut recovery_attempts,
+                        &mut log_id_counter,
+                        &mut last_device_id,
+                        &mut previous_device,
+                        &decode_result_tx,
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    info!("Engine shutdown via channel disconnect");
+                    let _ = core.stop_ltc();
+                    let _ = core.stop_output();
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // 1.5 Drain async decode results
+        loop {
+            match decode_result_rx.try_recv() {
+                Ok(LtcDecodeResult { path, generation, result }) => {
+                    // Only accept result if generation matches (discard stale results
+                    // from rapid re-clicks)
+                    if generation == current.ltc_decode_generation {
+                        current.ltc_is_detecting = false;
+                        match result {
+                            Ok(r) => {
+                                current.ltc_decode_result = Some(r.clone());
+                                current.ltc_decode_error = None;
+                                let summary = format!(
+                                    "LTC decode: {} frames (confidence {:.1}%, {} fps{})",
+                                    r.valid_frames,
+                                    r.avg_confidence * 100.0,
+                                    r.detected_fps,
+                                    if r.drop_frame { " DF" } else { "" },
+                                );
+                                current.status_message = summary;
+                                info!("LTC decode completed: {}", path);
+                            }
+                            Err(e) => {
+                                current.ltc_decode_result = None;
+                                current.ltc_decode_error = Some(e.clone());
+                                current.status_message = format!("Parse failed: {}", e);
+                                error!("LTC decode failed: {} — {}", path, e);
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("LTC decode result channel disconnected");
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
         }
 
         // 2. Poll current timecode if playing
@@ -78,6 +140,13 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
     }
 }
 
+/// Internal message sent from a spawned decode thread back to the engine loop.
+struct LtcDecodeResult {
+    path: String,
+    generation: u64,
+    result: Result<LtcDetectionResult, String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_command(
     cmd: GuiCommand,
@@ -87,6 +156,7 @@ fn process_command(
     log_id_counter: &mut u64,
     last_device_id: &mut Option<String>,
     previous_device: &mut Option<usize>,
+    decode_result_tx: &Sender<LtcDecodeResult>,
 ) {
     match cmd {
         GuiCommand::StartLtc => {
@@ -266,6 +336,25 @@ fn process_command(
         GuiCommand::ClearLogs => {
             state.logs.clear();
         }
+
+        GuiCommand::ParseLtcFile(path) => {
+            state.ltc_is_detecting = true;
+            state.ltc_decode_result = None;
+            state.ltc_decode_error = None;
+            state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
+            state.status_message = format!("Decoding LTC from: {}", path);
+            let capture_gen = state.ltc_decode_generation;
+            let tx = decode_result_tx.clone();
+            std::thread::spawn(move || {
+                let result = audio_core::decode_ltc_from_wav(Path::new(&path));
+                let _ = tx.send(LtcDecodeResult {
+                    path,
+                    generation: capture_gen,
+                    result,
+                });
+            });
+        }
+
         GuiCommand::SceneUp => {
             state.scene = state.scene.saturating_add(1);
         }
@@ -286,6 +375,10 @@ fn process_command(
         GuiCommand::SecondDown => { stepper_second(state, -1); }
         GuiCommand::FrameUp => { stepper_frame(state, 1); }
         GuiCommand::FrameDown => { stepper_frame(state, -1); }
+
+        GuiCommand::Shutdown => {
+            // Handled in the command drain loop before reaching process_command
+        }
     }
 }
 

@@ -56,6 +56,33 @@ interface ConversionProgressInfo {
   log: string;
 }
 
+// ── LTC detection types ──────────────────────────────────────────────────────
+
+interface LtcFrameTimecode {
+  frame_index: number;
+  timecode: { hours: number; minutes: number; seconds: number; frames: number };
+}
+
+type LtcDecodeStatus =
+  | { type: "Success" }
+  | { type: "NoSyncWord" }
+  | { type: "LowConfidence" }
+  | { type: "Error"; message: string };
+
+interface LtcDetectionResult {
+  status: LtcDecodeStatus;
+  detected_fps: number;
+  drop_frame: boolean;
+  total_possible_frames: number;
+  valid_frames: number;
+  timecodes: LtcFrameTimecode[];
+  avg_confidence: number;
+  details: string[];
+  total_audio_duration_secs: number;
+  sample_rate: number;
+  processing_time_ms: number;
+}
+
 const VIDEO_ENCODERS: [string, string][] = [
   ["libsvtav1", "AV1 (SVT-AV1) — good compression"],
   ["libx264", "H.264 (x264) — maximum compatibility"],
@@ -121,6 +148,12 @@ function TauriConverter() {
   const [convProgress, setConvProgress] = useState<number>(0);
   const [convLog, setConvLog] = useState<string>("");
   const pollingRef = useRef<number | null>(null);
+
+  // LTC detection
+  const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
+  const [ltcResult, setLtcResult] = useState<LtcDetectionResult | null>(null);
+  const [ltcDetecting, setLtcDetecting] = useState(false);
+  const [ltcError, setLtcError] = useState<string | null>(null);
 
   // Sanity check
   const [sanityMsg, setSanityMsg] = useState<string>("");
@@ -270,6 +303,29 @@ function TauriConverter() {
     []
   );
 
+  // LTC detection
+  const handleDetectLtc = useCallback(async () => {
+    if (selectedGroupIdx < 0) return;
+    const group = fileGroups[selectedGroupIdx];
+    if (!group || ltcFileIdx >= group.files.length) return;
+    const folder = selectedFolder.endsWith("/") ? selectedFolder : selectedFolder + "/";
+    const filePath = `${folder}${group.files[ltcFileIdx]}`;
+
+    setLtcDetecting(true);
+    setLtcResult(null);
+    setLtcError(null);
+    try {
+      const result = await invoke<LtcDetectionResult>("detect_ltc_in_file", {
+        path: filePath,
+      });
+      setLtcResult(result);
+    } catch (e) {
+      setLtcError(String(e));
+    } finally {
+      setLtcDetecting(false);
+    }
+  }, [selectedGroupIdx, fileGroups, ltcFileIdx, selectedFolder]);
+
   // Start conversion
   const handleStartConvert = useCallback(async () => {
     if (selectedGroupIdx < 0) return;
@@ -401,6 +457,73 @@ function TauriConverter() {
           </p>
         )}
       </div>
+
+      {/* LTC Verification */}
+      {selectedGroupIdx >= 0 && (
+        <>
+          <StepHeader number="L" label="VERIFY LTC TRACK" />
+          <p className="text-xs text-text-secondary mb-2">
+            Select the mono file that carries the LTC timecode signal, then click
+            "Detect LTC" to verify it can be read successfully.
+          </p>
+
+          <div className="flex items-center gap-2 mb-3">
+            <select
+              value={ltcFileIdx}
+              onChange={(e) => {
+                setLtcFileIdx(Number(e.target.value));
+                setLtcResult(null);
+                setLtcError(null);
+              }}
+              className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
+            >
+              {fileGroups[selectedGroupIdx].files.map((f, i) => (
+                <option key={i} value={i}>
+                  {f}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={handleDetectLtc}
+              disabled={ltcDetecting}
+              className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors flex items-center gap-2 ${
+                ltcDetecting
+                  ? "bg-border-main/30 text-text-muted cursor-not-allowed"
+                  : "bg-[#FF5F1F] text-black hover:bg-[#E0551C]"
+              }`}
+            >
+              {ltcDetecting ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  Detecting…
+                </>
+              ) : (
+                <>
+                  <Upload className="w-4 h-4" />
+                  Detect LTC
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* LTC result display */}
+          {ltcDetecting && (
+            <div className="flex items-center gap-2 p-3 bg-deep-bg border border-border-main rounded-lg text-xs text-text-muted animate-pulse">
+              <RefreshCw className="w-4 h-4 animate-spin" />
+              Scanning audio file for LTC timecode…
+            </div>
+          )}
+
+          {ltcError && (
+            <div className="flex items-start gap-2 p-3 bg-[#EF4444]/10 border border-[#EF4444]/20 rounded-lg text-xs text-[#EF4444]">
+              <XCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span>{ltcError}</span>
+            </div>
+          )}
+
+          {ltcResult && !ltcDetecting && <LtcResultDisplay result={ltcResult} />}
+        </>
+      )}
 
       {/* Step 2: Channel Mapping */}
       {numChannels > 0 && (
@@ -668,6 +791,125 @@ function SelectField({
           </option>
         ))}
       </select>
+    </div>
+  );
+}
+
+function formatTc(tc: { hours: number; minutes: number; seconds: number; frames: number }, sep = ":"): string {
+  return `${String(tc.hours).padStart(2, "0")}${sep}${String(tc.minutes).padStart(2, "0")}${sep}${String(tc.seconds).padStart(2, "0")}${sep}${String(tc.frames).padStart(2, "0")}`;
+}
+
+function LtcResultDisplay({ result }: { result: LtcDetectionResult }) {
+  const isSuccess = result.status.type === "Success";
+  const isLowConf = result.status.type === "LowConfidence";
+  const isError = result.status.type === "Error";
+  const isFailed = result.status.type === "NoSyncWord" || isError;
+
+  const statusColor = isSuccess
+    ? "text-[#22C55E]"
+    : isLowConf
+      ? "text-[#F59E0B]"
+      : "text-[#EF4444]";
+
+  const statusBg = isSuccess
+    ? "bg-[#22C55E]/10 border-[#22C55E]/20"
+    : isLowConf
+      ? "bg-[#F59E0B]/10 border-[#F59E0B]/20"
+      : "bg-[#EF4444]/10 border-[#EF4444]/20";
+
+  const statusIcon = isSuccess ? "✅" : isLowConf ? "⚠️" : "❌";
+
+  const dropFlag = result.drop_frame ? " (Drop Frame)" : "";
+  const fpsStr = result.detected_fps > 0 ? `${result.detected_fps.toFixed(2)} fps${dropFlag}` : "—";
+
+  const firstTc = result.timecodes[0];
+  const lastTc = result.timecodes[result.timecodes.length - 1];
+  const tcSummary =
+    result.timecodes.length > 0
+      ? `${formatTc(firstTc.timecode, result.drop_frame ? ";" : ":")} → ${formatTc(lastTc.timecode, result.drop_frame ? ";" : ":")}`
+      : "—";
+
+  return (
+    <div className={`space-y-2 p-3 rounded-lg border ${statusBg}`}>
+      {/* Status header */}
+      <div className={`flex items-center gap-2 text-xs font-semibold ${statusColor}`}>
+        <span>{statusIcon}</span>
+        {isSuccess && <span>LTC detected successfully</span>}
+        {isLowConf && <span>LTC detected with low confidence</span>}
+        {result.status.type === "NoSyncWord" && <span>No LTC timecode found</span>}
+        {isError && <span>Detection error: {(result.status as { type: "Error"; message: string }).message}</span>}
+      </div>
+
+      {!isError && (
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-text-muted">
+          <span>Detected rate:</span>
+          <span className="text-text-title font-mono font-semibold">{fpsStr}</span>
+
+          <span>Confidence:</span>
+          <span className="text-text-title font-mono font-semibold">
+            {(result.avg_confidence * 100).toFixed(1)}%
+          </span>
+
+          <span>Valid frames:</span>
+          <span className="text-text-title font-mono font-semibold">
+            {result.valid_frames} / {result.total_possible_frames}
+          </span>
+
+          <span>Timecode range:</span>
+          <span className="text-text-title font-mono font-semibold">{tcSummary}</span>
+
+          <span>Sample rate:</span>
+          <span className="text-text-title font-mono font-semibold">
+            {result.sample_rate} Hz
+          </span>
+
+          <span>Audio duration:</span>
+          <span className="text-text-title font-mono font-semibold">
+            {result.total_audio_duration_secs.toFixed(2)}s
+          </span>
+
+          <span>Processing time:</span>
+          <span className="text-text-title font-mono font-semibold">
+            {result.processing_time_ms.toFixed(1)} ms
+          </span>
+        </div>
+      )}
+
+      {/* Timecode list (collapsible) */}
+      {result.timecodes.length > 0 && (
+        <details className="mt-1">
+          <summary className="text-xs text-text-muted cursor-pointer hover:text-text-title font-semibold">
+            Show {result.timecodes.length} decoded timecodes
+          </summary>
+          <div className="mt-1 max-h-40 overflow-y-auto bg-deep-bg rounded border border-border-main p-2">
+            {result.timecodes.map((ftc, i) => (
+              <div
+                key={i}
+                className="text-xs font-mono text-text-muted hover:text-text-title"
+              >
+                [{String(ftc.frame_index).padStart(4, " ")}]{" "}
+                {formatTc(ftc.timecode, result.drop_frame ? ";" : ":")}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {/* Details list */}
+      {result.details.length > 0 && (
+        <details className="mt-1">
+          <summary className="text-xs text-text-muted cursor-pointer hover:text-text-title font-semibold">
+            Show debug details
+          </summary>
+          <div className="mt-1 space-y-0.5">
+            {result.details.map((d, i) => (
+              <p key={i} className="text-[10px] font-mono text-text-muted">
+                {d}
+              </p>
+            ))}
+          </div>
+        </details>
+      )}
     </div>
   );
 }

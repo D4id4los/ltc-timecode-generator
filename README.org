@@ -25,7 +25,8 @@ Setup:
 Compilation:
 
 #+begin_src bash
-  cargo zigbuild --release
+  cargo zigbuild --release --bin ltc-gui
+  cargo zigbuild --release --bin ltc-slint
 #+end_src
 
 ** Compiling the 32bit version
@@ -65,7 +66,8 @@ Now compile with:
   # dev
   cargo build --target x86_64-pc-windows-gnu
   # release
-  cargo build --target x86_64-pc-windows-gnu --release
+  cargo build --target x86_64-pc-windows-gnu --release --bin ltc-gui
+  cargo build --target x86_64-pc-windows-gnu --release --bin ltc-slint
 #+end_src
 
 * Running the Rust GUI

@@ -24,6 +24,14 @@ export component ConverterSection {
     in-out property <[string]> audio-encoder-options: [];
     in-out property <int> open-popup: -1;
 
+    // ── LTC detection properties ──
+    in-out property <int> ltc-file-idx: 0;
+    in-out property <[string]> ltc-file-names: [];
+    in-out property <string> ltc-status: "";
+    in-out property <string> ltc-result-text: "";
+    in-out property <string> ltc-error: "";
+    callback detect-ltc;
+
     callback select-folder;
     callback select-group(int);
     callback map-cell-clicked(int, int);
@@ -97,6 +105,99 @@ export component ConverterSection {
                                 text: "(" + group.channel-count + " ch)";
                                 color: AppColors.text-muted; font-size: 9px;
                                 horizontal-stretch: 1; vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                // ── LTC Verification ──
+                if (root.selected-group-idx >= 0) : VerticalLayout { spacing: 8px;
+                    HorizontalLayout { spacing: 6px;
+                        Rectangle {
+                            width: 22px; height: 22px; border-radius: 4px;
+                            background: AppColors.accent;
+                            Text { text: "L"; color: black; font-size: 11px; font-weight: 700;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Text { text: "VERIFY LTC TRACK"; color: AppColors.text-title; font-size: 12px; font-weight: 700; }
+                    }
+                    Text {
+                        text: "Select a file and click Detect to verify LTC timecode is readable.";
+                        color: AppColors.text-muted; font-size: 9px; wrap: word-wrap;
+                    }
+                    HorizontalLayout { spacing: 6px;
+                        // File selector
+                        Rectangle {
+                            border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                            background: AppColors.deep-bg; min-height: 28px;
+                            horizontal-stretch: 1;
+                            TouchArea {
+                                clicked => {
+                                    if (root.ltc-file-idx + 1 < root.ltc-file-names.length) {
+                                        root.ltc-file-idx += 1;
+                                    } else {
+                                        root.ltc-file-idx = 0;
+                                    }
+                                }
+                            }
+                            Text {
+                                text: root.ltc-file-names.length > 0 ? root.ltc-file-names[root.ltc-file-idx] : "(no files)";
+                                color: AppColors.text-title; font-size: 10px; font-family: "monospace";
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: root.ltc-status == "detecting" ? AppColors.nested-bg : AppColors.accent;
+                            min-height: 28px; max-width: 100px;
+                            TouchArea {
+                                enabled: root.ltc-status != "detecting" && root.ltc-file-names.length > 0;
+                                clicked => { root.detect-ltc(); }
+                            }
+                            Text {
+                                text: root.ltc-status == "detecting" ? "⏳" : "🔍 Detect";
+                                color: root.ltc-status == "detecting" ? AppColors.text-muted : black;
+                                font-size: 11px; font-weight: 700;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // Result display
+                    if (root.ltc-status == "success" || root.ltc-status == "low_confidence" || root.ltc-status == "no_sync") : Rectangle {
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: root.ltc-status == "success" ? AppColors.green : (root.ltc-status == "low_confidence" ? AppColors.amber : AppColors.red);
+                        min-height: 40px;
+                        Rectangle {
+                            border-radius: 6px;
+                            background: root.ltc-status == "success" ? AppColors.green : (root.ltc-status == "low_confidence" ? AppColors.amber : AppColors.red);
+                            opacity: 0.1;
+                            width: 100%; height: 100%;
+                        }
+                        VerticalLayout { padding: 8px; spacing: 4px;
+                            Text {
+                                text: root.ltc-status == "success" ? "✅ LTC detected" : (root.ltc-status == "low_confidence" ? "⚠️ LTC detected (low confidence)" : "❌ No LTC found");
+                                color: root.ltc-status == "success" ? AppColors.green : (root.ltc-status == "low_confidence" ? AppColors.amber : AppColors.red);
+                                font-size: 10px; font-weight: 700; wrap: word-wrap;
+                            }
+                            Text {
+                                text: root.ltc-result-text;
+                                color: AppColors.text-title; font-size: 9px; font-family: "monospace"; wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    if (root.ltc-error != "") : Rectangle {
+                        border-radius: 6px;
+                        border-width: 1px; border-color: AppColors.red;
+                        min-height: 20px;
+                        Rectangle {
+                            height: 20px;
+                            Text {
+                                text: "❌ " + root.ltc-error;
+                                color: AppColors.red; font-size: 9px; wrap: word-wrap;
+                                x: 6px; y: 4px;
                             }
                         }
                     }

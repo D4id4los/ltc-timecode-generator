@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use egui::{Color32, FontId, RichText, Ui};
+use gui_engine::command::GuiCommand;
 use gui_engine::converter::{
     conversion_sanity_check, query_ffmpeg_capabilities, spawn_conversion,
     supported_audio_encoders, supported_containers, supported_video_encoders, ChannelMap,
@@ -28,6 +29,11 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             ui.add_space(16.0);
 
             if state.selected_group.is_some() {
+                step_header(ui, "L", "VERIFY LTC TRACK", &colors);
+                ui.add_space(8.0);
+                render_ltc_verification(ui, state);
+                ui.add_space(16.0);
+
                 step_header(ui, "2", "CHANNEL MAPPING", &colors);
                 ui.add_space(8.0);
                 render_channel_matrix(ui, state);
@@ -178,6 +184,295 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
             }
         }
     }
+}
+
+// ── LTC Verification ─────────────────────────────────────────────────
+
+fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
+    let colors = state.theme.colors();
+
+    ui.label(
+        RichText::new("Select the mono file that carries the LTC timecode signal, then click \"Detect LTC\" to verify it can be read successfully.")
+            .font(FontId::proportional(9.0))
+            .color(colors.text_secondary),
+    );
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        let files: Vec<PathBuf> = state
+            .selected_group
+            .as_ref()
+            .and_then(|g| state.file_groups.as_ref()?.get(g))
+            .cloned()
+            .unwrap_or_default();
+
+        let file_names: Vec<String> = files
+            .iter()
+            .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string())
+            .collect();
+
+        if file_names.is_empty() {
+            return;
+        }
+
+        // Ensure ltc_file_idx is in range
+        if state.ltc_file_idx >= file_names.len() {
+            state.ltc_file_idx = file_names.len().saturating_sub(1);
+        }
+
+        let selected_name = &file_names[state.ltc_file_idx];
+        egui::ComboBox::from_id_salt("ltc_file_combo")
+            .selected_text(selected_name)
+            .width(ui.available_width() - 140.0)
+            .show_ui(ui, |ui| {
+                for (i, name) in file_names.iter().enumerate() {
+                    if ui.selectable_label(false, name).clicked() {
+                        state.ltc_file_idx = i;
+                    }
+                }
+            });
+
+        ui.add_space(8.0);
+
+        let is_detecting = state.latest.ltc_is_detecting;
+        let button_label = if is_detecting {
+            "⏳ Detecting…"
+        } else {
+            "🔍 Detect LTC"
+        };
+
+        let button_enabled = !is_detecting && !files.is_empty();
+        if ui
+            .add_enabled(
+                button_enabled,
+                egui::Button::new(RichText::new(button_label).font(FontId::proportional(11.0)).strong())
+                    .fill(if button_enabled { ACCENT } else { colors.deep_bg })
+                    .min_size(egui::vec2(100.0, 24.0)),
+            )
+            .clicked()
+        {
+            let file_path = files[state.ltc_file_idx].to_string_lossy().to_string();
+            state.send(GuiCommand::ParseLtcFile(file_path));
+        }
+    });
+
+    ui.add_space(4.0);
+
+    let decode_result = state.latest.ltc_decode_result.clone();
+    let decode_error = state.latest.ltc_decode_error.clone();
+
+    if let Some(ref error) = decode_error {
+        let error_frame = egui::Frame::new()
+            .fill(Color32::from_rgb(0x44, 0x11, 0x11))
+            .corner_radius(6.0)
+            .stroke(egui::Stroke::new(1.0, colors.error_red))
+            .inner_margin(egui::Margin::symmetric(10, 6));
+        error_frame.show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("❌ {}", error))
+                    .font(FontId::proportional(10.0))
+                    .color(colors.error_red),
+            );
+        });
+    }
+
+    if let Some(result) = decode_result {
+        render_ltc_result(ui, state, &result);
+    }
+}
+
+fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::LtcDetectionResult) {
+    let colors = state.theme.colors();
+
+    let (status_icon, status_color, status_text) = match &result.status {
+        gui_engine::LtcDecodeStatus::Success => ("✅", colors.success_green, "LTC detected successfully"),
+        gui_engine::LtcDecodeStatus::LowConfidence => ("⚠️", colors.warning_amber, "LTC detected with low confidence"),
+        gui_engine::LtcDecodeStatus::NoSyncWord => ("❌", colors.error_red, "No LTC timecode found"),
+        gui_engine::LtcDecodeStatus::Error { message } => {
+            let error_frame = egui::Frame::new()
+                .fill(Color32::from_rgb(0x44, 0x11, 0x11))
+                .corner_radius(6.0)
+                .stroke(egui::Stroke::new(1.0, colors.error_red))
+                .inner_margin(egui::Margin::symmetric(10, 6));
+            error_frame.show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("❌ Detection error: {}", message))
+                        .font(FontId::proportional(10.0))
+                        .color(colors.error_red),
+                );
+            });
+            return;
+        }
+    };
+
+    let bg_color = status_color.linear_multiply(0.08);
+    let border_color = status_color.linear_multiply(0.2);
+
+    let result_frame = egui::Frame::new()
+        .fill(bg_color)
+        .corner_radius(6.0)
+        .stroke(egui::Stroke::new(1.0, border_color))
+        .inner_margin(egui::Margin::symmetric(10, 6));
+    result_frame.show(ui, |ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new(format!("{} {}", status_icon, status_text))
+                    .font(FontId::proportional(11.0))
+                    .color(status_color)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+
+            let drop_flag = if result.drop_frame { " (Drop Frame)" } else { "" };
+            let fps_str = if result.detected_fps > 0.0 {
+                format!("{:.2} fps{}", result.detected_fps, drop_flag)
+            } else {
+                "—".to_string()
+            };
+
+            let first_tc = result.timecodes.first();
+            let last_tc = result.timecodes.last();
+            let tc_summary = match (first_tc, last_tc) {
+                (Some(f), Some(l)) => {
+                    let sep = if result.drop_frame { ";" } else { ":" };
+                    format!(
+                        "{:02}{sep}{:02}{sep}{:02}{sep}{:02} → {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
+                        f.timecode.hours, f.timecode.minutes, f.timecode.seconds, f.timecode.frames,
+                        l.timecode.hours, l.timecode.minutes, l.timecode.seconds, l.timecode.frames,
+                    )
+                }
+                _ => "—".to_string(),
+            };
+
+            let grid = egui::Grid::new("ltc_result_grid")
+                .num_columns(2)
+                .spacing([8.0, 2.0])
+                .striped(false);
+            grid.show(ui, |ui| {
+                ui.label(RichText::new("Detected rate:").font(FontId::proportional(10.0)).color(colors.text_muted));
+                ui.label(RichText::new(fps_str).font(FontId::monospace(10.0)).color(colors.text_title).strong());
+                ui.end_row();
+
+                ui.label(RichText::new("Confidence:").font(FontId::proportional(10.0)).color(colors.text_muted));
+                ui.label(
+                    RichText::new(format!("{:.1}%", result.avg_confidence * 100.0))
+                        .font(FontId::monospace(10.0))
+                        .color(colors.text_title)
+                        .strong(),
+                );
+                ui.end_row();
+
+                ui.label(RichText::new("Valid frames:").font(FontId::proportional(10.0)).color(colors.text_muted));
+                ui.label(
+                    RichText::new(format!("{} / {}", result.valid_frames, result.total_possible_frames))
+                        .font(FontId::monospace(10.0))
+                        .color(colors.text_title)
+                        .strong(),
+                );
+                ui.end_row();
+
+                ui.label(RichText::new("Timecode range:").font(FontId::proportional(10.0)).color(colors.text_muted));
+                ui.label(RichText::new(&tc_summary).font(FontId::monospace(10.0)).color(colors.text_title).strong());
+                ui.end_row();
+
+                ui.label(RichText::new("Sample rate:").font(FontId::proportional(10.0)).color(colors.text_muted));
+                ui.label(
+                    RichText::new(format!("{} Hz", result.sample_rate))
+                        .font(FontId::monospace(10.0))
+                        .color(colors.text_title)
+                        .strong(),
+                );
+                ui.end_row();
+
+                ui.label(RichText::new("Audio duration:").font(FontId::proportional(10.0)).color(colors.text_muted));
+                ui.label(
+                    RichText::new(format!("{:.2}s", result.total_audio_duration_secs))
+                        .font(FontId::monospace(10.0))
+                        .color(colors.text_title)
+                        .strong(),
+                );
+                ui.end_row();
+
+                ui.label(RichText::new("Processing time:").font(FontId::proportional(10.0)).color(colors.text_muted));
+                ui.label(
+                    RichText::new(format!("{:.1} ms", result.processing_time_ms))
+                        .font(FontId::monospace(10.0))
+                        .color(colors.text_title)
+                        .strong(),
+                );
+                ui.end_row();
+            });
+
+            // Collapsible timecode list
+            if !result.timecodes.is_empty() {
+                ui.add_space(4.0);
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    egui::Id::new("ltc_timecode_list"),
+                    false,
+                )
+                .show_header(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("Show {} decoded timecodes", result.timecodes.len()))
+                            .font(FontId::proportional(9.0))
+                            .color(colors.text_muted),
+                    );
+                })
+                .body(|ui| {
+                    let scroll_frame = egui::Frame::new()
+                        .fill(colors.deep_bg)
+                        .corner_radius(4.0)
+                        .stroke(egui::Stroke::new(0.5, colors.border_main))
+                        .inner_margin(egui::Margin::symmetric(6, 4));
+                    scroll_frame.show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                for ftc in &result.timecodes {
+                                    let sep = if result.drop_frame { ";" } else { ":" };
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "[{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
+                                            ftc.frame_index,
+                                            ftc.timecode.hours, ftc.timecode.minutes,
+                                            ftc.timecode.seconds, ftc.timecode.frames,
+                                        ))
+                                        .font(FontId::monospace(9.0))
+                                        .color(colors.text_muted),
+                                    );
+                                }
+                            });
+                    });
+                });
+            }
+
+            // Collapsible debug details
+            if !result.details.is_empty() {
+                ui.add_space(2.0);
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    egui::Id::new("ltc_debug_details"),
+                    false,
+                )
+                .show_header(ui, |ui| {
+                    ui.label(
+                        RichText::new("Show debug details")
+                            .font(FontId::proportional(9.0))
+                            .color(colors.text_muted),
+                    );
+                })
+                .body(|ui| {
+                    for detail in &result.details {
+                        ui.label(
+                            RichText::new(detail)
+                                .font(FontId::monospace(8.0))
+                                .color(colors.text_muted),
+                        );
+                    }
+                });
+            }
+        });
+    });
 }
 
 // ── Step 2: Channel mapping matrix ──────────────────────────────────────

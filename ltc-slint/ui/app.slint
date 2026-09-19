@@ -101,6 +101,13 @@ export component AppWindow inherits Window {
     in-out property <[string]> conv-video-encoder-options: [];
     in-out property <[string]> conv-audio-encoder-options: [];
 
+    // ── LTC detection properties ──
+    in-out property <int> ltc-file-idx: 0;
+    in-out property <[string]> ltc-file-names: [];
+    in-out property <string> ltc-status: "";
+    in-out property <string> ltc-result-text: "";
+    in-out property <string> ltc-error: "";
+
     // ── Tab state ──
     in-out property <int> active-tab: 0;
     in-out property <bool> show-faq: false;
@@ -145,6 +152,9 @@ export component AppWindow inherits Window {
     callback beep-duration-changed(float);
     callback refresh-devices;
     callback dismiss-toast(int);
+
+    // ── LTC detection callback ──
+    callback ltc-detect;
 
     // ── Converter callbacks ──
     callback conv-select-folder;
@@ -610,6 +620,12 @@ export component AppWindow inherits Window {
                     refresh-devices => { root.refresh-devices(); }
                 }
                 if (root.active-tab == 2) : ConverterSection {
+                    ltc-file-idx: root.ltc-file-idx;
+                    ltc-file-names: root.ltc-file-names;
+                    ltc-status: root.ltc-status;
+                    ltc-result-text: root.ltc-result-text;
+                    ltc-error: root.ltc-error;
+                    detect-ltc => { root.ltc-detect(); }
                     has-ffmpeg: root.conv-has-ffmpeg;
                     ffmpeg-error: root.conv-ffmpeg-error;
                     selected-folder: root.conv-selected-folder;

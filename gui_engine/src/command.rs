@@ -38,6 +38,10 @@ pub enum GuiCommand {
     // ── Logs ────────────────────────────────────────────────────────────
     ClearLogs,
 
+    // ── Parsing / shutdown ──────────────────────────────────────────────
+    ParseLtcFile(String),
+    Shutdown,
+
     // ── Steppers ─────────────────────────────────────────────────────────
     SceneUp,
     SceneDown,

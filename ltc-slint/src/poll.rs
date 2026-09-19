@@ -44,6 +44,7 @@ pub fn setup_poll_timer(
     let ui_weak = ui.as_weak();
     let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let last_device_key: Arc<Mutex<(usize, String)>> = Arc::new(Mutex::new((0, String::new())));
+    let last_ltc_decode_gen: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
 
     let poll_timer = slint::Timer::default();
     poll_timer.start(
@@ -66,6 +67,60 @@ pub fn setup_poll_timer(
 
             // 3. Theme sync
             AppColors::get(&ui).set_theme_dark(s.is_dark_theme);
+
+            // 3.5 LTC decode state sync
+            {
+                let mut last = last_ltc_decode_gen.lock().unwrap();
+                if s.ltc_decode_generation != *last {
+                    *last = s.ltc_decode_generation;
+                    if s.ltc_is_detecting {
+                        ui.set_ltc_status(SharedString::from("detecting"));
+                        ui.set_ltc_result_text(SharedString::from(""));
+                        ui.set_ltc_error(SharedString::from(""));
+                    } else if let Some(ref err) = s.ltc_decode_error {
+                        ui.set_ltc_status(SharedString::from("error"));
+                        ui.set_ltc_result_text(SharedString::from(""));
+                        ui.set_ltc_error(SharedString::from(err));
+                    } else if let Some(ref r) = s.ltc_decode_result {
+                        let status_str = match &r.status {
+                            gui_engine::LtcDecodeStatus::Success => "success",
+                            gui_engine::LtcDecodeStatus::LowConfidence => "low_confidence",
+                            gui_engine::LtcDecodeStatus::NoSyncWord => "no_sync",
+                            gui_engine::LtcDecodeStatus::Error { .. } => "error",
+                        };
+                        let drop_flag = if r.drop_frame { " DF" } else { "" };
+                        let fps_str = if r.detected_fps > 0.0 {
+                            format!("{:.2} fps{}", r.detected_fps, drop_flag)
+                        } else {
+                            "—".to_string()
+                        };
+                        let first = r.timecodes.first().map(|t| t.timecode);
+                        let last_tc = r.timecodes.last().map(|t| t.timecode);
+                        let tc_range = match (first, last_tc) {
+                            (Some(f), Some(l)) => {
+                                let sep = if r.drop_frame { ";" } else { ":" };
+                                format!(
+                                    "{:02}{sep}{:02}{sep}{:02}{sep}{:02} → {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
+                                    f.hours, f.minutes, f.seconds, f.frames,
+                                    l.hours, l.minutes, l.seconds, l.frames,
+                                )
+                            }
+                            _ => "—".to_string(),
+                        };
+                        ui.set_ltc_status(SharedString::from(status_str));
+                        ui.set_ltc_result_text(SharedString::from(format!(
+                            "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms",
+                            fps_str,
+                            r.avg_confidence * 100.0,
+                            r.valid_frames,
+                            r.total_possible_frames,
+                            tc_range,
+                            r.processing_time_ms,
+                        )));
+                        ui.set_ltc_error(SharedString::from(""));
+                    }
+                }
+            }
 
             // 4. Pulse phase animation
             let mut pp = pulse_phase.lock().unwrap();
