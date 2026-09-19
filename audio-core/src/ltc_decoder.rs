@@ -109,19 +109,83 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
 
     // ── Try ZC-interval method (fast, works on synthetic/clean LTC) ─────────
     let zc_result = try_decode_via_zc_intervals(&zc, sample_rate, fps, drop_frame);
-    let zc_valid = zc_result.as_ref().map_or(0, |r| r.valid_frames);
+    let zc_conf = zc_result.as_ref().map_or(0.0, |r| {
+        if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
+    });
 
-    // ── Also run waveform sampling evaluation (robust for noisy LTC) ────────
-    let (eval_result, eval_valid) = evaluate_on_slice(&samples, &zc, sample_rate, threshold, fps, drop_frame);
+    if zc_conf >= 0.70 {
+        info!("LTC decode: ZC-interval confidence {:.1}% >= 70% -- using directly", zc_conf * 100.0);
+        return build_result(zc_result, &zc, sample_rate, threshold, channels, total_duration, start);
+    }
 
-    // ── Pick whichever method found more valid frames ───────────────────────
-    let best_result = if eval_valid >= zc_valid {
-        if eval_valid > 0 { eval_result } else { zc_result }
-    } else {
-        zc_result
-    };
+    // ── Sliding window search for SPB/phase ─────────────────────────────────
+    // Evaluates 30s windows at 15s strides, using ZCs to skip silent regions.
+    // First window with >=70% confidence -> single-pass extract_bits on full file.
+    const WINDOW_SECS: f64 = 30.0;
+    const STRIDE_SECS: f64 = 15.0;
+    const HIGH_CONF_THRESHOLD: f32 = 0.70;
 
-    build_result(best_result, &zc, sample_rate, threshold, channels, total_duration, start)
+    let window_len = (WINDOW_SECS * sample_rate as f64) as usize;
+    let stride = (STRIDE_SECS * sample_rate as f64) as usize;
+    let max_windows = (samples.len() / stride.max(1)).max(1);
+
+    let mut best_window_result: Option<ScoredResult> = None;
+    let mut best_window_valid = 0u32;
+
+    for window_idx in 0..max_windows {
+        let window_start = window_idx * stride;
+        let window_end = (window_start + window_len).min(samples.len());
+
+        let window_zc = zc_in_range(&zc, window_start, window_end);
+        if window_zc.len() < 8 {
+            if window_end >= samples.len() { break; }
+            continue;
+        }
+
+        debug!("LTC eval: window {}/{} [+{:.0}s..{:.0}s] -- {} ZCs, best={} valid",
+            window_idx + 1, max_windows,
+            window_start as f64 / sample_rate as f64,
+            window_end as f64 / sample_rate as f64,
+            window_zc.len(), best_window_valid);
+
+        let (result, valid) = evaluate_on_slice(
+            &samples[window_start..window_end], &window_zc,
+            sample_rate, threshold, fps, drop_frame,
+        );
+
+        if valid > best_window_valid {
+            best_window_valid = valid;
+            best_window_result = result;
+
+            let conf = best_window_result.as_ref().map_or(0.0, |r| {
+                if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
+            });
+
+            if conf >= HIGH_CONF_THRESHOLD {
+                let r = best_window_result.as_ref().unwrap();
+                info!("LTC decode: window eval {:.1}% >= 70% -- single-pass on full file (spb={:.2}, phase={})",
+                    conf * 100.0, r.spb, r.phase);
+                return build_result(Some(decode_full_file(&samples, r, threshold, sample_rate)), &zc,
+                    sample_rate, threshold, channels, total_duration, start);
+            }
+        }
+
+        if window_end >= samples.len() { break; }
+    }
+
+    // ── Decode full file with best window parameters ────────────────────────
+    if let Some(ref r) = best_window_result {
+        let conf = r.valid_frames as f32 / r.total_possible.max(1) as f32;
+        info!("LTC decode: best window eval {:.1}% ({} valid) -- single-pass on full file (spb={:.2}, phase={})",
+            conf * 100.0, r.valid_frames, r.spb, r.phase);
+        return build_result(Some(decode_full_file(&samples, r, threshold, sample_rate)), &zc,
+            sample_rate, threshold, channels, total_duration, start);
+    }
+
+    // ── Fallback: full-file evaluate_on_slice (rare) ────────────────────────
+    warn!("LTC decode: sliding window found no valid LTC -- full-file eval fallback");
+    let (fallback_result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold, fps, drop_frame);
+    build_result(fallback_result, &zc, sample_rate, threshold, channels, total_duration, start)
 }
 
 /// Evaluate LTC on a slice using the given FPS.
@@ -156,15 +220,19 @@ fn evaluate_on_slice(
         vec![spb_nominal]
     };
 
-    for &spb in &spb_variants {
+    for (spb_idx, &spb) in spb_variants.iter().enumerate() {
         let max_phases = (spb / 4.0).round() as usize;
         let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
 
         let half_spb = (spb * 0.5) as usize;
+        let mut attempts_this_spb = 0u32;
         for phase in phases_to_try {
             for &candidate_phase in &[phase, phase.saturating_sub(half_spb)] {
+                debug!("LTC extract-bits: {} spb={:.2} phase={} -- scanning...",
+                    fps_name, spb, candidate_phase);
                 let bits = extract_bits(samples, spb, candidate_phase, threshold);
                 if bits.len() < 80 { continue; }
+                attempts_this_spb += 1;
 
                 let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
                 if valid_frames > best_valid {
@@ -178,7 +246,7 @@ fn evaluate_on_slice(
                         })
                         .collect();
 
-                    debug!("LTC extract-bits: {} spb={:.2} phase={} -- {} valid / {} possible",
+                    debug!("LTC extract-bits: {} spb={:.2} phase={} -- {} valid / {} possible (new best)",
                         fps_name, spb, candidate_phase, valid_frames, total_possible);
 
                     best_valid = valid_frames;
@@ -199,6 +267,9 @@ fn evaluate_on_slice(
                 }
             }
         }
+        debug!("LTC evaluate: SPB variant {}/{} done -- {} attempts in {:.1}s, best={} valid",
+            spb_idx + 1, spb_variants.len(),
+            attempts_this_spb, eval_start.elapsed().as_secs_f64(), best_valid);
     }
 
     if let Some(ref best) = best_result.clone() {
@@ -209,24 +280,24 @@ fn evaluate_on_slice(
         let best_drop_frame = best.drop_frame;
         let best_phase = best.phase;
 
-        let max_phases = (best_spb / 4.0).round() as usize;
+let max_phases = (best_spb / 4.0).round() as usize;
         let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
+        let mut last_heartbeat = std::time::Instant::now();
+        let mut refine_idx = 0u32;
         for phase in phases_to_try {
             if phase == best_phase { continue; }
+            refine_idx += 1;
+            if last_heartbeat.elapsed().as_secs_f64() >= 10.0 {
+                debug!("LTC refine (+{:.1}s): phase {}/{} (phase={}), best_valid={}",
+                    eval_start.elapsed().as_secs_f64(), refine_idx, max_phases.clamp(5, 12) - 1,
+                    phase, best_valid);
+                last_heartbeat = std::time::Instant::now();
+            }
             let bits = extract_bits_adaptive(samples, best_spb, phase, threshold, zc);
             if bits.len() < 80 { continue; }
 
             let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
             if valid_frames > best_valid {
-                let timecodes: Vec<FrameTimecode> = frame_starts
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, &start)| FrameTimecode {
-                        frame_index: idx as u32,
-                        timecode: decode_timecode_from_bits(&bits, start),
-                        timecode_secs: (phase as f64 + start as f64 * best_spb) / sample_rate as f64,
-                    })
-                    .collect();
 
                 debug!("LTC refinement adaptive -- {} valid / {} possible (phase={})",
                     valid_frames, total_possible, phase);
@@ -237,7 +308,15 @@ fn evaluate_on_slice(
                     drop_frame: best_drop_frame,
                     valid_frames,
                     total_possible,
-                    timecodes,
+                    timecodes: frame_starts
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &start)| FrameTimecode {
+                            frame_index: idx as u32,
+                            timecode: decode_timecode_from_bits(&bits, start),
+                            timecode_secs: (phase as f64 + start as f64 * best_spb) / sample_rate as f64,
+                        })
+                        .collect(),
                     details_entry: format!(
                         "{}: {} valid / {} possible frames (adaptive, phase={}, spb={:.2})",
                         fps_name, valid_frames, total_possible, phase, best_spb
@@ -605,6 +684,13 @@ fn try_decode_via_zc_intervals(
     })
 }
 
+/// Return the subslice of ZC positions falling within [range_start, range_end).
+fn zc_in_range<'a>(zc: &'a [usize], range_start: usize, range_end: usize) -> &'a [usize] {
+    let lo = zc.partition_point(|&p| p < range_start);
+    let hi = zc.partition_point(|&p| p < range_end);
+    &zc[lo..hi]
+}
+
 // ── Bit extraction (fallback for noisy LTC) ────────────────────────────────
 
 fn median_sample(samples: &[f32], center: usize) -> f32 {
@@ -832,6 +918,42 @@ struct ScoredResult {
     spb: f64,
     phase: usize,
     frame_starts: Vec<usize>,
+}
+
+/// Run a single-pass `extract_bits` + `find_frames` on the full sample buffer
+/// using the SPB/phase discovered from a window eval. Returns a populated
+/// `ScoredResult` with timecodes computed from the full decode.
+fn decode_full_file(
+    samples: &[f32],
+    params: &ScoredResult,
+    threshold: f32,
+    sample_rate: u32,
+) -> ScoredResult {
+    let bits = extract_bits(samples, params.spb, params.phase, threshold);
+    let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
+    let timecodes: Vec<FrameTimecode> = frame_starts
+        .iter()
+        .enumerate()
+        .map(|(idx, &start)| FrameTimecode {
+            frame_index: idx as u32,
+            timecode: decode_timecode_from_bits(&bits, start),
+            timecode_secs: (params.phase as f64 + start as f64 * params.spb) / sample_rate as f64,
+        })
+        .collect();
+    ScoredResult {
+        fps: params.fps,
+        drop_frame: params.drop_frame,
+        valid_frames,
+        total_possible,
+        timecodes,
+        details_entry: format!(
+            "{:.2} fps: {} valid / {} possible frames (single-pass, spb={:.2}, phase={})",
+            params.fps, valid_frames, total_possible, params.spb, params.phase
+        ),
+        spb: params.spb,
+        phase: params.phase,
+        frame_starts,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
