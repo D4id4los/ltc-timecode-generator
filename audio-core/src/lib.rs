@@ -790,12 +790,18 @@ pub use ltc_decoder::{
 pub use ltc_decoder_libltc::decode_ltc_from_wav_libltc;
 
 /// Decode LTC from a WAV file, selecting the decoder implementation.
+/// `fps` and `drop_frame` specify the expected frame rate (no auto-detection).
 /// Set `use_libltc = true` to use the libltc C library decoder.
-pub fn decode_ltc_with_decoder(path: &std::path::Path, use_libltc: bool) -> Result<LtcDetectionResult, String> {
+pub fn decode_ltc_with_decoder(
+    path: &std::path::Path,
+    use_libltc: bool,
+    fps: f64,
+    drop_frame: bool,
+) -> Result<LtcDetectionResult, String> {
     if use_libltc {
-        decode_ltc_from_wav_libltc(path)
+        decode_ltc_from_wav_libltc(path, fps, drop_frame)
     } else {
-        decode_ltc_from_wav(path)
+        decode_ltc_from_wav(path, fps, drop_frame)
     }
 }
 

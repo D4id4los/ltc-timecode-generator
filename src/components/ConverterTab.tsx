@@ -159,9 +159,19 @@ function TauriConverter() {
   const pollingRef = useRef<number | null>(null);
 
   // LTC detection
-  const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
+const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
   const [ltcResult, setLtcResult] = useState<LtcDetectionResult | null>(null);
+  const [ltcError, setLtcError] = useState<string | null>(null);
   const [ltcDetecting, setLtcDetecting] = useState(false);
+  const [decodeFpsIdx, setDecodeFpsIdx] = useState(1);
+
+  const DECODE_FPS_OPTIONS = [
+    { id: "24", name: "24 fps", fps: 24, dropFrame: false },
+    { id: "25", name: "25 fps", fps: 25, dropFrame: false },
+    { id: "29.97nd", name: "29.97 ND", fps: 29.97, dropFrame: false },
+    { id: "29.97df", name: "29.97 DF", fps: 29.97, dropFrame: true },
+    { id: "30", name: "30 fps", fps: 30, dropFrame: false },
+  ];
   const [ltcError, setLtcError] = useState<string | null>(null);
 
   // Trim to first LTC
@@ -369,6 +379,7 @@ function TauriConverter() {
     if (!group || ltcFileIdx >= group.files.length) return;
     const folder = selectedFolder.endsWith("/") ? selectedFolder : selectedFolder + "/";
     const filePath = `${folder}${group.files[ltcFileIdx]}`;
+    const opt = DECODE_FPS_OPTIONS[decodeFpsIdx];
 
     setLtcDetecting(true);
     setLtcResult(null);
@@ -376,6 +387,8 @@ function TauriConverter() {
     try {
       const result = await invoke<LtcDetectionResult>("detect_ltc_in_file", {
         path: filePath,
+        fps: opt.fps,
+        dropFrame: opt.dropFrame,
       });
       setLtcResult(result);
     } catch (e) {
@@ -383,7 +396,7 @@ function TauriConverter() {
     } finally {
       setLtcDetecting(false);
     }
-  }, [selectedGroupIdx, fileGroups, ltcFileIdx, selectedFolder]);
+  }, [selectedGroupIdx, fileGroups, ltcFileIdx, selectedFolder, decodeFpsIdx]);
 
   // Start conversion
   const handleStartConvert = useCallback(async () => {
@@ -569,6 +582,22 @@ function TauriConverter() {
                 </option>
               ))}
             </select>
+            <div className="flex gap-1">
+              {DECODE_FPS_OPTIONS.map((opt, i) => (
+                <button
+                  key={opt.id}
+                  onClick={() => setDecodeFpsIdx(i)}
+                  className={`px-2 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                    decodeFpsIdx === i
+                      ? "bg-[#FF5F1F] text-black"
+                      : "bg-deep-bg text-text-muted hover:text-text-title border border-border-main"
+                  }`}
+                  title={opt.name}
+                >
+                  {opt.name}
+                </button>
+              ))}
+            </div>
             <button
               onClick={handleDetectLtc}
               disabled={ltcDetecting}

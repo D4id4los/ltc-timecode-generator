@@ -38,6 +38,9 @@ pub enum GuiCommand {
     // ── Logs ────────────────────────────────────────────────────────────
     ClearLogs,
 
+    // ── Decode FPS ──────────────────────────────────────────────────────
+    SetDecodeFpsIndex(usize),
+
     // ── Parsing / shutdown ──────────────────────────────────────────────
     ParseLtcFile(String),
     Shutdown,

@@ -38,7 +38,10 @@ export component ConverterSection {
     in-out property <string> ltc-status: "";
     in-out property <string> ltc-result-text: "";
     in-out property <string> ltc-error: "";
+    in-out property <[string]> decode-fps-options: [];
+    in-out property <int> decode-fps-index: 1;
     callback detect-ltc;
+    callback decode-fps-selected(int);
 
     callback select-folder;
     callback select-group(int);
@@ -184,6 +187,23 @@ export component ConverterSection {
                             Text {
                                 text: root.ltc-file-names.length > 0 ? root.ltc-file-names[root.ltc-file-idx] : "(no files)";
                                 color: AppColors.text-title; font-size: 10px; font-family: "monospace";
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        // FPS pills
+                        for opt[idx] in root.decode-fps-options : Rectangle {
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: root.decode-fps-index == idx ? AppColors.accent : AppColors.border-main;
+                            background: root.decode-fps-index == idx ? AppColors.accent : AppColors.deep-bg;
+                            min-width: 40px; min-height: 28px;
+                            TouchArea {
+                                clicked => { root.decode-fps-selected(idx); }
+                            }
+                            Text {
+                                text: opt;
+                                color: root.decode-fps-index == idx ? black : AppColors.text-title;
+                                font-size: 9px; font-family: "monospace"; font-weight: 700;
                                 horizontal-alignment: center; vertical-alignment: center;
                             }
                         }

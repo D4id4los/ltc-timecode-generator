@@ -7,7 +7,7 @@ use log::{debug, info, warn};
 use crate::ltc_decoder::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
 use crate::Timecode;
 
-pub fn decode_ltc_from_wav_libltc(path: &Path) -> Result<LtcDetectionResult, String> {
+pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
     let start = Instant::now();
 
     let mut reader = hound::WavReader::open(path)
@@ -153,50 +153,15 @@ pub fn decode_ltc_from_wav_libltc(path: &Path) -> Result<LtcDetectionResult, Str
     let valid_count = timecodes.len() as u32;
     let processing_time_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    info!("LTC decode (+{:.1}s): inferring FPS from {} decoded frames...",
-        start.elapsed().as_secs_f64(), valid_count);
-    let (detected_fps, drop_frame, total_possible_frames, avg_confidence, details) =
-        if valid_count >= 2 {
-            let first_off = timecodes[0].timecode_secs;
-            let last_off = timecodes[timecodes.len() - 1].timecode_secs;
-            let span = last_off - first_off;
-            let raw_inferred = if span > 0.0 {
-                (valid_count - 1) as f64 / span
-            } else {
-                25.0
-            };
+    info!("LTC decode (+{:.1}s): using specified FPS {:.2} (drop_frame={})",
+        start.elapsed().as_secs_f64(), fps, drop_frame);
 
-            let (inferred_fps, df) = snap_to_known_fps(raw_inferred);
-
-            let total_possible = (total_duration * inferred_fps as f64).round() as u32;
-            let confidence = if total_possible > 0 {
-                (valid_count as f32 / total_possible as f32 * 100.0).min(100.0)
-            } else {
-                0.0
-            };
-
-            (
-                inferred_fps,
-                df,
-                total_possible,
-                confidence,
-                vec![
-                    format!(
-                        "libltc decoder: inferred {:.2} fps from {} frames over {:.2}s span",
-                        raw_inferred, valid_count, span
-                    ),
-                    format!("initial_apv={}", initial_apv),
-                    format!("libltc queue length: {}", decoder.queue_length()),
-                ],
-            )
-        } else {
-            let msg = if valid_count == 0 {
-                "libltc did not detect any complete frames".to_string()
-            } else {
-                "libltc detected only 1 frame — cannot infer FPS".to_string()
-            };
-            (0.0, false, 0, 0.0, vec![msg])
-        };
+    let total_possible_frames = (total_duration * fps).round() as u32;
+    let avg_confidence = if total_possible_frames > 0 {
+        (valid_count as f32 / total_possible_frames as f32 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
 
     let status = if valid_count > 0 {
         LtcDecodeStatus::Success
@@ -209,9 +174,15 @@ pub fn decode_ltc_from_wav_libltc(path: &Path) -> Result<LtcDetectionResult, Str
         .map(|ft| ft.timecode_secs)
         .unwrap_or(0.0);
 
+    let details = vec![
+        format!("libltc decoder: using {:.2} fps", fps),
+        format!("initial_apv={}", initial_apv),
+        format!("libltc queue length: {}", decoder.queue_length()),
+    ];
+
     let result = LtcDetectionResult {
         status,
-        detected_fps,
+        detected_fps: fps as f32,
         drop_frame,
         total_possible_frames,
         valid_frames: valid_count,
@@ -233,20 +204,6 @@ pub fn decode_ltc_from_wav_libltc(path: &Path) -> Result<LtcDetectionResult, Str
     );
 
     Ok(result)
-}
-
-fn snap_to_known_fps(raw: f64) -> (f32, bool) {
-    if (raw - 24.0).abs() < 0.5 {
-        (24.0, false)
-    } else if (raw - 25.0).abs() < 0.5 {
-        (25.0, false)
-    } else if (raw - 30.0).abs() < 0.5 {
-        (30.0, false)
-    } else if (raw - 29.97).abs() < 1.0 {
-        (29.97, true)
-    } else {
-        (raw as f32, false)
-    }
 }
 
 fn error_result(msg: impl Into<String>) -> LtcDetectionResult {

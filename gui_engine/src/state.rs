@@ -65,6 +65,11 @@ pub struct AppStateSnapshot {
     // Events drained from AudioCore (to be surfaced as toasts by the GUI)
     pub events: Vec<AudioEvent>,
 
+    // LTC decode FPS
+    pub decode_fps_index: usize,
+    pub decode_fps: f64,
+    pub decode_drop_frame: bool,
+
     // LTC file decode
     pub use_libltc: bool,   // decoder selection (set from CLI --decoder flag; false = builtin, true = libltc)
     pub ltc_decode_result: Option<LtcDetectionResult>,
@@ -123,6 +128,9 @@ impl AppStateSnapshot {
             status_message: "Ready".to_string(),
             system_time: String::new(),
             events: Vec::new(),
+            decode_fps_index: 1,
+            decode_fps: 25.0,
+            decode_drop_frame: false,
             use_libltc: false,
             ltc_decode_result: None,
             ltc_decode_error: None,

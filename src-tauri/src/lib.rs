@@ -127,8 +127,8 @@ fn get_wake_lock_status(state: tauri::State<'_, AudioState>) -> bool {
 // ── LTC detection command ──────────────────────────────────────────────────
 
 #[tauri::command]
-fn detect_ltc_in_file(path: String) -> Result<LtcDetectionResult, String> {
-    audio_core::decode_ltc_from_wav(Path::new(&path))
+fn detect_ltc_in_file(path: String, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
+    audio_core::decode_ltc_from_wav(Path::new(&path), fps, drop_frame)
 }
 
 // ── Converter commands ─────────────────────────────────────────────────────

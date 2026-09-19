@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use egui::{Color32, FontId, RichText, Ui};
+use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::command::GuiCommand;
 use gui_engine::converter::{
     conversion_sanity_check, query_ffmpeg_capabilities, spawn_conversion,
@@ -282,6 +283,22 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                     }
                 }
             });
+
+        // ── Decode FPS selector ──
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("FPS:").font(FontId::proportional(10.0)).color(colors.text_muted));
+            for (i, opt) in FPS_OPTIONS.iter().enumerate() {
+                let is_sel = i == state.latest.decode_fps_index;
+                let btn = egui::Button::new(
+                    RichText::new(opt.name).font(FontId::monospace(9.0)).color(if is_sel { Color32::BLACK } else { colors.text_muted })
+                )
+                .fill(if is_sel { ACCENT } else { colors.deep_bg })
+                .min_size(egui::vec2(0.0, 22.0));
+                if ui.add(btn).clicked() {
+                    state.send(GuiCommand::SetDecodeFpsIndex(i));
+                }
+            }
+        });
 
         ui.add_space(8.0);
 

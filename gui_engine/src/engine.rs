@@ -349,20 +349,37 @@ fn process_command(
             state.logs.clear();
         }
 
+        GuiCommand::SetDecodeFpsIndex(index) => {
+            if let Some(opt) = timecode::FPS_OPTIONS.get(index) {
+                state.decode_fps_index = index;
+                state.decode_fps = opt.fps;
+                state.decode_drop_frame = opt.drop_frame;
+                info!("Decode FPS set to: {} (index={})", opt.name, index);
+            }
+        }
+
         GuiCommand::ParseLtcFile(path) => {
             let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
-            info!("LTC decode requested for: {} (decoder: {})", path, decoder_name);
+            info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps);
             state.ltc_is_detecting = true;
             state.ltc_decode_result = None;
             state.ltc_decode_error = None;
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
-            state.status_message = format!("Decoding LTC from: {} [{}]", path, decoder_name);
+            state.status_message = format!(
+                "Decoding LTC from: {} [{}] at {:.2} fps",
+                path, decoder_name, state.decode_fps
+            );
             let capture_gen = state.ltc_decode_generation;
             let tx = decode_result_tx.clone();
             let use_libltc = state.use_libltc;
+            let decode_fps = state.decode_fps;
+            let decode_drop_frame = state.decode_drop_frame;
             std::thread::spawn(move || {
-                debug!("LTC decode thread spawned for gen={}: {} (decoder: {})", capture_gen, path, if use_libltc { "libltc" } else { "builtin" });
-                let result = audio_core::decode_ltc_with_decoder(Path::new(&path), use_libltc);
+                debug!("LTC decode thread spawned for gen={}: {} (decoder: {}, fps: {})",
+                    capture_gen, path, if use_libltc { "libltc" } else { "builtin" }, decode_fps);
+                let result = audio_core::decode_ltc_with_decoder(
+                    Path::new(&path), use_libltc, decode_fps, decode_drop_frame,
+                );
                 let _ = tx.send(LtcDecodeResult {
                     path,
                     generation: capture_gen,

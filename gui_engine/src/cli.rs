@@ -93,6 +93,14 @@ pub struct Cli {
     /// Decoder implementation: "builtin" (default) or "libltc"
     #[arg(long, default_value = "builtin", value_parser = clap::builder::PossibleValuesParser::new(["builtin", "libltc"]))]
     pub decoder: String,
+
+    /// Frame rate for LTC decoding (default: 25)
+    #[arg(long, default_value_t = 25.0)]
+    pub decode_fps: f64,
+
+    /// Enable drop-frame for LTC decoding (only meaningful for 29.97 fps)
+    #[arg(long)]
+    pub decode_drop_frame: bool,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -503,13 +511,17 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!(
-        "Decoding LTC from '{}' with {} decoder",
+        "Decoding LTC from '{}' with {} decoder at {:.2} fps{}",
         path,
-        if use_libltc { "libltc" } else { "builtin" }
+        if use_libltc { "libltc" } else { "builtin" },
+        cli.decode_fps,
+        if cli.decode_drop_frame { " DF" } else { "" },
     );
 
     info!("Starting LTC decode (this may take a while for large files)...");
-    let result = audio_core::decode_ltc_with_decoder(Path::new(path), use_libltc)?;
+    let result = audio_core::decode_ltc_with_decoder(
+        Path::new(path), use_libltc, cli.decode_fps, cli.decode_drop_frame,
+    )?;
 
     println!();
     println!("=== LTC Decode Results ===");
@@ -518,7 +530,7 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     println!("  Status:        {:?}", result.status);
     println!("  Sample rate:   {} Hz", result.sample_rate);
     println!("  Duration:      {:.3}s", result.total_audio_duration_secs);
-    println!("  Detected FPS:  {:.2}{}", result.detected_fps,
+    println!("  FPS:           {:.2}{}", result.detected_fps,
         if result.drop_frame { " DF" } else { "" });
     println!("  Valid frames:  {} / {} ({:.1}%)",
         result.valid_frames, result.total_possible_frames, result.avg_confidence);

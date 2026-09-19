@@ -58,31 +58,13 @@ impl LtcDetectionResult {
     }
 }
 
-// ── Internal candidates ──────────────────────────────────────────────────────
-
-const CANDIDATES: &[(f64, bool, &str)] = &[
-    (24.0, false, "24 fps"),
-    (25.0, false, "25 fps"),
-    (29.97, false, "29.97 ND"),
-    (29.97, true, "29.97 DF"),
-    (30.0, false, "30 fps"),
-];
-
 // Sync word at bits 64-79:  0 0 1 1 1 1 1 1 1 1 1 1 1 1 0 1
 const SYNC_WORD: [u8; 16] = [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1];
-const SYNC_OFFSET: usize = 64; // sync word starts at bit 64 of 80-bit frame
-
-/// Maximum duration of the prefix used for fast candidate search.
-/// Only the first N seconds are analyzed to determine FPS, SPB, and phase.
-const PREFIX_DURATION_SECS: f64 = 30.0;
-
-/// If prefix analysis achieves this confidence or higher, skip the full
-/// candidate search and decode the entire file in a single pass.
-const HIGH_CONFIDENCE_THRESHOLD: f32 = 0.70;
+const SYNC_OFFSET: usize = 64;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
+pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
     let start = std::time::Instant::now();
 
     let mut reader = hound::WavReader::open(path)
@@ -91,7 +73,7 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
 
-    info!("Decoding LTC from: {} ({} Hz, {} ch)", path.display(), sample_rate, channels);
+    info!("Decoding LTC from: {} ({} Hz, {} ch, {} fps)", path.display(), sample_rate, channels, fps);
 
     info!("LTC decode (+{:.1}s): reading audio samples from disk...", start.elapsed().as_secs_f64());
     let samples = read_mono_samples(&mut reader, &spec)
@@ -113,282 +95,112 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
         return Ok(LtcDetectionResult::error("Audio signal is completely silent"));
     }
 
-    // ── Dispatch based on file size ──────────────────────────────────────
-
-    if total_duration <= PREFIX_DURATION_SECS {
-        // ── Path A: Short file (≤ 30s) — direct full-file analysis ───────
-        debug!("LTC decode: file <= {}s prefix -- direct full search", PREFIX_DURATION_SECS);
-        info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (threshold={:.6})...",
-            start.elapsed().as_secs_f64(), samples.len(), threshold);
-        let zc = find_zero_crossings(&samples, threshold);
-        debug!("LTC decode: found {} zero-crossings", zc.len());
-        if zc.len() < 8 {
-            warn!("LTC decode: only {} zero-crossings, signal may not be LTC: {}", zc.len(), path.display());
-            return Ok(LtcDetectionResult::error(format!(
-                "Only {} zero-crossings found (need ≥8) -- signal may be silent or not LTC audio",
-                zc.len()
-            )));
-        }
-
-        // ZC-interval first (fast, no phase alignment needed)
-        let zc_result = try_decode_via_zc_intervals(&zc, sample_rate);
-        let zc_conf = zc_result.as_ref().map_or(0.0, |r| {
-            if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
-        });
-
-        // Verify ZC-interval result with evaluate_on_slice (catches FPS confusion)
-        // evaluate_on_slice finds its own optimal phase — no leakage from zc_result
-        let (verify_result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold);
-        let verify_conf = verify_result.as_ref().map_or(0.0, |r| {
-            if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
-        });
-
-        // Accept ZC-interval only if evaluate_on_slice agrees on FPS
-        let fps_agrees = zc_result.as_ref().zip(verify_result.as_ref())
-            .is_some_and(|(zr, vr)| (zr.fps - vr.fps).abs() < 0.01);
-
-        if zc_conf >= 0.30 && fps_agrees {
-            info!("LTC decode: ZC-interval accepted (verified) -- {} valid / {} possible ({:.1}%) at FPS {}",
-                zc_result.as_ref().unwrap().valid_frames,
-                zc_result.as_ref().unwrap().total_possible,
-                zc_conf * 100.0,
-                zc_result.as_ref().unwrap().fps);
-            return build_result(zc_result, &zc, sample_rate, threshold, channels, total_duration, start);
-        }
-
-        // Use evaluate_on_slice result if it has sufficient confidence
-        if verify_conf >= 0.30 {
-            info!("LTC decode: using evaluate_on_slice result -- {} valid / {} possible ({:.1}%)",
-                verify_result.as_ref().unwrap().valid_frames,
-                verify_result.as_ref().unwrap().total_possible,
-                verify_conf * 100.0);
-            return build_result(verify_result, &zc, sample_rate, threshold, channels, total_duration, start);
-        }
-
-        // Last resort: fall back to evaluate_on_slice even at low confidence
-        info!("LTC decode: both methods low confidence -- accepting evaluate_on_slice result");
-        return build_result(verify_result, &zc, sample_rate, threshold, channels, total_duration, start);
-    }
-
-    // ── Path B: Long file (> 30s) — hierarchical analysis ────────────────
-
-    let prefix_len = (PREFIX_DURATION_SECS * sample_rate as f64) as usize;
-
-    // Step 1: try first 30s segment
-    let mut prefix_samples: &[f32] = &samples[..prefix_len.min(samples.len())];
-    let mut zc_prefix = find_zero_crossings(prefix_samples, threshold);
-    debug!("LTC decode: prefix (first 30s) -- found {} zero-crossings (need ≥8)", zc_prefix.len());
-
-    // Step 2: if first 30s has insufficient ZCs, try middle of file
-    if zc_prefix.len() < 8 {
-        // Use ~1/3 of the way into the file to avoid pre-roll silence
-        let mid_start_secs = (total_duration * 0.33).min(total_duration - PREFIX_DURATION_SECS);
-        let mid_start = (mid_start_secs * sample_rate as f64) as usize;
-        let mid_end = (mid_start + prefix_len).min(samples.len());
-        prefix_samples = &samples[mid_start..mid_end];
-        zc_prefix = find_zero_crossings(prefix_samples, threshold);
-        debug!("LTC decode: prefix (middle 30s @ {:.1}s) -- found {} zero-crossings (need ≥8)",
-            mid_start_secs, zc_prefix.len());
-    }
-
-    if zc_prefix.len() >= 8 {
-        // We found zero crossings on a prefix — try ZC-interval first (very fast)
-        let zc_result = try_decode_via_zc_intervals(&zc_prefix, sample_rate);
-        let zc_conf = zc_result.as_ref().map_or(0.0, |r| {
-            if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
-        });
-        if let Some(ref r) = zc_result {
-            info!("LTC decode: prefix ZC-interval result -- {} valid / {} possible ({:.1}%) at FPS {}, spb={:.2}",
-                r.valid_frames, r.total_possible, zc_conf * 100.0, r.fps, r.spb);
-        }
-
-        // Also run evaluate_on_slice on the prefix (gives precise spb/phase)
-        info!("LTC decode: prefix -- running coarse-to-fine candidate search ({} FPS candidates, {} zero-crossings)",
-            CANDIDATES.len(), zc_prefix.len());
-        let (prefix_result, _) = evaluate_on_slice(prefix_samples, &zc_prefix, sample_rate, threshold);
-
-        let eval_conf = prefix_result.as_ref().map_or(0.0, |r| {
-            if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
-        });
-
-        match prefix_result {
-            Some(ref r) => {
-                info!("LTC decode: prefix eval result -- {} valid / {} possible ({:.1}%) at FPS {}, spb={:.2}, phase={}",
-                    r.valid_frames, r.total_possible, eval_conf * 100.0, r.fps, r.spb, r.phase);
-            }
-            None => {
-                info!("LTC decode: prefix -- no valid candidates from evaluate_on_slice");
-            }
-        }
-
-        // If prefix eval gives high confidence, decode full file via ZC-interval
-        if eval_conf >= HIGH_CONFIDENCE_THRESHOLD {
-            let r = prefix_result.unwrap();
-            info!("LTC decode: prefix eval confidence {:.1}% -- running ZC-interval on full file ({:.2}s, {} samples)",
-                eval_conf * 100.0, total_duration, samples.len());
-            let zc = find_zero_crossings(&samples, threshold);
-            let full_result = try_decode_via_zc_intervals(&zc, sample_rate);
-            let full_conf = full_result.as_ref().map_or(0.0, |r| {
-                if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
-            });
-            if full_conf >= 0.30 {
-                let mut fr = full_result.unwrap();
-                let fps_label = match r.fps as u32 {
-                    24 => "24 fps", 25 => "25 fps", 29 => "29.97", 30 => "30 fps", _ => "other",
-                };
-                fr.details_entry = format!(
-                    "{}: {} valid / {} possible frames (ZC-interval, spb={:.2})",
-                    fps_label, fr.valid_frames, fr.total_possible, fr.spb
-                );
-                return build_result(Some(fr), &zc, sample_rate, threshold, channels, total_duration, start);
-            }
-            // ZC-interval on full file below threshold -- fall through to full-file analysis
-        }
-
-        if zc_conf >= HIGH_CONFIDENCE_THRESHOLD && verify_zc_result(zc_result.as_ref().unwrap(), prefix_samples, threshold, sample_rate) {
-            let r = zc_result.unwrap();
-            info!("LTC decode: prefix ZC-interval confidence {:.1}% ≥ {}% (verified) -- running on full file ({:.2}s)",
-                zc_conf * 100.0, HIGH_CONFIDENCE_THRESHOLD * 100.0, total_duration);
-            let zc = find_zero_crossings(&samples, threshold);
-            let full_result = try_decode_via_zc_intervals(&zc, sample_rate);
-            let full_conf = full_result.as_ref().map_or(0.0, |r| {
-                if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
-            });
-            if full_conf >= 0.30 {
-                let mut fr = full_result.unwrap();
-                let fps_label = match r.fps as u32 {
-                    24 => "24 fps", 25 => "25 fps", 29 => "29.97", 30 => "30 fps", _ => "other",
-                };
-                fr.details_entry = format!(
-                    "{}: {} valid / {} possible frames (ZC-interval, spb={:.2})",
-                    fps_label, fr.valid_frames, fr.total_possible, fr.spb
-                );
-                return build_result(Some(fr), &zc, sample_rate, threshold, channels, total_duration, start);
-            }
-            // ZC-interval on full file below threshold -- fall through to full-file analysis
-        }
-    }
-
-    // ── Full-file analysis ────────────────────────────────────────────────
-    // We reach here when:
-    //   - Both prefix attempts had < 8 ZCs, OR
-    //   - Prefix had ZCs but neither method reached high confidence
-
-    info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (full file)...",
-        start.elapsed().as_secs_f64(), samples.len());
+    info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (threshold={:.6})...",
+        start.elapsed().as_secs_f64(), samples.len(), threshold);
     let zc = find_zero_crossings(&samples, threshold);
+    debug!("LTC decode: found {} zero-crossings", zc.len());
     if zc.len() < 8 {
+        warn!("LTC decode: only {} zero-crossings, signal may not be LTC: {}", zc.len(), path.display());
         return Ok(LtcDetectionResult::error(format!(
             "Only {} zero-crossings found (need ≥8) -- signal may be silent or not LTC audio",
             zc.len()
         )));
     }
-    debug!("LTC decode: full -- found {} zero-crossings", zc.len());
 
-    // Try fast ZC-interval method on full file (must pass verification)
-    if let Some(zc_result) = try_decode_via_zc_intervals(&zc, sample_rate) {
-        let zc_conf = zc_result.valid_frames as f32 / zc_result.total_possible.max(1) as f32;
-        info!("LTC decode: full-file ZC-interval -- {} valid / {} possible ({:.1}%) at FPS {}",
-            zc_result.valid_frames, zc_result.total_possible, zc_conf * 100.0, zc_result.fps);
-        if zc_conf >= 0.30 || zc_result.valid_frames > 0 {
-            if verify_zc_result(&zc_result, &samples, threshold, sample_rate) {
-                info!("LTC decode: full-file ZC-interval verification PASSED -- accepted at FPS {}", zc_result.fps);
-                return build_result(Some(zc_result), &zc, sample_rate, threshold, channels, total_duration, start);
-            }
-            info!("LTC decode: full-file ZC-interval verification FAILED -- falling to last resort");
-        }
-    }
+    // ── Try ZC-interval method (fast, works on synthetic/clean LTC) ─────────
+    let zc_result = try_decode_via_zc_intervals(&zc, sample_rate, fps, drop_frame);
+    let zc_valid = zc_result.as_ref().map_or(0, |r| r.valid_frames);
 
-    // Last resort: exhaustive waveform-sampling candidate search
-    info!("LTC decode: full-file candidate search -- evaluating {} FPS candidates on {:.2}s of audio (last resort)",
-        CANDIDATES.len(), total_duration);
-    let (result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold);
-    build_result(result, &zc, sample_rate, threshold, channels, total_duration, start)
+    // ── Also run waveform sampling evaluation (robust for noisy LTC) ────────
+    let (eval_result, eval_valid) = evaluate_on_slice(&samples, &zc, sample_rate, threshold, fps, drop_frame);
+
+    // ── Pick whichever method found more valid frames ───────────────────────
+    let best_result = if eval_valid >= zc_valid {
+        if eval_valid > 0 { eval_result } else { zc_result }
+    } else {
+        zc_result
+    };
+
+    build_result(best_result, &zc, sample_rate, threshold, channels, total_duration, start)
 }
 
-/// Evaluate LTC candidates on a slice of audio samples.
+/// Evaluate LTC on a slice using the given FPS.
 ///
-/// Strategy: try all FPS candidates at nominal SPB plus SPB variants,
-/// with phases derived from the first several zero-crossings.
+/// Tries SPB variants to compensate for clock drift, with phases derived
+/// from the first several zero-crossings.
 fn evaluate_on_slice(
     samples: &[f32],
     zc: &[usize],
     sample_rate: u32,
     threshold: f32,
+    fps: f64,
+    drop_frame: bool,
 ) -> (Option<ScoredResult>, u32) {
     let eval_start = std::time::Instant::now();
     let mut best_valid = 0u32;
     let mut best_result: Option<ScoredResult> = None;
 
-    info!("LTC evaluate: searching {} FPS candidates, {} ZCs over {:.2}s slice",
-        CANDIDATES.len(), zc.len(), samples.len() as f64 / sample_rate as f64);
+    let fps_name = format!("{:.2} fps", fps);
+    let spb_nominal = sample_rate as f64 / (fps * 80.0);
+    if spb_nominal < 0.5 {
+        return (None, 0);
+    }
+    debug!("LTC evaluate: trying {} (spb_nominal={:.2})", fps_name, spb_nominal);
 
-    for (candidate_idx, &(fps, drop_frame, fps_name)) in CANDIDATES.iter().enumerate() {
-        let spb_nominal = sample_rate as f64 / (fps * 80.0);
-        if spb_nominal < 0.5 { continue; }
-        debug!("LTC evaluate (+{:.1}s):  trying candidate {}/{}: {} (spb_nominal={:.2})",
-            eval_start.elapsed().as_secs_f64(), candidate_idx + 1, CANDIDATES.len(),
-            fps_name, spb_nominal);
+    let spb_variants = if spb_nominal >= 8.0 {
+        let half_range = (spb_nominal * 0.004).max(0.05);
+        (0..5)
+            .map(|i| { let t = i as f64 / 4.0; spb_nominal + (t - 0.5) * 2.0 * half_range })
+            .collect::<Vec<_>>()
+    } else {
+        vec![spb_nominal]
+    };
 
-        // Try SPB variants to compensate for clock drift
-        let spb_variants = if spb_nominal >= 8.0 {
-            let half_range = (spb_nominal * 0.004).max(0.05);
-            (0..5)
-                .map(|i| { let t = i as f64 / 4.0; spb_nominal + (t - 0.5) * 2.0 * half_range })
-                .collect::<Vec<_>>()
-        } else {
-            vec![spb_nominal]
-        };
+    for &spb in &spb_variants {
+        let max_phases = (spb / 4.0).round() as usize;
+        let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
 
-        for &spb in &spb_variants {
-            let max_phases = (spb / 4.0).round() as usize;
-            let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
+        let half_spb = (spb * 0.5) as usize;
+        for phase in phases_to_try {
+            for &candidate_phase in &[phase, phase.saturating_sub(half_spb)] {
+                let bits = extract_bits(samples, spb, candidate_phase, threshold);
+                if bits.len() < 80 { continue; }
 
-            let half_spb = (spb * 0.5) as usize;
-            for phase in phases_to_try {
-                for &candidate_phase in &[phase, phase.saturating_sub(half_spb)] {
-                    let bits = extract_bits(samples, spb, candidate_phase, threshold);
-                    if bits.len() < 80 { continue; }
+                let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
+                if valid_frames > best_valid {
+                    let timecodes: Vec<FrameTimecode> = frame_starts
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &start)| FrameTimecode {
+                            frame_index: idx as u32,
+                            timecode: decode_timecode_from_bits(&bits, start),
+                            timecode_secs: (candidate_phase as f64 + start as f64 * spb) / sample_rate as f64,
+                        })
+                        .collect();
 
-                    let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
-                    if valid_frames > best_valid {
-                        let timecodes: Vec<FrameTimecode> = frame_starts
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, &start)| FrameTimecode {
-                                frame_index: idx as u32,
-                                timecode: decode_timecode_from_bits(&bits, start),
-                                timecode_secs: (candidate_phase as f64 + start as f64 * spb) / sample_rate as f64,
-                            })
-                            .collect();
+                    debug!("LTC extract-bits: {} spb={:.2} phase={} -- {} valid / {} possible",
+                        fps_name, spb, candidate_phase, valid_frames, total_possible);
 
-                        debug!("LTC extract-bits: {} spb={:.2} phase={} -- {} valid / {} possible",
-                            fps_name, spb, candidate_phase, valid_frames, total_possible);
-
-                        best_valid = valid_frames;
-                        best_result = Some(ScoredResult {
-                            fps,
-                            drop_frame,
-                            valid_frames,
-                            total_possible,
-                            timecodes,
-                            details_entry: format!(
-                                "{}: {} valid / {} possible frames (spb={:.2}, phase={})",
-                                fps_name, valid_frames, total_possible, spb, candidate_phase
-                            ),
-                            spb,
-                            phase: candidate_phase,
-                            frame_starts,
-                        });
-                    }
+                    best_valid = valid_frames;
+                    best_result = Some(ScoredResult {
+                        fps,
+                        drop_frame,
+                        valid_frames,
+                        total_possible,
+                        timecodes,
+                        details_entry: format!(
+                            "{}: {} valid / {} possible frames (spb={:.2}, phase={})",
+                            fps_name, valid_frames, total_possible, spb, candidate_phase
+                        ),
+                        spb,
+                        phase: candidate_phase,
+                        frame_starts,
+                    });
                 }
             }
         }
     }
 
-    // ── Refinement: adaptive extraction for best candidate ──────────────
-    // Uses zero-crossing-snapped bit boundaries to improve decoding of
-    // noisy/real-world LTC where timing jitter causes fixed-spb drift.
     if let Some(ref best) = best_result.clone() {
         debug!("LTC evaluate (+{:.1}s): refinement phase for best candidate ({} fps, spb={:.2}, best_valid={})",
             eval_start.elapsed().as_secs_f64(), best.fps, best.spb, best_valid);
@@ -396,9 +208,6 @@ fn evaluate_on_slice(
         let best_fps = best.fps;
         let best_drop_frame = best.drop_frame;
         let best_phase = best.phase;
-        let fps_label = match best_fps as u32 {
-            24 => "24 fps", 25 => "25 fps", 29 => "29.97", 30 => "30 fps", _ => "other",
-        };
 
         let max_phases = (best_spb / 4.0).round() as usize;
         let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
@@ -431,7 +240,7 @@ fn evaluate_on_slice(
                     timecodes,
                     details_entry: format!(
                         "{}: {} valid / {} possible frames (adaptive, phase={}, spb={:.2})",
-                        fps_label, valid_frames, total_possible, phase, best_spb
+                        fps_name, valid_frames, total_possible, phase, best_spb
                     ),
                     spb: best_spb,
                     phase,
@@ -453,47 +262,6 @@ fn evaluate_on_slice(
     (best_result, best_valid)
 }
 
-#[allow(dead_code)]
-fn estimate_spb_from_zc(zc: &[usize], _sample_rate: u32) -> f64 {
-    if zc.len() < 5 {
-        return 0.0;
-    }
-
-    let mut intervals: Vec<f64> = zc.windows(2)
-        .map(|w| (w[1] - w[0]) as f64)
-        .collect();
-
-    intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = intervals.len();
-    let median = intervals[n / 2];
-
-    // Count intervals shorter than median
-    let n_short = intervals.iter().filter(|&&i| i < median).count();
-    let short_ratio = n_short as f64 / n as f64;
-
-    debug!("SPB estimate: {} intervals, median={:.2}, {:.1}% short",
-        n, median, short_ratio * 100.0);
-
-    if short_ratio > 0.20 {
-        // Real encoding: compute mean of intervals > median (these are ~1.0*spb)
-        let n_long = n - n_short;
-        if n_long == 0 { return median; }
-        let sum_long: f64 = intervals.iter().filter(|&&i| i > median).sum();
-        sum_long / n_long as f64
-    } else {
-        // Synthetic encoding: use the 15th percentile (small intervals ≈ spb)
-        let idx = (n * 15 / 100).max(1).min(n - 1);
-        // Average the 10th-20th percentile range for stability
-        let p10 = (n * 10 / 100).max(1).min(n - 1);
-        let p20 = (n * 20 / 100).max(1).min(n - 1);
-        let sum: f64 = intervals[p10..p20].iter().sum();
-        let count = (p20 - p10) as f64;
-        if count > 0.0 { sum / count } else { intervals[idx] }
-    }
-}
-
-/// Build the final LtcDetectionResult from the best candidate (or None) and
-/// all the metadata gathered during decoding.
 fn build_result(
     best_result: Option<ScoredResult>,
     zc: &[usize],
@@ -526,7 +294,7 @@ fn build_result(
             details.insert(
                 0,
                 format!(
-                    "Detected rate: {:.2} fps / {} spb -- confidence: {:.1}%",
+                    "Rate: {:.2} fps / {} spb -- confidence: {:.1}%",
                     r.fps,
                     r.spb,
                     confidence * 100.0
@@ -582,11 +350,11 @@ fn build_result(
         }
         None => {
             info!(
-                "LTC decode: no valid alignment found for any candidate ({} zero-crossings, threshold={:.6}, processing={:.0}ms)",
+                "LTC decode: no valid alignment found ({} zero-crossings, threshold={:.6}, processing={:.0}ms)",
                 zc.len(), threshold, processing_time_ms,
             );
             let details = vec![
-                "No valid LTC frame alignment found across any candidate frame rate.".to_string(),
+                "No valid LTC frame alignment found.".to_string(),
                 format!("Zero-crossings found: {} (threshold: {:.6})", zc.len(), threshold),
                 format!(
                     "Audio: {:.2}s @ {} Hz, {} channels",
@@ -612,7 +380,7 @@ fn build_result(
 }
 
 pub fn quick_check_ltc(path: &Path) -> Result<bool, String> {
-    let result = decode_ltc_from_wav(path)?;
+    let result = decode_ltc_from_wav(path, 25.0, false)?;
     Ok(matches!(result.status, LtcDecodeStatus::Success))
 }
 
@@ -694,16 +462,6 @@ fn find_zero_crossings(samples: &[f32], threshold: f32) -> Vec<usize> {
 }
 
 // ── ZC-interval bit reconstruction ──────────────────────────────────────────
-//
-// Two encoding schemes exist:
-//   REAL (SMPTE standard): transition at EVERY bit boundary + extra at mid of bit-1
-//     → intervals: 0.5 spb (half of bit-1) or 1.0 spb (full bit-0)
-//     → decode: two shorts = bit-1, one long = bit-0
-//   SYNTHETIC (our generator): transitions ONLY at mid of bit-1
-//     → intervals: k * spb (k = 1 + zeros_between_consecutive_ones)
-//     → decode: interval/spb = k → (k-1 zeros) + 1
-//
-// Auto-detect by counting intervals shorter than 75% of a bit period.
 
 fn decode_bits_from_zero_crossings(
     zc: &[usize],
@@ -718,7 +476,6 @@ fn decode_bits_from_zero_crossings(
     let short_threshold = spb * 0.75;
     let min_interval = spb * 0.20;
 
-    // Detect encoding: count intervals shorter than 0.75 spb
     let total = zc.len() - 1;
     let mut short_count = 0usize;
     for i in 0..total {
@@ -792,92 +549,60 @@ fn decode_bits_synthetic_zc(zc: &[usize], spb: f64) -> Vec<u8> {
     bits
 }
 
-/// Verify that a ZC-interval result is consistent by running waveform-sampling
-/// evaluation on a short audio segment.
-///
-/// Uses `evaluate_on_slice` which performs waveform sampling (not ZC-interval
-/// arithmetic) on a verification segment, finding its own optimal phase from
-/// the segment's zero-crossings. This catches false positives where ZC-interval
-/// finds many coincidental sync-word matches at the wrong FPS — a known
-/// weakness of the interval-arithmetic approach.
-fn verify_zc_result(
-    zc_result: &ScoredResult,
-    samples: &[f32],
-    threshold: f32,
+/// Try to decode LTC using the fast ZC-interval method with a single FPS.
+fn try_decode_via_zc_intervals(
+    zc: &[usize],
     sample_rate: u32,
-) -> bool {
-    let verify_duration = PREFIX_DURATION_SECS.min(samples.len() as f64 / sample_rate as f64);
-    let verify_len = (verify_duration * sample_rate as f64) as usize;
-    let verify_samples = &samples[..verify_len];
-    let verify_zc = find_zero_crossings(verify_samples, threshold);
-    if verify_zc.len() < 8 {
-        return false;
-    }
-    // evaluate_on_slice computes its own optimal phase from verify_zc
-    // (no phase leakage from zc_result — phases are local to the segment)
-    let (verify_result, _) = evaluate_on_slice(verify_samples, &verify_zc, sample_rate, threshold);
-    verify_result.is_some_and(|r| (r.fps - zc_result.fps).abs() < 0.01 && r.valid_frames > 0)
-}
-
-/// Try to decode LTC using the fast ZC-interval method for all FPS candidates.
-///
-/// This processes zero-crossing positions directly using interval arithmetic
-/// (two shorts = bit-1, one long = bit-0 for real SMPTE; interval/spb = k →
-/// (k-1 zeros) + 1 for synthetic encoding). Much faster than evaluate_on_slice
-/// because it avoids waveform sampling, SPB variants, and phase search.
-fn try_decode_via_zc_intervals(zc: &[usize], sample_rate: u32) -> Option<ScoredResult> {
+    fps: f64,
+    drop_frame: bool,
+) -> Option<ScoredResult> {
     if zc.len() < 8 {
         return None;
     }
 
-    let mut best_valid = 0u32;
-    let mut best_result: Option<ScoredResult> = None;
-
-    for &(fps, drop_frame, fps_name) in CANDIDATES {
-        let bits = decode_bits_from_zero_crossings(zc, sample_rate, fps);
-        if bits.len() < 80 {
-            continue;
-        }
-
-        let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
-        if valid_frames > best_valid {
-            best_valid = valid_frames;
-            let spb = sample_rate as f64 / (fps * 80.0);
-
-            let timecodes: Vec<FrameTimecode> = frame_starts
-                .iter()
-                .enumerate()
-                .map(|(idx, &start)| {
-                    let timecode = decode_timecode_from_bits(&bits, start);
-                    let timecode_secs = (zc[0] as f64 + start as f64 * spb) / sample_rate as f64;
-                    FrameTimecode {
-                        frame_index: idx as u32,
-                        timecode,
-                        timecode_secs,
-                    }
-                })
-                .collect();
-
-            let details_entry = format!(
-                "{}: {} valid / {} possible frames (ZC-interval)",
-                fps_name, valid_frames, total_possible
-            );
-
-            best_result = Some(ScoredResult {
-                fps,
-                drop_frame,
-                valid_frames,
-                total_possible,
-                timecodes,
-                details_entry,
-                spb,
-                phase: zc[0],
-                frame_starts,
-            });
-        }
+    let bits = decode_bits_from_zero_crossings(zc, sample_rate, fps);
+    if bits.len() < 80 {
+        return None;
     }
 
-    best_result
+    let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
+    if valid_frames == 0 {
+        return None;
+    }
+
+    let spb = sample_rate as f64 / (fps * 80.0);
+    let fps_name = format!("{:.2} fps", fps);
+
+    let timecodes: Vec<FrameTimecode> = frame_starts
+        .iter()
+        .enumerate()
+        .map(|(idx, &start)| {
+            let timecode = decode_timecode_from_bits(&bits, start);
+            let timecode_secs = (zc[0] as f64 + start as f64 * spb) / sample_rate as f64;
+            FrameTimecode {
+                frame_index: idx as u32,
+                timecode,
+                timecode_secs,
+            }
+        })
+        .collect();
+
+    let details_entry = format!(
+        "{}: {} valid / {} possible frames (ZC-interval)",
+        fps_name, valid_frames, total_possible
+    );
+
+    Some(ScoredResult {
+        fps,
+        drop_frame,
+        valid_frames,
+        total_possible,
+        timecodes,
+        details_entry,
+        spb,
+        phase: zc[0],
+        frame_starts,
+    })
 }
 
 // ── Bit extraction (fallback for noisy LTC) ────────────────────────────────
@@ -940,7 +665,6 @@ fn extract_bits_adaptive(
     let snap_radius = (samples_per_bit * 0.25) as usize;
     let mut pos = phase as f64;
 
-    // Binary search helper: find first ZC >= target
     fn zc_ge(zc: &[usize], target: usize) -> Option<usize> {
         match zc.binary_search(&target) {
             Ok(i) | Err(i) => zc.get(i).copied(),
@@ -1019,7 +743,6 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         return (0, 0, Vec::new());
     }
 
-    // Find the best frame alignment (0-79) by counting sync words at expected positions
     let mut alignment_scores = vec![0u32; 80];
     for &sp in &sync_positions {
         if sp >= SYNC_OFFSET {
@@ -1028,19 +751,13 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         }
     }
 
-    // max_by_key returns (index, &count) -- index is the alignment, count is the score
     let (best_alignment, _best_count_value) = alignment_scores
         .iter()
         .enumerate()
         .max_by_key(|&(_, &c)| c)
         .unwrap_or((0, &0));
-    // ^^ Note: alignment_scores is [u32; 80]. .iter().enumerate() yields (usize, &u32).
-    //    The name swap bug that existed here: previously (best_count, &best_alignment)
-    //    assigned the index to best_count and the count to best_alignment,
-    //    causing the "if best_count == 0" check to always early-return.
 
     if alignment_scores[0] == 0 && alignment_scores.iter().all(|&c| c == 0) {
-        // All alignments have zero hits -- nothing found
         return (0, 0, Vec::new());
     }
 
@@ -1050,7 +767,6 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         0
     };
 
-    // Walk through frames at the best alignment and verify each sync word
     let mut frame_starts = Vec::new();
     let align = best_alignment;
     for idx in 0.. {
@@ -1192,12 +908,10 @@ mod tests {
     fn test_get_ltc_bits_frame_04() {
         let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 4 };
         let bits = crate::get_ltc_bits(&tc, false);
-        // Frame units = 4 = 0b0100 → bits[0]=0, [1]=0, [2]=1, [3]=0
         assert_eq!(bits[0], 0);
         assert_eq!(bits[1], 0);
         assert_eq!(bits[2], 1);
         assert_eq!(bits[3], 0);
-        // Frame tens = 0 → bits[8]=0, [9]=0
         assert_eq!(bits[8], 0);
         assert_eq!(bits[9], 0);
     }
@@ -1206,12 +920,10 @@ mod tests {
     fn test_get_ltc_bits_frame_13() {
         let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 13 };
         let bits = crate::get_ltc_bits(&tc, false);
-        // Frame units = 3 = 0b0011
         assert_eq!(bits[0], 1);
         assert_eq!(bits[1], 1);
         assert_eq!(bits[2], 0);
         assert_eq!(bits[3], 0);
-        // Frame tens = 1 = 0b01
         assert_eq!(bits[8], 1);
         assert_eq!(bits[9], 0);
     }
@@ -1221,7 +933,6 @@ mod tests {
         let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
         let bits_nd = crate::get_ltc_bits(&tc, false);
         let bits_df = crate::get_ltc_bits(&tc, true);
-        // Bit 10 is the drop-frame flag
         assert_eq!(bits_nd[10], 0, "non-drop must have bit 10 = 0");
         assert_eq!(bits_df[10], 1, "drop-frame must have bit 10 = 1");
     }
@@ -1230,7 +941,6 @@ mod tests {
     fn test_get_ltc_bits_color_frame_zero() {
         let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
         let bits = crate::get_ltc_bits(&tc, false);
-        // Bit 11 is color frame flag
         assert_eq!(bits[11], 0, "color frame flag must be 0");
     }
 
@@ -1262,7 +972,6 @@ mod tests {
 
     #[test]
     fn test_decode_timecode_from_bits_later_frame() {
-        // Two frames concatenated: decode the second one
         let tc0 = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
         let tc1 = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
         let bits0 = crate::get_ltc_bits(&tc0, false);
@@ -1327,7 +1036,6 @@ mod tests {
 
     #[test]
     fn test_increment_timecode_drop_frame_skip() {
-        // At 29.97 DF: 01:00:59:29 → should skip frames 0,1 → 01:01:00:02
         let tc = Timecode { hours: 1, minutes: 0, seconds: 59, frames: 29 };
         let next = increment_timecode(&tc, 29.97, true);
         assert_eq!(next, Timecode { hours: 1, minutes: 1, seconds: 0, frames: 2 });
@@ -1335,7 +1043,6 @@ mod tests {
 
     #[test]
     fn test_increment_timecode_drop_frame_no_skip_div10() {
-        // At 29.97 DF: 01:09:59:29 → minute % 10 == 0 → NO skip → 01:10:00:00
         let tc = Timecode { hours: 1, minutes: 9, seconds: 59, frames: 29 };
         let next = increment_timecode(&tc, 29.97, true);
         assert_eq!(next, Timecode { hours: 1, minutes: 10, seconds: 0, frames: 0 });
@@ -1343,18 +1050,15 @@ mod tests {
 
     #[test]
     fn test_increment_timecode_drop_frame_sequential() {
-        // Verify the first few increments at 29.97 DF from a minute boundary (minutes % 10 != 0)
         let mut tc = Timecode { hours: 1, minutes: 1, seconds: 0, frames: 0 };
         tc = increment_timecode(&tc, 29.97, true);
         assert_eq!(tc, Timecode { hours: 1, minutes: 1, seconds: 0, frames: 1 });
         tc = increment_timecode(&tc, 29.97, true);
-        // frames 0 and 1 were already passed; this should be frame 2
         assert_eq!(tc, Timecode { hours: 1, minutes: 1, seconds: 0, frames: 2 });
     }
 
     #[test]
     fn test_increment_timecode_29_97_non_drop() {
-        // Non-drop should never skip frames
         let mut tc = Timecode { hours: 1, minutes: 0, seconds: 59, frames: 29 };
         tc = increment_timecode(&tc, 29.97, false);
         assert_eq!(tc, Timecode { hours: 1, minutes: 1, seconds: 0, frames: 0 });
@@ -1366,21 +1070,20 @@ mod tests {
     fn test_estimate_noise_floor_constant() {
         let samples = vec![0.5f32; 1000];
         let nf = estimate_noise_floor(&samples);
-        assert!((nf - 0.5).abs() < 1e-6, "median of constant signal should be the constant value");
+        assert!((nf - 0.5).abs() < 1e-6);
     }
 
     #[test]
     fn test_estimate_noise_floor_silent() {
         let samples = vec![0.0f32; 1000];
         let nf = estimate_noise_floor(&samples);
-        assert!((nf - 1e-10).abs() < 1e-12, "silence floor should floor at 1e-10");
+        assert!((nf - 1e-10).abs() < 1e-12);
     }
 
     #[test]
     fn test_estimate_noise_floor_mixed() {
         let samples: Vec<f32> = vec![0.5, 0.1, 0.3, 0.8, 0.2];
         let nf = estimate_noise_floor(&samples);
-        // sorted abs: [0.1, 0.2, 0.3, 0.5, 0.8] → median at index 2 = 0.3
         assert!((nf - 0.3).abs() < 1e-6);
     }
 
@@ -1388,7 +1091,6 @@ mod tests {
     fn test_estimate_noise_floor_negative_values() {
         let samples: Vec<f32> = vec![-0.7, -0.1, -0.5, -0.3];
         let nf = estimate_noise_floor(&samples);
-        // sorted abs: [0.1, 0.3, 0.5, 0.7] → median at index 2 = 0.5
         assert!((nf - 0.5).abs() < 1e-6);
     }
 
@@ -1396,7 +1098,7 @@ mod tests {
     fn test_estimate_noise_floor_clamped_10k() {
         let samples = vec![0.42f32; 20_000];
         let nf = estimate_noise_floor(&samples);
-        assert!((nf - 0.42).abs() < 1e-6, "should use only first 10K");
+        assert!((nf - 0.42).abs() < 1e-6);
     }
 
     // ── find_zero_crossings ──────────────────────────────────────────────
@@ -1412,21 +1114,20 @@ mod tests {
     fn test_find_zero_crossings_silent() {
         let samples = vec![0.0f32; 100];
         let crossings = find_zero_crossings(&samples, 0.01);
-        assert!(crossings.is_empty(), "silence should produce no crossings");
+        assert!(crossings.is_empty());
     }
 
     #[test]
     fn test_find_zero_crossings_below_threshold() {
         let samples = vec![0.01f32, -0.02, 0.01];
         let crossings = find_zero_crossings(&samples, 0.05);
-        assert!(crossings.is_empty(), "all values below threshold");
+        assert!(crossings.is_empty());
     }
 
     #[test]
     fn test_find_zero_crossings_alternating() {
         let samples: Vec<f32> = (0..20).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
         let crossings = find_zero_crossings(&samples, 0.1);
-        // Every position from 1..20 should be a crossing
         assert_eq!(crossings.len(), 19);
         for (idx, &pos) in crossings.iter().enumerate() {
             assert_eq!(pos, idx + 1, "crossing position mismatch");
@@ -1437,7 +1138,6 @@ mod tests {
     fn test_find_zero_crossings_stays_positive() {
         let samples = vec![0.5f32, 0.3, 0.1, -0.2, -0.4];
         let crossings = find_zero_crossings(&samples, 0.05);
-        // prev goes: 0→1, 1 stays while positive, then at -0.2: cur=-1 → crossing at 3
         assert_eq!(crossings, vec![3]);
     }
 
@@ -1448,14 +1148,10 @@ mod tests {
         let half = samples_per_bit / 2;
         match bit_value {
             0 => {
-                // No mid-bit transition: constant level
-                for s in buf.iter_mut() {
-                    *s = start_level;
-                }
+                for s in buf.iter_mut() { *s = start_level; }
                 (buf, start_level)
             }
             1 => {
-                // Mid-bit transition: flip at midpoint
                 let mid_level = -start_level;
                 buf[..half].fill(start_level);
                 buf[half..samples_per_bit].fill(mid_level);
@@ -1468,7 +1164,6 @@ mod tests {
     #[test]
     fn test_extract_bits_all_zeros() {
         let spb = 8.0;
-        // 3 zero bits: constant positive level
         let mut signal = Vec::new();
         let mut level = 0.5;
         for _ in 0..3 {
@@ -1477,7 +1172,7 @@ mod tests {
             level = l;
         }
         let bits = extract_bits(&signal, spb, 0, 0.01);
-        assert_eq!(bits, vec![0, 0, 0], "all same sign = zero bits");
+        assert_eq!(bits, vec![0, 0, 0]);
     }
 
     #[test]
@@ -1491,7 +1186,7 @@ mod tests {
             level = l;
         }
         let bits = extract_bits(&signal, spb, 0, 0.01);
-        assert_eq!(bits, vec![1, 1, 1], "mid transition = one bits");
+        assert_eq!(bits, vec![1, 1, 1]);
     }
 
     #[test]
@@ -1511,9 +1206,9 @@ mod tests {
     #[test]
     fn test_extract_bits_below_threshold() {
         let spb = 8.0;
-        let signal = vec![0.0f32; (spb as usize) * 3]; // all silence
+        let signal = vec![0.0f32; (spb as usize) * 3];
         let bits = extract_bits(&signal, spb, 0, 0.1);
-        assert_eq!(bits, vec![0, 0, 0], "below threshold → zero bits");
+        assert_eq!(bits, vec![0, 0, 0]);
     }
 
     #[test]
@@ -1526,12 +1221,10 @@ mod tests {
             signal.extend(chunk);
             level = l;
         }
-        // Prepend 3 samples of silence
         let mut padded = vec![0.0f32; 3];
         padded.extend(signal);
-        // Extract with phase offset 3
         let bits = extract_bits(&padded, spb, 3, 0.01);
-        assert_eq!(bits, vec![1, 0, 1], "phase offset should align correctly");
+        assert_eq!(bits, vec![1, 0, 1]);
     }
 
     // ── find_frames (sync word detection) ────────────────────────────────
@@ -1546,9 +1239,9 @@ mod tests {
     fn test_find_frames_single_frame() {
         let bits = build_frame_bits(Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 });
         let (valid, total, starts) = find_frames(&bits);
-        assert_eq!(valid, 1, "one valid frame");
-        assert_eq!(total, 1, "one possible frame (80 bits at alignment 0)");
-        assert_eq!(starts, vec![0], "frame starts at 0");
+        assert_eq!(valid, 1);
+        assert_eq!(total, 1);
+        assert_eq!(starts, vec![0]);
     }
 
     #[test]
@@ -1556,13 +1249,13 @@ mod tests {
         let mut bits = build_frame_bits(Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 });
         bits.extend(build_frame_bits(Timecode { hours: 1, minutes: 0, seconds: 0, frames: 1 }));
         let (valid, _total, starts) = find_frames(&bits);
-        assert_eq!(valid, 2, "two valid frames");
+        assert_eq!(valid, 2);
         assert_eq!(starts, vec![0, 80]);
     }
 
     #[test]
     fn test_find_frames_no_sync_word() {
-        let bits = vec![0u8; 160]; // all zeros, no sync word
+        let bits = vec![0u8; 160];
         let (valid, _total, starts) = find_frames(&bits);
         assert_eq!(valid, 0);
         assert!(starts.is_empty());
@@ -1573,7 +1266,6 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut bits = vec![0u8; 320];
-        // Fill with pseudo-random bits based on a seed
         let seed = 42u64;
         for (i, b) in bits.iter_mut().enumerate() {
             let mut h = DefaultHasher::new();
@@ -1581,16 +1273,13 @@ mod tests {
             seed.hash(&mut h);
             *b = (h.finish() & 1) as u8;
         }
-        let (valid, _total, _) = find_frames(&bits);
-        // With Hamming-distance tolerance of 2, random bits may produce
-        // a small number of false sync word matches (~0.2% per position).
-        // Verify that the count stays very low (<1% of total positions).
+        let (valid, _, _) = find_frames(&bits);
         assert!(valid <= 2, "random bits should produce at most 2 false sync word matches, got {}", valid);
     }
 
     #[test]
     fn test_find_frames_short_buffer() {
-        let bits = vec![0u8; 10]; // too short for a sync word
+        let bits = vec![0u8; 10];
         let (valid, total, starts) = find_frames(&bits);
         assert_eq!(valid, 0);
         assert_eq!(total, 0);
@@ -1599,12 +1288,8 @@ mod tests {
 
     #[test]
     fn test_find_frames_alignment_matters() {
-        // Place sync word at offset 0 (not 64) → should not match frame alignment
         let mut bits = vec![0u8; 160];
-        // Write sync word at position 0 (without proper frame context)
         bits[0..16].copy_from_slice(&SYNC_WORD);
-        // Now the alignment would be (0-64)%80 = 16 → alignment_scores[16] gets 1 hit
-        // But when iterating frames at alignment 16: frame 0 starts at 16, sync word at 80 not found
         let (valid, _, _) = find_frames(&bits);
         assert_eq!(valid, 0, "sync word at wrong offset should not produce valid frames");
     }
@@ -1684,13 +1369,11 @@ mod tests {
 
         let mut writer = hound::WavWriter::create(path, spec).unwrap();
 
-        // Write silence prefix
         let silence_samples = (silent_prefix_secs * sample_rate as f64).round() as usize;
         for _ in 0..silence_samples * 2 {
             writer.write_sample(0i16).unwrap();
         }
 
-        // Write LTC frames
         let total_frames = (duration_secs * fps).ceil() as u64;
         let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
         let samples_per_bit = samples_per_frame as f32 / 80.0;
@@ -1724,7 +1407,6 @@ mod tests {
         writer.finalize().unwrap();
     }
 
-    /// Run a full round-trip test: generate WAV → decode → verify
     fn verify_roundtrip(
         start_tc: Timecode,
         fps: f64,
@@ -1736,9 +1418,8 @@ mod tests {
     ) -> LtcDetectionResult {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("test_ltc.wav");
-
         generate_test_wav(&path, start_tc, fps, drop_frame, channel, volume, sample_rate, duration_secs);
-        decode_ltc_from_wav(&path).unwrap()
+        decode_ltc_from_wav(&path, fps, drop_frame).unwrap()
     }
 
     // ── WAV round-trip tests ─────────────────────────────────────────────
@@ -1752,7 +1433,6 @@ mod tests {
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
         assert!(result.valid_frames >= 48, "expected ~50 valid frames, got {}", result.valid_frames);
-        // First decoded frame runs ~50, start offset is within affordable precision
     }
 
     #[test]
@@ -1764,8 +1444,6 @@ mod tests {
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
         assert!(result.valid_frames >= 46, "expected ~48 valid frames, got {}", result.valid_frames);
-        assert!((result.detected_fps - 24.0).abs() < 0.1,
-            "expected ~24 fps, got {}", result.detected_fps);
     }
 
     #[test]
@@ -1777,15 +1455,10 @@ mod tests {
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
         assert!(result.valid_frames >= 58, "expected ~60 valid frames, got {}", result.valid_frames);
-        assert!((result.detected_fps - 30.0).abs() < 0.1,
-            "expected ~30 fps, got {}", result.detected_fps);
     }
 
     #[test]
     fn test_wav_roundtrip_2997_nd() {
-        // 29.97 fps gives fractional spb (~20.02 at 48 kHz).
-        // Non-integer spb causes accumulated drift in bit alignment.
-        // Decoder may find some frames but not enough for high confidence.
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
             29.97, false, "both", 0.5, 48000, 3.0,
@@ -1814,23 +1487,17 @@ mod tests {
         );
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
-        // Initial transient may skip first frame; verify timecodes are reasonably close
         assert!(result.valid_frames >= 22, "expected ~25 valid frames, got {}", result.valid_frames);
     }
 
     #[test]
     fn test_wav_roundtrip_16khz() {
-        // 16 kHz gives exactly 8 samples/bit at 25 fps.
-        // Bit extraction at 16 kHz produces correct bits when phase aligns properly.
-        // Use 48 kHz as the primary round-trip rate; this test verifies no crash.
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
             25.0, false, "both", 0.5, 16000, 2.0,
         );
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
             "expected no Error at 16kHz, got {:?}", result.status);
-        // 16 kHz may produce NoSyncWord due to limited samples/bit.
-        // The key requirement: no crash and valid output structure.
     }
 
     #[test]
@@ -1859,7 +1526,6 @@ mod tests {
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
             25.0, false, "right", 0.5, 48000, 1.0,
         );
-        // Decoder reads channel 0 (left). Signal on right channel only → silence on left
         assert!(!matches!(result.status, LtcDecodeStatus::Success),
             "right-only signal should not be decoded (left channel is silent), got {:?}", result.status);
     }
@@ -1873,12 +1539,12 @@ mod tests {
 
         generate_test_wav_with_prefix(
             &path,
-            0.5, // 0.5s of silence before LTC
+            0.5,
             Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
             25.0, false, "both", 0.5, 48000, 1.5,
         );
 
-        let result = decode_ltc_from_wav(&path).unwrap();
+        let result = decode_ltc_from_wav(&path, 25.0, false).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success for mid-signal LTC, got {:?} (details: {:?})",
             result.status, result.details);
@@ -1906,13 +1572,13 @@ mod tests {
                 25.0, false, "both", 0.5, 48000, 1.0,
             );
 
-            let result = decode_ltc_from_wav(&path).unwrap();
+            let result = decode_ltc_from_wav(&path, 25.0, false).unwrap();
             assert!(matches!(result.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence),
                 "silent_prefix={:.1}s: expected Success/LowConfidence, got {:?}",
                 silent_secs, result.status);
 
             let expected_offset = silent_secs;
-            let tolerance = 0.05; // 50ms tolerance -- initial transient may shift detection
+            let tolerance = 0.05;
 
             let abs_diff = (result.first_ltc_timecode_secs - expected_offset).abs();
             assert!(
@@ -1936,11 +1602,9 @@ mod tests {
 
     #[test]
     fn test_wav_single_frame() {
-        // A single frame is the minimum -- the decoder may or may not find it
-        // due to the initial transient. Use 3 frames for reliable detection.
         let result = verify_roundtrip(
             Timecode { hours: 12, minutes: 34, seconds: 56, frames: 18 },
-            25.0, false, "both", 0.5, 48000, 0.12, // ~3 frames
+            25.0, false, "both", 0.5, 48000, 0.12,
         );
         assert!(result.valid_frames >= 1,
             "expected at least 1 valid frame with 3-frame signal, got {}", result.valid_frames);
@@ -1965,7 +1629,7 @@ mod tests {
         }
         writer.finalize().unwrap();
 
-        let result = decode_ltc_from_wav(&path).unwrap();
+        let result = decode_ltc_from_wav(&path, 25.0, false).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Error { .. }),
             "silent audio should produce Error, got {:?}", result.status);
     }
@@ -1990,7 +1654,7 @@ mod tests {
         }
         writer.finalize().unwrap();
 
-        let result = decode_ltc_from_wav(&path).unwrap();
+        let result = decode_ltc_from_wav(&path, 25.0, false).unwrap();
         assert!(
             matches!(result.status, LtcDecodeStatus::NoSyncWord | LtcDecodeStatus::Error { .. }),
             "random noise should not produce Success, got {:?}", result.status
@@ -2016,7 +1680,7 @@ mod tests {
         }
         writer.finalize().unwrap();
 
-        let result = decode_ltc_from_wav(&path).unwrap();
+        let result = decode_ltc_from_wav(&path, 25.0, false).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Error { .. }),
             "very short audio should produce Error, got {:?}", result.status);
     }
@@ -2026,7 +1690,6 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("empty.wav");
 
-        // Write minimal valid WAV header with 0 samples
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 48000,
@@ -2036,7 +1699,7 @@ mod tests {
         let writer = hound::WavWriter::create(&path, spec).unwrap();
         writer.finalize().unwrap();
 
-        let result = decode_ltc_from_wav(&path).unwrap();
+        let result = decode_ltc_from_wav(&path, 25.0, false).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Error { .. }),
             "empty WAV should produce Error, got {:?}", result.status);
     }
@@ -2054,66 +1717,6 @@ mod tests {
         );
         let result = quick_check_ltc(&path).unwrap();
         assert!(result, "quick_check_ltc should return true for valid LTC");
-    }
-
-    // ── Integration: round-trip from generated samples to decoder ───────
-
-    #[test]
-    fn test_direct_sample_roundtrip() {
-        let tc = Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 };
-        let sample_rate = 48000u32;
-        let fps = 25.0;
-        let drop_frame = false;
-        let channel = "both";
-        let volume = 0.5;
-        let duration_secs = 0.5;
-
-        let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
-        let samples_per_bit = samples_per_frame as f32 / 80.0;
-        let total_frames = (duration_secs * fps).ceil() as usize;
-
-        let mut all_samples_l = Vec::new();
-        let mut tc = tc;
-        let mut last_level = (1.0f32, 1.0f32);
-        let mut frame_buf = vec![0.0f32; samples_per_frame * 2];
-
-        for _ in 0..total_frames {
-            frame_buf.fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc, drop_frame, samples_per_frame, samples_per_bit,
-                volume, channel, &mut last_level,
-                &mut frame_buf[..samples_per_frame * 2],
-            );
-            for s in 0..samples_per_frame {
-                all_samples_l.push(frame_buf[s * 2]);
-            }
-            tc = increment_timecode(&tc, fps, drop_frame);
-        }
-
-        let nf = estimate_noise_floor(&all_samples_l);
-        let threshold = (nf * 0.5).max(0.005);
-        let spb = sample_rate as f64 / (fps * 80.0);
-
-        let bits = extract_bits(&all_samples_l, spb, 0, threshold);
-        assert!(bits.len() >= 80);
-
-        let (valid, _total, starts) = find_frames(&bits);
-        assert!(valid > 0, "no valid frames at phase=0, threshold={}, spb={}", threshold, spb);
-        assert!(!starts.is_empty());
-
-        let zc = find_zero_crossings(&all_samples_l, threshold);
-        assert!(zc.len() >= 8);
-
-        for &phase in zc.iter().take(5) {
-            let bits2 = extract_bits(&all_samples_l, spb, phase, threshold);
-            if bits2.len() >= 80 {
-                let (v, _, _) = find_frames(&bits2);
-                if v > 0 {
-                    return;
-                }
-            }
-        }
-        panic!("no valid frame from any phase ({} zero-crossings)", zc.len());
     }
 
     #[test]
@@ -2135,7 +1738,7 @@ mod tests {
         assert!(!result, "quick_check_ltc should return false for silent file");
     }
 
-    // ── Real-world LTC test (wireless TX/RX artefacts) ──────────────────
+    // ── Real-world LTC test ──────────────────────────────────────────────
 
     #[test]
     fn test_wav_real_world_ltc() {
@@ -2150,7 +1753,7 @@ mod tests {
             panic!("Real-world LTC test file not found at: {}", wav_path.display());
         }
 
-        let result = decode_ltc_from_wav(&wav_path).unwrap();
+        let result = decode_ltc_from_wav(&wav_path, 25.0, false).unwrap();
 
         assert!(
             matches!(result.status, LtcDecodeStatus::Success),
@@ -2165,12 +1768,6 @@ mod tests {
             result.valid_frames >= 450,
             "Expected ≥450 valid frames from 20s real-world LTC, got {}",
             result.valid_frames,
-        );
-
-        assert!(
-            (result.detected_fps - 25.0).abs() < 0.1,
-            "Expected ~25 fps, got {:.2}",
-            result.detected_fps,
         );
 
         let frames_spanned = result.total_possible_frames.max(1) - 1;

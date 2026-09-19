@@ -103,6 +103,15 @@ fn _run_gui(
         ui.set_fps_options(fps_model);
     }
 
+    // ── Populate decode FPS options model ────────────────────────────────────
+    {
+        let decode_fps_names: Vec<SharedString> = FPS_OPTIONS
+            .iter()
+            .map(|opt| SharedString::from(opt.name))
+            .collect();
+        ui.set_decode_fps_options(ModelRc::new(VecModel::<SharedString>::from(decode_fps_names)));
+    }
+
     // ── Populate sample rate options ────────────────────────────────────────
     {
         let rate_model = ModelRc::new(VecModel::<SharedString>::from(
@@ -144,6 +153,7 @@ fn _run_gui(
         set_tc_segments(&ui, &tc_str);
         ui.set_ms_text(SharedString::from(timecode::timecode_to_ms_string(s.current_timecode, s.fps)));
         ui.set_fps_name(SharedString::from(FPS_OPTIONS[s.fps_index].name));
+        ui.set_decode_fps_index(s.decode_fps_index as i32);
     }
 
     // ── Refresh devices ────────────────────────────────────────────────────
@@ -783,6 +793,14 @@ fn _run_gui(
             let _ = cmd.send(GuiCommand::ParseLtcFile(
                 full_path.to_string_lossy().to_string(),
             ));
+        });
+    }
+
+    // ── Decode FPS selection callback ───────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_decode_fps_selected(move |index| {
+            let _ = cmd.send(GuiCommand::SetDecodeFpsIndex(index as usize));
         });
     }
 
