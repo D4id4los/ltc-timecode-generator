@@ -1,0 +1,691 @@
+import React, { useState, useCallback, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { isTauri } from "../utils/audioBackend";
+import {
+  Upload,
+  FolderOpen,
+  Settings2,
+  FileVideo,
+  Play,
+  Square,
+  Copy,
+  RefreshCw,
+  AlertTriangle,
+  CheckCircle2,
+  XCircle,
+  ExternalLink,
+} from "lucide-react";
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+interface FfmpegCaps {
+  has_ffmpeg: boolean;
+  available_encoders: string[];
+  available_formats: string[];
+  error_message: string | null;
+}
+
+interface FileGroupInfo {
+  prefix: string;
+  files: string[];
+  channel_count: number;
+}
+
+interface ScanResult {
+  groups: FileGroupInfo[];
+}
+
+interface ConvertRequest {
+  input_files: string[];
+  channel_map: number[];
+  container: string;
+  video_encoder: string;
+  audio_encoder: string;
+  output_path: string;
+}
+
+interface ConvertResponse {
+  success: boolean;
+  message: string;
+}
+
+interface ConversionProgressInfo {
+  status: string;
+  progress: number;
+  log: string;
+}
+
+const VIDEO_ENCODERS: [string, string][] = [
+  ["libsvtav1", "AV1 (SVT-AV1) — good compression"],
+  ["libx264", "H.264 (x264) — maximum compatibility"],
+  ["prores_ks", "ProRes (Kostya) — ideal for Resolve"],
+];
+
+const AUDIO_ENCODERS: [string, string][] = [
+  ["pcm_s24le", "PCM 24-bit — uncompressed, Resolve-compatible"],
+  ["pcm_s16le", "PCM 16-bit — uncompressed, smaller"],
+  ["aac", "AAC — compressed, good for MP4"],
+  ["libopus", "Opus — modern compressed, MKV only"],
+];
+
+const CONTAINERS: [string, string][] = [
+  ["mkv", "Matroska MKV — versatile, all codecs"],
+  ["mov", "QuickTime MOV — ProRes native"],
+  ["mp4", "MPEG-4 MP4 — universal compatibility"],
+];
+
+export default function ConverterTab() {
+  const isTauriMode = isTauri();
+
+  if (!isTauriMode) {
+    return <DesktopOnlyMessage />;
+  }
+
+  return <TauriConverter />;
+}
+
+function DesktopOnlyMessage() {
+  return (
+    <div className="flex flex-col items-center justify-center py-24 text-text-muted">
+      <FileVideo className="w-16 h-16 mb-4 opacity-30" />
+      <p className="text-lg font-semibold text-text-title mb-2">File Converter</p>
+      <p className="text-sm text-center max-w-md">
+        This feature requires the desktop application (Tauri). Please install the
+        native app to use file conversion and ffmpeg integration.
+      </p>
+    </div>
+  );
+}
+
+function TauriConverter() {
+  const [ffmpegCaps, setFfmpegCaps] = useState<FfmpegCaps | null>(null);
+  const [selectedFolder, setSelectedFolder] = useState<string>("");
+  const [fileGroups, setFileGroups] = useState<FileGroupInfo[]>([]);
+  const [selectedGroupIdx, setSelectedGroupIdx] = useState<number>(-1);
+
+  // Channel mapping
+  const [channelMap, setChannelMap] = useState<number[]>([]);
+  const [numChannels, setNumChannels] = useState<number>(0);
+
+  // Output format
+  const [container, setContainer] = useState<string>("mkv");
+  const [videoEncoder, setVideoEncoder] = useState<string>("libsvtav1");
+  const [audioEncoder, setAudioEncoder] = useState<string>("pcm_s24le");
+
+  // Output path
+  const [outputPath, setOutputPath] = useState<string>("");
+
+  // Conversion state
+  const [convStatus, setConvStatus] = useState<string>("idle");
+  const [convProgress, setConvProgress] = useState<number>(0);
+  const [convLog, setConvLog] = useState<string>("");
+  const pollingRef = useRef<number | null>(null);
+
+  // Sanity check
+  const [sanityMsg, setSanityMsg] = useState<string>("");
+
+  // Query ffmpeg on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const caps = await invoke<FfmpegCaps>("check_ffmpeg");
+        setFfmpegCaps(caps);
+      } catch {
+        setFfmpegCaps({
+          has_ffmpeg: false,
+          available_encoders: [],
+          available_formats: [],
+          error_message: "Failed to query ffmpeg",
+        });
+      }
+    })();
+  }, []);
+
+  // Run sanity check when settings change
+  useEffect(() => {
+    if (!ffmpegCaps?.has_ffmpeg) {
+      setSanityMsg("ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.");
+      return;
+    }
+    if (!outputPath) {
+      setSanityMsg("No output file path specified.");
+      return;
+    }
+    if (selectedGroupIdx < 0) {
+      setSanityMsg("");
+      return;
+    }
+
+    const group = fileGroups[selectedGroupIdx];
+    if (!group) return;
+
+    // Basic sanity: container + encoder compatibility
+    const encoders = VIDEO_ENCODERS.map(([k]) => k);
+    if (!ffmpegCaps.available_encoders.includes(videoEncoder)) {
+      setSanityMsg(
+        `Video encoder "${videoEncoder}" is not supported by your ffmpeg installation. Common alternatives: libx264, libsvtav1, prores_ks.`
+      );
+      return;
+    }
+    if (!ffmpegCaps.available_encoders.includes(audioEncoder)) {
+      setSanityMsg(
+        `Audio encoder "${audioEncoder}" is not supported by your ffmpeg installation. Common alternatives: pcm_s24le, aac, libopus.`
+      );
+      return;
+    }
+    if (!ffmpegCaps.available_formats.includes(container)) {
+      setSanityMsg(
+        `Container format "${container}" is not supported by your ffmpeg installation. Common alternatives: mkv, mov, mp4.`
+      );
+      return;
+    }
+
+    // Container + encoder compatibility
+    const containerEncoders: Record<string, (e: string) => boolean> = {
+      mkv: (e) => ["libsvtav1", "libx264", "prores_ks"].includes(e),
+      mov: (e) => ["prores_ks", "libx264", "libsvtav1"].includes(e),
+      mp4: (e) => ["libx264", "libsvtav1"].includes(e),
+    };
+    const containerAudio: Record<string, (e: string) => boolean> = {
+      mkv: (e) => ["pcm_s24le", "pcm_s16le", "aac", "libopus"].includes(e),
+      mov: (e) => ["pcm_s24le", "pcm_s16le", "aac", "libopus"].includes(e),
+      mp4: (e) => ["pcm_s24le", "pcm_s16le", "aac"].includes(e),
+    };
+
+    if (!containerEncoders[container]?.(videoEncoder)) {
+      setSanityMsg(
+        `Video encoder "${videoEncoder}" is not compatible with container "${container}". ProRes works with MOV/MKV, AV1/H.264 with MP4/MKV.`
+      );
+      return;
+    }
+    if (!containerAudio[container]?.(audioEncoder)) {
+      setSanityMsg(
+        `Audio encoder "${audioEncoder}" is not compatible with container "${container}".`
+      );
+      return;
+    }
+
+    setSanityMsg("");
+  }, [container, videoEncoder, audioEncoder, outputPath, ffmpegCaps, selectedGroupIdx, fileGroups]);
+
+  // Clean up polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current !== null) {
+        clearInterval(pollingRef.current);
+      }
+    };
+  }, []);
+
+  const handleSelectFolder = useCallback(async () => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select folder with audio recordings",
+      });
+      if (!selected) return;
+      const folderPath = selected as string;
+      setSelectedFolder(folderPath);
+      const result = await invoke<ScanResult>("scan_folder_for_groups", {
+        folderPath,
+        patternIndex: 0,
+      });
+      setFileGroups(result.groups);
+      setSelectedGroupIdx(-1);
+      setOutputPath("");
+    } catch (e) {
+      console.error("Folder selection failed:", e);
+    }
+  }, []);
+
+  // Select a file group
+  const handleSelectGroup = useCallback(
+    (idx: number) => {
+      setSelectedGroupIdx(idx);
+      const group = fileGroups[idx];
+      if (!group) return;
+      const n = group.channel_count;
+      setNumChannels(n);
+      setChannelMap(Array.from({ length: n }, (_, i) => i));
+      const defaultName = `${group.prefix}-multi-audio-vid.${container}`;
+      setOutputPath(selectedFolder ? `${selectedFolder}/${defaultName}` : defaultName);
+    },
+    [fileGroups, container, selectedFolder]
+  );
+
+  // Channel matrix: swap on click
+  const handleMatrixClick = useCallback(
+    (inputRow: number, targetCol: number) => {
+      setChannelMap((prev) => {
+        const next = [...prev];
+        const swappedInput = next.indexOf(targetCol);
+        if (swappedInput >= 0 && swappedInput !== inputRow) {
+          [next[inputRow], next[swappedInput]] = [next[swappedInput], next[inputRow]];
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  // Start conversion
+  const handleStartConvert = useCallback(async () => {
+    if (selectedGroupIdx < 0) return;
+    const group = fileGroups[selectedGroupIdx];
+    if (!group) return;
+    const folder = selectedFolder.endsWith("/") ? selectedFolder : selectedFolder + "/";
+    const inputFiles = group.files.map((f) => `${folder}${f}`);
+
+    const request: ConvertRequest = {
+      input_files: inputFiles,
+      channel_map: channelMap,
+      container,
+      video_encoder: videoEncoder,
+      audio_encoder: audioEncoder,
+      output_path: outputPath,
+    };
+
+    try {
+      const response = await invoke<ConvertResponse>("start_convert", { request });
+      if (!response.success) {
+        setConvStatus("failed");
+        setConvLog(response.message);
+        return;
+      }
+      setConvStatus("running");
+      setConvProgress(0);
+
+      // Start polling
+      pollingRef.current = window.setInterval(async () => {
+        try {
+          const prog = await invoke<ConversionProgressInfo>("get_conversion_progress");
+          setConvStatus(prog.status);
+          setConvProgress(prog.progress);
+          setConvLog(prog.log);
+          if (prog.status === "completed" || prog.status === "failed") {
+            if (pollingRef.current !== null) {
+              clearInterval(pollingRef.current);
+              pollingRef.current = null;
+            }
+          }
+        } catch {
+          if (pollingRef.current !== null) {
+            clearInterval(pollingRef.current);
+            pollingRef.current = null;
+          }
+        }
+      }, 200);
+    } catch (e) {
+      setConvStatus("failed");
+      setConvLog(String(e));
+    }
+  }, [selectedGroupIdx, fileGroups, selectedFolder, channelMap, container, videoEncoder, audioEncoder, outputPath]);
+
+  // Cancel conversion
+  const handleCancel = useCallback(async () => {
+    try {
+      await invoke("cancel_conversion");
+    } catch {}
+    if (pollingRef.current !== null) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    setConvStatus("idle");
+  }, []);
+
+  // Copy log
+  const handleCopyLog = useCallback(() => {
+    navigator.clipboard.writeText(convLog).catch(() => {});
+  }, [convLog]);
+
+  const canConvert =
+    ffmpegCaps?.has_ffmpeg &&
+    selectedGroupIdx >= 0 &&
+    outputPath.length > 0 &&
+    !sanityMsg &&
+    convStatus !== "running";
+
+  return (
+    <div className="space-y-6">
+      {/* Step 1: Select Files */}
+      <StepHeader number="1" label="SELECT FILES" />
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-text-muted font-semibold">Naming pattern:</span>
+          <span className="text-sm text-text-title font-mono">TASCAM</span>
+          <span className="text-xs text-text-secondary">
+            — Tascam Portacapture X8: prefix + S&lt;channel&gt;
+          </span>
+        </div>
+
+        <button
+          onClick={handleSelectFolder}
+          className="flex items-center gap-2 px-4 py-2 bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-sm text-text-title"
+        >
+          <FolderOpen className="w-4 h-4" />
+          {selectedFolder ? "Change Folder…" : "Select Folder…"}
+        </button>
+        {selectedFolder && (
+          <p className="text-xs text-text-muted font-mono truncate">{selectedFolder}</p>
+        )}
+
+        {fileGroups.length > 0 && (
+          <div>
+            <label className="text-xs text-text-muted font-semibold block mb-1">Recording:</label>
+            <div className="space-y-1">
+              {fileGroups.map((g, i) => (
+                <button
+                  key={g.prefix}
+                  onClick={() => handleSelectGroup(i)}
+                  className={`w-full text-left px-3 py-2 rounded-lg border text-sm transition-colors ${
+                    selectedGroupIdx === i
+                      ? "border-[#FF5F1F] bg-[#FF5F1F]/10 text-text-title"
+                      : "border-border-main bg-card-bg text-text-muted hover:border-[#FF5F1F]/50"
+                  }`}
+                >
+                  <span className="font-mono font-semibold">{g.prefix}</span>
+                  <span className="text-xs ml-2">
+                    ({g.channel_count} ch: {g.files.join(", ")})
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {fileGroups.length === 0 && selectedFolder && (
+          <p className="text-xs text-[#EF4444]">
+            No files matching the TASCAM pattern were found in this folder.
+          </p>
+        )}
+      </div>
+
+      {/* Step 2: Channel Mapping */}
+      {numChannels > 0 && (
+        <>
+          <StepHeader number="2" label="CHANNEL MAPPING" />
+          <p className="text-xs text-text-secondary mb-2">
+            Click a radio button to swap the input channel (row) with the channel currently mapped
+            to the selected output (column).
+          </p>
+          <div
+            className="inline-grid gap-1"
+            style={{
+              gridTemplateColumns: `60px repeat(${numChannels}, 44px)`,
+            }}
+          >
+            {/* Header row */}
+            <div />
+            {Array.from({ length: numChannels }, (_, col) => (
+              <div key={`h-${col}`} className="text-center text-[10px] text-text-muted font-mono font-semibold">
+                OUT {col + 1}
+              </div>
+            ))}
+
+            {/* Rows */}
+            {Array.from({ length: numChannels }, (_, row) => (
+              <React.Fragment key={`r-${row}`}>
+                <div className="text-xs text-text-title font-mono font-semibold flex items-center">
+                  CH {row + 1}
+                </div>
+                {Array.from({ length: numChannels }, (_, col) => {
+                  const isSelected = channelMap[row] === col;
+                  return (
+                    <button
+                      key={`c-${row}-${col}`}
+                      onClick={() => !isSelected && handleMatrixClick(row, col)}
+                      className={`w-10 h-10 flex items-center justify-center rounded-full transition-all ${
+                        isSelected
+                          ? "bg-[#FF5F1F]/30 border-2 border-[#FF5F1F]"
+                          : "border border-border-main hover:border-[#FF5F1F]/50"
+                      }`}
+                      title={`Map CH ${row + 1} → OUT ${col + 1}`}
+                    >
+                      {isSelected && <div className="w-3 h-3 rounded-full bg-[#FF5F1F]" />}
+                    </button>
+                  );
+                })}
+              </React.Fragment>
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* Step 3: Output Format */}
+      <StepHeader number="3" label="OUTPUT FORMAT" />
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <SelectField
+          label="Container"
+          value={container}
+          options={CONTAINERS}
+          onChange={setContainer}
+        />
+        <SelectField
+          label="Video Encoder"
+          value={videoEncoder}
+          options={VIDEO_ENCODERS}
+          onChange={setVideoEncoder}
+        />
+        <SelectField
+          label="Audio Encoder"
+          value={audioEncoder}
+          options={AUDIO_ENCODERS}
+          onChange={setAudioEncoder}
+        />
+      </div>
+
+      {/* Compatibility status */}
+      {ffmpegCaps && !ffmpegCaps.has_ffmpeg && (
+        <div className="flex items-start gap-2 p-3 bg-[#EF4444]/10 border border-[#EF4444]/20 rounded-lg text-xs text-[#EF4444]">
+          <XCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>
+            ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.
+          </span>
+        </div>
+      )}
+      {sanityMsg && ffmpegCaps?.has_ffmpeg && (
+        <div className="flex items-start gap-2 p-3 bg-[#F59E0B]/10 border border-[#F59E0B]/20 rounded-lg text-xs text-[#F59E0B]">
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>{sanityMsg}</span>
+        </div>
+      )}
+      {!sanityMsg && ffmpegCaps?.has_ffmpeg && selectedGroupIdx >= 0 && (
+        <div className="flex items-start gap-2 p-3 bg-[#22C55E]/10 border border-[#22C55E]/20 rounded-lg text-xs text-[#22C55E]">
+          <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>Settings are compatible.</span>
+        </div>
+      )}
+
+      {/* Step 4: Output File */}
+      <StepHeader number="4" label="OUTPUT FILE" />
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          value={outputPath}
+          onChange={(e) => setOutputPath(e.target.value)}
+          className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
+          placeholder="Path to output file…"
+        />
+      </div>
+
+      {/* Convert Button */}
+      <div className="pt-2">
+        {convStatus === "running" ? (
+          <button
+            onClick={handleCancel}
+            className="w-full py-3 bg-[#DC2626] text-white font-bold text-sm rounded-lg hover:bg-[#B91C1C] transition-colors flex items-center justify-center gap-2"
+          >
+            <Square className="w-4 h-4" />
+            CANCEL CONVERSION
+          </button>
+        ) : (
+          <button
+            onClick={handleStartConvert}
+            disabled={!canConvert}
+            className={`w-full py-3 font-bold text-sm rounded-lg transition-colors flex items-center justify-center gap-2 ${
+              canConvert
+                ? "bg-[#FF5F1F] text-black hover:bg-[#E0551C]"
+                : "bg-border-main/30 text-text-muted cursor-not-allowed"
+            }`}
+          >
+            <Play className="w-4 h-4" />
+            CONVERT TO MULTI-AUDIO VIDEO
+          </button>
+        )}
+
+        {!canConvert && convStatus !== "running" && (
+          <p className="text-xs text-text-secondary mt-2 text-center">
+            {!ffmpegCaps?.has_ffmpeg && "ffmpeg is not available. "}
+            {selectedGroupIdx < 0 && "Select a recording. "}
+            {!outputPath && "Set an output file path. "}
+            {!!sanityMsg && "Fix the compatibility issue above. "}
+          </p>
+        )}
+      </div>
+
+      {/* Progress & Log */}
+      {convStatus !== "idle" && (
+        <div className="space-y-3">
+          {convStatus === "running" && (
+            <div>
+              <div className="flex justify-between text-xs text-text-muted mb-1">
+                <span>Converting…</span>
+                <span>{Math.round(convProgress * 100)}%</span>
+              </div>
+              <div className="w-full h-2 bg-deep-bg rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-[#FF5F1F] rounded-full transition-all duration-200"
+                  style={{ width: `${convProgress * 100}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {convStatus === "completed" && (
+            <div className="flex items-start gap-2 p-3 bg-[#22C55E]/10 border border-[#22C55E]/20 rounded-lg text-xs text-[#22C55E]">
+              <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
+              <div>
+                <p className="font-semibold">Conversion completed successfully!</p>
+                <p className="text-text-muted mt-1">File saved to: {outputPath}</p>
+              </div>
+            </div>
+          )}
+
+          {convStatus === "failed" && (
+            <div className="flex items-start gap-2 p-3 bg-[#EF4444]/10 border border-[#EF4444]/20 rounded-lg text-xs">
+              <XCircle className="w-4 h-4 mt-0.5 shrink-0 text-[#EF4444]" />
+              <div className="flex-1 min-w-0">
+                <p className="font-semibold text-[#EF4444] mb-2">Conversion failed</p>
+                <LogViewer text={convLog} />
+              </div>
+            </div>
+          )}
+
+          {/* Log display */}
+          {convLog && convStatus === "running" && <LogViewer text={convLog} />}
+
+          {/* Copy log button */}
+          {convLog && (convStatus === "failed" || convStatus === "completed") && (
+            <div className="flex gap-2">
+              <button
+                onClick={handleCopyLog}
+                className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted"
+              >
+                <Copy className="w-3 h-3" />
+                Copy Full Log
+              </button>
+              {convStatus === "failed" && (
+                <button
+                  onClick={() => {
+                    setConvStatus("idle");
+                    setConvLog("");
+                    setConvProgress(0);
+                  }}
+                  className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  Try Again
+                </button>
+              )}
+              {convStatus === "completed" && (
+                <button
+                  onClick={() => {
+                    setConvStatus("idle");
+                    setConvLog("");
+                    setConvProgress(0);
+                  }}
+                  className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  Start New Conversion
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Sub-components ─────────────────────────────────────────────────────────
+
+function StepHeader({ number, label }: { number: string; label: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="inline-flex items-center justify-center w-6 h-6 rounded bg-[#FF5F1F] text-black text-xs font-bold font-mono">
+        {number}
+      </span>
+      <span className="text-sm font-bold text-text-title tracking-wider">{label}</span>
+    </div>
+  );
+}
+
+function SelectField({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: [string, string][];
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div>
+      <label className="text-xs text-text-muted font-semibold block mb-1">{label}</label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
+      >
+        {options.map(([key, desc]) => (
+          <option key={key} value={key}>
+            {key} — {desc}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function LogViewer({ text }: { text: string }) {
+  const ref = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    if (ref.current) {
+      ref.current.scrollTop = ref.current.scrollHeight;
+    }
+  }, [text]);
+
+  return (
+    <pre
+      ref={ref}
+      className="bg-[#0D0D0F] text-[#88CC88] text-xs font-mono p-3 rounded-lg border border-border-main max-h-40 overflow-auto"
+    >
+      {text}
+    </pre>
+  );
+}

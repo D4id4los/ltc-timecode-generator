@@ -18,3 +18,4 @@ eframe = { version = "0.35", default-features = false, features = [
     "x11",
 ] }
 egui = "0.35"
+rfd = "0.15"

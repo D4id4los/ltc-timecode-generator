@@ -1,9 +1,14 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, RichText, Sense, Ui};
 use gui_engine::command::GuiCommand;
+use gui_engine::converter::{ChannelMap, ConversionState, FfmpegCapabilities, SharedConversionState, CancelFlag};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::{ArcSwap, AudioEvent};
@@ -19,6 +24,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum Tab {
     Clapper,
     Settings,
+    Converter,
 }
 
 impl Tab {
@@ -26,6 +32,7 @@ impl Tab {
         match self {
             Tab::Clapper => "Clapper Slate & Logs",
             Tab::Settings => "Signal & Audio Settings",
+            Tab::Converter => "File Converter & Export",
         }
     }
 }
@@ -70,6 +77,21 @@ pub struct AppState {
     pub show_app_menu: bool,
     pub app_menu_pos: Option<egui::Pos2>,
     pub log_buffer: Arc<Mutex<gui_engine::log_buffer::LogBuffer>>,
+
+    // ── Converter state (GUI-local) ──────────────────────────────────
+    pub selected_pattern: usize,
+    pub selected_folder: Option<PathBuf>,
+    pub file_groups: Option<BTreeMap<String, Vec<PathBuf>>>,
+    pub selected_group: Option<String>,
+    pub channel_map: ChannelMap,
+    pub container: String,
+    pub video_encoder: String,
+    pub audio_encoder: String,
+    pub output_path: PathBuf,
+    pub conversion_state: SharedConversionState,
+    pub cancel_flag: CancelFlag,
+    pub convert_handle: Option<JoinHandle<()>>,
+    pub ffmpeg_caps: Option<FfmpegCapabilities>,
 }
 
 impl AppState {
@@ -93,6 +115,19 @@ impl AppState {
             show_app_menu: false,
             app_menu_pos: None,
             log_buffer,
+            selected_pattern: 0,
+            selected_folder: None,
+            file_groups: None,
+            selected_group: None,
+            channel_map: ChannelMap::identity(0),
+            container: "mkv".to_string(),
+            video_encoder: "libsvtav1".to_string(),
+            audio_encoder: "pcm_s24le".to_string(),
+            output_path: PathBuf::from(""),
+            conversion_state: Arc::new(Mutex::new(ConversionState::idle())),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            convert_handle: None,
+            ffmpeg_caps: None,
         }
     }
 
@@ -498,10 +533,20 @@ impl AppState {
         let colors = self.theme.colors();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::Vec2::new(0.0, 0.0);
-            for tab in &[Tab::Clapper, Tab::Settings] {
+            for tab in &[Tab::Clapper, Tab::Settings, Tab::Converter] {
                 let is_active = *tab == self.active_tab;
+                let is_wide = ui.available_width() > 500.0;
+                let label = if is_wide {
+                    tab.label().to_string()
+                } else {
+                    match tab {
+                        Tab::Clapper => "Clapper".to_string(),
+                        Tab::Settings => "Settings".to_string(),
+                        Tab::Converter => "Convert".to_string(),
+                    }
+                };
                 let btn = egui::Button::new(
-                    RichText::new(tab.label())
+                    RichText::new(label)
                         .font(FontId::proportional(12.0))
                         .color(if is_active { ACCENT } else { colors.text_muted })
                         .strong(),
@@ -523,6 +568,7 @@ impl AppState {
         match self.active_tab {
             Tab::Clapper => widgets::clapper::render(ui, self),
             Tab::Settings => widgets::settings::render(ui, self),
+            Tab::Converter => widgets::converter::render(ui, self),
         }
     }
 

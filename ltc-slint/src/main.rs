@@ -1,11 +1,19 @@
 slint::include_modules!();
 
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gui_engine::command::GuiCommand;
+use gui_engine::converter::{
+    query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionState, ConversionStatus,
+    ConverterSettings, FfmpegCapabilities,
+};
+use gui_engine::file_pattern::{match_files_to_groups, BUILTIN_PATTERNS};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::theme;
 use gui_engine::timecode::{self, FPS_OPTIONS};
@@ -173,6 +181,26 @@ fn _run_gui(
     let next_toast_id: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
     let last_debug_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let pulse_phase: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+
+    // ── Converter state ─────────────────────────────────────────────────────
+    let conv_selected_folder: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let conv_file_groups: Arc<Mutex<BTreeMap<String, Vec<PathBuf>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    let conv_selected_group_idx: Arc<Mutex<isize>> = Arc::new(Mutex::new(-1));
+    let conv_channel_map: Arc<Mutex<ChannelMap>> = Arc::new(Mutex::new(ChannelMap::identity(0)));
+    let conv_container: Arc<Mutex<String>> = Arc::new(Mutex::new("mkv".to_string()));
+    let conv_video_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("libsvtav1".to_string()));
+    let conv_audio_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("pcm_s24le".to_string()));
+    let conv_output_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let conv_state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
+    let conv_cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let conv_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>> = Arc::new(Mutex::new(None));
+    let conv_sanity_msg: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+    // Pre-clone Arcs for closures that need them (avoid move conflicts)
+    let conv_folder_for_group = conv_selected_folder.clone();
+    let conv_ffmpeg_caps_for_select = conv_ffmpeg_caps.clone();
 
     // ── Populate FPS options model ─────────────────────────────────────────
     {
@@ -510,7 +538,175 @@ fn _run_gui(
         ui.on_beep_duration_changed(move |val| { let _ = cmd.send(GuiCommand::SetBeepDuration(val)); });
     }
 
-    // ── Polling timer (25 fps) ─────────────────────────────────────────────
+    // ── Converter callbacks ──────────────────────────────────────────────────
+    {
+        let ui_weak = ui.as_weak();
+        let folder = conv_selected_folder.clone();
+        let groups = conv_file_groups.clone();
+        let idx = conv_selected_group_idx.clone();
+        ui.on_conv_select_folder(move || {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                let path_str = path.to_string_lossy().to_string();
+                *folder.lock().unwrap() = path_str.clone();
+                let pattern = &BUILTIN_PATTERNS[0];
+                let matched = match_files_to_groups(&path, pattern);
+                *groups.lock().unwrap() = matched.clone();
+                *idx.lock().unwrap() = -1;
+
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_selected_folder(SharedString::from(path_str));
+                    let model: Vec<FileGroupInfo> = matched.iter().map(|(prefix, files)| {
+                        FileGroupInfo {
+                            prefix: SharedString::from(prefix),
+                            files: ModelRc::new(VecModel::<SharedString>::from(
+                                files.iter().map(|f| {
+                                    SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+                                }).collect::<Vec<_>>()
+                            )),
+                            channel_count: files.len() as i32,
+                        }
+                    }).collect();
+                    u.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(model)));
+                }
+            }
+            // Query ffmpeg on first folder selection if not already done
+            let caps = conv_ffmpeg_caps_for_select.clone();
+            let ui_weak2 = ui_weak.clone();
+            std::thread::spawn(move || {
+                let mut c = caps.lock().unwrap();
+                if c.is_none() {
+                    *c = Some(query_ffmpeg_capabilities());
+                }
+                if let Some(ref caps_data) = *c {
+                    if let Some(u) = ui_weak2.upgrade() {
+                        u.set_conv_has_ffmpeg(caps_data.has_ffmpeg);
+                        if let Some(ref msg) = caps_data.error_message {
+                            u.set_conv_ffmpeg_error(SharedString::from(msg));
+                        }
+                    }
+                }
+            });
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let groups = conv_file_groups.clone();
+        let idx = conv_selected_group_idx.clone();
+        let cmap = conv_channel_map.clone();
+        let out_path = conv_output_path.clone();
+        let container = conv_container.clone();
+        ui.on_conv_select_group(move |group_idx| {
+            let g = groups.lock().unwrap();
+            let keys: Vec<String> = g.keys().cloned().collect();
+            if group_idx >= 0 && (group_idx as usize) < keys.len() {
+                let prefix = keys[group_idx as usize].clone();
+                let files = g.get(&prefix).cloned().unwrap_or_default();
+                let n = files.len();
+                *cmap.lock().unwrap() = ChannelMap::identity(n);
+                *idx.lock().unwrap() = group_idx as isize;
+                let folder = conv_folder_for_group.lock().unwrap().clone();
+                let container_str = container.lock().unwrap().clone();
+                let default_name = format!("{}-multi-audio-vid.{}", prefix, container_str);
+                let full_path = if folder.is_empty() {
+                    default_name
+                } else {
+                    format!("{}/{}", folder, default_name)
+                };
+                *out_path.lock().unwrap() = full_path.clone();
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_selected_group_idx(group_idx);
+                    u.set_conv_num_channels(n as i32);
+                    let map_vec: Vec<i32> = (0..n as i32).collect();
+                    u.set_conv_channel_map(ModelRc::new(VecModel::from(map_vec)));
+                    u.set_conv_output_path(SharedString::from(full_path));
+                }
+            }
+        });
+    }
+    {
+        let cmap = conv_channel_map.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_map_cell_clicked(move |row, col| {
+            let mut map = cmap.lock().unwrap();
+            map.swap(row as usize, col as usize);
+            let n = map.num_channels();
+            let vec: Vec<i32> = (0..n).map(|i| map.get(i) as i32).collect();
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_channel_map(ModelRc::new(VecModel::from(vec)));
+            }
+        });
+    }
+    {
+        let state = conv_state.clone();
+        let cancel = conv_cancel.clone();
+        let handle = conv_handle.clone();
+        let ui_weak = ui.as_weak();
+        let folder = conv_selected_folder.clone();
+        let groups_data = conv_file_groups.clone();
+        let idx = conv_selected_group_idx.clone();
+        let cmap = conv_channel_map.clone();
+        let container = conv_container.clone();
+        let venc = conv_video_encoder.clone();
+        let aenc = conv_audio_encoder.clone();
+        let out_path = conv_output_path.clone();
+        ui.on_conv_start(move || {
+            let g = groups_data.lock().unwrap();
+            let i = *idx.lock().unwrap();
+            let keys: Vec<String> = g.keys().cloned().collect();
+            if i < 0 || (i as usize) >= keys.len() { return; }
+            let prefix = &keys[i as usize];
+            let files = g.get(prefix).cloned().unwrap_or_default();
+            let folder_path = folder.lock().unwrap().clone();
+            let input_files: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(&folder_path).join(f)).collect();
+            let map = cmap.lock().unwrap().clone();
+            let output = PathBuf::from(out_path.lock().unwrap().clone());
+            let settings = ConverterSettings {
+                input_files,
+                channel_map: map,
+                container: container.lock().unwrap().clone(),
+                video_encoder: venc.lock().unwrap().clone(),
+                audio_encoder: aenc.lock().unwrap().clone(),
+                output_path: output,
+            };
+            *state.lock().unwrap() = ConversionState::idle();
+            cancel.store(false, Ordering::Relaxed);
+            let cs = state.clone();
+            let cf = cancel.clone();
+            let h = spawn_conversion(settings, cs, cf);
+            *handle.lock().unwrap() = Some(h);
+        });
+    }
+    {
+        let cancel = conv_cancel.clone();
+        ui.on_conv_cancel(move || {
+            cancel.store(true, Ordering::Relaxed);
+        });
+    }
+    {
+        let state = conv_state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_copy_log(move || {
+            let s = state.lock().unwrap();
+            let text = s.ffmpeg_output.clone();
+            if let Ok(mut ctx) = arboard::Clipboard::new() {
+                let _ = ctx.set_text(text);
+            }
+        });
+    }
+    {
+        let state = conv_state.clone();
+        let cmap = conv_channel_map.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_reset(move || {
+            *state.lock().unwrap() = ConversionState::idle();
+            cmap.lock().unwrap();
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_status(SharedString::from("idle"));
+                u.set_conv_progress(0.0);
+                u.set_conv_log(SharedString::from(""));
+            }
+        });
+    }
     {
         let state = engine_state.clone();
         let ui_weak = ui.as_weak();
@@ -519,6 +715,10 @@ fn _run_gui(
         let log_buffer_clone = log_buffer.clone();
         let last_count_clone = last_debug_log_count.clone();
         let pulse_phase_clone = pulse_phase.clone();
+        let conv_state_clone = conv_state.clone();
+        let conv_ffmpeg_caps_clone = conv_ffmpeg_caps.clone();
+        let conv_sanity_msg_clone = conv_sanity_msg.clone();
+        let conv_output_path_clone = conv_output_path.clone();
 
         let poll_timer = slint::Timer::default();
         poll_timer.start(
@@ -676,7 +876,61 @@ fn _run_gui(
                     }
                 }
 
-                // 19. Perf diagnostics
+                // 19. Converter state sync
+                {
+                    // ffmpeg capabilities
+                    let caps = conv_ffmpeg_caps_clone.lock().unwrap();
+                    if let Some(ref c) = *caps {
+                        ui.set_conv_has_ffmpeg(c.has_ffmpeg);
+                        if let Some(ref msg) = c.error_message {
+                            ui.set_conv_ffmpeg_error(SharedString::from(msg));
+                        }
+                    }
+                }
+                {
+                    // Conversion progress
+                    let cs = conv_state_clone.lock().unwrap();
+                    let (status_str, progress) = match &cs.status {
+                        ConversionStatus::Idle => ("idle".to_string(), 0.0),
+                        ConversionStatus::Running { progress } => ("running".to_string(), *progress),
+                        ConversionStatus::Completed => ("completed".to_string(), 1.0),
+                        ConversionStatus::Failed { .. } => ("failed".to_string(), 0.0),
+                    };
+                    ui.set_conv_status(SharedString::from(status_str));
+                    ui.set_conv_progress(progress);
+                    ui.set_conv_log(SharedString::from(cs.ffmpeg_output.clone()));
+                }
+                if tick % 10 == 0 {
+                    // Sanity check (periodic, not every tick)
+                    let out = conv_output_path_clone.lock().unwrap().clone();
+                    let caps = conv_ffmpeg_caps_clone.lock().unwrap().clone();
+                    let mut msg = String::new();
+                    match caps {
+                        Some(ref c) if !c.has_ffmpeg => {
+                            msg = "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.".to_string();
+                        }
+                        Some(ref c) if out.is_empty() => {
+                            msg = "No output file path specified.".to_string();
+                        }
+                        Some(ref c) if ui.get_conv_selected_group_idx() >= 0 => {
+                            let container = conv_container.lock().unwrap().clone();
+                            let venc = conv_video_encoder.lock().unwrap().clone();
+                            let aenc = conv_audio_encoder.lock().unwrap().clone();
+                            let input_files: Vec<PathBuf> = Vec::new();
+                            let output_path = PathBuf::from(&out);
+                            if let Err(e) = gui_engine::converter::conversion_sanity_check(
+                                &container, &venc, &aenc, &input_files, &output_path, c,
+                            ) {
+                                msg = e;
+                            }
+                        }
+                        _ => {}
+                    }
+                    *conv_sanity_msg_clone.lock().unwrap() = msg.clone();
+                    ui.set_conv_sanity_msg(SharedString::from(msg));
+                }
+
+                // 20. Perf diagnostics
                 let poll_elapsed = poll_start.elapsed();
                 if tick % 250 == 0 {
                     info!("[PERF] Poll tick #{}: {}ms", tick, poll_elapsed.as_micros() as f64 / 1000.0);

@@ -14,6 +14,7 @@ import {
 } from "./ltcGenerator";
 import TimecodeSettings from "./components/TimecodeSettings";
 import ClapperSlate from "./components/ClapperSlate";
+import ConverterTab from "./components/ConverterTab";
 import FooterStatusBar from "./components/FooterStatusBar";
 import {
   isTauri as isTauriApp,
@@ -101,7 +102,7 @@ export default function App() {
     beepDuration: 0.5,
   });
   const [logs, setLogs] = useState<ClapLogItem[]>([]);
-  const [activeTab, setActiveTab] = useState<"clapper" | "settings">("clapper");
+  const [activeTab, setActiveTab] = useState<"clapper" | "settings" | "converter">("clapper");
   const [clapTriggerCount, setClapTriggerCount] = useState<number>(0);
   const [showFaq, setShowFaq] = useState<boolean>(false);
   const [isWakeLockActive, setIsWakeLockActive] = useState<boolean>(false);
@@ -1082,6 +1083,18 @@ export default function App() {
                   <motion.div layoutId="activeTabUnderline" className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#FF5F1F]" />
                 )}
               </button>
+              <button
+                id="tab-converter"
+                onClick={() => setActiveTab("converter")}
+                className={`pb-3 px-5 text-xs font-bold tracking-widest uppercase relative transition-all touch-manipulation cursor-pointer ${
+                  activeTab === "converter" ? "text-text-title font-black" : "text-text-muted hover:text-text-title"
+                }`}
+              >
+                File Converter & Export
+                {activeTab === "converter" && (
+                  <motion.div layoutId="activeTabUnderline" className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#FF5F1F]" />
+                )}
+              </button>
             </div>
 
             {/* TAB SECTIONS */}
@@ -1116,6 +1129,9 @@ export default function App() {
                     setSampleRate(SAMPLE_RATE_OPTIONS[i]);
                   }}
                 />
+              </div>
+              <div className={activeTab === "converter" ? "block" : "hidden"}>
+                <ConverterTab />
               </div>
             </div>
           </section>

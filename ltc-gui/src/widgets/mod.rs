@@ -1,5 +1,6 @@
 pub mod clock;
 pub mod clapper;
+pub mod converter;
 pub mod settings;
 pub mod status;
 
