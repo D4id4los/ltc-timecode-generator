@@ -1,0 +1,98 @@
+import { AppColors } from "./theme.slint";
+
+export component PillBox {
+    in-out property <string> pill-text;
+    in-out property <color> bg: AppColors.nested-bg;
+    in-out property <color> text-color: AppColors.text-muted;
+
+    Rectangle {
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: AppColors.border-main;
+        background: root.bg;
+        min-height: 20px;
+
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            padding-top: 4px;
+            padding-bottom: 4px;
+
+            Text {
+                text: root.pill-text;
+                color: root.text-color;
+                font-weight: 600;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component StepperCard {
+    in-out property <string> label;
+    in-out property <int> value;
+    in-out property <bool> enabled: true;
+    callback up;
+    callback down;
+
+    Rectangle {
+        border-radius: 8px;
+        background: AppColors.deep-bg;
+        border-width: 1px;
+        border-color: AppColors.border-main;
+
+        VerticalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 2px;
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 24px; height: 20px;
+                    border-radius: 4px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    TouchArea {
+                        enabled: root.enabled;
+                        clicked => { root.up(); }
+                    }
+                    Text { text: "^"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+            Text {
+                text: root.value;
+                color: AppColors.text-title;
+                font-size: 20px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.label;
+                color: AppColors.text-muted;
+                font-size: 7.5px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 24px; height: 20px;
+                    border-radius: 4px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    TouchArea {
+                        enabled: root.enabled;
+                        clicked => { root.down(); }
+                    }
+                    Text { text: "v"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

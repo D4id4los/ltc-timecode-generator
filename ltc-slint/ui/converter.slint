@@ -1,0 +1,362 @@
+import { AppColors } from "./theme.slint";
+import { FileGroupInfo } from "./types.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export component ConverterSection {
+    in-out property <bool> has-ffmpeg: false;
+    in-out property <string> ffmpeg-error: "";
+    in-out property <string> selected-folder: "";
+    in-out property <[FileGroupInfo]> file-groups: [];
+    in-out property <int> selected-group-idx: -1;
+    in-out property <int> num-channels: 0;
+    in-out property <[int]> channel-map: [];
+    in-out property <string> container: "mkv";
+    in-out property <string> video-encoder: "libsvtav1";
+    in-out property <string> audio-encoder: "pcm_s24le";
+    in-out property <string> output-path: "";
+    in-out property <string> conv-status: "idle";
+    in-out property <float> conv-progress: 0.0;
+    in-out property <string> conv-log: "";
+    in-out property <string> sanity-msg: "";
+
+    callback select-folder;
+    callback select-group(int);
+    callback map-cell-clicked(int, int);
+    callback start-convert;
+    callback cancel-convert;
+    callback copy-log;
+    callback reset-conv;
+
+    Rectangle {
+        border-radius: 12px;
+        border-width: 1.5px;
+        border-color: AppColors.border-main;
+        background: AppColors.card-bg;
+
+        ScrollView {
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                // ── Step 1: Select Files ──
+                HorizontalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        width: 22px; height: 22px; border-radius: 4px;
+                        background: AppColors.accent;
+                        Text { text: "1"; color: black; font-size: 11px; font-weight: 700;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Text { text: "SELECT FILES"; color: AppColors.text-title; font-size: 12px; font-weight: 700; }
+                }
+
+                HorizontalLayout { spacing: 6px;
+                    Text { text: "Naming pattern:"; color: AppColors.text-muted; font-size: 10px; font-weight: 600; }
+                    Text { text: "TASCAM"; color: AppColors.text-title; font-size: 11px; font-family: "monospace"; font-weight: 700; }
+                }
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: AppColors.deep-bg;
+                    border-width: 1px; border-color: AppColors.border-main;
+                    min-height: 32px;
+                    TouchArea { clicked => { root.select-folder(); } }
+                    HorizontalLayout { padding: 8px; spacing: 6px;
+                        Text { text: "📂"; font-size: 12px; }
+                        Text {
+                            text: root.selected-folder == "" ? "Select Folder…" : root.selected-folder;
+                            color: root.selected-folder == "" ? AppColors.text-muted : AppColors.text-title;
+                            font-size: 10px; font-family: "monospace";
+                            horizontal-stretch: 1; vertical-alignment: center;
+                        }
+                    }
+                }
+
+                if (root.file-groups.length > 0) : VerticalLayout { spacing: 4px;
+                    Text { text: "Recording:"; color: AppColors.text-muted; font-size: 10px; font-weight: 600; }
+                    for group[idx] in root.file-groups : Rectangle {
+                        border-radius: 6px;
+                        background: AppColors.accent;
+                        opacity: root.selected-group-idx == idx ? 0.15 : 1.0;
+                        border-width: 1px;
+                        border-color: root.selected-group-idx == idx ? AppColors.accent : AppColors.border-main;
+                        min-height: 28px;
+                        TouchArea { clicked => { root.select-group(idx); } }
+                        HorizontalLayout { padding: 6px; spacing: 6px;
+                            Text { text: group.prefix; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                            Text {
+                                text: "(" + group.channel-count + " ch)";
+                                color: AppColors.text-muted; font-size: 9px;
+                                horizontal-stretch: 1; vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                // ── Step 2: Channel Mapping ──
+                if (root.num-channels > 0) : VerticalLayout { spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Rectangle {
+                            width: 22px; height: 22px; border-radius: 4px;
+                            background: AppColors.accent;
+                            Text { text: "2"; color: black; font-size: 11px; font-weight: 700;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Text { text: "CHANNEL MAPPING"; color: AppColors.text-title; font-size: 12px; font-weight: 700; }
+                    }
+                    Text {
+                        text: "Click a radio button to swap the input channel (row) with the channel currently mapped to the selected output (column).";
+                        color: AppColors.text-muted; font-size: 9px; wrap: word-wrap;
+                    }
+
+                    // Matrix header
+                    HorizontalLayout { spacing: 4px;
+                        Rectangle { width: 36px; height: 20px; }
+                        for col in root.num-channels : Rectangle {
+                            width: 30px; height: 20px;
+                            Text { text: "OUT " + (col + 1); color: AppColors.text-muted;
+                                   font-size: 8px; font-weight: 600;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                    // Matrix rows
+                    for row in root.num-channels : HorizontalLayout { spacing: 4px;
+                        Rectangle {
+                            width: 36px; height: 30px;
+                            Text { text: "CH " + (row + 1); color: AppColors.text-title;
+                                   font-size: 9px; font-family: "monospace"; font-weight: 600;
+                                   vertical-alignment: center; }
+                        }
+                        for col in root.num-channels : Rectangle {
+                            width: 30px; height: 30px;
+                            border-radius: 15px;
+                            border-width: root.channel-map[row] == col ? 2.5px : 1px;
+                            border-color: root.channel-map[row] == col ? AppColors.accent : AppColors.border-main;
+                            background: root.channel-map[row] == col ? AppColors.accent : AppColors.deep-bg;
+                            opacity: root.channel-map[row] == col ? 0.35 : 1.0;
+                            TouchArea { clicked => { root.map-cell-clicked(row, col); } }
+                        }
+                    }
+                }
+
+                // ── Step 3: Output Format ──
+                HorizontalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        width: 22px; height: 22px; border-radius: 4px;
+                        background: AppColors.accent;
+                        Text { text: "3"; color: black; font-size: 11px; font-weight: 700;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Text { text: "OUTPUT FORMAT"; color: AppColors.text-title; font-size: 12px; font-weight: 700; }
+                }
+
+                // Container / Video / Audio selectors
+                HorizontalLayout { spacing: 8px;
+                    // Container
+                    Rectangle {
+                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                        background: AppColors.deep-bg; min-height: 28px; horizontal-stretch: 1;
+                        VerticalLayout { padding: 4px; spacing: 2px;
+                            Text { text: "Container"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                            Text { text: root.container; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                        }
+                    }
+                    // Video encoder
+                    Rectangle {
+                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                        background: AppColors.deep-bg; min-height: 28px; horizontal-stretch: 1;
+                        VerticalLayout { padding: 4px; spacing: 2px;
+                            Text { text: "Video"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                            Text { text: root.video-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                        }
+                    }
+                    // Audio encoder
+                    Rectangle {
+                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                        background: AppColors.deep-bg; min-height: 28px; horizontal-stretch: 1;
+                        VerticalLayout { padding: 4px; spacing: 2px;
+                            Text { text: "Audio"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                            Text { text: root.audio-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                        }
+                    }
+                }
+
+                // Sanity / compatibility message
+                if (root.sanity-msg != "") : Rectangle {
+                    border-radius: 6px;
+                    border-width: 1px; border-color: AppColors.amber;
+                    min-height: 24px;
+                    Rectangle {
+                        border-radius: 6px;
+                        background: AppColors.amber;
+                        opacity: 0.15;
+                        width: 100%; height: 100%;
+                    }
+                    HorizontalLayout { padding: 8px; spacing: 6px;
+                        Text { text: "⚠"; color: AppColors.amber; font-size: 12px; }
+                        Text { text: root.sanity-msg; color: AppColors.amber; font-size: 10px; wrap: word-wrap; horizontal-stretch: 1; }
+                    }
+                }
+                if (!root.has-ffmpeg && root.ffmpeg-error != "") : Rectangle {
+                    border-radius: 6px;
+                    border-width: 1px; border-color: AppColors.red;
+                    min-height: 24px;
+                    Rectangle {
+                        border-radius: 6px;
+                        background: AppColors.red;
+                        opacity: 0.1;
+                        width: 100%; height: 100%;
+                    }
+                    HorizontalLayout { padding: 8px; spacing: 6px;
+                        Text { text: "✗"; color: AppColors.red; font-size: 12px; }
+                        Text { text: root.ffmpeg-error; color: AppColors.red; font-size: 10px; wrap: word-wrap; horizontal-stretch: 1; }
+                    }
+                }
+
+                // ── Step 4: Output File ──
+                HorizontalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        width: 22px; height: 22px; border-radius: 4px;
+                        background: AppColors.accent;
+                        Text { text: "4"; color: black; font-size: 11px; font-weight: 700;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Text { text: "OUTPUT FILE"; color: AppColors.text-title; font-size: 12px; font-weight: 700; }
+                }
+
+                Rectangle {
+                    border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                    background: AppColors.deep-bg; min-height: 28px;
+                    HorizontalLayout { padding: 8px; spacing: 6px;
+                        Text { text: "📁"; font-size: 12px; }
+                        Text {
+                            text: root.output-path == "" ? "(No output path set)" : root.output-path;
+                            color: root.output-path == "" ? AppColors.text-muted : AppColors.text-title;
+                            font-size: 10px; font-family: "monospace"; horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // ── Convert Button ──
+                if (root.conv-status == "running") : Rectangle {
+                    border-radius: 8px; background: AppColors.red; min-height: 40px;
+                    TouchArea { clicked => { root.cancel-convert(); } }
+                    Text { text: "■ CANCEL CONVERSION"; color: white; font-size: 13px; font-weight: 700;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+                if (root.conv-status != "running") : Rectangle {
+                    border-radius: 8px;
+                    background: (root.has-ffmpeg && root.selected-group-idx >= 0 && root.output-path != "" && root.sanity-msg == "") ? AppColors.accent : AppColors.nested-bg;
+                    min-height: 40px;
+                    TouchArea {
+                        enabled: root.has-ffmpeg && root.selected-group-idx >= 0 && root.output-path != "" && root.sanity-msg == "";
+                        clicked => { root.start-convert(); }
+                    }
+                    Text { text: "CONVERT TO MULTI-AUDIO VIDEO"; color: black; font-size: 13px; font-weight: 700;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                // ── Progress / Log ──
+                if (root.conv-status == "running") : VerticalLayout { spacing: 4px;
+                    Text { text: "Converting…"; color: AppColors.text-title; font-size: 11px; font-weight: 700; }
+                    Rectangle {
+                        height: 8px; border-radius: 4px; background: AppColors.deep-bg;
+                        Rectangle {
+                            height: 8px; border-radius: 4px; background: AppColors.accent;
+                            width: parent.width * root.conv-progress;
+                        }
+                    }
+                    Text { text: "ffmpeg output:"; color: AppColors.text-muted; font-size: 9px; font-weight: 600; }
+                    Rectangle {
+                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                        background: #0D0D0F; min-height: 80px; max-height: 120px;
+                        ScrollView {
+                            Text {
+                                text: root.conv-log == "" ? "(waiting for output…)" : root.conv-log;
+                                color: #88CC88; font-size: 9px; font-family: "monospace";
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                if (root.conv-status == "completed") : VerticalLayout { spacing: 6px;
+                    Rectangle {
+                        border-radius: 6px;
+                        border-width: 1px; border-color: AppColors.green;
+                        min-height: 40px;
+                        Rectangle {
+                            border-radius: 6px;
+                            background: AppColors.green;
+                            opacity: 0.1;
+                            width: 100%; height: 100%;
+                        }
+                        HorizontalLayout { padding: 10px; spacing: 8px;
+                            Text { text: "✓"; color: AppColors.green; font-size: 16px; }
+                            VerticalLayout { spacing: 2px;
+                                Text { text: "Conversion completed successfully!"; color: AppColors.green; font-size: 11px; font-weight: 700; }
+                                Text { text: "File saved to: " + root.output-path; color: AppColors.text-muted; font-size: 10px; wrap: word-wrap; }
+                            }
+                        }
+                    }
+                    if (root.conv-log != "") : Rectangle {
+                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                        background: #0D0D0F; min-height: 60px; max-height: 100px;
+                        ScrollView {
+                            Text { text: root.conv-log; color: #88CC88; font-size: 9px; font-family: "monospace"; wrap: word-wrap; }
+                        }
+                    }
+                    Rectangle {
+                        border-radius: 6px; background: AppColors.nested-bg; min-height: 28px; max-width: 200px;
+                        TouchArea { clicked => { root.reset-conv(); } }
+                        Text { text: "Start New Conversion"; color: AppColors.text-title; font-size: 10px; font-weight: 600;
+                               horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                if (root.conv-status == "failed") : VerticalLayout { spacing: 6px;
+                    Rectangle {
+                        border-radius: 6px;
+                        border-width: 1px; border-color: AppColors.red;
+                        min-height: 40px;
+                        Rectangle {
+                            border-radius: 6px;
+                            background: AppColors.red;
+                            opacity: 0.1;
+                            width: 100%; height: 100%;
+                        }
+                        HorizontalLayout { padding: 10px; spacing: 8px;
+                            Text { text: "✗"; color: AppColors.red; font-size: 16px; }
+                            Text { text: "Conversion failed"; color: AppColors.red; font-size: 11px; font-weight: 700; }
+                        }
+                    }
+                    Rectangle {
+                        border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                        background: #0D0D0F; min-height: 80px; max-height: 200px;
+                        ScrollView {
+                            Text { text: root.conv-log == "" ? "(no output)" : root.conv-log; color: #FF6666; font-size: 9px; font-family: "monospace"; wrap: word-wrap; }
+                        }
+                    }
+                    HorizontalLayout { spacing: 8px;
+                        Rectangle {
+                            border-radius: 6px; background: AppColors.nested-bg; min-height: 28px; max-width: 140px;
+                            TouchArea { clicked => { root.copy-log(); } }
+                            Text { text: "📋 Copy Error Log"; color: AppColors.text-title; font-size: 10px; font-weight: 600;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            border-radius: 6px; background: AppColors.nested-bg; min-height: 28px; max-width: 120px;
+                            TouchArea { clicked => { root.reset-conv(); } }
+                            Text { text: "Try Again"; color: AppColors.text-title; font-size: 10px; font-weight: 600;
+                                   horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

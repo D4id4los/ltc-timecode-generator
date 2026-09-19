@@ -1,0 +1,456 @@
+import { AppColors } from "./theme.slint";
+import { FrameRateOption } from "./types.slint";
+import { StepperCard } from "./widgets.slint";
+import { ComboBox, Slider } from "std-widgets.slint";
+
+export component SettingsSection {
+    in-out property <int> hour;
+    in-out property <int> minute;
+    in-out property <int> second;
+    in-out property <int> frame;
+    in-out property <int> max-frame;
+    in-out property <int> fps-index;
+    in-out property <[FrameRateOption]> fps-options;
+    in-out property <int> sample-rate-index;
+    in-out property <[string]> sample-rate-options;
+    in-out property <int> device-index;
+    in-out property <[string]> device-names;
+    in-out property <int> ltc-channel-index;
+    in-out property <int> beep-channel-index;
+    in-out property <float> ltc-volume;
+    in-out property <float> beep-volume;
+    in-out property <float> beep-frequency;
+    in-out property <float> beep-duration;
+    in-out property <bool> settings-enabled;
+    in-out property <length> window-width: 800px;
+
+    callback hour-up;
+    callback hour-down;
+    callback minute-up;
+    callback minute-down;
+    callback second-up;
+    callback second-down;
+    callback frame-up;
+    callback frame-down;
+    callback fps-selected(int);
+    callback sample-rate-tapped(string);
+    callback device-selected(int);
+    callback ltc-channel-selected(int);
+    callback beep-channel-selected(int);
+    callback ltc-volume-changed(float);
+    callback beep-volume-changed(float);
+    callback beep-frequency-changed(float);
+    callback beep-duration-changed(float);
+    callback refresh-devices;
+
+    Rectangle {
+        border-radius: 12px;
+        border-width: 1.5px;
+        border-color: AppColors.border-main;
+        background: AppColors.card-bg;
+
+        VerticalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 16px;
+
+            // 1. Start Timecode Steppers
+            VerticalLayout {
+                spacing: 8px;
+                HorizontalLayout {
+                    Text {
+                        text: "⚙️ SET STARTING TIMECODE";
+                        color: AppColors.text-muted;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+                    if (!root.settings-enabled) : Rectangle {
+                        border-radius: 6px;
+                        background: #F59E0B1A;
+                        border-width: 1px;
+                        border-color: #F59E0B33;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            Text {
+                                text: "STOP STREAM TO EDIT";
+                                color: AppColors.amber;
+                                font-weight: 700;
+                                font-size: 9px;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+                    StepperCard { label: "HOURS"; value: root.hour; enabled: root.settings-enabled; up => { root.hour-up(); } down => { root.hour-down(); } }
+                    StepperCard { label: "MINUTES"; value: root.minute; enabled: root.settings-enabled; up => { root.minute-up(); } down => { root.minute-down(); } }
+                    StepperCard { label: "SECONDS"; value: root.second; enabled: root.settings-enabled; up => { root.second-up(); } down => { root.second-down(); } }
+                    StepperCard { label: "FRAMES"; value: root.frame; enabled: root.settings-enabled; up => { root.frame-up(); } down => { root.frame-down(); } }
+                }
+            }
+
+            // 2. Frame Rate
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "📈 SELECT FRAME RATE";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    for fps-item in root.fps-options : Rectangle {
+                        min-width: 90px;
+                        min-height: 60px;
+                        border-radius: 8px;
+                        background: fps-item == root.fps-options[root.fps-index] ? AppColors.accent : AppColors.nested-bg;
+                        border-width: fps-item == root.fps-options[root.fps-index] ? 0px : 1px;
+                        border-color: AppColors.border-main;
+                        VerticalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 2px;
+                            Text {
+                                text: fps-item.name;
+                                color: fps-item == root.fps-options[root.fps-index] ? black : AppColors.text-title;
+                                font-size: 13px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: fps-item.description;
+                                color: fps-item == root.fps-options[root.fps-index] ? black : AppColors.text-muted;
+                                font-size: 9px;
+                            }
+                        }
+                        TouchArea {
+                            enabled: root.settings-enabled;
+                            clicked => { root.fps-selected(fps-item.fps * 100); }
+                        }
+                    }
+                }
+            }
+
+            // 3. Sample Rate
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "🎛️ SAMPLE RATE";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    for rate-text in root.sample-rate-options : Rectangle {
+                        min-width: 100px;
+                        min-height: 36px;
+                        border-radius: 8px;
+                        background: rate-text == root.sample-rate-options[root.sample-rate-index] ? AppColors.accent : AppColors.card-bg;
+                        border-width: rate-text == root.sample-rate-options[root.sample-rate-index] ? 0px : 1px;
+                        border-color: AppColors.border-main;
+                        VerticalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            alignment: center;
+                            Text {
+                                text: rate-text;
+                                color: rate-text == root.sample-rate-options[root.sample-rate-index] ? black : AppColors.text-title;
+                                font-weight: 700;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        TouchArea {
+                            enabled: root.settings-enabled;
+                            clicked => { root.sample-rate-tapped(rate-text); }
+                        }
+                    }
+                }
+            }
+
+            // 4. Audio Device
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "🔊 OUTPUT AUDIO INTERFACE";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    background: AppColors.deep-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    VerticalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        padding-top: 12px;
+                        padding-bottom: 12px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Interface:";
+                                color: AppColors.text-muted;
+                                font-size: 11px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                            if (root.device-names.length > 0) : ComboBox {
+                                current-index: root.device-index;
+                                model: root.device-names;
+                                selected => {
+                                    root.device-selected(self.current-index);
+                                }
+                            }
+                            if (root.device-names.length == 0) : Text {
+                                text: "No devices found — using default output";
+                                color: AppColors.text-muted;
+                                font-size: 12px;
+                            }
+                            Rectangle {
+                                min-width: 80px; min-height: 28px;
+                                border-radius: 6px;
+                                background: AppColors.card-bg;
+                                border-width: 1px;
+                                border-color: AppColors.border-main;
+                                TouchArea { clicked => { root.refresh-devices(); } }
+                                Text {
+                                    text: "Refresh List";
+                                    color: AppColors.text-muted;
+                                    font-size: 10px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        Rectangle {
+                            border-radius: 6px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 6px;
+                                Rectangle {
+                                    width: 6px; height: 6px;
+                                    border-radius: 3px;
+                                    background: AppColors.accent;
+                                }
+                                Text {
+                                    text: "Sends SMPTE Linear Timecode audio directly to mixers, USB-DAC, or sync adapters.";
+                                    color: AppColors.text-muted;
+                                    font-size: 10px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. Routing & Volume
+            VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "🎛️ AUDIO ROUTING & SETTINGS (DUAL-CHANNEL SPLITS)";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                Rectangle {
+                    border-radius: 10px;
+                    background: AppColors.deep-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        padding-top: 12px;
+                        padding-bottom: 12px;
+                        spacing: 20px;
+
+                        // Left column: routing
+                        VerticalLayout {
+                            spacing: 10px;
+                            // LTC routing
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "LTC OUTPUT";
+                                    color: AppColors.text-muted;
+                                    font-size: 9px;
+                                    font-weight: 700;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    for ch-index in [0, 1, 2] : Rectangle {
+                                        min-width: 60px; min-height: 28px;
+                                        border-radius: 6px;
+                                        background: root.ltc-channel-index == ch-index ? AppColors.accent : AppColors.card-bg;
+                                        border-width: root.ltc-channel-index == ch-index ? 0px : 1px;
+                                        border-color: AppColors.border-main;
+                                        TouchArea {
+                                            clicked => { root.ltc-channel-selected(ch-index); }
+                                        }
+                                        Text {
+                                            text: ch-index == 0 ? "Left" : (ch-index == 1 ? "Right" : "Both");
+                                            color: root.ltc-channel-index == ch-index ? black : AppColors.text-title;
+                                            font-weight: 700;
+                                            font-size: 11px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Beep routing
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "CLAPPER OUTPUT";
+                                    color: AppColors.text-muted;
+                                    font-size: 9px;
+                                    font-weight: 700;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    for ch-index in [0, 1, 2] : Rectangle {
+                                        min-width: 60px; min-height: 28px;
+                                        border-radius: 6px;
+                                        background: root.beep-channel-index == ch-index ? AppColors.accent : AppColors.card-bg;
+                                        border-width: root.beep-channel-index == ch-index ? 0px : 1px;
+                                        border-color: AppColors.border-main;
+                                        TouchArea {
+                                            clicked => { root.beep-channel-selected(ch-index); }
+                                        }
+                                        Text {
+                                            text: ch-index == 0 ? "Left" : (ch-index == 1 ? "Right" : "Both");
+                                            color: root.beep-channel-index == ch-index ? black : AppColors.text-title;
+                                            font-weight: 700;
+                                            font-size: 11px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Right column: sliders
+                        VerticalLayout {
+                            spacing: 6px;
+                            GridLayout {
+                            spacing: 6px;
+                            Row {
+                                Text { text: "LTC VOL"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
+                                Slider {
+                                    value: root.ltc-volume;
+                                    minimum: 0.0; maximum: 1.0;
+                                    changed(new_val) => { root.ltc-volume-changed(new_val); }
+                                }
+                                Text {
+                                    text: root.ltc-volume * 100;
+                                    color: AppColors.text-title;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                }
+                            }
+                            Row {
+                                Text { text: "BEEP VOL"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
+                                Slider {
+                                    value: root.beep-volume;
+                                    minimum: 0.0; maximum: 1.0;
+                                    changed(new_val) => { root.beep-volume-changed(new_val); }
+                                }
+                                Text {
+                                    text: root.beep-volume * 100;
+                                    color: AppColors.text-title;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                }
+                            }
+                            Row {
+                                Text { text: "PITCH"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
+                                Slider {
+                                    value: root.beep-frequency;
+                                    minimum: 400.0; maximum: 2000.0;
+                                    changed(new_val) => { root.beep-frequency-changed(new_val); }
+                                }
+                                Text {
+                                    text: root.beep-frequency;
+                                    color: AppColors.text-title;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                }
+                            }
+                            Row {
+                                Text { text: "DUR"; color: AppColors.text-muted; font-size: 9px; font-weight: 700; }
+                                Slider {
+                                    value: root.beep-duration;
+                                    minimum: 0.05; maximum: 2.0;
+                                    changed(new_val) => { root.beep-duration-changed(new_val); }
+                                }
+                                Text {
+                                    text: root.beep-duration * 1000;
+                                    color: AppColors.text-title;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                }
+                            }
+                        }
+
+                            }
+                        }
+
+                    }
+
+                // Tip
+                Rectangle {
+                    border-radius: 6px;
+                    background: AppColors.card-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 6px;
+                        Rectangle {
+                            width: 8px; height: 8px;
+                            border-radius: 4px;
+                            background: AppColors.accent;
+                        }
+                        Text {
+                            text: "LTC Right, Clapper Left into camera mic — Channel 1 Resolve, Channel 2 scratch.";
+                            color: AppColors.text-muted;
+                            font-size: 8.5px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

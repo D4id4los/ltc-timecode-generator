@@ -1,0 +1,45 @@
+export global AppColors {
+    in-out property <bool> theme-dark;
+
+    in property <color> dark-accent;
+    in property <color> dark-app-bg;
+    in property <color> dark-card-bg;
+    in property <color> dark-deep-bg;
+    in property <color> dark-nested-bg;
+    in property <color> dark-text-main;
+    in property <color> dark-text-title;
+    in property <color> dark-text-muted;
+    in property <color> dark-border-main;
+    in property <color> dark-green;
+    in property <color> dark-red;
+    in property <color> dark-amber;
+    in property <color> dark-clock-sep;
+
+    in property <color> light-accent;
+    in property <color> light-app-bg;
+    in property <color> light-card-bg;
+    in property <color> light-deep-bg;
+    in property <color> light-nested-bg;
+    in property <color> light-text-main;
+    in property <color> light-text-title;
+    in property <color> light-text-muted;
+    in property <color> light-border-main;
+    in property <color> light-green;
+    in property <color> light-red;
+    in property <color> light-amber;
+    in property <color> light-clock-sep;
+
+    in-out property <color> accent: root.theme-dark ? root.dark-accent : root.light-accent;
+    in-out property <color> app-bg: root.theme-dark ? root.dark-app-bg : root.light-app-bg;
+    in-out property <color> card-bg: root.theme-dark ? root.dark-card-bg : root.light-card-bg;
+    in-out property <color> deep-bg: root.theme-dark ? root.dark-deep-bg : root.light-deep-bg;
+    in-out property <color> nested-bg: root.theme-dark ? root.dark-nested-bg : root.light-nested-bg;
+    in-out property <color> text-main: root.theme-dark ? root.dark-text-main : root.light-text-main;
+    in-out property <color> text-title: root.theme-dark ? root.dark-text-title : root.light-text-title;
+    in-out property <color> text-muted: root.theme-dark ? root.dark-text-muted : root.light-text-muted;
+    in-out property <color> border-main: root.theme-dark ? root.dark-border-main : root.light-border-main;
+    in-out property <color> green: root.theme-dark ? root.dark-green : root.light-green;
+    in-out property <color> red: root.theme-dark ? root.dark-red : root.light-red;
+    in-out property <color> amber: root.theme-dark ? root.dark-amber : root.light-amber;
+    in-out property <color> clock-sep: root.theme-dark ? root.dark-clock-sep : root.light-clock-sep;
+}

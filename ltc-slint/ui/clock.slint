@@ -1,0 +1,309 @@
+import { AppColors } from "./theme.slint";
+import { PillBox } from "./widgets.slint";
+
+export component ClockSection {
+    in-out property <string> tc-hh: "01";
+    in-out property <string> tc-sep1: ":";
+    in-out property <string> tc-mm: "00";
+    in-out property <string> tc-sep2: ":";
+    in-out property <string> tc-ss: "00";
+    in-out property <string> tc-sep3: ":";
+    in-out property <string> tc-ff: "00";
+    in-out property <string> ms-text;
+    in-out property <bool> is-playing;
+    in-out property <bool> is-locked;
+    in-out property <string> fps-name;
+    in-out property <string> ltc-route;
+    in-out property <string> beep-route;
+    in-out property <float> pulse-phase: 0.0;
+    in-out property <length> window-width: 800px;
+    callback start-ltc;
+    callback stop-ltc;
+    callback clap-beep;
+    callback reset-tc;
+    callback toggle-lock;
+
+    Rectangle {
+        border-radius: 16px;
+        border-width: 1.5px;
+        border-color: AppColors.border-main;
+        background: AppColors.card-bg;
+
+        VerticalLayout {
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 8px;
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+                Text {
+                    text: "LINEAR TIMECODE STREAM";
+                    color: AppColors.accent;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: root.is-playing ? AppColors.green : AppColors.amber;
+                    opacity: root.is-playing ? Math.sin(root.pulse-phase * 1rad) * 0.3 + 0.7 : 1.0;
+                }
+            }
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: 0px;
+                Text { text: root.tc-hh; color: AppColors.text-main; font-size: 48px; font-weight: 700; }
+                Text { text: root.tc-sep1; color: AppColors.clock-sep; font-size: 48px; font-weight: 700; }
+                Text { text: root.tc-mm; color: AppColors.text-main; font-size: 48px; font-weight: 700; }
+                Text { text: root.tc-sep2; color: AppColors.clock-sep; font-size: 48px; font-weight: 700; }
+                Text { text: root.tc-ss; color: AppColors.text-main; font-size: 48px; font-weight: 700; }
+                Text { text: root.tc-sep3; color: AppColors.accent; font-size: 48px; font-weight: 700; }
+                Text { text: root.tc-ff; color: AppColors.accent; font-size: 48px; font-weight: 700; }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: center;
+                Text {
+                    text: "MS MATCH:";
+                    color: AppColors.text-muted;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.ms-text;
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+                PillBox {
+                    pill-text: "⚡ FPS: " + root.fps-name;
+                }
+                PillBox {
+                    pill-text: "🔊 ROUTE: LTC " + root.ltc-route + " | CLAP " + root.beep-route;
+                }
+            }
+
+            if root.window-width >= 420px : HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+
+                if (root.is-playing) : Rectangle {
+                    min-width: 160px;
+                    border-radius: 8px;
+                    background: AppColors.red;
+                    min-height: 40px;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.stop-ltc(); }
+                    }
+                    Text {
+                        text: "■ STOP";
+                        color: white;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if (!root.is-playing) : Rectangle {
+                    min-width: 160px;
+                    border-radius: 8px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    min-height: 40px;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.start-ltc(); }
+                    }
+                    Text {
+                        text: "▶ START";
+                        color: AppColors.text-title;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    min-width: 140px;
+                    min-height: 40px;
+                    border-radius: 8px;
+                    background: AppColors.accent;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.clap-beep(); }
+                    }
+                    Text {
+                        text: "🎥 CLAP & BEEP";
+                        color: black;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.reset-tc(); }
+                    }
+                    Text {
+                        text: "⟲";
+                        color: AppColors.text-title;
+                        font-weight: 700;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 8px;
+                    background: root.is-locked ? AppColors.accent : AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: root.is-locked ? AppColors.accent : AppColors.border-main;
+                    TouchArea {
+                        clicked => { root.toggle-lock(); }
+                    }
+                    Text {
+                        text: root.is-locked ? "🔒" : "🔓";
+                        color: root.is-locked ? black : AppColors.text-muted;
+                        font-weight: 700;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if root.window-width < 420px : VerticalLayout {
+                spacing: 8px;
+                alignment: center;
+
+                if (root.is-playing) : Rectangle {
+                    border-radius: 8px;
+                    background: AppColors.red;
+                    min-height: 40px;
+                    min-width: 200px;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.stop-ltc(); }
+                    }
+                    Text {
+                        text: "■ STOP";
+                        color: white;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if (!root.is-playing) : Rectangle {
+                    border-radius: 8px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    min-height: 40px;
+                    min-width: 200px;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.start-ltc(); }
+                    }
+                    Text {
+                        text: "▶ START";
+                        color: AppColors.text-title;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle {
+                    min-height: 40px;
+                    min-width: 200px;
+                    border-radius: 8px;
+                    background: AppColors.accent;
+                    TouchArea {
+                        enabled: !root.is-locked;
+                        clicked => { root.clap-beep(); }
+                    }
+                    Text {
+                        text: "🎥 CLAP & BEEP";
+                        color: black;
+                        font-weight: 700;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+                    Rectangle {
+                        width: 40px;
+                        height: 40px;
+                        border-radius: 8px;
+                        background: AppColors.nested-bg;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        TouchArea {
+                            enabled: !root.is-locked;
+                            clicked => { root.reset-tc(); }
+                        }
+                        Text {
+                            text: "⟲";
+                            color: AppColors.text-title;
+                            font-weight: 700;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle {
+                        width: 40px;
+                        height: 40px;
+                        border-radius: 8px;
+                        background: root.is-locked ? AppColors.accent : AppColors.nested-bg;
+                        border-width: 1px;
+                        border-color: root.is-locked ? AppColors.accent : AppColors.border-main;
+                        TouchArea {
+                            clicked => { root.toggle-lock(); }
+                        }
+                        Text {
+                            text: root.is-locked ? "🔒" : "🔓";
+                            color: root.is-locked ? black : AppColors.text-muted;
+                            font-weight: 700;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

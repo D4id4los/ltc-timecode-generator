@@ -1,0 +1,26 @@
+export struct LogEntry {
+    timestamp: string,
+    timecode: string,
+    milliseconds: string,
+    note: string,
+}
+
+export struct FrameRateOption {
+    name: string,
+    fps: float,
+    drop-frame: bool,
+    description: string,
+}
+
+export struct ToastData {
+    id: int,
+    message: string,
+    toast-type: string,
+    opacity: float,
+}
+
+export struct FileGroupInfo {
+    prefix: string,
+    files: [string],
+    channel-count: int,
+}

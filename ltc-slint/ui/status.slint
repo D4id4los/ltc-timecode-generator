@@ -1,0 +1,116 @@
+import { AppColors } from "./theme.slint";
+
+export component StatusBar {
+    in-out property <string> os-name;
+    in-out property <int> device-count;
+    in-out property <bool> is-playing;
+    in-out property <string> sample-format;
+    in-out property <bool> wake-lock-active;
+    in-out property <string> status-message;
+    in-out property <string> power-status;
+
+    Rectangle {
+        background: AppColors.deep-bg;
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            spacing: 16px;
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: AppColors.green;
+                }
+                Text {
+                    text: "OS: " + root.os-name;
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: AppColors.green;
+                }
+                Text {
+                    text: "AUDIO OUT: " + root.device-count + " DEVICES FOUND";
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: root.is-playing ? AppColors.green : AppColors.amber;
+                }
+                Text {
+                    text: root.is-playing ? "AUDIO CORE: RUNNING" : "AUDIO CORE: STANDBY";
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            if (root.sample-format != "") : HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: AppColors.green;
+                }
+                Text {
+                    text: "SAMPLE: " + root.sample-format;
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: root.wake-lock-active ? AppColors.green : AppColors.text-muted;
+                }
+                Text {
+                    text: root.wake-lock-active ? "WAKE LOCK: ACTIVE" : "WAKE LOCK: STANDBY";
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Rectangle {
+                    width: 6px; height: 6px;
+                    border-radius: 3px;
+                    background: AppColors.green;
+                }
+                Text {
+                    text: "POWER: " + root.power-status;
+                    color: AppColors.text-title;
+                    font-size: 10px;
+                    font-weight: 700;
+                }
+            }
+            HorizontalLayout {
+                alignment: end;
+                Text {
+                    text: root.status-message;
+                    color: AppColors.text-muted;
+                    font-size: 10px;
+                    font-weight: 600;
+                }
+            }
+        }
+    }
+}

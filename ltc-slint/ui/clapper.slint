@@ -1,0 +1,714 @@
+import { AppColors } from "./theme.slint";
+import { LogEntry } from "./types.slint";
+import { ListView } from "std-widgets.slint";
+
+export component ClapperSection {
+    in-out property <int> scene;
+    in-out property <int> take;
+    in-out property <string> roll;
+    in-out property <bool> auto-increment;
+    in-out property <[LogEntry]> logs;
+    in-out property <float> arm-angle: -0.43633;
+    in-out property <length> window-width: 800px;
+    in-out property <bool> copy-confirmed: false;
+
+    callback scene-up;
+    callback scene-down;
+    callback take-up;
+    callback take-down;
+    callback roll-changed;
+    callback auto-increment-toggled;
+    callback clap-beep;
+    callback clear-logs;
+    callback copy-logs;
+
+    if root.window-width >= 600px : HorizontalLayout {
+        spacing: 12px;
+
+        VerticalLayout {
+            spacing: 12px;
+
+            Rectangle {
+                vertical-stretch: 0;
+                min-height: 100px;
+                background: AppColors.deep-bg;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+
+                VerticalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 12px;
+                    padding-bottom: 12px;
+                    spacing: 4px;
+                    alignment: center;
+
+                    Rectangle {
+                        height: 20px;
+                        background: AppColors.deep-bg;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        border-radius: 2px;
+                        HorizontalLayout {
+                            spacing: 0px;
+                            for stripe-index in [0, 1, 2, 3, 4, 5] : Rectangle {
+                                width: 1px;
+                                background: Math.mod(stripe-index, 2) == 0 ? AppColors.deep-bg : AppColors.accent;
+                                border-radius: 0px;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 2px;
+                        background: AppColors.border-main;
+                    }
+
+                    Rectangle {
+                        height: 22px;
+                        Rectangle {
+                            height: 20px;
+                            y: 2px + root.arm-angle * 1px;
+                            background: AppColors.deep-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            border-radius: 2px;
+                            HorizontalLayout {
+                                spacing: 0px;
+                                for stripe-index in [0, 1, 2, 3, 4, 5] : Rectangle {
+                                    width: 1px;
+                                    background: Math.mod(stripe-index, 2) == 0 ? AppColors.deep-bg : AppColors.accent;
+                                    border-radius: 0px;
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Tap to clap";
+                        color: AppColors.text-muted;
+                        font-size: 12px;
+                    }
+                }
+
+                TouchArea {
+                    clicked => { root.clap-beep(); }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    min-height: 70px;
+                    VerticalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 2px;
+                        alignment: center;
+                        Text {
+                            text: "ROLL";
+                            color: AppColors.text-muted;
+                            font-size: 9px;
+                            font-weight: 700;
+                        }
+                        TextInput {
+                            text: root.roll;
+                            font-size: 14px;
+                            color: AppColors.text-title;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            edited => { root.roll-changed(); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    min-height: 70px;
+                    VerticalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 2px;
+                        alignment: center;
+                        Text {
+                            text: "SCENE";
+                            color: AppColors.text-muted;
+                            font-size: 9px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: root.scene;
+                            color: AppColors.text-title;
+                            font-size: 18px;
+                            font-weight: 700;
+                        }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            alignment: center;
+                            Rectangle {
+                                width: 22px; height: 22px;
+                                border-radius: 4px;
+                                background: AppColors.card-bg;
+                                border-width: 1px;
+                                border-color: AppColors.border-main;
+                                TouchArea { clicked => { root.scene-down(); } }
+                                Text { text: "-"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Rectangle {
+                                width: 22px; height: 22px;
+                                border-radius: 4px;
+                                background: AppColors.card-bg;
+                                border-width: 1px;
+                                border-color: AppColors.border-main;
+                                TouchArea { clicked => { root.scene-up(); } }
+                                Text { text: "+"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    border-radius: 8px;
+                    background: AppColors.nested-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    min-height: 70px;
+                    VerticalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
+                        spacing: 2px;
+                        alignment: center;
+                        Text {
+                            text: "TAKE";
+                            color: AppColors.text-muted;
+                            font-size: 9px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: root.take;
+                            color: AppColors.accent;
+                            font-size: 18px;
+                            font-weight: 700;
+                        }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            alignment: center;
+                            Rectangle {
+                                width: 22px; height: 22px;
+                                border-radius: 4px;
+                                background: AppColors.card-bg;
+                                border-width: 1px;
+                                border-color: AppColors.border-main;
+                                TouchArea { clicked => { root.take-down(); } }
+                                Text { text: "-"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Rectangle {
+                                width: 22px; height: 22px;
+                                border-radius: 4px;
+                                background: AppColors.card-bg;
+                                border-width: 1px;
+                                border-color: AppColors.border-main;
+                                TouchArea { clicked => { root.take-up(); } }
+                                Text { text: "+"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: "Auto-Increment Take";
+                    color: AppColors.text-muted;
+                    font-size: 11px;
+                }
+                TouchArea {
+                    clicked => { root.auto-increment-toggled(); }
+                    Rectangle {
+                        width: 16px; height: 16px;
+                        border-radius: 3px;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        background: root.auto-increment ? AppColors.accent : AppColors.nested-bg;
+                        if (root.auto-increment) : Text {
+                            text: "✓";
+                            color: black;
+                            font-weight: 700;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                min-height: 44px;
+                border-radius: 8px;
+                background: AppColors.accent;
+                TouchArea {
+                    clicked => { root.clap-beep(); }
+                }
+                Text {
+                    text: "CLAP & BEEP";
+                    color: black;
+                    font-weight: 700;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; background: transparent; }
+        }
+
+        Rectangle {
+            border-radius: 8px;
+            background: AppColors.card-bg;
+            border-width: 1.5px;
+            border-color: AppColors.border-main;
+
+            VerticalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "📋 SYNCHRONIZATION LOGS";
+                        color: AppColors.text-muted;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 4px;
+                        Rectangle {
+                            min-width: 50px; min-height: 24px;
+                            border-radius: 4px;
+                            background: root.copy-confirmed ? AppColors.green : AppColors.nested-bg;
+                            border-width: 1px;
+                            border-color: root.copy-confirmed ? AppColors.green : AppColors.border-main;
+                            TouchArea { clicked => { root.copy-logs(); } }
+                            Text {
+                                text: root.copy-confirmed ? "✓" : "Copy";
+                                color: root.copy-confirmed ? white : AppColors.text-title;
+                                font-size: 10px; font-weight: 600;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            min-width: 50px; min-height: 24px;
+                            border-radius: 4px;
+                            background: AppColors.nested-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.clear-logs(); } }
+                            Text { text: "Clear"; color: AppColors.text-title; font-size: 10px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                if (root.logs.length == 0) : VerticalLayout {
+                    vertical-stretch: 0;
+                    spacing: 4px;
+                    alignment: center;
+                    padding-top: 20px;
+                    padding-bottom: 20px;
+                    Text { text: "No clapper marks recorded yet."; color: AppColors.text-muted; font-weight: 700; }
+                    Text { text: "Tap CLAP & BEEP to capture markings."; color: AppColors.text-muted; font-size: 10px; }
+                }
+                if (root.logs.length == 0) : Rectangle { vertical-stretch: 1; background: transparent; }
+                if (root.logs.length > 0) : ListView {
+                    for log-entry in root.logs : Rectangle {
+                        border-radius: 6px;
+                        background: AppColors.nested-bg;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        VerticalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                Text { text: log-entry.note; color: AppColors.accent; font-weight: 700; font-size: 12px; }
+                                HorizontalLayout { alignment: end; Text { text: log-entry.timestamp; color: AppColors.text-muted; font-size: 10px; } }
+                            }
+                            HorizontalLayout {
+                                Text { text: "LTC Timecode:"; color: AppColors.text-muted; font-size: 10.5px; }
+                                Text { text: log-entry.timecode; color: AppColors.text-title; font-weight: 700; font-size: 10.5px; horizontal-alignment: right; }
+                            }
+                            HorizontalLayout {
+                                Text { text: "Milliseconds:"; color: AppColors.text-muted; font-size: 10.5px; }
+                                Text { text: log-entry.milliseconds; color: AppColors.accent; font-weight: 700; font-size: 10.5px; horizontal-alignment: right; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.window-width < 600px : VerticalLayout {
+        spacing: 12px;
+
+        Rectangle {
+            vertical-stretch: 0;
+            min-height: 100px;
+            background: AppColors.deep-bg;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: AppColors.border-main;
+
+            VerticalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 4px;
+                alignment: center;
+
+                Rectangle {
+                    height: 20px;
+                    background: AppColors.deep-bg;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    border-radius: 2px;
+                    HorizontalLayout {
+                        spacing: 0px;
+                        for stripe-index in [0, 1, 2, 3, 4, 5] : Rectangle {
+                            width: 1px;
+                            background: Math.mod(stripe-index, 2) == 0 ? AppColors.deep-bg : AppColors.accent;
+                            border-radius: 0px;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 2px;
+                    background: AppColors.border-main;
+                }
+
+                Rectangle {
+                    height: 22px;
+                    Rectangle {
+                        height: 20px;
+                        y: 2px + root.arm-angle * 1px;
+                        background: AppColors.deep-bg;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        border-radius: 2px;
+                        HorizontalLayout {
+                            spacing: 0px;
+                            for stripe-index in [0, 1, 2, 3, 4, 5] : Rectangle {
+                                width: 1px;
+                                background: Math.mod(stripe-index, 2) == 0 ? AppColors.deep-bg : AppColors.accent;
+                                border-radius: 0px;
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Tap to clap";
+                    color: AppColors.text-muted;
+                    font-size: 12px;
+                }
+            }
+
+            TouchArea {
+                clicked => { root.clap-beep(); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+
+            Rectangle {
+                border-radius: 8px;
+                background: AppColors.nested-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                min-height: 70px;
+                VerticalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    spacing: 2px;
+                    alignment: center;
+                    Text {
+                        text: "ROLL";
+                        color: AppColors.text-muted;
+                        font-size: 9px;
+                        font-weight: 700;
+                    }
+                    TextInput {
+                        text: root.roll;
+                        font-size: 14px;
+                        color: AppColors.text-title;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        edited => { root.roll-changed(); }
+                    }
+                }
+            }
+
+            Rectangle {
+                border-radius: 8px;
+                background: AppColors.nested-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                min-height: 70px;
+                VerticalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    spacing: 2px;
+                    alignment: center;
+                    Text {
+                        text: "SCENE";
+                        color: AppColors.text-muted;
+                        font-size: 9px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.scene;
+                        color: AppColors.text-title;
+                        font-size: 18px;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        alignment: center;
+                        Rectangle {
+                            width: 22px; height: 22px;
+                            border-radius: 4px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.scene-down(); } }
+                            Text { text: "-"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            width: 22px; height: 22px;
+                            border-radius: 4px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.scene-up(); } }
+                            Text { text: "+"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                border-radius: 8px;
+                background: AppColors.nested-bg;
+                border-width: 1px;
+                border-color: AppColors.border-main;
+                min-height: 70px;
+                VerticalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    spacing: 2px;
+                    alignment: center;
+                    Text {
+                        text: "TAKE";
+                        color: AppColors.text-muted;
+                        font-size: 9px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.take;
+                        color: AppColors.accent;
+                        font-size: 18px;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        alignment: center;
+                        Rectangle {
+                            width: 22px; height: 22px;
+                            border-radius: 4px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.take-down(); } }
+                            Text { text: "-"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        Rectangle {
+                            width: 22px; height: 22px;
+                            border-radius: 4px;
+                            background: AppColors.card-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.take-up(); } }
+                            Text { text: "+"; color: AppColors.text-title; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: "Auto-Increment Take";
+                color: AppColors.text-muted;
+                font-size: 11px;
+            }
+            TouchArea {
+                clicked => { root.auto-increment-toggled(); }
+                Rectangle {
+                    width: 16px; height: 16px;
+                    border-radius: 3px;
+                    border-width: 1px;
+                    border-color: AppColors.border-main;
+                    background: root.auto-increment ? AppColors.accent : AppColors.nested-bg;
+                    if (root.auto-increment) : Text {
+                        text: "✓";
+                        color: black;
+                        font-weight: 700;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            min-height: 44px;
+            border-radius: 8px;
+            background: AppColors.accent;
+            TouchArea {
+                clicked => { root.clap-beep(); }
+            }
+            Text {
+                text: "CLAP & BEEP";
+                color: black;
+                font-weight: 700;
+                font-size: 14px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; background: transparent; }
+
+        Rectangle {
+            border-radius: 8px;
+            background: AppColors.card-bg;
+            border-width: 1.5px;
+            border-color: AppColors.border-main;
+
+            VerticalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "📋 SYNCHRONIZATION LOGS";
+                        color: AppColors.text-muted;
+                        font-size: 11px;
+                        font-weight: 700;
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 4px;
+                        Rectangle {
+                            min-width: 50px; min-height: 24px;
+                            border-radius: 4px;
+                            background: root.copy-confirmed ? AppColors.green : AppColors.nested-bg;
+                            border-width: 1px;
+                            border-color: root.copy-confirmed ? AppColors.green : AppColors.border-main;
+                            TouchArea { clicked => { root.copy-logs(); } }
+                            Text {
+                                text: root.copy-confirmed ? "✓" : "Copy";
+                                color: root.copy-confirmed ? white : AppColors.text-title;
+                                font-size: 10px; font-weight: 600;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            min-width: 50px; min-height: 24px;
+                            border-radius: 4px;
+                            background: AppColors.nested-bg;
+                            border-width: 1px;
+                            border-color: AppColors.border-main;
+                            TouchArea { clicked => { root.clear-logs(); } }
+                            Text { text: "Clear"; color: AppColors.text-title; font-size: 10px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                if (root.logs.length == 0) : VerticalLayout {
+                    vertical-stretch: 0;
+                    spacing: 4px;
+                    alignment: center;
+                    padding-top: 20px;
+                    padding-bottom: 20px;
+                    Text { text: "No clapper marks recorded yet."; color: AppColors.text-muted; font-weight: 700; }
+                    Text { text: "Tap CLAP & BEEP to capture markings."; color: AppColors.text-muted; font-size: 10px; }
+                }
+                if (root.logs.length == 0) : Rectangle { vertical-stretch: 1; background: transparent; }
+                if (root.logs.length > 0) : ListView {
+                    for log-entry in root.logs : Rectangle {
+                        border-radius: 6px;
+                        background: AppColors.nested-bg;
+                        border-width: 1px;
+                        border-color: AppColors.border-main;
+                        VerticalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                Text { text: log-entry.note; color: AppColors.accent; font-weight: 700; font-size: 12px; }
+                                HorizontalLayout { alignment: end; Text { text: log-entry.timestamp; color: AppColors.text-muted; font-size: 10px; } }
+                            }
+                            HorizontalLayout {
+                                Text { text: "LTC Timecode:"; color: AppColors.text-muted; font-size: 10.5px; }
+                                Text { text: log-entry.timecode; color: AppColors.text-title; font-weight: 700; font-size: 10.5px; horizontal-alignment: right; }
+                            }
+                            HorizontalLayout {
+                                Text { text: "Milliseconds:"; color: AppColors.text-muted; font-size: 10.5px; }
+                                Text { text: log-entry.milliseconds; color: AppColors.accent; font-weight: 700; font-size: 10.5px; horizontal-alignment: right; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
