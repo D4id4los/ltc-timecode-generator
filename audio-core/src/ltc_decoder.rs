@@ -115,7 +115,8 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
 
     // ── Dispatch based on file size ──────────────────────────────────────
 
-    let (best_result, zc) = if total_duration <= PREFIX_DURATION_SECS {
+    if total_duration <= PREFIX_DURATION_SECS {
+        // ── Path A: Short file (≤ 30s) — direct full-file analysis ───────
         debug!("LTC decode: file <= {}s prefix -- direct full search", PREFIX_DURATION_SECS);
         info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (threshold={:.6})...",
             start.elapsed().as_secs_f64(), samples.len(), threshold);
@@ -128,146 +129,193 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                 zc.len()
             )));
         }
+
+        // Short files: evaluate_on_slice is fast enough, skip ZC-interval shortcut
+        info!("LTC decode: full-file candidate search -- evaluating {} FPS candidates on {:.2}s of audio",
+            CANDIDATES.len(), total_duration);
         let (result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold);
-        (result, zc)
-    } else {
-        let prefix_len = (PREFIX_DURATION_SECS * sample_rate as f64) as usize;
-        let prefix_len = prefix_len.min(samples.len());
-        info!("LTC decode: prefix analysis -- using first {:.2}s of {:.2}s total ({} samples, threshold={:.6})",
-            prefix_len as f64 / sample_rate as f64, total_duration, prefix_len, threshold);
+        return build_result(result, &zc, sample_rate, threshold, channels, total_duration, start);
+    }
 
-        let prefix = &samples[..prefix_len];
-        info!("LTC decode (+{:.1}s): scanning prefix ({} samples) for zero-crossings...",
-            start.elapsed().as_secs_f64(), prefix.len());
-        let zc_prefix = find_zero_crossings(prefix, threshold);
-        debug!("LTC decode: prefix -- found {} zero-crossings (need ≥8)", zc_prefix.len());
+    // ── Path B: Long file (> 30s) — hierarchical analysis ────────────────
 
-        if zc_prefix.len() < 8 {
-            warn!("LTC decode: prefix has only {} zero-crossings -- signal may start past prefix, falling back to full-file search", zc_prefix.len());
-            info!("LTC decode (+{:.1}s): full-file zero-crossings scan ({} samples)...",
-                start.elapsed().as_secs_f64(), samples.len());
-            let zc = find_zero_crossings(&samples, threshold);
-            if zc.len() < 8 {
-                return Ok(LtcDetectionResult::error(format!(
-                    "Only {} zero-crossings found (need ≥8) -- signal may be silent or not LTC audio",
-                    zc.len()
-                )));
+    let prefix_len = (PREFIX_DURATION_SECS * sample_rate as f64) as usize;
+
+    // Step 1: try first 30s segment
+    let mut prefix_samples: &[f32] = &samples[..prefix_len.min(samples.len())];
+    let mut zc_prefix = find_zero_crossings(prefix_samples, threshold);
+    debug!("LTC decode: prefix (first 30s) -- found {} zero-crossings (need ≥8)", zc_prefix.len());
+
+    // Step 2: if first 30s has insufficient ZCs, try middle of file
+    if zc_prefix.len() < 8 {
+        // Use ~1/3 of the way into the file to avoid pre-roll silence
+        let mid_start_secs = (total_duration * 0.33).min(total_duration - PREFIX_DURATION_SECS);
+        let mid_start = (mid_start_secs * sample_rate as f64) as usize;
+        let mid_end = (mid_start + prefix_len).min(samples.len());
+        prefix_samples = &samples[mid_start..mid_end];
+        zc_prefix = find_zero_crossings(prefix_samples, threshold);
+        debug!("LTC decode: prefix (middle 30s @ {:.1}s) -- found {} zero-crossings (need ≥8)",
+            mid_start_secs, zc_prefix.len());
+    }
+
+    if zc_prefix.len() >= 8 {
+        // We found zero crossings on a prefix — try ZC-interval first (very fast)
+        let zc_result = try_decode_via_zc_intervals(&zc_prefix, sample_rate);
+        let zc_conf = zc_result.as_ref().map_or(0.0, |r| {
+            if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
+        });
+        if let Some(ref r) = zc_result {
+            info!("LTC decode: prefix ZC-interval result -- {} valid / {} possible ({:.1}%) at FPS {}, spb={:.2}",
+                r.valid_frames, r.total_possible, zc_conf * 100.0, r.fps, r.spb);
+        }
+
+        // Also run evaluate_on_slice on the prefix (gives precise spb/phase)
+        info!("LTC decode: prefix -- running coarse-to-fine candidate search ({} FPS candidates, {} zero-crossings)",
+            CANDIDATES.len(), zc_prefix.len());
+        let (prefix_result, _) = evaluate_on_slice(prefix_samples, &zc_prefix, sample_rate, threshold);
+
+        let eval_conf = prefix_result.as_ref().map_or(0.0, |r| {
+            if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
+        });
+
+        match prefix_result {
+            Some(ref r) => {
+                info!("LTC decode: prefix eval result -- {} valid / {} possible ({:.1}%) at FPS {}, spb={:.2}, phase={}",
+                    r.valid_frames, r.total_possible, eval_conf * 100.0, r.fps, r.spb, r.phase);
             }
-            debug!("LTC decode: full -- found {} zero-crossings", zc.len());
-            info!("LTC decode: full-file candidate search -- evaluating {} FPS candidates on {:.2}s of audio",
-                CANDIDATES.len(), total_duration);
-            let (result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold);
-            (result, zc)
-        } else {
-            // Run coarse-to-fine candidate search on the prefix
-            info!("LTC decode: prefix -- running coarse-to-fine candidate search ({} FPS candidates, {} zero-crossings)",
-                CANDIDATES.len(), zc_prefix.len());
-            let (prefix_result, _) = evaluate_on_slice(prefix, &zc_prefix, sample_rate, threshold);
-
-            let confidence = prefix_result.as_ref().map_or(0.0, |r| {
-                if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
-            });
-
-            match prefix_result {
-                Some(ref r) => {
-                    info!("LTC decode: prefix result -- {} valid / {} possible ({:.1}%) at FPS {}, spb={:.2}, phase={}",
-                        r.valid_frames, r.total_possible, confidence * 100.0, r.fps, r.spb, r.phase);
-                }
-                None => {
-                    info!("LTC decode: prefix -- no valid candidates found");
-                }
+            None => {
+                info!("LTC decode: prefix -- no valid candidates from evaluate_on_slice");
             }
+        }
 
-            if confidence >= HIGH_CONFIDENCE_THRESHOLD {
-                let r = prefix_result.unwrap();
-                info!("LTC decode: prefix confidence {:.1}% ≥ {}% -- single-pass decoding full file ({:.2}s, {} samples)",
-                    confidence * 100.0, HIGH_CONFIDENCE_THRESHOLD * 100.0, total_duration, samples.len());
-                info!("LTC decode: full decode -- extracting bits (spb={:.2}, phase={}, threshold={:.6})",
-                    r.spb, r.phase, threshold);
-
-                let bits = extract_bits(&samples, r.spb, r.phase, threshold);
-                debug!("LTC decode: full decode -- extracted {} bits", bits.len());
-
-                if bits.len() < 80 {
-                    warn!("LTC decode: full decode -- fewer than 80 bits extracted, no frames possible");
-                    info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (fallback)...",
-                        start.elapsed().as_secs_f64(), samples.len());
-                    let zc = find_zero_crossings(&samples, threshold);
-                    return build_result(None, &zc, sample_rate, threshold, channels, total_duration, start);
-                }
-
-                info!("LTC decode (+{:.1}s): searching for sync words in {} bits...",
-                    start.elapsed().as_secs_f64(), bits.len());
-                let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
-                info!("LTC decode: full decode -- found {} valid / {} possible frames",
-                    valid_frames, total_possible);
-
-                if valid_frames > 0 {
-                    debug!("LTC decode: full decode -- decoding {} timecodes", valid_frames);
-                }
-                let timecodes: Vec<FrameTimecode> = frame_starts
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, &start)| FrameTimecode {
-                        frame_index: idx as u32,
-                        timecode: decode_timecode_from_bits(&bits, start),
-                        timecode_secs: (r.phase as f64 + start as f64 * r.spb) / sample_rate as f64,
-                    })
-                    .collect();
-
-                let fps_label = match r.fps as u32 {
-                    24 => "24 fps",
-                    25 => "25 fps",
-                    29 => "29.97",
-                    30 => "30 fps",
-                    _ => "other",
-                };
-
-                let details_entry = format!(
+        // If either method gives high confidence, do single-pass full decode
+        if eval_conf >= HIGH_CONFIDENCE_THRESHOLD {
+            let r = prefix_result.unwrap();
+            info!("LTC decode: prefix eval confidence {:.1}% ≥ {}% -- single-pass decoding full file ({:.2}s, {} samples)",
+                eval_conf * 100.0, HIGH_CONFIDENCE_THRESHOLD * 100.0, total_duration, samples.len());
+            let bits = extract_bits(&samples, r.spb, r.phase, threshold);
+            if bits.len() < 80 {
+                warn!("LTC decode: full decode -- fewer than 80 bits extracted, no frames possible");
+                let zc = find_zero_crossings(&samples, threshold);
+                return build_result(None, &zc, sample_rate, threshold, channels, total_duration, start);
+            }
+            let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
+            let timecodes: Vec<FrameTimecode> = frame_starts
+                .iter()
+                .enumerate()
+                .map(|(idx, &start)| FrameTimecode {
+                    frame_index: idx as u32,
+                    timecode: decode_timecode_from_bits(&bits, start),
+                    timecode_secs: (r.phase as f64 + start as f64 * r.spb) / sample_rate as f64,
+                })
+                .collect();
+            let fps_label = match r.fps as u32 {
+                24 => "24 fps",
+                25 => "25 fps",
+                29 => "29.97",
+                30 => "30 fps",
+                _ => "other",
+            };
+            let full_result = ScoredResult {
+                fps: r.fps,
+                drop_frame: r.drop_frame,
+                valid_frames,
+                total_possible,
+                timecodes,
+                bits,
+                details_entry: format!(
                     "{}: {} valid / {} possible frames (single-pass, spb={:.2})",
                     fps_label, valid_frames, total_possible, r.spb
-                );
-
-                let full_result = ScoredResult {
-                    fps: r.fps,
-                    drop_frame: r.drop_frame,
-                    valid_frames,
-                    total_possible,
-                    timecodes,
-                    bits,
-                    details_entry,
-                    spb: r.spb,
-                    phase: r.phase,
-                    frame_starts,
-                };
-
-                info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (final pass)...",
-                    start.elapsed().as_secs_f64(), samples.len());
-                let zc = find_zero_crossings(&samples, threshold);
-                return build_result(Some(full_result), &zc, sample_rate, threshold, channels, total_duration, start);
-            }
-
-            // Fallback: full-file candidate search
-            info!("LTC decode: prefix confidence {:.1}% < {}% -- falling back to full-file candidate search on {:.2}s of audio",
-                confidence * 100.0, HIGH_CONFIDENCE_THRESHOLD * 100.0, total_duration);
-            info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (fallback full-file)...",
-                start.elapsed().as_secs_f64(), samples.len());
+                ),
+                spb: r.spb,
+                phase: r.phase,
+                frame_starts,
+            };
             let zc = find_zero_crossings(&samples, threshold);
-            if zc.len() < 8 {
-                return Ok(LtcDetectionResult::error(format!(
-                    "Only {} zero-crossings found (need ≥8) -- signal may be silent or not LTC audio",
-                    zc.len()
-                )));
-            }
-            debug!("LTC decode: full -- found {} zero-crossings", zc.len());
-            info!("LTC decode: full-file candidate search -- evaluating {} FPS candidates on {:.2}s of audio",
-                CANDIDATES.len(), total_duration);
-            let (result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold);
-            (result, zc)
+            return build_result(Some(full_result), &zc, sample_rate, threshold, channels, total_duration, start);
         }
-    };
 
-    build_result(best_result, &zc, sample_rate, threshold, channels, total_duration, start)
+        if zc_conf >= HIGH_CONFIDENCE_THRESHOLD && verify_zc_result(zc_result.as_ref().unwrap(), prefix_samples, threshold, sample_rate) {
+            let r = zc_result.unwrap();
+            info!("LTC decode: prefix ZC-interval confidence {:.1}% ≥ {}% (verified) -- single-pass decoding full file ({:.2}s) at FPS {}, spb={:.2}",
+                zc_conf * 100.0, HIGH_CONFIDENCE_THRESHOLD * 100.0, total_duration, r.fps, r.spb);
+            let bits = extract_bits(&samples, r.spb, r.phase, threshold);
+            if bits.len() >= 80 {
+                let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
+                if valid_frames > 0 {
+                    let timecodes: Vec<FrameTimecode> = frame_starts
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &start)| FrameTimecode {
+                            frame_index: idx as u32,
+                            timecode: decode_timecode_from_bits(&bits, start),
+                            timecode_secs: (r.phase as f64 + start as f64 * r.spb) / sample_rate as f64,
+                        })
+                        .collect();
+                    let fps_label = match r.fps as u32 {
+                        24 => "24 fps",
+                        25 => "25 fps",
+                        29 => "29.97",
+                        30 => "30 fps",
+                        _ => "other",
+                    };
+                    let full_result = ScoredResult {
+                        fps: r.fps,
+                        drop_frame: r.drop_frame,
+                        valid_frames,
+                        total_possible,
+                        timecodes,
+                        bits,
+                        details_entry: format!(
+                            "{}: {} valid / {} possible frames (ZC-single-pass, spb={:.2})",
+                            fps_label, valid_frames, total_possible, r.spb
+                        ),
+                        spb: r.spb,
+                        phase: r.phase,
+                        frame_starts,
+                    };
+                    let zc = find_zero_crossings(&samples, threshold);
+                    return build_result(Some(full_result), &zc, sample_rate, threshold, channels, total_duration, start);
+                }
+            }
+        }
+    }
+
+    // ── Full-file analysis ────────────────────────────────────────────────
+    // We reach here when:
+    //   - Both prefix attempts had < 8 ZCs, OR
+    //   - Prefix had ZCs but neither method reached high confidence
+
+    info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (full file)...",
+        start.elapsed().as_secs_f64(), samples.len());
+    let zc = find_zero_crossings(&samples, threshold);
+    if zc.len() < 8 {
+        return Ok(LtcDetectionResult::error(format!(
+            "Only {} zero-crossings found (need ≥8) -- signal may be silent or not LTC audio",
+            zc.len()
+        )));
+    }
+    debug!("LTC decode: full -- found {} zero-crossings", zc.len());
+
+    // Try fast ZC-interval method on full file (must pass verification)
+    if let Some(zc_result) = try_decode_via_zc_intervals(&zc, sample_rate) {
+        let zc_conf = zc_result.valid_frames as f32 / zc_result.total_possible.max(1) as f32;
+        info!("LTC decode: full-file ZC-interval -- {} valid / {} possible ({:.1}%) at FPS {}",
+            zc_result.valid_frames, zc_result.total_possible, zc_conf * 100.0, zc_result.fps);
+        if zc_conf >= 0.30 || zc_result.valid_frames > 0 {
+            if verify_zc_result(&zc_result, &samples, threshold, sample_rate) {
+                info!("LTC decode: full-file ZC-interval verification PASSED -- accepted at FPS {}", zc_result.fps);
+                return build_result(Some(zc_result), &zc, sample_rate, threshold, channels, total_duration, start);
+            }
+            info!("LTC decode: full-file ZC-interval verification FAILED -- falling to last resort");
+        }
+    }
+
+    // Last resort: exhaustive waveform-sampling candidate search
+    info!("LTC decode: full-file candidate search -- evaluating {} FPS candidates on {:.2}s of audio (last resort)",
+        CANDIDATES.len(), total_duration);
+    let (result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold);
+    build_result(result, &zc, sample_rate, threshold, channels, total_duration, start)
 }
 
 /// Evaluate LTC candidates on a slice of audio samples.
@@ -671,7 +719,6 @@ fn find_zero_crossings(samples: &[f32], threshold: f32) -> Vec<usize> {
 //
 // Auto-detect by counting intervals shorter than 75% of a bit period.
 
-#[allow(dead_code)]
 fn decode_bits_from_zero_crossings(
     zc: &[usize],
     sample_rate: u32,
@@ -707,7 +754,6 @@ fn decode_bits_from_zero_crossings(
     }
 }
 
-#[allow(dead_code)]
 fn decode_bits_real_zc(zc: &[usize], spb: f64) -> Vec<u8> {
     let short_threshold = spb * 0.75;
     let mut bits = Vec::with_capacity(zc.len());
@@ -737,7 +783,6 @@ fn decode_bits_real_zc(zc: &[usize], spb: f64) -> Vec<u8> {
     bits
 }
 
-#[allow(dead_code)]
 fn decode_bits_synthetic_zc(zc: &[usize], spb: f64) -> Vec<u8> {
     let mut bits = Vec::with_capacity(zc.len() + 8);
 
@@ -761,6 +806,91 @@ fn decode_bits_synthetic_zc(zc: &[usize], spb: f64) -> Vec<u8> {
     }
 
     bits
+}
+
+/// Verify that a ZC-interval result is consistent by attempting waveform
+/// sampling (`extract_bits`) on a short audio segment at the candidate FPS.
+///
+/// This catches false positives where ZC-interval finds frames at the wrong
+/// FPS (common with synthetic encoding where intervals are ambiguous).
+/// Returns true if `extract_bits` confirms the same FPS.
+fn verify_zc_result(
+    zc_result: &ScoredResult,
+    samples: &[f32],
+    threshold: f32,
+    sample_rate: u32,
+) -> bool {
+    let verify_duration = PREFIX_DURATION_SECS.min(samples.len() as f64 / sample_rate as f64);
+    let verify_len = (verify_duration * sample_rate as f64) as usize;
+    let verify_samples = &samples[..verify_len];
+    let bits = extract_bits(verify_samples, zc_result.spb, zc_result.phase, threshold);
+    if bits.len() < 80 {
+        return false;
+    }
+    let (valid, _, _) = find_frames(&bits);
+    valid > 0
+}
+
+/// Try to decode LTC using the fast ZC-interval method for all FPS candidates.
+///
+/// This processes zero-crossing positions directly using interval arithmetic
+/// (two shorts = bit-1, one long = bit-0 for real SMPTE; interval/spb = k →
+/// (k-1 zeros) + 1 for synthetic encoding). Much faster than evaluate_on_slice
+/// because it avoids waveform sampling, SPB variants, and phase search.
+fn try_decode_via_zc_intervals(zc: &[usize], sample_rate: u32) -> Option<ScoredResult> {
+    if zc.len() < 8 {
+        return None;
+    }
+
+    let mut best_valid = 0u32;
+    let mut best_result: Option<ScoredResult> = None;
+
+    for &(fps, drop_frame, fps_name) in CANDIDATES {
+        let bits = decode_bits_from_zero_crossings(zc, sample_rate, fps);
+        if bits.len() < 80 {
+            continue;
+        }
+
+        let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
+        if valid_frames > best_valid {
+            best_valid = valid_frames;
+            let spb = sample_rate as f64 / (fps * 80.0);
+
+            let timecodes: Vec<FrameTimecode> = frame_starts
+                .iter()
+                .enumerate()
+                .map(|(idx, &start)| {
+                    let timecode = decode_timecode_from_bits(&bits, start);
+                    let timecode_secs = (zc[0] as f64 + start as f64 * spb) / sample_rate as f64;
+                    FrameTimecode {
+                        frame_index: idx as u32,
+                        timecode,
+                        timecode_secs,
+                    }
+                })
+                .collect();
+
+            let details_entry = format!(
+                "{}: {} valid / {} possible frames (ZC-interval)",
+                fps_name, valid_frames, total_possible
+            );
+
+            best_result = Some(ScoredResult {
+                fps,
+                drop_frame,
+                valid_frames,
+                total_possible,
+                timecodes,
+                bits,
+                details_entry,
+                spb,
+                phase: zc[0],
+                frame_starts,
+            });
+        }
+    }
+
+    best_result
 }
 
 // ── Bit extraction (fallback for noisy LTC) ────────────────────────────────
@@ -989,7 +1119,6 @@ fn bits_to_u8(slice: &[u8]) -> u8 {
 // ── Internal helper struct ───────────────────────────────────────────────────
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct ScoredResult {
     fps: f64,
     drop_frame: bool,
