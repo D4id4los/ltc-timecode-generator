@@ -719,6 +719,25 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
             }
         }
     });
+
+    // Trim to first LTC checkbox
+    let ltc_available = state.latest.ltc_decode_result.as_ref()
+        .map(|r| matches!(r.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence))
+        .unwrap_or(false);
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_enabled(ltc_available, egui::Checkbox::new(
+            &mut state.trim_ltc_start,
+            "Cut start to first LTC frame",
+        ));
+        if state.trim_ltc_start && state.trim_offset_secs > 0.001 {
+            ui.label(
+                RichText::new(format!("(trim {:.3}s of silence)", state.trim_offset_secs))
+                    .font(FontId::proportional(10.0))
+                    .color(colors.text_muted),
+            );
+        }
+    });
 }
 
 // ── Convert button ─────────────────────────────────────────────────────
@@ -836,6 +855,7 @@ fn start_conversion(state: &mut AppState) {
         video_encoder: state.video_encoder.clone(),
         audio_encoder: state.audio_encoder.clone(),
         output_path: state.output_path.clone(),
+        trim_start_secs: if state.trim_ltc_start { state.trim_offset_secs } else { 0.0 },
     };
 
     *state.conversion_state.lock().unwrap() = ConversionState::idle();

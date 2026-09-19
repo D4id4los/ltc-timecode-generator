@@ -95,6 +95,8 @@ pub struct AppState {
     pub cancel_flag: CancelFlag,
     pub convert_handle: Option<JoinHandle<()>>,
     pub ffmpeg_caps: Option<FfmpegCapabilities>,
+    pub trim_ltc_start: bool,
+    pub trim_offset_secs: f64,
 }
 
 impl AppState {
@@ -132,6 +134,8 @@ impl AppState {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             convert_handle: None,
             ffmpeg_caps: None,
+            trim_ltc_start: true,
+            trim_offset_secs: 0.0,
         }
     }
 
@@ -149,17 +153,24 @@ impl eframe::App for AppState {
         let snapshot = self.engine_state.load();
         self.latest = snapshot.as_ref().clone();
 
-        // 2. Maximize once
+        // 2. Derive trim offset from LTC result
+        if let Some(ref result) = self.latest.ltc_decode_result {
+            if matches!(result.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence) {
+                self.trim_offset_secs = result.first_ltc_timecode_secs;
+            }
+        }
+
+        // 3. Maximize once
         if !self.has_requested_maximize {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             self.has_requested_maximize = true;
         }
 
-        // 3. Derive theme from engine state and apply
+        // 4. Derive theme from engine state and apply
         self.theme = if self.latest.is_dark_theme { Theme::Dark } else { Theme::Light };
         self.theme.apply(ctx);
 
-        // 4. Delta time
+        // 5. Delta time
         let now = Instant::now();
         let _delta = self
             .last_frame_time
@@ -196,7 +207,7 @@ impl eframe::App for AppState {
             }
         }
 
-        // 6. Repaint scheduling
+        // 7. Repaint scheduling
         if self.latest.is_playing {
             let interval = Duration::from_secs_f64(1.0 / self.latest.fps);
             ctx.request_repaint_after(interval);
@@ -206,7 +217,7 @@ impl eframe::App for AppState {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
 
-        // 7. Keyboard shortcuts
+        // 8. Keyboard shortcuts
         let any_focused = ctx.memory(|m| m.focused().is_some());
         let (toggle_play, do_clap, do_reset, do_lock, toggle_debug) = if !any_focused {
             ctx.input(|i| (

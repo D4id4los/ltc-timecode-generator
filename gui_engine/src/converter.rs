@@ -320,6 +320,7 @@ pub struct ConverterSettings {
     pub video_encoder: String,
     pub audio_encoder: String,
     pub output_path: PathBuf,
+    pub trim_start_secs: f64,
 }
 
 // ── Conversion progress / state ──────────────────────────────────────────
@@ -369,8 +370,13 @@ fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
         "color=c=blue:s=1280x720:r=25".to_string(),
     ];
 
-    // Audio input files
+    // Audio input files (with optional trim)
+    let trim_secs = settings.trim_start_secs;
     for f in &settings.input_files {
+        if trim_secs > 0.001 {
+            args.push("-ss".to_string());
+            args.push(format!("{:.3}", trim_secs));
+        }
         args.push("-i".to_string());
         args.push(f.to_string_lossy().to_string());
     }

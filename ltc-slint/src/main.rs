@@ -79,6 +79,8 @@ fn _run_gui(
     let conv_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     let conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>> = Arc::new(Mutex::new(None));
     let conv_sanity_msg: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let conv_trim_to_first_ltc: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
+    let conv_trim_offset_secs: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
 
     let conv_folder_for_group = conv_selected_folder.clone();
     let conv_ffmpeg_caps_for_select = conv_ffmpeg_caps.clone();
@@ -539,6 +541,8 @@ fn _run_gui(
         let venc = conv_video_encoder.clone();
         let aenc = conv_audio_encoder.clone();
         let out_path = conv_output_path.clone();
+        let trim_flag = conv_trim_to_first_ltc.clone();
+        let trim_offset = conv_trim_offset_secs.clone();
         ui.on_conv_start(move || {
             let g = groups_data.lock().unwrap();
             let i = *idx.lock().unwrap();
@@ -557,6 +561,7 @@ fn _run_gui(
                 video_encoder: venc.lock().unwrap().clone(),
                 audio_encoder: aenc.lock().unwrap().clone(),
                 output_path: output,
+                trim_start_secs: if *trim_flag.lock().unwrap() { *trim_offset.lock().unwrap() } else { 0.0 },
             };
             *state.lock().unwrap() = ConversionState::idle();
             cancel.store(false, Ordering::Relaxed);
@@ -570,6 +575,17 @@ fn _run_gui(
         let cancel = conv_cancel.clone();
         ui.on_conv_cancel(move || {
             cancel.store(true, Ordering::Relaxed);
+        });
+    }
+    {
+        let trim_flag = conv_trim_to_first_ltc.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_trim_ltc(move || {
+            let mut f = trim_flag.lock().unwrap();
+            *f = !*f;
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_trim_to_first_ltc(*f);
+            }
         });
     }
     {
@@ -723,6 +739,7 @@ fn _run_gui(
         conv_video_encoder,
         conv_audio_encoder,
         conv_selected_folder,
+        conv_trim_offset_secs,
     );
 
     info!("LTC Slint GUI initialized, showing window");

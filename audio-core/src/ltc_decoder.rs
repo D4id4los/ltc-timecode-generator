@@ -34,6 +34,7 @@ pub struct LtcDetectionResult {
     pub total_audio_duration_secs: f64,
     pub sample_rate: u32,
     pub processing_time_ms: f64,
+    pub first_ltc_timecode_secs: f64,
 }
 
 impl LtcDetectionResult {
@@ -50,6 +51,7 @@ impl LtcDetectionResult {
             total_audio_duration_secs: 0.0,
             sample_rate: 0,
             processing_time_ms: 0.0,
+            first_ltc_timecode_secs: 0.0,
         }
     }
 }
@@ -155,6 +157,8 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                     bits,
                     details_entry,
                     spb,
+                    phase,
+                    frame_starts,
                 });
             }
         }
@@ -201,6 +205,12 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
 
             let timecodes = r.timecodes;
 
+            let first_ltc_timecode_secs = if r.valid_frames > 0 && !r.frame_starts.is_empty() {
+                (r.phase as f64 + r.frame_starts[0] as f64 * r.spb) / sample_rate as f64
+            } else {
+                0.0
+            };
+
             Ok(LtcDetectionResult {
                 status,
                 detected_fps: r.fps as f32,
@@ -213,6 +223,7 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                 total_audio_duration_secs: total_duration,
                 sample_rate,
                 processing_time_ms,
+                first_ltc_timecode_secs,
             })
         }
         None => {
@@ -236,6 +247,7 @@ pub fn decode_ltc_from_wav(path: &Path) -> Result<LtcDetectionResult, String> {
                 total_audio_duration_secs: total_duration,
                 sample_rate,
                 processing_time_ms,
+                first_ltc_timecode_secs: 0.0,
             })
         }
     }
@@ -467,6 +479,8 @@ struct ScoredResult {
     bits: Vec<u8>,
     details_entry: String,
     spb: f64,
+    phase: usize,
+    frame_starts: Vec<usize>,
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

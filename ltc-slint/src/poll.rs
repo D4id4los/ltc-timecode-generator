@@ -40,6 +40,7 @@ pub fn setup_poll_timer(
     conv_video_encoder: Arc<Mutex<String>>,
     conv_audio_encoder: Arc<Mutex<String>>,
     conv_selected_folder: Arc<Mutex<String>>,
+    conv_trim_offset_secs: Arc<Mutex<f64>>,
 ) {
     let ui_weak = ui.as_weak();
     let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -82,12 +83,18 @@ pub fn setup_poll_timer(
                         ui.set_ltc_result_text(SharedString::from(""));
                         ui.set_ltc_error(SharedString::from(err));
                     } else if let Some(ref r) = s.ltc_decode_result {
+                        let is_detected = matches!(r.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence);
                         let status_str = match &r.status {
                             gui_engine::LtcDecodeStatus::Success => "success",
                             gui_engine::LtcDecodeStatus::LowConfidence => "low_confidence",
                             gui_engine::LtcDecodeStatus::NoSyncWord => "no_sync",
                             gui_engine::LtcDecodeStatus::Error { .. } => "error",
                         };
+                        if is_detected {
+                            let offset = r.first_ltc_timecode_secs;
+                            *conv_trim_offset_secs.lock().unwrap() = offset;
+                            ui.set_trim_offset_secs(offset as f32);
+                        }
                         let drop_flag = if r.drop_frame { " DF" } else { "" };
                         let fps_str = if r.detected_fps > 0.0 {
                             format!("{:.2} fps{}", r.detected_fps, drop_flag)

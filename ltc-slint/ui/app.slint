@@ -100,6 +100,8 @@ export component AppWindow inherits Window {
     in-out property <[string]> conv-container-options: [];
     in-out property <[string]> conv-video-encoder-options: [];
     in-out property <[string]> conv-audio-encoder-options: [];
+    in-out property <bool> trim-to-first-ltc: true;
+    in-out property <float> trim-offset-secs: 0.0;
 
     // ── LTC detection properties ──
     in-out property <int> ltc-file-idx: 0;
@@ -168,6 +170,7 @@ export component AppWindow inherits Window {
     callback conv-video-selected(int);
     callback conv-audio-selected(int);
     callback conv-select-output-path;
+    callback toggle-trim-ltc;
 
     // ── Tab navigation ──
     callback tab-clicked(int);
@@ -644,6 +647,9 @@ export component AppWindow inherits Window {
                     container-options: root.conv-container-options;
                     video-encoder-options: root.conv-video-encoder-options;
                     audio-encoder-options: root.conv-audio-encoder-options;
+                    trim-to-first-ltc: root.trim-to-first-ltc;
+                    trim-offset-secs: root.trim-offset-secs;
+                    toggle-trim-ltc => { root.toggle-trim-ltc(); }
                     select-folder => { root.conv-select-folder(); }
                     select-group(idx) => { root.conv-select-group(idx); }
                     map-cell-clicked(row, col) => { root.conv-map-cell-clicked(row, col); }

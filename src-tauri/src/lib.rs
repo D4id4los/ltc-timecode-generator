@@ -187,6 +187,8 @@ struct ConvertRequest {
     video_encoder: String,
     audio_encoder: String,
     output_path: String,
+    #[serde(default)]
+    trim_start_secs: f64,
 }
 
 #[derive(serde::Serialize)]
@@ -211,6 +213,7 @@ fn start_convert(
         video_encoder: request.video_encoder,
         audio_encoder: request.audio_encoder,
         output_path,
+        trim_start_secs: request.trim_start_secs,
     };
 
     let caps = query_ffmpeg_capabilities();

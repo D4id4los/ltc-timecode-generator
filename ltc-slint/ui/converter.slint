@@ -24,6 +24,11 @@ export component ConverterSection {
     in-out property <[string]> audio-encoder-options: [];
     in-out property <int> open-popup: -1;
 
+    // ── Trim to first LTC ──
+    in-out property <bool> trim-to-first-ltc: true;
+    in-out property <float> trim-offset-secs: 0.0;
+    callback toggle-trim-ltc;
+
     // ── LTC detection properties ──
     in-out property <int> ltc-file-idx: 0;
     in-out property <[string]> ltc-file-names: [];
@@ -400,6 +405,36 @@ export component ConverterSection {
                             font-size: 10px; font-family: "monospace"; horizontal-stretch: 1;
                             vertical-alignment: center;
                         }
+                    }
+                }
+
+                // ── Trim to first LTC ──
+                HorizontalLayout { spacing: 6px; padding-top: 4px;
+Rectangle {
+                            width: 16px; height: 16px; border-radius: 3px;
+                            border-width: 1px;
+                            border-color: root.trim-to-first-ltc ? AppColors.accent : AppColors.border-main;
+                            background: root.trim-to-first-ltc ? AppColors.accent : transparent;
+                            opacity: root.ltc-status == "success" || root.ltc-status == "low_confidence" ? 1.0 : 0.4;
+                            TouchArea {
+                                enabled: root.ltc-status == "success" || root.ltc-status == "low_confidence";
+                            clicked => { root.toggle-trim-ltc(); }
+                        }
+                        Text {
+                            visible: root.trim-to-first-ltc;
+                            text: "✓"; color: black; font-size: 12px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: "Cut start to first LTC frame";
+                        color: root.ltc-status == "success" || root.ltc-status == "low_confidence" ? AppColors.text-title : AppColors.text-muted;
+                        font-size: 10px; vertical-alignment: center;
+                    }
+                    Text {
+                        visible: root.trim-to-first-ltc && root.trim-offset-secs > 0.001;
+                        text: "(trim " + (root.trim-offset-secs * 1000) + "ms of silence)";
+                        color: AppColors.text-muted; font-size: 9px; vertical-alignment: center;
                     }
                 }
 

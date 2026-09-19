@@ -43,6 +43,7 @@ interface ConvertRequest {
   video_encoder: string;
   audio_encoder: string;
   output_path: string;
+  trim_start_secs: number;
 }
 
 interface ConvertResponse {
@@ -81,6 +82,7 @@ interface LtcDetectionResult {
   total_audio_duration_secs: number;
   sample_rate: number;
   processing_time_ms: number;
+  first_ltc_timecode_secs: number;
 }
 
 const VIDEO_ENCODERS: [string, string][] = [
@@ -154,6 +156,10 @@ function TauriConverter() {
   const [ltcResult, setLtcResult] = useState<LtcDetectionResult | null>(null);
   const [ltcDetecting, setLtcDetecting] = useState(false);
   const [ltcError, setLtcError] = useState<string | null>(null);
+
+  // Trim to first LTC
+  const [trimToFirstLtc, setTrimToFirstLtc] = useState(true);
+  const [trimOffsetSecs, setTrimOffsetSecs] = useState(0);
 
   // Sanity check
   const [sanityMsg, setSanityMsg] = useState<string>("");
@@ -241,6 +247,15 @@ function TauriConverter() {
 
     setSanityMsg("");
   }, [container, videoEncoder, audioEncoder, outputPath, ffmpegCaps, selectedGroupIdx, fileGroups]);
+
+  // Derive trim offset from LTC result
+  useEffect(() => {
+    if (ltcResult && ltcResult.status.type === "Success" && ltcResult.first_ltc_timecode_secs > 0) {
+      setTrimOffsetSecs(ltcResult.first_ltc_timecode_secs);
+    } else if (!ltcResult) {
+      setTrimOffsetSecs(0);
+    }
+  }, [ltcResult]);
 
   // Clean up polling on unmount
   useEffect(() => {
@@ -341,6 +356,7 @@ function TauriConverter() {
       video_encoder: videoEncoder,
       audio_encoder: audioEncoder,
       output_path: outputPath,
+      trim_start_secs: trimToFirstLtc ? trimOffsetSecs : 0,
     };
 
     try {
@@ -631,6 +647,25 @@ function TauriConverter() {
           className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
           placeholder="Path to output file…"
         />
+      </div>
+
+      {/* Trim to first LTC */}
+      <div className="flex items-center gap-2 mt-1">
+        <input
+          type="checkbox"
+          checked={trimToFirstLtc}
+          disabled={!ltcResult || ltcResult.status.type !== "Success"}
+          onChange={(e) => setTrimToFirstLtc(e.target.checked)}
+          className="accent-[#FF5F1F]"
+        />
+        <label className={"text-xs " + (trimToFirstLtc && trimOffsetSecs > 0 ? "text-text-secondary" : "text-text-muted")}>
+          Cut start to first LTC frame
+          {trimToFirstLtc && trimOffsetSecs > 0 && (
+            <span className="text-text-muted ml-1">
+              (trim {trimOffsetSecs.toFixed(3)}s of silence)
+            </span>
+          )}
+        </label>
       </div>
 
       {/* Convert Button */}
