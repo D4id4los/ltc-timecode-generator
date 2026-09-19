@@ -34,6 +34,8 @@ pub fn setup_poll_timer(
     conv_output_path: Arc<Mutex<String>>,
 ) {
     let ui_weak = ui.as_weak();
+    let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let last_device_key: Arc<Mutex<(usize, String)>> = Arc::new(Mutex::new((0, String::new())));
 
     let poll_timer = slint::Timer::default();
     poll_timer.start(
@@ -123,34 +125,47 @@ pub fn setup_poll_timer(
                 .unwrap_or(0);
             ui.set_sample_rate_index(sr_index as i32);
 
-            // 16. Log entries
+            // 16. Log entries (only rebuild if log count changed)
             {
-                let log_entries: Vec<LogEntry> = s.logs
-                    .iter()
-                    .map(|l| LogEntry {
-                        timestamp: SharedString::from(&l.timestamp),
-                        timecode: SharedString::from(&l.timecode),
-                        milliseconds: SharedString::from(&l.milliseconds),
-                        note: SharedString::from(&l.note),
-                    })
-                    .collect();
-                ui.set_logs(ModelRc::new(VecModel::<LogEntry>::from(log_entries)));
+                let current_log_count = s.logs.len();
+                let mut last = last_log_count.lock().unwrap();
+                if current_log_count != *last {
+                    let log_entries: Vec<LogEntry> = s.logs
+                        .iter()
+                        .map(|l| LogEntry {
+                            timestamp: SharedString::from(&l.timestamp),
+                            timecode: SharedString::from(&l.timecode),
+                            milliseconds: SharedString::from(&l.milliseconds),
+                            note: SharedString::from(&l.note),
+                        })
+                        .collect();
+                    ui.set_logs(ModelRc::new(VecModel::<LogEntry>::from(log_entries)));
+                    *last = current_log_count;
+                }
             }
 
-            // 17. Device names
+            // 17. Device names (only rebuild if device list changed)
             {
-                let device_names: Vec<SharedString> = s.devices
-                    .iter()
-                    .map(|d| {
-                        if d.is_default {
-                            SharedString::from(format!("{} (Default)", d.name))
-                        } else {
-                            SharedString::from(d.name.clone())
-                        }
-                    })
-                    .collect();
-                ui.set_device_names(ModelRc::new(VecModel::<SharedString>::from(device_names)));
-                ui.set_device_count(s.devices.len() as i32);
+                let device_key = (
+                    s.devices.len(),
+                    s.devices.iter().map(|d| d.id.clone()).collect::<Vec<_>>().join("\n"),
+                );
+                let mut last = last_device_key.lock().unwrap();
+                if device_key != *last {
+                    let device_names: Vec<SharedString> = s.devices
+                        .iter()
+                        .map(|d| {
+                            if d.is_default {
+                                SharedString::from(format!("{} (Default)", d.name))
+                            } else {
+                                SharedString::from(d.name.clone())
+                            }
+                        })
+                        .collect();
+                    ui.set_device_names(ModelRc::new(VecModel::<SharedString>::from(device_names)));
+                    ui.set_device_count(s.devices.len() as i32);
+                    *last = device_key;
+                }
             }
 
             // 18. Process events into toasts
