@@ -584,11 +584,12 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let total_chunks = chunk_count;
 
             let progress_handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
                 loop {
                     let done = completed_ref.load(std::sync::atomic::Ordering::Relaxed);
                     let pct = if total_chunks > 0 { (done * 100) / total_chunks } else { 100 };
                     eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
-                    if done >= total_chunks || total_chunks == 0 {
+                    if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline {
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));

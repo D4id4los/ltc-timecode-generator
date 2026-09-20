@@ -739,10 +739,10 @@ impl WavChunkReader {
     }
 
     /// Read a range of mono samples as `Vec<i16>` for the libltc decoder.
-    /// Only works for 16-bit integer PCM.
+    /// Handles 8, 16, 24, and 32-bit integer PCM. Float formats return an error.
     pub fn read_mono_samples_i16(&mut self, start_sample: usize, num_samples: usize) -> Result<Vec<i16>, String> {
-        if self.spec.sample_format != hound::SampleFormat::Int || self.bytes_per_sample != 2 {
-            return Err("libltc chunk reader requires 16-bit integer PCM".to_string());
+        if self.spec.sample_format != hound::SampleFormat::Int {
+            return Err("libltc chunk reader requires integer PCM".to_string());
         }
 
         let byte_offset = self.data_start + (start_sample * self.channels) as u64 * self.bytes_per_sample;
@@ -763,11 +763,25 @@ impl WavChunkReader {
         }
         raw.truncate(pos);
 
-        let num_mono_samples = raw.len() / (self.channels * 2);
+        let bps = self.bytes_per_sample as usize;
+        let num_mono_samples = raw.len() / (self.channels * bps);
         let mut result = Vec::with_capacity(num_mono_samples);
         for i in 0..num_mono_samples {
-            let byte_ofs = i * self.channels * 2;
-            let sample = i16::from_le_bytes([raw[byte_ofs], raw[byte_ofs + 1]]);
+            let byte_ofs = i * self.channels * bps;
+            let sample = match bps {
+                1 => ((raw[byte_ofs] as i32) - 128) as i16,
+                2 => i16::from_le_bytes([raw[byte_ofs], raw[byte_ofs + 1]]),
+                3 => {
+                    let b = &raw[byte_ofs..byte_ofs + 3];
+                    let val = i32::from_le_bytes([b[0], b[1], b[2], 0]);
+                    (val >> 8) as i16
+                }
+                4 => {
+                    let val = i32::from_le_bytes([raw[byte_ofs], raw[byte_ofs + 1], raw[byte_ofs + 2], raw[byte_ofs + 3]]);
+                    (val >> 16) as i16
+                }
+                _ => return Err(format!("Unsupported bytes per sample: {}", bps)),
+            };
             result.push(sample);
         }
         Ok(result)
@@ -879,37 +893,26 @@ pub fn decode_ltc_chunked(
 
                 let chunk_start = Instant::now();
 
-                if use_libltc {
-                    let samples = match local_reader.read_mono_samples_i16(start_sample, num_samples) {
-                        Ok(s) => s,
-                        Err(e) => return ChunkResult {
-                            chunk_idx,
-                            result: Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
-                        },
-                    };
-                    let result = crate::ltc_decoder_libltc::decode_ltc_samples_libltc(
-                        &samples, 1, sample_rate, fps, drop_frame, chunk_start,
-                    );
-                    let elapsed = chunk_start.elapsed();
-                    debug!("Chunk {}/{} decoded (libltc): {:.1}ms", chunk_idx + 1, num_chunks, elapsed.as_secs_f64() * 1000.0);
-                    progress_completed.fetch_add(1, Ordering::Relaxed);
-                    ChunkResult { chunk_idx, result }
+                let result = if use_libltc {
+                    match local_reader.read_mono_samples_i16(start_sample, num_samples) {
+                        Ok(samples) => crate::ltc_decoder_libltc::decode_ltc_samples_libltc(
+                            &samples, 1, sample_rate, fps, drop_frame, chunk_start,
+                        ),
+                        Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
+                    }
                 } else {
-                    let samples = match local_reader.read_mono_samples_f32(start_sample, num_samples) {
-                        Ok(s) => s,
-                        Err(e) => return ChunkResult {
-                            chunk_idx,
-                            result: Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
-                        },
-                    };
-                    let result = crate::ltc_decoder::decode_ltc_samples(
-                        &samples, sample_rate, 1, fps, drop_frame, chunk_start,
-                    );
-                    let elapsed = chunk_start.elapsed();
-                    debug!("Chunk {}/{} decoded (builtin): {:.1}ms", chunk_idx + 1, num_chunks, elapsed.as_secs_f64() * 1000.0);
-                    progress_completed.fetch_add(1, Ordering::Relaxed);
-                    ChunkResult { chunk_idx, result }
-                }
+                    match local_reader.read_mono_samples_f32(start_sample, num_samples) {
+                        Ok(samples) => crate::ltc_decoder::decode_ltc_samples(
+                            &samples, sample_rate, 1, fps, drop_frame, chunk_start,
+                        ),
+                        Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
+                    }
+                };
+                let elapsed = chunk_start.elapsed();
+                let decoder_name = if use_libltc { "libltc" } else { "builtin" };
+                debug!("Chunk {}/{} decoded ({}): {:.1}ms", chunk_idx + 1, num_chunks, decoder_name, elapsed.as_secs_f64() * 1000.0);
+                progress_completed.fetch_add(1, Ordering::Relaxed);
+                ChunkResult { chunk_idx, result }
             });
 
             handles.push(handle);
@@ -1736,16 +1739,92 @@ mod tests {
     }
 
     #[test]
-    fn test_wav_chunk_reader_read_i16_rejects_non_16bit() {
+    fn test_wav_chunk_reader_read_i16_24bit_ok() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = write_test_wav_int(&dir, "24bit_i16_reject.wav", 1, 48000, 24, &[0, 1, -1]);
-        // Use 24-bit WAV → read_mono_samples_i16 should error
-        // But open only works if we read later: we need a 24-bit WAV
-        // Write one
+        // 24-bit integer values: 0, 256→1, -256→-1, max→32767, min→-32768, 65536→256, -65536→-256
+        let test_samples: Vec<i32> = vec![0, 256, -256, 8388607, -8388608, 65536, -65536];
+        let expected: Vec<i16> = vec![0, 1, -1, 32767, -32768, 256, -256];
+        let path = write_test_wav_int(&dir, "24bit_i16_ok.wav", 1, 48000, 24, &test_samples);
+
+        let (mut reader, _start) = WavChunkReader::open(&path).unwrap();
+        let result = reader.read_mono_samples_i16(0, test_samples.len());
+        assert!(result.is_ok(), "expected Ok for 24-bit read, got: {:?}", result);
+        let read = result.unwrap();
+        assert_eq!(read.len(), expected.len());
+        for (i, (&e, &a)) in expected.iter().zip(read.iter()).enumerate() {
+            assert_eq!(a, e, "sample[{}]: expected {}, got {}", i, e, a);
+        }
+    }
+
+    #[test]
+    fn test_wav_chunk_reader_read_i16_8bit_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // hound converts i8→u8 by adding 128. To store unsigned bytes [128,129,127,255,0],
+        // we pass i8 values: 0, 1, -1, 127, -128 respectively.
+        // read_mono_samples_i16 converts back: u8 → (u8 - 128) as i16
+        let input_i8: Vec<i8> = vec![0i8, 1, -1, 127, -128];
+        let expected: Vec<i16> = vec![0, 1, -1, 127, -128];
+        let path = dir.path().join("8bit_i16_ok.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 8,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for &s in &input_i8 {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let (mut reader, _start) = WavChunkReader::open(&path).unwrap();
+        let result = reader.read_mono_samples_i16(0, input_i8.len());
+        assert!(result.is_ok(), "expected Ok for 8-bit read, got: {:?}", result);
+        let read = result.unwrap();
+        assert_eq!(read.len(), expected.len());
+        for (i, (&e, &a)) in expected.iter().zip(read.iter()).enumerate() {
+            assert_eq!(a, e, "sample[{}]: expected {}, got {}", i, e, a);
+        }
+    }
+
+    #[test]
+    fn test_wav_chunk_reader_read_i16_32bit_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // 32-bit integer values shifted right by 16 to get i16
+        let test_samples: Vec<i32> = vec![0, 65536, -65536, 2147483647, -2147483648, 16777216, -16777216];
+        let expected: Vec<i16> = vec![0, 1, -1, 32767, -32768, 256, -256];
+        let path = write_test_wav_int(&dir, "32bit_i16_ok.wav", 1, 48000, 32, &test_samples);
+
+        let (mut reader, _start) = WavChunkReader::open(&path).unwrap();
+        let result = reader.read_mono_samples_i16(0, test_samples.len());
+        assert!(result.is_ok(), "expected Ok for 32-bit read, got: {:?}", result);
+        let read = result.unwrap();
+        assert_eq!(read.len(), expected.len());
+        for (i, (&e, &a)) in expected.iter().zip(read.iter()).enumerate() {
+            assert_eq!(a, e, "sample[{}]: expected {}, got {}", i, e, a);
+        }
+    }
+
+    #[test]
+    fn test_wav_chunk_reader_read_i16_rejects_float() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("float_i16_reject.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        writer.write_sample(0.0f32).unwrap();
+        writer.write_sample(0.5f32).unwrap();
+        writer.write_sample(-0.5f32).unwrap();
+        writer.finalize().unwrap();
+
         let (mut reader, _start) = WavChunkReader::open(&path).unwrap();
         let result = reader.read_mono_samples_i16(0, 3);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("16-bit"));
+        assert!(result.unwrap_err().contains("integer PCM"));
     }
 
     #[test]
@@ -2146,6 +2225,56 @@ mod tests {
         writer.finalize().unwrap();
     }
 
+    fn generate_ltc_wav_with_depth(
+        path: &Path,
+        start_tc: Timecode,
+        fps: f64,
+        drop_frame: bool,
+        sample_rate: u32,
+        num_frames: u32,
+        bits_per_sample: u16,
+    ) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate,
+            bits_per_sample,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
+        let samples_per_bit = samples_per_frame as f32 / 80.0;
+
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        let mut tc = start_tc;
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut frame_buf = vec![0.0f32; samples_per_frame * 2];
+
+        for _ in 0..num_frames {
+            frame_buf.fill(0.0);
+            crate::generate_ltc_frame_stereo(
+                &tc,
+                drop_frame,
+                samples_per_frame,
+                samples_per_bit,
+                0.5,
+                "both",
+                &mut last_level,
+                &mut frame_buf[..samples_per_frame * 2],
+            );
+
+            for &sample in &frame_buf[..samples_per_frame * 2] {
+                let clamped = sample.clamp(-1.0, 1.0);
+                let max_val = (1i64 << (bits_per_sample - 1)) as f32;
+                let int_sample = (clamped * max_val) as i32;
+                writer.write_sample(int_sample).unwrap();
+            }
+
+            tc = crate::increment_timecode(&tc, fps, drop_frame);
+        }
+
+        writer.finalize().unwrap();
+    }
+
     #[test]
     fn test_decode_ltc_chunked_compare_samples() {
         // Compare the samples read by WavChunkReader vs hound-based read_mono_samples
@@ -2309,6 +2438,64 @@ mod tests {
             "expected no Error for libltc chunked, got {:?}", result.status);
         assert!(result.valid_frames >= 20,
             "should decode at least 20 frames with libltc, got {}", result.valid_frames);
+    }
+
+    #[test]
+    fn test_decode_ltc_chunked_libltc_24bit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ltc_chunked_libltc_24bit.wav");
+
+        generate_ltc_wav_with_depth(
+            &path,
+            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
+            25.0, false, 48000, 25, 24,
+        );
+
+        let config = DecodeConfig {
+            chunk_size_bytes: 10_000_000,
+            overlap_seconds: 2.0,
+        };
+        let progress = DecodeProgress::new(1);
+        let result = decode_ltc_chunked(&path, true, 25.0, false, config, &progress).unwrap();
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "expected no Error for libltc chunked 24-bit, got {:?}", result.status);
+        assert!(result.valid_frames >= 20,
+            "should decode at least 20 frames with libltc 24-bit, got {}", result.valid_frames);
+    }
+
+    #[test]
+    fn test_decode_ltc_chunked_progress_on_libltc_read_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Create a 32-bit float WAV — read_mono_samples_i16 will reject it
+        let path = dir.path().join("float_error.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        // Write enough data for multiple chunks (chunk_size_bytes=1000 → ~250 float samples per chunk)
+        for _ in 0..2500 {
+            writer.write_sample(0.0f32).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let config = DecodeConfig {
+            chunk_size_bytes: 1000,
+            overlap_seconds: 0.1,
+        };
+        let progress = DecodeProgress::new(100);
+        let result = decode_ltc_chunked(&path, true, 25.0, false, config, &progress).unwrap();
+        // Should return Ok (not hang) — all chunks failed, progress should still complete
+        assert_eq!(result.valid_frames, 0,
+            "float WAV should decode 0 valid frames, got {}", result.valid_frames);
+        // Verify all chunks were marked complete
+        let total = progress.chunks_completed.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(total > 0, "progress should have completed at least 1 chunk");
+        // Error details should mention read failure
+        let has_read_error = result.details.iter().any(|d| d.contains("Failed to read"));
+        assert!(has_read_error, "expected detail mentioning 'Failed to read', got: {:?}", result.details);
     }
 }
 
