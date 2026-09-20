@@ -132,6 +132,11 @@ pub fn setup_poll_timer(
                 }
             }
 
+            // Sync decode progress every tick during active detection
+            if s.ltc_is_detecting {
+                ui.set_ltc_decode_progress(s.ltc_decode_progress_pct);
+            }
+
             // 4. Pulse phase animation
             let mut pp = pulse_phase.lock().unwrap();
             *pp += 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);

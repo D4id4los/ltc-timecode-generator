@@ -211,9 +211,9 @@ impl eframe::App for AppState {
         }
 
         // 7. Repaint scheduling
-        if self.latest.is_playing {
-            let interval = Duration::from_secs_f64(1.0 / self.latest.fps);
-            ctx.request_repaint_after(interval);
+        if self.latest.is_playing || self.latest.ltc_is_detecting {
+            let interval = Duration::from_secs_f64(1.0 / self.latest.fps.max(1.0));
+            ctx.request_repaint_after(interval.min(Duration::from_millis(40)));
         } else if self.latest.clap_flash_alpha > 0.0 || self.latest.clap_arm_angle < -24.0f32.to_radians() {
             ctx.request_repaint_after(Duration::from_secs_f64(1.0 / 60.0));
         } else {

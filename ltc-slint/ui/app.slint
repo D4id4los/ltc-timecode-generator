@@ -112,6 +112,7 @@ export component AppWindow inherits Window {
     in-out property <string> ltc-error: "";
     in-out property <[string]> decode-fps-options: [];
     in-out property <int> decode-fps-index: 1;
+    in-out property <float> ltc-decode-progress: 0.0;
 
     // ── Tab state ──
     in-out property <int> active-tab: 0;
@@ -161,6 +162,7 @@ export component AppWindow inherits Window {
     // ── LTC detection callbacks ──
     callback ltc-detect;
     callback decode-fps-selected(int);
+    callback cancel-decode;
 
     // ── Converter callbacks ──
     callback conv-select-folder;
@@ -635,8 +637,10 @@ export component AppWindow inherits Window {
                     ltc-error: root.ltc-error;
                     decode-fps-options: root.decode-fps-options;
                     decode-fps-index: root.decode-fps-index;
+                    ltc-decode-progress: root.ltc-decode-progress;
                     detect-ltc => { root.ltc-detect(); }
                     decode-fps-selected(val) => { root.decode-fps-selected(val); }
+                    cancel-decode => { root.cancel-decode(); }
                     has-ffmpeg: root.conv-has-ffmpeg;
                     ffmpeg-error: root.conv-ffmpeg-error;
                     selected-folder: root.conv-selected-folder;

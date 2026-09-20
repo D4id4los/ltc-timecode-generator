@@ -40,8 +40,10 @@ export component ConverterSection {
     in-out property <string> ltc-error: "";
     in-out property <[string]> decode-fps-options: [];
     in-out property <int> decode-fps-index: 1;
+    in-out property <float> ltc-decode-progress: 0.0;
     callback detect-ltc;
     callback decode-fps-selected(int);
+    callback cancel-decode;
 
     callback select-folder;
     callback select-group(int);
@@ -207,17 +209,36 @@ export component ConverterSection {
                                 horizontal-alignment: center; vertical-alignment: center;
                             }
                         }
-                        Rectangle {
+                        if (root.ltc-status == "detecting") : VerticalLayout { spacing: 4px;
+                            Rectangle {
+                                height: 8px; border-radius: 4px; background: AppColors.deep-bg;
+                                Rectangle {
+                                    height: 8px; border-radius: 4px; background: AppColors.accent;
+                                    width: parent.width * root.ltc-decode-progress;
+                                }
+                            }
+                            Rectangle {
+                                border-radius: 6px; background: AppColors.red;
+                                min-height: 24px; max-width: 80px;
+                                TouchArea { clicked => { root.cancel-decode(); } }
+                                Text {
+                                    text: "✕ Cancel";
+                                    color: white; font-size: 10px; font-weight: 700;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                            }
+                        }
+                        if (root.ltc-status != "detecting") : Rectangle {
                             border-radius: 6px;
-                            background: root.ltc-status == "detecting" ? AppColors.nested-bg : AppColors.accent;
+                            background: AppColors.accent;
                             min-height: 28px; max-width: 100px;
                             TouchArea {
-                                enabled: root.ltc-status != "detecting" && root.ltc-file-names.length > 0;
+                                enabled: root.ltc-file-names.length > 0;
                                 clicked => { root.detect-ltc(); }
                             }
                             Text {
-                                text: root.ltc-status == "detecting" ? "⏳" : "🔍 Detect";
-                                color: root.ltc-status == "detecting" ? AppColors.text-muted : black;
+                                text: "🔍 Detect";
+                                color: black;
                                 font-size: 11px; font-weight: 700;
                                 horizontal-alignment: center; vertical-alignment: center;
                             }

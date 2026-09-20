@@ -890,6 +890,14 @@ fn _run_gui(
         });
     }
 
+    // ── Cancel LTC decode callback ───────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_cancel_decode(move || {
+            let _ = cmd.send(GuiCommand::CancelDecode);
+        });
+    }
+
     // ── Poll timer — state sync ────────────────────────────────────────────
     setup_poll_timer(
         &ui,

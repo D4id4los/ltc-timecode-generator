@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
 use gui_engine::timecode::FPS_OPTIONS;
@@ -306,24 +307,61 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
             ui.add_space(8.0);
 
             let is_detecting = state.latest.ltc_is_detecting;
-            let button_label = if is_detecting {
-                "⏳ Detecting…"
-            } else {
-                "🔍 Detect LTC"
-            };
 
-            let button_enabled = !is_detecting;
-            if ui
-                .add_enabled(
-                    button_enabled,
-                    egui::Button::new(RichText::new(button_label).font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
-                        .fill(if button_enabled { ACCENT } else { colors.deep_bg })
+            if is_detecting {
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+
+                let progress_pct = state.latest.ltc_decode_progress_pct;
+                let progress_str = state.latest.ltc_decode_progress_str.clone();
+
+                ui.add(
+                    egui::ProgressBar::new(progress_pct)
+                        .show_percentage()
+                        .desired_width(140.0),
+                );
+
+                ui.add_space(2.0);
+
+                ui.label(
+                    RichText::new(&progress_str)
+                        .font(FontId::monospace(9.0))
+                        .color(colors.text_muted),
+                );
+
+                ui.add_space(4.0);
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("✕ CANCEL")
+                                .font(FontId::proportional(10.0))
+                                .color(Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(Color32::from_rgb(0xDC, 0x26, 0x26))
+                        .min_size(egui::vec2(80.0, 22.0)),
+                    )
+                    .clicked()
+                {
+                    state.send(GuiCommand::CancelDecode);
+                }
+            } else {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("🔍 Detect LTC")
+                                .font(FontId::proportional(11.0))
+                                .color(Color32::BLACK)
+                                .strong(),
+                        )
+                        .fill(ACCENT)
                         .min_size(egui::vec2(100.0, 24.0)),
-                )
-                .clicked()
-            {
-                let file_path = files[state.ltc_file_idx].to_string_lossy().to_string();
-                state.send(GuiCommand::ParseLtcFile(file_path));
+                    )
+                    .clicked()
+                {
+                    let file_path = files[state.ltc_file_idx].to_string_lossy().to_string();
+                    state.send(GuiCommand::ParseLtcFile(file_path));
+                }
             }
         });
     }
