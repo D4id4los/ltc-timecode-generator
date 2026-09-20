@@ -92,23 +92,95 @@ interface LtcDetectionResult {
 }
 
 const VIDEO_ENCODERS: [string, string][] = [
-  ["libsvtav1", "AV1 (SVT-AV1) — good compression"],
-  ["libx264", "H.264 (x264) — maximum compatibility"],
   ["prores_ks", "ProRes (Kostya) — ideal for Resolve"],
+  ["libx264", "H.264 (x264) — maximum compatibility"],
+  ["libx265", "H.265/HEVC (x265) — efficient, Resolve-compatible"],
+  ["libsvtav1", "AV1 (SVT-AV1) — good compression"],
+  ["dnxhd", "DNxHD — broadcast codec, ideal for MXF"],
 ];
 
 const AUDIO_ENCODERS: [string, string][] = [
   ["pcm_s24le", "PCM 24-bit — uncompressed, Resolve-compatible"],
   ["pcm_s16le", "PCM 16-bit — uncompressed, smaller"],
   ["aac", "AAC — compressed, good for MP4"],
-  ["libopus", "Opus — modern compressed, MKV only"],
+  ["libopus", "Opus — modern compressed, MKV/MOV only"],
 ];
 
 const CONTAINERS: [string, string][] = [
+  ["mov", "QuickTime MOV — ProRes native, Resolve-friendly"],
   ["mkv", "Matroska MKV — versatile, all codecs"],
-  ["mov", "QuickTime MOV — ProRes native"],
   ["mp4", "MPEG-4 MP4 — universal compatibility"],
+  ["mxf", "MXF (Material eXchange Format) — professional broadcast"],
 ];
+
+const CONTAINER_VIDEO: Record<string, string[]> = {
+  mkv: ["prores_ks", "libx264", "libx265", "libsvtav1", "dnxhd"],
+  mov: ["prores_ks", "libx264", "libx265", "libsvtav1", "dnxhd"],
+  mp4: ["libx264", "libx265", "libsvtav1"],
+  mxf: ["dnxhd", "libx264", "libx265"],
+};
+
+const CONTAINER_AUDIO: Record<string, string[]> = {
+  mkv: ["pcm_s24le", "pcm_s16le", "aac", "libopus"],
+  mov: ["pcm_s24le", "pcm_s16le", "aac", "libopus"],
+  mp4: ["pcm_s24le", "pcm_s16le", "aac"],
+  mxf: ["pcm_s24le", "pcm_s16le", "aac"],
+};
+
+const DEFAULT_PREFERENCES: [string, string, string][] = [
+  ["mov", "prores_ks", "pcm_s24le"],
+  ["mxf", "dnxhd", "pcm_s24le"],
+  ["mov", "libx264", "pcm_s24le"],
+  ["mkv", "libx264", "pcm_s24le"],
+  ["mkv", "libx265", "aac"],
+  ["mp4", "libx264", "aac"],
+];
+
+function selectBestCombination(
+  availableFormats: string[],
+  availableEncoders: string[],
+): [string, string, string] {
+  for (const [c, v, a] of DEFAULT_PREFERENCES) {
+    const fmt = c === "mkv" ? "matroska" : c;
+    if (
+      availableFormats.includes(fmt) &&
+      availableEncoders.includes(v) &&
+      availableEncoders.includes(a) &&
+      CONTAINER_VIDEO[c]?.includes(v) &&
+      CONTAINER_AUDIO[c]?.includes(a)
+    ) {
+      return [c, v, a];
+    }
+  }
+  for (const [c] of CONTAINERS) {
+    const fmt = c === "mkv" ? "matroska" : c;
+    if (!availableFormats.includes(fmt)) continue;
+    for (const [v] of VIDEO_ENCODERS) {
+      if (!availableEncoders.includes(v) || !CONTAINER_VIDEO[c]?.includes(v)) continue;
+      for (const [a] of AUDIO_ENCODERS) {
+        if (availableEncoders.includes(a) && CONTAINER_AUDIO[c]?.includes(a)) {
+          return [c, v, a];
+        }
+      }
+    }
+  }
+  return ["mkv", "libx264", "pcm_s24le"];
+}
+
+function availableVideoEncoders(container: string, availableEncoders: string[]): string[] {
+  return (CONTAINER_VIDEO[container] ?? []).filter((e) => availableEncoders.includes(e));
+}
+
+function availableAudioEncoders(container: string, availableEncoders: string[]): string[] {
+  return (CONTAINER_AUDIO[container] ?? []).filter((e) => availableEncoders.includes(e));
+}
+
+function availableContainers(availableFormats: string[]): string[] {
+  return CONTAINERS.filter(([key]) => {
+    const fmt = key === "mkv" ? "matroska" : key;
+    return availableFormats.includes(fmt);
+  }).map(([key]) => key);
+}
 
 export default function ConverterTab() {
   const isTauriMode = isTauri();
@@ -149,6 +221,11 @@ function TauriConverter() {
   const [videoEncoder, setVideoEncoder] = useState<string>("libsvtav1");
   const [audioEncoder, setAudioEncoder] = useState<string>("pcm_s24le");
 
+  // Derived option lists (filtered by ffmpeg caps + container compatibility)
+  const [filteredContainers, setFilteredContainers] = useState<[string, string][]>(CONTAINERS);
+  const [filteredVideo, setFilteredVideo] = useState<[string, string][]>(VIDEO_ENCODERS);
+  const [filteredAudio, setFilteredAudio] = useState<[string, string][]>(AUDIO_ENCODERS);
+
   // Output path
   const [outputPath, setOutputPath] = useState<string>("");
 
@@ -172,7 +249,6 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
     { id: "29.97df", name: "29.97 DF", fps: 29.97, dropFrame: true },
     { id: "30", name: "30 fps", fps: 30, dropFrame: false },
   ];
-  const [ltcError, setLtcError] = useState<string | null>(null);
 
   // Trim to first LTC
   const [trimToFirstLtc, setTrimToFirstLtc] = useState(false);
@@ -181,12 +257,37 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
   // Sanity check
   const [sanityMsg, setSanityMsg] = useState<string>("");
 
-  // Query ffmpeg on mount
+  // Query ffmpeg on mount, then apply intelligent defaults and filter options
   useEffect(() => {
     (async () => {
       try {
         const caps = await invoke<FfmpegCaps>("check_ffmpeg");
         setFfmpegCaps(caps);
+        if (caps.has_ffmpeg) {
+          const availContainers = availableContainers(caps.available_formats);
+          const availEncoders = caps.available_encoders;
+          const [bestC, bestV, bestA] = selectBestCombination(availContainers, availEncoders);
+          setContainer(bestC);
+          setVideoEncoder(bestV);
+          setAudioEncoder(bestA);
+          // Filter option lists
+          setFilteredContainers(
+            CONTAINERS.filter(([key]) => {
+              const fmt = key === "mkv" ? "matroska" : key;
+              return caps.available_formats.includes(fmt);
+            })
+          );
+          setFilteredVideo(
+            VIDEO_ENCODERS.filter(([key]) =>
+              availableVideoEncoders(bestC, availEncoders).includes(key)
+            )
+          );
+          setFilteredAudio(
+            AUDIO_ENCODERS.filter(([key]) =>
+              availableAudioEncoders(bestC, availEncoders).includes(key)
+            )
+          );
+        }
       } catch {
         setFfmpegCaps({
           has_ffmpeg: false,
@@ -230,32 +331,21 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
       );
       return;
     }
-    if (!ffmpegCaps.available_formats.includes(container)) {
+    const containerFmt = container === "mkv" ? "matroska" : container;
+    if (!ffmpegCaps.available_formats.includes(containerFmt)) {
       setSanityMsg(
-        `Container format "${container}" is not supported by your ffmpeg installation. Common alternatives: mkv, mov, mp4.`
+        `Container format "${container}" is not supported by your ffmpeg installation. Run \`ffmpeg -formats\` to see available formats.`
       );
       return;
     }
 
-    // Container + encoder compatibility
-    const containerEncoders: Record<string, (e: string) => boolean> = {
-      mkv: (e) => ["libsvtav1", "libx264", "prores_ks"].includes(e),
-      mov: (e) => ["prores_ks", "libx264", "libsvtav1"].includes(e),
-      mp4: (e) => ["libx264", "libsvtav1"].includes(e),
-    };
-    const containerAudio: Record<string, (e: string) => boolean> = {
-      mkv: (e) => ["pcm_s24le", "pcm_s16le", "aac", "libopus"].includes(e),
-      mov: (e) => ["pcm_s24le", "pcm_s16le", "aac", "libopus"].includes(e),
-      mp4: (e) => ["pcm_s24le", "pcm_s16le", "aac"].includes(e),
-    };
-
-    if (!containerEncoders[container]?.(videoEncoder)) {
+    if (!CONTAINER_VIDEO[container]?.includes(videoEncoder)) {
       setSanityMsg(
-        `Video encoder "${videoEncoder}" is not compatible with container "${container}". ProRes works with MOV/MKV, AV1/H.264 with MP4/MKV.`
+        `Video encoder "${videoEncoder}" is not compatible with container "${container}".`
       );
       return;
     }
-    if (!containerAudio[container]?.(audioEncoder)) {
+    if (!CONTAINER_AUDIO[container]?.includes(audioEncoder)) {
       setSanityMsg(
         `Audio encoder "${audioEncoder}" is not compatible with container "${container}".`
       );
@@ -697,19 +787,37 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
         <SelectField
           label="Container"
           value={container}
-          options={CONTAINERS}
-          onChange={setContainer}
+          options={filteredContainers}
+          disabledOptions={ffmpegCaps?.has_ffmpeg ? undefined : undefined}
+          onChange={(c) => {
+            setContainer(c);
+            // Re-filter encoders for the new container
+            if (ffmpegCaps?.has_ffmpeg) {
+              const availV = availableVideoEncoders(c, ffmpegCaps.available_encoders);
+              const availA = availableAudioEncoders(c, ffmpegCaps.available_encoders);
+              setFilteredVideo(VIDEO_ENCODERS.filter(([k]) => availV.includes(k)));
+              setFilteredAudio(AUDIO_ENCODERS.filter(([k]) => availA.includes(k)));
+              if (!availV.includes(videoEncoder) && availV.length > 0) {
+                setVideoEncoder(availV[0]);
+              }
+              if (!availA.includes(audioEncoder) && availA.length > 0) {
+                setAudioEncoder(availA[0]);
+              }
+            }
+          }}
         />
         <SelectField
           label="Video Encoder"
           value={videoEncoder}
-          options={VIDEO_ENCODERS}
+          options={filteredVideo}
+          disabledOptions={ffmpegCaps?.has_ffmpeg ? ffmpegCaps.available_encoders : undefined}
           onChange={setVideoEncoder}
         />
         <SelectField
           label="Audio Encoder"
           value={audioEncoder}
-          options={AUDIO_ENCODERS}
+          options={filteredAudio}
+          disabledOptions={ffmpegCaps?.has_ffmpeg ? ffmpegCaps.available_encoders : undefined}
           onChange={setAudioEncoder}
         />
       </div>
@@ -907,11 +1015,13 @@ function SelectField({
   label,
   value,
   options,
+  disabledOptions,
   onChange,
 }: {
   label: string;
   value: string;
   options: [string, string][];
+  disabledOptions?: string[];
   onChange: (v: string) => void;
 }) {
   return (
@@ -922,11 +1032,14 @@ function SelectField({
         onChange={(e) => onChange(e.target.value)}
         className="w-full px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
       >
-        {options.map(([key, desc]) => (
-          <option key={key} value={key}>
-            {key} — {desc}
-          </option>
-        ))}
+        {options.map(([key, desc]) => {
+          const disabled = disabledOptions && !disabledOptions.includes(key);
+          return (
+            <option key={key} value={key} disabled={disabled}>
+              {key} — {desc}
+            </option>
+          );
+        })}
       </select>
     </div>
   );

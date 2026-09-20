@@ -18,7 +18,9 @@ pub use audio_core::{
 
 // Re-export converter/file_pattern types for convenience
 pub use converter::{
-    conversion_sanity_check, query_ffmpeg_capabilities, spawn_conversion,
+    available_audio_encoders_for_container, available_containers,
+    available_video_encoders_for_container, conversion_sanity_check,
+    query_ffmpeg_capabilities, select_best_combination, spawn_conversion,
     supported_audio_encoders, supported_containers, supported_video_encoders,
     ChannelMap, ConversionState, ConversionStatus, ConverterSettings,
     FfmpegCapabilities, SharedConversionState, CancelFlag,

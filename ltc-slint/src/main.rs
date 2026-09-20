@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use gui_engine::command::GuiCommand;
 use gui_engine::converter::{
-    query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionState,
+    available_audio_encoders_for_container, available_containers,
+    available_video_encoders_for_container, query_ffmpeg_capabilities,
+    select_best_combination, spawn_conversion, ChannelMap, ConversionState,
     FfmpegCapabilities,
 };
 use gui_engine::file_pattern::{match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
@@ -40,6 +42,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _run_gui(cmd_tx, state)
         }
     }
+}
+
+/// Update the Slint dropdown models for container/video/audio options
+/// based on ffmpeg capabilities and current container selection.
+fn update_converter_options(
+    ui: &AppWindow,
+    caps: &FfmpegCapabilities,
+    container: &str,
+) {
+    let container_options: Vec<SharedString> = available_containers(caps)
+        .iter().map(|(k, _)| SharedString::from(*k)).collect();
+    ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(container_options)));
+
+    let video_options: Vec<SharedString> = available_video_encoders_for_container(container, caps)
+        .iter().map(|(k, _)| SharedString::from(*k)).collect();
+    ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(video_options)));
+
+    let audio_options: Vec<SharedString> = available_audio_encoders_for_container(container, caps)
+        .iter().map(|(k, _)| SharedString::from(*k)).collect();
+    ui.set_conv_audio_encoder_options(ModelRc::new(VecModel::<SharedString>::from(audio_options)));
 }
 
 fn _run_gui(
@@ -452,6 +474,9 @@ fn _run_gui(
         let folder = conv_selected_folder.clone();
         let groups = conv_file_groups.clone();
         let idx = conv_selected_group_idx.clone();
+        let venc_for_folder = conv_video_encoder.clone();
+        let aenc_for_folder = conv_audio_encoder.clone();
+        let container_for_folder = conv_container.clone();
         ui.on_conv_select_folder(move || {
             let pat = *pattern_arc.lock().unwrap();
             if pat == 0 {
@@ -515,6 +540,9 @@ fn _run_gui(
             }
             let caps = conv_ffmpeg_caps_for_select.clone();
             let ui_weak2 = ui_weak.clone();
+            let container_for_update = container_for_folder.clone();
+            let venc_for_update = venc_for_folder.clone();
+            let aenc_for_update = aenc_for_folder.clone();
             std::thread::spawn(move || {
                 let mut c = caps.lock().unwrap();
                 if c.is_none() {
@@ -526,6 +554,24 @@ fn _run_gui(
                         if let Some(ref msg) = caps_data.error_message {
                             u.set_conv_ffmpeg_error(SharedString::from(msg));
                         }
+                        let current_container = container_for_update.lock().unwrap().clone();
+                        // Apply intelligent defaults
+                        let (def_c, def_v, def_a) = select_best_combination(caps_data);
+                        if current_container != def_c {
+                            *container_for_update.lock().unwrap() = def_c.clone();
+                            u.set_conv_container(SharedString::from(def_c.clone()));
+                        }
+                        if *venc_for_update.lock().unwrap() != def_v {
+                            *venc_for_update.lock().unwrap() = def_v.clone();
+                            u.set_conv_video_encoder(SharedString::from(def_v));
+                        }
+                        if *aenc_for_update.lock().unwrap() != def_a {
+                            *aenc_for_update.lock().unwrap() = def_a.clone();
+                            u.set_conv_audio_encoder(SharedString::from(def_a));
+                        }
+                        // Update dropdown models to show only available options
+                        let cur_container = container_for_update.lock().unwrap().clone();
+                        update_converter_options(&u, caps_data, &cur_container);
                     }
                 }
             });
@@ -703,13 +749,35 @@ fn _run_gui(
     {
         let container = conv_container.clone();
         let ui_weak = ui.as_weak();
+        let caps_arc = conv_ffmpeg_caps.clone();
+        let venc_arc = conv_video_encoder.clone();
+        let aenc_arc = conv_audio_encoder.clone();
         ui.on_conv_container_selected(move |idx| {
-            let options = gui_engine::converter::supported_containers();
+            let caps = caps_arc.lock().unwrap().clone();
+            let options: Vec<(&str, &str)> = match caps {
+                Some(ref c) if c.has_ffmpeg => available_containers(c),
+                _ => gui_engine::converter::supported_containers(),
+            };
             if idx >= 0 && (idx as usize) < options.len() {
                 let key = options[idx as usize].0.to_string();
                 *container.lock().unwrap() = key.clone();
+                // Re-filter encoders for the new container
+                if let Some(ref c) = caps {
+                    if c.has_ffmpeg {
+                        let vids: Vec<(&str, &str)> = available_video_encoders_for_container(&key, c);
+                        let auds: Vec<(&str, &str)> = available_audio_encoders_for_container(&key, c);
+                        if !vids.is_empty() {
+                            *venc_arc.lock().unwrap() = vids[0].0.to_string();
+                        }
+                        if !auds.is_empty() {
+                            *aenc_arc.lock().unwrap() = auds[0].0.to_string();
+                        }
+                    }
+                }
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_container(SharedString::from(key));
+                    u.set_conv_video_encoder(SharedString::from(venc_arc.lock().unwrap().clone()));
+                    u.set_conv_audio_encoder(SharedString::from(aenc_arc.lock().unwrap().clone()));
                 }
             }
         });
@@ -717,10 +785,19 @@ fn _run_gui(
     {
         let venc = conv_video_encoder.clone();
         let ui_weak = ui.as_weak();
+        let caps_for_video = conv_ffmpeg_caps.clone();
+        let container_for_video = conv_container.clone();
         ui.on_conv_video_selected(move |idx| {
-            let options = gui_engine::converter::supported_video_encoders();
+            let caps = caps_for_video.lock().unwrap().clone();
+            let container = container_for_video.lock().unwrap().clone();
+            let options: Vec<&str> = match caps {
+                Some(ref c) if c.has_ffmpeg => available_video_encoders_for_container(&container, c)
+                    .iter().map(|(k, _)| *k).collect(),
+                _ => gui_engine::converter::supported_video_encoders()
+                    .iter().map(|(k, _)| *k).collect(),
+            };
             if idx >= 0 && (idx as usize) < options.len() {
-                let key = options[idx as usize].0.to_string();
+                let key = options[idx as usize].to_string();
                 *venc.lock().unwrap() = key.clone();
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_video_encoder(SharedString::from(key));
@@ -731,10 +808,19 @@ fn _run_gui(
     {
         let aenc = conv_audio_encoder.clone();
         let ui_weak = ui.as_weak();
+        let caps_for_audio = conv_ffmpeg_caps.clone();
+        let container_for_audio = conv_container.clone();
         ui.on_conv_audio_selected(move |idx| {
-            let options = gui_engine::converter::supported_audio_encoders();
+            let caps = caps_for_audio.lock().unwrap().clone();
+            let container = container_for_audio.lock().unwrap().clone();
+            let options: Vec<&str> = match caps {
+                Some(ref c) if c.has_ffmpeg => available_audio_encoders_for_container(&container, c)
+                    .iter().map(|(k, _)| *k).collect(),
+                _ => gui_engine::converter::supported_audio_encoders()
+                    .iter().map(|(k, _)| *k).collect(),
+            };
             if idx >= 0 && (idx as usize) < options.len() {
-                let key = options[idx as usize].0.to_string();
+                let key = options[idx as usize].to_string();
                 *aenc.lock().unwrap() = key.clone();
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_audio_encoder(SharedString::from(key));

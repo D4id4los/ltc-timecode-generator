@@ -104,8 +104,13 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
         }
     }
 
-    let encoders = run_ffmpeg_list(&["-encoders", "-hide_banner"]);
-    let formats = run_ffmpeg_list(&["-formats", "-hide_banner"]);
+    let encoders = run_ffmpeg_list(&["-encoders", "-hide_banner"], |flags| {
+        let f = flags.as_bytes();
+        !f.is_empty() && (f[0] == b'V' || f[0] == b'A')
+    });
+    let formats = run_ffmpeg_list(&["-formats", "-hide_banner"], |flags| {
+        flags.contains('E')
+    });
 
     FfmpegCapabilities {
         has_ffmpeg: true,
@@ -115,7 +120,7 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
     }
 }
 
-fn run_ffmpeg_list(args: &[&str]) -> BTreeSet<String> {
+fn run_ffmpeg_list(args: &[&str], filter_fn: fn(&str) -> bool) -> BTreeSet<String> {
     let output = Command::new("ffmpeg")
         .args(args)
         .stdout(Stdio::piped())
@@ -131,11 +136,14 @@ fn run_ffmpeg_list(args: &[&str]) -> BTreeSet<String> {
                     if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with("--") {
                         return Vec::new().into_iter();
                     }
-                    if trimmed.starts_with("Encoders:") || trimmed.starts_with("File formats:") {
+                    if trimmed.starts_with("Encoders:")
+                        || trimmed.starts_with("Formats:")
+                        || trimmed.starts_with("File formats:")
+                    {
                         return Vec::new().into_iter();
                     }
                     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                    if parts.len() >= 2 {
+                    if parts.len() >= 2 && filter_fn(parts[0]) {
                         parts[1]
                             .split(',')
                             .map(|s| s.trim().to_string())
@@ -155,9 +163,11 @@ fn run_ffmpeg_list(args: &[&str]) -> BTreeSet<String> {
 
 pub fn supported_video_encoders() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("libsvtav1", "AV1 (SVT-AV1) — good compression, widely supported"),
-        ("libx264", "H.264 (x264) — maximum compatibility"),
         ("prores_ks", "ProRes (Kostya) — ideal for Resolve, larger files"),
+        ("libx264", "H.264 (x264) — maximum compatibility"),
+        ("libx265", "H.265/HEVC (x265) — efficient, Resolve-compatible"),
+        ("libsvtav1", "AV1 (SVT-AV1) — good compression, widely supported"),
+        ("dnxhd", "DNxHD — broadcast codec, ideal for MXF"),
     ]
 }
 
@@ -166,23 +176,31 @@ pub fn supported_audio_encoders() -> Vec<(&'static str, &'static str)> {
         ("pcm_s24le", "PCM 24-bit — uncompressed, Resolve-compatible"),
         ("pcm_s16le", "PCM 16-bit — uncompressed, smaller"),
         ("aac", "AAC — compressed, good for MP4"),
-        ("libopus", "Opus — modern compressed, MKV only"),
+        ("libopus", "Opus — modern compressed, MKV/MOV only"),
     ]
 }
 
 pub fn supported_containers() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("mkv", "Matroska MKV — versatile, all codecs"),
         ("mov", "QuickTime MOV — ProRes native, Resolve-friendly"),
+        ("mkv", "Matroska MKV — versatile, all codecs"),
         ("mp4", "MPEG-4 MP4 — universal compatibility"),
+        ("mxf", "MXF (Material eXchange Format) — professional broadcast"),
     ]
 }
 
 fn container_supports_video_encoder(container: &str, encoder: &str) -> bool {
     match container {
-        "mkv" => matches!(encoder, "libsvtav1" | "libx264" | "prores_ks"),
-        "mov" => matches!(encoder, "prores_ks" | "libx264" | "libsvtav1"),
-        "mp4" => matches!(encoder, "libx264" | "libsvtav1"),
+        "mkv" => matches!(
+            encoder,
+            "libsvtav1" | "libx264" | "libx265" | "prores_ks" | "dnxhd"
+        ),
+        "mov" => matches!(
+            encoder,
+            "prores_ks" | "libx264" | "libx265" | "libsvtav1" | "dnxhd"
+        ),
+        "mp4" => matches!(encoder, "libx264" | "libx265" | "libsvtav1"),
+        "mxf" => matches!(encoder, "dnxhd" | "libx264" | "libx265"),
         _ => false,
     }
 }
@@ -195,8 +213,104 @@ fn container_supports_audio_encoder(container: &str, encoder: &str) -> bool {
             "pcm_s24le" | "pcm_s16le" | "aac" | "libopus"
         ),
         "mp4" => matches!(encoder, "pcm_s24le" | "pcm_s16le" | "aac"),
+        "mxf" => matches!(encoder, "pcm_s24le" | "pcm_s16le" | "aac"),
         _ => false,
     }
+}
+
+/// Returns the intersection of ffmpeg-available video encoders
+/// that are also compatible with the given container.
+pub fn available_video_encoders_for_container<'a>(
+    container: &str,
+    caps: &FfmpegCapabilities,
+) -> Vec<(&'a str, &'a str)> {
+    supported_video_encoders()
+        .into_iter()
+        .filter(|(key, _)| {
+            container_supports_video_encoder(container, key)
+                && caps.available_encoders.contains(*key)
+        })
+        .collect()
+}
+
+/// Returns the intersection of ffmpeg-available audio encoders
+/// that are also compatible with the given container.
+pub fn available_audio_encoders_for_container<'a>(
+    container: &str,
+    caps: &FfmpegCapabilities,
+) -> Vec<(&'a str, &'a str)> {
+    supported_audio_encoders()
+        .into_iter()
+        .filter(|(key, _)| {
+            container_supports_audio_encoder(container, key)
+                && caps.available_encoders.contains(*key)
+        })
+        .collect()
+}
+
+/// Returns the subset of supported containers that are available in this ffmpeg.
+pub fn available_containers<'a>(caps: &FfmpegCapabilities) -> Vec<(&'a str, &'a str)> {
+    supported_containers()
+        .into_iter()
+        .filter(|(key, _)| {
+            let ffmpeg_name = container_to_ffmpeg_format(key);
+            caps.available_formats.contains(ffmpeg_name)
+        })
+        .collect()
+}
+
+/// Select the best available (container, video_encoder, audio_encoder) combination
+/// based on ffmpeg capabilities.  Priority: ProRes > DNxHD > H.264 universal > first found.
+pub fn select_best_combination(caps: &FfmpegCapabilities) -> (String, String, String) {
+    let preferences: &[(&str, &str, &str)] = &[
+        ("mov", "prores_ks", "pcm_s24le"),
+        ("mxf", "dnxhd", "pcm_s24le"),
+        ("mov", "libx264", "pcm_s24le"),
+        ("mkv", "libx264", "pcm_s24le"),
+        ("mkv", "libx265", "aac"),
+        ("mp4", "libx264", "aac"),
+    ];
+
+    for &(container, video, audio) in preferences {
+        let ffmpeg_name = container_to_ffmpeg_format(container);
+        if caps.available_formats.contains(ffmpeg_name)
+            && caps.available_encoders.contains(video)
+            && caps.available_encoders.contains(audio)
+            && container_supports_video_encoder(container, video)
+            && container_supports_audio_encoder(container, audio)
+        {
+            return (container.to_string(), video.to_string(), audio.to_string());
+        }
+    }
+
+    // Absolute fallback: any compatible pair
+    for (container, _) in supported_containers() {
+        let ffmpeg_name = container_to_ffmpeg_format(container);
+        if !caps.available_formats.contains(ffmpeg_name) {
+            continue;
+        }
+        for (video, _) in supported_video_encoders() {
+            if !caps.available_encoders.contains(video)
+                || !container_supports_video_encoder(container, video)
+            {
+                continue;
+            }
+            for (audio, _) in supported_audio_encoders() {
+                if caps.available_encoders.contains(audio)
+                    && container_supports_audio_encoder(container, audio)
+                {
+                    return (
+                        container.to_string(),
+                        video.to_string(),
+                        audio.to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    // Last resort: raw strings even if not in ffmpeg (will show error later)
+    ("mkv".to_string(), "libx264".to_string(), "pcm_s24le".to_string())
 }
 
 fn encoder_available_in_ffmpeg(encoder: &str, caps: &FfmpegCapabilities) -> bool {
@@ -265,7 +379,8 @@ pub fn conversion_sanity_check(
         return Err(format!(
             "Video encoder '{}' is not supported by your ffmpeg installation. \
              Run `ffmpeg -encoders` to see available encoders. \
-             Common alternatives: libx264 (H.264), libsvtav1 (AV1), prores_ks (ProRes).",
+             Common alternatives: prores_ks (ProRes), libx264 (H.264), libx265 (HEVC), \
+             libsvtav1 (AV1), dnxhd (DNxHD).",
             video_encoder
         ));
     }
@@ -274,7 +389,7 @@ pub fn conversion_sanity_check(
         return Err(format!(
             "Audio encoder '{}' is not supported by your ffmpeg installation. \
              Run `ffmpeg -encoders` to see available encoders. \
-             Common alternatives: pcm_s24le (PCM 24-bit), aac, libopus.",
+             Common alternatives: pcm_s24le (PCM 24-bit), pcm_s16le (PCM 16-bit), aac, libopus.",
             audio_encoder
         ));
     }
@@ -287,8 +402,10 @@ pub fn conversion_sanity_check(
             container,
             match video_encoder {
                 "prores_ks" => "ProRes typically requires MOV or MKV containers.",
-                "libsvtav1" => "AV1 works in MKV and MP4 containers.",
-                "libx264" => "H.264 works in MKV, MP4, and MOV containers.",
+                "libsvtav1" => "AV1 works in MKV, MP4, and MOV containers.",
+                "libx264" => "H.264 works in all containers.",
+                "libx265" => "HEVC works in all containers.",
+                "dnxhd" => "DNxHD requires MXF, MOV, or MKV containers.",
                 _ => "",
             }
         ));
@@ -302,8 +419,8 @@ pub fn conversion_sanity_check(
             container,
             match audio_encoder {
                 "libopus" => "Opus is only supported in MKV and MOV containers.",
-                "pcm_s24le" | "pcm_s16le" => "Uncompressed PCM works in MKV and MOV containers.",
-                "aac" => "AAC works in MKV, MOV, and MP4 containers.",
+                "pcm_s24le" | "pcm_s16le" => "Uncompressed PCM works in all containers.",
+                "aac" => "AAC works in all containers.",
                 _ => "",
             }
         ));
@@ -446,6 +563,24 @@ pub(crate) fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
             args.push("libx264".to_string());
             args.push("-pix_fmt".to_string());
             args.push("yuv420p".to_string());
+        }
+        "libx265" => {
+            args.push("-c:v".to_string());
+            args.push("libx265".to_string());
+            args.push("-pix_fmt".to_string());
+            args.push("yuv420p".to_string());
+            args.push("-tag:v".to_string());
+            args.push("hvc1".to_string());
+        }
+        "dnxhd" => {
+            args.push("-c:v".to_string());
+            args.push("dnxhd".to_string());
+            args.push("-pix_fmt".to_string());
+            args.push("yuv422p".to_string());
+            args.push("-profile:v".to_string());
+            args.push("dnxhd".to_string());
+            args.push("-b:v".to_string());
+            args.push("36M".to_string());
         }
         _ => {
             args.push("-c:v".to_string());
@@ -826,12 +961,36 @@ mod tests {
         assert!(container_supports_video_encoder("mkv", "libx264"));
         assert!(container_supports_video_encoder("mov", "prores_ks"));
         assert!(container_supports_video_encoder("mp4", "libx264"));
+        assert!(container_supports_video_encoder("mkv", "libx265"));
+        assert!(container_supports_video_encoder("mov", "dnxhd"));
+        assert!(container_supports_video_encoder("mxf", "dnxhd"));
+        assert!(container_supports_video_encoder("mxf", "libx264"));
+        assert!(container_supports_video_encoder("mxf", "libx265"));
     }
 
     #[test]
     fn test_container_rejects_incompatible_video_encoder() {
         assert!(!container_supports_video_encoder("mp4", "prores_ks"));
+        assert!(!container_supports_video_encoder("mp4", "dnxhd"));
+        assert!(!container_supports_video_encoder("mxf", "prores_ks"));
+        assert!(!container_supports_video_encoder("mxf", "libsvtav1"));
         assert!(!container_supports_video_encoder("mkv", "nonexistent"));
+    }
+
+    #[test]
+    fn test_container_supports_audio_encoder_valid() {
+        assert!(container_supports_audio_encoder("mkv", "pcm_s24le"));
+        assert!(container_supports_audio_encoder("mov", "libopus"));
+        assert!(container_supports_audio_encoder("mp4", "aac"));
+        assert!(container_supports_audio_encoder("mxf", "pcm_s24le"));
+        assert!(container_supports_audio_encoder("mxf", "aac"));
+    }
+
+    #[test]
+    fn test_container_rejects_incompatible_audio_encoder() {
+        assert!(!container_supports_audio_encoder("mp4", "libopus"));
+        assert!(!container_supports_audio_encoder("mxf", "libopus"));
+        assert!(!container_supports_audio_encoder("mp4", "nonexistent"));
     }
 
     #[test]
@@ -839,5 +998,57 @@ mod tests {
         assert_eq!(container_to_ffmpeg_format("mkv"), "matroska");
         assert_eq!(container_to_ffmpeg_format("mov"), "mov");
         assert_eq!(container_to_ffmpeg_format("mp4"), "mp4");
+        assert_eq!(container_to_ffmpeg_format("mxf"), "mxf");
+    }
+
+    #[test]
+    fn test_select_best_combination_prefers_prores() {
+        let caps = FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: BTreeSet::from([
+                "prores_ks".into(),
+                "libx264".into(),
+                "pcm_s24le".into(),
+            ]),
+            available_formats: BTreeSet::from(["mov".into(), "matroska".into(), "mp4".into()]),
+            error_message: None,
+        };
+        let (c, v, a) = select_best_combination(&caps);
+        assert_eq!((c.as_str(), v.as_str(), a.as_str()), ("mov", "prores_ks", "pcm_s24le"));
+    }
+
+    #[test]
+    fn test_select_best_combination_falls_back_to_dnxhd() {
+        let caps = FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: BTreeSet::from([
+                "dnxhd".into(),
+                "libx264".into(),
+                "pcm_s24le".into(),
+            ]),
+            available_formats: BTreeSet::from(["mxf".into(), "matroska".into()]),
+            error_message: None,
+        };
+        let (c, v, a) = select_best_combination(&caps);
+        assert_eq!((c.as_str(), v.as_str(), a.as_str()), ("mxf", "dnxhd", "pcm_s24le"));
+    }
+
+    #[test]
+    fn test_available_video_encoders_for_container_filters_correctly() {
+        let caps = FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: BTreeSet::from([
+                "libx264".into(),
+                "libx265".into(),
+                "pcm_s24le".into(),
+            ]),
+            available_formats: BTreeSet::from(["mov".into()]),
+            error_message: None,
+        };
+        let available = available_video_encoders_for_container("mov", &caps);
+        let keys: Vec<&str> = available.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&"libx264"));
+        assert!(keys.contains(&"libx265"));
+        assert!(!keys.contains(&"prores_ks"));
     }
 }

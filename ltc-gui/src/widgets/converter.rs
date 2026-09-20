@@ -5,9 +5,11 @@ use egui::{Color32, FontId, RichText, Ui};
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::command::GuiCommand;
 use gui_engine::converter::{
-    conversion_sanity_check, query_ffmpeg_capabilities, spawn_conversion,
+    available_audio_encoders_for_container, available_containers,
+    available_video_encoders_for_container, conversion_sanity_check,
+    query_ffmpeg_capabilities, select_best_combination, spawn_conversion,
     supported_audio_encoders, supported_containers, supported_video_encoders, ChannelMap,
-    ConversionState, ConversionStatus, ConverterSettings,
+    ConversionState, ConversionStatus, ConverterSettings, FfmpegCapabilities,
 };
 use gui_engine::file_pattern::{default_output_filename, match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
 
@@ -655,16 +657,31 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
 fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
+    let caps_clone = state.ffmpeg_caps.clone();
+
+    // When ffmpeg caps become available, apply intelligent defaults
+    if let Some(ref caps) = caps_clone {
+        use_available_defaults(state, caps);
+    }
+
+    let containers: Vec<(&str, &str)> = if let Some(ref caps) = caps_clone {
+        available_containers(caps)
+    } else {
+        supported_containers()
+    };
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Container:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        let containers = supported_containers();
         egui::ComboBox::from_id_salt("container_combo")
             .selected_text(&state.container)
             .show_ui(ui, |ui| {
                 for (key, desc) in &containers {
                     if ui.selectable_label(false, format!("{} — {}", key, desc)).clicked() {
                         state.container = key.to_string();
+                        // Re-select encoders compatible with the new container
+                        if let Some(ref caps) = caps_clone {
+                            re_select_encoders_for_container(state, caps);
+                        }
                         if let Some(group) = &state.selected_group {
                             if let Some(folder) = &state.selected_folder {
                                 state.output_path = folder.join(default_output_filename(group, &state.container));
@@ -676,13 +693,18 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     });
 
     ui.add_space(4.0);
+    let video_encoders = if let Some(ref caps) = caps_clone {
+        available_video_encoders_for_container(&state.container, caps)
+    } else {
+        supported_video_encoders()
+    };
+
     ui.horizontal(|ui| {
         ui.label(RichText::new("Video encoder:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        let encoders = supported_video_encoders();
         egui::ComboBox::from_id_salt("video_enc_combo")
             .selected_text(&state.video_encoder)
             .show_ui(ui, |ui| {
-                for (key, desc) in &encoders {
+                for (key, desc) in &video_encoders {
                     if ui.selectable_label(false, format!("{} — {}", key, desc)).clicked() {
                         state.video_encoder = key.to_string();
                     }
@@ -691,13 +713,18 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     });
 
     ui.add_space(4.0);
+    let audio_encoders = if let Some(ref caps) = caps_clone {
+        available_audio_encoders_for_container(&state.container, caps)
+    } else {
+        supported_audio_encoders()
+    };
+
     ui.horizontal(|ui| {
         ui.label(RichText::new("Audio encoder:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        let encoders = supported_audio_encoders();
         egui::ComboBox::from_id_salt("audio_enc_combo")
             .selected_text(&state.audio_encoder)
             .show_ui(ui, |ui| {
-                for (key, desc) in &encoders {
+                for (key, desc) in &audio_encoders {
                     if ui.selectable_label(false, format!("{} — {}", key, desc)).clicked() {
                         state.audio_encoder = key.to_string();
                     }
@@ -705,7 +732,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             });
     });
 
-    if let Some(caps) = &state.ffmpeg_caps {
+    if let Some(ref caps) = caps_clone {
         ui.add_space(4.0);
         let input_files: Vec<PathBuf> = state
             .selected_group
@@ -738,8 +765,8 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
         }
     }
 
-    match &state.ffmpeg_caps {
-        Some(caps) if !caps.has_ffmpeg => {
+    if let Some(ref caps) = caps_clone {
+        if !caps.has_ffmpeg {
             ui.add_space(4.0);
             let error_frame = egui::Frame::new()
                 .fill(Color32::from_rgb(0xEF, 0x44, 0x44).linear_multiply(0.08))
@@ -752,7 +779,49 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
                 }
             });
         }
-        _ => {}
+    }
+}
+
+/// Apply `select_best_combination` defaults when ffmpeg caps are first loaded.
+/// Skips if the current selection is already a valid combination.
+fn use_available_defaults(state: &mut AppState, caps: &FfmpegCapabilities) {
+    let containers: Vec<&str> = available_containers(caps).iter().map(|(k, _)| *k).collect();
+    if !containers.contains(&state.container.as_str()) {
+        let (c, v, a) = select_best_combination(caps);
+        state.container = c;
+        state.video_encoder = v;
+        state.audio_encoder = a;
+        return;
+    }
+    let vids: Vec<&str> =
+        available_video_encoders_for_container(&state.container, caps).iter().map(|(k, _)| *k).collect();
+    let auds: Vec<&str> =
+        available_audio_encoders_for_container(&state.container, caps).iter().map(|(k, _)| *k).collect();
+    if !vids.contains(&state.video_encoder.as_str()) || !auds.contains(&state.audio_encoder.as_str()) {
+        let (c, v, a) = select_best_combination(caps);
+        state.container = c;
+        state.video_encoder = v;
+        state.audio_encoder = a;
+    }
+}
+
+/// When the container changes, re-select video/audio encoders that are
+/// compatible with the new container (and available in ffmpeg).
+fn re_select_encoders_for_container(state: &mut AppState, caps: &FfmpegCapabilities) {
+    let video_available: Vec<&str> = available_video_encoders_for_container(&state.container, caps)
+        .iter()
+        .map(|(k, _)| *k)
+        .collect();
+    if !video_available.is_empty() && !video_available.contains(&state.video_encoder.as_str()) {
+        state.video_encoder = video_available[0].to_string();
+    }
+
+    let audio_available: Vec<&str> = available_audio_encoders_for_container(&state.container, caps)
+        .iter()
+        .map(|(k, _)| *k)
+        .collect();
+    if !audio_available.is_empty() && !audio_available.contains(&state.audio_encoder.as_str()) {
+        state.audio_encoder = audio_available[0].to_string();
     }
 }
 
