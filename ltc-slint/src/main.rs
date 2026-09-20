@@ -898,6 +898,98 @@ fn _run_gui(
         });
     }
 
+    // ── Copy LTC report callback ──────────────────────────────────────────
+    {
+        let state = engine_state.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_copy_ltc_report(move || {
+            let s = state.load();
+            if let Some(ref result) = s.ltc_decode_result {
+                let drop_flag = if result.drop_frame { " DF" } else { "" };
+                let fps_str = if result.detected_fps > 0.0 {
+                    format!("{:.2}{}", result.detected_fps, drop_flag)
+                } else {
+                    "—".to_string()
+                };
+                let first = result.timecodes.first();
+                let last = result.timecodes.last();
+                let tc_range = match (first, last) {
+                    (Some(f), Some(l)) => {
+                        format!(
+                            "{} → {}",
+                            timecode::timecode_to_string(f.timecode, result.drop_frame),
+                            timecode::timecode_to_string(l.timecode, result.drop_frame),
+                        )
+                    }
+                    _ => "—".to_string(),
+                };
+
+                let mut report = String::new();
+                report.push_str("LTC Decode Report\n");
+                report.push_str("=================\n");
+                report.push_str(&format!("Status:          {:?}\n", result.status));
+                report.push_str(&format!("FPS:             {}\n", fps_str));
+                report.push_str(&format!(
+                    "Valid frames:   {} / {} ({:.1}%)\n",
+                    result.valid_frames,
+                    result.total_possible_frames,
+                    result.avg_confidence * 100.0
+                ));
+                report.push_str(&format!("Timecode range:  {}\n", tc_range));
+                report.push_str(&format!("Sample rate:     {} Hz\n", result.sample_rate));
+                report.push_str(&format!("Audio duration:  {:.2}s\n", result.total_audio_duration_secs));
+                report.push_str(&format!("Processing time: {:.1}ms\n", result.processing_time_ms));
+
+                if let Some(ref q) = result.quality {
+                    report.push_str(&format!(
+                        "\nQuality Score:  {:.2} / 1.00 ({})\n",
+                        q.score, q.grade
+                    ));
+                    report.push_str(&format!(
+                        "  Missing:       {} frames, {} gap(s), {} glitch(es), {} edit point(s)\n",
+                        q.missing_frames, q.gap_count, q.glitch_count, q.edit_count
+                    ));
+                    if q.max_drift_secs > 0.01 {
+                        report.push_str(&format!("  Max drift:    {:.3}s\n", q.max_drift_secs));
+                    }
+                }
+
+                if !result.timecodes.is_empty() {
+                    report.push_str(&format!(
+                        "\nTimecodes ({} total):\n",
+                        result.timecodes.len()
+                    ));
+                    for ft in &result.timecodes {
+                        let tc = timecode::timecode_to_string(ft.timecode, result.drop_frame);
+                        report.push_str(&format!(
+                            "  [{:4}] {}  ({:.3}s)\n",
+                            ft.frame_index, tc, ft.timecode_secs
+                        ));
+                    }
+                }
+
+                if let Ok(mut ctx) = arboard::Clipboard::new() {
+                    let _ = ctx.set_text(report);
+                }
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_copy_confirmed(true);
+                    let ui_weak2 = u.as_weak();
+                    let reset_timer = slint::Timer::default();
+                    reset_timer.start(
+                        slint::TimerMode::SingleShot,
+                        Duration::from_millis(2000),
+                        move || {
+                            if let Some(fui) = ui_weak2.upgrade() {
+                                fui.set_copy_confirmed(false);
+                            }
+                        },
+                    );
+                    Box::leak(Box::new(reset_timer));
+                }
+            }
+        });
+    }
+
     // ── Poll timer — state sync ────────────────────────────────────────────
     setup_poll_timer(
         &ui,

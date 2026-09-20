@@ -171,6 +171,7 @@ export component AppWindow inherits Window {
     callback conv-start;
     callback conv-cancel;
     callback conv-copy-log;
+    callback conv-copy-ltc-report;
     callback conv-reset;
     callback conv-container-selected(int);
     callback conv-video-selected(int);
@@ -669,6 +670,7 @@ export component AppWindow inherits Window {
                     start-convert => { root.conv-start(); }
                     cancel-convert => { root.conv-cancel(); }
                     copy-log => { root.conv-copy-log(); }
+                    copy-ltc-report => { root.conv-copy-ltc-report(); }
                     reset-conv => { root.conv-reset(); }
                     container-selected(idx) => { root.conv-container-selected(idx); }
                     video-selected(idx) => { root.conv-video-selected(idx); }

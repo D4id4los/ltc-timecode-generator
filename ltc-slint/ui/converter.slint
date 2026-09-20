@@ -44,6 +44,7 @@ export component ConverterSection {
     callback detect-ltc;
     callback decode-fps-selected(int);
     callback cancel-decode;
+    callback copy-ltc-report;
 
     callback select-folder;
     callback select-group(int);
@@ -266,6 +267,16 @@ export component ConverterSection {
                             Text {
                                 text: root.ltc-result-text;
                                 color: AppColors.text-title; font-size: 9px; font-family: "monospace"; wrap: word-wrap;
+                            }
+                            if (root.ltc-status == "success" || root.ltc-status == "low_confidence") : Rectangle {
+                                border-radius: 6px; background: AppColors.nested-bg;
+                                min-height: 26px; max-width: 120px;
+                                TouchArea { clicked => { root.copy-ltc-report(); } }
+                                Text {
+                                    text: "📋 Copy Report";
+                                    color: AppColors.text-title; font-size: 9px; font-weight: 600;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
                             }
                         }
                     }

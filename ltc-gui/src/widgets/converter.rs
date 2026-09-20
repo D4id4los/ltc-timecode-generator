@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
-use gui_engine::timecode::FPS_OPTIONS;
+use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::command::GuiCommand;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
@@ -613,6 +613,15 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                 });
             }
 
+            // Copy Report button
+            if !result.timecodes.is_empty() {
+                ui.add_space(4.0);
+                if ui.button("📋 Copy Report").clicked() {
+                    let report = format_ltc_report_text(result);
+                    ui.ctx().copy_text(report);
+                }
+            }
+
             // Collapsible debug details
             if !result.details.is_empty() {
                 ui.add_space(2.0);
@@ -640,6 +649,74 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
             }
         });
     });
+}
+
+fn format_ltc_report_text(result: &gui_engine::LtcDetectionResult) -> String {
+    let drop_flag = if result.drop_frame { " DF" } else { "" };
+    let fps_str = if result.detected_fps > 0.0 {
+        format!("{:.2}{}", result.detected_fps, drop_flag)
+    } else {
+        "—".to_string()
+    };
+
+    let first = result.timecodes.first();
+    let last = result.timecodes.last();
+    let tc_range = match (first, last) {
+        (Some(f), Some(l)) => {
+            format!(
+                "{} → {}",
+                timecode::timecode_to_string(f.timecode, result.drop_frame),
+                timecode::timecode_to_string(l.timecode, result.drop_frame),
+            )
+        }
+        _ => "—".to_string(),
+    };
+
+    let mut report = String::new();
+    report.push_str("LTC Decode Report\n");
+    report.push_str("=================\n");
+    report.push_str(&format!("Status:          {:?}\n", result.status));
+    report.push_str(&format!("FPS:             {}\n", fps_str));
+    report.push_str(&format!(
+        "Valid frames:   {} / {} ({:.1}%)\n",
+        result.valid_frames,
+        result.total_possible_frames,
+        result.avg_confidence * 100.0
+    ));
+    report.push_str(&format!("Timecode range:  {}\n", tc_range));
+    report.push_str(&format!("Sample rate:     {} Hz\n", result.sample_rate));
+    report.push_str(&format!("Audio duration:  {:.2}s\n", result.total_audio_duration_secs));
+    report.push_str(&format!("Processing time: {:.1}ms\n", result.processing_time_ms));
+
+    if let Some(ref q) = result.quality {
+        report.push_str(&format!(
+            "\nQuality Score:  {:.2} / 1.00 ({})\n",
+            q.score, q.grade
+        ));
+        report.push_str(&format!(
+            "  Missing:       {} frames, {} gap(s), {} glitch(es), {} edit point(s)\n",
+            q.missing_frames, q.gap_count, q.glitch_count, q.edit_count
+        ));
+        if q.max_drift_secs > 0.01 {
+            report.push_str(&format!("  Max drift:    {:.3}s\n", q.max_drift_secs));
+        }
+    }
+
+    if !result.timecodes.is_empty() {
+        report.push_str(&format!(
+            "\nTimecodes ({} total):\n",
+            result.timecodes.len()
+        ));
+        for ft in &result.timecodes {
+            let tc = timecode::timecode_to_string(ft.timecode, result.drop_frame);
+            report.push_str(&format!(
+                "  [{:4}] {}  ({:.3}s)\n",
+                ft.frame_index, tc, ft.timecode_secs
+            ));
+        }
+    }
+
+    report
 }
 
 // ── Step 2: Channel mapping matrix ──────────────────────────────────────

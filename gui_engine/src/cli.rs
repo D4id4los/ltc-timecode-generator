@@ -106,6 +106,10 @@ pub struct Cli {
     /// Preferred for small files or when memory is not a concern.
     #[arg(long)]
     pub single_pass: bool,
+
+    /// Print all decoded timecodes from the LTC file
+    #[arg(short = 't', long = "list-timecodes", help = "Print all decoded LTC timecodes")]
+    pub list_timecodes: bool,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -637,6 +641,20 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("  Summary:      {}", q.summary);
     }
 
+    if cli.list_timecodes {
+        println!("\n=== Decoded Timecodes ===");
+        for ft in &result.timecodes {
+            let sep = if result.drop_frame { ";" } else { ":" };
+            println!(
+                "  [{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  ({:.3}s)",
+                ft.frame_index,
+                ft.timecode.hours, ft.timecode.minutes,
+                ft.timecode.seconds, ft.timecode.frames,
+                ft.timecode_secs,
+            );
+        }
+    }
+
     println!();
 
     Ok(())
@@ -860,6 +878,7 @@ mod tests {
             decode: None, decoder: "builtin".into(),
             decode_fps: 25.0, decode_drop_frame: false,
             single_pass: false,
+            list_timecodes: false,
         }
     }
 
