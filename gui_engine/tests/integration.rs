@@ -34,6 +34,7 @@ fn make_wav_cli(path: &Path, fps: f64, drop_frame: bool, duration: f64, sample_r
         decode_fps: fps,
         decode_drop_frame: drop_frame,
         single_pass: false,
+        context_frames: 3,
         list_timecodes: false,
     }
 }

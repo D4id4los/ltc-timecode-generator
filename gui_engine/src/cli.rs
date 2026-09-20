@@ -78,7 +78,7 @@ pub struct Cli {
     #[arg(long)]
     pub output_to_file: Option<String>,
 
-    /// Print timecode progression to stdout
+    /// Print timecode progression (headless) or detailed quality report (decode)
     #[arg(long, short = 'v')]
     pub verbose: bool,
 
@@ -106,6 +106,10 @@ pub struct Cli {
     /// Preferred for small files or when memory is not a concern.
     #[arg(long)]
     pub single_pass: bool,
+
+    /// Context window: number of frames to show before/after gaps and glitches in verbose quality report
+    #[arg(long, default_value_t = 3)]
+    pub context_frames: u32,
 
     /// Print all decoded timecodes from the LTC file
     #[arg(short = 't', long = "list-timecodes", help = "Print all decoded LTC timecodes")]
@@ -641,6 +645,91 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("  Summary:      {}", q.summary);
     }
 
+    if cli.verbose {
+        if let Some(ref q) = result.quality {
+            let ctx = cli.context_frames as usize;
+            let tc = &result.timecodes;
+            let fps = result.detected_fps as f64;
+            let frame_duration = 1.0 / fps;
+            let tc_to_secs = |ft: &audio_core::FrameTimecode| -> f64 {
+                ft.timecode.hours as f64 * 3600.0
+                    + ft.timecode.minutes as f64 * 60.0
+                    + ft.timecode.seconds as f64
+                    + ft.timecode.frames as f64 / fps
+            };
+            let has_issues = !q.gap_edges.is_empty() || !q.glitch_indices.is_empty();
+
+            if has_issues {
+                println!();
+                println!("=== Verbose Quality Report ===");
+
+                if !q.gap_edges.is_empty() {
+                    println!();
+                    for (gi, &(prev_last, next_first)) in q.gap_edges.iter().enumerate() {
+                        println!("--- Gap {} ---", gi + 1);
+                        let pre_start = prev_last.saturating_sub(ctx) + 1;
+                        for j in pre_start..=prev_last {
+                            let ft = &tc[j];
+                            println!(
+                                "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
+                                ft.frame_index, ft.timecode.hours,
+                                ft.timecode.minutes, ft.timecode.seconds,
+                                ft.timecode.frames, ft.timecode_secs,
+                            );
+                        }
+                        let missing = ((tc_to_secs(&tc[next_first]) - tc_to_secs(&tc[prev_last]) - frame_duration) / frame_duration).round() as u32;
+                        println!("  ---- GAP ({} missing frame(s)) ----", missing);
+                        let post_end = (next_first + ctx).min(tc.len());
+                        for j in next_first..post_end {
+                            let ft = &tc[j];
+                            println!(
+                                "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
+                                ft.frame_index, ft.timecode.hours,
+                                ft.timecode.minutes, ft.timecode.seconds,
+                                ft.timecode.frames, ft.timecode_secs,
+                            );
+                        }
+                        println!();
+                    }
+                }
+
+                if !q.glitch_indices.is_empty() {
+                    for (gi, &idx) in q.glitch_indices.iter().enumerate() {
+                        println!("--- Glitch {} ---", gi + 1);
+                        let pre_start = idx.saturating_sub(ctx);
+                        for j in pre_start..idx {
+                            let ft = &tc[j];
+                            println!(
+                                "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
+                                ft.frame_index, ft.timecode.hours,
+                                ft.timecode.minutes, ft.timecode.seconds,
+                                ft.timecode.frames, ft.timecode_secs,
+                            );
+                        }
+                        let ft = &tc[idx];
+                        println!(
+                            "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)  <<< GLITCH",
+                            ft.frame_index, ft.timecode.hours,
+                            ft.timecode.minutes, ft.timecode.seconds,
+                            ft.timecode.frames, ft.timecode_secs,
+                        );
+                        let post_end = (idx + 1 + ctx).min(tc.len());
+                        for j in (idx + 1)..post_end {
+                            let ft = &tc[j];
+                            println!(
+                                "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
+                                ft.frame_index, ft.timecode.hours,
+                                ft.timecode.minutes, ft.timecode.seconds,
+                                ft.timecode.frames, ft.timecode_secs,
+                            );
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
+    }
+
     if cli.list_timecodes {
         println!("\n=== Decoded Timecodes ===");
         for ft in &result.timecodes {
@@ -878,6 +967,7 @@ mod tests {
             decode: None, decoder: "builtin".into(),
             decode_fps: 25.0, decode_drop_frame: false,
             single_pass: false,
+            context_frames: 3,
             list_timecodes: false,
         }
     }

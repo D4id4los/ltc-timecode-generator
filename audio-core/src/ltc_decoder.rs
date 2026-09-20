@@ -70,6 +70,10 @@ pub struct LtcQualityReport {
     pub largest_block: u32,
     /// Human-readable summary of issues found
     pub summary: String,
+    /// Indices of gap boundaries: (prev_segment_last_idx, next_segment_first_idx)
+    pub gap_edges: Vec<(usize, usize)>,
+    /// Indices of individual glitch frames (single-frame outliers)
+    pub glitch_indices: Vec<usize>,
 }
 
 impl LtcDetectionResult {
@@ -735,6 +739,7 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
     // An edit is: a large LTC jump (>=10 frames) where audio elapsed doesn't match ltc elapsed
     let mut gap_count: u32 = 0;
     let mut edit_count: u32 = 0;
+    let mut gap_edges: Vec<(usize, usize)> = Vec::new();
     let edit_threshold = 0.1;  // seconds — audio-vs-LTC mismatch must exceed this
     let edit_ltc_jump_threshold = 10.0 / fps;  // LTC must jump by at least 10 frames
 
@@ -745,6 +750,7 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         let i_cur = cur.start;
 
         gap_count += 1;
+        gap_edges.push((i_prev, i_cur));
 
         let audio_elapsed = audio_secs[i_cur] - audio_secs[i_prev];
         let ltc_elapsed = ltc_secs[i_cur] - ltc_secs[i_prev];
@@ -757,6 +763,7 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
 
     // Detect glitch frames within contiguous segments
     let mut glitch_count: u32 = 0;
+    let mut glitch_indices: Vec<usize> = Vec::new();
     let glitch_threshold = 2.0 / fps;
 
     for seg in &segments {
@@ -768,6 +775,7 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
             let expected = (ltc_secs[i - 1] + ltc_secs[i + 1]) / 2.0;
             if (ltc_secs[i] - expected).abs() > glitch_threshold {
                 glitch_count += 1;
+                glitch_indices.push(i);
             }
         }
     }
@@ -874,6 +882,8 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         drift_rate,
         largest_block,
         summary,
+        gap_edges,
+        glitch_indices,
     })
 }
 
