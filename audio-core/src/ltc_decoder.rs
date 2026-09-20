@@ -1,7 +1,15 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+
+static OVERRIDE_SYNC_TOLERANCE: AtomicU32 = AtomicU32::new(0);
+
+fn effective_sync_tolerance() -> u32 {
+    let ov = OVERRIDE_SYNC_TOLERANCE.load(Ordering::Relaxed);
+    if ov > 0 { ov } else { SYNC_MATCH_TOLERANCE }
+}
 
 use crate::Timecode;
 
@@ -66,7 +74,7 @@ const SYNC_OFFSET: usize = 64;
 
 /// Decode LTC from a pre-loaded buffer of mono f32 samples.
 /// This is the core decoding logic, extracted from `decode_ltc_from_wav`.
-pub fn decode_ltc_samples(
+fn decode_ltc_samples_inner(
     samples: &[f32],
     sample_rate: u32,
     channels: usize,
@@ -92,8 +100,22 @@ pub fn decode_ltc_samples(
 
     info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (threshold={:.6})...",
         start.elapsed().as_secs_f64(), samples.len(), threshold);
-    let zc = find_zero_crossings(samples, threshold);
+    let mut zc = find_zero_crossings(samples, threshold);
     debug!("LTC decode: found {} zero-crossings", zc.len());
+
+    // Adaptive ZC: if far more ZCs than expected for clean LTC, noise is causing
+    // micro-crossings. Re-run with a stricter threshold to filter them out.
+    // Expected ZC upper bound: each LTC frame has ~120 ZC pairs on average at 25fps.
+    let expected_max_zcs = ((samples.len() as f64 / sample_rate as f64)
+        * fps * 240.0) as usize;
+    if zc.len() > expected_max_zcs * 3 && zc.len() > 1000 {
+        let stricter = (threshold * 4.0).min(0.5);
+        info!("LTC decode: ZC count {} is > {}x expected ({}) -- re-running with stricter threshold {:.6}",
+            zc.len(), 3, expected_max_zcs, stricter);
+        zc = find_zero_crossings(samples, stricter);
+        debug!("LTC decode: re-run with stricter threshold found {} zero-crossings", zc.len());
+    }
+
     if zc.len() < 8 {
         warn!("LTC decode: only {} zero-crossings, signal may not be LTC", zc.len());
         return Ok(LtcDetectionResult::error(format!(
@@ -221,6 +243,18 @@ pub fn decode_ltc_samples(
     }
     let final_r = if zc_better { zc_result } else { fallback_result };
     build_result(final_r, &zc, sample_rate, threshold, channels, total_duration, start)
+}
+
+/// Public entry point for LTC decode. Wraps the inner decoder.
+pub fn decode_ltc_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: usize,
+    fps: f64,
+    drop_frame: bool,
+    start: std::time::Instant,
+) -> Result<LtcDetectionResult, String> {
+    decode_ltc_samples_inner(samples, sample_rate, channels, fps, drop_frame, start)
 }
 
 pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
@@ -951,11 +985,12 @@ fn extract_bits_adaptive(
 const SYNC_MATCH_TOLERANCE: u32 = 2;
 
 fn bits_hamming_distance_16(a: &[u8]) -> u32 {
+    let tolerance = effective_sync_tolerance();
     let mut dist = 0u32;
     for (i, &bit) in a.iter().enumerate() {
         if bit != SYNC_WORD[i] {
             dist += 1;
-            if dist > SYNC_MATCH_TOLERANCE {
+            if dist > tolerance {
                 return dist;
             }
         }
@@ -1017,7 +1052,7 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         }
         let sync_start = frame_start + SYNC_OFFSET;
         if sync_start + 16 <= bits.len()
-            && bits_hamming_distance_16(&bits[sync_start..sync_start + 16]) <= SYNC_MATCH_TOLERANCE
+            && bits_hamming_distance_16(&bits[sync_start..sync_start + 16]) <= effective_sync_tolerance()
         {
             frame_starts.push(frame_start);
         }

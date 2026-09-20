@@ -101,6 +101,11 @@ pub struct Cli {
     /// Enable drop-frame for LTC decoding (only meaningful for 29.97 fps)
     #[arg(long)]
     pub decode_drop_frame: bool,
+
+    /// Use single-pass (non-chunked) decode instead of chunked parallel decode.
+    /// Preferred for small files or when memory is not a concern.
+    #[arg(long)]
+    pub single_pass: bool,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -520,63 +525,78 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting LTC decode (this may take a while for large files)...");
 
-    // Use chunked decode for progress reporting
-    let config = audio_core::DecodeConfig::default();
-    // Quick open to estimate chunk count
-    let chunk_count = match audio_core::WavChunkReader::open(Path::new(path)) {
-        Ok((reader, _)) => {
-            let total_mono = reader.total_mono_samples();
-            let sr = reader.sample_rate();
-            let ch = reader.channels();
-            let spec = reader.spec();
-            let bytes_per_mono = (ch as u64) * (spec.bits_per_sample as u64 / 8);
-            let chunk_mono = (config.chunk_size_bytes / bytes_per_mono.max(1)) as usize;
-            let overlap_samples = (config.overlap_seconds * sr as f64) as usize;
-            let chunk_mono = chunk_mono.max(overlap_samples * 2);
-            if total_mono <= chunk_mono + overlap_samples {
-                1
-            } else {
-                let mut count = 0usize;
-                let mut pos = 0usize;
-                while pos < total_mono {
-                    count += 1;
-                    let end = (pos + chunk_mono).min(total_mono);
-                    if end >= total_mono { break; }
-                    let next = end.saturating_sub(overlap_samples);
-                    if next <= pos || next >= total_mono { break; }
-                    pos = next;
+    let result = if cli.single_pass {
+        info!("Using single-pass (non-chunked) decode");
+        eprintln!("Decoding (single-pass)...");
+        audio_core::decode_ltc_with_decoder(
+            Path::new(path), use_libltc, cli.decode_fps, cli.decode_drop_frame,
+        )?
+    } else {
+        let config = audio_core::DecodeConfig::default();
+        // Quick open to estimate chunk count
+        let chunk_count = match audio_core::WavChunkReader::open(Path::new(path)) {
+            Ok((reader, _)) => {
+                let total_mono = reader.total_mono_samples();
+                let sr = reader.sample_rate();
+                let ch = reader.channels();
+                let spec = reader.spec();
+                let bytes_per_mono = (ch as u64) * (spec.bits_per_sample as u64 / 8);
+                let chunk_mono = (config.chunk_size_bytes / bytes_per_mono.max(1)) as usize;
+                let overlap_samples = (config.overlap_seconds * sr as f64) as usize;
+                let chunk_mono = chunk_mono.max(overlap_samples * 2);
+                if total_mono <= chunk_mono + overlap_samples {
+                    1
+                } else {
+                    let mut count = 0usize;
+                    let mut pos = 0usize;
+                    while pos < total_mono {
+                        count += 1;
+                        let end = (pos + chunk_mono).min(total_mono);
+                        if end >= total_mono { break; }
+                        let next = end.saturating_sub(overlap_samples);
+                        if next <= pos || next >= total_mono { break; }
+                        pos = next;
+                    }
+                    count
                 }
-                count
             }
+            Err(_) => 1,
+        };
+
+        if chunk_count <= 1 {
+            info!("Small file (1 chunk): using single-threaded decode");
+            eprintln!("Decoding (single-pass)...");
+            audio_core::decode_ltc_with_decoder(
+                Path::new(path), use_libltc, cli.decode_fps, cli.decode_drop_frame,
+            )?
+        } else {
+            eprint!("Decoding:   0%");
+            let progress = audio_core::DecodeProgress::new(chunk_count);
+            let completed_ref = progress.chunks_completed.clone();
+            let total_chunks = chunk_count;
+
+            let progress_handle = std::thread::spawn(move || {
+                loop {
+                    let done = completed_ref.load(std::sync::atomic::Ordering::Relaxed);
+                    let pct = if total_chunks > 0 { (done * 100) / total_chunks } else { 100 };
+                    eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
+                    if done >= total_chunks || total_chunks == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            });
+
+            let result = audio_core::decode_ltc_chunked(
+                Path::new(path), use_libltc, cli.decode_fps, cli.decode_drop_frame,
+                config, &progress,
+            )?;
+
+            let _ = progress_handle.join();
+            eprintln!("\rDecoding: 100%  (chunk {}/{})", total_chunks, total_chunks);
+            result
         }
-        Err(_) => 1,
     };
-
-    eprint!("Decoding:   0%");
-    let progress = audio_core::DecodeProgress::new(chunk_count);
-    let completed_ref = progress.chunks_completed.clone();
-    let total_chunks = chunk_count;
-
-    // Spawn a progress display thread
-    let progress_handle = std::thread::spawn(move || {
-        loop {
-            let done = completed_ref.load(std::sync::atomic::Ordering::Relaxed);
-            let pct = if total_chunks > 0 { (done * 100) / total_chunks } else { 100 };
-            eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
-            if done >= total_chunks || total_chunks == 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-    });
-
-    let result = audio_core::decode_ltc_chunked(
-        Path::new(path), use_libltc, cli.decode_fps, cli.decode_drop_frame,
-        config, &progress,
-    )?;
-
-    let _ = progress_handle.join();
-    eprintln!("\rDecoding: 100%  (chunk {}/{})", total_chunks, total_chunks);
 
     println!();
     println!("=== LTC Decode Results ===");
@@ -588,7 +608,7 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     println!("  FPS:           {:.2}{}", result.detected_fps,
         if result.drop_frame { " DF" } else { "" });
     println!("  Valid frames:  {} / {} ({:.1}%)",
-        result.valid_frames, result.total_possible_frames, result.avg_confidence);
+        result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0);
     println!("  First TC at:   {:.3}s", result.first_ltc_timecode_secs);
     println!("  Processing:    {:.1}ms", result.processing_time_ms);
 
@@ -828,6 +848,7 @@ mod tests {
             output_to_file: None, verbose: false, debug: false,
             decode: None, decoder: "builtin".into(),
             decode_fps: 25.0, decode_drop_frame: false,
+            single_pass: false,
         }
     }
 
