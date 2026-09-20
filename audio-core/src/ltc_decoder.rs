@@ -191,7 +191,7 @@ fn decode_ltc_samples_inner(
                 let r = best_window_result.as_ref().unwrap();
                 info!("LTC decode: window eval {:.1}% >= 70% -- single-pass on full file (spb={:.2}, phase={})",
                     conf * 100.0, r.spb, r.phase);
-                let decoded = decode_full_file(samples, r, threshold, sample_rate, best_window_start);
+                let decoded = decode_full_file(samples, r, threshold, sample_rate, best_window_start, &zc);
                 let zc_better = zc_result.as_ref().is_some_and(|zcr| {
                     zcr.valid_frames > decoded.valid_frames
                 });
@@ -214,7 +214,7 @@ fn decode_ltc_samples_inner(
         let conf = r.valid_frames as f32 / r.total_possible.max(1) as f32;
         info!("LTC decode: best window eval {:.1}% ({} valid) -- single-pass on full file (spb={:.2}, phase={})",
             conf * 100.0, r.valid_frames, r.spb, r.phase);
-        let decoded = decode_full_file(samples, r, threshold, sample_rate, best_window_start);
+        let decoded = decode_full_file(samples, r, threshold, sample_rate, best_window_start, &zc);
         let zc_better = zc_result.as_ref().is_some_and(|zcr| {
             zcr.valid_frames > decoded.valid_frames
         });
@@ -1119,10 +1119,22 @@ fn decode_full_file(
     threshold: f32,
     sample_rate: u32,
     phase_offset: usize,
+    zero_crossings: &[usize],
 ) -> ScoredResult {
     let absolute_phase = params.phase + phase_offset;
-    let bits = extract_bits(samples, params.spb, absolute_phase, threshold);
-    let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
+
+    let bits_nominal = extract_bits(samples, params.spb, absolute_phase, threshold);
+    let (valid_nominal, total_possible, frame_starts_nominal) = find_frames(&bits_nominal);
+
+    let bits_adaptive = extract_bits_adaptive(samples, params.spb, absolute_phase, threshold, zero_crossings);
+    let (valid_adaptive, total_possible_adaptive, frame_starts_adaptive) = find_frames(&bits_adaptive);
+
+    let (use_adaptive, valid_frames, total_possible, frame_starts, bits) = if valid_adaptive > valid_nominal {
+        (true, valid_adaptive, total_possible_adaptive, frame_starts_adaptive, bits_adaptive)
+    } else {
+        (false, valid_nominal, total_possible, frame_starts_nominal, bits_nominal)
+    };
+
     let timecodes: Vec<FrameTimecode> = frame_starts
         .iter()
         .enumerate()
@@ -1132,6 +1144,7 @@ fn decode_full_file(
             timecode_secs: (absolute_phase as f64 + start as f64 * params.spb) / sample_rate as f64,
         })
         .collect();
+    let method = if use_adaptive { "adaptive" } else { "nominal" };
     ScoredResult {
         fps: params.fps,
         drop_frame: params.drop_frame,
@@ -1139,7 +1152,7 @@ fn decode_full_file(
         total_possible,
         timecodes,
         details_entry: format!(
-            "{:.2} fps: {} valid / {} possible frames (single-pass, spb={:.2}, phase={})",
+            "{:.2} fps: {} valid / {} possible frames (single-pass {method}, spb={:.2}, phase={})",
             params.fps, valid_frames, total_possible, params.spb, absolute_phase
         ),
         spb: params.spb,
@@ -1470,6 +1483,29 @@ mod tests {
                 buf[..half].fill(start_level);
                 buf[half..samples_per_bit].fill(mid_level);
                 (buf, mid_level)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Generate a single bit of SMPTE-standard bi-phase mark: every bit starts
+    /// with a transition (level flips), and bit=1 adds a second transition at
+    /// the midpoint. This matches real-world LTC where every bit boundary
+    /// produces a zero-crossing, giving adaptive extraction a signal to follow.
+    fn synthesize_bit_smpte(samples_per_bit: usize, bit_value: u8, start_level: f32) -> (Vec<f32>, f32) {
+        let mut buf = vec![0.0f32; samples_per_bit];
+        let half = samples_per_bit / 2;
+        let first_half_level = -start_level;
+        match bit_value {
+            0 => {
+                buf.fill(first_half_level);
+                (buf, first_half_level)
+            }
+            1 => {
+                let second_half_level = start_level;
+                buf[..half].fill(first_half_level);
+                buf[half..].fill(second_half_level);
+                (buf, second_half_level)
             }
             _ => unreachable!(),
         }
@@ -2810,7 +2846,7 @@ mod tests {
             frame_starts: vec![],
         };
 
-        let result = decode_full_file(&signal, &params, 0.001, 48000, 0);
+        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &[]);
         assert_eq!(result.valid_frames, 3);
         assert_eq!(result.total_possible, 3);
         assert_eq!(result.timecodes.len(), 3);
@@ -2835,10 +2871,183 @@ mod tests {
             frame_starts: vec![],
         };
 
-        let result = decode_full_file(&signal, &params, 0.5, 48000, 0);
+        let result = decode_full_file(&signal, &params, 0.5, 48000, 0, &[]);
         // With high threshold, signal is below threshold → extract_bits returns zeros
         // No sync word in zeros → valid_frames = 0
         assert_eq!(result.valid_frames, 0);
+    }
+
+    // ── decode_full_file adaptive tests ───────────────────────────────
+
+    #[test]
+    fn test_decode_full_file_no_drift_adaptive_regression() {
+        let spb = 24.0;
+        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let bits = crate::get_ltc_bits(&tc, false);
+        let mut signal = Vec::new();
+        let mut level = 0.5;
+        for _ in 0..3 {
+            for &bit in &bits {
+                let (chunk, l) = synthesize_bit(spb as usize, bit, level);
+                signal.extend(chunk);
+                level = l;
+            }
+        }
+        let zc = find_zero_crossings(&signal, 0.001);
+
+        let params = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 3,
+            total_possible: 3,
+            timecodes: vec![],
+            details_entry: "test".to_string(),
+            spb,
+            phase: 0,
+            frame_starts: vec![],
+        };
+
+        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &zc);
+        assert_eq!(result.valid_frames, 3);
+        assert_eq!(result.total_possible, 3);
+        assert_eq!(result.timecodes.len(), 3);
+        for ftc in &result.timecodes {
+            assert_eq!(ftc.timecode, tc);
+        }
+    }
+
+    #[test]
+    fn test_decode_full_file_adaptive_with_spb_mismatch() {
+        let spb_true = 24.0;
+        let spb_mismatch = 24.1;
+        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let bits = crate::get_ltc_bits(&tc, false);
+        let mut signal = Vec::new();
+        let mut level = 0.5;
+        for _ in 0..3 {
+            for &bit in &bits {
+                let (chunk, l) = synthesize_bit(spb_true as usize, bit, level);
+                signal.extend(chunk);
+                level = l;
+            }
+        }
+        let zc = find_zero_crossings(&signal, 0.001);
+
+        let params = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 0,
+            total_possible: 3,
+            timecodes: vec![],
+            details_entry: "test".to_string(),
+            spb: spb_mismatch,
+            phase: 0,
+            frame_starts: vec![],
+        };
+
+        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &zc);
+        assert!(result.valid_frames >= 2,
+            "expected >=2 valid frames with spb mismatch (true={}, used={}), got {}",
+            spb_true, spb_mismatch, result.valid_frames);
+    }
+
+    // ── extract_bits_adaptive basic correctness ─────────────────────
+
+    #[test]
+    fn test_extract_bits_adaptive_consistent_with_nominal() {
+        let spb = 24.0;
+        let bit_pattern: Vec<u8> = (0..10).map(|i| if i % 2 == 0 { 1 } else { 0 }).collect();
+        let mut signal = Vec::new();
+        let mut level = 0.5;
+        for &bit in &bit_pattern {
+            let (chunk, l) = synthesize_bit(spb as usize, bit, level);
+            signal.extend(chunk);
+            level = l;
+        }
+        let zc = find_zero_crossings(&signal, 0.001);
+
+        let bits_adaptive = extract_bits_adaptive(&signal, spb, 0, 0.01, &zc);
+        let bits_nominal = extract_bits(&signal, spb, 0, 0.01);
+
+        assert_eq!(bits_adaptive.len(), bit_pattern.len(),
+            "adaptive: expected {} bits, got {}", bit_pattern.len(), bits_adaptive.len());
+        assert_eq!(bits_nominal.len(), bit_pattern.len(),
+            "nominal: expected {} bits, got {}", bit_pattern.len(), bits_nominal.len());
+        for (i, (&got, &expected)) in bits_adaptive.iter().zip(bit_pattern.iter()).enumerate() {
+            assert_eq!(got, expected,
+                "adaptive bit {} mismatch: got {}, expected {}", i, got, expected);
+        }
+        // On clean synthetic signal, both extractors should produce identical results
+        assert_eq!(bits_adaptive, bits_nominal,
+            "adaptive and nominal should produce identical bits on clean signal");
+    }
+
+    // ── extract_bits_adaptive accumulating drift (SMPTE encoder) ─────
+
+    #[test]
+    fn test_extract_bits_adaptive_accumulating_drift() {
+        let nominal_spb = 24.0;
+        let actual_spb: usize = 25;
+        let num_bits = 200;
+        let bit_pattern: Vec<u8> = (0..num_bits).map(|i| if i % 2 == 0 { 1 } else { 0 }).collect();
+
+        let mut signal = Vec::new();
+        let mut last_level = 0.5f32;
+        for &bit in &bit_pattern {
+            let (chunk, l) = synthesize_bit_smpte(actual_spb, bit, last_level);
+            signal.extend(chunk);
+            last_level = l;
+        }
+
+        let zc = find_zero_crossings(&signal, 0.001);
+        assert!(zc.len() > num_bits,
+            "SMPTE signal should have at least {} ZCs, got {}",
+            num_bits, zc.len());
+
+        let bits_adaptive = extract_bits_adaptive(&signal, nominal_spb, 0, 0.01, &zc);
+        assert_eq!(bits_adaptive.len(), num_bits,
+            "adaptive: expected {} bits, got {}", num_bits, bits_adaptive.len());
+        for (i, (&got, &expected)) in bits_adaptive.iter().zip(bit_pattern.iter()).enumerate() {
+            assert_eq!(got, expected,
+                "adaptive bit {} mismatch: got {}, expected {}", i, got, expected);
+        }
+
+        let bits_nominal = extract_bits(&signal, nominal_spb, 0, 0.01);
+        assert_ne!(bits_nominal, bit_pattern,
+            "non-adaptive extraction should fail with SPB mismatch (nominal={}, actual={})",
+            nominal_spb, actual_spb);
+    }
+
+    // ── Helper: synthesize LTC signal with clock drift ────────────────
+
+    /// Generate mono f32 LTC where each bit is slightly longer than nominal,
+    /// simulating a sample-rate mismatch between recording and source.
+    fn synthesize_ltc_signal_with_drift(
+        timecodes: &[Timecode],
+        fps: f64,
+        drop_frame: bool,
+        sample_rate: u32,
+        volume: f32,
+        drift_ppm: f64,
+    ) -> Vec<f32> {
+        let nominal_spb = sample_rate as f64 / (fps * 80.0);
+        let drift_spb = nominal_spb * (1.0 + drift_ppm / 1_000_000.0);
+        let mut signal = Vec::new();
+        let mut last_level = 1.0f32;
+        let mut bit_acc = 0.0f64;
+
+        for tc in timecodes {
+            let bits = crate::get_ltc_bits(tc, drop_frame);
+            for &bit in bits.iter() {
+                bit_acc += drift_spb;
+                let samples_this_bit = bit_acc.floor() as usize;
+                bit_acc -= samples_this_bit as f64;
+                let (chunk, l) = synthesize_bit(samples_this_bit.max(1), bit, last_level * volume.signum());
+                signal.extend(chunk.iter().map(|s| s * volume));
+                last_level = l;
+            }
+        }
+        signal
     }
 
     // ── Helper: synthesize LTC signal for decode_ltc_samples ──────────
@@ -3071,6 +3280,30 @@ mod tests {
         let result = decode_ltc_samples(&signal, 48000, 1, 29.97, true, std::time::Instant::now()).unwrap();
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
             "expected no Error for 29.97 DF, got {:?}", result.status);
+    }
+
+    // ── Clock drift end-to-end test ─────────────────────────────────────
+
+    #[test]
+    fn test_decode_ltc_samples_clock_drift_long() {
+        let tcs: Vec<Timecode> = (0..1500)
+            .map(|i| Timecode {
+                hours: (i / (25 * 60)) as u32,
+                minutes: ((i / 25) % 60) as u32,
+                seconds: (i % 25) as u32,
+                frames: 0,
+            })
+            .collect();
+        let signal = synthesize_ltc_signal_with_drift(&tcs, 25.0, false, 48000, 0.5, 100.0);
+        let result = decode_ltc_samples(&signal, 48000, 1, 25.0, false, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for 60s LTC with 100ppm drift, got {:?} (valid={}/{})",
+            result.status, result.valid_frames, result.total_possible_frames);
+        let total_expected = tcs.len() as u32;
+        assert!(result.valid_frames as f32 / total_expected as f32 >= 0.70,
+            "expected >=70% valid frames with 100ppm drift, got {}/{} ({:.1}%)",
+            result.valid_frames, total_expected,
+            result.valid_frames as f32 / total_expected as f32 * 100.0);
     }
 
     // ═══════════════════════════════════════════════════════════════════
