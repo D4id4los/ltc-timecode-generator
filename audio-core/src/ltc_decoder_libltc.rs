@@ -4,7 +4,7 @@ use std::time::Instant;
 use libltc_rs::prelude::*;
 use log::{debug, info, warn};
 
-use crate::ltc_decoder::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
+use crate::ltc_decoder::{apply_coherent_first_timecode, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
 use crate::Timecode;
 
 pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
@@ -180,7 +180,7 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool) -> Re
         format!("libltc queue length: {}", decoder.queue_length()),
     ];
 
-    let result = LtcDetectionResult {
+    let mut result = LtcDetectionResult {
         status,
         detected_fps: fps as f32,
         drop_frame,
@@ -195,12 +195,15 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool) -> Re
         first_ltc_timecode_secs: first_secs,
     };
 
+    apply_coherent_first_timecode(&mut result);
+
     info!(
-        "libltc decode complete: {} valid / {} possible ({:.1}%) in {:.1}ms",
+        "libltc decode complete: {} valid / {} possible ({:.1}%) in {:.1}ms, first_ltc_timecode_secs={:.3}s",
         result.valid_frames,
         result.total_possible_frames,
         result.avg_confidence,
-        result.processing_time_ms
+        result.processing_time_ms,
+        result.first_ltc_timecode_secs,
     );
 
     Ok(result)

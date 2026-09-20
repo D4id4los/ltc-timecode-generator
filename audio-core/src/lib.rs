@@ -785,7 +785,8 @@ pub const SAMPLE_RATE_OPTIONS: &[u32] = &[16000, 48000];
 
 // Re-export LTC decoder types for convenience
 pub use ltc_decoder::{
-    decode_ltc_from_wav, quick_check_ltc, FrameTimecode, LtcDecodeStatus, LtcDetectionResult,
+    apply_coherent_first_timecode, decode_ltc_from_wav, find_first_coherent_index,
+    quick_check_ltc, FrameTimecode, LtcDecodeStatus, LtcDetectionResult,
 };
 pub use ltc_decoder_libltc::decode_ltc_from_wav_libltc;
 

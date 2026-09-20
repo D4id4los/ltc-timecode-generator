@@ -394,7 +394,7 @@ fn build_result(
     let elapsed = start.elapsed();
     let processing_time_ms = elapsed.as_secs_f64() * 1000.0;
 
-    match best_result {
+let mut result = match best_result {
         Some(r) => {
             let confidence = if r.total_possible > 0 {
                 r.valid_frames as f32 / r.total_possible as f32
@@ -453,7 +453,7 @@ fn build_result(
                 first_ltc_timecode_secs, tc0_secs, processing_time_ms,
             );
 
-            Ok(LtcDetectionResult {
+            LtcDetectionResult {
                 status,
                 detected_fps: r.fps as f32,
                 drop_frame: r.drop_frame,
@@ -466,7 +466,7 @@ fn build_result(
                 sample_rate,
                 processing_time_ms,
                 first_ltc_timecode_secs,
-            })
+            }
         }
         None => {
             info!(
@@ -481,7 +481,7 @@ fn build_result(
                     total_duration, sample_rate, channels
                 ),
             ];
-            Ok(LtcDetectionResult {
+            LtcDetectionResult {
                 status: LtcDecodeStatus::NoSyncWord,
                 detected_fps: 0.0,
                 drop_frame: false,
@@ -492,9 +492,103 @@ fn build_result(
                 details,
                 total_audio_duration_secs: total_duration,
                 sample_rate,
-                processing_time_ms,
+                processing_time_ms: 0.0,
                 first_ltc_timecode_secs: 0.0,
-            })
+            }
+        }
+    };
+
+    apply_coherent_first_timecode(&mut result);
+    Ok(result)
+}
+
+/// Scan decoded timecodes to find the index of the first frame that is part of
+/// a coherent sequence (no jumps or gaps) continuing for at least 2 seconds.
+///
+/// Returns `Some(index)` if found, or `None` if (a) the timecodes already start
+/// with a coherent run, (b) there are too few frames to form a 2-second run, or
+/// (c) no sufficiently long coherent run exists anywhere.
+pub fn find_first_coherent_index(
+    timecodes: &[FrameTimecode],
+    fps: f64,
+    drop_frame: bool,
+) -> Option<usize> {
+    if timecodes.is_empty() || fps <= 0.0 {
+        return None;
+    }
+
+    let frame_duration = 1.0 / fps;
+    let max_frames = fps.ceil() as u32;
+    let min_run = (2.0 * fps).ceil() as usize;
+
+    if timecodes.len() < min_run {
+        return None;
+    }
+
+    let is_valid_tc = |tc: &Timecode| -> bool {
+        tc.hours < 24 && tc.minutes < 60 && tc.seconds < 60 && tc.frames < max_frames
+    };
+
+    let is_valid_pair = |prev: &FrameTimecode, curr: &FrameTimecode| -> bool {
+        let expected = crate::increment_timecode(&prev.timecode, fps, drop_frame);
+        if curr.timecode != expected {
+            return false;
+        }
+        let dt = curr.timecode_secs - prev.timecode_secs;
+        (dt - frame_duration).abs() < frame_duration * 0.5
+    };
+
+    for i in 0..=timecodes.len() - min_run {
+        if !is_valid_tc(&timecodes[i].timecode) {
+            continue;
+        }
+
+        let mut run_len = 1;
+        for j in i + 1..timecodes.len() {
+            if !is_valid_tc(&timecodes[j].timecode) {
+                break;
+            }
+            if is_valid_pair(&timecodes[j - 1], &timecodes[j]) {
+                run_len += 1;
+                if run_len >= min_run {
+                    return Some(i);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    None
+}
+
+/// Post-process a `LtcDetectionResult` to find the first coherent timecode
+/// and trim any non-coherent frames from the start of the `timecodes` vector.
+/// Updates `first_ltc_timecode_secs` to match the first coherent frame.
+pub fn apply_coherent_first_timecode(result: &mut LtcDetectionResult) {
+    if result.timecodes.is_empty() || result.detected_fps <= 0.0 {
+        return;
+    }
+
+    let fps = result.detected_fps as f64;
+
+    if let Some(idx) = find_first_coherent_index(&result.timecodes, fps, result.drop_frame) {
+        if idx > 0 {
+            let first_coherent_secs = result.timecodes[idx].timecode_secs;
+            let first_tc = result.timecodes[idx].timecode;
+
+            result.timecodes = result.timecodes[idx..].to_vec();
+            for (i, ftc) in result.timecodes.iter_mut().enumerate() {
+                ftc.frame_index = i as u32;
+            }
+
+            result.first_ltc_timecode_secs = first_coherent_secs;
+
+            result.details.push(format!(
+                "Coherent start: trimmed {} non-coherent frame(s), first clean TC at {:.3}s = {:02}:{:02}:{:02}:{:02}",
+                idx, first_coherent_secs,
+                first_tc.hours, first_tc.minutes, first_tc.seconds, first_tc.frames,
+            ));
         }
     }
 }
@@ -1942,5 +2036,131 @@ mod tests {
             "Real-world LTC should span >15s of timecode, got {:.2}s ({} possible frames @ {:.2}fps)",
             secs_spanned, result.total_possible_frames, result.detected_fps,
         );
+    }
+
+    // ── find_first_coherent_index ───────────────────────────────────────────
+
+    #[test]
+    fn test_coherent_index_clean_from_start() {
+        let fps = 25.0;
+        let fd = 1.0 / fps;
+        let tcs: Vec<FrameTimecode> = (0..100)
+            .map(|i| {
+                let t = (0..i).fold(
+                    Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+                    |acc, _| crate::increment_timecode(&acc, fps, false),
+                );
+                FrameTimecode {
+                    frame_index: i as u32,
+                    timecode: t,
+                    timecode_secs: i as f64 * fd,
+                }
+            })
+            .collect();
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), Some(0));
+    }
+
+    #[test]
+    fn test_coherent_index_noisy_start() {
+        let fps = 25.0;
+        let fd = 1.0 / fps;
+        let mut tcs = Vec::new();
+        // 3 noise frames (out-of-range timecodes)
+        tcs.push(FrameTimecode {
+            frame_index: 0,
+            timecode: Timecode { hours: 45, minutes: 85, seconds: 85, frames: 45 },
+            timecode_secs: 0.0,
+        });
+        tcs.push(FrameTimecode {
+            frame_index: 1,
+            timecode: Timecode { hours: 2, minutes: 4, seconds: 14, frames: 2 },
+            timecode_secs: 113.0,
+        });
+        tcs.push(FrameTimecode {
+            frame_index: 2,
+            timecode: Timecode { hours: 2, minutes: 4, seconds: 14, frames: 15 },
+            timecode_secs: 113.04,
+        });
+        // 70 clean frames (2.8 seconds at 25fps)
+        let base = Timecode { hours: 2, minutes: 4, seconds: 20, frames: 0 };
+        for i in 0..70 {
+            let t = (0..i).fold(base, |acc, _| crate::increment_timecode(&acc, fps, false));
+            tcs.push(FrameTimecode {
+                frame_index: (3 + i) as u32,
+                timecode: t,
+                timecode_secs: 200.0 + i as f64 * fd,
+            });
+        }
+        let idx = find_first_coherent_index(&tcs, fps, false);
+        assert_eq!(idx, Some(3));
+    }
+
+    #[test]
+    fn test_coherent_index_isolated_valid_frames() {
+        let fps = 25.0;
+        let fd = 1.0 / fps;
+        let mut tcs = Vec::new();
+        for i in 0..10 {
+            let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: (i * 5) as u32 };
+            tcs.push(FrameTimecode {
+                frame_index: i as u32,
+                timecode: tc,
+                timecode_secs: i as f64 * fd,
+            });
+        }
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), None);
+    }
+
+    #[test]
+    fn test_coherent_index_too_few_frames() {
+        let fps = 25.0;
+        let tcs = vec![
+            FrameTimecode {
+                frame_index: 0,
+                timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
+                timecode_secs: 0.0,
+            },
+            FrameTimecode {
+                frame_index: 1,
+                timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: 1 },
+                timecode_secs: 0.04,
+            },
+        ];
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), None);
+    }
+
+    #[test]
+    fn test_coherent_index_drop_frame() {
+        let fps = 29.97;
+        let fd = 1.0 / fps;
+        let mut tcs = Vec::new();
+        let base = Timecode { hours: 0, minutes: 9, seconds: 59, frames: 29 };
+        for i in 0..120 {
+            let t = (0..i).fold(base, |acc, _| crate::increment_timecode(&acc, fps, true));
+            tcs.push(FrameTimecode {
+                frame_index: i as u32,
+                timecode: t,
+                timecode_secs: i as f64 * fd,
+            });
+        }
+        // All frames form a valid drop-frame sequence → no adjustment needed
+        assert_eq!(find_first_coherent_index(&tcs, fps, true), Some(0));
+    }
+
+    #[test]
+    fn test_coherent_index_midnight_wrap() {
+        let fps = 25.0;
+        let fd = 1.0 / fps;
+        let mut tcs = Vec::new();
+        let base = Timecode { hours: 23, minutes: 59, seconds: 59, frames: 24 };
+        for i in 0..150 {
+            let t = (0..i).fold(base, |acc, _| crate::increment_timecode(&acc, fps, false));
+            tcs.push(FrameTimecode {
+                frame_index: i as u32,
+                timecode: t,
+                timecode_secs: i as f64 * fd,
+            });
+        }
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), Some(0));
     }
 }
