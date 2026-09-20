@@ -81,12 +81,14 @@ fn test_cli_generate_wav_roundtrip() {
         debug: false,
         decode: None,
         decoder: "builtin".to_string(),
+        decode_fps: 25.0,
+        decode_drop_frame: false,
     };
 
     gui_engine::cli::generate_wav(cli).expect("WAV generation failed");
 
     // Decode the file
-    let result = decode_ltc_from_wav(&wav_path).expect("LTC decode failed");
+    let result = decode_ltc_from_wav(&wav_path, 25.0, false).expect("LTC decode failed");
     assert!(
         matches!(result.status, LtcDecodeStatus::Success),
         "expected Success, got {:?} (valid={})",
@@ -119,6 +121,8 @@ fn test_engine_mpsc_parse_ltc_command() {
         debug: false,
         decode: None,
         decoder: "builtin".to_string(),
+        decode_fps: 25.0,
+        decode_drop_frame: false,
     };
     gui_engine::cli::generate_wav(cli).expect("WAV generation failed");
 

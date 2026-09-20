@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 pub mod ltc_decoder;
 pub mod ltc_decoder_libltc;
+pub mod ltc_encoder;
+
+pub use ltc_encoder::{get_ltc_bits, increment_timecode, generate_ltc_frame_stereo};
 
 // ── Ring buffer capacities ─────────────────────────────────────────────────
 
@@ -65,8 +68,14 @@ struct LtcStreamState {
     next_frame_time: Instant,
     stop_signal: Arc<AtomicBool>,
     scheduler_thread: Option<JoinHandle<()>>,
-    total_samples: usize,
-    samples_per_bit: f32,
+    /// Exact (fractional) samples per frame: `sample_rate / fps`.
+    exact_samples_per_frame: f64,
+    /// `floor(exact_samples_per_frame)` — the base number of (mono) samples per frame.
+    base_samples: usize,
+    /// Running fractional-sample accumulator.  Added to `exact_samples_per_frame.fract()`
+    /// each frame; when it reaches ≥1.0, one extra sample is added to that frame
+    /// and the accumulator is decremented.
+    samples_accumulator: f64,
 }
 
 struct AudioOutputState {
@@ -199,8 +208,9 @@ impl AudioCore {
             next_frame_time: Instant::now(),
             stop_signal: Arc::new(AtomicBool::new(false)),
             scheduler_thread: None,
-            total_samples: 0,
-            samples_per_bit: 0.0,
+            exact_samples_per_frame: 0.0,
+            base_samples: 0,
+            samples_accumulator: 0.0,
         }));
 
         let streaming = Arc::new(AtomicBool::new(false));
@@ -284,8 +294,8 @@ impl AudioCore {
 
         let frame_duration_ns = (1.0 / fps * 1_000_000_000.0) as u64;
         let frame_duration = Duration::from_nanos(frame_duration_ns);
-        let total_samples = (ltc.sample_rate as f64 / fps).round() as usize;
-        let samples_per_bit = total_samples as f32 / 80.0;
+        let exact_samples_per_frame = ltc.sample_rate as f64 / fps;
+        let base_samples = exact_samples_per_frame.floor() as usize;
         *ltc = LtcStreamState {
             running: true,
             tc,
@@ -299,12 +309,16 @@ impl AudioCore {
             next_frame_time: Instant::now(),
             stop_signal: Arc::new(AtomicBool::new(false)),
             scheduler_thread: None,
-            total_samples,
-            samples_per_bit,
+            exact_samples_per_frame,
+            base_samples,
+            samples_accumulator: 0.0_f64,
         };
 
+        // Prefill with base_samples (accumulator starts at 0, so no extra yet)
         let prefill_count = 5;
-        let mut frame_buf = vec![0.0f32; total_samples * 2];
+        let prefill_total = base_samples;
+        let prefill_spb = prefill_total as f32 / 80.0;
+        let mut frame_buf = vec![0.0f32; prefill_total * 2];
         let mut prefill_tc = tc;
         let mut prefill_level = (1.0f32, 1.0f32);
         {
@@ -317,18 +331,18 @@ impl AudioCore {
                 generate_ltc_frame_stereo(
                     &prefill_tc,
                     drop_frame,
-                    total_samples,
-                    samples_per_bit,
+                    prefill_total,
+                    prefill_spb,
                     ltc_volume,
                     &ltc_channel,
                     &mut prefill_level,
-                    &mut frame_buf[..total_samples * 2],
+                    &mut frame_buf[..prefill_total * 2],
                 );
-                let pushed = producer.push_slice(&frame_buf[..total_samples * 2]);
-                if pushed < total_samples * 2 {
+                let pushed = producer.push_slice(&frame_buf[..prefill_total * 2]);
+                if pushed < prefill_total * 2 {
                     warn!(
                         "LTC start: ring buffer full during prefill, dropped {} samples",
-                        total_samples * 2 - pushed
+                        prefill_total * 2 - pushed
                     );
                 }
                 prefill_tc = increment_timecode(&prefill_tc, fps, drop_frame);
@@ -472,7 +486,7 @@ impl AudioCore {
             .lock()
             .map_err(|e| format!("State lock error: {}", e))?;
         if let Some(ref output) = *audio {
-            let samples = generate_beep_samples(sample_rate, frequency, duration, volume, channel);
+            let samples = ltc_encoder::generate_beep_samples(sample_rate, frequency, duration, volume, channel);
             let mut producer = output
                 .beep_producer
                 .lock()
@@ -1028,185 +1042,6 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     Ok(devices)
 }
 
-// ── Volume mapping ──────────────────────────────────────────────────────────
-
-/// Maps a linear 0–1 UI value to a perceptually logarithmic volume.
-/// Quadratic curve: 0→0, 0.5→0.25, 0.7→0.49, 1.0→1.0.
-/// Gives finer granularity at low perceived volumes.
-fn map_volume(linear: f32) -> f32 {
-    linear * linear
-}
-
-// ── LTC generation (ported from ltcGenerator.ts) ───────────────────────────
-
-fn write_val(bits: &mut [u8; 80], val: u32, start_bit: usize, length: usize) {
-    for i in 0..length {
-        bits[start_bit + i] = ((val >> i) & 1) as u8;
-    }
-}
-
-pub fn get_ltc_bits(tc: &Timecode, drop_frame: bool) -> [u8; 80] {
-    let mut bits = [0u8; 80];
-
-    write_val(&mut bits, tc.frames % 10, 0, 4);
-    write_val(&mut bits, 0, 4, 4);
-    write_val(&mut bits, tc.frames / 10, 8, 2);
-    bits[10] = if drop_frame { 1 } else { 0 };
-    bits[11] = 0;
-    write_val(&mut bits, 0, 12, 4);
-
-    write_val(&mut bits, tc.seconds % 10, 16, 4);
-    write_val(&mut bits, 0, 20, 4);
-    write_val(&mut bits, tc.seconds / 10, 24, 3);
-    write_val(&mut bits, 0, 27, 5);
-
-    write_val(&mut bits, tc.minutes % 10, 32, 4);
-    write_val(&mut bits, 0, 36, 4);
-    write_val(&mut bits, tc.minutes / 10, 40, 3);
-    bits[43] = 0;
-    write_val(&mut bits, 0, 44, 4);
-
-    write_val(&mut bits, tc.hours % 10, 48, 4);
-    write_val(&mut bits, 0, 52, 4);
-    write_val(&mut bits, tc.hours / 10, 56, 2);
-    bits[58] = 0;
-    bits[59] = 0;
-    write_val(&mut bits, 0, 60, 4);
-
-    bits[64] = 0;
-    bits[65] = 0;
-    for bit in bits.iter_mut().take(78).skip(66) {
-        *bit = 1;
-    }
-    bits[78] = 0;
-    bits[79] = 1;
-
-    bits
-}
-
-pub fn increment_timecode(tc: &Timecode, fps: f64, drop_frame: bool) -> Timecode {
-    let max_frames = fps.ceil() as u32;
-    let mut h = tc.hours;
-    let mut m = tc.minutes;
-    let mut s = tc.seconds;
-    let mut f = tc.frames + 1;
-
-    if f >= max_frames {
-        f = 0;
-        s += 1;
-        if s >= 60 {
-            s = 0;
-            m += 1;
-            if m >= 60 {
-                m = 0;
-                h += 1;
-                if h >= 24 {
-                    h = 0;
-                }
-            }
-            if drop_frame && m % 10 != 0 {
-                f = 2;
-            }
-        }
-    }
-
-    Timecode {
-        hours: h,
-        minutes: m,
-        seconds: s,
-        frames: f,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn generate_ltc_frame_stereo(
-    tc: &Timecode,
-    drop_frame: bool,
-    total_samples: usize,
-    samples_per_bit: f32,
-    volume: f32,
-    channel: &str,
-    last_level: &mut (f32, f32),
-    stereo_out: &mut [f32],
-) {
-    let bits = get_ltc_bits(tc, drop_frame);
-    let play_left = channel == "both" || channel == "left";
-    let play_right = channel == "both" || channel == "right";
-    let alpha = 0.35f32;
-    let mut current_level = last_level.0;
-    let mut last_y = last_level.1;
-
-    for b in 0..80u32 {
-        let bf = b as f32;
-        let start_sample = (bf * samples_per_bit).round() as usize;
-        let end_sample = ((bf + 1.0) * samples_per_bit).round() as usize;
-        let mid_sample = ((bf + 0.5) * samples_per_bit).round() as usize;
-        let bit_val = bits[b as usize];
-
-        current_level = -current_level;
-
-        let mid = mid_sample.min(total_samples);
-        let end = end_sample.min(total_samples);
-
-        for s in start_sample..mid {
-            last_y += alpha * (current_level - last_y);
-            let val = last_y * map_volume(volume);
-            stereo_out[s * 2] = if play_left { val } else { 0.0 };
-            stereo_out[s * 2 + 1] = if play_right { val } else { 0.0 };
-        }
-
-        if bit_val == 1 {
-            current_level = -current_level;
-        }
-
-        for s in mid..end {
-            last_y += alpha * (current_level - last_y);
-            let val = last_y * map_volume(volume);
-            stereo_out[s * 2] = if play_left { val } else { 0.0 };
-            stereo_out[s * 2 + 1] = if play_right { val } else { 0.0 };
-        }
-    }
-
-    last_level.0 = current_level;
-    last_level.1 = last_y;
-}
-
-fn generate_beep_samples(
-    sample_rate: u32,
-    frequency: f32,
-    duration: f32,
-    volume: f32,
-    channel: &str,
-) -> Vec<f32> {
-    let num_samples = (sample_rate as f32 * duration) as usize;
-    let attack = (sample_rate as f32 * 0.005) as usize;
-    let release = (sample_rate as f32 * 0.02) as usize;
-    let mut samples = Vec::with_capacity(num_samples * 2);
-
-    let play_left = channel == "both" || channel == "left";
-    let play_right = channel == "both" || channel == "right";
-
-    for i in 0..num_samples {
-        let t = i as f32 / sample_rate as f32;
-        let val = (t * frequency * 2.0 * std::f32::consts::PI).sin() * map_volume(volume);
-
-        let envelope = if i < attack {
-            i as f32 / attack.max(1) as f32
-        } else if i > num_samples.saturating_sub(release) {
-            (num_samples - i) as f32 / release.max(1) as f32
-        } else {
-            1.0
-        };
-
-        let sample = val * envelope;
-
-        samples.push(if play_left { sample } else { 0.0 });
-        samples.push(if play_right { sample } else { 0.0 });
-    }
-
-    samples
-}
-
 // ── LTC scheduler thread ───────────────────────────────────────────────────
 
 fn ltc_scheduler_thread(
@@ -1246,7 +1081,7 @@ fn ltc_scheduler_thread(
             return;
         }
 
-        let (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, mut last_level) = {
+        let (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, mut last_level, new_accumulator) = {
             let state = match ltc.lock() {
                 Ok(s) => s,
                 Err(e) => {
@@ -1282,11 +1117,16 @@ fn ltc_scheduler_thread(
             let ltc_channel = state.ltc_channel.clone();
             let ltc_volume = state.ltc_volume;
             let frame_dur = state.frame_duration;
-            let total_samples = state.total_samples;
-            let samples_per_bit = state.samples_per_bit;
             let last_level = state.last_level;
 
-            (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, last_level)
+            // Sample accumulator: track fractional-sample remainder across frames
+            let (frame_samples, spb, acc) = ltc_encoder::compute_frame_sample_count(
+                state.exact_samples_per_frame,
+                state.base_samples,
+                state.samples_accumulator,
+            );
+
+            (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, frame_samples, spb, last_level, acc)
         };
 
         // ── Watchdog: check if audio callback is still alive ──
@@ -1406,6 +1246,7 @@ fn ltc_scheduler_thread(
             state.last_level = last_level;
             state.tc = increment_timecode(&state.tc, fps, drop_frame);
             state.next_frame_time += frame_dur;
+            state.samples_accumulator = new_accumulator;
         }
     }
 }
