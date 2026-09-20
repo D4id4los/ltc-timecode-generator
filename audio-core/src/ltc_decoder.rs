@@ -1750,13 +1750,13 @@ mod tests {
     }
 
     #[test]
-    fn test_wav_roundtrip_16khz() {
+    fn test_wav_roundtrip_44khz() {
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "both", 0.5, 16000, 2.0,
+            25.0, false, "both", 0.5, 44100, 2.0,
         );
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
-            "expected no Error at 16kHz, got {:?}", result.status);
+            "expected no Error at 44kHz, got {:?}", result.status);
     }
 
     #[test]

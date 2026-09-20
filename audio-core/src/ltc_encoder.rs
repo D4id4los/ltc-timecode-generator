@@ -927,12 +927,12 @@ mod tests {
         assert!(mean.abs() < 0.02, "DC offset should be near zero, got {}", mean);
     }
 
-    // ── generate_ltc_frame_stereo: 16kHz and 48kHz ────────────────────────
+    // ── generate_ltc_frame_stereo: 44kHz and 48kHz ────────────────────────
 
     #[test]
-    fn test_frame_16khz() {
+    fn test_frame_44khz() {
         let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        let total_samples = 640; // 16000/25
+        let total_samples = 1764; // 44100/25
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
@@ -941,7 +941,7 @@ mod tests {
 
         assert_eq!(buf.len(), total_samples * 2);
         let has_energy = buf.iter().any(|&s| s.abs() > 0.1);
-        assert!(has_energy, "16kHz frame should have signal");
+        assert!(has_energy, "44kHz frame should have signal");
     }
 
     #[test]
@@ -1055,8 +1055,8 @@ mod tests {
     }
 
     #[test]
-    fn test_long_running_2h_sample_count_zero_drift_16khz() {
-        let sample_rate = 16000u32;
+    fn test_long_running_2h_sample_count_zero_drift_44khz() {
+        let sample_rate = 44100u32;
         let fps = 29.97;
         let exact_spf = sample_rate as f64 / fps;
         let base = exact_spf.floor() as usize;

@@ -43,12 +43,10 @@ export function getAudioBackendType(): AudioBackendType {
   return isTauri() ? 'tauri' : 'web';
 }
 
-export const SAMPLE_RATE_OPTIONS: number[] = [16000, 48000];
+export const SAMPLE_RATE_OPTIONS: number[] = [44100, 48000];
 
 export function suggestSampleRate(): number {
-  const cores = navigator.hardwareConcurrency || 2;
-  const isWeak = cores < 4;
-  return isWeak ? 16000 : 48000;
+  return 48000;
 }
 
 // ── Device enumeration ────────────────────────────────────────────────────

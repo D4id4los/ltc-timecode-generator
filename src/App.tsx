@@ -768,7 +768,7 @@ export default function App() {
 
     if (isTauriMode) {
       tauriPlayBeep(
-        16000,
+        48000,
         audioSettings.beepFrequency,
         audioSettings.beepDuration,
         audioSettings.beepVolume * 0.5,

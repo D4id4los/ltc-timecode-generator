@@ -171,7 +171,7 @@ The `audio-core` crate provides the raw audio engine:
 - **`AudioEvent`**: `StreamError`, `StreamDied`, `StreamRecovering`, `StreamDead`, `RecoveryNeeded`, `Underrun`, `FramesDropped`.
 - **`AudioDeviceInfo`**: `{id, name, is_default, formats, channels_min/max, sample_rate_min/max, buffer_min/max}` with Clone, Debug, Serialize.
 - **Free functions**: `list_audio_devices()`, `get_ltc_bits()`, `increment_timecode()`, `generate_ltc_frame_stereo()`, `suggest_sample_rate()`, `is_transient_audio_error()`, `is_permanent_device_error()`.
-- **Constants**: `SAMPLE_RATE_OPTIONS = &[16000, 48000]`.
+- **Constants**: `SAMPLE_RATE_OPTIONS = &[44100, 48000]`.
 
 ## Key Architecture — Dual Audio Backend
 
@@ -182,13 +182,13 @@ The app runs in **two modes**, detected at runtime via `window.__TAURI_INTERNALS
 - **Audio output**: JS sends high-level commands to Rust (`start_ltc_stream`, `play_beep`). Rust's `audio-core` handles ALL sample generation internally. No audio data over IPC.
 - **Rust playback**: cpal output stream with 2-channel config, reads from ringbufs, sums LTC + beep, writes silence on underrun
 - **Timing**: `performance.now()` relative to `tauriStartTimeRef`; Rust maintains own timing via scheduler thread
-- **Sample rate**: 16000 or 48000 Hz (auto-suggested based on CPU cores)
+- **Sample rate**: 44100 or 48000 Hz
 
 ### Web Mode (Browser)
 - **Device detection**: `navigator.mediaDevices.enumerateDevices()` + `getUserMedia()`
 - **Audio output**: Web Audio API (AudioContext, AudioBufferSourceNode, OscillatorNode, ChannelMergerNode)
 - **Timing**: `audioCtx.currentTime`
-- **Sample rate**: 16000 or 48000 Hz (auto-suggested, falls back to default)
+- **Sample rate**: 44100 or 48000 Hz (auto-suggested, falls back to default)
 
 ## Version Management
 

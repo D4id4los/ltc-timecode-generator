@@ -783,19 +783,13 @@ pub fn is_permanent_device_error(err: &str) -> bool {
     keywords.iter().any(|kw| err.contains(kw))
 }
 
-/// Detects CPU capability and returns a sensible default sample rate.
-/// Returns 16000 Hz for weak/low-core-count CPUs, 48000 Hz for modern hardware.
+/// Returns the default sample rate for audio processing.
 pub fn suggest_sample_rate() -> u32 {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    let cpu_info = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let is_weak = cpu_info.contains("Atom") || cpu_info.contains("N270") || cores < 4;
-    if is_weak { 16000 } else { 48000 }
+    48000
 }
 
 /// Available sample rate options for UI display.
-pub const SAMPLE_RATE_OPTIONS: &[u32] = &[16000, 48000];
+pub const SAMPLE_RATE_OPTIONS: &[u32] = &[44100, 48000];
 
 #[cfg(test)]
 mod tests {
@@ -1009,7 +1003,7 @@ mod tests {
     #[test]
     fn test_sample_rate_options_valid() {
         assert_eq!(SAMPLE_RATE_OPTIONS.len(), 2);
-        assert!(SAMPLE_RATE_OPTIONS.contains(&16000));
+        assert!(SAMPLE_RATE_OPTIONS.contains(&44100));
         assert!(SAMPLE_RATE_OPTIONS.contains(&48000));
     }
 

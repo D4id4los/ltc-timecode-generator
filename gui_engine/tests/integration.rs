@@ -137,13 +137,13 @@ fn test_wav_roundtrip_2997_df() {
 }
 
 #[test]
-fn test_wav_roundtrip_16khz() {
+fn test_wav_roundtrip_44khz() {
     let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("test_16khz.wav");
-    generate_wav(&path, 25.0, false, 2.0, 16000);
+    let path = dir.path().join("test_44khz.wav");
+    generate_wav(&path, 25.0, false, 2.0, 44100);
     let result = decode_ltc_from_wav(&path, 25.0, false).expect("LTC decode failed");
     assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
-        "expected no Error at 16kHz, got {:?}", result.status);
+        "expected no Error at 44kHz, got {:?}", result.status);
 }
 
 // ── Engine MPSC: ParseLtcFile ───────────────────────────────────────────

@@ -66,7 +66,7 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.25)]
     pub volume: f32,
 
-    /// Sample rate: 16000 or 48000 (default: auto-detect)
+    /// Sample rate: 44100 or 48000 (default: auto-detect)
     #[arg(long)]
     pub sample_rate: Option<u32>,
 
