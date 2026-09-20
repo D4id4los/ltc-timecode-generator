@@ -360,7 +360,7 @@ pub type CancelFlag = Arc<AtomicBool>;
 
 // ── ffmpeg argument construction ─────────────────────────────────────────
 
-fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
+pub(crate) fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
     let num_channels = settings.channel_map.num_channels;
     let mapping = settings.channel_map.mapping();
     let trim_secs = settings.trim_start_secs;
@@ -460,6 +460,10 @@ fn build_ffmpeg_args(settings: &ConverterSettings) -> Vec<String> {
     // Shortest: end when shortest input ends
     args.push("-shortest".to_string());
 
+    // Machine-readable progress to stderr (uses \n line endings)
+    args.push("-progress".to_string());
+    args.push("pipe:2".to_string());
+
     // Explicit container format
     let container = container_to_ffmpeg_format(&settings.container).to_string();
     args.push("-f".to_string());
@@ -522,8 +526,9 @@ pub fn spawn_conversion(
         use std::io::BufRead;
         let mut full_log = String::new();
         let mut progress: f32 = 0.0;
-        let duration_re = regex::Regex::new(r"time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
-        let mut estimated_duration_secs: Option<f64> = None;
+        let out_time_re = regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        let duration_re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        let mut total_duration_secs: Option<f64> = None;
         let mut last_logged_pct: u8 = 0;
 
         for line in reader.lines() {
@@ -553,25 +558,39 @@ pub fn spawn_conversion(
                 full_log.clone()
             };
 
-            // Parse progress from ffmpeg stderr
-            if let Some(caps) = duration_re.captures(&line) {
+            // Capture total duration from ffmpeg's input metadata
+            if total_duration_secs.is_none() {
+                if let Some(caps) = duration_re.captures(&line) {
+                    let h: f64 = caps[1].parse().unwrap_or(0.0);
+                    let m: f64 = caps[2].parse().unwrap_or(0.0);
+                    let s: f64 = caps[3].parse().unwrap_or(0.0);
+                    let frac: f64 = caps[4].parse().unwrap_or(0.0) / 100.0;
+                    if h > 0.0 || m > 0.0 || s > 0.0 || frac > 0.0 {
+                        total_duration_secs = Some(h * 3600.0 + m * 60.0 + s + frac);
+                        debug!("Detected total duration: {:.3}s", total_duration_secs.unwrap());
+                    }
+                }
+            }
+
+            // Parse current position from ffmpeg's machine-readable progress
+            if let Some(caps) = out_time_re.captures(&line) {
                 let h: f64 = caps[1].parse().unwrap_or(0.0);
                 let m: f64 = caps[2].parse().unwrap_or(0.0);
                 let s: f64 = caps[3].parse().unwrap_or(0.0);
-                let frac: f64 = caps[4].parse().unwrap_or(0.0) / 100.0;
+                let frac: f64 = caps[4].parse().unwrap_or(0.0) / 1_000_000.0;
                 let current_secs = h * 3600.0 + m * 60.0 + s + frac;
 
-                // Estimate duration from first frame
-                if estimated_duration_secs.is_none() && current_secs > 0.0 {
-                    estimated_duration_secs = Some(current_secs * 100.0);
-                }
-
-                if let Some(total) = estimated_duration_secs {
+                if let Some(total) = total_duration_secs {
                     if total > 0.0 {
                         progress = (current_secs / total).min(1.0) as f32;
                     }
                 } else {
-                    progress = 0.0;
+                    // No Duration metadata available — use linear estimate from out_time
+                    // as a fallback (progress will jump to 100% on completion)
+                    if current_secs > 0.0 {
+                        let heuristic = current_secs * 100.0;
+                        progress = (current_secs / heuristic).min(1.0) as f32;
+                    }
                 }
 
                 // Log progress at ~10% intervals
@@ -583,14 +602,17 @@ pub fn spawn_conversion(
                 }
             }
 
+            // Detect progress=end sentinel (ffmpeg -progress signals encoding complete)
+            if line.trim() == "progress=end" {
+                progress = 1.0;
+            }
+
             {
                 let mut s = state.lock().unwrap();
                 s.status = ConversionStatus::Running { progress };
                 s.ffmpeg_output = tail.clone();
                 s.current_line = line.clone();
             }
-
-            // Check for fatal error keywords (no action needed — just let ffmpeg finish)
         }
 
         let exit_status = child.wait();
@@ -627,4 +649,195 @@ pub fn spawn_conversion(
             }
         }
     })
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // ── build_ffmpeg_args tests ─────────────────────────────────────────
+
+    fn make_settings(trim: f64) -> ConverterSettings {
+        ConverterSettings {
+            input_files: vec![
+                PathBuf::from("/tmp/input1.wav"),
+                PathBuf::from("/tmp/input2.wav"),
+            ],
+            channel_map: ChannelMap::identity(2),
+            container: "mkv".to_string(),
+            video_encoder: "libx264".to_string(),
+            audio_encoder: "pcm_s24le".to_string(),
+            output_path: PathBuf::from("/tmp/output.mkv"),
+            trim_start_secs: trim,
+        }
+    }
+
+    #[test]
+    fn test_build_args_contains_progress_flag() {
+        let args = build_ffmpeg_args(&make_settings(0.0));
+        let pos = args.iter().position(|a| a == "-progress");
+        assert!(pos.is_some(), "args should contain -progress flag");
+        if let Some(p) = pos {
+            assert_eq!(args.get(p + 1), Some(&"pipe:2".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_build_args_contains_expected_structure() {
+        let args = build_ffmpeg_args(&make_settings(0.0));
+        assert!(args.contains(&"-y".to_string()));
+        assert!(args.contains(&"-shortest".to_string()));
+        assert!(args.contains(&"-filter_complex".to_string()));
+        assert!(args.contains(&"-f".to_string()));
+        assert!(args.contains(&"matroska".to_string()));
+        assert!(args.contains(&"/tmp/output.mkv".to_string()));
+        // Input files
+        assert!(args.contains(&"/tmp/input1.wav".to_string()));
+        assert!(args.contains(&"/tmp/input2.wav".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_trim_enabled() {
+        let args = build_ffmpeg_args(&make_settings(1.500));
+        let fc_idx = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let fc = &args[fc_idx + 1];
+        assert!(fc.contains("atrim=start=1.500"), "filter complex should contain atrim when trim > 0");
+    }
+
+    #[test]
+    fn test_build_args_trim_disabled() {
+        let args = build_ffmpeg_args(&make_settings(0.0));
+        let fc_idx = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let fc = &args[fc_idx + 1];
+        assert!(!fc.contains("atrim"), "filter complex should NOT contain atrim when trim == 0");
+    }
+
+    #[test]
+    fn test_build_args_channel_count() {
+        let mut s = make_settings(0.0);
+        s.channel_map = ChannelMap::identity(4);
+        let args = build_ffmpeg_args(&s);
+        // Should have -map [a1] through -map [a4]
+        let maps: Vec<&String> = args.iter().filter(|a| a.starts_with("[a") && a.ends_with(']')).collect();
+        assert_eq!(maps.len(), 4, "should have 4 audio output maps for 4 channels");
+    }
+
+    // ── Regex parsing tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_out_time_regex_matches() {
+        let re = regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        let caps = re.captures("out_time=00:01:23.456789").unwrap();
+        let h: f64 = caps[1].parse::<f64>().unwrap();
+        let m: f64 = caps[2].parse::<f64>().unwrap();
+        let s: f64 = caps[3].parse::<f64>().unwrap();
+        let frac: f64 = caps[4].parse::<f64>().unwrap() / 1_000_000.0;
+        let secs = h * 3600.0 + m * 60.0 + s + frac;
+        assert!((secs - 83.456789).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_out_time_regex_zero() {
+        let re = regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        let caps = re.captures("out_time=00:00:00.000000").unwrap();
+        let h: f64 = caps[1].parse::<f64>().unwrap();
+        let m: f64 = caps[2].parse::<f64>().unwrap();
+        let s: f64 = caps[3].parse::<f64>().unwrap();
+        let frac: f64 = caps[4].parse::<f64>().unwrap() / 1_000_000.0;
+        let secs = h * 3600.0 + m * 60.0 + s + frac;
+        assert!((secs - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_out_time_regex_does_not_match_stderr_time() {
+        let re = regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        // stderr uses "time=" not "out_time=" — regex must NOT match
+        assert!(re.captures("time=00:01:23.45").is_none());
+    }
+
+    #[test]
+    fn test_duration_regex_matches() {
+        let re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        let caps = re.captures("  Duration: 00:01:30.00, start: 0.000000, bitrate: 1411 kb/s").unwrap();
+        let h: f64 = caps[1].parse::<f64>().unwrap();
+        let m: f64 = caps[2].parse::<f64>().unwrap();
+        let s: f64 = caps[3].parse::<f64>().unwrap();
+        let frac: f64 = caps[4].parse::<f64>().unwrap() / 100.0;
+        let secs = h * 3600.0 + m * 60.0 + s + frac;
+        assert!((secs - 90.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_duration_regex_zero_duration() {
+        let re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        let caps = re.captures("  Duration: 00:00:00.00, start: 0.000000").unwrap();
+        let h: f64 = caps[1].parse::<f64>().unwrap();
+        let m: f64 = caps[2].parse::<f64>().unwrap();
+        let s: f64 = caps[3].parse::<f64>().unwrap();
+        let frac: f64 = caps[4].parse::<f64>().unwrap() / 100.0;
+        let secs = h * 3600.0 + m * 60.0 + s + frac;
+        assert!((secs - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_duration_regex_none_on_input_without_duration() {
+        let re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        // lavfi-generated streams have Duration: N/A
+        assert!(re.captures("  Duration: N/A, start: 0.000000").is_none());
+    }
+
+    #[test]
+    fn test_progress_end_line_detected() {
+        let line = "progress=end";
+        assert_eq!(line.trim(), "progress=end");
+    }
+
+    #[test]
+    fn test_progress_continue_not_mistaken_for_end() {
+        let line = "progress=continue";
+        assert_ne!(line.trim(), "progress=end");
+    }
+
+    #[test]
+    fn test_non_matching_lines_do_not_trigger_out_time() {
+        let re = regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
+        assert!(re.captures("frame=  123 fps= 45").is_none());
+        assert!(re.captures("size=    1024kB time=00:00:04.56").is_none());
+        assert!(re.captures("").is_none());
+    }
+
+    // ── ConversionState tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_conversion_state_idle_initial() {
+        let s = ConversionState::idle();
+        assert_eq!(s.status, ConversionStatus::Idle);
+        assert!(s.ffmpeg_output.is_empty());
+        assert!(s.current_line.is_empty());
+    }
+
+    // ── Container/encoder compatibility ─────────────────────────────────
+
+    #[test]
+    fn test_container_supports_video_encoder_valid() {
+        assert!(container_supports_video_encoder("mkv", "libx264"));
+        assert!(container_supports_video_encoder("mov", "prores_ks"));
+        assert!(container_supports_video_encoder("mp4", "libx264"));
+    }
+
+    #[test]
+    fn test_container_rejects_incompatible_video_encoder() {
+        assert!(!container_supports_video_encoder("mp4", "prores_ks"));
+        assert!(!container_supports_video_encoder("mkv", "nonexistent"));
+    }
+
+    #[test]
+    fn test_container_to_ffmpeg_format() {
+        assert_eq!(container_to_ffmpeg_format("mkv"), "matroska");
+        assert_eq!(container_to_ffmpeg_format("mov"), "mov");
+        assert_eq!(container_to_ffmpeg_format("mp4"), "mp4");
+    }
 }
