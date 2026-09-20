@@ -113,6 +113,12 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
         if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
     });
 
+    match zc_result.as_ref() {
+        Some(r) => info!("LTC decode: ZC-interval result -- {} valid / {} possible ({:.1}%)",
+            r.valid_frames, r.total_possible, zc_conf * 100.0),
+        None => debug!("LTC decode: ZC-interval returned no frames"),
+    }
+
     if zc_conf >= 0.70 {
         info!("LTC decode: ZC-interval confidence {:.1}% >= 70% -- using directly", zc_conf * 100.0);
         return build_result(zc_result, &zc, sample_rate, threshold, channels, total_duration, start);
@@ -131,16 +137,18 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
 
     let mut best_window_result: Option<ScoredResult> = None;
     let mut best_window_valid = 0u32;
+    let mut best_window_start = 0usize;
 
     for window_idx in 0..max_windows {
         let window_start = window_idx * stride;
         let window_end = (window_start + window_len).min(samples.len());
 
-        let window_zc = zc_in_range(&zc, window_start, window_end);
-        if window_zc.len() < 8 {
+        let window_zc_abs = zc_in_range(&zc, window_start, window_end);
+        if window_zc_abs.len() < 8 {
             if window_end >= samples.len() { break; }
             continue;
         }
+        let window_zc: Vec<usize> = window_zc_abs.iter().map(|p| p - window_start).collect();
 
         debug!("LTC eval: window {}/{} [+{:.0}s..{:.0}s] -- {} ZCs, best={} valid",
             window_idx + 1, max_windows,
@@ -156,6 +164,7 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
         if valid > best_window_valid {
             best_window_valid = valid;
             best_window_result = result;
+            best_window_start = window_start;
 
             let conf = best_window_result.as_ref().map_or(0.0, |r| {
                 if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
@@ -165,7 +174,17 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
                 let r = best_window_result.as_ref().unwrap();
                 info!("LTC decode: window eval {:.1}% >= 70% -- single-pass on full file (spb={:.2}, phase={})",
                     conf * 100.0, r.spb, r.phase);
-                return build_result(Some(decode_full_file(&samples, r, threshold, sample_rate)), &zc,
+                let decoded = decode_full_file(&samples, r, threshold, sample_rate, best_window_start);
+                let zc_better = zc_result.as_ref().is_some_and(|zcr| {
+                    zcr.valid_frames > decoded.valid_frames
+                });
+                if zc_better {
+                    let zcr = zc_result.as_ref().unwrap();
+                    info!("LTC decode: ZC-interval ({}/{}) beats detailed scan ({}/{}) -- using ZC-interval",
+                        zcr.valid_frames, zcr.total_possible, decoded.valid_frames, decoded.total_possible);
+                }
+                let final_r = if zc_better { zc_result } else { Some(decoded) };
+                return build_result(final_r, &zc,
                     sample_rate, threshold, channels, total_duration, start);
             }
         }
@@ -178,14 +197,35 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
         let conf = r.valid_frames as f32 / r.total_possible.max(1) as f32;
         info!("LTC decode: best window eval {:.1}% ({} valid) -- single-pass on full file (spb={:.2}, phase={})",
             conf * 100.0, r.valid_frames, r.spb, r.phase);
-        return build_result(Some(decode_full_file(&samples, r, threshold, sample_rate)), &zc,
+        let decoded = decode_full_file(&samples, r, threshold, sample_rate, best_window_start);
+        let zc_better = zc_result.as_ref().is_some_and(|zcr| {
+            zcr.valid_frames > decoded.valid_frames
+        });
+        if zc_better {
+            let zcr = zc_result.as_ref().unwrap();
+            info!("LTC decode: ZC-interval ({}/{}) beats detailed scan ({}/{}) -- using ZC-interval",
+                zcr.valid_frames, zcr.total_possible, decoded.valid_frames, decoded.total_possible);
+        }
+        let final_r = if zc_better { zc_result } else { Some(decoded) };
+        return build_result(final_r, &zc,
             sample_rate, threshold, channels, total_duration, start);
     }
 
     // ── Fallback: full-file evaluate_on_slice (rare) ────────────────────────
     warn!("LTC decode: sliding window found no valid LTC -- full-file eval fallback");
     let (fallback_result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold, fps, drop_frame);
-    build_result(fallback_result, &zc, sample_rate, threshold, channels, total_duration, start)
+    let zc_better = zc_result.as_ref().is_some_and(|zcr| {
+        fallback_result.as_ref().map_or(true, |fr| zcr.valid_frames > fr.valid_frames)
+    });
+    if zc_better {
+        let zcr = zc_result.as_ref().unwrap();
+        info!("LTC decode: ZC-interval ({}/{}) beats fallback scan ({}/{}) -- using ZC-interval",
+            zcr.valid_frames, zcr.total_possible,
+            fallback_result.as_ref().map_or(0, |fr| fr.valid_frames),
+            fallback_result.as_ref().map_or(0, |fr| fr.total_possible));
+    }
+    let final_r = if zc_better { zc_result } else { fallback_result };
+    build_result(final_r, &zc, sample_rate, threshold, channels, total_duration, start)
 }
 
 /// Evaluate LTC on a slice using the given FPS.
@@ -226,10 +266,11 @@ fn evaluate_on_slice(
 
         let half_spb = (spb * 0.5) as usize;
         let mut attempts_this_spb = 0u32;
+        debug!("LTC evaluate: SPB variant {}/{} -- spb={:.2} ({} phases)",
+            spb_idx + 1, spb_variants.len(), spb, max_phases.clamp(5, 12) * 2);
+
         for phase in phases_to_try {
             for &candidate_phase in &[phase, phase.saturating_sub(half_spb)] {
-                debug!("LTC extract-bits: {} spb={:.2} phase={} -- scanning...",
-                    fps_name, spb, candidate_phase);
                 let bits = extract_bits(samples, spb, candidate_phase, threshold);
                 if bits.len() < 80 { continue; }
                 attempts_this_spb += 1;
@@ -685,7 +726,7 @@ fn try_decode_via_zc_intervals(
 }
 
 /// Return the subslice of ZC positions falling within [range_start, range_end).
-fn zc_in_range<'a>(zc: &'a [usize], range_start: usize, range_end: usize) -> &'a [usize] {
+fn zc_in_range(zc: &[usize], range_start: usize, range_end: usize) -> &[usize] {
     let lo = zc.partition_point(|&p| p < range_start);
     let hi = zc.partition_point(|&p| p < range_end);
     &zc[lo..hi]
@@ -928,8 +969,10 @@ fn decode_full_file(
     params: &ScoredResult,
     threshold: f32,
     sample_rate: u32,
+    phase_offset: usize,
 ) -> ScoredResult {
-    let bits = extract_bits(samples, params.spb, params.phase, threshold);
+    let absolute_phase = params.phase + phase_offset;
+    let bits = extract_bits(samples, params.spb, absolute_phase, threshold);
     let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
     let timecodes: Vec<FrameTimecode> = frame_starts
         .iter()
@@ -937,7 +980,7 @@ fn decode_full_file(
         .map(|(idx, &start)| FrameTimecode {
             frame_index: idx as u32,
             timecode: decode_timecode_from_bits(&bits, start),
-            timecode_secs: (params.phase as f64 + start as f64 * params.spb) / sample_rate as f64,
+            timecode_secs: (absolute_phase as f64 + start as f64 * params.spb) / sample_rate as f64,
         })
         .collect();
     ScoredResult {
@@ -948,10 +991,10 @@ fn decode_full_file(
         timecodes,
         details_entry: format!(
             "{:.2} fps: {} valid / {} possible frames (single-pass, spb={:.2}, phase={})",
-            params.fps, valid_frames, total_possible, params.spb, params.phase
+            params.fps, valid_frames, total_possible, params.spb, absolute_phase
         ),
         spb: params.spb,
-        phase: params.phase,
+        phase: absolute_phase,
         frame_starts,
     }
 }
