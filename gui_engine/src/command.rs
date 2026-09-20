@@ -43,6 +43,7 @@ pub enum GuiCommand {
 
     // ── Parsing / shutdown ──────────────────────────────────────────────
     ParseLtcFile(String),
+    CancelDecode,
     Shutdown,
 
     // ── Steppers ─────────────────────────────────────────────────────────

@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use audio_core::{AudioCore, AudioEvent, LtcDetectionResult};
+use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetectionResult, WavChunkReader};
 use log::{debug, error, info, warn};
 
 use crate::command::GuiCommand;
@@ -32,6 +33,10 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
     let (decode_result_tx, decode_result_rx) =
         std::sync::mpsc::channel::<LtcDecodeResult>();
 
+    // Chunked decode progress / cancel tracking
+    let mut decode_cancel: Option<Arc<AtomicBool>> = None;
+    let mut decode_progress: Option<(usize, Arc<AtomicUsize>)> = None;
+
     loop {
         let now = Instant::now();
         let dt = (now - last_tick).as_secs_f32();
@@ -56,6 +61,8 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
                         &mut last_device_id,
                         &mut previous_device,
                         &decode_result_tx,
+                        &mut decode_cancel,
+                        &mut decode_progress,
                     );
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -76,6 +83,10 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
                     // from rapid re-clicks)
                     if generation == current.ltc_decode_generation {
                         current.ltc_is_detecting = false;
+                        decode_cancel = None;
+                        decode_progress = None;
+                        current.ltc_decode_progress_pct = 1.0;
+                        current.ltc_decode_progress_str = String::new();
                         match result {
                             Ok(r) => {
                                 let first_offset = r.first_ltc_timecode_secs;
@@ -102,10 +113,19 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
                                 info!("LTC decode completed: {}", path);
                             }
                             Err(e) => {
+                                let is_cancel = e == "Decode canceled by user";
                                 current.ltc_decode_result = None;
-                                current.ltc_decode_error = Some(e.clone());
-                                current.status_message = format!("Parse failed: {}", e);
-                                error!("LTC decode failed: {} — {}", path, e);
+                                current.ltc_decode_error = if is_cancel { None } else { Some(e.clone()) };
+                                current.status_message = if is_cancel {
+                                    "Decode canceled".to_string()
+                                } else {
+                                    format!("Parse failed: {}", e)
+                                };
+                                if !is_cancel {
+                                    error!("LTC decode failed: {} — {}", path, e);
+                                } else {
+                                    info!("LTC decode canceled: {}", path);
+                                }
                             }
                         }
                     }
@@ -116,6 +136,20 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
             }
+        }
+
+        // 1.6 Poll chunked decode progress
+        if current.ltc_is_detecting {
+            if let Some((total, ref completed)) = decode_progress {
+                let done = completed.load(Ordering::Relaxed);
+                let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                current.ltc_decode_progress_pct = pct;
+                current.ltc_decode_progress_str = format!("Chunk {}/{}", done.min(total), total);
+            }
+        } else {
+            decode_progress = None;
+            current.ltc_decode_progress_pct = 0.0;
+            current.ltc_decode_progress_str = String::new();
         }
 
         // 2. Poll current timecode if playing
@@ -169,6 +203,8 @@ fn process_command(
     last_device_id: &mut Option<String>,
     previous_device: &mut Option<usize>,
     decode_result_tx: &Sender<LtcDecodeResult>,
+    decode_cancel: &mut Option<Arc<AtomicBool>>,
+    decode_progress: &mut Option<(usize, Arc<AtomicUsize>)>,
 ) {
     match cmd {
         GuiCommand::StartLtc => {
@@ -358,33 +394,104 @@ fn process_command(
             }
         }
 
+        GuiCommand::CancelDecode => {
+            if let Some(ref cancel) = decode_cancel {
+                info!("CancelDecode: signaling cancel flag");
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+
         GuiCommand::ParseLtcFile(path) => {
             let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
             info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps);
+
+            // Quick open to calculate chunk count
+            let (chunk_count, _sr, _ch, _spec) = match WavChunkReader::open(Path::new(&path)) {
+                Ok((reader, _start)) => {
+                    let total_mono = reader.total_mono_samples();
+                    let sr = reader.sample_rate();
+                    let ch = reader.channels();
+                    let spec = reader.spec().clone();
+                    let bytes_per_mono = (ch as u64) * (spec.bits_per_sample as u64 / 8);
+                    let config = DecodeConfig::default();
+                    let chunk_mono = (config.chunk_size_bytes / bytes_per_mono.max(1)) as usize;
+                    let overlap_samples = (config.overlap_seconds * sr as f64) as usize;
+                    let chunk_mono = chunk_mono.max(overlap_samples * 2);
+
+                    if total_mono <= chunk_mono + overlap_samples {
+                        (1usize, sr, ch, spec)
+                    } else {
+                        let mut count = 0usize;
+                        let mut pos = 0usize;
+                        while pos < total_mono {
+                            count += 1;
+                            let end = (pos + chunk_mono).min(total_mono);
+                            if end >= total_mono { break; }
+                            let next = end.saturating_sub(overlap_samples);
+                            if next <= pos || next >= total_mono { break; }
+                            pos = next;
+                        }
+                        (count, sr, ch, spec)
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to open WAV for chunked decode: {}", e);
+                    state.ltc_is_detecting = false;
+                    state.ltc_decode_error = Some(e.clone());
+                    state.status_message = format!("Parse failed: {}", e);
+                    return;
+                }
+            };
+
             state.ltc_is_detecting = true;
             state.ltc_decode_result = None;
             state.ltc_decode_error = None;
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
             state.status_message = format!(
-                "Decoding LTC from: {} [{}] at {:.2} fps",
-                path, decoder_name, state.decode_fps
+                "Decoding LTC from: {} [{}] at {:.2} fps ({} chunks)",
+                path, decoder_name, state.decode_fps, chunk_count
             );
+
+            let progress = DecodeProgress::new(chunk_count);
+            *decode_cancel = Some(progress.cancel_flag.clone());
+            *decode_progress = Some((chunk_count, progress.chunks_completed.clone()));
+
             let capture_gen = state.ltc_decode_generation;
             let tx = decode_result_tx.clone();
             let use_libltc = state.use_libltc;
             let decode_fps = state.decode_fps;
             let decode_drop_frame = state.decode_drop_frame;
+
+            info!("Spawning chunked decode ({} chunks, decoder={}, fps={})",
+                chunk_count, decoder_name, decode_fps);
+
             std::thread::spawn(move || {
-                debug!("LTC decode thread spawned for gen={}: {} (decoder: {}, fps: {})",
-                    capture_gen, path, if use_libltc { "libltc" } else { "builtin" }, decode_fps);
-                let result = audio_core::decode_ltc_with_decoder(
-                    Path::new(&path), use_libltc, decode_fps, decode_drop_frame,
-                );
-                let _ = tx.send(LtcDecodeResult {
-                    path,
-                    generation: capture_gen,
-                    result,
-                });
+                debug!("LTC chunked decode thread spawned for gen={}: {}",
+                    capture_gen, path);
+
+                if chunk_count <= 1 {
+                    // Small file: use single-threaded decode
+                    let result = audio_core::decode_ltc_with_decoder(
+                        Path::new(&path), use_libltc, decode_fps, decode_drop_frame,
+                    );
+                    progress.chunks_completed.store(1, Ordering::Relaxed);
+                    let _ = tx.send(LtcDecodeResult {
+                        path,
+                        generation: capture_gen,
+                        result,
+                    });
+                } else {
+                    let config = DecodeConfig::default();
+                    let result = audio_core::decode_ltc_chunked(
+                        Path::new(&path), use_libltc, decode_fps, decode_drop_frame,
+                        config, &progress,
+                    );
+                    let _ = tx.send(LtcDecodeResult {
+                        path,
+                        generation: capture_gen,
+                        result,
+                    });
+                }
             });
         }
 
@@ -860,6 +967,7 @@ mod tests {
         process_command(
             GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
             &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None,
         );
         assert!(state.is_locked);
     }
@@ -875,9 +983,11 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
-            &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         process_command(GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
-            &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!(!state.is_locked);
     }
 
@@ -892,7 +1002,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetFpsIndex(4), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.fps_index, 4);
         assert_eq!(state.fps, 30.0);
         assert!(!state.drop_frame);
@@ -909,7 +1020,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetFpsIndex(3), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.fps_index, 3);
         assert!((state.fps - 29.97).abs() < 0.01);
         assert!(state.drop_frame);
@@ -926,7 +1038,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetFpsIndex(99), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.fps_index, 1);
         assert_eq!(state.fps, 25.0);
     }
@@ -942,11 +1055,13 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetTheme(true), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!(state.is_dark_theme);
 
         process_command(GuiCommand::SetTheme(false), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!(!state.is_dark_theme);
     }
 
@@ -961,11 +1076,13 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::ToggleTheme, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!(state.is_dark_theme, "toggle from initial false → true");
 
         process_command(GuiCommand::ToggleTheme, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!(!state.is_dark_theme, "toggle again true → false");
     }
 
@@ -988,7 +1105,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::ClearLogs, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!(state.logs.is_empty());
     }
 
@@ -1003,7 +1121,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetLtcChannel("both".into()), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.ltc_channel, "both");
     }
 
@@ -1018,7 +1137,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetBeepVolume(0.75), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!((state.beep_volume - 0.75).abs() < 1e-6);
     }
 
@@ -1034,7 +1154,8 @@ mod tests {
         let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
 
         process_command(GuiCommand::SetStartTimecode(tc), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.start_timecode, tc);
     }
 
@@ -1049,15 +1170,18 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetScene(42), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.scene, 42);
 
         process_command(GuiCommand::SetTake(7), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.take, 7);
 
         process_command(GuiCommand::SetRoll("B002".into()), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.roll, "B002");
     }
 
@@ -1073,11 +1197,13 @@ mod tests {
 
         state.scene = 5;
         process_command(GuiCommand::SceneUp, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.scene, 6);
 
         process_command(GuiCommand::SceneDown, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.scene, 5);
     }
 
@@ -1093,11 +1219,13 @@ mod tests {
 
         state.take = 3;
         process_command(GuiCommand::TakeUp, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.take, 4);
 
         process_command(GuiCommand::TakeDown, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.take, 3);
     }
 
@@ -1113,7 +1241,8 @@ mod tests {
 
         state.scene = 0;
         process_command(GuiCommand::SceneDown, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.scene, 0, "scene should not go below 0");
     }
 
@@ -1129,7 +1258,8 @@ mod tests {
 
         state.take = 0;
         process_command(GuiCommand::TakeDown, &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.take, 0, "take should not go below 0");
     }
 
@@ -1144,7 +1274,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetSampleRate(48000), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.sample_rate, 48000);
     }
 
@@ -1159,11 +1290,13 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetAutoIncrement(false), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!(!state.auto_increment_take);
 
         process_command(GuiCommand::SetAutoIncrement(true), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!(state.auto_increment_take);
     }
 
@@ -1178,7 +1311,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetDecodeFpsIndex(4), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert_eq!(state.decode_fps_index, 4);
         assert_eq!(state.decode_fps, 30.0);
         assert!(!state.decode_drop_frame);
@@ -1195,7 +1329,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetDecodeFpsIndex(3), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         assert!((state.decode_fps - 29.97).abs() < 0.01);
         assert!(state.decode_drop_frame);
     }
@@ -1211,7 +1346,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetDecodeFpsIndex(99), &core, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut None, &mut None);
         // Should not change since index is out of range
         assert_eq!(state.decode_fps_index, 1);
     }

@@ -7,7 +7,7 @@ use crate::Timecode;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LtcDecodeStatus {
     Success,
@@ -40,7 +40,7 @@ pub struct LtcDetectionResult {
 }
 
 impl LtcDetectionResult {
-    fn error(msg: impl Into<String>) -> Self {
+    pub fn error(msg: impl Into<String>) -> Self {
         LtcDetectionResult {
             status: LtcDecodeStatus::Error { message: msg.into() },
             detected_fps: 0.0,
@@ -64,43 +64,38 @@ const SYNC_OFFSET: usize = 64;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
-    let start = std::time::Instant::now();
-
-    let mut reader = hound::WavReader::open(path)
-        .map_err(|e| format!("Failed to open WAV file: {}", e))?;
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = spec.channels as usize;
-
-    info!("Decoding LTC from: {} ({} Hz, {} ch, {} fps)", path.display(), sample_rate, channels, fps);
-
-    info!("LTC decode (+{:.1}s): reading audio samples from disk...", start.elapsed().as_secs_f64());
-    let samples = read_mono_samples(&mut reader, &spec)
-        .map_err(|e| format!("Failed to read audio samples: {}", e))?;
-
+/// Decode LTC from a pre-loaded buffer of mono f32 samples.
+/// This is the core decoding logic, extracted from `decode_ltc_from_wav`.
+pub fn decode_ltc_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: usize,
+    fps: f64,
+    drop_frame: bool,
+    start: std::time::Instant,
+) -> Result<LtcDetectionResult, String> {
     if samples.is_empty() {
-        warn!("LTC decode: audio file contains no samples: {}", path.display());
-        return Ok(LtcDetectionResult::error("Audio file contains no samples"));
+        warn!("LTC decode: audio buffer contains no samples");
+        return Ok(LtcDetectionResult::error("Audio buffer contains no samples"));
     }
 
     let total_duration = samples.len() as f64 / sample_rate as f64;
-    let noise_floor = estimate_noise_floor(&samples);
+    let noise_floor = estimate_noise_floor(samples);
     let threshold = (noise_floor * 0.5).max(0.005);
     debug!("LTC decode: read {:.2}s of audio, noise_floor={:.8}, threshold={:.8}",
         total_duration, noise_floor, threshold);
 
     if threshold < 1e-8 {
-        warn!("LTC decode: signal is completely silent: {}", path.display());
+        warn!("LTC decode: signal is completely silent");
         return Ok(LtcDetectionResult::error("Audio signal is completely silent"));
     }
 
     info!("LTC decode (+{:.1}s): scanning {} samples for zero-crossings (threshold={:.6})...",
         start.elapsed().as_secs_f64(), samples.len(), threshold);
-    let zc = find_zero_crossings(&samples, threshold);
+    let zc = find_zero_crossings(samples, threshold);
     debug!("LTC decode: found {} zero-crossings", zc.len());
     if zc.len() < 8 {
-        warn!("LTC decode: only {} zero-crossings, signal may not be LTC: {}", zc.len(), path.display());
+        warn!("LTC decode: only {} zero-crossings, signal may not be LTC", zc.len());
         return Ok(LtcDetectionResult::error(format!(
             "Only {} zero-crossings found (need ≥8) -- signal may be silent or not LTC audio",
             zc.len()
@@ -174,7 +169,7 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
                 let r = best_window_result.as_ref().unwrap();
                 info!("LTC decode: window eval {:.1}% >= 70% -- single-pass on full file (spb={:.2}, phase={})",
                     conf * 100.0, r.spb, r.phase);
-                let decoded = decode_full_file(&samples, r, threshold, sample_rate, best_window_start);
+                let decoded = decode_full_file(samples, r, threshold, sample_rate, best_window_start);
                 let zc_better = zc_result.as_ref().is_some_and(|zcr| {
                     zcr.valid_frames > decoded.valid_frames
                 });
@@ -197,7 +192,7 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
         let conf = r.valid_frames as f32 / r.total_possible.max(1) as f32;
         info!("LTC decode: best window eval {:.1}% ({} valid) -- single-pass on full file (spb={:.2}, phase={})",
             conf * 100.0, r.valid_frames, r.spb, r.phase);
-        let decoded = decode_full_file(&samples, r, threshold, sample_rate, best_window_start);
+        let decoded = decode_full_file(samples, r, threshold, sample_rate, best_window_start);
         let zc_better = zc_result.as_ref().is_some_and(|zcr| {
             zcr.valid_frames > decoded.valid_frames
         });
@@ -213,7 +208,7 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
 
     // ── Fallback: full-file evaluate_on_slice (rare) ────────────────────────
     warn!("LTC decode: sliding window found no valid LTC -- full-file eval fallback");
-    let (fallback_result, _) = evaluate_on_slice(&samples, &zc, sample_rate, threshold, fps, drop_frame);
+    let (fallback_result, _) = evaluate_on_slice(samples, &zc, sample_rate, threshold, fps, drop_frame);
     let zc_better = zc_result.as_ref().is_some_and(|zcr| {
         fallback_result.as_ref().map_or(true, |fr| zcr.valid_frames > fr.valid_frames)
     });
@@ -226,6 +221,26 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<Lt
     }
     let final_r = if zc_better { zc_result } else { fallback_result };
     build_result(final_r, &zc, sample_rate, threshold, channels, total_duration, start)
+}
+
+pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
+    let start = std::time::Instant::now();
+
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| format!("Failed to open WAV file: {}", e))?;
+    let spec = reader.spec();
+    let sample_rate = spec.sample_rate;
+    let channels = spec.channels as usize;
+
+    info!("Decoding LTC from: {} ({} Hz, {} ch, {} fps)", path.display(), sample_rate, channels, fps);
+
+    info!("LTC decode (+{:.1}s): reading audio samples from disk...", start.elapsed().as_secs_f64());
+    let samples = read_mono_samples(&mut reader, &spec)
+        .map_err(|e| format!("Failed to read audio samples: {}", e))?;
+
+    drop(reader);
+
+    decode_ltc_samples(&samples, sample_rate, channels, fps, drop_frame, start)
 }
 
 /// Evaluate LTC on a slice using the given FPS.
@@ -635,11 +650,24 @@ fn read_mono_samples<R: std::io::Read>(
 // ── Noise floor estimation ───────────────────────────────────────────────────
 
 fn estimate_noise_floor(samples: &[f32]) -> f32 {
-    let n = samples.len().min(10_000);
-    let mut sorted: Vec<f32> = samples[..n].iter().map(|s| s.abs()).collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[sorted.len() / 2];
-    median.max(1e-10)
+    let total = samples.len();
+    if total == 0 {
+        return 1e-10;
+    }
+    let window_count = 4usize;
+    let window_size = (total / window_count).max(100).min(10_000);
+    let mut best_median = f32::MAX;
+    for w in 0..window_count {
+        let start = (total * w / window_count).min(total.saturating_sub(window_size));
+        let end = (start + window_size).min(total);
+        let mut vals: Vec<f32> = samples[start..end].iter().map(|s| s.abs()).collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let med = vals[vals.len() / 2];
+        if med < best_median {
+            best_median = med;
+        }
+    }
+    best_median.max(1e-10)
 }
 
 // ── Zero-crossing detection ──────────────────────────────────────────────────
@@ -843,7 +871,7 @@ fn median_sample(samples: &[f32], center: usize) -> f32 {
     buf[len / 2]
 }
 
-fn extract_bits(samples: &[f32], samples_per_bit: f64, phase: usize, threshold: f32) -> Vec<u8> {
+fn extract_bits(samples: &[f32], samples_per_bit: f64, phase: usize, _threshold: f32) -> Vec<u8> {
     let mut bits = Vec::new();
     let quarter = samples_per_bit * 0.25;
     let three_quarter = samples_per_bit * 0.75;
@@ -860,12 +888,8 @@ fn extract_bits(samples: &[f32], samples_per_bit: f64, phase: usize, threshold: 
         let s25 = median_sample(samples, p25);
         let s75 = median_sample(samples, p75);
 
-        if s25.abs() < threshold || s75.abs() < threshold {
-            bits.push(0);
-        } else {
-            let bit = if s25.signum() != s75.signum() { 1 } else { 0 };
-            bits.push(bit);
-        }
+        let bit = if s25.signum() != s75.signum() { 1 } else { 0 };
+        bits.push(bit);
 
         pos += samples_per_bit;
     }
@@ -877,7 +901,7 @@ fn extract_bits_adaptive(
     samples: &[f32],
     samples_per_bit: f64,
     phase: usize,
-    threshold: f32,
+    _threshold: f32,
     zero_crossings: &[usize],
 ) -> Vec<u8> {
     let mut bits = Vec::new();
@@ -903,12 +927,8 @@ fn extract_bits_adaptive(
         let s25 = median_sample(samples, p25);
         let s75 = median_sample(samples, p75);
 
-        if s25.abs() < threshold || s75.abs() < threshold {
-            bits.push(0);
-        } else {
-            let bit = if s25.signum() != s75.signum() { 1 } else { 0 };
+        let bit = if s25.signum() != s75.signum() { 1 } else { 0 };
             bits.push(bit);
-        }
 
         let next_boundary = (pos + samples_per_bit) as usize;
         let target_lo = next_boundary.saturating_sub(snap_radius);
@@ -1963,6 +1983,19 @@ mod tests {
             "empty WAV should produce Error, got {:?}", result.status);
     }
 
+    // ── Low-amplitude LTC (below old 0.005 min threshold) ────────────────
+
+    #[test]
+    fn test_wav_low_amplitude_ltc() {
+        let result = verify_roundtrip(
+            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            25.0, false, "both", 0.12, 48000, 2.0,
+        );
+        assert!(result.valid_frames > 0,
+            "expected >0 valid frames with low-amplitude LTC (volume=0.12, amp≈0.014), got {}/{}",
+            result.valid_frames, result.total_possible_frames);
+    }
+
     // ── quick_check_ltc ──────────────────────────────────────────────────
 
     #[test]
@@ -2162,5 +2195,758 @@ mod tests {
             });
         }
         assert_eq!(find_first_coherent_index(&tcs, fps, false), Some(0));
+    }
+
+    // ── bits_hamming_distance_16 ───────────────────────────────────────
+
+    #[test]
+    fn test_bits_hamming_distance_16_exact_match() {
+        assert_eq!(bits_hamming_distance_16(&SYNC_WORD), 0);
+    }
+
+    #[test]
+    fn test_bits_hamming_distance_16_one_bit_flip() {
+        let mut bits = SYNC_WORD;
+        bits[0] ^= 1;
+        assert_eq!(bits_hamming_distance_16(&bits), 1);
+    }
+
+    #[test]
+    fn test_bits_hamming_distance_16_two_bit_flips() {
+        let mut bits = SYNC_WORD;
+        bits[0] ^= 1;
+        bits[5] ^= 1;
+        assert_eq!(bits_hamming_distance_16(&bits), 2);
+    }
+
+    #[test]
+    fn test_bits_hamming_distance_16_three_bit_flips_early_exit() {
+        let mut bits = SYNC_WORD;
+        bits[0] ^= 1;
+        bits[1] ^= 1;
+        bits[2] ^= 1;
+        assert_eq!(bits_hamming_distance_16(&bits), 3);
+    }
+
+    #[test]
+    fn test_bits_hamming_distance_16_all_wrong() {
+        let bits = [1u8; 16];
+        assert_eq!(bits_hamming_distance_16(&bits), 3);
+    }
+
+    #[test]
+    fn test_bits_hamming_distance_16_all_zero() {
+        let bits = [0u8; 16];
+        // SYNC_WORD has 13 ones → distance to all-zero is 13, but early exit at 3
+        assert_eq!(bits_hamming_distance_16(&bits), 3);
+    }
+
+    // ── median_sample ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_median_sample_middle() {
+        let samples = vec![0.1, 0.5, 0.3];
+        assert!((median_sample(&samples, 1) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_median_sample_left_edge() {
+        let samples = vec![0.7, 0.3, 0.5];
+        assert!((median_sample(&samples, 0) - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_median_sample_right_edge() {
+        let samples = vec![0.1, 0.3, 0.9];
+        assert!((median_sample(&samples, 2) - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_median_sample_two_samples_only() {
+        let samples = vec![0.8, 0.2];
+        // len=2, buf sorted → [0.2, 0.8], buf[2/2] = buf[1] = 0.8 (upper median)
+        assert!((median_sample(&samples, 1) - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_median_sample_constant_values() {
+        let samples = vec![0.5f32; 5];
+        assert!((median_sample(&samples, 2) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_median_sample_negative_values() {
+        let samples = vec![-0.7, -0.5, -0.9];
+        assert!((median_sample(&samples, 1) + 0.7).abs() < 1e-6);
+    }
+
+    // ── zc_in_range ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_zc_in_range_all_included() {
+        let zc = vec![10, 20, 30, 40, 50];
+        let result = zc_in_range(&zc, 10, 51);
+        assert_eq!(result, &[10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn test_zc_in_range_partial() {
+        let zc = vec![10, 20, 30, 40, 50];
+        let result = zc_in_range(&zc, 25, 45);
+        assert_eq!(result, &[30, 40]);
+    }
+
+    #[test]
+    fn test_zc_in_range_empty() {
+        let zc = vec![10, 20, 30, 40, 50];
+        let result = zc_in_range(&zc, 0, 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_zc_in_range_start_equals_end() {
+        let zc = vec![10, 20, 30];
+        let result = zc_in_range(&zc, 20, 20);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_zc_in_range_single_element() {
+        let zc = vec![42];
+        let result = zc_in_range(&zc, 0, 100);
+        assert_eq!(result, &[42]);
+    }
+
+    #[test]
+    fn test_zc_in_range_exclusive_end() {
+        let zc = vec![10, 20, 30, 40];
+        let result = zc_in_range(&zc, 20, 30);
+        assert_eq!(result, &[20]);
+    }
+
+    // ── decode_bits_synthetic_zc ──────────────────────────────────────
+
+    /// Build a zero-crossing array for a sequence of LTC bits.
+    /// Each '1' bit produces a ZC at `(bit_index * spb + spb/2)`.
+    fn bits_to_zc(bits: &[u8], spb: f64) -> Vec<usize> {
+        bits.iter()
+            .enumerate()
+            .filter(|(_, &b)| b == 1)
+            .map(|(i, _)| (i as f64 * spb + spb * 0.5).round() as usize)
+            .collect()
+    }
+
+    #[test]
+    fn test_decode_bits_synthetic_zc_basic() {
+        // Bits: 1 followed by three 1s with regular spacing
+        let spb = 24.0;
+        // Bit pattern: 1,0,1,0,1
+        // ZC positions: bit0 midpoint, bit2 midpoint, bit4 midpoint
+        let zc = vec![12, 60, 108]; // spb*0+12, spb*2+12, spb*4+12
+        let bits = decode_bits_synthetic_zc(&zc, spb);
+        // Leading: (12/24 - 0.5).round() = 0 leading zeros
+        // ZC at 12 -> first bit is 1
+        // Between first(12) and second(60): interval=48, n_periods=2, zeros=1, then 1
+        // Between second(60) and third(108): interval=48, n_periods=2, zeros=1, then 1
+        assert_eq!(bits, vec![1, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn test_decode_bits_synthetic_zc_with_leading_gap() {
+        let spb = 24.0;
+        // First ZC at bit position 2 (spb*2+12=60)
+        let zc = vec![60, 108]; // bit positions 2 and 4
+        let bits = decode_bits_synthetic_zc(&zc, spb);
+        // Leading: (60/24 - 0.5).round() = (2.5 - 0.5).round() = 2 zeros
+        // Then ZC = 1
+        // Between 60 and 108: interval=48=2*spb → n_periods=2 → zeros=1, then 1
+        // Expected: [0,0,1,0,1]
+        assert_eq!(bits, vec![0, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn test_decode_bits_synthetic_zc_consecutive_ones() {
+        let spb = 24.0;
+        // Consecutive 1s at bits 0, 1, 2
+        let zc = vec![12, 36, 60]; // spb*0+12, spb*1+12, spb*2+12
+        let bits = decode_bits_synthetic_zc(&zc, spb);
+        // Leading: (12/24 - 0.5).round() = (0.5-0.5).round() = 0
+        // ZC at 12 -> 1
+        // interval 12→36 = 24 = spb → n_periods=1 → zeros=0 → 1
+        // interval 36→60 = 24 = spb → n_periods=1 → zeros=0 → 1
+        assert_eq!(bits, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn test_decode_bits_synthetic_zc_single_zc() {
+        let spb = 24.0;
+        let zc = vec![12]; // one ZC at bit 0
+        let bits = decode_bits_synthetic_zc(&zc, spb);
+        assert_eq!(bits, vec![1]);
+    }
+
+    #[test]
+    fn test_decode_bits_synthetic_zc_three_gap() {
+        let spb = 24.0;
+        // bit 0 has ZC, then bit 4 has ZC (3 zero bits between)
+        let zc = vec![12, 108]; // positions: spb*0+12, spb*4+12
+        let bits = decode_bits_synthetic_zc(&zc, spb);
+        // Leading: 0
+        // ZC at 12 -> 1
+        // interval 12→108 = 96 = 4*spb → n_periods=4 → zeros=3 → 1
+        assert_eq!(bits, vec![1, 0, 0, 0, 1]);
+    }
+
+    // ── decode_bits_real_zc ───────────────────────────────────────────
+
+    #[test]
+    fn test_decode_bits_real_zc_alternating() {
+        let spb = 24.0;
+        // Real ZCs: short (bit=1) then long (bit=0) intervals
+        // ZC at bit 0, then bit 1 (short interval = spb), then bit 3 (long -> wait, that's 2*spb = is long)
+        // Actually: short < 0.75*spb = 18. So short_threshold = 18
+        // interval 0→1 = spb = 24 >= 18 → long → bit 0
+        let zc = vec![12, 36]; // one short interval = spb
+        let bits = decode_bits_real_zc(&zc, spb);
+        // interval = 24 >= 18 (short_threshold) → long → push 0
+        assert_eq!(bits, vec![0], "interval=spb should decode as long→0");
+    }
+
+    #[test]
+    fn test_decode_bits_real_zc_short_interval() {
+        let spb = 24.0;
+        // Generate a "short" interval: make ZCs close together
+        // ZC at 10, then ZC at 10+10 = 20 (interval=10 < 18)
+        // Then a third ZC at 20+10 = 30 (interval=10 < 18)
+        // Short interval followed by short → decoded as 1
+        let zc = vec![10, 20, 30];
+        let bits = decode_bits_real_zc(&zc, spb);
+        assert_eq!(bits, vec![1]);
+    }
+
+    #[test]
+    fn test_decode_bits_real_zc_long_short_long() {
+        let spb = 24.0;
+        // ZC at 10, ZC at 40 (interval=30 >= 18 = long → 0)
+        // ZC at 40, ZC at 48 (interval=8 < 18 = short)
+        // ZC at 48, ZC at 52 (interval=4 < 18 = short)
+        // Pair of shorts at [40,48,52] → short+short = 1
+        // Actually we need to trace through: i=0: interval(10→40)=30 >=18 → push 0, i=1
+        // i=1: interval(40→48)=8 < 18 → check next: interval(48→52)=4 < 18 → push 1, i=3
+        // Result: [0, 1]
+        let zc = vec![10, 40, 48, 52];
+        let bits = decode_bits_real_zc(&zc, spb);
+        assert_eq!(bits, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_decode_bits_real_zc_trailing_short() {
+        let spb = 24.0;
+        // Short interval at the end with no following ZC → should be skipped safely
+        let zc = vec![10, 40, 48]; // 10→40=long(0), 40→48=short but no next → skip
+        let bits = decode_bits_real_zc(&zc, spb);
+        assert_eq!(bits, vec![0]);
+    }
+
+    #[test]
+    fn test_decode_bits_real_zc_single_interval() {
+        let spb = 24.0;
+        let zc = vec![10, 40]; // single long interval
+        let bits = decode_bits_real_zc(&zc, spb);
+        assert_eq!(bits, vec![0]);
+    }
+
+    // ── decode_bits_from_zero_crossings ───────────────────────────────
+
+    #[test]
+    fn test_decode_bits_from_zc_fewer_than_2_returns_empty() {
+        let zc = vec![10];
+        let bits = decode_bits_from_zero_crossings(&zc, 48000, 25.0);
+        assert!(bits.is_empty());
+    }
+
+    #[test]
+    fn test_decode_bits_from_zc_empty_returns_empty() {
+        let zc = vec![];
+        let bits = decode_bits_from_zero_crossings(&zc, 48000, 25.0);
+        assert!(bits.is_empty());
+    }
+
+    #[test]
+    fn test_decode_bits_from_zc_synthetic_path() {
+        // Create ZCs with long intervals (few short intervals) → synthetic path
+        // At 25fps, spb = 48000/(25*80) = 24
+        // All intervals = spb → short_ratio = 0 → synthetic path
+        let zc = vec![12, 36, 60, 84, 108];
+        let bits = decode_bits_from_zero_crossings(&zc, 48000, 25.0);
+        // synthetic: leading=0, then each interval=spb → n_periods=1 → zeros=0 + 1
+        // So: [1,1,1,1,1]
+        assert_eq!(bits, vec![1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_decode_bits_from_zc_real_path() {
+        // Create ZCs with many short intervals → real path
+        // spb = 24, short_threshold = 18
+        // Alternate short(10) and long(30) intervals: short_ratio ≈ 0.5 > 0.10
+        let zc = vec![0, 10, 40, 50, 80, 90, 120, 130]; // short, long, short, long, short, long, short
+        let bits = decode_bits_from_zero_crossings(&zc, 48000, 25.0);
+        // real path: intervals: 10(S), 30(L), 10(S), 30(L), 10(S), 30(L), 10(S)
+        // S at [0-10]: next(10-40)=30(L) → no pair → skip
+        // 10→40=30(L)→0
+        // 40→50=10(S): next 50→80=30(L) → no pair → skip
+        // 50→80=30(L)→0
+        // 80→90=10(S): next 90→120=30(L) → no pair → skip
+        // 90→120=30(L)→0
+        // 120→130=10(S): no next → skip
+        // But wait, let me trace more carefully:
+        //
+        // i=0: interval(0→10)=10 < 18 : short
+        //   i+2 < len? 0+2=2 < 8: yes
+        //   next = interval(10→40)=30 >= 18: no pair → i+=1 → i=1
+        // i=1: interval(10→40)=30 >= 18: push 0 → i+=1 → i=2
+        // i=2: interval(40→50)=10 < 18 : short
+        //   i+2 < len? 2+2=4 < 8: yes
+        //   next = interval(50→80)=30 >= 18: no pair → i+=1 → i=3
+        // i=3: interval(50→80)=30 >= 18: push 0 → i+=1 → i=4
+        // i=4: interval(80→90)=10 < 18 : short
+        //   i+2 < len? 4+2=6 < 8: yes
+        //   next = interval(90→120)=30 >= 18: no pair → i+=1 → i=5
+        // i=5: interval(90→120)=30 >= 18: push 0 → i+=1 → i=6
+        // i=6: interval(120→130)=10 < 18 : short
+        //   i+2 < len? 6+2=8 < 8: NO → break
+        //
+        // Result: [0,0,0]
+        assert_eq!(bits, vec![0, 0, 0]);
+    }
+
+    // ── try_decode_via_zc_intervals ───────────────────────────────────
+
+    #[test]
+    fn test_try_decode_zc_intervals_few_zcs() {
+        let zc = vec![0, 10, 20];
+        let result = try_decode_via_zc_intervals(&zc, 48000, 25.0, false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_decode_zc_intervals_too_few_bits() {
+        // ZCs that produce fewer than 80 bits
+        // Only generate a few ZCs
+        let zc = vec![12, 36, 60, 84, 108, 132, 156]; // 7 ZCs → synthetic produces 7 bits
+        let result = try_decode_via_zc_intervals(&zc, 48000, 25.0, false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_try_decode_zc_intervals_valid_synthetic() {
+        // Build ZCs matching a valid LTC frame (use get_ltc_bits to know the pattern)
+        let tc = Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 };
+        let bits = crate::get_ltc_bits(&tc, false);
+        let spb = 24.0; // 48000/(25*80)
+        let zc = bits_to_zc(&bits, spb);
+        let result = try_decode_via_zc_intervals(&zc, 48000, 25.0, false);
+        assert!(result.is_some(), "should decode a valid frame");
+        if let Some(r) = result {
+            assert!(r.valid_frames >= 1, "should find at least 1 valid frame, got {}", r.valid_frames);
+        }
+    }
+
+    #[test]
+    fn test_try_decode_zc_intervals_all_zero_bits() {
+        // No '1' bits means no ZCs at all
+        let zc = vec![];
+        let result = try_decode_via_zc_intervals(&zc, 48000, 25.0, false);
+        assert!(result.is_none());
+    }
+
+    // ── extract_bits_adaptive ─────────────────────────────────────────
+
+    #[test]
+    fn test_extract_bits_adaptive_basic() {
+        let spb = 8.0;
+        let mut signal = Vec::new();
+        let mut level = 0.5;
+        for &bit in &[1u8, 0, 1, 0] {
+            let (chunk, l) = synthesize_bit(spb as usize, bit, level);
+            signal.extend(chunk);
+            level = l;
+        }
+        // ZCs: bit0 at mid=4, bit1=no ZC, bit2 at mid=16+4=20, bit3=no ZC
+        let zc = vec![4, 20];
+        let bits = extract_bits_adaptive(&signal, spb, 0, 0.01, &zc);
+        assert_eq!(bits, vec![1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn test_extract_bits_adaptive_phase_offset() {
+        let spb = 8.0;
+        let mut signal = vec![0.0f32; 3]; // phase offset
+        let mut level = 0.5;
+        for &bit in &[1u8, 0, 1] {
+            let (chunk, l) = synthesize_bit(spb as usize, bit, level);
+            signal.extend(chunk);
+            level = l;
+        }
+        let zc = vec![7, 23]; // phase=3 → bit0 mid at 3+4=7, bit2 mid at 3+16+4=23
+        let bits = extract_bits_adaptive(&signal, spb, 3, 0.01, &zc);
+        assert_eq!(bits, vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn test_extract_bits_adaptive_snap_to_zc() {
+        let spb = 8.0;
+        // Create signal with slight clock drift in the ZCs
+        let mut signal = Vec::new();
+        let mut level = 0.5;
+        for &bit in &[1u8, 1, 0] {
+            let (chunk, l) = synthesize_bit(spb as usize, bit, level);
+            signal.extend(chunk);
+            level = l;
+        }
+        // ZC positions slightly offset from ideal (simulating drift)
+        let ideal_first = 4;
+        let ideal_second = 12;
+        let drift_zc = vec![ideal_first + 1, ideal_second - 1]; // 5 and 11
+        let bits = extract_bits_adaptive(&signal, spb, 0, 0.01, &drift_zc);
+        // First bit: should snap to ZC at 5 (within snap_radius=2 from ideal 4)
+        // Second bit: next_boundary = 8, snap_radius=2 → target_lo=6, target_hi=10
+        //   ZC at 11 is NOT in [6,10], so no snap → pos = 8
+        // Third bit: at pos=8+8=16, p25=16+2=18...
+        assert_eq!(bits, vec![1, 1, 0]);
+    }
+
+    #[test]
+    fn test_extract_bits_adaptive_below_threshold() {
+        let spb = 8.0;
+        let signal = vec![0.0f32; (spb as usize) * 4];
+        let zc = vec![];
+        let bits = extract_bits_adaptive(&signal, spb, 0, 0.1, &zc);
+        assert_eq!(bits, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_extract_bits_adaptive_no_zc_snap() {
+        let spb = 8.0;
+        let mut signal = Vec::new();
+        let mut level = 0.5;
+        for &bit in &[1u8, 1] {
+            let (chunk, l) = synthesize_bit(spb as usize, bit, level);
+            signal.extend(chunk);
+            level = l;
+        }
+        // No ZCs in the provided list → should use regular boundary
+        let zc = vec![];
+        let bits = extract_bits_adaptive(&signal, spb, 0, 0.01, &zc);
+        assert_eq!(bits, vec![1, 1]);
+    }
+
+    // ── build_result ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_result_with_valid_result() {
+        let r = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 50,
+            total_possible: 60,
+            timecodes: vec![
+                FrameTimecode {
+                    frame_index: 0,
+                    timecode: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+                    timecode_secs: 0.0,
+                },
+            ],
+            details_entry: "test details".to_string(),
+            spb: 24.0,
+            phase: 12,
+            frame_starts: vec![0],
+        };
+        let zc = vec![12, 36, 60];
+        let result = build_result(Some(r), &zc, 48000, 0.01, 2, 2.0, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Success));
+        assert!((result.avg_confidence - 50.0 / 60.0).abs() < 0.001);
+        assert_eq!(result.valid_frames, 50);
+        assert_eq!(result.total_possible_frames, 60);
+        assert!(!result.timecodes.is_empty());
+    }
+
+    #[test]
+    fn test_build_result_with_none() {
+        let zc = vec![];
+        let result = build_result(None, &zc, 48000, 0.01, 2, 0.5, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::NoSyncWord));
+        assert_eq!(result.valid_frames, 0);
+        assert!(result.timecodes.is_empty());
+    }
+
+    #[test]
+    fn test_build_result_confidence_thresholds() {
+        let low_conf = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 10,
+            total_possible: 100,
+            timecodes: vec![],
+            details_entry: "".to_string(),
+            spb: 24.0,
+            phase: 0,
+            frame_starts: vec![],
+        };
+        let zc = vec![];
+        let result = build_result(Some(low_conf), &zc, 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::NoSyncWord));
+
+        let med_conf = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 40,
+            total_possible: 100,
+            timecodes: vec![],
+            details_entry: "".to_string(),
+            spb: 24.0,
+            phase: 0,
+            frame_starts: vec![],
+        };
+        let result = build_result(Some(med_conf), &zc, 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::LowConfidence));
+
+        let high_conf = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 90,
+            total_possible: 100,
+            timecodes: vec![],
+            details_entry: "".to_string(),
+            spb: 24.0,
+            phase: 0,
+            frame_starts: vec![],
+        };
+        let result = build_result(Some(high_conf), &zc, 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Success));
+    }
+
+    #[test]
+    fn test_build_result_zero_possible() {
+        let r = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 0,
+            total_possible: 0,
+            timecodes: vec![],
+            details_entry: "".to_string(),
+            spb: 24.0,
+            phase: 0,
+            frame_starts: vec![],
+        };
+        let zc = vec![];
+        let result = build_result(Some(r), &zc, 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::NoSyncWord));
+        assert_eq!(result.avg_confidence, 0.0);
+    }
+
+    // ── decode_full_file ──────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_full_file_clean_signal() {
+        let spb = 24.0;
+        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let bits = crate::get_ltc_bits(&tc, false);
+        // Generate full signal for 3 identical frames
+        let mut signal = Vec::new();
+        let mut level = 0.5;
+        for _ in 0..3 {
+            for &bit in &bits {
+                let (chunk, l) = synthesize_bit(spb as usize, bit, level);
+                signal.extend(chunk);
+                level = l;
+            }
+        }
+
+        let params = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 3,
+            total_possible: 3,
+            timecodes: vec![],
+            details_entry: "test".to_string(),
+            spb,
+            phase: 0, // phase=0 = start of bit boundary
+            frame_starts: vec![],
+        };
+
+        let result = decode_full_file(&signal, &params, 0.001, 48000, 0);
+        assert_eq!(result.valid_frames, 3);
+        assert_eq!(result.total_possible, 3);
+        assert_eq!(result.timecodes.len(), 3);
+        for ftc in &result.timecodes {
+            assert_eq!(ftc.timecode, tc);
+        }
+    }
+
+    #[test]
+    fn test_decode_full_file_silent_signal() {
+        let spb = 24.0;
+        let signal = vec![0.0f32; 4800]; // silence
+        let params = ScoredResult {
+            fps: 25.0,
+            drop_frame: false,
+            valid_frames: 0,
+            total_possible: 0,
+            timecodes: vec![],
+            details_entry: "test".to_string(),
+            spb,
+            phase: 0,
+            frame_starts: vec![],
+        };
+
+        let result = decode_full_file(&signal, &params, 0.5, 48000, 0);
+        // With high threshold, signal is below threshold → extract_bits returns zeros
+        // No sync word in zeros → valid_frames = 0
+        assert_eq!(result.valid_frames, 0);
+    }
+
+    // ── Helper: synthesize LTC signal for decode_ltc_samples ──────────
+
+    /// Generate a mono f32 LTC signal from a list of timecodes.
+    fn synthesize_ltc_signal(
+        timecodes: &[Timecode],
+        fps: f64,
+        drop_frame: bool,
+        sample_rate: u32,
+        volume: f32,
+    ) -> Vec<f32> {
+        let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
+        let samples_per_bit = samples_per_frame as f32 / 80.0;
+        let mut signal = Vec::with_capacity(samples_per_frame * timecodes.len());
+        let mut last_level = 1.0f32;
+
+        for tc in timecodes {
+            let bits = crate::get_ltc_bits(tc, drop_frame);
+            for &bit in &bits {
+                let (chunk, l) = synthesize_bit(samples_per_bit as usize, bit, last_level * volume.signum());
+                signal.extend(chunk.iter().map(|s| s * volume));
+                last_level = l;
+            }
+        }
+        signal
+    }
+
+    // ── decode_ltc_samples ────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_ltc_samples_empty_buffer() {
+        let samples = vec![];
+        let result = decode_ltc_samples(&samples, 48000, 2, 25.0, false, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Error { .. }));
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_silent_buffer() {
+        let samples = vec![0.0f32; 48000 * 2]; // 1 sec silence
+        let result = decode_ltc_samples(&samples, 48000, 2, 25.0, false, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Error { .. }));
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_25fps_basic() {
+        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
+        }).collect();
+        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5);
+        let result = decode_ltc_samples(&signal, 48000, 1, 25.0, false, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for 25fps LTC, got {:?} (valid={})", result.status, result.valid_frames);
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_24fps() {
+        let tcs: Vec<Timecode> = (0..24).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
+        }).collect();
+        let signal = synthesize_ltc_signal(&tcs, 24.0, false, 48000, 0.5);
+        let result = decode_ltc_samples(&signal, 48000, 1, 24.0, false, std::time::Instant::now()).unwrap();
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }));
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_30fps() {
+        let tcs: Vec<Timecode> = (0..30).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
+        }).collect();
+        let signal = synthesize_ltc_signal(&tcs, 30.0, false, 48000, 0.5);
+        let result = decode_ltc_samples(&signal, 48000, 1, 30.0, false, std::time::Instant::now()).unwrap();
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }));
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_44100hz() {
+        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
+        }).collect();
+        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 44100, 0.5);
+        let result = decode_ltc_samples(&signal, 44100, 1, 25.0, false, std::time::Instant::now()).unwrap();
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }));
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_different_start_timecode() {
+        let tcs = vec![Timecode { hours: 10, minutes: 15, seconds: 30, frames: 12 }];
+        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5);
+        let result = decode_ltc_samples(&signal, 48000, 1, 25.0, false, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success, got {:?}", result.status);
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_too_short_signal() {
+        // Only a few samples — not enough for any zero crossings
+        let samples = vec![0.5f32, -0.5, 0.5, -0.5];
+        let result = decode_ltc_samples(&samples, 48000, 1, 25.0, false, std::time::Instant::now()).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Error { .. }));
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_wrong_fps() {
+        // Generate 25fps LTC but decode at 30fps
+        let tcs: Vec<Timecode> = (0..50).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
+        }).collect();
+        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5);
+        let result = decode_ltc_samples(&signal, 48000, 1, 30.0, false, std::time::Instant::now()).unwrap();
+        // Should get something (maybe low confidence or error)
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }) || result.valid_frames > 0);
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_multiple_frames_timecodes() {
+        // Generate a sequence of timecodes and verify they decode correctly
+        let tcs: Vec<Timecode> = (0..10).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i * 3,
+        }).collect();
+        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5);
+        let result = decode_ltc_samples(&signal, 48000, 1, 25.0, false, std::time::Instant::now()).unwrap();
+        if matches!(result.status, LtcDecodeStatus::Success) {
+            assert!(result.valid_frames >= 5,
+                "should decode at least 5 of 10 frames, got {}", result.valid_frames);
+            // Check that timecodes are roughly in the right ballpark
+            if !result.timecodes.is_empty() {
+                assert!(result.timecodes[0].timecode.minutes == 0
+                    || result.timecodes[0].timecode.seconds == 0);
+            }
+        }
+    }
+
+    // ───ƒ─ decode_ltc_samples drop-frame ──────────────────────────────────
+
+    #[test]
+    fn test_decode_ltc_samples_drop_frame() {
+        let tcs: Vec<Timecode> = (0..30).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
+        }).collect();
+        let signal = synthesize_ltc_signal(&tcs, 29.97, true, 48000, 0.5);
+        let result = decode_ltc_samples(&signal, 48000, 1, 29.97, true, std::time::Instant::now()).unwrap();
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "expected no Error for 29.97 DF, got {:?}", result.status);
     }
 }

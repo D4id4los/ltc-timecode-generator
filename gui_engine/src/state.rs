@@ -76,6 +76,10 @@ pub struct AppStateSnapshot {
     pub ltc_decode_error: Option<String>,
     pub ltc_is_detecting: bool,
     pub ltc_decode_generation: u64,
+
+    // Chunked decode progress
+    pub ltc_decode_progress_pct: f32,       // 0.0..1.0
+    pub ltc_decode_progress_str: String,    // "Chunk 3/12..."
 }
 
 impl AppStateSnapshot {
@@ -136,6 +140,8 @@ impl AppStateSnapshot {
             ltc_decode_error: None,
             ltc_is_detecting: false,
             ltc_decode_generation: 0,
+            ltc_decode_progress_pct: 0.0,
+            ltc_decode_progress_str: String::new(),
         }
     }
 }
