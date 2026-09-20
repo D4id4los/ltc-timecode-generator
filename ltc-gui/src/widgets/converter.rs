@@ -252,41 +252,43 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     );
     ui.add_space(6.0);
 
-    ui.horizontal(|ui| {
-        let files: Vec<PathBuf> = state
-            .selected_group
-            .as_ref()
-            .and_then(|g| state.file_groups.as_ref()?.get(g))
-            .cloned()
-            .unwrap_or_default();
+    let files: Vec<PathBuf> = state
+        .selected_group
+        .as_ref()
+        .and_then(|g| state.file_groups.as_ref()?.get(g))
+        .cloned()
+        .unwrap_or_default();
 
-        let file_names: Vec<String> = files
-            .iter()
-            .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string())
-            .collect();
+    let file_names: Vec<String> = files
+        .iter()
+        .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string())
+        .collect();
 
-        if file_names.is_empty() {
-            return;
-        }
-
+    if !file_names.is_empty() {
         // Ensure ltc_file_idx is in range
         if state.ltc_file_idx >= file_names.len() {
             state.ltc_file_idx = file_names.len().saturating_sub(1);
         }
 
-        let selected_name = &file_names[state.ltc_file_idx];
-        egui::ComboBox::from_id_salt("ltc_file_combo")
-            .selected_text(selected_name)
-            .width(ui.available_width() - 140.0)
-            .show_ui(ui, |ui| {
-                for (i, name) in file_names.iter().enumerate() {
-                    if ui.selectable_label(false, name).clicked() {
-                        state.ltc_file_idx = i;
-                    }
-                }
-            });
+        let selected_name = file_names[state.ltc_file_idx].clone();
 
-        // ── Decode FPS selector ──
+        // ── Row 1: Track selection dropdown ──
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("ltc_file_combo")
+                .selected_text(&selected_name)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for (i, name) in file_names.iter().enumerate() {
+                        if ui.selectable_label(false, name).clicked() {
+                            state.ltc_file_idx = i;
+                        }
+                    }
+                });
+        });
+
+        ui.add_space(6.0);
+
+        // ── Row 2: Decode FPS selector + Detect button ──
         ui.horizontal(|ui| {
             ui.label(RichText::new("FPS:").font(FontId::proportional(10.0)).color(colors.text_muted));
             for (i, opt) in FPS_OPTIONS.iter().enumerate() {
@@ -300,31 +302,31 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                     state.send(GuiCommand::SetDecodeFpsIndex(i));
                 }
             }
+
+            ui.add_space(8.0);
+
+            let is_detecting = state.latest.ltc_is_detecting;
+            let button_label = if is_detecting {
+                "⏳ Detecting…"
+            } else {
+                "🔍 Detect LTC"
+            };
+
+            let button_enabled = !is_detecting;
+            if ui
+                .add_enabled(
+                    button_enabled,
+                    egui::Button::new(RichText::new(button_label).font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
+                        .fill(if button_enabled { ACCENT } else { colors.deep_bg })
+                        .min_size(egui::vec2(100.0, 24.0)),
+                )
+                .clicked()
+            {
+                let file_path = files[state.ltc_file_idx].to_string_lossy().to_string();
+                state.send(GuiCommand::ParseLtcFile(file_path));
+            }
         });
-
-        ui.add_space(8.0);
-
-        let is_detecting = state.latest.ltc_is_detecting;
-        let button_label = if is_detecting {
-            "⏳ Detecting…"
-        } else {
-            "🔍 Detect LTC"
-        };
-
-        let button_enabled = !is_detecting && !files.is_empty();
-        if ui
-            .add_enabled(
-                button_enabled,
-                egui::Button::new(RichText::new(button_label).font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
-                    .fill(if button_enabled { ACCENT } else { colors.deep_bg })
-                    .min_size(egui::vec2(100.0, 24.0)),
-            )
-            .clicked()
-        {
-            let file_path = files[state.ltc_file_idx].to_string_lossy().to_string();
-            state.send(GuiCommand::ParseLtcFile(file_path));
-        }
-    });
+    }
 
     ui.add_space(4.0);
 
