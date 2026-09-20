@@ -797,6 +797,247 @@ pub fn suggest_sample_rate() -> u32 {
 /// Available sample rate options for UI display.
 pub const SAMPLE_RATE_OPTIONS: &[u32] = &[16000, 48000];
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── sample_format_name ────────────────────────────────────────────────
+
+    #[test]
+    fn test_sample_format_name_f32() {
+        assert_eq!(sample_format_name(cpal::SampleFormat::F32), "f32");
+    }
+
+    #[test]
+    fn test_sample_format_name_i16() {
+        assert_eq!(sample_format_name(cpal::SampleFormat::I16), "i16");
+    }
+
+    #[test]
+    fn test_sample_format_name_i32() {
+        assert_eq!(sample_format_name(cpal::SampleFormat::I32), "i32");
+    }
+
+    #[test]
+    fn test_sample_format_name_u16() {
+        assert_eq!(sample_format_name(cpal::SampleFormat::U16), "u16");
+    }
+
+    #[test]
+    fn test_sample_format_name_i8() {
+        assert_eq!(sample_format_name(cpal::SampleFormat::I8), "i8");
+    }
+
+    #[test]
+    fn test_sample_format_name_u8() {
+        assert_eq!(sample_format_name(cpal::SampleFormat::U8), "u8");
+    }
+
+    #[test]
+    fn test_sample_format_name_f64() {
+        assert_eq!(sample_format_name(cpal::SampleFormat::F64), "f64");
+    }
+
+    // ── is_transient_audio_error ──────────────────────────────────────────
+
+    #[test]
+    fn test_is_transient_audio_error_temporarily_busy() {
+        assert!(is_transient_audio_error("device temporarily busy"));
+    }
+
+    #[test]
+    fn test_is_transient_audio_error_already_in_use() {
+        assert!(is_transient_audio_error("device already in use"));
+    }
+
+    #[test]
+    fn test_is_transient_audio_error_resource_busy() {
+        assert!(is_transient_audio_error("resource busy"));
+    }
+
+    #[test]
+    fn test_is_transient_audio_error_permission_denied() {
+        assert!(!is_transient_audio_error("Permission denied"));
+    }
+
+    #[test]
+    fn test_is_transient_audio_error_empty_string() {
+        assert!(!is_transient_audio_error(""));
+    }
+
+    #[test]
+    fn test_is_transient_audio_error_unrelated() {
+        assert!(!is_transient_audio_error("device not found"));
+        assert!(!is_transient_audio_error("unknown error"));
+    }
+
+    #[test]
+    fn test_is_transient_audio_error_partial_match() {
+        assert!(is_transient_audio_error("The device is temporarily busy"));
+        assert!(is_transient_audio_error("Stream error: already in use"));
+    }
+
+    #[test]
+    fn test_is_transient_audio_error_case_sensitivity() {
+        // The function does .contains() which is case-sensitive
+        assert!(is_transient_audio_error("temporarily busy"));
+        assert!(!is_transient_audio_error("TEMPORARILY BUSY"));
+    }
+
+    // ── is_permanent_device_error ─────────────────────────────────────────
+
+    #[test]
+    fn test_is_permanent_device_error_permission_denied() {
+        assert!(is_permanent_device_error("Permission denied"));
+    }
+
+    #[test]
+    fn test_is_permanent_device_error_access_denied() {
+        assert!(is_permanent_device_error("Access denied"));
+    }
+
+    #[test]
+    fn test_is_permanent_device_error_not_permanent() {
+        assert!(!is_permanent_device_error("device temporarily busy"));
+        assert!(!is_permanent_device_error("device not found"));
+    }
+
+    #[test]
+    fn test_is_permanent_device_error_partial_context() {
+        assert!(is_permanent_device_error("ALSA: Permission denied"));
+        assert!(is_permanent_device_error("Access denied: /dev/snd/pcmC0D0p"));
+    }
+
+    #[test]
+    fn test_is_permanent_device_error_empty() {
+        assert!(!is_permanent_device_error(""));
+    }
+
+    // ── suggest_sample_rate ───────────────────────────────────────────────
+
+    #[test]
+    fn test_suggest_sample_rate_returns_valid() {
+        let rate = suggest_sample_rate();
+        assert!(
+            SAMPLE_RATE_OPTIONS.contains(&rate),
+            "suggested rate {} should be one of {:?}",
+            rate,
+            SAMPLE_RATE_OPTIONS,
+        );
+    }
+
+    // ── is_valid_device ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_valid_device_plugin_keyword_filtered() {
+        // Test with default host (likely ALSA or PulseAudio)
+        let host = cpal::default_host();
+        let host_id = host.id();
+        assert!(!is_valid_device("Discard all samples", &host_id), "Discard all samples should be filtered");
+        assert!(!is_valid_device("Rate Converter Plugin", &host_id), "Rate Converter Plugin should be filtered");
+        assert!(!is_valid_device("Samplerate Library", &host_id), "Samplerate Library should be filtered");
+    }
+
+    #[test]
+    fn test_is_valid_device_clean_name_allowed() {
+        let host = cpal::default_host();
+        let host_id = host.id();
+        assert!(is_valid_device("Built-in Audio Analog Stereo", &host_id));
+        assert!(is_valid_device("UMC204HD", &host_id));
+    }
+
+    #[test]
+    fn test_is_valid_device_pipewire_pulseaudio_always_allowed() {
+        // We can't mock the host, but we can verify that the logic
+        // would return true for these hosts regardless of name
+        let host = cpal::default_host();
+        let host_id = host.id();
+        // Just verify our test names are accepted under the current host
+        assert!(is_valid_device("Normal Device Name", &host_id));
+    }
+
+    // ── AudioCore: new / drain_events / sample_format_name / wake_lock ────
+
+    #[test]
+    fn test_audio_core_new_initial_state() {
+        let core = AudioCore::new();
+        assert!(core.drain_events().is_empty());
+        assert!(core.sample_format_name().is_empty());
+        assert!(!core.wake_lock_active());
+    }
+
+    #[test]
+    fn test_audio_core_drain_events_idempotent() {
+        let core = AudioCore::new();
+        assert!(core.drain_events().is_empty());
+        assert!(core.drain_events().is_empty());
+    }
+
+    #[test]
+    fn test_audio_core_current_timecode_when_not_initialized() {
+        let core = AudioCore::new();
+        let tc = core.current_timecode();
+        assert_eq!(tc.hours, 0);
+        assert_eq!(tc.minutes, 0);
+        assert_eq!(tc.seconds, 0);
+        assert_eq!(tc.frames, 0);
+    }
+
+    // ── AudioEvent types ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_audio_event_debug() {
+        let e1 = AudioEvent::StreamError("test".into());
+        let e2 = AudioEvent::StreamDied;
+        let e3 = AudioEvent::Underrun;
+        let e4 = AudioEvent::FramesDropped { total: 42 };
+        assert!(format!("{:?}", e1).contains("StreamError"));
+        assert!(format!("{:?}", e2).contains("StreamDied"));
+        assert!(format!("{:?}", e3).contains("Underrun"));
+        assert!(format!("{:?}", e4).contains("42"));
+    }
+
+    #[test]
+    fn test_audio_event_clone() {
+        let e = AudioEvent::StreamError("msg".into());
+        let cloned = e.clone();
+        assert!(matches!(cloned, AudioEvent::StreamError(ref m) if m == "msg"));
+    }
+
+    // ── SAMPLE_RATE_OPTIONS ───────────────────────────────────────────────
+
+    #[test]
+    fn test_sample_rate_options_valid() {
+        assert_eq!(SAMPLE_RATE_OPTIONS.len(), 2);
+        assert!(SAMPLE_RATE_OPTIONS.contains(&16000));
+        assert!(SAMPLE_RATE_OPTIONS.contains(&48000));
+    }
+
+    // ── Timecode ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_timecode_clone_copy() {
+        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
+        let copied = tc;
+        assert_eq!(copied, tc);
+    }
+
+    #[test]
+    fn test_timecode_debug() {
+        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
+        let d = format!("{:?}", tc);
+        assert!(d.contains("1") || d.contains("hours"));
+    }
+
+    #[test]
+    fn test_timecode_serialize_deserialize() {
+        let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
+        let json = serde_json::to_string(&tc).unwrap();
+        let deserialized: Timecode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, tc);
+    }
+}
+
 // Re-export LTC decoder types for convenience
 pub use ltc_decoder::{
     apply_coherent_first_timecode, decode_ltc_from_wav, find_first_coherent_index,

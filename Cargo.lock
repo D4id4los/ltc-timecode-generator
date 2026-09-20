@@ -613,6 +613,7 @@ dependencies = [
  "log",
  "ringbuf",
  "serde",
+ "serde_json",
  "tempfile",
  "thread-priority",
 ]

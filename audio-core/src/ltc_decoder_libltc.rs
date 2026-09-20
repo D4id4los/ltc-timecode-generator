@@ -227,3 +227,62 @@ fn error_result(msg: impl Into<String>) -> LtcDetectionResult {
         first_ltc_timecode_secs: 0.0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_result_contains_message() {
+        let r = error_result("test error");
+        assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message == "test error"));
+    }
+
+    #[test]
+    fn test_error_result_empty_message() {
+        let r = error_result("");
+        assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message.is_empty()));
+    }
+
+    #[test]
+    fn test_error_result_zeroed_fields() {
+        let r = error_result("err");
+        assert_eq!(r.detected_fps, 0.0);
+        assert!(!r.drop_frame);
+        assert_eq!(r.total_possible_frames, 0);
+        assert_eq!(r.valid_frames, 0);
+        assert!(r.timecodes.is_empty());
+        assert_eq!(r.avg_confidence, 0.0);
+        assert!(r.details.is_empty());
+        assert_eq!(r.total_audio_duration_secs, 0.0);
+        assert_eq!(r.sample_rate, 0);
+        assert_eq!(r.processing_time_ms, 0.0);
+        assert_eq!(r.first_ltc_timecode_secs, 0.0);
+    }
+
+    #[test]
+    fn test_error_result_from_string() {
+        let r = error_result("permission denied".to_string());
+        assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message == "permission denied"));
+    }
+
+    #[test]
+    fn test_decode_ltc_from_wav_libltc_rejects_non_16bit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test_32bit.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        writer.write_sample(0i32).unwrap();
+        writer.finalize().unwrap();
+
+        let result = decode_ltc_from_wav_libltc(&path, 25.0, false);
+        assert!(result.is_err(), "expected error for non-16-bit WAV");
+        let err = result.unwrap_err();
+        assert!(err.contains("32 bit"), "error should mention bit depth: {}", err);
+    }
+}

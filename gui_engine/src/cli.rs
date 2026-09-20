@@ -616,3 +616,248 @@ pub fn process_cli(cli: Cli) -> CliOutcome {
         state,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audio_core::AudioDeviceInfo;
+
+    // ── parse_timecode ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_timecode_valid() {
+        let tc = parse_timecode("01:02:03:04").unwrap();
+        assert_eq!(tc.hours, 1);
+        assert_eq!(tc.minutes, 2);
+        assert_eq!(tc.seconds, 3);
+        assert_eq!(tc.frames, 4);
+    }
+
+    #[test]
+    fn test_parse_timecode_zero() {
+        let tc = parse_timecode("00:00:00:00").unwrap();
+        assert_eq!(tc.hours, 0);
+        assert_eq!(tc.minutes, 0);
+        assert_eq!(tc.seconds, 0);
+        assert_eq!(tc.frames, 0);
+    }
+
+    #[test]
+    fn test_parse_timecode_max_valid() {
+        let tc = parse_timecode("23:59:59:29").unwrap();
+        assert_eq!(tc.hours, 23);
+        assert_eq!(tc.minutes, 59);
+        assert_eq!(tc.seconds, 59);
+        assert_eq!(tc.frames, 29);
+    }
+
+    #[test]
+    fn test_parse_timecode_wrong_segment_count() {
+        let err = parse_timecode("01:02:03").unwrap_err();
+        assert!(err.contains("HH:MM:SS:FF"), "error should mention format: {}", err);
+    }
+
+    #[test]
+    fn test_parse_timecode_too_many_segments() {
+        let err = parse_timecode("01:02:03:04:05").unwrap_err();
+        assert!(err.contains("HH:MM:SS:FF"), "error should mention format: {}", err);
+    }
+
+    #[test]
+    fn test_parse_timecode_non_numeric_hours() {
+        let err = parse_timecode("ab:00:00:00").unwrap_err();
+        assert!(err.contains("hours"), "error should mention hours: {}", err);
+    }
+
+    #[test]
+    fn test_parse_timecode_non_numeric_frames() {
+        let err = parse_timecode("00:00:00:xx").unwrap_err();
+        assert!(err.contains("frames"), "error should mention frames: {}", err);
+    }
+
+    #[test]
+    fn test_parse_timecode_hours_overflow() {
+        let err = parse_timecode("24:00:00:00").unwrap_err();
+        assert!(err.contains("0-23"), "error should mention 0-23 range: {}", err);
+    }
+
+    #[test]
+    fn test_parse_timecode_minutes_overflow() {
+        let err = parse_timecode("00:60:00:00").unwrap_err();
+        assert!(err.contains("0-59"), "error should mention 0-59 range: {}", err);
+    }
+
+    #[test]
+    fn test_parse_timecode_seconds_overflow() {
+        let err = parse_timecode("00:00:60:00").unwrap_err();
+        assert!(err.contains("0-59"), "error should mention 0-59 range: {}", err);
+    }
+
+    #[test]
+    fn test_parse_timecode_empty_string() {
+        let err = parse_timecode("").unwrap_err();
+        assert!(err.contains("HH:MM:SS:FF"), "error should mention format: {}", err);
+    }
+
+    #[test]
+    fn test_parse_timecode_negative_hours() {
+        let err = parse_timecode("-1:00:00:00").unwrap_err();
+        assert!(err.contains("hours") || err.contains("Invalid"), "error should mention hours: {}", err);
+    }
+
+    // ── timecode_fmt ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_timecode_fmt_zero() {
+        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        assert_eq!(timecode_fmt(&tc), "00:00:00:00");
+    }
+
+    #[test]
+    fn test_timecode_fmt_typical() {
+        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
+        assert_eq!(timecode_fmt(&tc), "01:02:03:04");
+    }
+
+    #[test]
+    fn test_timecode_fmt_max() {
+        let tc = Timecode { hours: 23, minutes: 59, seconds: 59, frames: 29 };
+        assert_eq!(timecode_fmt(&tc), "23:59:59:29");
+    }
+
+    #[test]
+    fn test_timecode_fmt_width() {
+        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        assert_eq!(timecode_fmt(&tc).len(), 11);
+    }
+
+    // ── resolve_device ────────────────────────────────────────────────────
+
+    fn make_devices() -> Vec<AudioDeviceInfo> {
+        vec![
+            AudioDeviceInfo {
+                id: "alsa_output.pci-0000_00_1f.3.analog-stereo".into(),
+                name: "Built-in Audio (Default)".into(),
+                is_default: true,
+                formats: vec!["f32".into(), "i16".into()],
+                channels_min: 2,
+                channels_max: 2,
+                sample_rate_min: 44100,
+                sample_rate_max: 192000,
+                buffer_min: 256,
+                buffer_max: 8192,
+            },
+            AudioDeviceInfo {
+                id: "alsa_output.usb-Behringer_UMC204HD-00.analog-stereo".into(),
+                name: "UMC204HD".into(),
+                is_default: false,
+                formats: vec!["f32".into(), "i16".into()],
+                channels_min: 2,
+                channels_max: 2,
+                sample_rate_min: 44100,
+                sample_rate_max: 96000,
+                buffer_min: 64,
+                buffer_max: 2048,
+            },
+        ]
+    }
+
+    fn default_resolve_cli() -> Cli {
+        Cli {
+            device: None, device_index: None,
+            list_devices: false, headless: false,
+            start_timecode: "01:00:00:00".into(),
+            fps: 25.0, drop_frame: false,
+            channel: "left".into(), volume: 0.25,
+            sample_rate: None, duration: None,
+            output_to_file: None, verbose: false, debug: false,
+            decode: None, decoder: "builtin".into(),
+            decode_fps: 25.0, decode_drop_frame: false,
+        }
+    }
+
+    #[test]
+    fn test_resolve_device_default_fallback() {
+        let devs = make_devices();
+        let cli = default_resolve_cli();
+        let id = resolve_device(&devs, &cli).unwrap();
+        assert_eq!(id, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+    }
+
+    #[test]
+    fn test_resolve_device_by_index() {
+        let devs = make_devices();
+        let mut cli = default_resolve_cli();
+        cli.device_index = Some(1);
+        let id = resolve_device(&devs, &cli).unwrap();
+        assert_eq!(id, "alsa_output.usb-Behringer_UMC204HD-00.analog-stereo");
+    }
+
+    #[test]
+    fn test_resolve_device_by_name_exact() {
+        let devs = make_devices();
+        let mut cli = default_resolve_cli();
+        cli.device = Some("UMC204HD".into());
+        let id = resolve_device(&devs, &cli).unwrap();
+        assert_eq!(id, "alsa_output.usb-Behringer_UMC204HD-00.analog-stereo");
+    }
+
+    #[test]
+    fn test_resolve_device_by_id_exact() {
+        let devs = make_devices();
+        let id_str = "alsa_output.pci-0000_00_1f.3.analog-stereo";
+        let mut cli = default_resolve_cli();
+        cli.device = Some(id_str.into());
+        let id = resolve_device(&devs, &cli).unwrap();
+        assert_eq!(id, id_str);
+    }
+
+    #[test]
+    fn test_resolve_device_by_substring() {
+        let devs = make_devices();
+        let mut cli = default_resolve_cli();
+        cli.device = Some("UMC204".into());
+        let id = resolve_device(&devs, &cli).unwrap();
+        assert!(id.contains("UMC204HD"), "expected UMC204HD, got {}", id);
+    }
+
+    #[test]
+    fn test_resolve_device_index_out_of_range() {
+        let devs = make_devices();
+        let mut cli = default_resolve_cli();
+        cli.device_index = Some(99);
+        let err = resolve_device(&devs, &cli).unwrap_err();
+        assert!(err.contains("out of range"), "error should mention out of range: {}", err);
+    }
+
+    #[test]
+    fn test_resolve_device_name_not_found() {
+        let devs = make_devices();
+        let mut cli = default_resolve_cli();
+        cli.device = Some("NonExistentDevice".into());
+        let err = resolve_device(&devs, &cli).unwrap_err();
+        assert!(err.contains("not found"), "error should mention not found: {}", err);
+    }
+
+    #[test]
+    fn test_resolve_device_empty_device_list() {
+        let devs: Vec<AudioDeviceInfo> = vec![];
+        let cli = default_resolve_cli();
+        let err = resolve_device(&devs, &cli).unwrap_err();
+        assert!(err.contains("No audio devices"), "error should mention no devices: {}", err);
+    }
+
+    #[test]
+    fn test_resolve_device_first_when_no_default() {
+        let devs = vec![
+            AudioDeviceInfo {
+                id: "dev1".into(), name: "Device 1".into(), is_default: false,
+                formats: vec![], channels_min: 0, channels_max: 0,
+                sample_rate_min: 0, sample_rate_max: 0, buffer_min: 0, buffer_max: 0,
+            },
+        ];
+        let cli = default_resolve_cli();
+        let id = resolve_device(&devs, &cli).unwrap();
+        assert_eq!(id, "dev1");
+    }
+}

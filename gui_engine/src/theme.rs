@@ -72,3 +72,59 @@ pub const LIGHT: ThemeColors = ThemeColors {
 pub fn palette(is_dark: bool) -> &'static ThemeColors {
     if is_dark { &DARK } else { &LIGHT }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_palette_dark() {
+        let p = palette(true);
+        assert_eq!(p.app_bg, DARK.app_bg);
+        assert_eq!(p.text_main, DARK.text_main);
+        assert_eq!(p.accent, DARK.accent);
+    }
+
+    #[test]
+    fn test_palette_light() {
+        let p = palette(false);
+        assert_eq!(p.app_bg, LIGHT.app_bg);
+        assert_eq!(p.text_main, LIGHT.text_main);
+        assert_eq!(p.accent, LIGHT.accent);
+    }
+
+    #[test]
+    fn test_palette_dark_not_light() {
+        let dark = palette(true);
+        let light = palette(false);
+        assert_ne!(dark.app_bg, light.app_bg);
+        assert_ne!(dark.text_main, light.text_main);
+    }
+
+    #[test]
+    fn test_accent_same_in_both() {
+        assert_eq!(DARK.accent, LIGHT.accent);
+    }
+
+    #[test]
+    fn test_theme_colors_are_different() {
+        assert_ne!(DARK.app_bg, DARK.card_bg);
+        assert_ne!(DARK.text_main, DARK.text_muted);
+    }
+
+    #[test]
+    fn test_rgb_new() {
+        let c = Rgb::new(0xFF, 0x5F, 0x1F);
+        assert_eq!(c.0, 0xFF);
+        assert_eq!(c.1, 0x5F);
+        assert_eq!(c.2, 0x1F);
+    }
+
+    #[test]
+    fn test_rgb_debug() {
+        let c = Rgb(255, 95, 31);
+        let d = format!("{:?}", c);
+        assert!(d.contains("255"));
+        assert!(d.contains("95"));
+    }
+}

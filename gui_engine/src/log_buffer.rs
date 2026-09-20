@@ -80,3 +80,100 @@ pub fn init_logger(
 
     Ok(buffer)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_buffer_new_creates_empty() {
+        let buf = LogBuffer::new(10);
+        assert!(buf.entries.is_empty());
+        assert_eq!(buf.max_entries, 10);
+    }
+
+    #[test]
+    fn test_log_buffer_push_adds_entry() {
+        let mut buf = LogBuffer::new(10);
+        buf.push("entry 1".to_string());
+        assert_eq!(buf.entries.len(), 1);
+        assert_eq!(buf.entries[0], "entry 1");
+    }
+
+    #[test]
+    fn test_log_buffer_push_preserves_order() {
+        let mut buf = LogBuffer::new(10);
+        buf.push("first".to_string());
+        buf.push("second".to_string());
+        buf.push("third".to_string());
+        assert_eq!(buf.entries.len(), 3);
+        assert_eq!(buf.entries[0], "first");
+        assert_eq!(buf.entries[1], "second");
+        assert_eq!(buf.entries[2], "third");
+    }
+
+    #[test]
+    fn test_log_buffer_overflow_removes_oldest() {
+        let mut buf = LogBuffer::new(3);
+        buf.push("a".to_string());
+        buf.push("b".to_string());
+        buf.push("c".to_string());
+        buf.push("d".to_string());
+        assert_eq!(buf.entries.len(), 3);
+        assert_eq!(buf.entries[0], "b");
+        assert_eq!(buf.entries[1], "c");
+        assert_eq!(buf.entries[2], "d");
+    }
+
+    #[test]
+    fn test_log_buffer_overflow_multiple() {
+        let mut buf = LogBuffer::new(2);
+        buf.push("a".to_string());
+        buf.push("b".to_string());
+        buf.push("c".to_string());
+        buf.push("d".to_string());
+        buf.push("e".to_string());
+        assert_eq!(buf.entries.len(), 2);
+        assert_eq!(buf.entries[0], "d");
+        assert_eq!(buf.entries[1], "e");
+    }
+
+    #[test]
+    fn test_log_buffer_single_entry() {
+        let mut buf = LogBuffer::new(1);
+        buf.push("only".to_string());
+        assert_eq!(buf.entries.len(), 1);
+        assert_eq!(buf.entries[0], "only");
+    }
+
+    #[test]
+    fn test_log_buffer_single_overflow() {
+        let mut buf = LogBuffer::new(1);
+        buf.push("first".to_string());
+        buf.push("second".to_string());
+        assert_eq!(buf.entries.len(), 1);
+        assert_eq!(buf.entries[0], "second");
+    }
+
+    #[test]
+    fn test_log_buffer_capacity_exact() {
+        let mut buf = LogBuffer::new(5);
+        for i in 0..5 {
+            buf.push(format!("entry {}", i));
+        }
+        assert_eq!(buf.entries.len(), 5);
+        assert_eq!(buf.entries[0], "entry 0");
+        assert_eq!(buf.entries[4], "entry 4");
+    }
+
+    #[test]
+    fn test_log_buffer_large_capacity() {
+        let mut buf = LogBuffer::new(1000);
+        for i in 0..100 {
+            buf.push(format!("entry {}", i));
+        }
+        assert_eq!(buf.entries.len(), 100);
+        assert_eq!(buf.entries[0], "entry 0");
+        assert_eq!(buf.entries[99], "entry 99");
+    }
+}

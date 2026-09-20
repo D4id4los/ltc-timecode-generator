@@ -612,3 +612,607 @@ fn attempt_recovery(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppStateSnapshot;
+    use audio_core::Timecode;
+
+    fn setup_state() -> AppStateSnapshot {
+        AppStateSnapshot::initial()
+    }
+
+    // ── stepper_hour ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stepper_hour_up() {
+        let mut state = setup_state();
+        state.start_timecode.hours = 0;
+        stepper_hour(&mut state, 1);
+        assert_eq!(state.start_timecode.hours, 1);
+    }
+
+    #[test]
+    fn test_stepper_hour_down() {
+        let mut state = setup_state();
+        state.start_timecode.hours = 5;
+        stepper_hour(&mut state, -1);
+        assert_eq!(state.start_timecode.hours, 4);
+    }
+
+    #[test]
+    fn test_stepper_hour_wrap_forward() {
+        let mut state = setup_state();
+        state.start_timecode.hours = 23;
+        stepper_hour(&mut state, 1);
+        assert_eq!(state.start_timecode.hours, 0);
+    }
+
+    #[test]
+    fn test_stepper_hour_wrap_backward() {
+        let mut state = setup_state();
+        state.start_timecode.hours = 0;
+        stepper_hour(&mut state, -1);
+        assert_eq!(state.start_timecode.hours, 23);
+    }
+
+    #[test]
+    fn test_stepper_hour_multiple_steps() {
+        let mut state = setup_state();
+        state.start_timecode.hours = 22;
+        stepper_hour(&mut state, 5);
+        assert_eq!(state.start_timecode.hours, 3);
+    }
+
+    #[test]
+    fn test_stepper_hour_other_fields_unchanged() {
+        let mut state = setup_state();
+        state.start_timecode = Timecode { hours: 5, minutes: 30, seconds: 15, frames: 10 };
+        stepper_hour(&mut state, 1);
+        assert_eq!(state.start_timecode.minutes, 30);
+        assert_eq!(state.start_timecode.seconds, 15);
+        assert_eq!(state.start_timecode.frames, 10);
+    }
+
+    // ── stepper_minute ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stepper_minute_up() {
+        let mut state = setup_state();
+        state.start_timecode.minutes = 0;
+        stepper_minute(&mut state, 1);
+        assert_eq!(state.start_timecode.minutes, 1);
+    }
+
+    #[test]
+    fn test_stepper_minute_down() {
+        let mut state = setup_state();
+        state.start_timecode.minutes = 30;
+        stepper_minute(&mut state, -1);
+        assert_eq!(state.start_timecode.minutes, 29);
+    }
+
+    #[test]
+    fn test_stepper_minute_wrap_forward() {
+        let mut state = setup_state();
+        state.start_timecode.minutes = 59;
+        stepper_minute(&mut state, 1);
+        assert_eq!(state.start_timecode.minutes, 0);
+    }
+
+    #[test]
+    fn test_stepper_minute_wrap_backward() {
+        let mut state = setup_state();
+        state.start_timecode.minutes = 0;
+        stepper_minute(&mut state, -1);
+        assert_eq!(state.start_timecode.minutes, 59);
+    }
+
+    #[test]
+    fn test_stepper_minute_large_delta() {
+        let mut state = setup_state();
+        state.start_timecode.minutes = 5;
+        stepper_minute(&mut state, 100);
+        assert_eq!(state.start_timecode.minutes, 45);
+    }
+
+    // ── stepper_second ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stepper_second_up() {
+        let mut state = setup_state();
+        state.start_timecode.seconds = 0;
+        stepper_second(&mut state, 1);
+        assert_eq!(state.start_timecode.seconds, 1);
+    }
+
+    #[test]
+    fn test_stepper_second_wrap_forward() {
+        let mut state = setup_state();
+        state.start_timecode.seconds = 59;
+        stepper_second(&mut state, 1);
+        assert_eq!(state.start_timecode.seconds, 0);
+    }
+
+    #[test]
+    fn test_stepper_second_wrap_backward() {
+        let mut state = setup_state();
+        state.start_timecode.seconds = 0;
+        stepper_second(&mut state, -1);
+        assert_eq!(state.start_timecode.seconds, 59);
+    }
+
+    #[test]
+    fn test_stepper_second_down() {
+        let mut state = setup_state();
+        state.start_timecode.seconds = 30;
+        stepper_second(&mut state, -5);
+        assert_eq!(state.start_timecode.seconds, 25);
+    }
+
+    // ── stepper_frame ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stepper_frame_up() {
+        let mut state = setup_state();
+        state.fps = 25.0;
+        state.start_timecode.frames = 0;
+        stepper_frame(&mut state, 1);
+        assert_eq!(state.start_timecode.frames, 1);
+    }
+
+    #[test]
+    fn test_stepper_frame_wrap_forward_25fps() {
+        let mut state = setup_state();
+        state.fps = 25.0;
+        state.start_timecode.frames = 24;
+        stepper_frame(&mut state, 1);
+        assert_eq!(state.start_timecode.frames, 0);
+    }
+
+    #[test]
+    fn test_stepper_frame_wrap_forward_30fps() {
+        let mut state = setup_state();
+        state.fps = 30.0;
+        state.start_timecode.frames = 29;
+        stepper_frame(&mut state, 1);
+        assert_eq!(state.start_timecode.frames, 0);
+    }
+
+    #[test]
+    fn test_stepper_frame_wrap_forward_24fps() {
+        let mut state = setup_state();
+        state.fps = 24.0;
+        state.start_timecode.frames = 23;
+        stepper_frame(&mut state, 1);
+        assert_eq!(state.start_timecode.frames, 0);
+    }
+
+    #[test]
+    fn test_stepper_frame_down() {
+        let mut state = setup_state();
+        state.fps = 25.0;
+        state.start_timecode.frames = 15;
+        stepper_frame(&mut state, -1);
+        assert_eq!(state.start_timecode.frames, 14);
+    }
+
+    #[test]
+    fn test_stepper_frame_wrap_backward_25fps() {
+        let mut state = setup_state();
+        state.fps = 25.0;
+        state.start_timecode.frames = 0;
+        stepper_frame(&mut state, -1);
+        assert_eq!(state.start_timecode.frames, 24);
+    }
+
+    #[test]
+    fn test_stepper_frame_wrap_backward_30fps() {
+        let mut state = setup_state();
+        state.fps = 30.0;
+        state.start_timecode.frames = 0;
+        stepper_frame(&mut state, -1);
+        assert_eq!(state.start_timecode.frames, 29);
+    }
+
+    #[test]
+    fn test_stepper_frame_fps_changes_max() {
+        let mut state = setup_state();
+        state.fps = 25.0;
+        state.start_timecode.frames = 24;
+        stepper_frame(&mut state, 1);
+        assert_eq!(state.start_timecode.frames, 0, "25fps: 24→0");
+
+        state.fps = 30.0;
+        state.start_timecode.frames = 29;
+        stepper_frame(&mut state, 1);
+        assert_eq!(state.start_timecode.frames, 0, "30fps: 29→0");
+
+        state.fps = 24.0;
+        state.start_timecode.frames = 23;
+        stepper_frame(&mut state, 1);
+        assert_eq!(state.start_timecode.frames, 0, "24fps: 23→0");
+    }
+
+    #[test]
+    fn test_stepper_frame_large_delta() {
+        let mut state = setup_state();
+        state.fps = 25.0;
+        state.start_timecode.frames = 5;
+        stepper_frame(&mut state, 50);
+        assert_eq!(state.start_timecode.frames, 5);
+    }
+
+    // ── ProcessCommand: basic command effects on state ────────────────────
+
+    #[test]
+    fn test_process_command_toggle_lock() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        // ToggleLock on: false → true
+        process_command(
+            GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
+            &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+        );
+        assert!(state.is_locked);
+    }
+
+    #[test]
+    fn test_process_command_toggle_lock_twice() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
+            &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        process_command(GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
+            &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!(!state.is_locked);
+    }
+
+    #[test]
+    fn test_process_command_set_fps_index_valid() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetFpsIndex(4), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.fps_index, 4);
+        assert_eq!(state.fps, 30.0);
+        assert!(!state.drop_frame);
+    }
+
+    #[test]
+    fn test_process_command_set_fps_index_drop_frame() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetFpsIndex(3), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.fps_index, 3);
+        assert!((state.fps - 29.97).abs() < 0.01);
+        assert!(state.drop_frame);
+    }
+
+    #[test]
+    fn test_process_command_set_fps_index_out_of_range() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetFpsIndex(99), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.fps_index, 1);
+        assert_eq!(state.fps, 25.0);
+    }
+
+    #[test]
+    fn test_process_command_set_theme() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetTheme(true), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!(state.is_dark_theme);
+
+        process_command(GuiCommand::SetTheme(false), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!(!state.is_dark_theme);
+    }
+
+    #[test]
+    fn test_process_command_toggle_theme() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::ToggleTheme, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!(state.is_dark_theme, "toggle from initial false → true");
+
+        process_command(GuiCommand::ToggleTheme, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!(!state.is_dark_theme, "toggle again true → false");
+    }
+
+    #[test]
+    fn test_process_command_clear_logs() {
+        let mut state = setup_state();
+        state.logs.push(ClapLogItem {
+            id: "1".into(), timestamp: "12:00:00".into(),
+            timecode: "01:00:00:00".into(), milliseconds: "0".into(), note: "test".into(),
+        });
+        state.logs.push(ClapLogItem {
+            id: "2".into(), timestamp: "12:00:01".into(),
+            timecode: "01:00:00:01".into(), milliseconds: "0".into(), note: "test2".into(),
+        });
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::ClearLogs, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!(state.logs.is_empty());
+    }
+
+    #[test]
+    fn test_process_command_set_ltc_channel() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetLtcChannel("both".into()), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.ltc_channel, "both");
+    }
+
+    #[test]
+    fn test_process_command_set_beep_volume() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetBeepVolume(0.75), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!((state.beep_volume - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_process_command_set_start_timecode() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
+
+        process_command(GuiCommand::SetStartTimecode(tc), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.start_timecode, tc);
+    }
+
+    #[test]
+    fn test_process_command_set_scene_take_roll() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetScene(42), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.scene, 42);
+
+        process_command(GuiCommand::SetTake(7), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.take, 7);
+
+        process_command(GuiCommand::SetRoll("B002".into()), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.roll, "B002");
+    }
+
+    #[test]
+    fn test_process_command_scene_up_down() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        state.scene = 5;
+        process_command(GuiCommand::SceneUp, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.scene, 6);
+
+        process_command(GuiCommand::SceneDown, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.scene, 5);
+    }
+
+    #[test]
+    fn test_process_command_take_up_down() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        state.take = 3;
+        process_command(GuiCommand::TakeUp, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.take, 4);
+
+        process_command(GuiCommand::TakeDown, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.take, 3);
+    }
+
+    #[test]
+    fn test_process_command_scene_down_at_zero() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        state.scene = 0;
+        process_command(GuiCommand::SceneDown, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.scene, 0, "scene should not go below 0");
+    }
+
+    #[test]
+    fn test_process_command_take_down_at_zero() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        state.take = 0;
+        process_command(GuiCommand::TakeDown, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.take, 0, "take should not go below 0");
+    }
+
+    #[test]
+    fn test_process_command_set_sample_rate() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetSampleRate(48000), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.sample_rate, 48000);
+    }
+
+    #[test]
+    fn test_process_command_set_auto_increment() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetAutoIncrement(false), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!(!state.auto_increment_take);
+
+        process_command(GuiCommand::SetAutoIncrement(true), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!(state.auto_increment_take);
+    }
+
+    #[test]
+    fn test_process_command_set_decode_fps_index() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetDecodeFpsIndex(4), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert_eq!(state.decode_fps_index, 4);
+        assert_eq!(state.decode_fps, 30.0);
+        assert!(!state.decode_drop_frame);
+    }
+
+    #[test]
+    fn test_process_command_set_decode_fps_index_drop_frame() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetDecodeFpsIndex(3), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        assert!((state.decode_fps - 29.97).abs() < 0.01);
+        assert!(state.decode_drop_frame);
+    }
+
+    #[test]
+    fn test_process_command_set_decode_fps_index_out_of_range() {
+        let mut state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        process_command(GuiCommand::SetDecodeFpsIndex(99), &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx);
+        // Should not change since index is out of range
+        assert_eq!(state.decode_fps_index, 1);
+    }
+}

@@ -139,3 +139,166 @@ impl AppStateSnapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn initial_state() -> AppStateSnapshot {
+        AppStateSnapshot::initial()
+    }
+
+    // ── Transport defaults ────────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_is_playing_false() {
+        assert!(!initial_state().is_playing);
+    }
+
+    #[test]
+    fn test_initial_is_locked_false() {
+        assert!(!initial_state().is_locked);
+    }
+
+    #[test]
+    fn test_initial_start_timecode() {
+        let s = initial_state();
+        assert_eq!(s.start_timecode.hours, 1);
+        assert_eq!(s.start_timecode.minutes, 0);
+        assert_eq!(s.start_timecode.seconds, 0);
+        assert_eq!(s.start_timecode.frames, 0);
+    }
+
+    #[test]
+    fn test_initial_current_timecode_matches_start() {
+        let s = initial_state();
+        assert_eq!(s.current_timecode, s.start_timecode);
+    }
+
+    // ── FPS defaults ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_fps() {
+        let s = initial_state();
+        assert_eq!(s.fps_index, 1);
+        assert_eq!(s.fps, 25.0);
+        assert!(!s.drop_frame);
+    }
+
+    // ── Audio routing defaults ────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_audio_routing() {
+        let s = initial_state();
+        assert_eq!(s.ltc_channel, "left");
+        assert_eq!(s.beep_channel, "right");
+        assert!((s.ltc_volume - 0.25).abs() < 1e-6);
+        assert!((s.beep_volume - 0.5).abs() < 1e-6);
+        assert!((s.beep_frequency - 1000.0).abs() < 1e-6);
+        assert!((s.beep_duration - 0.5).abs() < 1e-6);
+    }
+
+    // ── Audio device defaults ─────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_audio_state() {
+        let s = initial_state();
+        assert!(s.devices.is_empty());
+        assert_eq!(s.selected_device, 0);
+        assert!(!s.audio_initialized);
+        assert!(s.sample_format_name.is_empty());
+        assert!(!s.wake_lock_active);
+    }
+
+    #[test]
+    fn test_initial_sample_rate_is_valid() {
+        let s = initial_state();
+        assert!(
+            audio_core::SAMPLE_RATE_OPTIONS.contains(&s.sample_rate),
+            "sample_rate {} should be one of {:?}",
+            s.sample_rate,
+            audio_core::SAMPLE_RATE_OPTIONS,
+        );
+    }
+
+    // ── Clapper defaults ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_clapper() {
+        let s = initial_state();
+        assert_eq!(s.scene, 1);
+        assert_eq!(s.take, 1);
+        assert_eq!(s.roll, "A001");
+        assert!(s.auto_increment_take);
+    }
+
+    #[test]
+    fn test_initial_logs_empty() {
+        assert!(initial_state().logs.is_empty());
+    }
+
+    // ── Animation defaults ────────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_animation() {
+        let s = initial_state();
+        assert_eq!(s.clap_flash_alpha, 0.0);
+        assert!((s.clap_arm_angle - (-25.0f32).to_radians()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_initial_clap_arm_angle_negative() {
+        let s = initial_state();
+        assert!(s.clap_arm_angle < 0.0);
+    }
+
+    // ── Theme defaults ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_theme_light() {
+        assert!(!initial_state().is_dark_theme);
+    }
+
+    // ── Status defaults ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_status() {
+        assert_eq!(initial_state().status_message, "Ready");
+    }
+
+    // ── LTC decode defaults ───────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_decode_state() {
+        let s = initial_state();
+        assert_eq!(s.decode_fps_index, 1);
+        assert_eq!(s.decode_fps, 25.0);
+        assert!(!s.decode_drop_frame);
+        assert!(!s.use_libltc);
+        assert!(s.ltc_decode_result.is_none());
+        assert!(s.ltc_decode_error.is_none());
+        assert!(!s.ltc_is_detecting);
+        assert_eq!(s.ltc_decode_generation, 0);
+    }
+
+    // ── Generation field ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_generation_zero() {
+        assert_eq!(initial_state().generation, 0);
+    }
+
+    // ── Clone produces independent copy ───────────────────────────────────
+
+    #[test]
+    fn test_state_clone_is_independent() {
+        let mut a = AppStateSnapshot::initial();
+        let mut b = a.clone();
+        a.scene = 99;
+        b.take = 88;
+        assert_eq!(a.scene, 99);
+        assert_eq!(b.scene, 1);
+        assert_eq!(a.take, 1);
+        assert_eq!(b.take, 88);
+    }
+}
