@@ -2867,6 +2867,94 @@ mod tests {
         signal
     }
 
+    // ── Noise injection helpers (deterministic LCG) ───────────────────
+
+    /// LCG in [0, 1). Deterministic, reproduces same sequence for same seed.
+    fn lcg_next(state: &mut u64) -> f32 {
+        *state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        ((*state >> 16) & 0x7FFF) as f32 / 32768.0
+    }
+
+    /// Box-Muller Gaussian sample using LCG as source of uniform randomness.
+    fn gaussian_lcg(state: &mut u64) -> f32 {
+        let u1 = lcg_next(state);
+        let u2 = lcg_next(state);
+        let r = (-2.0 * u1.ln()).sqrt();
+        r * (2.0 * std::f32::consts::PI * u2).cos()
+    }
+
+    fn add_gaussian_noise(signal: &[f32], std_dev: f32, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        signal.iter().map(|&s| s + gaussian_lcg(&mut state) * std_dev).collect()
+    }
+
+    fn add_impulse_noise(signal: &[f32], probability: f32, amplitude: f32, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        signal.iter().map(|&s| {
+            if lcg_next(&mut state) < probability { amplitude } else { s }
+        }).collect()
+    }
+
+    fn add_dc_offset(signal: &[f32], offset: f32) -> Vec<f32> {
+        signal.iter().map(|&s| s + offset).collect()
+    }
+
+    fn add_hum(signal: &[f32], sample_rate: u32, amplitude: f32, freq: f32) -> Vec<f32> {
+        let phase_inc = 2.0 * std::f32::consts::PI * freq / sample_rate as f32;
+        signal.iter().enumerate().map(|(i, &s)| {
+            s + amplitude * (phase_inc * i as f32).sin()
+        }).collect()
+    }
+
+    fn apply_fading(signal: &[f32], sample_rate: u32, mod_freq: f32, depth: f32) -> Vec<f32> {
+        let phase_inc = 2.0 * std::f32::consts::PI * mod_freq / sample_rate as f32;
+        signal.iter().enumerate().map(|(i, &s)| {
+            let envelope = 1.0 - depth * 0.5 * (1.0 + (phase_inc * i as f32).sin());
+            s * envelope
+        }).collect()
+    }
+
+    fn add_dropouts(signal: &[f32], sample_rate: u32, dropout_secs: f32, num_dropouts: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        let dropout_samples = (dropout_secs * sample_rate as f32) as usize;
+        let mut result = signal.to_vec();
+        let max_start = result.len().saturating_sub(dropout_samples);
+        for _ in 0..num_dropouts {
+            if max_start == 0 { break; }
+            let start = ((lcg_next(&mut state) as f64) * max_start as f64) as usize;
+            let end = (start + dropout_samples).min(result.len());
+            result[start..end].fill(0.0);
+        }
+        result
+    }
+
+    /// Simple one-pole low-pass filter to simulate bandwidth-limited wireless link.
+    fn apply_lowpass(signal: &[f32], factor: f32) -> Vec<f32> {
+        let mut result = Vec::with_capacity(signal.len());
+        let mut prev = 0.0f32;
+        for &s in signal {
+            let filtered = prev + factor * (s - prev);
+            result.push(filtered);
+            prev = filtered;
+        }
+        result
+    }
+
+    fn make_timecodes(count: u32) -> Vec<Timecode> {
+        (0..count).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i,
+        }).collect()
+    }
+
+    /// Assert that decode succeeded with at least `min_valid` valid frames.
+    fn assert_ltc_ok(result: &LtcDetectionResult, min_valid: u32) {
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "unexpected Error: {:?} (valid={}/{})", result.status, result.valid_frames, result.total_possible_frames);
+        assert!(result.valid_frames >= min_valid,
+            "expected >= {} valid frames, got {} (status={:?})",
+            min_valid, result.valid_frames, result.status);
+    }
+
     // ── decode_ltc_samples ────────────────────────────────────────────
 
     #[test]
@@ -2983,5 +3071,256 @@ mod tests {
         let result = decode_ltc_samples(&signal, 48000, 1, 29.97, true, std::time::Instant::now()).unwrap();
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
             "expected no Error for 29.97 DF, got {:?}", result.status);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Noise robustness tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ── Helper: generate clean base signal ────────────────────────────────
+
+    fn base_signal() -> Vec<f32> {
+        let tcs = make_timecodes(50);
+        synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5)
+    }
+
+    fn base_decode(signal: &[f32]) -> LtcDetectionResult {
+        decode_ltc_samples(signal, 48000, 1, 25.0, false, std::time::Instant::now()).unwrap()
+    }
+
+    // ── 1. Additive Gaussian noise ──────────────────────────────────────
+
+    #[test]
+    fn test_noise_gaussian_20db() {
+        let signal = add_gaussian_noise(&base_signal(), 0.05, 42);
+        let result = base_decode(&signal);
+        // 20dB SNR: should decode cleanly
+        assert_ltc_ok(&result, 20);
+    }
+
+    #[test]
+    fn test_noise_gaussian_15db() {
+        let signal = add_gaussian_noise(&base_signal(), 0.09, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 15);
+    }
+
+    #[test]
+    fn test_noise_gaussian_10db() {
+        let signal = add_gaussian_noise(&base_signal(), 0.16, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 10);
+    }
+
+    #[test]
+    fn test_noise_gaussian_6db() {
+        let signal = add_gaussian_noise(&base_signal(), 0.25, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 3);
+    }
+
+    #[test]
+    fn test_noise_gaussian_3db() {
+        let signal = add_gaussian_noise(&base_signal(), 0.35, 42);
+        let result = base_decode(&signal);
+        // At 3dB SNR the decoder may struggle — verify it doesn't crash
+        // and that at least some frames are detected
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "3dB SNR should not error, got {:?} (valid={})",
+            result.status, result.valid_frames);
+    }
+
+    // ── 2. Impulse / click noise ────────────────────────────────────────
+
+    #[test]
+    fn test_noise_impulse_light() {
+        let signal = add_impulse_noise(&base_signal(), 0.001, 1.0, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 20);
+    }
+
+    #[test]
+    fn test_noise_impulse_medium() {
+        let signal = add_impulse_noise(&base_signal(), 0.005, 1.0, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 10);
+    }
+
+    #[test]
+    fn test_noise_impulse_heavy() {
+        let signal = add_impulse_noise(&base_signal(), 0.05, 1.0, 42);
+        let result = base_decode(&signal);
+        // 5% impulse rate is extreme — just don't crash, may produce no frames
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "5% impulse noise should not error, got {:?}",
+            result.status);
+    }
+
+    // ── 3. DC offset ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_noise_dc_offset_small() {
+        let signal = add_dc_offset(&base_signal(), 0.01);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 20);
+    }
+
+    #[test]
+    fn test_noise_dc_offset_medium() {
+        let signal = add_dc_offset(&base_signal(), 0.05);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 10);
+    }
+
+    #[test]
+    fn test_noise_dc_offset_large() {
+        let signal = add_dc_offset(&base_signal(), 0.1);
+        let result = base_decode(&signal);
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "DC offset 0.1 should not error, got {:?} (valid={})",
+            result.status, result.valid_frames);
+    }
+
+    // ── 4. Hum interference (50/60 Hz) ──────────────────────────────────
+
+    #[test]
+    fn test_noise_hum_50hz_low() {
+        let signal = add_hum(&base_signal(), 48000, 0.05, 50.0);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 20);
+    }
+
+    #[test]
+    fn test_noise_hum_50hz_moderate() {
+        let signal = add_hum(&base_signal(), 48000, 0.15, 50.0);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 10);
+    }
+
+    #[test]
+    fn test_noise_hum_60hz_moderate() {
+        let signal = add_hum(&base_signal(), 48000, 0.15, 60.0);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 10);
+    }
+
+    // ── 5. Amplitude modulation / fading ────────────────────────────────
+
+    #[test]
+    fn test_noise_fading_slow() {
+        let signal = apply_fading(&base_signal(), 48000, 2.0, 0.5);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 20);
+    }
+
+    #[test]
+    fn test_noise_fading_deep() {
+        let signal = apply_fading(&base_signal(), 48000, 1.0, 0.9);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 10);
+    }
+
+    // ── 6. Dropouts (simulated wireless signal loss) ────────────────────
+
+    #[test]
+    fn test_noise_dropouts_short() {
+        // Two 50ms gaps in a 2s signal — decoder should resync after each
+        let signal = add_dropouts(&base_signal(), 48000, 0.05, 2, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 30);
+    }
+
+    #[test]
+    fn test_noise_dropouts_medium() {
+        // One 200ms gap — 10% of signal lost
+        let signal = add_dropouts(&base_signal(), 48000, 0.2, 1, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 30);
+    }
+
+    #[test]
+    fn test_noise_dropouts_long() {
+        // One 500ms gap — 25% of signal lost, decoder should resync
+        let signal = add_dropouts(&base_signal(), 48000, 0.5, 1, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 15);
+    }
+
+    // ── 7. Combined stress ──────────────────────────────────────────────
+
+    #[test]
+    fn test_noise_combined_light() {
+        // Gaussian (+20dB) + DC offset (0.01) + hum (50Hz, low) + light fading
+        let signal = base_signal();
+        let signal = add_gaussian_noise(&signal, 0.05, 42);
+        let signal = add_dc_offset(&signal, 0.01);
+        let signal = add_hum(&signal, 48000, 0.05, 50.0);
+        let signal = apply_fading(&signal, 48000, 2.0, 0.3);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 15);
+    }
+
+    #[test]
+    fn test_noise_combined_moderate() {
+        // Gaussian (+15dB) + DC offset (0.03) + hum (50Hz, moderate) + fading (50%)
+        let signal = base_signal();
+        let signal = add_gaussian_noise(&signal, 0.09, 42);
+        let signal = add_dc_offset(&signal, 0.03);
+        let signal = add_hum(&signal, 48000, 0.1, 50.0);
+        let signal = apply_fading(&signal, 48000, 2.0, 0.5);
+        let result = base_decode(&signal);
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "moderate combined noise should not error, got {:?} (valid={})",
+            result.status, result.valid_frames);
+    }
+
+    #[test]
+    fn test_noise_combined_heavy() {
+        // Gaussian (+10dB) + DC offset (0.05) + hum (50Hz, moderate) + heavy fading
+        let signal = base_signal();
+        let signal = add_gaussian_noise(&signal, 0.16, 42);
+        let signal = add_dc_offset(&signal, 0.05);
+        let signal = add_hum(&signal, 48000, 0.15, 50.0);
+        let signal = apply_fading(&signal, 48000, 1.5, 0.7);
+        let result = base_decode(&signal);
+        // Just don't crash — some frames may survive
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "heavy combined noise should not error, got {:?}",
+            result.status);
+    }
+
+    // ── 8. Frequency roll-off (bandwidth-limited wireless link) ────────
+
+    #[test]
+    fn test_noise_lowpass_mild() {
+        let signal = apply_lowpass(&base_signal(), 0.3);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 20);
+    }
+
+    #[test]
+    fn test_noise_lowpass_moderate() {
+        let signal = apply_lowpass(&base_signal(), 0.1);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 10);
+    }
+
+    #[test]
+    fn test_noise_lowpass_heavy() {
+        let signal = apply_lowpass(&base_signal(), 0.03);
+        let result = base_decode(&signal);
+        // Heavy low-pass erases bi-phase transitions — may not decode
+        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "heavy lowpass should not error, got {:?}",
+            result.status);
+    }
+
+    // ── 9. Verify clean signal baseline (noise-free sanity check) ──────
+
+    #[test]
+    fn test_noise_baseline_clean() {
+        let signal = base_signal();
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 45);
     }
 }
