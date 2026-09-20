@@ -1030,9 +1030,11 @@ pub fn decode_ltc_chunked(
         sample_rate: last_sample_rate,
         processing_time_ms,
         first_ltc_timecode_secs: if first_tc_secs < f64::MAX { first_tc_secs } else { 0.0 },
+        quality: None,
     };
 
     apply_coherent_first_timecode(&mut result);
+    result.quality = compute_ltc_quality(&result);
 
     info!("decode_ltc_chunked complete: {} valid / {} possible ({:.1}%) in {:.1}ms",
         result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0, processing_time_ms);
@@ -2312,9 +2314,9 @@ mod tests {
 
 // Re-export LTC decoder types for convenience
 pub use ltc_decoder::{
-    apply_coherent_first_timecode, decode_ltc_from_wav, decode_ltc_samples,
+    apply_coherent_first_timecode, compute_ltc_quality, decode_ltc_from_wav, decode_ltc_samples,
     find_first_coherent_index, quick_check_ltc, FrameTimecode, LtcDecodeStatus,
-    LtcDetectionResult,
+    LtcDetectionResult, LtcQualityReport,
 };
 pub use ltc_decoder_libltc::{decode_ltc_from_wav_libltc, decode_ltc_samples_libltc};
 

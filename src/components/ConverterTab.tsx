@@ -76,6 +76,19 @@ type LtcDecodeStatus =
   | { type: "LowConfidence" }
   | { type: "Error"; message: string };
 
+interface LtcQualityReport {
+  score: number;
+  grade: string;
+  missing_frames: number;
+  gap_count: number;
+  glitch_count: number;
+  edit_count: number;
+  max_drift_secs: number;
+  drift_rate: number;
+  largest_block: number;
+  summary: string;
+}
+
 interface LtcDetectionResult {
   status: LtcDecodeStatus;
   detected_fps: number;
@@ -89,6 +102,7 @@ interface LtcDetectionResult {
   sample_rate: number;
   processing_time_ms: number;
   first_ltc_timecode_secs: number;
+  quality: LtcQualityReport | null;
 }
 
 const VIDEO_ENCODERS: [string, string][] = [
@@ -1122,6 +1136,61 @@ function LtcResultDisplay({ result }: { result: LtcDetectionResult }) {
           <span className="text-text-title font-mono font-semibold">
             {result.processing_time_ms.toFixed(1)} ms
           </span>
+        </div>
+      )}
+
+      {/* Quality report */}
+      {result.quality && (
+        <div
+          className={`mt-2 p-2 rounded border ${
+            result.quality.score >= 0.95
+              ? "bg-[#22C55E]/10 border-[#22C55E]/30"
+              : result.quality.score >= 0.8
+                ? "bg-[#22C55E]/5 border-[#22C55E]/20"
+                : result.quality.score >= 0.6
+                  ? "bg-[#F59E0B]/10 border-[#F59E0B]/30"
+                  : "bg-[#EF4444]/10 border-[#EF4444]/30"
+          }`}
+        >
+          <div className="flex items-center gap-2 text-xs">
+            <span className="text-text-muted">Quality:</span>
+            <span
+              className={`font-mono font-bold ${
+                result.quality.score >= 0.8
+                  ? "text-[#22C55E]"
+                  : result.quality.score >= 0.6
+                    ? "text-[#F59E0B]"
+                    : "text-[#EF4444]"
+              }`}
+            >
+              {(result.quality.score * 100).toFixed(0)}%
+            </span>
+            <span
+              className={`font-semibold ${
+                result.quality.score >= 0.8
+                  ? "text-[#22C55E]"
+                  : result.quality.score >= 0.6
+                    ? "text-[#F59E0B]"
+                    : "text-[#EF4444]"
+              }`}
+            >
+              {result.quality.grade}
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-text-muted font-mono mt-0.5">
+            <span>
+              {result.quality.edit_count > 0
+                ? `${result.quality.edit_count} edit(s)`
+                : result.quality.glitch_count > 0 || result.quality.gap_count > 0
+                  ? `${result.quality.gap_count} gap(s), ${result.quality.glitch_count} glitch(es)`
+                  : result.quality.missing_frames > 0
+                    ? `${result.quality.missing_frames} missing`
+                    : "All frames contiguous"}
+            </span>
+            {result.quality.max_drift_secs > 0.01 && (
+              <span>drift {result.quality.max_drift_secs.toFixed(3)}s</span>
+            )}
+          </div>
         </div>
       )}
 

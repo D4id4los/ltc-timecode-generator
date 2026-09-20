@@ -118,14 +118,27 @@ pub fn setup_poll_timer(
                             _ => "—".to_string(),
                         };
                         ui.set_ltc_status(SharedString::from(status_str));
+                        let quality_str = r.quality.as_ref().map(|q| {
+                            let issues = if q.edit_count > 0 {
+                                format!("{} edit(s)", q.edit_count)
+                            } else if q.glitch_count > 0 || q.gap_count > 0 {
+                                format!("{}/{} gap/glitch", q.gap_count, q.glitch_count)
+                            } else if q.missing_frames > 0 {
+                                format!("{} missing", q.missing_frames)
+                            } else {
+                                "perfect".to_string()
+                            };
+                            format!(" | Quality: {:.0}% ({}) {}", q.score * 100.0, q.grade, issues)
+                        }).unwrap_or_default();
                         ui.set_ltc_result_text(SharedString::from(format!(
-                            "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms",
+                            "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms{}",
                             fps_str,
                             r.avg_confidence * 100.0,
                             r.valid_frames,
                             r.total_possible_frames,
                             tc_range,
                             r.processing_time_ms,
+                            quality_str,
                         )));
                         ui.set_ltc_error(SharedString::from(""));
                     }

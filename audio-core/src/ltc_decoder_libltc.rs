@@ -4,7 +4,7 @@ use std::time::Instant;
 use libltc_rs::prelude::*;
 use log::{debug, info, warn};
 
-use crate::ltc_decoder::{apply_coherent_first_timecode, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
+use crate::ltc_decoder::{apply_coherent_first_timecode, compute_ltc_quality, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
 use crate::Timecode;
 
 pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
@@ -179,9 +179,11 @@ pub fn decode_ltc_samples_libltc(
         sample_rate,
         processing_time_ms,
         first_ltc_timecode_secs: first_secs,
+        quality: None,
     };
 
     apply_coherent_first_timecode(&mut result);
+    result.quality = compute_ltc_quality(&result);
 
     info!(
         "libltc decode complete: {} valid / {} possible ({:.1}%) in {:.1}ms, first_ltc_timecode_secs={:.3}s",
@@ -211,6 +213,7 @@ fn error_result(msg: impl Into<String>) -> LtcDetectionResult {
         sample_rate: 0,
         processing_time_ms: 0.0,
         first_ltc_timecode_secs: 0.0,
+        quality: None,
     }
 }
 

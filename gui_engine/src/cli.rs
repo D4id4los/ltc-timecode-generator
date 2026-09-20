@@ -626,6 +626,17 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     for detail in &result.details {
         println!("  {}", detail);
     }
+
+    if let Some(ref q) = result.quality {
+        println!();
+        println!("=== LTC Quality ===");
+        println!("  Score:        {:.2} / 1.00 ({})", q.score, q.grade);
+        println!("  Frames:       {} missing, {} largest block", q.missing_frames, q.largest_block);
+        println!("  Contiguity:   {} gap(s), {} glitch(es), {} edit point(s)", q.gap_count, q.glitch_count, q.edit_count);
+        println!("  Sync drift:   max {:.3}s, rate {:.4} s/s", q.max_drift_secs, q.drift_rate);
+        println!("  Summary:      {}", q.summary);
+    }
+
     println!();
 
     Ok(())

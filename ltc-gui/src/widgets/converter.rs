@@ -513,6 +513,62 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                 ui.end_row();
             });
 
+            // Quality report
+            if let Some(ref q) = result.quality {
+                ui.add_space(4.0);
+
+                let (grade_color, grade_bg) = if q.score >= 0.95 {
+                    (colors.success_green, colors.success_green.linear_multiply(0.12))
+                } else if q.score >= 0.80 {
+                    (colors.success_green, colors.success_green.linear_multiply(0.08))
+                } else if q.score >= 0.60 {
+                    (colors.warning_amber, colors.warning_amber.linear_multiply(0.10))
+                } else if q.score >= 0.30 {
+                    (colors.error_red, colors.error_red.linear_multiply(0.10))
+                } else {
+                    (colors.error_red, colors.error_red.linear_multiply(0.15))
+                };
+
+                let quality_frame = egui::Frame::new()
+                    .fill(grade_bg)
+                    .corner_radius(4.0)
+                    .stroke(egui::Stroke::new(0.5, grade_color.linear_multiply(0.3)))
+                    .inner_margin(egui::Margin::symmetric(8, 4));
+                quality_frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Quality:")
+                            .font(FontId::proportional(9.0))
+                            .color(colors.text_muted));
+                        ui.label(RichText::new(format!("{:.0}%", q.score * 100.0))
+                            .font(FontId::monospace(11.0))
+                            .color(grade_color)
+                            .strong());
+                        ui.label(RichText::new(&q.grade)
+                            .font(FontId::proportional(9.0))
+                            .color(grade_color));
+                    });
+                    ui.horizontal(|ui| {
+                        let issues = if q.edit_count > 0 {
+                            format!("{} edit(s)", q.edit_count)
+                        } else if q.glitch_count > 0 || q.gap_count > 0 {
+                            format!("{} gap(s), {} glitch(es)", q.gap_count, q.glitch_count)
+                        } else if q.missing_frames > 0 {
+                            format!("{} missing", q.missing_frames)
+                        } else {
+                            "perfect".to_string()
+                        };
+                        ui.label(RichText::new(issues)
+                            .font(FontId::monospace(8.0))
+                            .color(colors.text_muted));
+                        if q.max_drift_secs > 0.01 {
+                            ui.label(RichText::new(format!("drift {:.3}s", q.max_drift_secs))
+                                .font(FontId::monospace(8.0))
+                                .color(colors.text_muted));
+                        }
+                    });
+                });
+            }
+
             // Collapsible timecode list
             if !result.timecodes.is_empty() {
                 ui.add_space(4.0);

@@ -45,6 +45,31 @@ pub struct LtcDetectionResult {
     pub sample_rate: u32,
     pub processing_time_ms: f64,
     pub first_ltc_timecode_secs: f64,
+    pub quality: Option<LtcQualityReport>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LtcQualityReport {
+    /// Overall quality score 0.0–1.0
+    pub score: f64,
+    /// Human-readable grade: Excellent / Good / Fair / Poor / Bad
+    pub grade: String,
+    /// Number of undetected frames (total_possible - valid)
+    pub missing_frames: u32,
+    /// Number of gaps between contiguous frame blocks
+    pub gap_count: u32,
+    /// Number of isolated glitch frames (single-frame outliers)
+    pub glitch_count: u32,
+    /// Number of edit points (jumps where LTC shifts and continues consecutively)
+    pub edit_count: u32,
+    /// Maximum drift between LTC and audio position (seconds)
+    pub max_drift_secs: f64,
+    /// Drift rate (seconds of drift per second of audio)
+    pub drift_rate: f64,
+    /// Largest contiguous block of consecutive frames
+    pub largest_block: u32,
+    /// Human-readable summary of issues found
+    pub summary: String,
 }
 
 impl LtcDetectionResult {
@@ -62,6 +87,7 @@ impl LtcDetectionResult {
             sample_rate: 0,
             processing_time_ms: 0.0,
             first_ltc_timecode_secs: 0.0,
+            quality: None,
         }
     }
 }
@@ -515,6 +541,7 @@ let mut result = match best_result {
                 sample_rate,
                 processing_time_ms,
                 first_ltc_timecode_secs,
+                quality: None,
             }
         }
         None => {
@@ -543,11 +570,13 @@ let mut result = match best_result {
                 sample_rate,
                 processing_time_ms: 0.0,
                 first_ltc_timecode_secs: 0.0,
+                quality: None,
             }
         }
     };
 
     apply_coherent_first_timecode(&mut result);
+    result.quality = compute_ltc_quality(&result);
     Ok(result)
 }
 
@@ -640,6 +669,199 @@ pub fn apply_coherent_first_timecode(result: &mut LtcDetectionResult) {
             ));
         }
     }
+}
+
+/// Compute a quality report for a decoded LTC sequence.
+///
+/// Returns `None` when there are no decoded timecodes to analyze.
+/// Otherwise compares LTC timecode values against audio positions to detect
+/// gaps, glitches, edit points, and clock drift.
+pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityReport> {
+    let timecodes = &result.timecodes;
+    let valid = result.valid_frames;
+    if timecodes.is_empty() || result.detected_fps <= 0.0 {
+        return None;
+    }
+    let fps = result.detected_fps as f64;
+    let n = timecodes.len();
+
+    // Convert each LTC timecode to total seconds
+    let ltc_secs: Vec<f64> = timecodes
+        .iter()
+        .map(|ft| {
+            ft.timecode.hours as f64 * 3600.0
+                + ft.timecode.minutes as f64 * 60.0
+                + ft.timecode.seconds as f64
+                + ft.timecode.frames as f64 / fps
+        })
+        .collect();
+
+    let audio_secs: Vec<f64> = timecodes.iter().map(|ft| ft.timecode_secs).collect();
+    let first_audio = audio_secs[0];
+    let first_ltc = ltc_secs[0];
+
+    // Normalized drift (audio position minus LTC value, zeroed at first frame)
+    let drift: Vec<f64> = (0..n)
+        .map(|i| (audio_secs[i] - first_audio) - (ltc_secs[i] - first_ltc))
+        .collect();
+
+    // Find contiguous segments (frame_index increments by 1)
+    let mut segments: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut seg_start = 0;
+    for i in 1..n {
+        if timecodes[i].frame_index != timecodes[i - 1].frame_index + 1 {
+            segments.push(seg_start..i);
+            seg_start = i;
+        }
+    }
+    segments.push(seg_start..n);
+
+    let _seg_count = segments.len();
+    let total_possible = result.total_possible_frames.max(valid) as f64;
+    let missing_frames = if total_possible > 0.0 {
+        (total_possible - valid as f64).max(0.0) as u32
+    } else {
+        0
+    };
+
+    // Largest contiguous block
+    let largest_block = segments.iter().map(|s| (s.end - s.start) as u32).max().unwrap_or(0);
+
+    // Analyze gaps between segments and detect edits
+    let mut gap_count: u32 = 0;
+    let mut edit_count: u32 = 0;
+
+    for w in segments.windows(2) {
+        let prev = &w[0];
+        let cur = &w[1];
+        let i_prev = prev.end - 1;
+        let i_cur = cur.start;
+
+        gap_count += 1;
+
+        let audio_elapsed = audio_secs[i_cur] - audio_secs[i_prev];
+        let ltc_elapsed = ltc_secs[i_cur] - ltc_secs[i_prev];
+        let diff = (audio_elapsed - ltc_elapsed).abs();
+        let frame_threshold = 2.0 / fps;
+
+        if diff > frame_threshold {
+            edit_count += 1;
+        }
+    }
+
+    // Detect glitch frames within contiguous segments
+    let mut glitch_count: u32 = 0;
+    let frame_2_threshold = 2.0 / fps;
+
+    for seg in &segments {
+        let seg_len = seg.end - seg.start;
+        if seg_len < 3 {
+            continue;
+        }
+        for i in (seg.start + 1)..(seg.end - 1) {
+            let expected = (ltc_secs[i - 1] + ltc_secs[i + 1]) / 2.0;
+            if (ltc_secs[i] - expected).abs() > frame_2_threshold {
+                glitch_count += 1;
+            }
+        }
+    }
+
+    // Compute overall drift rate and max drift via linear fit
+    let max_drift_secs = drift.iter().map(|d| d.abs()).fold(0.0f64, f64::max);
+
+    let drift_rate = if n >= 2 && (audio_secs[n - 1] - audio_secs[0]).abs() > 1e-6 {
+        (drift[n - 1] - drift[0]) / (audio_secs[n - 1] - audio_secs[0])
+    } else {
+        0.0
+    };
+
+    // Calculate score (0.0 - 1.0)
+    let missing_ratio = if total_possible > 0.0 {
+        missing_frames as f64 / total_possible
+    } else {
+        0.0
+    };
+
+    let mut score = 1.0;
+
+    if missing_ratio > 0.05 {
+        score -= 0.15 * (missing_ratio / 0.5).min(1.0);
+    }
+
+    score -= 0.03 * (gap_count as f64).min(5.0);
+    score -= 0.03 * (glitch_count as f64).min(5.0);
+
+    if edit_count > 0 {
+        score -= 0.30;
+        if edit_count > 1 {
+            score -= 0.10 * (edit_count - 1) as f64;
+        }
+    }
+
+    let drift_rate_fps = drift_rate.abs() * fps;
+    if drift_rate_fps > 0.5 {
+        score -= 0.05 * (drift_rate_fps / 5.0).min(1.0);
+    }
+
+    let max_drift_frames = max_drift_secs * fps;
+    if max_drift_frames > 3.0 {
+        score -= 0.10 * (max_drift_frames / 10.0).min(1.0);
+    }
+
+    score = score.clamp(0.0, 1.0);
+
+    // Grade
+    let grade = if score >= 0.95 {
+        "Excellent".to_string()
+    } else if score >= 0.80 {
+        "Good".to_string()
+    } else if score >= 0.60 {
+        "Fair".to_string()
+    } else if score >= 0.30 {
+        "Poor".to_string()
+    } else {
+        "Bad".to_string()
+    };
+
+    // Build summary
+    let mut parts: Vec<String> = Vec::new();
+    if missing_frames > 0 {
+        parts.push(format!("{} missing frame(s)", missing_frames));
+    }
+    if gap_count > 0 {
+        parts.push(format!("{} gap(s)", gap_count));
+    }
+    if glitch_count > 0 {
+        parts.push(format!("{} glitch(es)", glitch_count));
+    }
+    if edit_count > 0 {
+        parts.push(format!("{} edit point(s)", edit_count));
+    }
+    if drift_rate_fps > 0.5 {
+        parts.push(format!("drift {:.3} s/s", drift_rate));
+    }
+    if max_drift_frames > 1.0 {
+        parts.push(format!("max drift {:.2}s", max_drift_secs));
+    }
+
+    let summary = if parts.is_empty() {
+        "No issues detected — all frames contiguous and in sync".to_string()
+    } else {
+        parts.join(", ")
+    };
+
+    Some(LtcQualityReport {
+        score,
+        grade,
+        missing_frames,
+        gap_count,
+        glitch_count,
+        edit_count,
+        max_drift_secs,
+        drift_rate,
+        largest_block,
+        summary,
+    })
 }
 
 pub fn quick_check_ltc(path: &Path) -> Result<bool, String> {
