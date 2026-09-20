@@ -705,18 +705,6 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         .map(|i| (audio_secs[i] - first_audio) - (ltc_secs[i] - first_ltc))
         .collect();
 
-    // Find contiguous segments (frame_index increments by 1)
-    let mut segments: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut seg_start = 0;
-    for i in 1..n {
-        if timecodes[i].frame_index != timecodes[i - 1].frame_index + 1 {
-            segments.push(seg_start..i);
-            seg_start = i;
-        }
-    }
-    segments.push(seg_start..n);
-
-    let _seg_count = segments.len();
     let total_possible = result.total_possible_frames.max(valid) as f64;
     let missing_frames = if total_possible > 0.0 {
         (total_possible - valid as f64).max(0.0) as u32
@@ -724,12 +712,31 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         0
     };
 
+    // Find contiguous segments by comparing LTC timecode values,
+    // NOT frame_index (which gets re-indexed by chunked merge).
+    let frame_duration = 1.0 / fps;
+    let gap_threshold = frame_duration * 2.0;
+
+    let mut segments: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut seg_start = 0;
+    for i in 1..n {
+        let expected = ltc_secs[i - 1] + frame_duration;
+        if (ltc_secs[i] - expected).abs() > gap_threshold {
+            segments.push(seg_start..i);
+            seg_start = i;
+        }
+    }
+    segments.push(seg_start..n);
+
     // Largest contiguous block
     let largest_block = segments.iter().map(|s| (s.end - s.start) as u32).max().unwrap_or(0);
 
     // Analyze gaps between segments and detect edits
+    // An edit is: a large LTC jump (>=10 frames) where audio elapsed doesn't match ltc elapsed
     let mut gap_count: u32 = 0;
     let mut edit_count: u32 = 0;
+    let edit_threshold = 0.1;  // seconds — audio-vs-LTC mismatch must exceed this
+    let edit_ltc_jump_threshold = 10.0 / fps;  // LTC must jump by at least 10 frames
 
     for w in segments.windows(2) {
         let prev = &w[0];
@@ -742,16 +749,15 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         let audio_elapsed = audio_secs[i_cur] - audio_secs[i_prev];
         let ltc_elapsed = ltc_secs[i_cur] - ltc_secs[i_prev];
         let diff = (audio_elapsed - ltc_elapsed).abs();
-        let frame_threshold = 2.0 / fps;
 
-        if diff > frame_threshold {
+        if ltc_elapsed.abs() > edit_ltc_jump_threshold && diff > edit_threshold {
             edit_count += 1;
         }
     }
 
     // Detect glitch frames within contiguous segments
     let mut glitch_count: u32 = 0;
-    let frame_2_threshold = 2.0 / fps;
+    let glitch_threshold = 2.0 / fps;
 
     for seg in &segments {
         let seg_len = seg.end - seg.start;
@@ -760,14 +766,21 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         }
         for i in (seg.start + 1)..(seg.end - 1) {
             let expected = (ltc_secs[i - 1] + ltc_secs[i + 1]) / 2.0;
-            if (ltc_secs[i] - expected).abs() > frame_2_threshold {
+            if (ltc_secs[i] - expected).abs() > glitch_threshold {
                 glitch_count += 1;
             }
         }
     }
 
-    // Compute overall drift rate and max drift via linear fit
-    let max_drift_secs = drift.iter().map(|d| d.abs()).fold(0.0f64, f64::max);
+    // Compute robust max drift (99th percentile of |drift|)
+    let mut sorted_drift_abs: Vec<f64> = drift.iter().map(|d| d.abs()).collect();
+    sorted_drift_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let max_drift_secs = if sorted_drift_abs.len() > 5 {
+        let p99_idx = ((sorted_drift_abs.len() - 1) as f64 * 0.99).round() as usize;
+        sorted_drift_abs[p99_idx.min(sorted_drift_abs.len() - 1)]
+    } else {
+        sorted_drift_abs.last().copied().unwrap_or(0.0)
+    };
 
     let drift_rate = if n >= 2 && (audio_secs[n - 1] - audio_secs[0]).abs() > 1e-6 {
         (drift[n - 1] - drift[0]) / (audio_secs[n - 1] - audio_secs[0])
