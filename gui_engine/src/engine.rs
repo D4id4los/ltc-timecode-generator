@@ -444,16 +444,48 @@ fn process_command(
             );
 
             let capture_gen = state.ltc_decode_generation;
-            let tx = decode_result_tx.clone();
             let use_libltc = state.use_libltc;
             let decode_fps = state.decode_fps;
             let decode_drop_frame = state.decode_drop_frame;
 
+            // Hardening: validate the selection against the probe data so a
+            // stale or out-of-range GUI state fails fast with a clear message
+            // instead of invoking ffmpeg on a nonexistent stream.
+            if let Some(ref probe) = state.ltc_probe {
+                let available: Vec<usize> =
+                    probe.streams.iter().map(|s| s.stream_index).collect();
+                let validation_error = match probe
+                    .streams
+                    .iter()
+                    .find(|s| s.stream_index == stream_index)
+                {
+                    None => Some(format!(
+                        "Stream {} not found in '{}' (available audio streams: {:?})",
+                        stream_index, path, available
+                    )),
+                    Some(s) if channel_index >= s.channels => Some(format!(
+                        "Channel {} out of range for stream {} in '{}' ({} channels available)",
+                        channel_index, stream_index, path, s.channels
+                    )),
+                    Some(_) => None,
+                };
+                if let Some(e) = validation_error {
+                    error!("LTC video decode rejected: {}", e);
+                    state.ltc_is_detecting = false;
+                    state.ltc_decode_error = Some(e.clone());
+                    state.status_message = format!("Parse failed: {}", e);
+                    return;
+                }
+            }
+
+            let tx = decode_result_tx.clone();
+
             std::thread::spawn(move || {
                 let tmp_dir = std::env::temp_dir();
                 let tmp_wav = tmp_dir.join(format!(
-                    "ltc_extract_{}_{}_{}.wav",
+                    "ltc_extract_{}_{}_{}_{}.wav",
                     std::process::id(),
+                    capture_gen,
                     stream_index,
                     channel_index,
                 ));

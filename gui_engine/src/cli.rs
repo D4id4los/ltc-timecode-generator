@@ -94,7 +94,7 @@ pub struct Cli {
     #[arg(long)]
     pub decode: Option<String>,
 
-    /// Audio stream index within the video file (0-based, for --decode of video files)
+    /// Audio stream position among the file's audio streams (0-based, for --decode of video files)
     #[arg(long, default_value_t = 0)]
     pub audio_stream: usize,
 
@@ -764,30 +764,34 @@ fn run_decode_video(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let probe = ffprobe::probe_video_audio(path)
         .map_err(|e| format!("Failed to probe video: {}", e))?;
 
-    let stream_idx = cli.audio_stream;
+    let stream_pos = cli.audio_stream;
     let channel_idx = cli.audio_channel;
 
-    // Validate stream/channel indices
-    if stream_idx >= probe.streams.len() {
+    // Validate stream/channel indices. `--audio-stream` is a 0-based position
+    // among the audio streams; extraction itself needs the absolute stream
+    // index (ffprobe `index` numbering).
+    if stream_pos >= probe.streams.len() {
         return Err(format!(
             "Audio stream index {} out of range ({} streams available). Use --audio-stream to select.",
-            stream_idx,
+            stream_pos,
             probe.streams.len(),
         ).into());
     }
-    let stream = &probe.streams[stream_idx];
+    let stream = &probe.streams[stream_pos];
     if channel_idx >= stream.channels {
         return Err(format!(
             "Channel index {} out of range for stream {} ({} channels available). Use --audio-channel to select.",
             channel_idx,
-            stream_idx,
+            stream_pos,
             stream.channels,
         ).into());
     }
+    let stream_idx = stream.stream_index;
 
     info!(
-        "Probed video: {} streams, streaming stream {} ({} ch) channel {} ({})",
+        "Probed video: {} streams, audio #{} = absolute stream {} ({} ch), decoding channel {} ({})",
         probe.streams.len(),
+        stream_pos,
         stream_idx,
         stream.channels,
         channel_idx,
