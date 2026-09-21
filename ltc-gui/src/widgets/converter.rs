@@ -3,8 +3,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
-use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::command::GuiCommand;
+use gui_engine::config;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
     available_video_encoders_for_container, conversion_sanity_check,
@@ -15,6 +15,7 @@ use gui_engine::converter::{
     FfmpegCapabilities, RecordingType, TimecodeMetadata,
 };
 use gui_engine::file_pattern::match_files_all_patterns;
+use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::LtcDecodeStatus;
 
 use crate::app::AppState;
@@ -99,10 +100,15 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                 .interactive(false),
         );
         if ui.button("Browse…").clicked() {
-            let folder = rfd::FileDialog::new().pick_folder();
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(ref last) = state.selected_folder {
+                dialog = dialog.set_directory(last);
+            }
+            let folder = dialog.pick_folder();
             if let Some(path) = folder {
                 state.selected_folder = Some(path.clone());
                 state.selected_files = None;
+                config::save_input_folder(&path);
 
                 // Apply all patterns simultaneously
                 state.file_groups = Some(match_files_all_patterns(&path));
@@ -1129,7 +1135,8 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
                 .set_directory(&state.output_folder)
                 .pick_folder();
             if let Some(path) = folder {
-                state.output_folder = path;
+                state.output_folder = path.clone();
+                config::save_output_folder(&path);
             }
         }
     });

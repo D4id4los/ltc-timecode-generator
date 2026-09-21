@@ -16,6 +16,7 @@ name = "gui_engine"
 audio-core = { path = "../audio-core" }
 arc-swap = "1.7"
 chrono = "0.4"
+dirs = "6"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3.4"
 env_logger = "0.11"

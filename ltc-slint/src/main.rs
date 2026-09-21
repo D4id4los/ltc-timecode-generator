@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gui_engine::command::GuiCommand;
+use gui_engine::config;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
     available_video_encoders_for_container, find_timecode_at_offset,
@@ -116,6 +117,37 @@ fn _run_gui(
 
     let conv_folder_for_group = conv_selected_folder.clone();
     let conv_ffmpeg_caps_for_select = conv_ffmpeg_caps.clone();
+
+    // ── Restore last used converter folders from config ─────────────────────
+    {
+        let cfg = config::load();
+        if let Some(ref folder) = cfg.last_input_folder {
+            let path = std::path::Path::new(folder);
+            if path.exists() {
+                *conv_selected_folder.lock().unwrap() = folder.clone();
+                let matched = match_files_to_groups(path, &BUILTIN_PATTERNS[0]);
+                *conv_file_groups.lock().unwrap() = matched.clone();
+                *conv_selected_group_idx.lock().unwrap() = -1;
+                ui.set_conv_selected_folder(SharedString::from(folder.as_str()));
+                let model: Vec<FileGroupInfo> = matched.iter().map(|(prefix, files)| {
+                    FileGroupInfo {
+                        prefix: SharedString::from(prefix),
+                        files: ModelRc::new(VecModel::<SharedString>::from(
+                            files.iter().map(|f| {
+                                SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+                            }).collect::<Vec<_>>()
+                        )),
+                        channel_count: files.len() as i32,
+                    }
+                }).collect();
+                ui.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(model)));
+            }
+        }
+        if let Some(ref out_path) = cfg.last_output_folder {
+            *conv_output_path.lock().unwrap() = out_path.clone();
+            ui.set_conv_output_folder(SharedString::from(out_path.as_str()));
+        }
+    }
 
     // ── Populate FPS options model ──────────────────────────────────────────
     {
@@ -489,10 +521,18 @@ fn _run_gui(
             let pat = *pattern_arc.lock().unwrap();
             if pat == 0 {
                 // TASCAM: folder picker
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                let mut dialog = rfd::FileDialog::new();
+                {
+                    let cur = folder.lock().unwrap();
+                    if !cur.is_empty() {
+                        dialog = dialog.set_directory(cur.as_str());
+                    }
+                }
+                if let Some(path) = dialog.pick_folder() {
                     let path_str = path.to_string_lossy().to_string();
                     *folder.lock().unwrap() = path_str.clone();
                     *files_arc.lock().unwrap() = Vec::new();
+                    config::save_input_folder(&path);
                     let pattern = &BUILTIN_PATTERNS[0];
                     let matched = match_files_to_groups(&path, pattern);
                     *groups.lock().unwrap() = matched.clone();
@@ -516,14 +556,22 @@ fn _run_gui(
                 }
             } else {
                 // * (any): file picker
-                if let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Audio", &["*"])
-                    .pick_files()
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("Audio", &["*"]);
+                {
+                    let cur = folder.lock().unwrap();
+                    if !cur.is_empty() {
+                        dialog = dialog.set_directory(cur.as_str());
+                    }
+                }
+                if let Some(paths) = dialog.pick_files()
                 {
                     if !paths.is_empty() {
                         let parent = paths[0].parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
                         *folder.lock().unwrap() = parent.clone();
                         *files_arc.lock().unwrap() = paths.clone();
+                        let parent_path = paths[0].parent().unwrap_or(std::path::Path::new(""));
+                        config::save_input_folder(parent_path);
                         let matched = wrap_user_selected_files(paths);
                         *groups.lock().unwrap() = matched.clone();
                         *idx.lock().unwrap() = -1;
@@ -946,9 +994,17 @@ fn _run_gui(
         let ui_weak = ui.as_weak();
         let out_folder = conv_folder_for_group.clone();
         ui.on_conv_select_output_folder(move || {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            let mut dialog = rfd::FileDialog::new();
+            {
+                let cur = out_folder.lock().unwrap();
+                if !cur.is_empty() {
+                    dialog = dialog.set_directory(cur.as_str());
+                }
+            }
+            if let Some(path) = dialog.pick_folder() {
                 let path_str = path.to_string_lossy().to_string();
                 *out_folder.lock().unwrap() = path_str.clone();
+                config::save_output_folder(&path);
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_output_folder(SharedString::from(path_str));
                 }
