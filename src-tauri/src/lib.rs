@@ -153,30 +153,7 @@ fn detect_ltc_in_video(
         channel_index,
     ));
 
-    let channel_filter = format!("pan=mono|FC=c{}", channel_index);
-
-    let output = std::process::Command::new("ffmpeg")
-        .args(&[
-            "-y",
-            "-i", &path,
-            "-map", &format!("0:a:{}", stream_index),
-            "-af", &channel_filter,
-            "-c:a", "pcm_s24le",
-            "-f", "wav",
-            &tmp_wav.to_string_lossy(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to run ffmpeg for audio extraction: {}", e))?;
-
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&tmp_wav);
-        return Err(format!(
-            "ffmpeg audio extraction failed: stream {} channel {} in {}",
-            stream_index, channel_index, path
-        ));
-    }
+    gui_engine::ffprobe::extract_audio_channel(video_path, stream_index, channel_index, &tmp_wav)?;
 
     let result = audio_core::decode_ltc_from_wav(&tmp_wav, fps, drop_frame);
     let _ = std::fs::remove_file(&tmp_wav);

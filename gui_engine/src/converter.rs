@@ -784,6 +784,7 @@ pub type CancelFlag = Arc<AtomicBool>;
 // ── ffmpeg argument construction ─────────────────────────────────────────
 
 /// Build ffmpeg args for pure-audio-to-audio pipeline (no video stream).
+/// Only used for the non-split path; split tracks use `build_split_track_args`.
 fn build_audio_to_audio_args(
     settings: &ConverterSettings,
     format: &str,
@@ -792,56 +793,14 @@ fn build_audio_to_audio_args(
 ) -> Vec<String> {
     let mut args: Vec<String> = vec!["-y".to_string()];
 
-    // Input files
-    for f in &settings.input_files {
-        args.push("-i".to_string());
-        args.push(f.to_string_lossy().to_string());
+    // Input files, with per-file trim applied before each `-i`
+    for (i, f) in settings.input_files.iter().enumerate() {
+        let trim_secs = settings.trim_offsets_secs.get(i).copied().unwrap_or(0.0);
+        push_input_with_trim(&mut args, f, trim_secs);
     }
 
     // No video
     args.push("-vn".to_string());
-
-    if settings.split_tracks {
-        // One output per track (each gets its own ffmpeg call in spawn)
-        // Here we just build the filter complex for the first track
-        // and the caller handles the loop
-        let mapping = settings.channel_map.mapping();
-        let track_idx = 0; // caller substitutes
-        let input_idx = mapping.iter().position(|&o| o == track_idx).unwrap_or(track_idx);
-        let trim_secs = settings.trim_offsets_secs.first().copied().unwrap_or(0.0);
-        if trim_secs > 0.001 {
-            args.push("-ss".to_string());
-            args.push(format!("{:.3}", trim_secs));
-        }
-        args.push("-map_channel".to_string());
-        args.push(format!("0:{}.0", input_idx));
-    } else {
-        // All channels in one file
-        let trim_secs = settings.trim_offsets_secs.first().copied().unwrap_or(0.0);
-        if trim_secs > 0.001 {
-            for i in 0..settings.input_files.len() {
-                args.push("-ss".to_string());
-                args.push(format!("{:.3}", settings.trim_offsets_secs.get(i).copied().unwrap_or(trim_secs)));
-                // -ss before -i for each input
-                let idx = args.len() - 2;
-                args.swap_remove(idx);
-                // Actually -ss needs to be before -i, let's do it properly
-            }
-            // Simplification: apply the same trim to all
-            // Actually we need per-file handling, let's rebuild
-            args.truncate(1); // keep -y
-            for (i, f) in settings.input_files.iter().enumerate() {
-                let off = settings.trim_offsets_secs.get(i).copied().unwrap_or(0.0);
-                if off > 0.001 {
-                    args.push("-ss".to_string());
-                    args.push(format!("{:.3}", off));
-                }
-                args.push("-i".to_string());
-                args.push(f.to_string_lossy().to_string());
-            }
-            args.push("-vn".to_string());
-        }
-    }
 
     // Audio encoder
     args.push("-c:a".to_string());
@@ -852,14 +811,8 @@ fn build_audio_to_audio_args(
         push_audio_timecode_args(&mut args, tc, format, sample_rate);
     }
 
-    // Progress
-    args.push("-progress".to_string());
-    args.push("pipe:2".to_string());
+    push_output_trailer(&mut args, format);
 
-    args.push("-f".to_string());
-    args.push(format.to_string());
-
-    // Output is substituted by caller
     args
 }
 
@@ -923,12 +876,7 @@ fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<Stri
     }
 
     args.push("-shortest".to_string());
-    args.push("-progress".to_string());
-    args.push("pipe:2".to_string());
-
-    let container = container_to_ffmpeg_format(&settings.container).to_string();
-    args.push("-f".to_string());
-    args.push(container);
+    push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
 
     args
 }
@@ -939,12 +887,7 @@ fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> Vec<S
     let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
 
     let mut args: Vec<String> = vec!["-y".to_string()];
-    if trim_secs > 0.001 {
-        args.push("-ss".to_string());
-        args.push(format!("{:.3}", trim_secs));
-    }
-    args.push("-i".to_string());
-    args.push(input.to_string_lossy().to_string());
+    push_input_with_trim(&mut args, input, trim_secs);
     args.push("-map".to_string());
     args.push("0:v".to_string());
     args.push("-an".to_string());
@@ -955,11 +898,7 @@ fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> Vec<S
         push_timecode_args(&mut args, tc);
     }
 
-    args.push("-progress".to_string());
-    args.push("pipe:2".to_string());
-    let container = container_to_ffmpeg_format(&settings.container).to_string();
-    args.push("-f".to_string());
-    args.push(container);
+    push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
     args
 }
 
@@ -969,12 +908,7 @@ fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &Au
     let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
 
     let mut args: Vec<String> = vec!["-y".to_string()];
-    if trim_secs > 0.001 {
-        args.push("-ss".to_string());
-        args.push(format!("{:.3}", trim_secs));
-    }
-    args.push("-i".to_string());
-    args.push(input.to_string_lossy().to_string());
+    push_input_with_trim(&mut args, input, trim_secs);
     args.push("-map".to_string());
     args.push("0:v".to_string());
 
@@ -1057,32 +991,27 @@ fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &Au
         push_timecode_args(&mut args, tc);
     }
 
-    args.push("-progress".to_string());
-    args.push("pipe:2".to_string());
-    let container = container_to_ffmpeg_format(&settings.container).to_string();
-    args.push("-f".to_string());
-    args.push(container);
+    push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
     args
 }
 
 /// Build ffmpeg args for extracting a single audio channel from a video file.
+///
+/// `sample_rate` should come from the probed audio stream so the BWF
+/// `time_reference` is computed with the source's real rate.
 fn build_video_track_extract_args(
     settings: &ConverterSettings,
     file_idx: usize,
     stream_idx: usize,
     channel_idx: usize,
     format: &str,
+    sample_rate: u32,
 ) -> Vec<String> {
     let input = &settings.input_files[file_idx];
     let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
 
     let mut args: Vec<String> = vec!["-y".to_string()];
-    if trim_secs > 0.001 {
-        args.push("-ss".to_string());
-        args.push(format!("{:.3}", trim_secs));
-    }
-    args.push("-i".to_string());
-    args.push(input.to_string_lossy().to_string());
+    push_input_with_trim(&mut args, input, trim_secs);
     args.push("-map".to_string());
     args.push(format!("0:{}", stream_idx));
     args.push("-af".to_string());
@@ -1091,36 +1020,20 @@ fn build_video_track_extract_args(
     if format == "wav" {
         args.push("-c:a".to_string());
         args.push("pcm_s24le".to_string());
-        args.push("-f".to_string());
-        args.push("wav".to_string());
-
-        // Add BWF time_reference if timecode metadata is available
-        if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
-            let sample_rate = 48000; // default; could be taken from probe
-            let total_secs = tc.start.hours as f64 * 3600.0
-                + tc.start.minutes as f64 * 60.0
-                + tc.start.seconds as f64
-                + tc.start.frames as f64 / tc.fps;
-            let time_reference = (total_secs * sample_rate as f64).round() as u64;
-            args.push("-write_bext".to_string());
-            args.push("1".to_string());
-            args.push("-metadata".to_string());
-            args.push(format!("time_reference={}", time_reference));
-        }
     } else if format == "adts" {
         args.push("-c:a".to_string());
         args.push("aac".to_string());
-        args.push("-f".to_string());
-        args.push("adts".to_string());
     } else {
         args.push("-c:a".to_string());
         args.push(settings.audio_encoder.clone());
-        args.push("-f".to_string());
-        args.push(format.to_string());
     }
 
-    args.push("-progress".to_string());
-    args.push("pipe:2".to_string());
+    // Timecode metadata — identical treatment to the audio-to-audio path.
+    if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
+        push_audio_timecode_args(&mut args, tc, format, sample_rate);
+    }
+
+    push_output_trailer(&mut args, format);
     args
 }
 
@@ -1134,9 +1047,33 @@ fn build_video_to_video_args(settings: &ConverterSettings, step: &VideoOutputSte
             build_video_mux_args(settings, *file_idx, keep, probe)
         }
         VideoOutputStep::AudioChannel { file_idx, stream_idx, channel_idx, format, .. } => {
-            build_video_track_extract_args(settings, *file_idx, *stream_idx, *channel_idx, format)
+            let sample_rate = probe
+                .streams
+                .iter()
+                .find(|s| s.stream_index == *stream_idx)
+                .map(|s| s.sample_rate)
+                .unwrap_or(48000);
+            build_video_track_extract_args(settings, *file_idx, *stream_idx, *channel_idx, format, sample_rate)
         }
     }
+}
+
+/// Push `-ss <trim>` (when significant) followed by `-i <file>`.
+fn push_input_with_trim(args: &mut Vec<String>, file: &Path, trim_secs: f64) {
+    if trim_secs > 0.001 {
+        args.push("-ss".to_string());
+        args.push(format!("{:.3}", trim_secs));
+    }
+    args.push("-i".to_string());
+    args.push(file.to_string_lossy().to_string());
+}
+
+/// Push the standard output trailer: progress reporting and muxer format.
+fn push_output_trailer(args: &mut Vec<String>, format: &str) {
+    args.push("-progress".to_string());
+    args.push("pipe:2".to_string());
+    args.push("-f".to_string());
+    args.push(format.to_string());
 }
 
 fn push_video_encoder(args: &mut Vec<String>, encoder: &str) {
@@ -1181,17 +1118,25 @@ fn push_timecode_args(args: &mut Vec<String>, tc: &TimecodeMetadata) {
     args.push(format!("{:.3}", tc.fps));
 }
 
-/// Push timecode args for audio-only pipelines (no video stream).
+/// Compute the BWF `time_reference` value (sample offset since midnight)
+/// for a timecode at the given sample rate.
+pub fn time_reference_samples(tc: &TimecodeMetadata, sample_rate: u32) -> u64 {
+    let total_secs = tc.start.hours as f64 * 3600.0
+        + tc.start.minutes as f64 * 60.0
+        + tc.start.seconds as f64
+        + tc.start.frames as f64 / tc.fps;
+    (total_secs * sample_rate as f64).round() as u64
+}
+
+/// Push timecode metadata args for an audio-only output file.
+/// Single source of truth, shared by the audio-to-audio path and the
+/// video-path per-channel extraction so both produce identical metadata.
 /// For WAV format: uses BWF bext chunk with `time_reference` for DaVinci Resolve compatibility.
 /// For other formats: uses generic `-timecode` metadata tag.
 fn push_audio_timecode_args(args: &mut Vec<String>, tc: &TimecodeMetadata, format: &str, sample_rate: u32) {
     let tc_str = format_ffmpeg_timecode(&tc.start, tc.drop_frame);
     if format == "wav" {
-        let total_secs = tc.start.hours as f64 * 3600.0
-            + tc.start.minutes as f64 * 60.0
-            + tc.start.seconds as f64
-            + tc.start.frames as f64 / tc.fps;
-        let time_reference = (total_secs * sample_rate as f64).round() as u64;
+        let time_reference = time_reference_samples(tc, sample_rate);
         args.push("-write_bext".to_string());
         args.push("1".to_string());
         args.push("-metadata".to_string());
@@ -1353,15 +1298,10 @@ fn build_split_track_args(
     let mapping = settings.channel_map.mapping();
     let input_idx = mapping.iter().position(|&o| o == track_idx).unwrap_or(track_idx);
     let mut args: Vec<String> = vec!["-y".to_string()];
-    let trim_secs = settings.trim_offsets_secs.first().copied().unwrap_or(0.0);
+    let trim_secs = settings.trim_offsets_secs.get(input_idx).copied().unwrap_or(0.0);
 
     if input_idx < settings.input_files.len() {
-        if trim_secs > 0.001 {
-            args.push("-ss".to_string());
-            args.push(format!("{:.3}", trim_secs));
-        }
-        args.push("-i".to_string());
-        args.push(settings.input_files[input_idx].to_string_lossy().to_string());
+        push_input_with_trim(&mut args, &settings.input_files[input_idx], trim_secs);
     }
     args.push("-vn".to_string());
     args.push("-c:a".to_string());
@@ -1371,10 +1311,7 @@ fn build_split_track_args(
         push_audio_timecode_args(&mut args, tc, format, sample_rate);
     }
 
-    args.push("-progress".to_string());
-    args.push("pipe:2".to_string());
-    args.push("-f".to_string());
-    args.push(format.to_string());
+    push_output_trailer(&mut args, format);
     args
 }
 
@@ -1691,6 +1628,7 @@ pub fn apply_available_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffprobe::AudioStreamInfo;
     use std::path::PathBuf;
 
     fn make_settings_audio_only() -> ConverterSettings {
@@ -2051,6 +1989,86 @@ mod tests {
         let ref_string = format!("time_reference={}", expected_ref);
         let ref_found = args.iter().any(|a| a.contains(&ref_string));
         assert!(ref_found, "time_reference should be calculated for 2:15:30:12 at 44.1kHz, got expected={}", expected_ref);
+    }
+
+    fn make_probe(stream_index: usize, channels: usize, sample_rate: u32) -> VideoAudioProbe {
+        VideoAudioProbe {
+            streams: vec![AudioStreamInfo {
+                stream_index,
+                channels,
+                codec_name: "pcm_s24le".to_string(),
+                sample_rate,
+            }],
+            total_audio_channels: channels,
+            is_video_file: true,
+        }
+    }
+
+    #[test]
+    fn test_build_video_track_extract_args_wav_timecode() {
+        let mut s = make_video_settings();
+        s.timecode_meta_per_file[0] = Some(TimecodeMetadata {
+            start: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            fps: 25.0,
+            drop_frame: false,
+        });
+        let args = build_video_track_extract_args(&s, 0, 1, 0, "wav", 44100);
+        let tc_pos = args.iter().position(|a| a == "-timecode").unwrap();
+        assert_eq!(args[tc_pos + 1], "01:00:00:00");
+        let bext_pos = args.iter().position(|a| a == "-write_bext").unwrap();
+        assert_eq!(args[bext_pos + 1], "1");
+        // 1 hour at the probed 44.1 kHz rate — not the old 48 kHz hardcode
+        assert!(
+            args.contains(&"time_reference=158760000".to_string()),
+            "expected time_reference=158760000 (1h @ 44.1kHz), args: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn test_build_video_track_extract_args_no_timecode() {
+        let s = make_video_settings();
+        let args = build_video_track_extract_args(&s, 0, 1, 0, "wav", 48000);
+        assert!(!args.contains(&"-timecode".to_string()), "no -timecode when metadata absent");
+        assert!(!args.contains(&"-write_bext".to_string()), "no -write_bext when metadata absent");
+    }
+
+    #[test]
+    fn test_build_video_track_extract_args_adts_timecode() {
+        let mut s = make_video_settings();
+        s.timecode_meta_per_file[0] = Some(TimecodeMetadata {
+            start: Timecode { hours: 10, minutes: 30, seconds: 0, frames: 0 },
+            fps: 25.0,
+            drop_frame: false,
+        });
+        let args = build_video_track_extract_args(&s, 0, 1, 0, "adts", 48000);
+        let tc_pos = args.iter().position(|a| a == "-timecode").unwrap();
+        assert_eq!(args[tc_pos + 1], "10:30:00:00");
+        assert!(!args.contains(&"-write_bext".to_string()), "no bext for non-WAV");
+    }
+
+    #[test]
+    fn test_build_video_to_video_args_uses_probed_sample_rate() {
+        let mut s = make_video_settings();
+        s.timecode_meta_per_file[0] = Some(TimecodeMetadata {
+            start: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            fps: 25.0,
+            drop_frame: false,
+        });
+        let probe = make_probe(1, 4, 44100);
+        let step = VideoOutputStep::AudioChannel {
+            file_idx: 0,
+            stream_idx: 1,
+            channel_idx: 0,
+            output: PathBuf::from("/tmp/out.wav"),
+            format: "wav".to_string(),
+        };
+        let args = build_video_to_video_args(&s, &step, &probe);
+        assert!(
+            args.contains(&"time_reference=158760000".to_string()),
+            "time_reference must use the probed 44.1 kHz rate, args: {:?}",
+            args
+        );
     }
 
     #[test]
@@ -2522,7 +2540,7 @@ mod tests {
     #[test]
     fn test_build_video_track_extract_args_wav() {
         let s = make_video_settings();
-        let args = build_video_track_extract_args(&s, 0, 1, 0, "wav");
+        let args = build_video_track_extract_args(&s, 0, 1, 0, "wav", 48000);
         let map_pos = args.iter().position(|a| a == "-map").unwrap();
         assert_eq!(args[map_pos + 1], "0:1");
         let af_pos = args.iter().position(|a| a == "-af").unwrap();
@@ -2536,7 +2554,7 @@ mod tests {
     #[test]
     fn test_build_video_track_extract_args_aac() {
         let s = make_video_settings();
-        let args = build_video_track_extract_args(&s, 0, 2, 1, "adts");
+        let args = build_video_track_extract_args(&s, 0, 2, 1, "adts", 48000);
         let map_pos = args.iter().position(|a| a == "-map").unwrap();
         assert_eq!(args[map_pos + 1], "0:2");
         let af_pos = args.iter().position(|a| a == "-af").unwrap();
