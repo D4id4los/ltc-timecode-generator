@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, FontId, RichText, Sense, Ui};
 use gui_engine::command::GuiCommand;
 use gui_engine::config;
-use gui_engine::converter::{ChannelMap, ConversionState, FfmpegCapabilities, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX};
+use gui_engine::converter::{ChannelMap, ConversionState, FfmpegCapabilities, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, query_ffmpeg_capabilities};
 use gui_engine::file_pattern::{match_files_all_patterns, MatchedGroup};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
@@ -103,7 +103,8 @@ pub struct AppState {
     pub conversion_state: SharedConversionState,
     pub cancel_flag: CancelFlag,
     pub convert_handle: Option<JoinHandle<()>>,
-    pub ffmpeg_caps: Option<FfmpegCapabilities>,
+    pub ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>>,
+    pub ffmpeg_probe_started: Arc<AtomicBool>,
     pub trim_ltc_start: bool,
     pub trim_offset_secs: f64,
     pub per_file_trim_offsets: Vec<f64>,
@@ -117,13 +118,41 @@ impl AppState {
         engine_state: Arc<ArcSwap<AppStateSnapshot>>,
         log_buffer: Arc<Mutex<gui_engine::log_buffer::LogBuffer>>,
     ) -> Self {
+        let cfg = config::load();
+        Self::new_with_config_and_probe(cmd_tx, engine_state, log_buffer, cfg, query_ffmpeg_capabilities)
+    }
+
+    pub fn new_with_config_and_probe<F>(
+        cmd_tx: Sender<GuiCommand>,
+        engine_state: Arc<ArcSwap<AppStateSnapshot>>,
+        log_buffer: Arc<Mutex<gui_engine::log_buffer::LogBuffer>>,
+        cfg: gui_engine::config::ConverterConfig,
+        probe: F,
+    ) -> Self
+    where
+        F: Fn() -> FfmpegCapabilities + Send + 'static,
+    {
         let initial = AppStateSnapshot::initial();
 
         // Restore last used converter folders from config
-        let cfg = config::load();
         let (selected_folder, file_groups, selected_group_idx, channel_map, recording_type, filename_prefix)
             = Self::restore_input_folder(&cfg);
         let output_folder = cfg.last_output_folder.map(PathBuf::from).unwrap_or_default();
+
+        let ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>> = Arc::new(Mutex::new(None));
+        let ffmpeg_probe_started: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+        // Spawn background ffmpeg probe when a folder was restored
+        if selected_folder.is_some() {
+            let caps = ffmpeg_caps.clone();
+            let guard = ffmpeg_probe_started.clone();
+            if !guard.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                std::thread::spawn(move || {
+                    let result = probe();
+                    *caps.lock().unwrap() = Some(result);
+                });
+            }
+        }
 
         Self {
             cmd_tx,
@@ -160,7 +189,8 @@ impl AppState {
             conversion_state: Arc::new(Mutex::new(ConversionState::idle())),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             convert_handle: None,
-            ffmpeg_caps: None,
+            ffmpeg_caps,
+            ffmpeg_probe_started,
             trim_ltc_start: false,
             trim_offset_secs: 0.0,
             per_file_trim_offsets: Vec::new(),
@@ -751,5 +781,84 @@ impl AppState {
                     }
                 });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gui_engine::converter::FfmpegCapabilities;
+    use std::sync::mpsc;
+    use std::collections::BTreeSet;
+
+    fn dummy_caps() -> FfmpegCapabilities {
+        FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: BTreeSet::new(),
+            available_formats: BTreeSet::new(),
+            error_message: None,
+        }
+    }
+
+    fn dummy_state() -> Arc<ArcSwap<AppStateSnapshot>> {
+        Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())))
+    }
+
+    fn dummy_log_buffer() -> Arc<Mutex<gui_engine::log_buffer::LogBuffer>> {
+        Arc::new(Mutex::new(gui_engine::log_buffer::LogBuffer::new(10)))
+    }
+
+    #[test]
+    fn startup_probe_runs_when_folder_restored() {
+        let (tx, _) = mpsc::channel();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+        let cfg = gui_engine::config::ConverterConfig {
+            last_input_folder: Some("/tmp".to_string()),
+            last_output_folder: None,
+        };
+        let app = AppState::new_with_config_and_probe(
+            tx,
+            dummy_state(),
+            dummy_log_buffer(),
+            cfg,
+            move || {
+                called_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                dummy_caps()
+            },
+        );
+
+        // Probe was started (guard set true before spawn)
+        assert!(app.ffmpeg_probe_started.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Probe eventually produces a result
+        for _ in 0..100 {
+            if app.ffmpeg_caps.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.ffmpeg_caps.lock().unwrap().is_some());
+        assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.selected_folder.is_some());
+    }
+
+    #[test]
+    fn no_probe_when_no_folder_restored() {
+        let (tx, _) = mpsc::channel();
+        let cfg = gui_engine::config::ConverterConfig::default();
+        let app = AppState::new_with_config_and_probe(
+            tx,
+            dummy_state(),
+            dummy_log_buffer(),
+            cfg,
+            dummy_caps,
+        );
+
+        // Wait a bit in case a probe was erroneously started
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!app.ffmpeg_probe_started.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.ffmpeg_caps.lock().unwrap().is_none());
+        assert!(app.selected_folder.is_none());
     }
 }

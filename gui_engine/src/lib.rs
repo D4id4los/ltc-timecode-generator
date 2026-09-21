@@ -21,15 +21,16 @@ pub use audio_core::{
 
 // Re-export converter/file_pattern types for convenience
 pub use converter::{
-    available_audio_encoders_for_container, available_containers,
-    available_video_encoders_for_container, conversion_sanity_check,
-    find_timecode_at_offset, format_ffmpeg_timecode,
+    apply_available_defaults, available_audio_encoders_for_container,
+    available_containers, available_video_encoders_for_container,
+    conversion_sanity_check, evaluate_readiness, find_timecode_at_offset,
+    format_blockers, format_ffmpeg_timecode,
     query_ffmpeg_capabilities, select_best_combination, spawn_conversion,
     supported_audio_encoders, supported_containers, supported_video_encoders,
-    ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
-    ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
-    FfmpegCapabilities, RecordingType, SharedConversionState, CancelFlag,
-    TimecodeMetadata,
+    ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
+    ConversionState, ConversionStatus, ConverterSettings, DEFAULT_AUDIO_SUFFIX,
+    DEFAULT_VIDEO_SUFFIX, FfmpegCapabilities, RecordingType,
+    SharedConversionState, CancelFlag, TimecodeMetadata,
 };
 pub use file_pattern::{default_output_filename, match_files_to_groups, match_files_all_patterns, wrap_user_selected_files, FileNamingPattern, BUILTIN_PATTERNS, CAMERA_PATTERNS};
 

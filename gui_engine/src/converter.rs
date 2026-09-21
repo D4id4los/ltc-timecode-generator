@@ -1264,6 +1264,109 @@ fn run_ffmpeg_process(
     }
 }
 
+// ── Converter readiness (pure, UI-agnostic gating) ──────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConvertBlocker {
+    NoRecording,
+    NoPrefix,
+    NoOutputFolder,
+    FfmpegNotQueried,
+    FfmpegMissing(Option<String>),
+}
+
+#[derive(Clone, Debug)]
+pub struct ConvertReadiness {
+    pub can_convert: bool,
+    pub blockers: Vec<ConvertBlocker>,
+}
+
+pub fn evaluate_readiness(
+    has_group: bool,
+    prefix_empty: bool,
+    output_folder_empty: bool,
+    caps: Option<&FfmpegCapabilities>,
+) -> ConvertReadiness {
+    let mut blockers = Vec::new();
+    if !has_group {
+        blockers.push(ConvertBlocker::NoRecording);
+    }
+    if prefix_empty {
+        blockers.push(ConvertBlocker::NoPrefix);
+    }
+    if output_folder_empty {
+        blockers.push(ConvertBlocker::NoOutputFolder);
+    }
+    match caps {
+        None => blockers.push(ConvertBlocker::FfmpegNotQueried),
+        Some(c) if !c.has_ffmpeg => blockers.push(ConvertBlocker::FfmpegMissing(c.error_message.clone())),
+        Some(_) => {}
+    }
+    ConvertReadiness {
+        can_convert: blockers.is_empty(),
+        blockers,
+    }
+}
+
+pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
+    let imperatives: Vec<&str> = blockers.iter().filter_map(|b| match b {
+        ConvertBlocker::NoRecording => Some("select a recording"),
+        ConvertBlocker::NoPrefix => Some("set a filename prefix"),
+        ConvertBlocker::NoOutputFolder => Some("choose an output folder"),
+        _ => None,
+    }).collect();
+
+    let ffmpeg_messages: Vec<String> = blockers.iter().filter_map(|b| match b {
+        ConvertBlocker::FfmpegNotQueried => {
+            Some("ffmpeg availability is being checked…".to_string())
+        }
+        ConvertBlocker::FfmpegMissing(msg) => {
+            let base = "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.";
+            match msg {
+                Some(detail) if !detail.is_empty() => Some(format!("{} ({})", base, detail)),
+                _ => Some(base.to_string()),
+            }
+        }
+        _ => None,
+    }).collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    if !imperatives.is_empty() {
+        parts.push(format!("To convert, please {}.", imperatives.join(", ")));
+    }
+    parts.extend(ffmpeg_messages);
+    parts.join(" ")
+}
+
+/// Pure version of the default-selection logic, extracted for testability.
+/// Replaces container/video_encoder/audio_encoder with `select_best_combination`
+/// defaults if the current selection is not available in `caps`.
+pub fn apply_available_defaults(
+    container: &mut String,
+    video_encoder: &mut String,
+    audio_encoder: &mut String,
+    caps: &FfmpegCapabilities,
+) {
+    let containers: Vec<&str> = available_containers(caps).iter().map(|(k, _)| *k).collect();
+    if !containers.contains(&container.as_str()) {
+        let (c, v, a) = select_best_combination(caps);
+        *container = c;
+        *video_encoder = v;
+        *audio_encoder = a;
+        return;
+    }
+    let vids: Vec<&str> =
+        available_video_encoders_for_container(container, caps).iter().map(|(k, _)| *k).collect();
+    let auds: Vec<&str> =
+        available_audio_encoders_for_container(container, caps).iter().map(|(k, _)| *k).collect();
+    if !vids.contains(&video_encoder.as_str()) || !auds.contains(&audio_encoder.as_str()) {
+        let (c, v, a) = select_best_combination(caps);
+        *container = c;
+        *video_encoder = v;
+        *audio_encoder = a;
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1301,6 +1404,155 @@ mod tests {
         s.pipeline = ConversionPipeline::AudioOnly { generate_synthetic_video: true };
         s.trim_offsets_secs = vec![trim; 2];
         s
+    }
+
+    fn make_caps(has_ffmpeg: bool, encoders: BTreeSet<&str>, formats: BTreeSet<&str>) -> FfmpegCapabilities {
+        FfmpegCapabilities {
+            has_ffmpeg,
+            available_encoders: encoders.into_iter().map(String::from).collect(),
+            available_formats: formats.into_iter().map(String::from).collect(),
+            error_message: None,
+        }
+    }
+
+    // ── evaluate_readiness / format_blockers ────────────────────────────
+
+    #[test]
+    fn test_readiness_unqueried_caps_is_not_missing() {
+        let r = evaluate_readiness(true, false, false, None);
+        assert!(!r.can_convert);
+        assert_eq!(r.blockers, vec![ConvertBlocker::FfmpegNotQueried]);
+    }
+
+    #[test]
+    fn test_readiness_ready_when_all_met() {
+        let caps = make_caps(true, BTreeSet::from(["libx264"]), BTreeSet::from(["matroska"]));
+        let r = evaluate_readiness(true, false, false, Some(&caps));
+        assert!(r.can_convert);
+        assert!(r.blockers.is_empty());
+    }
+
+    #[test]
+    fn test_readiness_missing_ffmpeg() {
+        let caps = make_caps(false, BTreeSet::new(), BTreeSet::new());
+        let r = evaluate_readiness(true, false, false, Some(&caps));
+        assert!(!r.can_convert);
+        assert_eq!(r.blockers, vec![ConvertBlocker::FfmpegMissing(None)]);
+    }
+
+    #[test]
+    fn test_readiness_missing_ffmpeg_with_error() {
+        let caps = FfmpegCapabilities {
+            has_ffmpeg: false,
+            available_encoders: BTreeSet::new(),
+            available_formats: BTreeSet::new(),
+            error_message: Some("ffmpeg found but returned non-zero exit status".to_string()),
+        };
+        let r = evaluate_readiness(true, false, false, Some(&caps));
+        assert_eq!(r.blockers, vec![ConvertBlocker::FfmpegMissing(Some("ffmpeg found but returned non-zero exit status".to_string()))]);
+    }
+
+    #[test]
+    fn test_readiness_no_group() {
+        let caps = make_caps(true, BTreeSet::from(["libx264"]), BTreeSet::from(["matroska"]));
+        let r = evaluate_readiness(false, false, false, Some(&caps));
+        assert!(!r.can_convert);
+        assert_eq!(r.blockers, vec![ConvertBlocker::NoRecording]);
+    }
+
+    #[test]
+    fn test_readiness_no_prefix() {
+        let caps = make_caps(true, BTreeSet::from(["libx264"]), BTreeSet::from(["matroska"]));
+        let r = evaluate_readiness(true, true, false, Some(&caps));
+        assert!(!r.can_convert);
+        assert_eq!(r.blockers, vec![ConvertBlocker::NoPrefix]);
+    }
+
+    #[test]
+    fn test_readiness_no_output_folder() {
+        let caps = make_caps(true, BTreeSet::from(["libx264"]), BTreeSet::from(["matroska"]));
+        let r = evaluate_readiness(true, false, true, Some(&caps));
+        assert!(!r.can_convert);
+        assert_eq!(r.blockers, vec![ConvertBlocker::NoOutputFolder]);
+    }
+
+    #[test]
+    fn test_readiness_multiple_blockers() {
+        let r = evaluate_readiness(false, true, true, None);
+        assert!(!r.can_convert);
+        assert_eq!(r.blockers.len(), 4);
+        assert!(r.blockers.contains(&ConvertBlocker::NoRecording));
+        assert!(r.blockers.contains(&ConvertBlocker::NoPrefix));
+        assert!(r.blockers.contains(&ConvertBlocker::NoOutputFolder));
+        assert!(r.blockers.contains(&ConvertBlocker::FfmpegNotQueried));
+    }
+
+    #[test]
+    fn test_format_blockers_imperative_only() {
+        let blockers = vec![ConvertBlocker::NoRecording, ConvertBlocker::NoPrefix];
+        let msg = format_blockers(&blockers);
+        assert_eq!(msg, "To convert, please select a recording, set a filename prefix.");
+    }
+
+    #[test]
+    fn test_format_blockers_ffmpeg_not_queried() {
+        let blockers = vec![ConvertBlocker::FfmpegNotQueried];
+        let msg = format_blockers(&blockers);
+        assert_eq!(msg, "ffmpeg availability is being checked…");
+    }
+
+    #[test]
+    fn test_format_blockers_ffmpeg_missing() {
+        let blockers = vec![ConvertBlocker::FfmpegMissing(None)];
+        let msg = format_blockers(&blockers);
+        assert!(msg.contains("ffmpeg is not available"));
+        assert!(msg.contains("install ffmpeg"));
+    }
+
+    #[test]
+    fn test_format_blockers_mixed() {
+        let blockers = vec![ConvertBlocker::NoRecording, ConvertBlocker::FfmpegNotQueried];
+        let msg = format_blockers(&blockers);
+        assert!(msg.starts_with("To convert, please select a recording."));
+        assert!(msg.contains("ffmpeg availability is being checked"));
+    }
+
+    // ── apply_available_defaults ────────────────────────────────────────
+
+    #[test]
+    fn test_apply_defaults_replaces_invalid_container() {
+        let caps = make_caps(true, BTreeSet::from(["prores_ks", "libx264", "pcm_s24le"]), BTreeSet::from(["mov", "matroska"]));
+        let mut c = "mxf".to_string();
+        let mut v = "libx264".to_string();
+        let mut a = "pcm_s24le".to_string();
+        apply_available_defaults(&mut c, &mut v, &mut a, &caps);
+        assert_eq!(c, "mov");
+        assert_eq!(v, "prores_ks");
+        assert_eq!(a, "pcm_s24le");
+    }
+
+    #[test]
+    fn test_apply_defaults_replaces_missing_encoder() {
+        let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
+        let mut c = "mkv".to_string();
+        let mut v = "libsvtav1".to_string();
+        let mut a = "pcm_s24le".to_string();
+        apply_available_defaults(&mut c, &mut v, &mut a, &caps);
+        assert_eq!(c, "mkv");
+        assert_eq!(v, "libx264");
+        assert_eq!(a, "pcm_s24le");
+    }
+
+    #[test]
+    fn test_apply_defaults_keeps_valid_selection() {
+        let caps = make_caps(true, BTreeSet::from(["prores_ks", "pcm_s24le"]), BTreeSet::from(["mov"]));
+        let mut c = "mov".to_string();
+        let mut v = "prores_ks".to_string();
+        let mut a = "pcm_s24le".to_string();
+        apply_available_defaults(&mut c, &mut v, &mut a, &caps);
+        assert_eq!(c, "mov");
+        assert_eq!(v, "prores_ks");
+        assert_eq!(a, "pcm_s24le");
     }
 
     #[test]

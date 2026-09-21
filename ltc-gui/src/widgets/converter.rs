@@ -6,12 +6,13 @@ use egui::{Color32, FontId, RichText, Ui};
 use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
-    available_audio_encoders_for_container, available_containers,
-    available_video_encoders_for_container, conversion_sanity_check,
-    find_timecode_at_offset, query_ffmpeg_capabilities, select_best_combination,
+    apply_available_defaults, available_audio_encoders_for_container,
+    available_containers, available_video_encoders_for_container,
+    conversion_sanity_check, evaluate_readiness, find_timecode_at_offset,
+    format_blockers, query_ffmpeg_capabilities,
     spawn_conversion, supported_audio_encoders, supported_containers,
-    supported_video_encoders, ChannelMap, ConversionPipeline, ConversionState,
-    ConversionStatus, ConverterSettings,
+    supported_video_encoders, ChannelMap, ConversionPipeline,
+    ConversionState, ConversionStatus, ConverterSettings,
     FfmpegCapabilities, RecordingType, TimecodeMetadata,
 };
 use gui_engine::file_pattern::match_files_all_patterns;
@@ -116,9 +117,13 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                 state.ltc_file_idx = 1; // default to track 2
                 state.trim_ltc_start = false;
 
-                if state.ffmpeg_caps.is_none() {
-                    let caps = query_ffmpeg_capabilities();
-                    state.ffmpeg_caps = Some(caps);
+                let guard = state.ffmpeg_probe_started.clone();
+                let caps_arc = state.ffmpeg_caps.clone();
+                if !guard.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::spawn(move || {
+                        let result = query_ffmpeg_capabilities();
+                        *caps_arc.lock().unwrap() = Some(result);
+                    });
                 }
             }
         }
@@ -894,25 +899,25 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
 
 fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let caps_clone = state.ffmpeg_caps.clone();
+    let caps_opt = state.ffmpeg_caps.lock().unwrap().clone();
 
-    if let Some(ref caps) = caps_clone {
-        use_available_defaults(state, caps);
+    if let Some(ref caps) = caps_opt {
+        apply_available_defaults(&mut state.container, &mut state.video_encoder, &mut state.audio_encoder, caps);
     }
 
-    let containers: Vec<(&str, &str)> = if let Some(ref caps) = caps_clone {
+    let containers: Vec<(&str, &str)> = if let Some(ref caps) = caps_opt {
         available_containers(caps)
     } else {
         supported_containers()
     };
 
-    let video_encoders = if let Some(ref caps) = caps_clone {
+    let video_encoders = if let Some(ref caps) = caps_opt {
         available_video_encoders_for_container(&state.container, caps)
     } else {
         supported_video_encoders()
     };
 
-    let audio_encoders = if let Some(ref caps) = caps_clone {
+    let audio_encoders = if let Some(ref caps) = caps_opt {
         available_audio_encoders_for_container(&state.container, caps)
     } else {
         supported_audio_encoders()
@@ -932,7 +937,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             {
                 let mut update_container = |v: &str| {
                     state.container = v.to_string();
-                    if let Some(ref caps) = caps_clone {
+                    if let Some(ref caps) = caps_opt {
                         re_select_encoders_for_container(state, caps);
                     }
                 };
@@ -965,7 +970,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
                 {
                     let mut update_container = |v: &str| {
                         state.container = v.to_string();
-                        if let Some(ref caps) = caps_clone {
+                        if let Some(ref caps) = caps_opt {
                             re_select_encoders_for_container(state, caps);
                         }
                     };
@@ -994,7 +999,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     }
 
     // Sanity check
-    if let Some(ref caps) = caps_clone {
+    if let Some(ref caps) = caps_opt {
         ui.add_space(4.0);
         let input_files: Vec<PathBuf> = state
             .selected_group_idx
@@ -1029,7 +1034,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
         }
     }
 
-    if let Some(ref caps) = caps_clone {
+    if let Some(ref caps) = caps_opt {
         if !caps.has_ffmpeg {
             ui.add_space(4.0);
             let error_frame = egui::Frame::new()
@@ -1068,28 +1073,7 @@ fn render_format_row(
     });
 }
 
-/// Apply `select_best_combination` defaults when ffmpeg caps are first loaded.
-/// Skips if the current selection is already a valid combination.
-fn use_available_defaults(state: &mut AppState, caps: &FfmpegCapabilities) {
-    let containers: Vec<&str> = available_containers(caps).iter().map(|(k, _)| *k).collect();
-    if !containers.contains(&state.container.as_str()) {
-        let (c, v, a) = select_best_combination(caps);
-        state.container = c;
-        state.video_encoder = v;
-        state.audio_encoder = a;
-        return;
-    }
-    let vids: Vec<&str> =
-        available_video_encoders_for_container(&state.container, caps).iter().map(|(k, _)| *k).collect();
-    let auds: Vec<&str> =
-        available_audio_encoders_for_container(&state.container, caps).iter().map(|(k, _)| *k).collect();
-    if !vids.contains(&state.video_encoder.as_str()) || !auds.contains(&state.audio_encoder.as_str()) {
-        let (c, v, a) = select_best_combination(caps);
-        state.container = c;
-        state.video_encoder = v;
-        state.audio_encoder = a;
-    }
-}
+
 
 /// When the container changes, re-select video/audio encoders that are
 /// compatible with the new container (and available in ffmpeg).
@@ -1257,13 +1241,18 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
         return;
     }
 
-    let can_convert = state.selected_group_idx.is_some()
-        && !state.filename_prefix.is_empty()
-        && !state.output_folder.as_os_str().is_empty()
-        && state.ffmpeg_caps.as_ref().map(|c| c.has_ffmpeg).unwrap_or(false);
+    let caps_opt = state.ffmpeg_caps.lock().unwrap().clone();
+
+    let readiness = evaluate_readiness(
+        state.selected_group_idx.is_some(),
+        state.filename_prefix.is_empty(),
+        state.output_folder.as_os_str().is_empty(),
+        caps_opt.as_ref(),
+    );
+    let can_convert = readiness.can_convert;
 
     let sanity_ok = if can_convert {
-        let caps = state.ffmpeg_caps.as_ref().unwrap();
+        let caps = caps_opt.as_ref().unwrap();
         let input_files = selected_input_files(state);
         conversion_sanity_check(
             &state.container,
@@ -1310,26 +1299,11 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
 
     if !can_convert {
         ui.add_space(2.0);
-        let mut reasons: Vec<&str> = Vec::new();
-        if state.selected_group_idx.is_none() {
-            reasons.push("select a recording");
-        }
-        if state.filename_prefix.is_empty() {
-            reasons.push("set a filename prefix");
-        }
-        if state.output_folder.as_os_str().is_empty() {
-            reasons.push("select an output folder");
-        }
-        if !state.ffmpeg_caps.as_ref().map(|c| c.has_ffmpeg).unwrap_or(false) {
-            reasons.push("ffmpeg is not available");
-        }
-        if !reasons.is_empty() {
-            ui.label(
-                RichText::new(format!("To convert, please {}.", reasons.join(", ")))
-                    .font(FontId::proportional(10.0))
-                    .color(colors.text_secondary),
-            );
-        }
+        ui.label(
+            RichText::new(format_blockers(&readiness.blockers))
+                .font(FontId::proportional(10.0))
+                .color(colors.text_secondary),
+        );
     } else if !sanity_ok {
         ui.add_space(2.0);
         ui.label(
