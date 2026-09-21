@@ -205,3 +205,43 @@ Allow non root (i.e. you) users to run docker:
   sudo usermod -aG docker $USER
   newgrp docker
 #+end_src
+
+* Cross Compiling Libltc on Linux for Windows builds
+
+#+begin_src bash
+# 1. Clone source code
+git clone https://github.com/x42/libltc.git
+cd libltc
+
+# 2. Generate configuration files
+autoreconf -vfi
+
+# 3. Create a isolated install directory (e.g. $HOME/deps/libltc-win64)
+mkdir -p $HOME/bin/libltc-win64
+
+# 4. Configure build for Windows 64-bit MinGW
+./configure \
+  --host=x86_64-w64-mingw32 \
+  --prefix=$HOME/bin/libltc-win64 \
+  --enable-static \
+  --disable-shared
+
+# 5. Compile and install
+make -j$(nproc)
+make install 
+#+end_src
+
+Compile:
+#+begin_src bash
+BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$HOME/bin/libltc-win64/include" RUSTFLAGS="-L native=$HOME/bin/libltc-win64/lib" cargo build --target x86_64-pc-windows-gnu --release --bin ltc-gui
+#+end_src
+
+Make arguments automatic, edit =.cargo/config.toml=:
+#+begin_src toml
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-L", "native=/home/viktoria/bin/libltc-win64/lib"]
+
+[env]
+BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu = "-I/home/viktoria/bin/libltc-win64/include"
+#+end_src
