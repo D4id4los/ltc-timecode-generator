@@ -55,10 +55,8 @@ export function getLTCBits(
   writeVal(seconds % 10, 16, 4);
   // 20-23: User bits 3 (0)
   writeVal(0, 20, 4);
-  // 24-25: Seconds tens (0-5)
-  writeVal(Math.floor(seconds / 10), 24, 2);
-  // 26: Polarity Correction / Bi-phase mark phase correction (0)
-  bitsCache[26] = 0;
+  // 24-26: Seconds tens (0-5)
+  writeVal(Math.floor(seconds / 10), 24, 3);
   // 27-31: User bits 4 (0)
   writeVal(0, 27, 5);
 

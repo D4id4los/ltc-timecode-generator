@@ -1147,4 +1147,398 @@ mod tests {
         assert_eq!(bits_to_u8(&[1, 0]), 1);
         assert_eq!(bits_to_u8(&[1, 1, 0, 0, 0, 0, 0, 0]), 3);
     }
+
+    // ── Helpers: exhaustive sweeps / continuity ───────────────────────────
+
+    fn bits_to_hex(bits: &[u8; 80]) -> String {
+        let mut bytes = [0u8; 10];
+        for (i, &b) in bits.iter().enumerate() {
+            bytes[i / 8] |= b << (i % 8);
+        }
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    #[test]
+    fn test_golden_vectors() {
+        let cases: [(u32, u32, u32, u32, bool, &str); 11] = [
+            (0, 0, 0, 0, false, "0000000000000000fcbf"),
+            (1, 2, 3, 4, false, "0400030002000100fcbf"),
+            (2, 1, 39, 24, false, "0402090301000200fcbf"),
+            (2, 1, 40, 0, false, "0000000401000200fcbf"),
+            (2, 1, 50, 24, false, "0402000501000200fcbf"),
+            (2, 1, 59, 24, false, "0402090501000200fcbf"),
+            (9, 59, 40, 0, false, "0000000409050900fcbf"),
+            (12, 34, 56, 18, false, "0801060504030201fcbf"),
+            (23, 59, 59, 29, false, "0902090509050302fcbf"),
+            (0, 0, 0, 0, true, "0004000000000000fcbf"),
+            (10, 15, 30, 12, true, "0205000305010001fcbf"),
+        ];
+        for (h, m, s, f, df, expected_hex) in cases {
+            let hex = bits_to_hex(&get_ltc_bits(&mk_tc(h, m, s, f), df));
+            assert_eq!(
+                hex, expected_hex,
+                "golden vector for {:02}:{:02}:{:02}:{:02} df={}",
+                h, m, s, f, df
+            );
+        }
+    }
+
+    fn mk_tc(hours: u32, minutes: u32, seconds: u32, frames: u32) -> Timecode {
+        Timecode { hours, minutes, seconds, frames }
+    }
+
+    /// Absolute frame number in the integer frame-number space used by
+    /// `increment_timecode` (`fps.ceil()` frames per displayed second).
+    fn tc_frame_number(tc: &Timecode, fps: f64) -> u64 {
+        let mpf = fps.ceil() as u64;
+        (tc.hours as u64 * 3600 + tc.minutes as u64 * 60 + tc.seconds as u64) * mpf
+            + tc.frames as u64
+    }
+
+    fn roundtrip(t: &Timecode, drop_frame: bool) -> Timecode {
+        let bits = get_ltc_bits(t, drop_frame);
+        decode_timecode_from_bits(&bits, 0)
+    }
+
+    // ── Regression: seconds tens must use all 3 bits (24–26) ─────────────
+    //
+    // Historical bug (a7ac813 → 2f68dd8): the seconds-tens BCD digit (0–5)
+    // was written into 2 bits, so tens=4 (0b100) truncated to 0 and tens=5
+    // (0b101) truncated to 1. Every minute decoded as: 00–39 correct,
+    // 40–59 shown as 00–19 → periodic backward/forward jumps exactly at
+    // :39:24 → :00:00 and :19:24 → next minute.
+
+    #[test]
+    fn test_seconds_tens_uses_3_bits() {
+        for s in 40u32..=59 {
+            let t = mk_tc(2, 1, s, 12);
+            let bits = get_ltc_bits(&t, false);
+            let expected: [u8; 3] = if s < 50 { [0, 0, 1] } else { [1, 0, 1] };
+            assert_eq!(bits[24..27], expected, "seconds-tens bits for s={}", s);
+            assert_eq!(roundtrip(&t, false), t, "round-trip for s={}", s);
+        }
+    }
+
+    // ── Exhaustive round-trip sweeps ──────────────────────────────────────
+
+    #[test]
+    fn test_roundtrip_exhaustive_25fps() {
+        for h in 0u32..=23 {
+            for m in 0u32..=59 {
+                for s in 0u32..=59 {
+                    for f in 0u32..=24 {
+                        let t = mk_tc(h, m, s, f);
+                        assert_eq!(roundtrip(&t, false), t, "tc={:?}", t);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_sweep_other_fps() {
+        for &fps in &[24.0f64, 29.97, 30.0] {
+            let mf = fps.ceil() as u32;
+            for &h in &[0u32, 1, 9, 10, 23] {
+                for m in 0u32..=59 {
+                    for s in 0u32..=59 {
+                        for f in 0..mf {
+                            let t = mk_tc(h, m, s, f);
+                            assert_eq!(roundtrip(&t, false), t, "fps={} tc={:?}", fps, t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_bcd_field_positions_and_widths() {
+        for v in 0u32..=9 {
+            let t = mk_tc(0, 0, 0, v);
+            assert_eq!(bits_to_u8(&get_ltc_bits(&t, false)[0..4]), v as u8, "frame units {}", v);
+        }
+        for v in 0u32..=2 {
+            let t = mk_tc(0, 0, 0, v * 10 + 3);
+            let bits = get_ltc_bits(&t, false);
+            assert_eq!(bits_to_u8(&bits[8..10]), v as u8, "frame tens {}", v);
+            assert_eq!(bits_to_u8(&bits[0..4]), 3);
+        }
+        for v in 0u32..=9 {
+            let t = mk_tc(0, 0, v, 3);
+            let bits = get_ltc_bits(&t, false);
+            assert_eq!(bits_to_u8(&bits[16..20]), v as u8, "seconds units {}", v);
+        }
+        for v in 0u32..=5 {
+            let t = mk_tc(0, 0, v * 10 + 3, 0);
+            let bits = get_ltc_bits(&t, false);
+            assert_eq!(bits_to_u8(&bits[24..27]), v as u8, "seconds tens {}", v);
+            assert_eq!(bits_to_u8(&bits[16..20]), 3);
+        }
+        for v in 0u32..=9 {
+            let t = mk_tc(0, v, 3, 0);
+            let bits = get_ltc_bits(&t, false);
+            assert_eq!(bits_to_u8(&bits[32..36]), v as u8, "minutes units {}", v);
+        }
+        for v in 0u32..=5 {
+            let t = mk_tc(0, v * 10 + 3, 3, 0);
+            let bits = get_ltc_bits(&t, false);
+            assert_eq!(bits_to_u8(&bits[40..43]), v as u8, "minutes tens {}", v);
+            assert_eq!(bits_to_u8(&bits[32..36]), 3);
+        }
+        for v in 0u32..=9 {
+            let t = mk_tc(v, 3, 3, 0);
+            let bits = get_ltc_bits(&t, false);
+            assert_eq!(bits_to_u8(&bits[48..52]), v as u8, "hours units {}", v);
+        }
+        for v in 0u32..=2 {
+            let t = mk_tc(v * 10 + 1, 3, 3, 0);
+            let bits = get_ltc_bits(&t, false);
+            assert_eq!(bits_to_u8(&bits[56..58]), v as u8, "hours tens {}", v);
+            assert_eq!(bits_to_u8(&bits[48..52]), 1);
+        }
+    }
+
+    // ── Continuity: encode→decode sequence must advance by exactly 1 ─────
+    //
+    // Catches the observed production failure: every decoded frame must be
+    // the strict +1 successor of the previous one. The historical 2-bit
+    // seconds-tens bug produces 1000 "missing" frames per minute and fails
+    // at the first :39:24 → :40:00 boundary.
+
+    #[test]
+    fn test_encoded_sequence_continuous_2h_25fps() {
+        let fps = 25.0f64;
+        let num_frames = (7200.0 * fps) as u64;
+        let mut t = mk_tc(10, 0, 0, 0);
+        let mut prev = tc_frame_number(&t, fps);
+        for i in 0..num_frames {
+            t = increment_timecode(&t, fps, false);
+            let decoded = roundtrip(&t, false);
+            assert_eq!(decoded, t, "frame {} must round-trip", i);
+            let n = tc_frame_number(&decoded, fps);
+            assert_eq!(n, prev + 1, "frame {} must advance exactly +1 ({} -> {})", i, prev, n);
+            prev = n;
+        }
+        assert_eq!(t, mk_tc(12, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_encoded_sequence_continuous_2h_various_fps() {
+        for &fps in &[24.0f64, 29.97, 30.0] {
+            let num_frames = 7200 * fps.ceil() as u64;
+            let mut t = mk_tc(10, 0, 0, 0);
+            let mut prev = tc_frame_number(&t, fps);
+            for i in 0..num_frames {
+                t = increment_timecode(&t, fps, false);
+                let decoded = roundtrip(&t, false);
+                assert_eq!(decoded, t, "fps={} frame {} must round-trip", fps, i);
+                let n = tc_frame_number(&decoded, fps);
+                assert_eq!(n, prev + 1, "fps={} frame {} must advance exactly +1", fps, i);
+                prev = n;
+            }
+            assert_eq!(t, mk_tc(12, 0, 0, 0), "fps={} must land on +2h", fps);
+        }
+    }
+
+    #[test]
+    fn test_encoded_sequence_continuous_2h_2997_drop_frame() {
+        let fps = 29.97f64;
+        let num_frames = (7200.0 * fps).round() as u64;
+        assert_eq!(num_frames, 215_784, "2h of 29.97df frame numbers");
+        let mut t = mk_tc(10, 0, 0, 0);
+        let mut skipped = 0u64;
+        for i in 0..num_frames {
+            let decoded = roundtrip(&t, true);
+            assert_eq!(decoded, t, "df frame {} must round-trip", i);
+            let prev_frames = t.frames;
+            t = increment_timecode(&t, fps, true);
+            if t.frames == 2 && prev_frames == 29 {
+                skipped += 1;
+                assert_ne!(t.minutes % 10, 0, "frames may only be dropped in non-tenth minutes");
+            }
+        }
+        assert_eq!(skipped, 108, "54 drop events per hour (2 frames each) = 108 over 2h");
+        assert_eq!(t, mk_tc(12, 0, 0, 0), "frame accounting must land exactly on +2h");
+    }
+
+    #[test]
+    fn test_midnight_wrap_continuity_25fps() {
+        let fps = 25.0f64;
+        let day_frames = 24u64 * 3600 * fps as u64;
+        let mut t = mk_tc(23, 59, 59, 20);
+        let start_num = tc_frame_number(&t, fps);
+        for i in 0..20u64 {
+            t = increment_timecode(&t, fps, false);
+            let decoded = roundtrip(&t, false);
+            assert_eq!(decoded, t, "wrap step {} must round-trip", i);
+            let n = tc_frame_number(&decoded, fps);
+            assert_eq!(n, (start_num + i + 1) % day_frames, "wrap step {}", i);
+        }
+        assert_eq!(t, mk_tc(0, 0, 0, 15));
+    }
+
+    #[test]
+    fn test_full_24h_roundtrip_and_continuity_25fps() {
+        let fps = 25.0f64;
+        let day_frames = 24u64 * 3600 * fps as u64;
+        let mut t = mk_tc(0, 0, 0, 0);
+        let mut prev: u64 = day_frames - 1;
+        for i in 0..day_frames {
+            let decoded = roundtrip(&t, false);
+            assert_eq!(decoded, t, "frame {} must round-trip", i);
+            let n = tc_frame_number(&decoded, fps);
+            assert_eq!(n, (prev + 1) % day_frames, "frame {} must advance exactly +1", i);
+            prev = n;
+            t = increment_timecode(&t, fps, false);
+        }
+        assert_eq!(t, mk_tc(0, 0, 0, 0), "24h must wrap back to zero");
+    }
+
+    // ── Long-running sample-count drift at 25fps ─────────────────────────
+
+    #[test]
+    fn test_long_running_2h_sample_count_zero_drift_48khz_25fps() {
+        let sample_rate = 48000u32;
+        let fps = 25.0;
+        let exact_spf = sample_rate as f64 / fps;
+        let base = exact_spf.floor() as usize;
+        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut total_generated: u64 = 0;
+        let mut accumulator = 0.0_f64;
+        let num_frames = (7200.0_f64 * fps) as u64;
+        let mut frame_buf = vec![0.0f32; (base + 1) * 2];
+
+        for _ in 0..num_frames {
+            let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
+            frame_buf[..samples * 2].fill(0.0);
+            generate_ltc_frame_stereo(
+                &tc, false, samples, spb,
+                0.5, "both", &mut last_level, &mut frame_buf[..samples * 2],
+            );
+            total_generated += samples as u64;
+            tc = increment_timecode(&tc, fps, false);
+            accumulator = new_acc;
+        }
+
+        let expected = (sample_rate as f64 * 7200.0) as u64;
+        let drift = total_generated as i64 - expected as i64;
+        assert!(
+            drift.unsigned_abs() <= 2,
+            "zero drift target at 48kHz/25fps: got {} samples drift over 2h (allowed ±2)",
+            drift
+        );
+    }
+
+    #[test]
+    fn test_long_running_2h_sample_count_zero_drift_44khz_25fps() {
+        let sample_rate = 44100u32;
+        let fps = 25.0;
+        let exact_spf = sample_rate as f64 / fps;
+        let base = exact_spf.floor() as usize;
+        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut total_generated: u64 = 0;
+        let mut accumulator = 0.0_f64;
+        let num_frames = (7200.0_f64 * fps) as u64;
+        let mut frame_buf = vec![0.0f32; (base + 1) * 2];
+
+        for _ in 0..num_frames {
+            let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
+            frame_buf[..samples * 2].fill(0.0);
+            generate_ltc_frame_stereo(
+                &tc, false, samples, spb,
+                0.5, "both", &mut last_level, &mut frame_buf[..samples * 2],
+            );
+            total_generated += samples as u64;
+            tc = increment_timecode(&tc, fps, false);
+            accumulator = new_acc;
+        }
+
+        let expected = (sample_rate as f64 * 7200.0) as u64;
+        let drift = total_generated as i64 - expected as i64;
+        assert!(
+            drift.unsigned_abs() <= 2,
+            "zero drift target at 44.1kHz/25fps: got {} samples drift over 2h (allowed ±2)",
+            drift
+        );
+    }
+
+    // ── End-to-end: generated audio must decode gap-free ─────────────────
+    //
+    // Generates real modulated audio across the historically broken
+    // boundaries (:39:24 → :40:00 and :59:24 → minute rollover, plus an
+    // hour rollover) and runs the builtin decoder over it, mirroring the
+    // production analysis pipeline. Any backward jump or gap fails here.
+
+    #[test]
+    fn test_generated_audio_decodes_gap_free_48khz_25fps() {
+        let sample_rate = 48000u32;
+        let fps = 25.0f64;
+        let exact_spf = sample_rate as f64 / fps;
+        let base = exact_spf.floor() as usize;
+        let duration_secs = 63.0f64;
+        let num_frames = (duration_secs * fps) as u64;
+        let mut tc = mk_tc(9, 59, 39, 0);
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut accumulator = 0.0_f64;
+        let mut expected: Vec<Timecode> = Vec::with_capacity(num_frames as usize);
+        let mut audio: Vec<f32> = Vec::with_capacity((duration_secs * sample_rate as f64) as usize);
+        let mut frame_buf = vec![0.0f32; (base + 1) * 2];
+
+        for _ in 0..num_frames {
+            let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
+            frame_buf[..samples * 2].fill(0.0);
+            generate_ltc_frame_stereo(
+                &tc, false, samples, spb,
+                0.8, "both", &mut last_level, &mut frame_buf[..samples * 2],
+            );
+            audio.extend(frame_buf[..samples * 2].iter().step_by(2).copied());
+            expected.push(tc);
+            accumulator = new_acc;
+            tc = increment_timecode(&tc, fps, false);
+        }
+        assert_eq!(tc, mk_tc(10, 0, 42, 0), "generation must end at expected TC");
+
+        let result = crate::ltc_decoder::decode_ltc_samples(
+            &audio, sample_rate, 1, fps, false, std::time::Instant::now(),
+        )
+        .expect("decode of generated audio must succeed");
+        assert!(matches!(result.status, crate::ltc_decoder::LtcDecodeStatus::Success),
+            "status must be Success, got {:?}", result.status);
+        assert_eq!(result.sample_rate, sample_rate);
+        assert!((result.detected_fps - 25.0).abs() < 0.01, "detected fps 25, got {}", result.detected_fps);
+
+        let decoded: Vec<Timecode> = result.timecodes.iter().map(|f| f.timecode).collect();
+        assert!(!decoded.is_empty(), "at least one frame must decode");
+        assert!(expected[..3].contains(&decoded[0]),
+            "first decoded frame must be at the start (decoder may skip 1-2 frames before sync lock), got {:?}", decoded[0]);
+        assert!(expected[expected.len() - 3..].contains(decoded.last().unwrap()),
+            "last decoded frame must be at the end, got {:?}", decoded.last().unwrap());
+        assert!(decoded.len() >= expected.len() - 4,
+            "decode coverage: {} of {} frames", decoded.len(), expected.len());
+
+        let start_idx = expected.iter().position(|t| *t == decoded[0]).unwrap();
+        for (i, frame) in decoded.iter().enumerate() {
+            assert_eq!(*frame, expected[start_idx + i],
+                "decoded frame {} must be the expected +1 successor (gap or jump at index {})", i, i);
+        }
+
+        for boundary in [
+            mk_tc(9, 59, 40, 0),
+            mk_tc(10, 0, 0, 0),
+            mk_tc(10, 0, 40, 0),
+        ] {
+            assert!(decoded.contains(&boundary), "boundary {:?} must be decoded", boundary);
+        }
+
+        if let Some(q) = &result.quality {
+            assert_eq!(q.gap_count, 0, "no gaps allowed: {}", q.summary);
+            assert_eq!(q.glitch_count, 0, "no glitches allowed: {}", q.summary);
+            assert_eq!(q.edit_count, 0, "no edit points allowed: {}", q.summary);
+            assert!(q.missing_frames <= 2, "at most 2 edge frames missing: {}", q.summary);
+            assert!(q.max_drift_secs < 0.1, "drift must be negligible: {}", q.max_drift_secs);
+        }
+    }
 }

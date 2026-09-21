@@ -2,22 +2,26 @@
 
 ## Overview
 High-precision SMPTE Linear Timecode (LTC) audio signal generator + digital clapper-board for multi-camera video sync. Generates bi-phase mark modulated LTC audio and beep tones, routed to selectable stereo channels. Four frontends share a common `audio-core` Rust crate:
-1. **Web app** (React + Vite, browser-based)
-2. **Tauri v2** desktop (WebKitGTK + Rust backend, being phased out)
-3. **ltc-gui** (native Rust egui/eframe app — the target for weak-GPU tablets)
-4. **ltc-slint** (experimental Slint-based GUI spike)
+1. **ltc-gui** (native Rust egui/eframe app — currently the target main GUI target)
+2. **ltc-slint** (Slint-based GUI spike for lower CPU usage)
+3. **Web app** (React + Vite, browser-based -- Legacy GUI)
+4. **Tauri v2** desktop (WebKitGTK + Rust backend, -- Legacy GUI being phased out)
 
 Both Rust GUIs delegate all audio lifecycle, state management, and CLI handling to the shared **`gui-engine`** crate via an event-driven message bus.
 
+## Development Methodology
+
+- When fixing bugs, use a TTD approach: write test that catches the bug -> Run test (Expect Failure) -> Fix bug -> Run test again (Expect Success).
+
 ## Tech Stack
-- **Frontend**: React 19 + TypeScript + Vite 6 + Tailwind CSS 4 + `lucide-react` icons + `motion` + `@google/genai`
-- **Desktop**: Tauri v2 (`@tauri-apps/cli` v2.11.4)
-- **Rust Backend**: Tauri v2.11.3, audio-core (path dep), serde/serde_json, tauri-plugin-log 2
 - **audio-core** (shared crate): cpal 0.18, keepawake 0.6, ringbuf 0.3, serde, log, thread-priority 0.5; conditional pipewire on 64-bit Linux
 - **gui-engine** (shared GUI engine): audio-core, arc-swap 1.7, chrono 0.4, clap 4, ctrlc 3.4, env_logger 0.11, hound 3.5, log 0.4
 - **Native GUI** (ltc-gui): gui-engine, eframe 0.35 (glow), egui 0.35
 - **Slint GUI** (ltc-slint): gui-engine, slint 1.17, slint-build 1.17, arboard 3
 - **Build**: `npm run build` → `dist/`, `npx tauri build` → AppImage/deb/msi, `cargo build` (workspace builds all Rust crates)
+- **Web Frontend**: React 19 + TypeScript + Vite 6 + Tailwind CSS 4 + `lucide-react` icons + `motion` + `@google/genai`
+- **Web UI Desktop**: Tauri v2 (`@tauri-apps/cli` v2.11.4)
+- **Rust Backend**: Tauri v2.11.3, audio-core (path dep), serde/serde_json, tauri-plugin-log 2
 - **32-bit Legacy**: `src-tauri-32bit/` (Tauri v1, Docker cross-compile via `build-32bit.sh`)
 
 ## Project Structure
@@ -173,7 +177,7 @@ The `audio-core` crate provides the raw audio engine:
 - **Free functions**: `list_audio_devices()`, `get_ltc_bits()`, `increment_timecode()`, `generate_ltc_frame_stereo()`, `suggest_sample_rate()`, `is_transient_audio_error()`, `is_permanent_device_error()`.
 - **Constants**: `SAMPLE_RATE_OPTIONS = &[44100, 48000]`.
 
-## Key Architecture — Dual Audio Backend
+## Web UI Architecture
 
 The app runs in **two modes**, detected at runtime via `window.__TAURI_INTERNALS__`:
 

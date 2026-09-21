@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist src-tauri/target src-tauri-32bit/target ltc-gui/target",
     "lint": "tsc --noEmit",
+    "test": "vitest run",
     "version": "node scripts/sync-version.js"
   },
   "dependencies": {
@@ -32,6 +33,7 @@
     "esbuild": "^0.25.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
-    "typescript": "~5.8.2"
+    "typescript": "~5.8.2",
+    "vitest": "^5.0.1"
   }
 }
