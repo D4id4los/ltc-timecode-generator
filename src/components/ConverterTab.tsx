@@ -290,6 +290,14 @@ function TauriConverter() {
   const [ltcDetecting, setLtcDetecting] = useState(false);
   const [decodeFpsIdx, setDecodeFpsIdx] = useState(1);
 
+  // Auto-check split/drop on successful LTC detection
+  useEffect(() => {
+    if (ltcResult && (ltcResult.status.type === "Success" || ltcResult.status.type === "LowConfidence")) {
+      setSplitTracks(true);
+      setDropLtcTrack(true);
+    }
+  }, [ltcResult]);
+
   // Video audio probe (streams + channels within each stream)
   const [videoAudioInfo, setVideoAudioInfo] = useState<{ streams: AudioStreamInfo[]; total_audio_channels: number } | null>(null);
   const [selectedStream, setSelectedStream] = useState(0);
@@ -882,7 +890,6 @@ function TauriConverter() {
               <input
                 type="checkbox"
                 checked={splitTracks}
-                disabled={!ltcResult}
                 onChange={(e) => setSplitTracks(e.target.checked)}
                 className="accent-[#FF5F1F]"
               />
@@ -898,9 +905,6 @@ function TauriConverter() {
               />
               Drop LTC track
             </label>
-            {!ltcResult && (
-              <span className="text-[10px] text-text-muted italic">(Detect LTC first)</span>
-            )}
           </div>
         </>
       )}

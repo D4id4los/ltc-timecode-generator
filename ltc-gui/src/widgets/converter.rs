@@ -859,7 +859,7 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.add_enabled(ltc_available, egui::Checkbox::new(
+        ui.add(egui::Checkbox::new(
             &mut state.split_tracks,
             "Split tracks into separate files",
         ));
@@ -868,13 +868,6 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
             "Drop LTC track",
         ));
     });
-    if !ltc_available {
-        ui.label(
-            RichText::new("(Detect LTC first to enable these options)")
-                .font(FontId::proportional(9.0))
-                .color(colors.text_muted),
-        );
-    }
     if state.split_tracks {
         ui.label(
             RichText::new("ℹ Each input track will be written to its own file. Channel mapping greets are preserved.")

@@ -42,6 +42,8 @@ pub fn setup_poll_timer(
     conv_selected_folder: Arc<Mutex<String>>,
     conv_trim_offset_secs: Arc<Mutex<f64>>,
     conv_trim_to_first_ltc: Arc<Mutex<bool>>,
+    conv_split_tracks: Arc<Mutex<bool>>,
+    conv_drop_ltc_track: Arc<Mutex<bool>>,
 ) {
     let ui_weak = ui.as_weak();
     let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -97,6 +99,10 @@ pub fn setup_poll_timer(
                             ui.set_trim_offset_secs(offset as f32);
                             *conv_trim_to_first_ltc.lock().unwrap() = true;
                             ui.set_trim_to_first_ltc(true);
+                            *conv_split_tracks.lock().unwrap() = true;
+                            ui.set_conv_split_tracks(true);
+                            *conv_drop_ltc_track.lock().unwrap() = true;
+                            ui.set_conv_drop_ltc_track(true);
                         }
                         let drop_flag = if r.drop_frame { " DF" } else { "" };
                         let fps_str = if r.detected_fps > 0.0 {

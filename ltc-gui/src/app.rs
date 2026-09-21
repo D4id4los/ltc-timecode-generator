@@ -171,11 +171,13 @@ impl eframe::App for AppState {
         let snapshot = self.engine_state.load();
         self.latest = snapshot.as_ref().clone();
 
-        // 2. Derive trim offset from LTC result
+        // 2. Derive trim offset from LTC result, auto-check split/drop
         if let Some(ref result) = self.latest.ltc_decode_result {
             if matches!(result.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence) {
                 self.trim_offset_secs = result.first_ltc_timecode_secs;
                 self.trim_ltc_start = true;
+                self.split_tracks = true;
+                self.drop_ltc_track = true;
             }
         }
 

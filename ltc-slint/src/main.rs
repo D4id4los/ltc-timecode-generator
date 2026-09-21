@@ -1231,6 +1231,8 @@ fn _run_gui(
         conv_selected_folder,
         conv_trim_offset_secs,
         conv_trim_to_first_ltc,
+        conv_split_tracks.clone(),
+        conv_drop_ltc_track.clone(),
     );
 
     info!("LTC Slint GUI initialized, showing window");
