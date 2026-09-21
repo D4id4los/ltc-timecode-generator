@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
@@ -8,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, RichText, Sense, Ui};
 use gui_engine::command::GuiCommand;
-use gui_engine::converter::{ChannelMap, ConversionState, FfmpegCapabilities, SharedConversionState, CancelFlag};
+use gui_engine::converter::{ChannelMap, ConversionState, FfmpegCapabilities, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX};
+use gui_engine::file_pattern::MatchedGroup;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::{ArcSwap, AudioEvent};
@@ -82,22 +82,30 @@ pub struct AppState {
     pub ltc_file_idx: usize,
 
     // ── Converter state (GUI-local) ──────────────────────────────────
-    pub selected_pattern: usize,
+    pub _selected_pattern: usize,
     pub selected_folder: Option<PathBuf>,
     pub selected_files: Option<Vec<PathBuf>>,
-    pub file_groups: Option<BTreeMap<String, Vec<PathBuf>>>,
-    pub selected_group: Option<String>,
+    pub file_groups: Option<Vec<MatchedGroup>>,
+    pub selected_group_idx: Option<usize>,
     pub channel_map: ChannelMap,
+    pub recording_type: RecordingType,
+    pub generate_synthetic_video: bool,
+    pub split_tracks: bool,
+    pub drop_ltc_track: bool,
     pub container: String,
     pub video_encoder: String,
     pub audio_encoder: String,
-    pub output_path: PathBuf,
+    pub output_folder: PathBuf,
+    pub filename_prefix: String,
+    pub audio_suffix_template: String,
+    pub video_suffix_template: String,
     pub conversion_state: SharedConversionState,
     pub cancel_flag: CancelFlag,
     pub convert_handle: Option<JoinHandle<()>>,
     pub ffmpeg_caps: Option<FfmpegCapabilities>,
     pub trim_ltc_start: bool,
     pub trim_offset_secs: f64,
+    pub per_file_trim_offsets: Vec<f64>,
 }
 
 impl AppState {
@@ -122,22 +130,30 @@ impl AppState {
             app_menu_pos: None,
             log_buffer,
             ltc_file_idx: 0,
-            selected_pattern: 0,
+            _selected_pattern: 0,
             selected_folder: None,
             selected_files: None,
             file_groups: None,
-            selected_group: None,
+            selected_group_idx: None,
             channel_map: ChannelMap::identity(0),
+            recording_type: RecordingType::MultiTrackAudio,
+            generate_synthetic_video: false,
+            split_tracks: false,
+            drop_ltc_track: false,
             container: "mkv".to_string(),
             video_encoder: "libsvtav1".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
-            output_path: PathBuf::from(""),
+            output_folder: PathBuf::from(""),
+            filename_prefix: String::new(),
+            audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
+            video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
             conversion_state: Arc::new(Mutex::new(ConversionState::idle())),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             convert_handle: None,
             ffmpeg_caps: None,
             trim_ltc_start: false,
             trim_offset_secs: 0.0,
+            per_file_trim_offsets: Vec::new(),
         }
     }
 

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,7 +33,7 @@ pub fn setup_poll_timer(
     conv_state: Arc<Mutex<ConversionState>>,
     conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>>,
     conv_sanity_msg: Arc<Mutex<String>>,
-    conv_output_path: Arc<Mutex<String>>,
+    conv_filename_prefix: Arc<Mutex<String>>,
     conv_file_groups: Arc<Mutex<BTreeMap<String, Vec<PathBuf>>>>,
     conv_selected_group_idx: Arc<Mutex<isize>>,
     conv_container: Arc<Mutex<String>>,
@@ -319,19 +319,19 @@ pub fn setup_poll_timer(
                 ui.set_conv_log(SharedString::from(cs.ffmpeg_output.clone()));
             }
             if tick % 10 == 0 {
-                let out = conv_output_path.lock().unwrap().clone();
                 let caps = conv_ffmpeg_caps.lock().unwrap().clone();
                 let container = conv_container.lock().unwrap().clone();
                 let venc = conv_video_encoder.lock().unwrap().clone();
                 let aenc = conv_audio_encoder.lock().unwrap().clone();
                 let folder = conv_selected_folder.lock().unwrap().clone();
+                let filename_prefix = conv_filename_prefix.lock().unwrap().clone();
                 let mut msg = String::new();
                 match caps {
                     Some(ref c) if !c.has_ffmpeg => {
                         msg = "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.".to_string();
                     }
-                    Some(_) if out.is_empty() => {
-                        msg = "No output file path specified.".to_string();
+                    Some(_) if filename_prefix.is_empty() => {
+                        msg = "No input group selected.".to_string();
                     }
                     Some(ref c) => {
                         let sel_idx = *conv_selected_group_idx.lock().unwrap();
@@ -348,9 +348,10 @@ pub fn setup_poll_timer(
                         } else {
                             Vec::new()
                         };
-                        let output_path = PathBuf::from(&out);
+                        let output_folder = Path::new(&folder);
                         if let Err(e) = gui_engine::converter::conversion_sanity_check(
-                            &container, &venc, &aenc, &input_files, &output_path, c,
+                            &container, &venc, &aenc, &input_files, output_folder, &filename_prefix, c,
+                            None, None,
                         ) {
                             msg = e;
                         }

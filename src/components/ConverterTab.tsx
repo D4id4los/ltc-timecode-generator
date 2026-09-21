@@ -19,11 +19,6 @@ import {
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-const PATTERNS: { name: string; description: string }[] = [
-  { name: "TASCAM", description: "Tascam Portacapture X8 — name prefix + S<channel>" },
-  { name: "* (any)", description: "Any audio file — select files directly" },
-];
-
 interface FfmpegCaps {
   has_ffmpeg: boolean;
   available_encoders: string[];
@@ -35,6 +30,8 @@ interface FileGroupInfo {
   prefix: string;
   files: string[];
   channel_count: number;
+  pattern_name: string;
+  recording_type: string; // "MultiTrackAudio" | "VideoClipSequence"
 }
 
 interface ScanResult {
@@ -47,8 +44,23 @@ interface ConvertRequest {
   container: string;
   video_encoder: string;
   audio_encoder: string;
-  output_path: string;
-  trim_start_secs: number;
+  output_folder: string;
+  filename_prefix: string;
+  audio_suffix_template: string;
+  video_suffix_template: string;
+  recording_type: string;
+  ltc_track_channel_index: number;
+  split_tracks: boolean;
+  drop_ltc_track: boolean;
+  generate_synthetic_video: boolean;
+  trim_to_first_ltc: boolean;
+  trim_offsets_secs: number[];
+  timecode_hours?: number;
+  timecode_minutes?: number;
+  timecode_seconds?: number;
+  timecode_frames?: number;
+  timecode_fps?: number;
+  timecode_drop_frame?: boolean;
 }
 
 interface ConvertResponse {
@@ -221,27 +233,35 @@ function DesktopOnlyMessage() {
 
 function TauriConverter() {
   const [ffmpegCaps, setFfmpegCaps] = useState<FfmpegCaps | null>(null);
-  const [selectedPattern, setSelectedPattern] = useState<number>(0);
   const [selectedFolder, setSelectedFolder] = useState<string>("");
   const [fileGroups, setFileGroups] = useState<FileGroupInfo[]>([]);
   const [selectedGroupIdx, setSelectedGroupIdx] = useState<number>(-1);
 
+  // Recording type (derived from selected group)
+  const [recordingType, setRecordingType] = useState<string>("MultiTrackAudio");
+
   // Channel mapping
   const [channelMap, setChannelMap] = useState<number[]>([]);
   const [numChannels, setNumChannels] = useState<number>(0);
+  const [splitTracks, setSplitTracks] = useState(false);
+  const [dropLtcTrack, setDropLtcTrack] = useState(false);
 
   // Output format
   const [container, setContainer] = useState<string>("mkv");
   const [videoEncoder, setVideoEncoder] = useState<string>("libsvtav1");
   const [audioEncoder, setAudioEncoder] = useState<string>("pcm_s24le");
+  const [generateSyntheticVideo, setGenerateSyntheticVideo] = useState(false);
 
   // Derived option lists (filtered by ffmpeg caps + container compatibility)
   const [filteredContainers, setFilteredContainers] = useState<[string, string][]>(CONTAINERS);
   const [filteredVideo, setFilteredVideo] = useState<[string, string][]>(VIDEO_ENCODERS);
   const [filteredAudio, setFilteredAudio] = useState<[string, string][]>(AUDIO_ENCODERS);
 
-  // Output path
-  const [outputPath, setOutputPath] = useState<string>("");
+  // Output naming
+  const [outputFolder, setOutputFolder] = useState<string>("");
+  const [filenamePrefix, setFilenamePrefix] = useState<string>("");
+  const [audioSuffix, setAudioSuffix] = useState<string>("_audio_track{:01d}");
+  const [videoSuffix, setVideoSuffix] = useState<string>("_video_clip{:02d}");
 
   // Conversion state
   const [convStatus, setConvStatus] = useState<string>("idle");
@@ -250,7 +270,7 @@ function TauriConverter() {
   const pollingRef = useRef<number | null>(null);
 
   // LTC detection
-const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
+  const [ltcFileIdx, setLtcFileIdx] = useState<number>(1); // default track 2
   const [ltcResult, setLtcResult] = useState<LtcDetectionResult | null>(null);
   const [ltcError, setLtcError] = useState<string | null>(null);
   const [ltcDetecting, setLtcDetecting] = useState(false);
@@ -263,6 +283,9 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
     { id: "29.97df", name: "29.97 DF", fps: 29.97, dropFrame: true },
     { id: "30", name: "30 fps", fps: 30, dropFrame: false },
   ];
+
+  // Derived: is this a video recording?
+  const isVideo = recordingType === "VideoClipSequence";
 
   // Trim to first LTC
   const [trimToFirstLtc, setTrimToFirstLtc] = useState(false);
@@ -284,7 +307,6 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
           setContainer(bestC);
           setVideoEncoder(bestV);
           setAudioEncoder(bestA);
-          // Filter option lists
           setFilteredContainers(
             CONTAINERS.filter(([key]) => {
               const fmt = key === "mkv" ? "matroska" : key;
@@ -319,8 +341,12 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
       setSanityMsg("ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.");
       return;
     }
-    if (!outputPath) {
-      setSanityMsg("No output file path specified.");
+    if (!outputFolder) {
+      setSanityMsg("No output folder specified.");
+      return;
+    }
+    if (!filenamePrefix) {
+      setSanityMsg("No filename prefix specified.");
       return;
     }
     if (selectedGroupIdx < 0) {
@@ -331,24 +357,22 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
     const group = fileGroups[selectedGroupIdx];
     if (!group) return;
 
-    // Basic sanity: container + encoder compatibility
-    const encoders = VIDEO_ENCODERS.map(([k]) => k);
     if (!ffmpegCaps.available_encoders.includes(videoEncoder)) {
       setSanityMsg(
-        `Video encoder "${videoEncoder}" is not supported by your ffmpeg installation. Common alternatives: libx264, libsvtav1, prores_ks.`
+        `Video encoder "${videoEncoder}" is not supported by your ffmpeg installation.`
       );
       return;
     }
     if (!ffmpegCaps.available_encoders.includes(audioEncoder)) {
       setSanityMsg(
-        `Audio encoder "${audioEncoder}" is not supported by your ffmpeg installation. Common alternatives: pcm_s24le, aac, libopus.`
+        `Audio encoder "${audioEncoder}" is not supported by your ffmpeg installation.`
       );
       return;
     }
     const containerFmt = container === "mkv" ? "matroska" : container;
     if (!ffmpegCaps.available_formats.includes(containerFmt)) {
       setSanityMsg(
-        `Container format "${container}" is not supported by your ffmpeg installation. Run \`ffmpeg -formats\` to see available formats.`
+        `Container format "${container}" is not supported by your ffmpeg installation.`
       );
       return;
     }
@@ -367,7 +391,7 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
     }
 
     setSanityMsg("");
-  }, [container, videoEncoder, audioEncoder, outputPath, ffmpegCaps, selectedGroupIdx, fileGroups]);
+  }, [container, videoEncoder, audioEncoder, outputFolder, filenamePrefix, ffmpegCaps, selectedGroupIdx, fileGroups]);
 
   // Derive trim offset from LTC result
   useEffect(() => {
@@ -399,52 +423,23 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
       const selected = await open({
         directory: true,
         multiple: false,
-        title: "Select folder with audio recordings",
+        title: "Select folder with recordings",
       });
       if (!selected) return;
       const folderPath = selected as string;
       setSelectedFolder(folderPath);
+      setOutputFolder(folderPath);
       const result = await invoke<ScanResult>("scan_folder_for_groups", {
         folderPath,
         patternIndex: 0,
       });
       setFileGroups(result.groups);
       setSelectedGroupIdx(-1);
-      setOutputPath("");
+      setFilenamePrefix("");
     } catch (e) {
       console.error("Folder selection failed:", e);
     }
   }, []);
-
-  const handleSelectFiles = useCallback(async () => {
-    try {
-      const selected = await open({
-        multiple: true,
-        title: "Select audio files",
-        filters: [{ name: "Audio", extensions: ["*"] }],
-      });
-      if (!selected) return;
-      const filePaths = selected as string[];
-      if (filePaths.length === 0) return;
-
-      const firstStem = filePaths[0].split("/").pop()?.split(".").shift() || "selected";
-      const parent = filePaths[0].substring(0, filePaths[0].lastIndexOf("/")) || ".";
-      setSelectedFolder(parent);
-
-      const basenames = filePaths.map((fp) => fp.split("/").pop() || "?");
-      setFileGroups([{
-        prefix: firstStem,
-        files: basenames,
-        channel_count: filePaths.length,
-      }]);
-      setSelectedGroupIdx(0);
-      setOutputPath(`${parent}/${firstStem}-multi-audio-vid.${container}`);
-      setNumChannels(filePaths.length);
-      setChannelMap(Array.from({ length: filePaths.length }, (_, i) => i));
-    } catch (e) {
-      console.error("File selection failed:", e);
-    }
-  }, [container]);
 
   // Select a file group
   const handleSelectGroup = useCallback(
@@ -452,13 +447,18 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
       setSelectedGroupIdx(idx);
       const group = fileGroups[idx];
       if (!group) return;
-      const n = group.channel_count;
+      const n = group.files.length;
       setNumChannels(n);
+      setRecordingType(group.recording_type);
       setChannelMap(Array.from({ length: n }, (_, i) => i));
-      const defaultName = `${group.prefix}-multi-audio-vid.${container}`;
-      setOutputPath(selectedFolder ? `${selectedFolder}/${defaultName}` : defaultName);
+      setFilenamePrefix(group.prefix);
+      setSplitTracks(false);
+      setDropLtcTrack(false);
+      setGenerateSyntheticVideo(false);
+      setLtcResult(null);
+      setLtcError(null);
     },
-    [fileGroups, container, selectedFolder]
+    [fileGroups]
   );
 
   // Channel matrix: swap on click
@@ -489,18 +489,25 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
     setLtcResult(null);
     setLtcError(null);
     try {
-      const result = await invoke<LtcDetectionResult>("detect_ltc_in_file", {
-        path: filePath,
-        fps: opt.fps,
-        dropFrame: opt.dropFrame,
-      });
+      const result = isVideo
+        ? await invoke<LtcDetectionResult>("detect_ltc_in_video", {
+            path: filePath,
+            trackIndex: ltcFileIdx,
+            fps: opt.fps,
+            dropFrame: opt.dropFrame,
+          })
+        : await invoke<LtcDetectionResult>("detect_ltc_in_file", {
+            path: filePath,
+            fps: opt.fps,
+            dropFrame: opt.dropFrame,
+          });
       setLtcResult(result);
     } catch (e) {
       setLtcError(String(e));
     } finally {
       setLtcDetecting(false);
     }
-  }, [selectedGroupIdx, fileGroups, ltcFileIdx, selectedFolder, decodeFpsIdx]);
+  }, [selectedGroupIdx, fileGroups, ltcFileIdx, selectedFolder, decodeFpsIdx, isVideo]);
 
   // Start conversion
   const handleStartConvert = useCallback(async () => {
@@ -510,14 +517,52 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
     const folder = selectedFolder.endsWith("/") ? selectedFolder : selectedFolder + "/";
     const inputFiles = group.files.map((f) => `${folder}${f}`);
 
+    const trimSecs = trimToFirstLtc ? trimOffsetSecs : 0;
+    const numFiles = inputFiles.length;
+
+    // Per-file trim offsets
+    const trimOffsets = Array(numFiles).fill(trimSecs);
+
+    // Find the LTC timecode closest to trim offset
+    let timecodeFields: Partial<ConvertRequest> = {};
+    if (trimSecs > 0.001 && ltcResult && ltcResult.timecodes.length > 0 &&
+        (ltcResult.status.type === "Success" || ltcResult.status.type === "LowConfidence")) {
+      const tcs = ltcResult.timecodes;
+      let lo = 0, hi = tcs.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (tcs[mid].timecode_secs < trimSecs) lo = mid + 1;
+        else hi = mid;
+      }
+      const closest = tcs[lo];
+      timecodeFields = {
+        timecode_hours: closest.timecode.hours,
+        timecode_minutes: closest.timecode.minutes,
+        timecode_seconds: closest.timecode.seconds,
+        timecode_frames: closest.timecode.frames,
+        timecode_fps: ltcResult.detected_fps,
+        timecode_drop_frame: ltcResult.drop_frame,
+      };
+    }
+
     const request: ConvertRequest = {
       input_files: inputFiles,
       channel_map: channelMap,
       container,
       video_encoder: videoEncoder,
       audio_encoder: audioEncoder,
-      output_path: outputPath,
-      trim_start_secs: trimToFirstLtc ? trimOffsetSecs : 0,
+      output_folder: outputFolder,
+      filename_prefix: filenamePrefix,
+      audio_suffix_template: audioSuffix,
+      video_suffix_template: videoSuffix,
+      recording_type: recordingType,
+      ltc_track_channel_index: ltcFileIdx,
+      split_tracks: splitTracks,
+      drop_ltc_track: dropLtcTrack,
+      generate_synthetic_video: generateSyntheticVideo,
+      trim_to_first_ltc: trimToFirstLtc,
+      trim_offsets_secs: trimOffsets,
+      ...timecodeFields,
     };
 
     try {
@@ -530,7 +575,6 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
       setConvStatus("running");
       setConvProgress(0);
 
-      // Start polling
       pollingRef.current = window.setInterval(async () => {
         try {
           const prog = await invoke<ConversionProgressInfo>("get_conversion_progress");
@@ -554,7 +598,7 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
       setConvStatus("failed");
       setConvLog(String(e));
     }
-  }, [selectedGroupIdx, fileGroups, selectedFolder, channelMap, container, videoEncoder, audioEncoder, outputPath]);
+  }, [selectedGroupIdx, fileGroups, selectedFolder, channelMap, container, videoEncoder, audioEncoder, outputFolder, filenamePrefix, audioSuffix, videoSuffix, recordingType, ltcFileIdx, splitTracks, dropLtcTrack, generateSyntheticVideo, trimToFirstLtc, trimOffsetSecs, ltcResult]);
 
   // Cancel conversion
   const handleCancel = useCallback(async () => {
@@ -576,63 +620,36 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
   const canConvert =
     ffmpegCaps?.has_ffmpeg &&
     selectedGroupIdx >= 0 &&
-    outputPath.length > 0 &&
+    outputFolder.length > 0 &&
+    filenamePrefix.length > 0 &&
     !sanityMsg &&
     convStatus !== "running";
+
+  const convertButtonLabel = isVideo
+    ? "CONVERT VIDEO CLIPS"
+    : generateSyntheticVideo
+      ? "CONVERT WITH SYNTHETIC VIDEO"
+      : "CONVERT AUDIO FILES";
 
   return (
     <div className="space-y-6">
       {/* Step 1: Select Files */}
       <StepHeader number="1" label="SELECT FILES" />
       <div className="space-y-4">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-text-muted font-semibold">Naming pattern:</span>
-          <select
-            value={selectedPattern}
-            onChange={(e) => {
-              setSelectedPattern(Number(e.target.value));
-              setFileGroups([]);
-              setSelectedGroupIdx(-1);
-              setSelectedFolder("");
-              setOutputPath("");
-              setNumChannels(0);
-              setChannelMap([]);
-            }}
-            className="px-2 py-1 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
-          >
-            {PATTERNS.map((p, i) => (
-              <option key={i} value={i}>{p.name}</option>
-            ))}
-          </select>
-          <span className="text-xs text-text-secondary">
-            — {PATTERNS[selectedPattern].description}
-          </span>
-        </div>
-
-        {selectedPattern === 0 ? (
-          <button
-            onClick={handleSelectFolder}
-            className="flex items-center gap-2 px-4 py-2 bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-sm text-text-title"
-          >
-            <FolderOpen className="w-4 h-4" />
-            {selectedFolder ? "Change Folder…" : "Select Folder…"}
-          </button>
-        ) : (
-          <button
-            onClick={handleSelectFiles}
-            className="flex items-center gap-2 px-4 py-2 bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-sm text-text-title"
-          >
-            <FolderOpen className="w-4 h-4" />
-            {fileGroups.length > 0 ? "Change Files…" : "Select Files…"}
-          </button>
-        )}
+        <button
+          onClick={handleSelectFolder}
+          className="flex items-center gap-2 px-4 py-2 bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-sm text-text-title"
+        >
+          <FolderOpen className="w-4 h-4" />
+          {selectedFolder ? "Change Folder…" : "Select Folder…"}
+        </button>
         {selectedFolder && (
           <p className="text-xs text-text-muted font-mono truncate">{selectedFolder}</p>
         )}
 
         {fileGroups.length > 0 && (
           <div>
-            <label className="text-xs text-text-muted font-semibold block mb-1">{selectedPattern === 0 ? "Recording:" : "Selected files:"}</label>
+            <label className="text-xs text-text-muted font-semibold block mb-1">Recording:</label>
             <div className="space-y-1">
               {fileGroups.map((g, i) => (
                 <button
@@ -645,8 +662,15 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
                   }`}
                 >
                   <span className="font-mono font-semibold">{g.prefix}</span>
+                  <span className={`text-xs ml-2 px-1.5 py-0.5 rounded ${
+                    g.recording_type === "MultiTrackAudio"
+                      ? "bg-blue-500/20 text-blue-400"
+                      : "bg-green-500/20 text-green-400"
+                  }`}>
+                    {g.recording_type === "MultiTrackAudio" ? "AUDIO" : "VIDEO"}
+                  </span>
                   <span className="text-xs ml-2">
-                    ({g.channel_count} file{g.channel_count !== 1 ? "s" : ""}: {g.files.join(", ")})
+                    ({g.files.length} file{g.files.length !== 1 ? "s" : ""}: {g.files.join(", ")})
                   </span>
                 </button>
               ))}
@@ -654,9 +678,9 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
           </div>
         )}
 
-        {fileGroups.length === 0 && selectedFolder && selectedPattern === 0 && (
+        {fileGroups.length === 0 && selectedFolder && (
           <p className="text-xs text-[#EF4444]">
-            No files matching the TASCAM pattern were found in this folder.
+            No files matching known patterns were found in this folder.
           </p>
         )}
       </div>
@@ -666,7 +690,7 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
         <>
           <StepHeader number="L" label="VERIFY LTC TRACK" />
           <p className="text-xs text-text-secondary mb-2">
-            Select the mono file that carries the LTC timecode signal, then click
+            Select the track that carries the LTC timecode signal, then click
             "Detect LTC" to verify it can be read successfully.
           </p>
 
@@ -680,9 +704,9 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
               }}
               className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
             >
-              {fileGroups[selectedGroupIdx].files.map((f, i) => (
+              {fileGroups[selectedGroupIdx].files.map((_, i) => (
                 <option key={i} value={i}>
-                  {f}
+                  {isVideo ? `Track ${i + 1} (channel ${i + 1})` : fileGroups[selectedGroupIdx].files[i]}
                 </option>
               ))}
             </select>
@@ -712,24 +736,17 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
               }`}
             >
               {ltcDetecting ? (
-                <>
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                  Detecting…
-                </>
+                <><RefreshCw className="w-4 h-4 animate-spin" /> Detecting…</>
               ) : (
-                <>
-                  <Upload className="w-4 h-4" />
-                  Detect LTC
-                </>
+                <><Upload className="w-4 h-4" /> Detect LTC</>
               )}
             </button>
           </div>
 
-          {/* LTC result display */}
           {ltcDetecting && (
             <div className="flex items-center gap-2 p-3 bg-deep-bg border border-border-main rounded-lg text-xs text-text-muted animate-pulse">
               <RefreshCw className="w-4 h-4 animate-spin" />
-              Scanning audio file for LTC timecode…
+              Scanning for LTC timecode…
             </div>
           )}
 
@@ -744,10 +761,10 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
         </>
       )}
 
-      {/* Step 2: Channel Mapping */}
+      {/* Step 2: Channel Splitting or Mapping */}
       {numChannels > 0 && (
         <>
-          <StepHeader number="2" label="CHANNEL MAPPING" />
+          <StepHeader number="2" label="CHANNEL SPLITTING OR MAPPING" />
           <p className="text-xs text-text-secondary mb-2">
             Click a radio button to swap the input channel (row) with the channel currently mapped
             to the selected output (column).
@@ -758,15 +775,12 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
               gridTemplateColumns: `60px repeat(${numChannels}, 44px)`,
             }}
           >
-            {/* Header row */}
             <div />
             {Array.from({ length: numChannels }, (_, col) => (
               <div key={`h-${col}`} className="text-center text-[10px] text-text-muted font-mono font-semibold">
                 OUT {col + 1}
               </div>
             ))}
-
-            {/* Rows */}
             {Array.from({ length: numChannels }, (_, row) => (
               <React.Fragment key={`r-${row}`}>
                 <div className="text-xs text-text-title font-mono font-semibold flex items-center">
@@ -792,57 +806,95 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
               </React.Fragment>
             ))}
           </div>
+
+          {/* Split / Drop LTC options */}
+          <div className="flex items-center gap-4 mt-3">
+            <label className="flex items-center gap-1.5 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={splitTracks}
+                disabled={!ltcResult}
+                onChange={(e) => setSplitTracks(e.target.checked)}
+                className="accent-[#FF5F1F]"
+              />
+              Split tracks into separate files
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={dropLtcTrack}
+                disabled={!ltcResult}
+                onChange={(e) => setDropLtcTrack(e.target.checked)}
+                className="accent-[#FF5F1F]"
+              />
+              Drop LTC track
+            </label>
+            {!ltcResult && (
+              <span className="text-[10px] text-text-muted italic">(Detect LTC first)</span>
+            )}
+          </div>
         </>
       )}
 
       {/* Step 3: Output Format */}
       <StepHeader number="3" label="OUTPUT FORMAT" />
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <SelectField
-          label="Container"
-          value={container}
-          options={filteredContainers}
-          disabledOptions={ffmpegCaps?.has_ffmpeg ? undefined : undefined}
-          onChange={(c) => {
-            setContainer(c);
-            // Re-filter encoders for the new container
-            if (ffmpegCaps?.has_ffmpeg) {
-              const availV = availableVideoEncoders(c, ffmpegCaps.available_encoders);
-              const availA = availableAudioEncoders(c, ffmpegCaps.available_encoders);
-              setFilteredVideo(VIDEO_ENCODERS.filter(([k]) => availV.includes(k)));
-              setFilteredAudio(AUDIO_ENCODERS.filter(([k]) => availA.includes(k)));
-              if (!availV.includes(videoEncoder) && availV.length > 0) {
-                setVideoEncoder(availV[0]);
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+        {/* Video Format column */}
+        <div>
+          <p className="text-xs text-text-title font-bold mb-2">VIDEO FORMAT</p>
+          <SelectField
+            label="Container"
+            value={container}
+            options={filteredContainers}
+            onChange={(c) => {
+              setContainer(c);
+              if (ffmpegCaps?.has_ffmpeg) {
+                const availV = availableVideoEncoders(c, ffmpegCaps.available_encoders);
+                const availA = availableAudioEncoders(c, ffmpegCaps.available_encoders);
+                setFilteredVideo(VIDEO_ENCODERS.filter(([k]) => availV.includes(k)));
+                setFilteredAudio(AUDIO_ENCODERS.filter(([k]) => availA.includes(k)));
+                if (!availV.includes(videoEncoder) && availV.length > 0) setVideoEncoder(availV[0]);
+                if (!availA.includes(audioEncoder) && availA.length > 0) setAudioEncoder(availA[0]);
               }
-              if (!availA.includes(audioEncoder) && availA.length > 0) {
-                setAudioEncoder(availA[0]);
-              }
-            }
-          }}
-        />
-        <SelectField
-          label="Video Encoder"
-          value={videoEncoder}
-          options={filteredVideo}
-          disabledOptions={ffmpegCaps?.has_ffmpeg ? ffmpegCaps.available_encoders : undefined}
-          onChange={setVideoEncoder}
-        />
-        <SelectField
-          label="Audio Encoder"
-          value={audioEncoder}
-          options={filteredAudio}
-          disabledOptions={ffmpegCaps?.has_ffmpeg ? ffmpegCaps.available_encoders : undefined}
-          onChange={setAudioEncoder}
-        />
+            }}
+          />
+          <div className="mt-2">
+            <SelectField
+              label="Video encoder"
+              value={videoEncoder}
+              options={filteredVideo}
+              onChange={setVideoEncoder}
+            />
+          </div>
+          {!isVideo && (
+            <label className="flex items-center gap-1.5 text-xs text-text-secondary mt-2">
+              <input
+                type="checkbox"
+                checked={generateSyntheticVideo}
+                onChange={(e) => setGenerateSyntheticVideo(e.target.checked)}
+                className="accent-[#FF5F1F]"
+              />
+              Generate synthetic video (blue background)
+            </label>
+          )}
+        </div>
+        {/* Audio Format column */}
+        <div>
+          <p className="text-xs text-text-title font-bold mb-2">AUDIO FORMAT</p>
+          <SelectField
+            label="Audio encoder"
+            value={audioEncoder}
+            options={filteredAudio}
+            onChange={setAudioEncoder}
+          />
+        </div>
       </div>
 
       {/* Compatibility status */}
       {ffmpegCaps && !ffmpegCaps.has_ffmpeg && (
         <div className="flex items-start gap-2 p-3 bg-[#EF4444]/10 border border-[#EF4444]/20 rounded-lg text-xs text-[#EF4444]">
           <XCircle className="w-4 h-4 mt-0.5 shrink-0" />
-          <span>
-            ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.
-          </span>
+          <span>ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.</span>
         </div>
       )}
       {sanityMsg && ffmpegCaps?.has_ffmpeg && (
@@ -860,36 +912,89 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
 
       {/* Step 4: Output File */}
       <StepHeader number="4" label="OUTPUT FILE" />
-      <div className="flex items-center gap-2">
-        <input
-          type="text"
-          value={outputPath}
-          onChange={(e) => setOutputPath(e.target.value)}
-          className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
-          placeholder="Path to output file…"
-        />
-      </div>
+      <div className="space-y-3">
+        {/* Output folder */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-text-muted font-semibold w-28 shrink-0">Output folder:</span>
+          <input
+            type="text"
+            value={outputFolder}
+            onChange={(e) => setOutputFolder(e.target.value)}
+            className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
+            placeholder="/path/to/output"
+          />
+          <button
+            onClick={async () => {
+              const f = await open({ directory: true, title: "Select output folder" });
+              if (f) setOutputFolder(f as string);
+            }}
+            className="px-3 py-2 bg-card-bg border border-border-main rounded-lg text-xs hover:bg-nested-bg"
+          >
+            Browse…
+          </button>
+        </div>
 
-      {/* Trim to first LTC */}
-      <div className="flex items-center gap-2 mt-1">
-        <input
-          type="checkbox"
-          checked={trimToFirstLtc}
-          disabled={ltcDetecting || (ltcResult === null && ltcError === null)}
-          onChange={(e) => setTrimToFirstLtc(e.target.checked)}
-          className="accent-[#FF5F1F]"
-        />
-        <label className={"text-xs " + (trimToFirstLtc && trimOffsetSecs > 0 ? "text-text-secondary" : "text-text-muted")}>
-          Cut start to first LTC frame
-          {trimToFirstLtc && trimOffsetSecs > 0 && (
-            <span className="text-text-muted ml-1">
-              (trim {trimOffsetSecs.toFixed(3)}s of silence)
-            </span>
-          )}
-          {!ltcResult && !ltcError && !ltcDetecting && (
-            <span className="text-[10px] text-text-muted ml-1 italic">(Detect LTC first)</span>
-          )}
-        </label>
+        {/* Filename prefix */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-text-muted font-semibold w-28 shrink-0">Filename prefix:</span>
+          <input
+            type="text"
+            value={filenamePrefix}
+            onChange={(e) => setFilenamePrefix(e.target.value)}
+            className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
+            placeholder="recording_prefix"
+          />
+        </div>
+
+        {/* Audio suffix */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-text-muted font-semibold w-28 shrink-0">Audio suffix:</span>
+          <input
+            type="text"
+            value={audioSuffix}
+            onChange={(e) => setAudioSuffix(e.target.value)}
+            className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
+          />
+        </div>
+
+        {/* Video suffix */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-text-muted font-semibold w-28 shrink-0">Video suffix:</span>
+          <input
+            type="text"
+            value={videoSuffix}
+            onChange={(e) => setVideoSuffix(e.target.value)}
+            className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
+          />
+        </div>
+
+        {/* Naming preview */}
+        {filenamePrefix && (
+          <p className="text-[10px] text-text-muted font-mono">
+            ↳ {outputFolder}/{filenamePrefix}_{splitTracks ? "{track}" : "multi"}.{container}
+            {isVideo ? ` + ${filenamePrefix}_video_clip01.${container}…` : ""}
+          </p>
+        )}
+
+        {/* Trim checkbox (renamed) */}
+        <div className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={trimToFirstLtc}
+            disabled={ltcDetecting || (ltcResult === null && ltcError === null)}
+            onChange={(e) => setTrimToFirstLtc(e.target.checked)}
+            className="accent-[#FF5F1F]"
+          />
+          <label className={"text-xs " + (trimToFirstLtc && trimOffsetSecs > 0 ? "text-text-secondary" : "text-text-muted")}>
+            Cut and Set Start Time to First LTC Frame
+            {trimToFirstLtc && trimOffsetSecs > 0 && (
+              <span className="text-text-muted ml-1">(trim {trimOffsetSecs.toFixed(3)}s of silence)</span>
+            )}
+            {!ltcResult && !ltcError && !ltcDetecting && (
+              <span className="text-[10px] text-text-muted ml-1 italic">(Detect LTC first)</span>
+            )}
+          </label>
+        </div>
       </div>
 
       {/* Convert Button */}
@@ -913,7 +1018,7 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
             }`}
           >
             <Play className="w-4 h-4" />
-            CONVERT TO MULTI-AUDIO VIDEO
+            {convertButtonLabel}
           </button>
         )}
 
@@ -921,7 +1026,8 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
           <p className="text-xs text-text-secondary mt-2 text-center">
             {!ffmpegCaps?.has_ffmpeg && "ffmpeg is not available. "}
             {selectedGroupIdx < 0 && "Select files. "}
-            {!outputPath && "Set an output file path. "}
+            {!outputFolder && "Set an output folder. "}
+            {!filenamePrefix && "Set a filename prefix. "}
             {!!sanityMsg && "Fix the compatibility issue above. "}
           </p>
         )}
@@ -937,10 +1043,7 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
                 <span>{Math.round(convProgress * 100)}%</span>
               </div>
               <div className="w-full h-2 bg-deep-bg rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-[#FF5F1F] rounded-full transition-all duration-200"
-                  style={{ width: `${convProgress * 100}%` }}
-                />
+                <div className="h-full bg-[#FF5F1F] rounded-full transition-all duration-200" style={{ width: `${convProgress * 100}%` }} />
               </div>
             </div>
           )}
@@ -950,7 +1053,7 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
               <CheckCircle2 className="w-4 h-4 mt-0.5 shrink-0" />
               <div>
                 <p className="font-semibold">Conversion completed successfully!</p>
-                <p className="text-text-muted mt-1">File saved to: {outputPath}</p>
+                <p className="text-text-muted mt-1">Files saved to: {outputFolder}/{filenamePrefix}_*</p>
               </div>
             </div>
           )}
@@ -965,43 +1068,21 @@ const [ltcFileIdx, setLtcFileIdx] = useState<number>(0);
             </div>
           )}
 
-          {/* Log display */}
           {convLog && convStatus === "running" && <LogViewer text={convLog} />}
 
-          {/* Copy log button */}
           {convLog && (convStatus === "failed" || convStatus === "completed") && (
             <div className="flex gap-2">
-              <button
-                onClick={handleCopyLog}
-                className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted"
-              >
-                <Copy className="w-3 h-3" />
-                Copy Full Log
+              <button onClick={handleCopyLog} className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted">
+                <Copy className="w-3 h-3" /> Copy Full Log
               </button>
               {convStatus === "failed" && (
-                <button
-                  onClick={() => {
-                    setConvStatus("idle");
-                    setConvLog("");
-                    setConvProgress(0);
-                  }}
-                  className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted"
-                >
-                  <RefreshCw className="w-3 h-3" />
-                  Try Again
+                <button onClick={() => { setConvStatus("idle"); setConvLog(""); setConvProgress(0); }} className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted">
+                  <RefreshCw className="w-3 h-3" /> Try Again
                 </button>
               )}
               {convStatus === "completed" && (
-                <button
-                  onClick={() => {
-                    setConvStatus("idle");
-                    setConvLog("");
-                    setConvProgress(0);
-                  }}
-                  className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted"
-                >
-                  <RefreshCw className="w-3 h-3" />
-                  Start New Conversion
+                <button onClick={() => { setConvStatus("idle"); setConvLog(""); setConvProgress(0); }} className="flex items-center gap-1 px-3 py-1.5 text-xs bg-card-bg border border-border-main rounded-lg hover:bg-nested-bg transition-colors text-text-muted">
+                  <RefreshCw className="w-3 h-3" /> Start New Conversion
                 </button>
               )}
             </div>

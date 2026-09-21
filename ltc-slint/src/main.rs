@@ -10,9 +10,11 @@ use std::time::Duration;
 use gui_engine::command::GuiCommand;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
-    available_video_encoders_for_container, query_ffmpeg_capabilities,
-    select_best_combination, spawn_conversion, ChannelMap, ConversionState,
-    FfmpegCapabilities,
+    available_video_encoders_for_container, find_timecode_at_offset,
+    query_ffmpeg_capabilities, select_best_combination, spawn_conversion,
+    ChannelMap, ConversionPipeline, ConversionState, ConverterSettings,
+    DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, FfmpegCapabilities,
+    RecordingType, TimecodeMetadata,
 };
 use gui_engine::file_pattern::{match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
 use gui_engine::state::AppStateSnapshot;
@@ -98,6 +100,12 @@ fn _run_gui(
     let conv_video_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("libsvtav1".to_string()));
     let conv_audio_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("pcm_s24le".to_string()));
     let conv_output_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let conv_filename_prefix: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let conv_split_tracks: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let conv_drop_ltc_track: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let conv_generate_synthetic_video: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let conv_audio_suffix_template: Arc<Mutex<String>> = Arc::new(Mutex::new(DEFAULT_AUDIO_SUFFIX.to_string()));
+    let conv_video_suffix_template: Arc<Mutex<String>> = Arc::new(Mutex::new(DEFAULT_VIDEO_SUFFIX.to_string()));
     let conv_state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
     let conv_cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let conv_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
@@ -585,6 +593,7 @@ fn _run_gui(
         let groups = conv_file_groups.clone();
         let idx = conv_selected_group_idx.clone();
         let out_path = conv_output_path.clone();
+        let prefix_arc = conv_filename_prefix.clone();
         let ui_weak = ui.as_weak();
         ui.on_conv_select_pattern(move |new_pattern| {
             *pattern_arc.lock().unwrap() = new_pattern;
@@ -593,13 +602,14 @@ fn _run_gui(
             *groups.lock().unwrap() = BTreeMap::new();
             *idx.lock().unwrap() = -1;
             *out_path.lock().unwrap() = String::new();
+            *prefix_arc.lock().unwrap() = String::new();
             if let Some(u) = ui_weak.upgrade() {
                 u.set_conv_selected_pattern(new_pattern);
                 u.set_conv_selected_folder(SharedString::from(""));
                 u.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(vec![])));
                 u.set_conv_selected_group_idx(-1);
                 u.set_conv_num_channels(0);
-                u.set_conv_output_path(SharedString::from(""));
+                u.set_conv_output_folder(SharedString::from(""));
             }
         });
     }
@@ -609,7 +619,13 @@ fn _run_gui(
         let idx = conv_selected_group_idx.clone();
         let cmap = conv_channel_map.clone();
         let out_path = conv_output_path.clone();
-        let container = conv_container.clone();
+        let prefix_arc = conv_filename_prefix.clone();
+        let pattern_arc_sel = conv_selected_pattern.clone();
+        let audio_suffix = conv_audio_suffix_template.clone();
+        let video_suffix = conv_video_suffix_template.clone();
+        let split_arc = conv_split_tracks.clone();
+        let drop_arc = conv_drop_ltc_track.clone();
+        let folder_for_group = conv_folder_for_group.clone();
         ui.on_conv_select_group(move |group_idx| {
             let g = groups.lock().unwrap();
             let keys: Vec<String> = g.keys().cloned().collect();
@@ -617,23 +633,29 @@ fn _run_gui(
                 let prefix = keys[group_idx as usize].clone();
                 let files = g.get(&prefix).cloned().unwrap_or_default();
                 let n = files.len();
+                let is_video = *pattern_arc_sel.lock().unwrap() == 1 && n == 1;
                 *cmap.lock().unwrap() = ChannelMap::identity(n);
                 *idx.lock().unwrap() = group_idx as isize;
-                let folder = conv_folder_for_group.lock().unwrap().clone();
-                let container_str = container.lock().unwrap().clone();
-                let default_name = format!("{}-multi-audio-vid.{}", prefix, container_str);
-                let full_path = if folder.is_empty() {
-                    default_name
-                } else {
-                    format!("{}/{}", folder, default_name)
-                };
-                *out_path.lock().unwrap() = full_path.clone();
+                *prefix_arc.lock().unwrap() = prefix.clone();
+                *out_path.lock().unwrap() = String::new();
+                *split_arc.lock().unwrap() = false;
+                *drop_arc.lock().unwrap() = false;
+                let folder = folder_for_group.lock().unwrap().clone();
+                let ltc_file_names: Vec<SharedString> = files.iter().map(|f| {
+                    SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+                }).collect();
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_selected_group_idx(group_idx);
                     u.set_conv_num_channels(n as i32);
+                    u.set_conv_is_video_recording(is_video);
                     let map_vec: Vec<i32> = (0..n as i32).collect();
                     u.set_conv_channel_map(ModelRc::new(VecModel::from(map_vec)));
-                    u.set_conv_output_path(SharedString::from(full_path));
+                    u.set_conv_output_folder(SharedString::from(folder.clone()));
+                    u.set_conv_filename_prefix(SharedString::from(prefix.clone()));
+                    u.set_conv_audio_suffix_template(SharedString::from(audio_suffix.lock().unwrap().clone()));
+                    u.set_conv_video_suffix_template(SharedString::from(video_suffix.lock().unwrap().clone()));
+                    u.set_ltc_file_idx(1);
+                    u.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
                 }
             }
         });
@@ -662,9 +684,16 @@ fn _run_gui(
         let container = conv_container.clone();
         let venc = conv_video_encoder.clone();
         let aenc = conv_audio_encoder.clone();
-        let out_path = conv_output_path.clone();
+        let name_prefix_arc = conv_filename_prefix.clone();
         let trim_flag = conv_trim_to_first_ltc.clone();
         let trim_offset = conv_trim_offset_secs.clone();
+        let eng_state = engine_state.clone();
+        let gen_synth = conv_generate_synthetic_video.clone();
+        let split_arc2 = conv_split_tracks.clone();
+        let drop_arc2 = conv_drop_ltc_track.clone();
+        let audio_suffix_arc = conv_audio_suffix_template.clone();
+        let video_suffix_arc = conv_video_suffix_template.clone();
+        let pattern_arc2 = conv_selected_pattern.clone();
         ui.on_conv_start(move || {
             let g = groups_data.lock().unwrap();
             let i = *idx.lock().unwrap();
@@ -674,16 +703,67 @@ fn _run_gui(
             let files = g.get(prefix).cloned().unwrap_or_default();
             let folder_path = folder.lock().unwrap().clone();
             let input_files: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(&folder_path).join(f)).collect();
+            let num_files = input_files.len();
             let map = cmap.lock().unwrap().clone();
-            let output = PathBuf::from(out_path.lock().unwrap().clone());
-            let settings = gui_engine::converter::ConverterSettings {
+            let trim_flag_val = *trim_flag.lock().unwrap();
+            let trim_secs = if trim_flag_val { *trim_offset.lock().unwrap() } else { 0.0 };
+            let filename_prefix = name_prefix_arc.lock().unwrap().clone();
+            let trim_offsets_secs: Vec<f64> = if trim_flag_val && trim_secs > 0.001 {
+                vec![trim_secs; num_files]
+            } else {
+                vec![0.0; num_files]
+            };
+            let ltc_result = eng_state.load().ltc_decode_result.clone();
+            let timecode_meta_per_file: Vec<Option<TimecodeMetadata>> = if trim_flag_val && trim_secs > 0.001 {
+                (0..num_files).map(|_| {
+                    ltc_result.as_ref().and_then(|r| {
+                        use gui_engine::LtcDecodeStatus;
+                        if !matches!(r.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
+                            return None;
+                        }
+                        find_timecode_at_offset(&r.timecodes, trim_secs).map(|tc| TimecodeMetadata {
+                            start: tc,
+                            fps: r.detected_fps as f64,
+                            drop_frame: r.drop_frame,
+                        })
+                    })
+                }).collect()
+            } else {
+                vec![None; num_files]
+            };
+            let generate_video = *gen_synth.lock().unwrap();
+            let split_val = *split_arc2.lock().unwrap();
+            let drop_val = *drop_arc2.lock().unwrap();
+            let audio_suffix_val = audio_suffix_arc.lock().unwrap().clone();
+            let video_suffix_val = video_suffix_arc.lock().unwrap().clone();
+            let ltc_idx = 1;
+            let rec_type = if *pattern_arc2.lock().unwrap() == 1 && num_files == 1 {
+                RecordingType::VideoClipSequence
+            } else {
+                RecordingType::MultiTrackAudio
+            };
+            let pipeline = match rec_type {
+                RecordingType::MultiTrackAudio => ConversionPipeline::AudioOnly { generate_synthetic_video: generate_video },
+                RecordingType::VideoClipSequence => ConversionPipeline::VideoPassthrough,
+            };
+            let settings = ConverterSettings {
+                pipeline,
                 input_files,
+                recording_type: rec_type,
+                ltc_track_channel_index: ltc_idx,
                 channel_map: map,
+                split_tracks: split_val,
+                drop_ltc_track: drop_val,
                 container: container.lock().unwrap().clone(),
                 video_encoder: venc.lock().unwrap().clone(),
                 audio_encoder: aenc.lock().unwrap().clone(),
-                output_path: output,
-                trim_start_secs: if *trim_flag.lock().unwrap() { *trim_offset.lock().unwrap() } else { 0.0 },
+                output_folder: PathBuf::from(&folder_path),
+                filename_prefix,
+                audio_suffix_template: audio_suffix_val,
+                video_suffix_template: video_suffix_val,
+                trim_to_first_ltc: trim_flag_val,
+                trim_offsets_secs,
+                timecode_meta_per_file,
             };
             *state.lock().unwrap() = ConversionState::idle();
             cancel.store(false, Ordering::Relaxed);
@@ -726,6 +806,12 @@ fn _run_gui(
         let groups = conv_file_groups.clone();
         let idx = conv_selected_group_idx.clone();
         let out_path = conv_output_path.clone();
+        let prefix_arc = conv_filename_prefix.clone();
+        let split_arc3 = conv_split_tracks.clone();
+        let drop_arc3 = conv_drop_ltc_track.clone();
+        let gen_arc2 = conv_generate_synthetic_video.clone();
+        let audio_suffix_arc2 = conv_audio_suffix_template.clone();
+        let video_suffix_arc2 = conv_video_suffix_template.clone();
         let ui_weak = ui.as_weak();
         ui.on_conv_reset(move || {
             *state.lock().unwrap() = ConversionState::idle();
@@ -733,6 +819,12 @@ fn _run_gui(
             *groups.lock().unwrap() = BTreeMap::new();
             *idx.lock().unwrap() = -1;
             *out_path.lock().unwrap() = String::new();
+            *prefix_arc.lock().unwrap() = String::new();
+            *split_arc3.lock().unwrap() = false;
+            *drop_arc3.lock().unwrap() = false;
+            *gen_arc2.lock().unwrap() = false;
+            *audio_suffix_arc2.lock().unwrap() = DEFAULT_AUDIO_SUFFIX.to_string();
+            *video_suffix_arc2.lock().unwrap() = DEFAULT_VIDEO_SUFFIX.to_string();
             if let Some(u) = ui_weak.upgrade() {
                 u.set_conv_status(SharedString::from("idle"));
                 u.set_conv_progress(0.0);
@@ -740,7 +832,14 @@ fn _run_gui(
                 u.set_conv_selected_group_idx(-1);
                 u.set_conv_num_channels(0);
                 u.set_conv_channel_map(ModelRc::new(VecModel::<i32>::from(vec![])));
-                u.set_conv_output_path(SharedString::from(""));
+                u.set_conv_output_folder(SharedString::from(""));
+                u.set_conv_filename_prefix(SharedString::from(""));
+                u.set_conv_split_tracks(false);
+                u.set_conv_drop_ltc_track(false);
+                u.set_conv_generate_synthetic_video(false);
+                u.set_conv_audio_suffix_template(SharedString::from(DEFAULT_AUDIO_SUFFIX));
+                u.set_conv_video_suffix_template(SharedString::from(DEFAULT_VIDEO_SUFFIX));
+                u.set_conv_is_video_recording(false);
                 u.set_conv_sanity_msg(SharedString::from(""));
             }
         });
@@ -829,18 +928,78 @@ fn _run_gui(
         });
     }
     {
-        let out_path = conv_output_path.clone();
         let ui_weak = ui.as_weak();
-        ui.on_conv_select_output_path(move || {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_file_name("output.mkv")
-                .save_file()
-            {
+        let out_folder = conv_folder_for_group.clone();
+        ui.on_conv_select_output_folder(move || {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 let path_str = path.to_string_lossy().to_string();
-                *out_path.lock().unwrap() = path_str.clone();
+                *out_folder.lock().unwrap() = path_str.clone();
                 if let Some(u) = ui_weak.upgrade() {
-                    u.set_conv_output_path(SharedString::from(path_str));
+                    u.set_conv_output_folder(SharedString::from(path_str));
                 }
+            }
+        });
+    }
+    {
+        let prefix_arc = conv_filename_prefix.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_filename_prefix_changed(move |val| {
+            *prefix_arc.lock().unwrap() = val.to_string();
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_filename_prefix(val.clone());
+            }
+        });
+    }
+    {
+        let audio_suffix = conv_audio_suffix_template.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_audio_suffix_changed(move |val| {
+            *audio_suffix.lock().unwrap() = val.to_string();
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_audio_suffix_template(val);
+            }
+        });
+    }
+    {
+        let video_suffix = conv_video_suffix_template.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_conv_video_suffix_changed(move |val| {
+            *video_suffix.lock().unwrap() = val.to_string();
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_video_suffix_template(val);
+            }
+        });
+    }
+    {
+        let split_arc = conv_split_tracks.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_split_tracks(move || {
+            let mut f = split_arc.lock().unwrap();
+            *f = !*f;
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_split_tracks(*f);
+            }
+        });
+    }
+    {
+        let drop_arc = conv_drop_ltc_track.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_drop_ltc_track(move || {
+            let mut f = drop_arc.lock().unwrap();
+            *f = !*f;
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_drop_ltc_track(*f);
+            }
+        });
+    }
+    {
+        let gen_arc = conv_generate_synthetic_video.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_synthetic_video(move || {
+            let mut f = gen_arc.lock().unwrap();
+            *f = !*f;
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_generate_synthetic_video(*f);
             }
         });
     }
@@ -1002,7 +1161,7 @@ fn _run_gui(
         conv_state,
         conv_ffmpeg_caps,
         conv_sanity_msg,
-        conv_output_path,
+        conv_filename_prefix,
         conv_file_groups,
         conv_selected_group_idx,
         conv_container,

@@ -8,10 +8,11 @@ use audio_core::{
     Timecode,
 };
 use gui_engine::converter::{
-    self, query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionState,
-    ConversionStatus, ConverterSettings, FfmpegCapabilities,
+    self, query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionPipeline,
+    ConversionState, ConversionStatus, ConverterSettings, FfmpegCapabilities, RecordingType,
+    TimecodeMetadata,
 };
-use gui_engine::file_pattern::{self, BUILTIN_PATTERNS};
+use gui_engine::file_pattern::{self, match_files_all_patterns, BUILTIN_PATTERNS, MatchedGroup};
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -124,11 +125,55 @@ fn get_wake_lock_status(state: tauri::State<'_, AudioState>) -> bool {
     state.audio.lock().map(|c| c.wake_lock_active()).unwrap_or(false)
 }
 
-// ── LTC detection command ──────────────────────────────────────────────────
+// ── LTC detection commands ──────────────────────────────────────────────────
 
 #[tauri::command]
 fn detect_ltc_in_file(path: String, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
     audio_core::decode_ltc_from_wav(Path::new(&path), fps, drop_frame)
+}
+
+#[tauri::command]
+fn detect_ltc_in_video(path: String, track_index: usize, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
+    let video_path = Path::new(&path);
+    if !video_path.exists() {
+        return Err(format!("Video file not found: {}", path));
+    }
+
+    // Create a temporary WAV file for the extracted audio track
+    let tmp_dir = std::env::temp_dir();
+    let tmp_wav = tmp_dir.join(format!("ltc_extract_{}.wav", std::process::id()));
+
+    // Use ffmpeg to extract audio: select the specified channel from the first audio stream
+    // Map: 0:a:0 (first audio stream), then use pan filter to select the channel
+    let channel_filter = format!("pan=mono|FC=c{}", track_index);
+
+    let output = std::process::Command::new("ffmpeg")
+        .args(&[
+            "-y",
+            "-i", &path,
+            "-map", "0:a:0",
+            "-af", &channel_filter,
+            "-c:a", "pcm_s24le",
+            "-f", "wav",
+            &tmp_wav.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg for audio extraction: {}", e))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp_wav);
+        return Err(format!("ffmpeg audio extraction failed for track {} in {}", track_index + 1, path));
+    }
+
+    // Run LTC decode on the extracted WAV
+    let result = audio_core::decode_ltc_from_wav(&tmp_wav, fps, drop_frame);
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(&tmp_wav);
+
+    result
 }
 
 // ── Converter commands ─────────────────────────────────────────────────────
@@ -138,6 +183,8 @@ struct FileGroupInfo {
     prefix: String,
     files: Vec<String>,
     channel_count: usize,
+    pattern_name: String,
+    recording_type: String,
 }
 
 #[derive(serde::Serialize)]
@@ -146,30 +193,34 @@ struct ScanResult {
 }
 
 #[tauri::command]
-fn scan_folder_for_groups(folder_path: String, pattern_index: usize) -> Result<ScanResult, String> {
+fn scan_folder_for_groups(folder_path: String, _pattern_index: usize) -> Result<ScanResult, String> {
     let path = PathBuf::from(&folder_path);
     if !path.is_dir() {
         return Err(format!("Not a directory: {}", folder_path));
     }
 
-    let pattern = BUILTIN_PATTERNS.get(pattern_index).ok_or_else(|| {
-        format!("Invalid pattern index: {}", pattern_index)
-    })?;
-
-    let groups = file_pattern::match_files_to_groups(&path, pattern);
-    let mut result = Vec::new();
-    for (prefix, files) in groups {
-        let file_names: Vec<String> = files
-            .iter()
-            .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string())
-            .collect();
-        let channel_count = files.len();
-        result.push(FileGroupInfo {
-            prefix,
-            files: file_names,
-            channel_count,
-        });
-    }
+    let groups = match_files_all_patterns(&path);
+    let result = groups
+        .into_iter()
+        .map(|g| {
+            let file_names: Vec<String> = g
+                .files
+                .iter()
+                .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string())
+                .collect();
+            let rt = match g.recording_type {
+                RecordingType::MultiTrackAudio => "MultiTrackAudio",
+                RecordingType::VideoClipSequence => "VideoClipSequence",
+            };
+            FileGroupInfo {
+                prefix: g.prefix,
+                files: file_names,
+                channel_count: g.files.len(),
+                pattern_name: g.pattern_name.to_string(),
+                recording_type: rt.to_string(),
+            }
+        })
+        .collect();
 
     Ok(ScanResult { groups: result })
 }
@@ -186,10 +237,44 @@ struct ConvertRequest {
     container: String,
     video_encoder: String,
     audio_encoder: String,
-    output_path: String,
+    output_folder: String,
+    filename_prefix: String,
+    #[serde(default = "default_audio_suffix")]
+    audio_suffix_template: String,
+    #[serde(default = "default_video_suffix")]
+    video_suffix_template: String,
     #[serde(default)]
-    trim_start_secs: f64,
+    pipeline: String,
+    #[serde(default)]
+    recording_type: String,
+    #[serde(default)]
+    ltc_track_channel_index: usize,
+    #[serde(default)]
+    split_tracks: bool,
+    #[serde(default)]
+    drop_ltc_track: bool,
+    #[serde(default)]
+    generate_synthetic_video: bool,
+    #[serde(default)]
+    trim_to_first_ltc: bool,
+    #[serde(default)]
+    trim_offsets_secs: Vec<f64>,
+    #[serde(default)]
+    timecode_hours: Option<u32>,
+    #[serde(default)]
+    timecode_minutes: Option<u32>,
+    #[serde(default)]
+    timecode_seconds: Option<u32>,
+    #[serde(default)]
+    timecode_frames: Option<u32>,
+    #[serde(default)]
+    timecode_fps: Option<f64>,
+    #[serde(default)]
+    timecode_drop_frame: Option<bool>,
 }
+
+fn default_audio_suffix() -> String { "_audio_track{:01d}".to_string() }
+fn default_video_suffix() -> String { "_video_clip{:02d}".to_string() }
 
 #[derive(serde::Serialize)]
 struct ConvertResponse {
@@ -203,17 +288,59 @@ fn start_convert(
     request: ConvertRequest,
 ) -> Result<ConvertResponse, String> {
     let input_files: Vec<PathBuf> = request.input_files.iter().map(PathBuf::from).collect();
-    let output_path = PathBuf::from(&request.output_path);
     let channel_map = ChannelMap::from_mapping(request.channel_map);
 
+    let pipeline = match request.recording_type.as_str() {
+        "VideoClipSequence" => ConversionPipeline::VideoPassthrough,
+        _ => ConversionPipeline::AudioOnly { generate_synthetic_video: request.generate_synthetic_video },
+    };
+
+    let recording_type = match request.recording_type.as_str() {
+        "VideoClipSequence" => RecordingType::VideoClipSequence,
+        _ => RecordingType::MultiTrackAudio,
+    };
+
+    // Build per-file timecode metadata
+    let timecode_meta_per_file: Vec<Option<TimecodeMetadata>> = if let (Some(h), Some(m), Some(s), Some(f), Some(fps), Some(df)) = (
+        request.timecode_hours,
+        request.timecode_minutes,
+        request.timecode_seconds,
+        request.timecode_frames,
+        request.timecode_fps,
+        request.timecode_drop_frame,
+    ) {
+        let meta = TimecodeMetadata {
+            start: Timecode { hours: h, minutes: m, seconds: s, frames: f },
+            fps,
+            drop_frame: df,
+        };
+        (0..input_files.len()).map(|_| Some(meta.clone())).collect()
+    } else {
+        vec![None; input_files.len()]
+    };
+
     let settings = ConverterSettings {
+        pipeline,
         input_files,
+        recording_type,
+        ltc_track_channel_index: request.ltc_track_channel_index,
         channel_map,
+        split_tracks: request.split_tracks,
+        drop_ltc_track: request.drop_ltc_track,
         container: request.container,
         video_encoder: request.video_encoder,
         audio_encoder: request.audio_encoder,
-        output_path,
-        trim_start_secs: request.trim_start_secs,
+        output_folder: PathBuf::from(&request.output_folder),
+        filename_prefix: request.filename_prefix,
+        audio_suffix_template: request.audio_suffix_template,
+        video_suffix_template: request.video_suffix_template,
+        trim_to_first_ltc: request.trim_to_first_ltc,
+        trim_offsets_secs: if request.trim_offsets_secs.is_empty() {
+            vec![0.0; input_files.len()]
+        } else {
+            request.trim_offsets_secs
+        },
+        timecode_meta_per_file,
     };
 
     let caps = query_ffmpeg_capabilities();
@@ -222,8 +349,11 @@ fn start_convert(
         &settings.video_encoder,
         &settings.audio_encoder,
         &settings.input_files,
-        &settings.output_path,
+        &settings.output_folder,
+        &settings.filename_prefix,
         &caps,
+        Some(&settings.audio_suffix_template),
+        Some(&settings.video_suffix_template),
     ) {
         return Ok(ConvertResponse {
             success: false,
@@ -327,6 +457,7 @@ pub fn run() {
             scan_folder_for_groups,
             check_ffmpeg,
             detect_ltc_in_file,
+            detect_ltc_in_video,
             start_convert,
             get_conversion_progress,
             cancel_conversion,

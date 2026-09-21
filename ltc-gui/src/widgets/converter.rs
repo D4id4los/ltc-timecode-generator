@@ -8,11 +8,14 @@ use gui_engine::command::GuiCommand;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
     available_video_encoders_for_container, conversion_sanity_check,
-    query_ffmpeg_capabilities, select_best_combination, spawn_conversion,
-    supported_audio_encoders, supported_containers, supported_video_encoders, ChannelMap,
-    ConversionState, ConversionStatus, ConverterSettings, FfmpegCapabilities,
+    find_timecode_at_offset, query_ffmpeg_capabilities, select_best_combination,
+    spawn_conversion, supported_audio_encoders, supported_containers,
+    supported_video_encoders, ChannelMap, ConversionPipeline, ConversionState,
+    ConversionStatus, ConverterSettings,
+    FfmpegCapabilities, RecordingType, TimecodeMetadata,
 };
-use gui_engine::file_pattern::{default_output_filename, match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
+use gui_engine::file_pattern::match_files_all_patterns;
+use gui_engine::LtcDecodeStatus;
 
 use crate::app::AppState;
 use crate::theme::ACCENT;
@@ -32,15 +35,16 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             render_file_selection(ui, state);
             ui.add_space(16.0);
 
-            if state.selected_group.is_some() {
+            if state.selected_group_idx.is_some() {
                 step_header(ui, "L", "VERIFY LTC TRACK", &colors);
                 ui.add_space(8.0);
                 render_ltc_verification(ui, state);
                 ui.add_space(16.0);
 
-                step_header(ui, "2", "CHANNEL MAPPING", &colors);
+                step_header(ui, "2", "CHANNEL SPLITTING OR MAPPING", &colors);
                 ui.add_space(8.0);
                 render_channel_matrix(ui, state);
+                render_split_options(ui, state);
                 ui.add_space(16.0);
             }
 
@@ -80,140 +84,91 @@ fn step_header(ui: &mut Ui, number: &str, label: &str, colors: &crate::theme::Th
 fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
 
-    // Pattern selector
+    // Folder picker (all patterns are applied simultaneously)
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Naming pattern:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        egui::ComboBox::from_id_salt("pattern_combo")
-            .selected_text(BUILTIN_PATTERNS[state.selected_pattern].name)
-            .show_ui(ui, |ui| {
-                for (i, p) in BUILTIN_PATTERNS.iter().enumerate() {
-                    if ui.selectable_label(false, format!("{} — {}", p.name, p.description)).clicked() {
-                        state.selected_pattern = i;
-                        state.selected_group = None;
-                        state.file_groups = None;
-                        state.selected_files = None;
-                    }
+        ui.label(RichText::new("Folder:").font(FontId::proportional(10.0)).color(colors.text_muted));
+        let folder_label = match &state.selected_folder {
+            Some(p) => p.to_string_lossy().to_string(),
+            None => String::from("(No folder selected)"),
+        };
+        let mut display = folder_label;
+        ui.add_sized(
+            egui::vec2(ui.available_width() - 90.0, 20.0),
+            egui::TextEdit::singleline(&mut display)
+                .font(FontId::monospace(10.0))
+                .interactive(false),
+        );
+        if ui.button("Browse…").clicked() {
+            let folder = rfd::FileDialog::new().pick_folder();
+            if let Some(path) = folder {
+                state.selected_folder = Some(path.clone());
+                state.selected_files = None;
+
+                // Apply all patterns simultaneously
+                state.file_groups = Some(match_files_all_patterns(&path));
+                state.selected_group_idx = None;
+                state.ltc_file_idx = 1; // default to track 2
+                state.trim_ltc_start = false;
+
+                if state.ffmpeg_caps.is_none() {
+                    let caps = query_ffmpeg_capabilities();
+                    state.ffmpeg_caps = Some(caps);
                 }
-            });
+            }
+        }
     });
 
-    if ui.available_width() > 100.0 {
-        ui.label(RichText::new(BUILTIN_PATTERNS[state.selected_pattern].description).font(FontId::proportional(9.0)).color(colors.text_secondary));
-        ui.add_space(4.0);
-    }
-
-    if state.selected_pattern == 0 {
-        // ── TASCAM: folder picker ──
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Folder:").font(FontId::proportional(10.0)).color(colors.text_muted));
-            let folder_label = match &state.selected_folder {
-                Some(p) => p.to_string_lossy().to_string(),
-                None => String::from("(No folder selected)"),
-            };
-            let mut display = folder_label;
-            ui.add_sized(
-                egui::vec2(ui.available_width() - 90.0, 20.0),
-                egui::TextEdit::singleline(&mut display)
-                    .font(FontId::monospace(10.0))
-                    .interactive(false),
-            );
-            if ui.button("Browse…").clicked() {
-                let folder = rfd::FileDialog::new().pick_folder();
-                if let Some(path) = folder {
-                    state.selected_folder = Some(path.clone());
-                    state.selected_files = None;
-                    let pattern = &BUILTIN_PATTERNS[state.selected_pattern];
-                    state.file_groups = Some(match_files_to_groups(&path, pattern));
-                    state.selected_group = None;
-                    if state.ffmpeg_caps.is_none() {
-                        let caps = query_ffmpeg_capabilities();
-                        state.ffmpeg_caps = Some(caps);
-                    }
-                }
-            }
-        });
-    } else {
-        // ── * (any): file picker ──
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Files:").font(FontId::proportional(10.0)).color(colors.text_muted));
-            let file_label = match &state.selected_files {
-                Some(files) => format!("{} file(s) selected", files.len()),
-                None => String::from("(No files selected)"),
-            };
-            let mut display = file_label;
-            ui.add_sized(
-                egui::vec2(ui.available_width() - 90.0, 20.0),
-                egui::TextEdit::singleline(&mut display)
-                    .font(FontId::monospace(10.0))
-                    .interactive(false),
-            );
-            if ui.button("Browse…").clicked() {
-                let files = rfd::FileDialog::new()
-                    .add_filter("Audio", &["*"])
-                    .pick_files();
-                if let Some(paths) = files {
-                    if !paths.is_empty() {
-                        state.selected_files = Some(paths.clone());
-                        state.selected_folder = paths[0].parent().map(|p| p.to_path_buf());
-                        state.file_groups = Some(wrap_user_selected_files(paths));
-                        state.selected_group = None;
-                        if state.ffmpeg_caps.is_none() {
-                            let caps = query_ffmpeg_capabilities();
-                            state.ffmpeg_caps = Some(caps);
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // File group selector
+    // File group selector (shows all matched groups with type badge)
     if let Some(groups) = &state.file_groups {
         if groups.is_empty() {
-            let msg = if state.selected_pattern == 0 {
-                "No files matching the TASCAM pattern were found in this folder."
-            } else {
-                "No files selected."
-            };
-            ui.label(RichText::new(msg).font(FontId::proportional(10.0)).color(colors.error_red));
+            ui.label(RichText::new("No files matching any known pattern were found in this folder.")
+                .font(FontId::proportional(10.0)).color(colors.error_red));
         } else {
-            let is_any_pattern = state.selected_pattern == 1;
-            let group_names: Vec<&String> = groups.keys().collect();
             ui.horizontal(|ui| {
-                let label = if is_any_pattern { "Selected files:" } else { "Recording:" };
-                ui.label(RichText::new(label).font(FontId::proportional(10.0)).color(colors.text_muted));
-                let selected_text = state.selected_group.as_deref().unwrap_or(
-                    if is_any_pattern { "Select a group…" } else { "Select a recording…" }
-                );
+                ui.label(RichText::new("Recording:").font(FontId::proportional(10.0)).color(colors.text_muted));
+                let selected_text = state
+                    .selected_group_idx
+                    .and_then(|idx| groups.get(idx))
+                    .map(|g| g.prefix.as_str())
+                    .unwrap_or("Select a recording…");
                 egui::ComboBox::from_id_salt("group_combo")
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
-                        for name in &group_names {
-                            let files = &groups[name.as_str()];
-                            let detail = files
+                        for (i, group) in groups.iter().enumerate() {
+                            let type_badge = match group.recording_type {
+                                RecordingType::MultiTrackAudio => "🎵 AUDIO",
+                                RecordingType::VideoClipSequence => "🎬 VIDEO",
+                            };
+                            let detail = group.files
                                 .iter()
                                 .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            let label = if is_any_pattern {
-                                format!("{}  ({} file{}: {})", name, files.len(), if files.len() == 1 { "" } else { "s" }, detail)
-                            } else {
-                                format!("{}  ({} ch: {})", name, files.len(), detail)
-                            };
+                            let label = format!(
+                                "{}  [{}]  ({} file{}: {})",
+                                group.prefix,
+                                type_badge,
+                                group.files.len(),
+                                if group.files.len() == 1 { "" } else { "s" },
+                                detail
+                            );
                             if ui.selectable_label(false, label).clicked() {
-                                state.selected_group = Some(name.to_string());
-                                let num_ch = files.len();
+                                state.selected_group_idx = Some(i);
+                                let num_ch = group.files.len();
                                 state.channel_map = ChannelMap::identity(num_ch);
-                                let container = state.container.clone();
-                                state.output_path =
-                                    state.selected_folder.as_ref().map(|p| p.join(default_output_filename(name, &container))).unwrap_or_else(|| PathBuf::from(default_output_filename(name, &container)));
+                                state.recording_type = group.recording_type.clone();
+                                state.filename_prefix = group.prefix.clone();
+                                state.output_folder = state.selected_folder.clone().unwrap_or_default();
+                                state.split_tracks = false;
+                                state.drop_ltc_track = false;
+                                state.per_file_trim_offsets = vec![0.0; num_ch];
                             }
                         }
                     });
             });
 
-            if let Some(group_name) = &state.selected_group {
-                if let Some(files) = groups.get(group_name) {
+            if let Some(idx) = state.selected_group_idx {
+                if let Some(group) = groups.get(idx) {
                     ui.add_space(4.0);
                     let pill_frame = egui::Frame::new()
                         .fill(colors.deep_bg)
@@ -222,7 +177,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                     pill_frame.show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 2.0);
-                            for f in files {
+                            for f in &group.files {
                                 let name = f.file_name().and_then(|s| s.to_str()).unwrap_or("?");
                                 let pill = egui::Frame::new()
                                     .fill(colors.card_bg)
@@ -247,40 +202,51 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
 
     ui.label(
-        RichText::new("Select the mono file that carries the LTC timecode signal, then click \"Detect LTC\" to verify it can be read successfully.")
+        RichText::new("Select the track that carries the LTC timecode signal, then click \"Detect LTC\" to verify it can be read successfully.")
             .font(FontId::proportional(9.0))
             .color(colors.text_secondary),
     );
     ui.add_space(6.0);
 
-    let files: Vec<PathBuf> = state
-        .selected_group
-        .as_ref()
-        .and_then(|g| state.file_groups.as_ref()?.get(g))
-        .cloned()
-        .unwrap_or_default();
+    let group = state
+        .selected_group_idx
+        .and_then(|idx| state.file_groups.as_ref()?.get(idx));
 
-    let file_names: Vec<String> = files
-        .iter()
-        .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string())
-        .collect();
+    let file_count = group.map(|g| g.files.len()).unwrap_or(0);
 
-    if !file_names.is_empty() {
-        // Ensure ltc_file_idx is in range
-        if state.ltc_file_idx >= file_names.len() {
-            state.ltc_file_idx = file_names.len().saturating_sub(1);
+    if file_count > 0 {
+        // Ensure ltc_file_idx is in range (0-based, default to track 2 = index 1)
+        if state.ltc_file_idx >= file_count {
+            state.ltc_file_idx = file_count.saturating_sub(1);
         }
 
-        let selected_name = file_names[state.ltc_file_idx].clone();
+        let is_video = state.recording_type == RecordingType::VideoClipSequence;
+        let track_label = if is_video { "Track" } else { "File" };
 
-        // ── Row 1: Track selection dropdown ──
+        // ── Row 1: Track selection ──
         ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{}:", track_label)).font(FontId::proportional(10.0)).color(colors.text_muted));
             egui::ComboBox::from_id_salt("ltc_file_combo")
-                .selected_text(&selected_name)
+                .selected_text(format!(
+                    "{} {}",
+                    track_label,
+                    if is_video { format!("{}", state.ltc_file_idx + 1) } else {
+                        group.unwrap().files[state.ltc_file_idx]
+                            .file_name().and_then(|s| s.to_str()).unwrap_or("?")
+                            .to_string()
+                    }
+                ))
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
-                    for (i, name) in file_names.iter().enumerate() {
-                        if ui.selectable_label(false, name).clicked() {
+                    for i in 0..file_count {
+                        let name = if is_video {
+                            format!("Track {} (channel {})", i + 1, i + 1)
+                        } else {
+                            group.unwrap().files[i]
+                                .file_name().and_then(|s| s.to_str()).unwrap_or("?")
+                                .to_string()
+                        };
+                        if ui.selectable_label(false, &name).clicked() {
                             state.ltc_file_idx = i;
                         }
                     }
@@ -310,56 +276,22 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
 
             if is_detecting {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
-
                 let progress_pct = state.latest.ltc_decode_progress_pct;
                 let progress_str = state.latest.ltc_decode_progress_str.clone();
-
-                ui.add(
-                    egui::ProgressBar::new(progress_pct)
-                        .show_percentage()
-                        .desired_width(140.0),
-                );
-
+                ui.add(egui::ProgressBar::new(progress_pct).show_percentage().desired_width(140.0));
                 ui.add_space(2.0);
-
-                ui.label(
-                    RichText::new(&progress_str)
-                        .font(FontId::monospace(9.0))
-                        .color(colors.text_muted),
-                );
-
+                ui.label(RichText::new(&progress_str).font(FontId::monospace(9.0)).color(colors.text_muted));
                 ui.add_space(4.0);
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("✕ CANCEL")
-                                .font(FontId::proportional(10.0))
-                                .color(Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(Color32::from_rgb(0xDC, 0x26, 0x26))
-                        .min_size(egui::vec2(80.0, 22.0)),
-                    )
-                    .clicked()
+                if ui.add(egui::Button::new(RichText::new("✕ CANCEL").font(FontId::proportional(10.0)).color(Color32::WHITE).strong())
+                    .fill(Color32::from_rgb(0xDC, 0x26, 0x26)).min_size(egui::vec2(80.0, 22.0))).clicked()
                 {
                     state.send(GuiCommand::CancelDecode);
                 }
             } else {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("🔍 Detect LTC")
-                                .font(FontId::proportional(11.0))
-                                .color(Color32::BLACK)
-                                .strong(),
-                        )
-                        .fill(ACCENT)
-                        .min_size(egui::vec2(100.0, 24.0)),
-                    )
-                    .clicked()
+                let file_path = group.unwrap().files[state.ltc_file_idx].to_string_lossy().to_string();
+                if ui.add(egui::Button::new(RichText::new("🔍 Detect LTC").font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
+                    .fill(ACCENT).min_size(egui::vec2(100.0, 24.0))).clicked()
                 {
-                    let file_path = files[state.ltc_file_idx].to_string_lossy().to_string();
                     state.send(GuiCommand::ParseLtcFile(file_path));
                 }
             }
@@ -378,11 +310,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
             .stroke(egui::Stroke::new(1.0, colors.error_red))
             .inner_margin(egui::Margin::symmetric(10, 6));
         error_frame.show(ui, |ui| {
-            ui.label(
-                RichText::new(format!("❌ {}", error))
-                    .font(FontId::proportional(10.0))
-                    .color(colors.error_red),
-            );
+            ui.label(RichText::new(format!("❌ {}", error)).font(FontId::proportional(10.0)).color(colors.error_red));
         });
     }
 
@@ -826,13 +754,52 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
     }
 }
 
-// ── Step 3: Output format ──────────────────────────────────────────────
+// ── Split / Drop options ────────────────────────────────────────────────
+
+fn render_split_options(ui: &mut Ui, state: &mut AppState) {
+    let colors = state.theme.colors();
+    let ltc_available = state.latest.ltc_decode_result.is_some();
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_enabled(ltc_available, egui::Checkbox::new(
+            &mut state.split_tracks,
+            "Split tracks into separate files",
+        ));
+        ui.add_enabled(ltc_available, egui::Checkbox::new(
+            &mut state.drop_ltc_track,
+            "Drop LTC track",
+        ));
+    });
+    if !ltc_available {
+        ui.label(
+            RichText::new("(Detect LTC first to enable these options)")
+                .font(FontId::proportional(9.0))
+                .color(colors.text_muted),
+        );
+    }
+    if state.split_tracks {
+        ui.label(
+            RichText::new("ℹ Each input track will be written to its own file. Channel mapping greets are preserved.")
+                .font(FontId::proportional(9.0))
+                .color(colors.text_secondary),
+        );
+    }
+    if state.drop_ltc_track && state.ltc_file_idx < state.channel_map.num_channels() {
+        ui.label(
+            RichText::new(format!("ℹ LTC track (channel {}) will be excluded from all output.", state.ltc_file_idx + 1))
+                .font(FontId::proportional(9.0))
+                .color(colors.text_secondary),
+        );
+    }
+}
+
+// ── Step 3: Output format (Video / Audio columns) ──────────────────────
 
 fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let caps_clone = state.ffmpeg_caps.clone();
 
-    // When ffmpeg caps become available, apply intelligent defaults
     if let Some(ref caps) = caps_clone {
         use_available_defaults(state, caps);
     }
@@ -843,75 +810,100 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
         supported_containers()
     };
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Container:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        egui::ComboBox::from_id_salt("container_combo")
-            .selected_text(&state.container)
-            .show_ui(ui, |ui| {
-                for (key, desc) in &containers {
-                    if ui.selectable_label(false, format!("{} — {}", key, desc)).clicked() {
-                        state.container = key.to_string();
-                        // Re-select encoders compatible with the new container
-                        if let Some(ref caps) = caps_clone {
-                            re_select_encoders_for_container(state, caps);
-                        }
-                        if let Some(group) = &state.selected_group {
-                            if let Some(folder) = &state.selected_folder {
-                                state.output_path = folder.join(default_output_filename(group, &state.container));
-                            }
-                        }
-                    }
-                }
-            });
-    });
-
-    ui.add_space(4.0);
     let video_encoders = if let Some(ref caps) = caps_clone {
         available_video_encoders_for_container(&state.container, caps)
     } else {
         supported_video_encoders()
     };
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Video encoder:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        egui::ComboBox::from_id_salt("video_enc_combo")
-            .selected_text(&state.video_encoder)
-            .show_ui(ui, |ui| {
-                for (key, desc) in &video_encoders {
-                    if ui.selectable_label(false, format!("{} — {}", key, desc)).clicked() {
-                        state.video_encoder = key.to_string();
-                    }
-                }
-            });
-    });
-
-    ui.add_space(4.0);
     let audio_encoders = if let Some(ref caps) = caps_clone {
         available_audio_encoders_for_container(&state.container, caps)
     } else {
         supported_audio_encoders()
     };
 
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Audio encoder:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        egui::ComboBox::from_id_salt("audio_enc_combo")
-            .selected_text(&state.audio_encoder)
-            .show_ui(ui, |ui| {
-                for (key, desc) in &audio_encoders {
-                    if ui.selectable_label(false, format!("{} — {}", key, desc)).clicked() {
-                        state.audio_encoder = key.to_string();
+    // Clone values to avoid borrow conflicts with FnMut closures
+    let cur_container = state.container.clone();
+    let cur_video_encoder = state.video_encoder.clone();
+    let cur_audio_encoder = state.audio_encoder.clone();
+
+    // Two-column layout: Video Format | Audio Format
+    let is_narrow = ui.available_width() < 400.0;
+    if is_narrow {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("VIDEO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
+            ui.add_space(4.0);
+            {
+                let mut update_container = |v: &str| {
+                    state.container = v.to_string();
+                    if let Some(ref caps) = caps_clone {
+                        re_select_encoders_for_container(state, caps);
                     }
+                };
+                render_format_row(ui, "Container", &cur_container, &containers, &mut update_container, &colors);
+            }
+            {
+                let mut update_video = |v: &str| state.video_encoder = v.to_string();
+                render_format_row(ui, "Video encoder", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
+            }
+
+            if state.recording_type == RecordingType::MultiTrackAudio {
+                ui.checkbox(&mut state.generate_synthetic_video, "Generate synthetic video (blue background)");
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(RichText::new("AUDIO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
+            ui.add_space(4.0);
+            {
+                let mut update_audio = |v: &str| state.audio_encoder = v.to_string();
+                render_format_row(ui, "Audio encoder", &cur_audio_encoder, &audio_encoders, &mut update_audio, &colors);
+            }
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("VIDEO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
+                ui.add_space(4.0);
+                {
+                    let mut update_container = |v: &str| {
+                        state.container = v.to_string();
+                        if let Some(ref caps) = caps_clone {
+                            re_select_encoders_for_container(state, caps);
+                        }
+                    };
+                    render_format_row(ui, "Container", &cur_container, &containers, &mut update_container, &colors);
+                }
+                {
+                    let mut update_video = |v: &str| state.video_encoder = v.to_string();
+                    render_format_row(ui, "Video encoder", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
+                }
+                if state.recording_type == RecordingType::MultiTrackAudio {
+                    ui.checkbox(&mut state.generate_synthetic_video, "Generate synthetic video");
                 }
             });
-    });
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(16.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("AUDIO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
+                ui.add_space(4.0);
+                {
+                    let mut update_audio = |v: &str| state.audio_encoder = v.to_string();
+                    render_format_row(ui, "Audio encoder", &cur_audio_encoder, &audio_encoders, &mut update_audio, &colors);
+                }
+            });
+        });
+    }
 
+    // Sanity check
     if let Some(ref caps) = caps_clone {
         ui.add_space(4.0);
         let input_files: Vec<PathBuf> = state
-            .selected_group
-            .as_ref()
-            .and_then(|g| state.file_groups.as_ref()?.get(g))
-            .cloned()
+            .selected_group_idx
+            .and_then(|idx| state.file_groups.as_ref()?.get(idx))
+            .map(|g| g.files.clone())
             .unwrap_or_default();
 
         match conversion_sanity_check(
@@ -919,8 +911,11 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             &state.video_encoder,
             &state.audio_encoder,
             &input_files,
-            &state.output_path,
+            &state.output_folder,
+            &state.filename_prefix,
             caps,
+            Some(&state.audio_suffix_template),
+            Some(&state.video_suffix_template),
         ) {
             Ok(()) => {
                 ui.label(RichText::new("✓ Settings are compatible.").font(FontId::proportional(10.0)).color(colors.success_green));
@@ -953,6 +948,28 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             });
         }
     }
+}
+
+fn render_format_row(
+    ui: &mut Ui,
+    label: &str,
+    current: &str,
+    options: &[(&str, &str)],
+    on_change: &mut dyn FnMut(&str),
+    colors: &crate::theme::ThemeColors,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{}:", label)).font(FontId::proportional(10.0)).color(colors.text_muted));
+        egui::ComboBox::from_id_salt(format!("fmt_{}", label))
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                for (key, desc) in options {
+                    if ui.selectable_label(false, format!("{} — {}", key, desc)).clicked() {
+                        on_change(key);
+                    }
+                }
+            });
+    });
 }
 
 /// Apply `select_best_combination` defaults when ffmpeg caps are first loaded.
@@ -1003,46 +1020,97 @@ fn re_select_encoders_for_container(state: &mut AppState, caps: &FfmpegCapabilit
 fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
 
+    // Output folder
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Save as:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        let mut path_str = state.output_path.to_string_lossy().to_string();
+        ui.label(RichText::new("Output folder:").font(FontId::proportional(10.0)).color(colors.text_muted));
+        let mut folder_str = state.output_folder.to_string_lossy().to_string();
         if ui
             .add(
-                egui::TextEdit::singleline(&mut path_str)
+                egui::TextEdit::singleline(&mut folder_str)
                     .font(FontId::monospace(10.0))
                     .desired_width(ui.available_width() - 100.0),
             )
             .changed()
         {
-            state.output_path = PathBuf::from(&path_str);
+            state.output_folder = PathBuf::from(&folder_str);
         }
         if ui.button("Browse…").clicked() {
-            let default_name = state
-                .output_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("output.mkv");
-            let file = rfd::FileDialog::new()
-                .set_file_name(default_name)
-                .save_file();
-            if let Some(path) = file {
-                state.output_path = path;
+            let folder = rfd::FileDialog::new()
+                .set_directory(&state.output_folder)
+                .pick_folder();
+            if let Some(path) = folder {
+                state.output_folder = path;
             }
         }
     });
 
-    // Trim to first LTC checkbox
+    // Filename prefix
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Filename prefix:").font(FontId::proportional(10.0)).color(colors.text_muted));
+        ui.add_sized(
+            egui::vec2(ui.available_width(), 20.0),
+            egui::TextEdit::singleline(&mut state.filename_prefix)
+                .font(FontId::monospace(10.0)),
+        );
+    });
+
+    // Audio suffix
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Audio suffix:").font(FontId::proportional(10.0)).color(colors.text_muted));
+        ui.add_sized(
+            egui::vec2(ui.available_width(), 20.0),
+            egui::TextEdit::singleline(&mut state.audio_suffix_template)
+                .font(FontId::monospace(10.0)),
+        );
+    });
+
+    // Video suffix
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Video suffix:").font(FontId::proportional(10.0)).color(colors.text_muted));
+        ui.add_sized(
+            egui::vec2(ui.available_width(), 20.0),
+            egui::TextEdit::singleline(&mut state.video_suffix_template)
+                .font(FontId::monospace(10.0)),
+        );
+    });
+
+    // Preview of output filenames
+    if !state.filename_prefix.is_empty() {
+        ui.add_space(4.0);
+        let preview = if state.split_tracks {
+            let n = state.channel_map.num_channels();
+            let count = if state.drop_ltc_track { n.saturating_sub(1) } else { n };
+            format!(
+                "↳ {} audio file(s) + {} video clip(s) in {}",
+                count,
+                if state.recording_type == RecordingType::VideoClipSequence { state.channel_map.num_channels() } else { 0 },
+                state.output_folder.display(),
+            )
+        } else {
+            format!(
+                "↳ 1 audio file + {} video clip(s) in {}",
+                if state.recording_type == RecordingType::VideoClipSequence { state.channel_map.num_channels() } else { 0 },
+                state.output_folder.display(),
+            )
+        };
+        ui.label(RichText::new(preview).font(FontId::proportional(9.0)).color(colors.text_secondary));
+    }
+
+    // Trim to first LTC checkbox (renamed for clarity)
     let ltc_available = !state.latest.ltc_is_detecting
         && (state.latest.ltc_decode_result.is_some() || state.latest.ltc_decode_error.is_some());
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_enabled(ltc_available, egui::Checkbox::new(
             &mut state.trim_ltc_start,
-            "Cut start to first LTC frame",
+            "Cut and Set Start Time to First LTC Frame",
         ));
         if state.trim_ltc_start && state.trim_offset_secs > 0.001 {
             ui.label(
-                RichText::new(format!("(trim {:.3}s of silence)", state.trim_offset_secs))
+                RichText::new(format!("(trim {:.3}s of silence, set timecode from LTC)", state.trim_offset_secs))
                     .font(FontId::proportional(10.0))
                     .color(colors.text_muted),
             );
@@ -1058,6 +1126,13 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
 }
 
 // ── Convert button ─────────────────────────────────────────────────────
+
+fn selected_input_files(state: &AppState) -> Vec<PathBuf> {
+    state.selected_group_idx
+        .and_then(|idx| state.file_groups.as_ref()?.get(idx))
+        .map(|g| g.files.clone())
+        .unwrap_or_default()
+}
 
 fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
@@ -1085,36 +1160,44 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
         return;
     }
 
-    let can_convert = state.selected_group.is_some()
-        && !state.output_path.as_os_str().is_empty()
+    let can_convert = state.selected_group_idx.is_some()
+        && !state.filename_prefix.is_empty()
+        && !state.output_folder.as_os_str().is_empty()
         && state.ffmpeg_caps.as_ref().map(|c| c.has_ffmpeg).unwrap_or(false);
 
     let sanity_ok = if can_convert {
         let caps = state.ffmpeg_caps.as_ref().unwrap();
-        let input_files: Vec<PathBuf> = state
-            .selected_group
-            .as_ref()
-            .and_then(|g| state.file_groups.as_ref()?.get(g))
-            .cloned()
-            .unwrap_or_default();
+        let input_files = selected_input_files(state);
         conversion_sanity_check(
             &state.container,
             &state.video_encoder,
             &state.audio_encoder,
             &input_files,
-            &state.output_path,
+            &state.output_folder,
+            &state.filename_prefix,
             caps,
+            Some(&state.audio_suffix_template),
+            Some(&state.video_suffix_template),
         )
         .is_ok()
     } else {
         false
     };
 
+    let button_label = match state.recording_type {
+        RecordingType::MultiTrackAudio => if state.generate_synthetic_video {
+            "CONVERT WITH SYNTHETIC VIDEO"
+        } else {
+            "CONVERT AUDIO FILES"
+        },
+        RecordingType::VideoClipSequence => "CONVERT VIDEO CLIPS",
+    };
+
     ui.add_enabled_ui(can_convert && sanity_ok, |ui| {
         if ui
             .add(
                 egui::Button::new(
-                    RichText::new("CONVERT TO MULTI-AUDIO VIDEO")
+                    RichText::new(button_label)
                         .font(FontId::proportional(13.0))
                         .color(Color32::BLACK)
                         .strong(),
@@ -1131,11 +1214,14 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
     if !can_convert {
         ui.add_space(2.0);
         let mut reasons: Vec<&str> = Vec::new();
-        if state.selected_group.is_none() {
+        if state.selected_group_idx.is_none() {
             reasons.push("select a recording");
         }
-        if state.output_path.as_os_str().is_empty() {
-            reasons.push("set an output file path");
+        if state.filename_prefix.is_empty() {
+            reasons.push("set a filename prefix");
+        }
+        if state.output_folder.as_os_str().is_empty() {
+            reasons.push("select an output folder");
         }
         if !state.ffmpeg_caps.as_ref().map(|c| c.has_ffmpeg).unwrap_or(false) {
             reasons.push("ffmpeg is not available");
@@ -1158,21 +1244,62 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
 }
 
 fn start_conversion(state: &mut AppState) {
-    let input_files: Vec<PathBuf> = state
-        .selected_group
-        .as_ref()
-        .and_then(|g| state.file_groups.as_ref()?.get(g))
-        .cloned()
-        .unwrap_or_default();
+    let input_files = selected_input_files(state);
+    let num_files = input_files.len();
+
+    let trim_secs = if state.trim_ltc_start { state.trim_offset_secs } else { 0.0 };
+
+    // Per-file timecode metadata (same trim offset for all files)
+    let trim_offsets: Vec<f64> = if num_files > 0 && state.trim_ltc_start {
+        vec![trim_secs; num_files]
+    } else {
+        vec![0.0; num_files]
+    };
+
+    // Per-file timecode metadata from LTC decode result
+    let timecode_meta_per_file: Vec<Option<TimecodeMetadata>> = if state.trim_ltc_start && trim_secs > 0.001 {
+        let ltc_result = state.latest.ltc_decode_result.as_ref();
+        (0..num_files).map(|_| {
+            ltc_result.and_then(|r| {
+                if !matches!(r.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
+                    return None;
+                }
+                find_timecode_at_offset(&r.timecodes, trim_secs).map(|tc| TimecodeMetadata {
+                    start: tc,
+                    fps: r.detected_fps as f64,
+                    drop_frame: r.drop_frame,
+                })
+            })
+        }).collect()
+    } else {
+        vec![None; num_files]
+    };
+
+    let pipeline = match state.recording_type {
+        RecordingType::MultiTrackAudio => {
+            ConversionPipeline::AudioOnly { generate_synthetic_video: state.generate_synthetic_video }
+        }
+        RecordingType::VideoClipSequence => ConversionPipeline::VideoPassthrough,
+    };
 
     let settings = ConverterSettings {
+        pipeline,
         input_files,
+        recording_type: state.recording_type.clone(),
+        ltc_track_channel_index: state.ltc_file_idx,
         channel_map: state.channel_map.clone(),
+        split_tracks: state.split_tracks,
+        drop_ltc_track: state.drop_ltc_track,
         container: state.container.clone(),
         video_encoder: state.video_encoder.clone(),
         audio_encoder: state.audio_encoder.clone(),
-        output_path: state.output_path.clone(),
-        trim_start_secs: if state.trim_ltc_start { state.trim_offset_secs } else { 0.0 },
+        output_folder: state.output_folder.clone(),
+        filename_prefix: state.filename_prefix.clone(),
+        audio_suffix_template: state.audio_suffix_template.clone(),
+        video_suffix_template: state.video_suffix_template.clone(),
+        trim_to_first_ltc: state.trim_ltc_start,
+        trim_offsets_secs: trim_offsets,
+        timecode_meta_per_file,
     };
 
     *state.conversion_state.lock().unwrap() = ConversionState::idle();
@@ -1243,7 +1370,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             ui.label(RichText::new("✓ Conversion completed successfully!").font(FontId::proportional(12.0)).color(colors.success_green).strong());
             ui.add_space(4.0);
             ui.label(
-                RichText::new(format!("File saved to: {}", state.output_path.display()))
+                RichText::new(format!("Files saved to: {}/{}", state.output_folder.display(), state.filename_prefix))
                     .font(FontId::proportional(10.0))
                     .color(colors.text_muted),
             );

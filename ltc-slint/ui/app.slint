@@ -89,10 +89,17 @@ export component AppWindow inherits Window {
     in-out property <int> conv-selected-group-idx: -1;
     in-out property <int> conv-num-channels: 0;
     in-out property <[int]> conv-channel-map: [];
+    in-out property <bool> conv-split-tracks: false;
+    in-out property <bool> conv-drop-ltc-track: false;
+    in-out property <bool> conv-generate-synthetic-video: false;
+    in-out property <bool> conv-is-video-recording: false;
     in-out property <string> conv-container: "mkv";
     in-out property <string> conv-video-encoder: "libsvtav1";
     in-out property <string> conv-audio-encoder: "pcm_s24le";
-    in-out property <string> conv-output-path: "";
+    in-out property <string> conv-output-folder: "";
+    in-out property <string> conv-filename-prefix: "";
+    in-out property <string> conv-audio-suffix-template: "_audio_track{:01d}";
+    in-out property <string> conv-video-suffix-template: "_video_clip{:02d}";
     in-out property <string> conv-status: "idle";
     in-out property <float> conv-progress: 0.0;
     in-out property <string> conv-log: "";
@@ -176,7 +183,13 @@ export component AppWindow inherits Window {
     callback conv-container-selected(int);
     callback conv-video-selected(int);
     callback conv-audio-selected(int);
-    callback conv-select-output-path;
+    callback conv-select-output-folder;
+    callback conv-filename-prefix-changed(string);
+    callback conv-audio-suffix-changed(string);
+    callback conv-video-suffix-changed(string);
+    callback toggle-split-tracks;
+    callback toggle-drop-ltc-track;
+    callback toggle-synthetic-video;
     callback conv-select-pattern(int);
     callback toggle-trim-ltc;
 
@@ -649,10 +662,17 @@ export component AppWindow inherits Window {
                     selected-group-idx: root.conv-selected-group-idx;
                     num-channels: root.conv-num-channels;
                     channel-map: root.conv-channel-map;
+                    split-tracks: root.conv-split-tracks;
+                    drop-ltc-track: root.conv-drop-ltc-track;
+                    generate-synthetic-video: root.conv-generate-synthetic-video;
+                    is-video-recording: root.conv-is-video-recording;
                     container: root.conv-container;
                     video-encoder: root.conv-video-encoder;
                     audio-encoder: root.conv-audio-encoder;
-                    output-path: root.conv-output-path;
+                    output-folder: root.conv-output-folder;
+                    filename-prefix: root.conv-filename-prefix;
+                    audio-suffix-template: root.conv-audio-suffix-template;
+                    video-suffix-template: root.conv-video-suffix-template;
                     conv-status: root.conv-status;
                     conv-progress: root.conv-progress;
                     conv-log: root.conv-log;
@@ -675,7 +695,13 @@ export component AppWindow inherits Window {
                     container-selected(idx) => { root.conv-container-selected(idx); }
                     video-selected(idx) => { root.conv-video-selected(idx); }
                     audio-selected(idx) => { root.conv-audio-selected(idx); }
-                    select-output-path => { root.conv-select-output-path(); }
+                    select-output-folder => { root.conv-select-output-folder(); }
+                    filename-prefix-changed(val) => { root.conv-filename-prefix-changed(val); }
+                    audio-suffix-changed(val) => { root.conv-audio-suffix-changed(val); }
+                    video-suffix-changed(val) => { root.conv-video-suffix-changed(val); }
+                    toggle-split-tracks => { root.toggle-split-tracks(); }
+                    toggle-drop-ltc-track => { root.toggle-drop-ltc-track(); }
+                    toggle-synthetic-video => { root.toggle-synthetic-video(); }
                     select-pattern(idx) => { root.conv-select-pattern(idx); }
                 }
                     }
