@@ -25,4 +25,4 @@ tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"
 audio-core = { path = "../audio-core" }
-gui-engine = { path = "../gui_engine" }
+gui-engine = { path = "../gui-engine" }

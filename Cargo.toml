@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
   "audio-core",
-  "gui_engine",
+  "gui-engine",
   "ltc-gui",
   "ltc-slint"
 ]

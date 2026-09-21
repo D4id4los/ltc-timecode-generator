@@ -51,7 +51,7 @@ for (const { path, apply } of TAURI_CONFS) {
 
 const CARGO_MANIFESTS = [
   'audio-core/Cargo.toml',
-  'gui_engine/Cargo.toml',
+  'gui-engine/Cargo.toml',
   'ltc-gui/Cargo.toml',
   'ltc-slint/Cargo.toml',
   'src-tauri/Cargo.toml',
@@ -80,7 +80,7 @@ run('npm install', '.');
 console.log('  ✓ package-lock.json');
 
 run('cargo update --workspace', '.');
-console.log('  ✓ Cargo.lock (workspace: audio-core + gui_engine + ltc-gui + ltc-slint)');
+console.log('  ✓ Cargo.lock (workspace: audio-core + gui-engine + ltc-gui + ltc-slint)');
 
 run('cargo update --workspace --manifest-path src-tauri/Cargo.toml', '.');
 console.log('  ✓ src-tauri/Cargo.lock');
@@ -95,7 +95,7 @@ run(
   'git add package.json package-lock.json Cargo.lock ' +
     'src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock ' +
     'src-tauri-32bit/tauri.conf.json src-tauri-32bit/Cargo.toml src-tauri-32bit/Cargo.lock ' +
-    'audio-core/Cargo.toml gui_engine/Cargo.toml ltc-gui/Cargo.toml ltc-slint/Cargo.toml',
+    'audio-core/Cargo.toml gui-engine/Cargo.toml ltc-gui/Cargo.toml ltc-slint/Cargo.toml',
   '.',
 );
 console.log('  ✓ All files staged');

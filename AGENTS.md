@@ -9,7 +9,7 @@ Four frontends share a common `audio-core` Rust crate:
 3. **Web app** (React + Vite, browser-based — legacy)
 4. **Tauri v2** desktop (WebKitGTK + Rust backend — legacy, being phased out)
 
-Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, decoding, and conversion to the shared **`gui-engine`** crate (directory: `gui_engine/`) via an event-driven message bus.
+Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, decoding, and conversion to the shared **`gui-engine`** crate via an event-driven message bus.
 
 > Enumerations (command variants, state fields, dependency lists) are deliberately **not** duplicated in this file — they change too often. The named source files are the source of truth.
 
@@ -22,14 +22,14 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 | Crate / App | Role | UI framework |
 |---|---|---|
 | **audio-core** | Raw audio engine: LTC/beep generation, cpal output, decoders | — |
-| **gui-engine** (`gui_engine/`) | Shared engine: owns AudioCore + state, CLI, decoding, conversion | — |
+| **gui-engine** | Shared engine: owns AudioCore + state, CLI, decoding, conversion | — |
 | **ltc-gui** | Native desktop GUI (primary target, weak-GPU tablets) | egui/eframe 0.35 (glow) |
 | **ltc-slint** | Alternative desktop GUI | Slint 1.17 |
 | **Web app** (legacy) | Browser frontend | React 19 + TypeScript + Vite 6 + Tailwind CSS 4 |
 | **Tauri v2** (legacy) | Desktop wrapper for web frontend | Tauri 2 + `src-tauri/` |
 | **32-bit legacy** | i686 builds for old tablets | Tauri v1, Docker cross-compile (`build-32bit.sh`) |
 
-- **Workspace**: `audio-core`, `gui_engine`, `ltc-gui`, `ltc-slint` (see root `Cargo.toml`; `src-tauri` and `src-tauri-32bit` are excluded standalone crates). Workspace clippy lints: style/correctness/complexity/perf = warn.
+- **Workspace**: `audio-core`, `gui-engine`, `ltc-gui`, `ltc-slint` (see root `Cargo.toml`; `src-tauri` and `src-tauri-32bit` are excluded standalone crates). Workspace clippy lints: style/correctness/complexity/perf = warn.
 - **Dependencies**: source of truth is each crate's `Cargo.toml`. Notable: `audio-core` uses cpal 0.18 (pulseaudio always; pipewire on non-32-bit Linux), `hound` (WAV IO), and `libltc-rs` (bindgen binding → requires system `libltc`, see Build & Run).
 
 ## Project Structure
@@ -45,7 +45,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   ├── components/               # TimecodeSettings, ClapperSlate, ConverterTab, FooterStatusBar, ToastContainer
 │   └── utils/
 │       └── audioBackend.ts       # Tauri/Web abstraction layer
-├── gui_engine/                   # Shared Rust GUI engine crate (pkg name: gui-engine)
+├── gui-engine/                    # Shared Rust GUI engine crate (lib name: gui_engine)
 │   ├── Cargo.toml
 │   ├── src/
 │   │   ├── lib.rs                # Module decls + re-exports (ArcSwap, decode types, converter/file_pattern/ffprobe API)
@@ -256,7 +256,7 @@ npm version major    # 0.3.2 → 1.0.0
 ```
 
 The `"version"` npm lifecycle hook runs `scripts/sync-version.js` automatically during `npm version` — after bumping `package.json` but before the git commit and tag. The script:
-1. Propagates the version to `src-tauri/tauri.conf.json`, `src-tauri-32bit/tauri.conf.json`, and the `[package]` version in all six crate manifests: `audio-core/Cargo.toml`, `gui_engine/Cargo.toml`, `ltc-gui/Cargo.toml`, `ltc-slint/Cargo.toml`, `src-tauri/Cargo.toml`, `src-tauri-32bit/Cargo.toml`
+1. Propagates the version to `src-tauri/tauri.conf.json`, `src-tauri-32bit/tauri.conf.json`, and the `[package]` version in all six crate manifests: `audio-core/Cargo.toml`, `gui-engine/Cargo.toml`, `ltc-gui/Cargo.toml`, `ltc-slint/Cargo.toml`, `src-tauri/Cargo.toml`, `src-tauri-32bit/Cargo.toml`
 2. Updates `package-lock.json`, workspace `Cargo.lock` (covers all four workspace members), `src-tauri/Cargo.lock`, `src-tauri-32bit/Cargo.lock` — lock files are synced with `cargo update --workspace`, which only re-locks the workspace/path-dep crate versions and never re-resolves third-party dependencies
 3. Stages all affected files with `git add` (they become part of the `npm version` commit)
 
@@ -278,7 +278,7 @@ npm run lint                         # TypeScript typecheck (tsc --noEmit)
 cargo clippy --all-targets           # Lint all workspace crates
 ```
 
-Integration suites in `gui_engine/tests/`: `integration.rs` (engine), `converter_integration.rs` (conversion pipelines), `video_extraction.rs` (ffprobe/ffmpeg extraction). Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
+Integration suites in `gui-engine/tests/`: `integration.rs` (engine), `converter_integration.rs` (conversion pipelines), `video_extraction.rs` (ffprobe/ffmpeg extraction). Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 
 ## Build & Run
 
