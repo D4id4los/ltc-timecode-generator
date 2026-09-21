@@ -7,6 +7,7 @@ use gui_engine::converter::{
     query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionPipeline, ConversionState,
     ConversionStatus, ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, RecordingType,
 };
+use gui_engine::video_codecs::resolve_encoder_chain;
 
 /// Create a short PCM 16-bit mono WAV file with silence.
 fn create_test_wav(path: &Path, sample_rate: u32, duration_secs: f64, amplitude: i16) {
@@ -73,15 +74,14 @@ fn test_conversion_progress_tracking() {
         eprintln!("Skipping: ffmpeg not available");
         return;
     }
-    if !caps.available_encoders.contains("libx264") {
-        eprintln!("Skipping: libx264 encoder not available");
+    if resolve_encoder_chain("h264", &caps).is_empty() {
+        eprintln!("Skipping: no H.264 encoder available");
         return;
     }
 
     let dir = tempfile::TempDir::new().unwrap();
     let wav1 = dir.path().join("ch1.wav");
     let wav2 = dir.path().join("ch2.wav");
-    let output = dir.path().join("output.mkv");
 
     // Create two very short (0.25s) WAV files
     create_test_wav(&wav1, 48000, 0.25, 8000);
@@ -97,8 +97,9 @@ fn test_conversion_progress_tracking() {
         drop_ltc_track: false,
         ltc_video_source: None,
         container: "mkv".to_string(),
-        video_encoder: "libx264".to_string(),
+        video_encoder: "h264".to_string(),
         audio_encoder: "pcm_s24le".to_string(),
+        resolved_video_encoder: String::new(),
         output_folder: dir.path().to_path_buf(),
         filename_prefix: "test".to_string(),
         audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
@@ -111,7 +112,7 @@ fn test_conversion_progress_tracking() {
     let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
     let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
-    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel));
+    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
 
     let (final_status, _max_progress, log) =
         poll_conversion(&state, &cancel, Duration::from_secs(30));
@@ -147,15 +148,14 @@ fn test_conversion_cancellation() {
         eprintln!("Skipping: ffmpeg not available");
         return;
     }
-    if !caps.available_encoders.contains("libx264") {
-        eprintln!("Skipping: libx264 encoder not available");
+    if resolve_encoder_chain("h264", &caps).is_empty() {
+        eprintln!("Skipping: no H.264 encoder available");
         return;
     }
 
     let dir = tempfile::TempDir::new().unwrap();
     let wav1 = dir.path().join("ch1.wav");
     let wav2 = dir.path().join("ch2.wav");
-    let output = dir.path().join("output.mkv");
 
     // Use a longer duration so we have time to cancel
     create_test_wav(&wav1, 48000, 5.0, 8000);
@@ -166,7 +166,7 @@ fn test_conversion_cancellation() {
     let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
     let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
-    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel));
+    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
 
     // Let it run briefly, then cancel
     std::thread::sleep(Duration::from_millis(200));
@@ -204,8 +204,9 @@ fn make_test_settings(dir: &Path, input_files: Vec<std::path::PathBuf>) -> Conve
         drop_ltc_track: false,
         ltc_video_source: None,
         container: "mkv".to_string(),
-        video_encoder: "libx264".to_string(),
+        video_encoder: "h264".to_string(),
         audio_encoder: "pcm_s24le".to_string(),
+        resolved_video_encoder: String::new(),
         output_folder: dir.to_path_buf(),
         filename_prefix: "test".to_string(),
         audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
@@ -223,8 +224,8 @@ fn test_conversion_progress_reaches_100_percent() {
         eprintln!("Skipping: ffmpeg not available");
         return;
     }
-    if !caps.available_encoders.contains("libx264") {
-        eprintln!("Skipping: libx264 encoder not available");
+    if resolve_encoder_chain("h264", &caps).is_empty() {
+        eprintln!("Skipping: no H.264 encoder available");
         return;
     }
 
@@ -240,7 +241,7 @@ fn test_conversion_progress_reaches_100_percent() {
     let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
     let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
-    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel));
+    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
 
     let (final_status, _max_progress, log) =
         poll_conversion(&state, &cancel, Duration::from_secs(30));
@@ -251,6 +252,97 @@ fn test_conversion_progress_reaches_100_percent() {
         matches!(final_status, ConversionStatus::Completed),
         "Expected Completed, got {:?}. Log:\n{}",
         final_status,
+        log,
+    );
+}
+
+/// With a capability set restricted to `libx264`, the codec "h264" must
+/// resolve to exactly that encoder, which is then reported in the log.
+#[test]
+fn test_conversion_resolves_and_reports_encoder() {
+    let mut caps = query_ffmpeg_capabilities();
+    if !caps.has_ffmpeg {
+        eprintln!("Skipping: ffmpeg not available");
+        return;
+    }
+    if !caps.available_encoders.contains("libx264") {
+        eprintln!("Skipping: libx264 encoder not available");
+        return;
+    }
+    caps.available_encoders = std::collections::BTreeSet::from([
+        "libx264".to_string(),
+        "pcm_s24le".to_string(),
+    ]);
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let wav1 = dir.path().join("ch1.wav");
+    let wav2 = dir.path().join("ch2.wav");
+    create_test_wav(&wav1, 48000, 0.25, 8000);
+    create_test_wav(&wav2, 48000, 0.25, -8000);
+
+    let settings = make_test_settings(dir.path(), vec![wav1, wav2]);
+
+    let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
+    let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
+
+    let (final_status, _max_progress, log) =
+        poll_conversion(&state, &cancel, Duration::from_secs(30));
+
+    handle.join().expect("conversion thread panicked");
+
+    assert!(
+        matches!(final_status, ConversionStatus::Completed),
+        "Expected Completed, got {:?}. Log:\n{}",
+        final_status,
+        log,
+    );
+    assert!(
+        log.contains("Video encoder used: libx264"),
+        "Log should report the resolved encoder. Log:\n{}",
+        log,
+    );
+}
+
+/// An unknown codec id yields a single dead candidate; the fallback runner
+/// must exhaust it and publish a Failed state with an explanatory log.
+#[test]
+fn test_conversion_fails_when_no_encoder_candidate_exists() {
+    let caps = query_ffmpeg_capabilities();
+    if !caps.has_ffmpeg {
+        eprintln!("Skipping: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let wav1 = dir.path().join("ch1.wav");
+    let wav2 = dir.path().join("ch2.wav");
+    create_test_wav(&wav1, 48000, 0.25, 8000);
+    create_test_wav(&wav2, 48000, 0.25, -8000);
+
+    let mut settings = make_test_settings(dir.path(), vec![wav1, wav2]);
+    settings.video_encoder = "definitely_not_a_codec".to_string();
+
+    let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
+    let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
+
+    let (final_status, _max_progress, log) =
+        poll_conversion(&state, &cancel, Duration::from_secs(30));
+
+    handle.join().expect("conversion thread panicked");
+
+    assert!(
+        matches!(final_status, ConversionStatus::Failed { .. }),
+        "Expected Failed for unknown codec, got {:?}. Log:\n{}",
+        final_status,
+        log,
+    );
+    assert!(
+        log.contains("failed to initialize"),
+        "Log should explain the encoder failure. Log:\n{}",
         log,
     );
 }

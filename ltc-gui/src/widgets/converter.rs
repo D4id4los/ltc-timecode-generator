@@ -7,14 +7,13 @@ use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, available_video_encoders_for_container,
-    conversion_sanity_check, evaluate_readiness, find_timecode_at_offset,
-    format_blockers, query_ffmpeg_capabilities,
+    available_containers, conversion_sanity_check, evaluate_readiness,
+    find_timecode_at_offset, format_blockers, query_ffmpeg_capabilities,
     spawn_conversion, supported_audio_encoders, supported_containers,
-    supported_video_encoders, ChannelMap, ConversionPipeline,
-    ConversionState, ConversionStatus, ConverterSettings,
-    FfmpegCapabilities, RecordingType, TimecodeMetadata,
+    ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
+    ConverterSettings, FfmpegCapabilities, RecordingType, TimecodeMetadata,
 };
+use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
 use gui_engine::file_pattern::match_files_all_patterns;
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::LtcDecodeStatus;
@@ -912,9 +911,9 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     };
 
     let video_encoders = if let Some(ref caps) = caps_opt {
-        available_video_encoders_for_container(&state.container, caps)
+        available_video_codecs(&state.container, caps)
     } else {
-        supported_video_encoders()
+        supported_video_codecs()
     };
 
     let audio_encoders = if let Some(ref caps) = caps_opt {
@@ -945,7 +944,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             }
             {
                 let mut update_video = |v: &str| state.video_encoder = v.to_string();
-                render_format_row(ui, "Video encoder", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
+                render_format_row(ui, "Video codec", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
             }
 
             if state.recording_type == RecordingType::MultiTrackAudio {
@@ -978,7 +977,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
                 }
                 {
                     let mut update_video = |v: &str| state.video_encoder = v.to_string();
-                    render_format_row(ui, "Video encoder", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
+                    render_format_row(ui, "Video codec", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
                 }
                 if state.recording_type == RecordingType::MultiTrackAudio {
                     ui.checkbox(&mut state.generate_synthetic_video, "Generate synthetic video");
@@ -1019,7 +1018,13 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             Some(&state.video_suffix_template),
         ) {
             Ok(()) => {
-                ui.label(RichText::new("✓ Settings are compatible.").font(FontId::proportional(10.0)).color(colors.success_green));
+                let codec = normalize_video_codec(&state.video_encoder);
+                let chain = describe_chain(codec, caps);
+                ui.label(
+                    RichText::new(format!("✓ Settings are compatible — {} via {}", codec, chain))
+                        .font(FontId::proportional(10.0))
+                        .color(colors.success_green),
+                );
             }
             Err(msg) => {
                 let warning_area = egui::Frame::new()
@@ -1075,15 +1080,16 @@ fn render_format_row(
 
 
 
-/// When the container changes, re-select video/audio encoders that are
+/// When the container changes, re-select video codec/audio encoders that are
 /// compatible with the new container (and available in ffmpeg).
 fn re_select_encoders_for_container(state: &mut AppState, caps: &FfmpegCapabilities) {
-    let video_available: Vec<&str> = available_video_encoders_for_container(&state.container, caps)
+    let codecs_available: Vec<&str> = available_video_codecs(&state.container, caps)
         .iter()
         .map(|(k, _)| *k)
         .collect();
-    if !video_available.is_empty() && !video_available.contains(&state.video_encoder.as_str()) {
-        state.video_encoder = video_available[0].to_string();
+    let codec = normalize_video_codec(&state.video_encoder);
+    if !codecs_available.is_empty() && !codecs_available.contains(&codec) {
+        state.video_encoder = codecs_available[0].to_string();
     }
 
     let audio_available: Vec<&str> = available_audio_encoders_for_container(&state.container, caps)
@@ -1385,6 +1391,7 @@ fn start_conversion(state: &mut AppState) {
         container: state.container.clone(),
         video_encoder: state.video_encoder.clone(),
         audio_encoder: state.audio_encoder.clone(),
+        resolved_video_encoder: String::new(),
         output_folder: state.output_folder.clone(),
         filename_prefix: state.filename_prefix.clone(),
         audio_suffix_template: state.audio_suffix_template.clone(),
@@ -1399,7 +1406,8 @@ fn start_conversion(state: &mut AppState) {
 
     let cs = state.conversion_state.clone();
     let cf = state.cancel_flag.clone();
-    state.convert_handle = Some(spawn_conversion(settings, cs, cf));
+    let caps = state.ffmpeg_caps.lock().unwrap().clone();
+    state.convert_handle = Some(spawn_conversion(settings, cs, cf, caps.as_ref()));
 }
 
 // ── Progress & log display ──────────────────────────────────────────────

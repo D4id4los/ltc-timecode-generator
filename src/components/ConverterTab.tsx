@@ -131,13 +131,29 @@ interface LtcDetectionResult {
   quality: LtcQualityReport | null;
 }
 
-const VIDEO_ENCODERS: [string, string][] = [
-  ["prores_ks", "ProRes (Kostya) — ideal for Resolve"],
-  ["libx264", "H.264 (x264) — maximum compatibility"],
-  ["libx265", "H.265/HEVC (x265) — efficient, Resolve-compatible"],
-  ["libsvtav1", "AV1 (SVT-AV1) — good compression"],
+// Video codecs — the user picks a codec; the Rust side resolves the best
+// available ffmpeg encoder at conversion time (hardware first: nvenc/qsv/
+// amf/mf/v4l2m2m, software fallbacks last).
+const VIDEO_CODECS: [string, string][] = [
+  ["prores", "ProRes — ideal for Resolve"],
+  ["h264", "H.264 — maximum compatibility"],
+  ["h265", "H.265/HEVC — efficient, Resolve-compatible"],
+  ["av1", "AV1 — good compression, widely supported"],
   ["dnxhd", "DNxHD — broadcast codec, ideal for MXF"],
 ];
+
+// Mirrors gui-engine/src/video_codecs.rs; used only for availability filtering.
+const CODEC_CANDIDATES: Record<string, string[]> = {
+  prores: ["prores_ks", "prores_aw"],
+  dnxhd: ["dnxhd"],
+  h264: ["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "h264_v4l2m2m", "libx264"],
+  h265: ["hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_mf", "hevc_v4l2m2m", "libx265"],
+  av1: ["av1_nvenc", "av1_qsv", "av1_amf", "libsvtav1", "libaom-av1", "librav1e"],
+};
+
+function codecAvailable(codec: string, availableEncoders: string[]): boolean {
+  return (CODEC_CANDIDATES[codec] ?? []).some((e) => availableEncoders.includes(e));
+}
 
 const AUDIO_ENCODERS: [string, string][] = [
   ["pcm_s24le", "PCM 24-bit — uncompressed, Resolve-compatible"],
@@ -154,10 +170,10 @@ const CONTAINERS: [string, string][] = [
 ];
 
 const CONTAINER_VIDEO: Record<string, string[]> = {
-  mkv: ["prores_ks", "libx264", "libx265", "libsvtav1", "dnxhd"],
-  mov: ["prores_ks", "libx264", "libx265", "libsvtav1", "dnxhd"],
-  mp4: ["libx264", "libx265", "libsvtav1"],
-  mxf: ["dnxhd", "libx264", "libx265"],
+  mkv: ["prores", "h264", "h265", "av1", "dnxhd"],
+  mov: ["prores", "h264", "h265", "av1", "dnxhd"],
+  mp4: ["h264", "h265", "av1"],
+  mxf: ["dnxhd", "h264", "h265"],
 };
 
 const CONTAINER_AUDIO: Record<string, string[]> = {
@@ -168,12 +184,12 @@ const CONTAINER_AUDIO: Record<string, string[]> = {
 };
 
 const DEFAULT_PREFERENCES: [string, string, string][] = [
-  ["mov", "prores_ks", "pcm_s24le"],
+  ["mov", "prores", "pcm_s24le"],
   ["mxf", "dnxhd", "pcm_s24le"],
-  ["mov", "libx264", "pcm_s24le"],
-  ["mkv", "libx264", "pcm_s24le"],
-  ["mkv", "libx265", "aac"],
-  ["mp4", "libx264", "aac"],
+  ["mov", "h264", "pcm_s24le"],
+  ["mkv", "h264", "pcm_s24le"],
+  ["mkv", "h265", "aac"],
+  ["mp4", "h264", "aac"],
 ];
 
 function selectBestCombination(
@@ -184,7 +200,7 @@ function selectBestCombination(
     const fmt = c === "mkv" ? "matroska" : c;
     if (
       availableFormats.includes(fmt) &&
-      availableEncoders.includes(v) &&
+      codecAvailable(v, availableEncoders) &&
       availableEncoders.includes(a) &&
       CONTAINER_VIDEO[c]?.includes(v) &&
       CONTAINER_AUDIO[c]?.includes(a)
@@ -195,8 +211,8 @@ function selectBestCombination(
   for (const [c] of CONTAINERS) {
     const fmt = c === "mkv" ? "matroska" : c;
     if (!availableFormats.includes(fmt)) continue;
-    for (const [v] of VIDEO_ENCODERS) {
-      if (!availableEncoders.includes(v) || !CONTAINER_VIDEO[c]?.includes(v)) continue;
+    for (const [v] of VIDEO_CODECS) {
+      if (!codecAvailable(v, availableEncoders) || !CONTAINER_VIDEO[c]?.includes(v)) continue;
       for (const [a] of AUDIO_ENCODERS) {
         if (availableEncoders.includes(a) && CONTAINER_AUDIO[c]?.includes(a)) {
           return [c, v, a];
@@ -204,11 +220,11 @@ function selectBestCombination(
       }
     }
   }
-  return ["mkv", "libx264", "pcm_s24le"];
+  return ["mkv", "av1", "pcm_s24le"];
 }
 
-function availableVideoEncoders(container: string, availableEncoders: string[]): string[] {
-  return (CONTAINER_VIDEO[container] ?? []).filter((e) => availableEncoders.includes(e));
+function availableVideoCodecs(container: string, availableEncoders: string[]): string[] {
+  return (CONTAINER_VIDEO[container] ?? []).filter((c) => codecAvailable(c, availableEncoders));
 }
 
 function availableAudioEncoders(container: string, availableEncoders: string[]): string[] {
@@ -262,13 +278,13 @@ function TauriConverter() {
 
   // Output format
   const [container, setContainer] = useState<string>("mkv");
-  const [videoEncoder, setVideoEncoder] = useState<string>("libsvtav1");
+  const [videoEncoder, setVideoEncoder] = useState<string>("av1");
   const [audioEncoder, setAudioEncoder] = useState<string>("pcm_s24le");
   const [generateSyntheticVideo, setGenerateSyntheticVideo] = useState(false);
 
   // Derived option lists (filtered by ffmpeg caps + container compatibility)
   const [filteredContainers, setFilteredContainers] = useState<[string, string][]>(CONTAINERS);
-  const [filteredVideo, setFilteredVideo] = useState<[string, string][]>(VIDEO_ENCODERS);
+  const [filteredVideo, setFilteredVideo] = useState<[string, string][]>(VIDEO_CODECS);
   const [filteredAudio, setFilteredAudio] = useState<[string, string][]>(AUDIO_ENCODERS);
 
   // Output naming
@@ -341,8 +357,8 @@ function TauriConverter() {
             })
           );
           setFilteredVideo(
-            VIDEO_ENCODERS.filter(([key]) =>
-              availableVideoEncoders(bestC, availEncoders).includes(key)
+            VIDEO_CODECS.filter(([key]) =>
+              availableVideoCodecs(bestC, availEncoders).includes(key)
             )
           );
           setFilteredAudio(
@@ -384,9 +400,9 @@ function TauriConverter() {
     const group = fileGroups[selectedGroupIdx];
     if (!group) return;
 
-    if (!ffmpegCaps.available_encoders.includes(videoEncoder)) {
+    if (!codecAvailable(videoEncoder, ffmpegCaps.available_encoders)) {
       setSanityMsg(
-        `Video encoder "${videoEncoder}" is not supported by your ffmpeg installation.`
+        `No encoder for video codec "${videoEncoder}" is available in your ffmpeg installation.`
       );
       return;
     }
@@ -406,7 +422,7 @@ function TauriConverter() {
 
     if (!CONTAINER_VIDEO[container]?.includes(videoEncoder)) {
       setSanityMsg(
-        `Video encoder "${videoEncoder}" is not compatible with container "${container}".`
+        `Video codec "${videoEncoder}" is not compatible with container "${container}".`
       );
       return;
     }
@@ -922,9 +938,9 @@ function TauriConverter() {
             onChange={(c) => {
               setContainer(c);
               if (ffmpegCaps?.has_ffmpeg) {
-                const availV = availableVideoEncoders(c, ffmpegCaps.available_encoders);
+                const availV = availableVideoCodecs(c, ffmpegCaps.available_encoders);
                 const availA = availableAudioEncoders(c, ffmpegCaps.available_encoders);
-                setFilteredVideo(VIDEO_ENCODERS.filter(([k]) => availV.includes(k)));
+                setFilteredVideo(VIDEO_CODECS.filter(([k]) => availV.includes(k)));
                 setFilteredAudio(AUDIO_ENCODERS.filter(([k]) => availA.includes(k)));
                 if (!availV.includes(videoEncoder) && availV.length > 0) setVideoEncoder(availV[0]);
                 if (!availA.includes(audioEncoder) && availA.length > 0) setAudioEncoder(availA[0]);
@@ -933,7 +949,7 @@ function TauriConverter() {
           />
           <div className="mt-2">
             <SelectField
-              label="Video encoder"
+              label="Video codec"
               value={videoEncoder}
               options={filteredVideo}
               onChange={setVideoEncoder}

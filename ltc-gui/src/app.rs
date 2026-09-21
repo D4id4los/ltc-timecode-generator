@@ -180,7 +180,7 @@ impl AppState {
             split_tracks: false,
             drop_ltc_track: false,
             container: "mkv".to_string(),
-            video_encoder: "libsvtav1".to_string(),
+            video_encoder: "av1".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
             output_folder,
             filename_prefix,

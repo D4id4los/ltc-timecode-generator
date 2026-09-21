@@ -11,6 +11,7 @@ use log::{info, warn};
 use audio_core::{FrameTimecode, Timecode};
 
 use crate::ffprobe::VideoAudioProbe;
+use crate::video_codecs;
 
 pub const DEFAULT_AUDIO_SUFFIX: &str = "_audio_track{:01d}";
 pub const DEFAULT_VIDEO_SUFFIX: &str = "_video_clip{:02d}";
@@ -168,16 +169,13 @@ fn run_ffmpeg_list(args: &[&str], filter_fn: fn(&str) -> bool) -> BTreeSet<Strin
 }
 
 // ── Codec / container compatibility ──────────────────────────────────────
-
-pub fn supported_video_encoders() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("prores_ks", "ProRes (Kostya) — ideal for Resolve, larger files"),
-        ("libx264", "H.264 (x264) — maximum compatibility"),
-        ("libx265", "H.265/HEVC (x265) — efficient, Resolve-compatible"),
-        ("libsvtav1", "AV1 (SVT-AV1) — good compression, widely supported"),
-        ("dnxhd", "DNxHD — broadcast codec, ideal for MXF"),
-    ]
-}
+//
+// Video encoders are selected at the *codec* level ("av1", "h265", …) via
+// the registry in [`crate::video_codecs`]; concrete ffmpeg encoders are
+// resolved at conversion time (hardware candidates first, software
+// fallbacks last). See `video_codecs::supported_video_codecs()` for the
+// dropdown source and `video_codecs::available_video_codecs()` for the
+// availability-filtered variant.
 
 pub fn supported_audio_encoders() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -197,22 +195,6 @@ pub fn supported_containers() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-fn container_supports_video_encoder(container: &str, encoder: &str) -> bool {
-    match container {
-        "mkv" => matches!(
-            encoder,
-            "libsvtav1" | "libx264" | "libx265" | "prores_ks" | "dnxhd"
-        ),
-        "mov" => matches!(
-            encoder,
-            "prores_ks" | "libx264" | "libx265" | "libsvtav1" | "dnxhd"
-        ),
-        "mp4" => matches!(encoder, "libx264" | "libx265" | "libsvtav1"),
-        "mxf" => matches!(encoder, "dnxhd" | "libx264" | "libx265"),
-        _ => false,
-    }
-}
-
 fn container_supports_audio_encoder(container: &str, encoder: &str) -> bool {
     match container {
         "mkv" => matches!(encoder, "pcm_s24le" | "pcm_s16le" | "aac" | "libopus"),
@@ -224,21 +206,6 @@ fn container_supports_audio_encoder(container: &str, encoder: &str) -> bool {
         "mxf" => matches!(encoder, "pcm_s24le" | "pcm_s16le" | "aac"),
         _ => false,
     }
-}
-
-/// Returns the intersection of ffmpeg-available video encoders
-/// that are also compatible with the given container.
-pub fn available_video_encoders_for_container<'a>(
-    container: &str,
-    caps: &FfmpegCapabilities,
-) -> Vec<(&'a str, &'a str)> {
-    supported_video_encoders()
-        .into_iter()
-        .filter(|(key, _)| {
-            container_supports_video_encoder(container, key)
-                && caps.available_encoders.contains(*key)
-        })
-        .collect()
 }
 
 /// Returns the intersection of ffmpeg-available audio encoders
@@ -267,27 +234,29 @@ pub fn available_containers<'a>(caps: &FfmpegCapabilities) -> Vec<(&'a str, &'a 
         .collect()
 }
 
-/// Select the best available (container, video_encoder, audio_encoder) combination
+/// Select the best available (container, video_codec, audio_encoder) combination
 /// based on ffmpeg capabilities.  Priority: ProRes > DNxHD > H.264 universal > first found.
 pub fn select_best_combination(caps: &FfmpegCapabilities) -> (String, String, String) {
     let preferences: &[(&str, &str, &str)] = &[
-        ("mov", "prores_ks", "pcm_s24le"),
+        ("mov", "prores", "pcm_s24le"),
         ("mxf", "dnxhd", "pcm_s24le"),
-        ("mov", "libx264", "pcm_s24le"),
-        ("mkv", "libx264", "pcm_s24le"),
-        ("mkv", "libx265", "aac"),
-        ("mp4", "libx264", "aac"),
+        ("mov", "h264", "pcm_s24le"),
+        ("mkv", "h264", "pcm_s24le"),
+        ("mkv", "h265", "aac"),
+        ("mp4", "h264", "aac"),
     ];
 
-    for &(container, video, audio) in preferences {
+    let codec_available = |codec: &str| !video_codecs::resolve_encoder_chain(codec, caps).is_empty();
+
+    for &(container, codec, audio) in preferences {
         let ffmpeg_name = container_to_ffmpeg_format(container);
         if caps.available_formats.contains(ffmpeg_name)
-            && caps.available_encoders.contains(video)
             && caps.available_encoders.contains(audio)
-            && container_supports_video_encoder(container, video)
             && container_supports_audio_encoder(container, audio)
+            && video_codecs::codec_supports_container(codec, container)
+            && codec_available(codec)
         {
-            return (container.to_string(), video.to_string(), audio.to_string());
+            return (container.to_string(), codec.to_string(), audio.to_string());
         }
     }
 
@@ -297,9 +266,8 @@ pub fn select_best_combination(caps: &FfmpegCapabilities) -> (String, String, St
         if !caps.available_formats.contains(ffmpeg_name) {
             continue;
         }
-        for (video, _) in supported_video_encoders() {
-            if !caps.available_encoders.contains(video)
-                || !container_supports_video_encoder(container, video)
+        for (codec, _) in video_codecs::supported_video_codecs() {
+            if !video_codecs::codec_supports_container(codec, container) || !codec_available(codec)
             {
                 continue;
             }
@@ -309,7 +277,7 @@ pub fn select_best_combination(caps: &FfmpegCapabilities) -> (String, String, St
                 {
                     return (
                         container.to_string(),
-                        video.to_string(),
+                        codec.to_string(),
                         audio.to_string(),
                     );
                 }
@@ -318,7 +286,11 @@ pub fn select_best_combination(caps: &FfmpegCapabilities) -> (String, String, St
     }
 
     // Last resort: raw strings even if not in ffmpeg (will show error later)
-    ("mkv".to_string(), "libx264".to_string(), "pcm_s24le".to_string())
+    (
+        "mkv".to_string(),
+        video_codecs::DEFAULT_VIDEO_CODEC.to_string(),
+        "pcm_s24le".to_string(),
+    )
 }
 
 fn encoder_available_in_ffmpeg(encoder: &str, caps: &FfmpegCapabilities) -> bool {
@@ -342,9 +314,12 @@ fn format_available_in_ffmpeg(format: &str, caps: &FfmpegCapabilities) -> bool {
 ///
 /// The `audio_suffix` and `video_suffix` parameters are optional suffix templates
 /// to validate. Pass `None` to skip suffix validation.
+///
+/// `video_codec` is a codec id ("av1", "h265", …); legacy concrete encoder
+/// names are accepted and normalized.
 pub fn conversion_sanity_check(
     container: &str,
-    video_encoder: &str,
+    video_codec: &str,
     audio_encoder: &str,
     input_files: &[PathBuf],
     output_folder: &Path,
@@ -395,13 +370,25 @@ pub fn conversion_sanity_check(
         ConverterSettings::validate_suffix_template(suffix)?;
     }
 
-    if !encoder_available_in_ffmpeg(video_encoder, caps) {
+    let codec_id = video_codecs::normalize_video_codec(video_codec);
+    if video_codecs::find_codec(codec_id).is_none() {
+        let known: Vec<&str> = video_codecs::supported_video_codecs()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
         return Err(format!(
-            "Video encoder '{}' is not supported by your ffmpeg installation. \
-             Run `ffmpeg -encoders` to see available encoders. \
-             Common alternatives: prores_ks (ProRes), libx264 (H.264), libx265 (HEVC), \
-             libsvtav1 (AV1), dnxhd (DNxHD).",
-            video_encoder
+            "Unknown video codec '{}'. Supported codecs: {}.",
+            video_codec,
+            known.join(", ")
+        ));
+    }
+
+    if video_codecs::resolve_encoder_chain(codec_id, caps).is_empty() {
+        return Err(format!(
+            "No {} encoder is available in your ffmpeg installation \
+             (needs one of: {}). Run `ffmpeg -encoders` to see available encoders.",
+            codec_id,
+            video_codecs::static_encoder_chain(codec_id).join(", ")
         ));
     }
 
@@ -414,18 +401,17 @@ pub fn conversion_sanity_check(
         ));
     }
 
-    if !container_supports_video_encoder(container, video_encoder) {
+    if !video_codecs::codec_supports_container(codec_id, container) {
         return Err(format!(
-            "Video encoder '{}' is not compatible with container format '{}'. \
+            "Video codec '{}' is not compatible with container format '{}'. \
              {}",
-            video_encoder,
+            codec_id,
             container,
-            match video_encoder {
-                "prores_ks" => "ProRes typically requires MOV or MKV containers.",
-                "libsvtav1" => "AV1 works in MKV, MP4, and MOV containers.",
-                "libx264" => "H.264 works in all containers.",
-                "libx265" => "HEVC works in all containers.",
+            match codec_id {
+                "prores" => "ProRes typically requires MOV or MKV containers.",
+                "av1" => "AV1 works in MKV, MP4, and MOV containers.",
                 "dnxhd" => "DNxHD requires MXF, MOV, or MKV containers.",
+                "h264" | "h265" => "H.264/HEVC work in all containers.",
                 _ => "",
             }
         ));
@@ -493,8 +479,14 @@ pub struct ConverterSettings {
 
     // ── Output Format ──
     pub container: String,
+    /// Video *codec* id ("av1", "h265", …). Legacy concrete encoder names
+    /// are accepted and normalized via `video_codecs::normalize_video_codec`.
     pub video_encoder: String,
     pub audio_encoder: String,
+    /// Concrete ffmpeg encoder resolved from the codec chain at conversion
+    /// time (hardware candidates first). Empty until resolved; the arg
+    /// builders then prefer it over the static chain head.
+    pub resolved_video_encoder: String,
 
     // ── Output Naming ──
     pub output_folder: PathBuf,
@@ -604,6 +596,26 @@ pub fn plan_video_outputs(settings: &ConverterSettings, probe: &VideoAudioProbe)
 }
 
 impl ConverterSettings {
+    /// Concrete ffmpeg encoder to pass to `-c:v`.
+    ///
+    /// Prefers the runtime-resolved encoder; falls back to the codec's first
+    /// static candidate. Legacy concrete encoder names in `video_encoder`
+    /// map to themselves so old callers keep working unchanged.
+    pub fn effective_video_encoder(&self) -> String {
+        if !self.resolved_video_encoder.is_empty() {
+            return self.resolved_video_encoder.clone();
+        }
+        let input = self.video_encoder.as_str();
+        if video_codecs::is_known_encoder(input) {
+            return input.to_string();
+        }
+        let codec = video_codecs::normalize_video_codec(input);
+        video_codecs::static_encoder_chain(codec)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| codec.to_string())
+    }
+
     /// Build the output path for a single output file given a track/clip index
     /// and an extension derived from the container.
     pub fn output_path_for_index(&self, kind: &str, index: usize, extension: &str) -> PathBuf {
@@ -864,7 +876,7 @@ fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<Stri
     }
 
     // Video encoder
-    push_video_encoder(&mut args, &settings.video_encoder);
+    push_video_encoder(&mut args, settings);
 
     // Audio encoder
     args.push("-c:a".to_string());
@@ -892,7 +904,7 @@ fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> Vec<S
     args.push("0:v".to_string());
     args.push("-an".to_string());
 
-    push_video_encoder(&mut args, &settings.video_encoder);
+    push_video_encoder(&mut args, settings);
 
     if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
         push_timecode_args(&mut args, tc);
@@ -987,6 +999,8 @@ fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &Au
         }
     }
 
+    push_video_encoder(&mut args, settings);
+
     if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
         push_timecode_args(&mut args, tc);
     }
@@ -1076,35 +1090,21 @@ fn push_output_trailer(args: &mut Vec<String>, format: &str) {
     args.push(format.to_string());
 }
 
-fn push_video_encoder(args: &mut Vec<String>, encoder: &str) {
-    match encoder {
-        "libsvtav1" => {
-            args.push("-c:v".to_string()); args.push("libsvtav1".to_string());
-            args.push("-pix_fmt".to_string()); args.push("yuv420p".to_string());
-        }
-        "prores_ks" => {
-            args.push("-c:v".to_string()); args.push("prores_ks".to_string());
-            args.push("-profile:v".to_string()); args.push("0".to_string());
-            args.push("-pix_fmt".to_string()); args.push("yuv422p10le".to_string());
-        }
-        "libx264" => {
-            args.push("-c:v".to_string()); args.push("libx264".to_string());
-            args.push("-pix_fmt".to_string()); args.push("yuv420p".to_string());
-        }
-        "libx265" => {
-            args.push("-c:v".to_string()); args.push("libx265".to_string());
-            args.push("-pix_fmt".to_string()); args.push("yuv420p".to_string());
-            args.push("-tag:v".to_string()); args.push("hvc1".to_string());
-        }
-        "dnxhd" => {
-            args.push("-c:v".to_string()); args.push("dnxhd".to_string());
-            args.push("-pix_fmt".to_string()); args.push("yuv422p".to_string());
-            args.push("-profile:v".to_string()); args.push("dnxhd".to_string());
-            args.push("-b:v".to_string()); args.push("36M".to_string());
-        }
-        _ => {
-            args.push("-c:v".to_string()); args.push(encoder.to_string());
-        }
+/// Push the video encoding args: `-c:v <resolved encoder>` plus codec-level
+/// args (e.g. `-tag:v hvc1` for HEVC) and the resolved encoder's own args
+/// (e.g. `-pix_fmt yuv420p`), from the codec registry.
+fn push_video_encoder(args: &mut Vec<String>, settings: &ConverterSettings) {
+    let codec_id = video_codecs::normalize_video_codec(&settings.video_encoder);
+    let encoder = settings.effective_video_encoder();
+    args.push("-c:v".to_string());
+    args.push(encoder.clone());
+    for (key, value) in video_codecs::codec_args(codec_id) {
+        args.push(format!("-{}", key));
+        args.push((*value).to_string());
+    }
+    for (key, value) in video_codecs::candidate_args(&encoder) {
+        args.push(format!("-{}", key));
+        args.push((*value).to_string());
     }
 }
 
@@ -1146,14 +1146,198 @@ fn push_audio_timecode_args(args: &mut Vec<String>, tc: &TimecodeMetadata, forma
     args.push(tc_str);
 }
 
+// ── Encoder fallback ─────────────────────────────────────────────────────
+
+/// Failure of a single ffmpeg step, classified for the encoder fallback.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StepFailure {
+    /// ffmpeg exited before producing any output — typically an encoder
+    /// initialization failure (the encoder is listed by `ffmpeg -encoders`
+    /// but the hardware/driver is missing). Safe to retry with the next
+    /// candidate in the chain.
+    EncoderInit(String),
+    /// Failure after output was produced, a spawn error, or user
+    /// cancellation. Not retryable with a different encoder.
+    Fatal(String),
+}
+
+/// Publishes the terminal `Failed` state. Failure text is accumulated in
+/// `overall_log` by `run_ffmpeg_process` before this is called.
+fn mark_conversion_failed(state: &SharedConversionState, overall_log: &str) {
+    let mut s = state.lock().unwrap();
+    s.status = ConversionStatus::Failed {
+        error_log: overall_log.to_string(),
+    };
+    s.ffmpeg_output = overall_log.to_string();
+}
+
+/// Tracks the concrete video encoder chain for one conversion: hardware
+/// candidates first, software fallbacks last. Encoders that failed to
+/// initialize are memoized so later steps skip them; the first successful
+/// encoder is pinned for the rest of the run.
+struct EncoderFallback {
+    chain: Vec<String>,
+    failed: BTreeSet<String>,
+    resolved: Option<String>,
+}
+
+impl EncoderFallback {
+    fn new(chain: Vec<String>) -> Self {
+        EncoderFallback {
+            chain,
+            failed: BTreeSet::new(),
+            resolved: None,
+        }
+    }
+
+    /// Candidates still worth trying: the pinned encoder once one succeeded,
+    /// otherwise the chain minus already-failed entries.
+    fn remaining(&self) -> Vec<String> {
+        if let Some(resolved) = &self.resolved {
+            return vec![resolved.clone()];
+        }
+        self.chain
+            .iter()
+            .filter(|e| !self.failed.contains(*e))
+            .cloned()
+            .collect()
+    }
+
+    fn note_success(&mut self, encoder: &str) {
+        self.resolved = Some(encoder.to_string());
+    }
+
+    fn note_failure(&mut self, encoder: &str) {
+        self.failed.insert(encoder.to_string());
+    }
+
+    fn resolved(&self) -> Option<&str> {
+        self.resolved.as_deref()
+    }
+}
+
+/// Run one video-producing ffmpeg step, walking the encoder candidate chain
+/// on encoder-initialization failures (listed but non-functional hardware
+/// encoders). Returns `true` on success; on `false` the terminal `Failed`
+/// state has already been published.
+#[allow(clippy::too_many_arguments)]
+fn run_video_step_with_fallback(
+    settings: &mut ConverterSettings,
+    fallback: &mut EncoderFallback,
+    build_args: &mut dyn FnMut(&ConverterSettings) -> Vec<String>,
+    output: &Path,
+    state: &SharedConversionState,
+    cancel: &CancelFlag,
+    step_progress_weight: f32,
+    overall_progress: &mut f32,
+    overall_log: &mut String,
+    total_steps: usize,
+    current_step: usize,
+) -> bool {
+    let candidates = fallback.remaining();
+    if candidates.is_empty() {
+        let msg = "no video encoder candidate available".to_string();
+        warn!("{}", msg);
+        overall_log.push_str(&format!("\n\n--- {} ---", msg));
+        mark_conversion_failed(state, overall_log);
+        return false;
+    }
+
+    let mut attempt = 0;
+    while attempt < candidates.len() {
+        let encoder = candidates[attempt].clone();
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        settings.resolved_video_encoder = encoder.clone();
+        let args = build_args(settings);
+        match run_ffmpeg_process(
+            &args,
+            output,
+            state,
+            cancel,
+            step_progress_weight,
+            overall_progress,
+            overall_log,
+            total_steps,
+            current_step,
+        ) {
+            Ok(()) => {
+                fallback.note_success(&encoder);
+                return true;
+            }
+            Err(StepFailure::Fatal(_)) => {
+                mark_conversion_failed(state, overall_log);
+                return false;
+            }
+            Err(StepFailure::EncoderInit(_)) => {
+                fallback.note_failure(&encoder);
+                attempt += 1;
+                if attempt < candidates.len() {
+                    let msg = format!(
+                        "--- encoder '{}' failed to initialize; falling back to '{}' ---",
+                        encoder, candidates[attempt]
+                    );
+                    warn!("{} (output: {})", msg, output.display());
+                    overall_log.push_str(&format!("\n--- {} ---\n", msg));
+                }
+            }
+        }
+    }
+
+    // All candidates failed to initialize.
+    let msg = format!(
+        "all encoder candidates for codec '{}' failed to initialize ({})",
+        video_codecs::normalize_video_codec(&settings.video_encoder),
+        fallback
+            .failed
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    warn!("{}", msg);
+    overall_log.push_str(&format!("\n\n--- {} ---", msg));
+    mark_conversion_failed(state, overall_log);
+    false
+}
+
 // ── Spawn conversion ─────────────────────────────────────────────────────
 
+/// Spawn a conversion on a background thread.
+///
+/// `caps` (typically probed once by the GUI) resolves the selected video
+/// codec into an ordered concrete-encoder chain: hardware candidates first,
+/// software fallbacks last. When no capability info is available the full
+/// static chain is used and the runtime fallback sorts it out.
 pub fn spawn_conversion(
     settings: ConverterSettings,
     state: SharedConversionState,
     cancel: CancelFlag,
+    caps: Option<&FfmpegCapabilities>,
 ) -> JoinHandle<()> {
+    // Resolve the codec → encoder chain on the caller thread (cheap, and
+    // avoids moving the `caps` borrow into the spawned thread).
+    let codec_id = video_codecs::normalize_video_codec(&settings.video_encoder).to_string();
+    let mut chain: Vec<String> = caps
+        .filter(|c| c.has_ffmpeg)
+        .map(|c| video_codecs::resolve_encoder_chain(&codec_id, c))
+        .unwrap_or_default();
+    if chain.is_empty() {
+        // No capability info (or stale): try the full static chain and
+        // let the runtime fallback sort it out.
+        chain = video_codecs::static_encoder_chain(&codec_id);
+    }
+
     std::thread::spawn(move || {
+        let mut settings = settings;
+        let mut fallback = EncoderFallback::new(chain);
+        info!(
+            "Encoder chain for codec '{}': {}",
+            codec_id,
+            fallback.remaining().join(" → ")
+        );
+
         let (output_format, output_extension) = match settings.pipeline {
             ConversionPipeline::AudioOnly { generate_synthetic_video: false } => {
                 let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
@@ -1174,7 +1358,7 @@ pub fn spawn_conversion(
         let input_count = settings.input_files.len();
 
         info!(
-            "Starting conversion: {} input(s), pipeline={:?}, split={}, drop_ltc={}, encoders={}/{}",
+            "Starting conversion: {} input(s), pipeline={:?}, split={}, drop_ltc={}, video codec={}, audio encoder={}",
             input_count,
             settings.pipeline,
             settings.split_tracks,
@@ -1201,10 +1385,10 @@ pub fn spawn_conversion(
                 run_audio_to_audio(&settings, &output_format, extension, &state, &cancel, total_steps, &mut overall_progress, &mut overall_log);
             }
             ConversionPipeline::AudioOnly { generate_synthetic_video: true } => {
-                run_audio_to_synthetic_video(&settings, extension, &state, &cancel, &mut overall_progress, &mut overall_log);
+                run_audio_to_synthetic_video(&mut settings, extension, &mut fallback, &state, &cancel, &mut overall_progress, &mut overall_log);
             }
             ConversionPipeline::VideoPassthrough => {
-                run_video_to_video(&settings, extension, &state, &cancel, &mut total_steps, &mut overall_progress, &mut overall_log);
+                run_video_to_video(&mut settings, extension, &mut fallback, &state, &cancel, &mut total_steps, &mut overall_progress, &mut overall_log);
             }
         }
 
@@ -1216,9 +1400,16 @@ pub fn spawn_conversion(
         if matches!(final_status, ConversionStatus::Failed { .. }) {
             info!("Conversion failed - see log for details.");
         } else {
+            let encoder_line = fallback
+                .resolved()
+                .map(|e| format!("\nVideo encoder used: {}", e))
+                .unwrap_or_default();
             let mut s = state.lock().unwrap();
             s.status = ConversionStatus::Completed;
-            s.ffmpeg_output = format!("{}\n\n--- CONVERSION COMPLETED SUCCESSFULLY ---", overall_log);
+            s.ffmpeg_output = format!(
+                "{}\n\n--- CONVERSION COMPLETED SUCCESSFULLY ---{}",
+                overall_log, encoder_line
+            );
         }
     })
 }
@@ -1274,7 +1465,10 @@ fn run_audio_to_audio(
                 .and_then(|m| m.as_ref());
             let step_args = build_split_track_args(settings, format, track_idx, tc, sample_rate);
             let step_progress = 1.0 / total_steps as f32;
-            run_ffmpeg_process(&step_args, &output_path, state, cancel, step_progress, overall_progress, overall_log, total_steps, 1);
+            if run_ffmpeg_process(&step_args, &output_path, state, cancel, step_progress, overall_progress, overall_log, total_steps, 1).is_err() {
+                mark_conversion_failed(state, overall_log);
+                return;
+            }
             *overall_progress += step_progress;
         }
     } else {
@@ -1284,7 +1478,9 @@ fn run_audio_to_audio(
             .and_then(|m| m.as_ref());
         let base_args = build_audio_to_audio_args(settings, format, tc, sample_rate);
         let output_path = settings.output_path_for_index("audio", 0, extension);
-        run_ffmpeg_process(&base_args, &output_path, state, cancel, 1.0, overall_progress, overall_log, 1, 1);
+        if run_ffmpeg_process(&base_args, &output_path, state, cancel, 1.0, overall_progress, overall_log, 1, 1).is_err() {
+            mark_conversion_failed(state, overall_log);
+        }
     }
 }
 
@@ -1315,30 +1511,48 @@ fn build_split_track_args(
     args
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_audio_to_synthetic_video(
-    settings: &ConverterSettings,
+    settings: &mut ConverterSettings,
     extension: &str,
+    fallback: &mut EncoderFallback,
     state: &SharedConversionState,
     cancel: &CancelFlag,
     overall_progress: &mut f32,
     overall_log: &mut String,
 ) {
-    let args = build_audio_to_synthetic_video_args(settings);
     let output_path = settings.output_path_for_index("video", 1, extension);
-    run_ffmpeg_process(&args, &output_path, state, cancel, 1.0, overall_progress, overall_log, 1, 1);
+    let mut build_args =
+        |s: &ConverterSettings| build_audio_to_synthetic_video_args(s);
+    run_video_step_with_fallback(
+        settings,
+        fallback,
+        &mut build_args,
+        &output_path,
+        state,
+        cancel,
+        1.0,
+        overall_progress,
+        overall_log,
+        1,
+        1,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_video_to_video(
-    settings: &ConverterSettings,
+    settings: &mut ConverterSettings,
     extension: &str,
+    fallback: &mut EncoderFallback,
     state: &SharedConversionState,
     cancel: &CancelFlag,
     _total_steps: &mut usize,
     overall_progress: &mut f32,
     overall_log: &mut String,
 ) {
-    // Probe each file to build the plan
-    let mut steps: Vec<(Vec<String>, PathBuf)> = Vec::new();
+    // Phase 1: probe each file and build the step plan (encoder args are
+    // built lazily per attempt so the fallback can substitute encoders).
+    let mut planned: Vec<(VideoOutputStep, VideoAudioProbe)> = Vec::new();
 
     for file_idx in 0..settings.input_files.len() {
         if cancel.load(Ordering::Relaxed) { break; }
@@ -1348,39 +1562,62 @@ fn run_video_to_video(
 
         match probe {
             Ok(probe) => {
-                let file_steps = plan_video_outputs(settings, &probe);
-                for s in &file_steps {
-                    let args = build_video_to_video_args(settings, s, &probe);
-                    let output = match s {
-                        VideoOutputStep::VideoOnly { output, .. }
-                        | VideoOutputStep::VideoMux { output, .. }
-                        | VideoOutputStep::AudioChannel { output, .. } => output.clone(),
-                    };
-                    steps.push((args, output));
+                for s in plan_video_outputs(settings, &probe) {
+                    planned.push((s, probe.clone()));
                 }
             }
             Err(e) => {
                 // Probe failure: warn, treat as no-audio, produce video-only output
                 warn!("Probe failed for '{}': {} — treating as no-audio", input.display(), e);
                 let output_path = settings.output_path_for_index("video", file_idx + 1, extension);
-                let args = build_video_only_args(settings, file_idx);
-                steps.push((args, output_path));
+                let step = VideoOutputStep::VideoOnly { file_idx, output: output_path };
+                planned.push((
+                    step,
+                    VideoAudioProbe {
+                        streams: Vec::new(),
+                        total_audio_channels: 0,
+                        is_video_file: true,
+                    },
+                ));
             }
         }
     }
 
     // Recalculate total steps from actual plan
-    *_total_steps = steps.len();
+    *_total_steps = planned.len();
 
-    // Execute steps
-    for (step_idx, (args, output)) in steps.iter().enumerate() {
+    // Phase 2: execute steps with encoder fallback
+    for (step_idx, (step, probe)) in planned.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) { break; }
-        let step_progress = 1.0 / steps.len().max(1) as f32;
-        run_ffmpeg_process(args, output, state, cancel, step_progress, overall_progress, overall_log, steps.len(), step_idx + 1);
+        let output = match step {
+            VideoOutputStep::VideoOnly { output, .. }
+            | VideoOutputStep::VideoMux { output, .. }
+            | VideoOutputStep::AudioChannel { output, .. } => output.clone(),
+        };
+        let step_progress = 1.0 / planned.len().max(1) as f32;
+        let mut build_args =
+            |s: &ConverterSettings| build_video_to_video_args(s, step, probe);
+        let ok = run_video_step_with_fallback(
+            settings,
+            fallback,
+            &mut build_args,
+            &output,
+            state,
+            cancel,
+            step_progress,
+            overall_progress,
+            overall_log,
+            planned.len(),
+            step_idx + 1,
+        );
         *overall_progress += step_progress;
+        if !ok {
+            break;
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_process(
     args: &[String],
     output: &Path,
@@ -1391,7 +1628,7 @@ fn run_ffmpeg_process(
     overall_log: &mut String,
     total_steps: usize,
     current_step: usize,
-) {
+) -> Result<(), StepFailure> {
     let step_label = format!("[{}/{}]", current_step, total_steps);
     info!("{} Spawning ffmpeg with {} args → {}", step_label, args.len(), output.display());
 
@@ -1413,9 +1650,8 @@ fn run_ffmpeg_process(
         Err(e) => {
             let err_msg = format!("{} Failed to spawn ffmpeg: {}", step_label, e);
             warn!("{}", err_msg);
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Failed { error_log: err_msg };
-            return;
+            overall_log.push_str(&format!("\n\n--- {} ---", err_msg));
+            return Err(StepFailure::Fatal(err_msg));
         }
     };
 
@@ -1424,6 +1660,10 @@ fn run_ffmpeg_process(
     use std::io::BufRead;
     let mut local_log = String::new();
     let mut step_progress: f32 = 0.0;
+    // Whether ffmpeg actually produced encoded output; distinguishes
+    // encoder-init failures (nothing produced → retryable) from real
+    // transcoding failures (progress was made → fatal).
+    let mut produced_output = false;
     let out_time_re = regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
     let duration_re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
     let mut total_duration_secs: Option<f64> = None;
@@ -1432,12 +1672,8 @@ fn run_ffmpeg_process(
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             overall_log.push_str(&format!("{} --- CANCELLED ---\n", step_label));
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Failed {
-                error_log: format!("{}\n\n--- CANCELLED BY USER ---", *overall_log),
-            };
-            s.ffmpeg_output = overall_log.clone();
-            return;
+            overall_log.push_str("\n\n--- CANCELLED BY USER ---");
+            return Err(StepFailure::Fatal("cancelled by user".to_string()));
         }
 
         let line = match line {
@@ -1467,6 +1703,10 @@ fn run_ffmpeg_process(
             let frac: f64 = caps[4].parse().unwrap_or(0.0) / 1_000_000.0;
             let current_secs = h * 3600.0 + m * 60.0 + s + frac;
 
+            if current_secs > 0.0 {
+                produced_output = true;
+            }
+
             if let Some(total) = total_duration_secs {
                 if total > 0.0 {
                     step_progress = (current_secs / total).min(1.0) as f32;
@@ -1479,6 +1719,7 @@ fn run_ffmpeg_process(
 
         if line.trim() == "progress=end" {
             step_progress = 1.0;
+            produced_output = true;
         }
 
         let combined = *overall_progress + step_progress * step_progress_weight;
@@ -1497,25 +1738,25 @@ fn run_ffmpeg_process(
             // Ensure progress is reported as 1.0 even if ffmpeg completed too fast for progress tracking
             *overall_progress += step_progress_weight;
             info!("{} Step completed: {}", step_label, output.display());
+            Ok(())
         }
         Ok(status) => {
             let code = status.code().map(|c| c.to_string()).unwrap_or("unknown".into());
             warn!("{} ffmpeg exited with code {}: {}", step_label, code, output.display());
             overall_log.push_str(&format!("\n\n--- FFMPEG EXITED WITH CODE {} ---", code));
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Failed {
-                error_log: overall_log.clone(),
-            };
-            return;
+            if produced_output {
+                Err(StepFailure::Fatal(format!("ffmpeg exited with code {}", code)))
+            } else {
+                Err(StepFailure::EncoderInit(format!(
+                    "ffmpeg exited with code {} before producing output",
+                    code
+                )))
+            }
         }
         Err(e) => {
             warn!("{} ffmpeg error: {}", step_label, e);
             overall_log.push_str(&format!("\n\n--- FFMPEG ERROR: {} ---", e));
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Failed {
-                error_log: overall_log.clone(),
-            };
-            return;
+            Err(StepFailure::Fatal(e.to_string()))
         }
     }
 }
@@ -1595,14 +1836,21 @@ pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
 }
 
 /// Pure version of the default-selection logic, extracted for testability.
-/// Replaces container/video_encoder/audio_encoder with `select_best_combination`
+/// Replaces container/video codec/audio_encoder with `select_best_combination`
 /// defaults if the current selection is not available in `caps`.
+/// `video_encoder` holds a codec id; legacy concrete encoder names are
+/// normalized to their codec id first.
 pub fn apply_available_defaults(
     container: &mut String,
     video_encoder: &mut String,
     audio_encoder: &mut String,
     caps: &FfmpegCapabilities,
 ) {
+    let codec = video_codecs::normalize_video_codec(video_encoder);
+    if codec != video_encoder.as_str() {
+        *video_encoder = codec.to_string();
+    }
+
     let containers: Vec<&str> = available_containers(caps).iter().map(|(k, _)| *k).collect();
     if !containers.contains(&container.as_str()) {
         let (c, v, a) = select_best_combination(caps);
@@ -1611,11 +1859,11 @@ pub fn apply_available_defaults(
         *audio_encoder = a;
         return;
     }
-    let vids: Vec<&str> =
-        available_video_encoders_for_container(container, caps).iter().map(|(k, _)| *k).collect();
+    let codecs: Vec<&str> = video_codecs::available_video_codecs(container, caps)
+        .iter().map(|(k, _)| *k).collect();
     let auds: Vec<&str> =
         available_audio_encoders_for_container(container, caps).iter().map(|(k, _)| *k).collect();
-    if !vids.contains(&video_encoder.as_str()) || !auds.contains(&audio_encoder.as_str()) {
+    if !codecs.contains(&video_encoder.as_str()) || !auds.contains(&audio_encoder.as_str()) {
         let (c, v, a) = select_best_combination(caps);
         *container = c;
         *video_encoder = v;
@@ -1645,8 +1893,9 @@ mod tests {
             drop_ltc_track: false,
             ltc_video_source: None,
             container: "mkv".to_string(),
-            video_encoder: "libx264".to_string(),
+            video_encoder: "h264".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
+            resolved_video_encoder: String::new(),
             output_folder: PathBuf::from("/tmp"),
             filename_prefix: "output".to_string(),
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
@@ -1781,11 +2030,11 @@ mod tests {
     fn test_apply_defaults_replaces_invalid_container() {
         let caps = make_caps(true, BTreeSet::from(["prores_ks", "libx264", "pcm_s24le"]), BTreeSet::from(["mov", "matroska"]));
         let mut c = "mxf".to_string();
-        let mut v = "libx264".to_string();
+        let mut v = "h264".to_string();
         let mut a = "pcm_s24le".to_string();
         apply_available_defaults(&mut c, &mut v, &mut a, &caps);
         assert_eq!(c, "mov");
-        assert_eq!(v, "prores_ks");
+        assert_eq!(v, "prores");
         assert_eq!(a, "pcm_s24le");
     }
 
@@ -1793,11 +2042,23 @@ mod tests {
     fn test_apply_defaults_replaces_missing_encoder() {
         let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
         let mut c = "mkv".to_string();
-        let mut v = "libsvtav1".to_string();
+        let mut v = "av1".to_string();
         let mut a = "pcm_s24le".to_string();
         apply_available_defaults(&mut c, &mut v, &mut a, &caps);
         assert_eq!(c, "mkv");
-        assert_eq!(v, "libx264");
+        assert_eq!(v, "h264");
+        assert_eq!(a, "pcm_s24le");
+    }
+
+    #[test]
+    fn test_apply_defaults_normalizes_legacy_encoder_names() {
+        let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
+        let mut c = "mkv".to_string();
+        let mut v = "libx264".to_string();
+        let mut a = "pcm_s24le".to_string();
+        apply_available_defaults(&mut c, &mut v, &mut a, &caps);
+        assert_eq!(c, "mkv");
+        assert_eq!(v, "h264", "legacy 'libx264' must normalize to codec id 'h264'");
         assert_eq!(a, "pcm_s24le");
     }
 
@@ -1805,11 +2066,11 @@ mod tests {
     fn test_apply_defaults_keeps_valid_selection() {
         let caps = make_caps(true, BTreeSet::from(["prores_ks", "pcm_s24le"]), BTreeSet::from(["mov"]));
         let mut c = "mov".to_string();
-        let mut v = "prores_ks".to_string();
+        let mut v = "prores".to_string();
         let mut a = "pcm_s24le".to_string();
         apply_available_defaults(&mut c, &mut v, &mut a, &caps);
         assert_eq!(c, "mov");
-        assert_eq!(v, "prores_ks");
+        assert_eq!(v, "prores");
         assert_eq!(a, "pcm_s24le");
     }
 
@@ -2226,28 +2487,7 @@ mod tests {
         assert!(s.current_line.is_empty());
     }
 
-    // ── Container/encoder compatibility ─────────────────────────────────
-
-    #[test]
-    fn test_container_supports_video_encoder_valid() {
-        assert!(container_supports_video_encoder("mkv", "libx264"));
-        assert!(container_supports_video_encoder("mov", "prores_ks"));
-        assert!(container_supports_video_encoder("mp4", "libx264"));
-        assert!(container_supports_video_encoder("mkv", "libx265"));
-        assert!(container_supports_video_encoder("mov", "dnxhd"));
-        assert!(container_supports_video_encoder("mxf", "dnxhd"));
-        assert!(container_supports_video_encoder("mxf", "libx264"));
-        assert!(container_supports_video_encoder("mxf", "libx265"));
-    }
-
-    #[test]
-    fn test_container_rejects_incompatible_video_encoder() {
-        assert!(!container_supports_video_encoder("mp4", "prores_ks"));
-        assert!(!container_supports_video_encoder("mp4", "dnxhd"));
-        assert!(!container_supports_video_encoder("mxf", "prores_ks"));
-        assert!(!container_supports_video_encoder("mxf", "libsvtav1"));
-        assert!(!container_supports_video_encoder("mkv", "nonexistent"));
-    }
+    // ── Container/codec compatibility ───────────────────────────────────
 
     #[test]
     fn test_container_supports_audio_encoder_valid() {
@@ -2286,7 +2526,7 @@ mod tests {
             error_message: None,
         };
         let (c, v, a) = select_best_combination(&caps);
-        assert_eq!((c.as_str(), v.as_str(), a.as_str()), ("mov", "prores_ks", "pcm_s24le"));
+        assert_eq!((c.as_str(), v.as_str(), a.as_str()), ("mov", "prores", "pcm_s24le"));
     }
 
     #[test]
@@ -2306,7 +2546,7 @@ mod tests {
     }
 
     #[test]
-    fn test_available_video_encoders_for_container_filters_correctly() {
+    fn test_available_video_codecs_for_container_filters_correctly() {
         let caps = FfmpegCapabilities {
             has_ffmpeg: true,
             available_encoders: BTreeSet::from([
@@ -2317,11 +2557,146 @@ mod tests {
             available_formats: BTreeSet::from(["mov".into()]),
             error_message: None,
         };
-        let available = available_video_encoders_for_container("mov", &caps);
+        let available = video_codecs::available_video_codecs("mov", &caps);
         let keys: Vec<&str> = available.iter().map(|(k, _)| *k).collect();
-        assert!(keys.contains(&"libx264"));
-        assert!(keys.contains(&"libx265"));
-        assert!(!keys.contains(&"prores_ks"));
+        assert!(keys.contains(&"h264"));
+        assert!(keys.contains(&"h265"));
+        assert!(!keys.contains(&"prores"), "prores_ks not installed → codec hidden");
+    }
+
+    // ── Encoder fallback tracking ────────────────────────────────────────
+
+    #[test]
+    fn test_encoder_fallback_remaining_skips_failed() {
+        let mut fb = EncoderFallback::new(vec!["av1_nvenc".into(), "libsvtav1".into(), "libaom-av1".into()]);
+        assert_eq!(fb.remaining(), vec!["av1_nvenc", "libsvtav1", "libaom-av1"]);
+        fb.note_failure("av1_nvenc");
+        assert_eq!(fb.remaining(), vec!["libsvtav1", "libaom-av1"]);
+        fb.note_failure("libsvtav1");
+        assert_eq!(fb.remaining(), vec!["libaom-av1"]);
+    }
+
+    #[test]
+    fn test_encoder_fallback_pins_resolved_encoder() {
+        let mut fb = EncoderFallback::new(vec!["av1_nvenc".into(), "libsvtav1".into()]);
+        fb.note_success("av1_nvenc");
+        assert_eq!(fb.remaining(), vec!["av1_nvenc"], "pinned encoder is reused");
+        assert_eq!(fb.resolved(), Some("av1_nvenc"));
+    }
+
+    #[test]
+    fn test_encoder_fallback_exhausted_chain() {
+        let mut fb = EncoderFallback::new(vec!["av1_nvenc".into()]);
+        fb.note_failure("av1_nvenc");
+        assert!(fb.remaining().is_empty());
+        assert_eq!(fb.resolved(), None);
+    }
+
+    // ── effective_video_encoder / push_video_encoder ─────────────────────
+
+    #[test]
+    fn test_effective_video_encoder_prefers_resolved() {
+        let mut s = make_video_settings();
+        s.video_encoder = "av1".to_string();
+        s.resolved_video_encoder = "av1_nvenc".to_string();
+        assert_eq!(s.effective_video_encoder(), "av1_nvenc");
+    }
+
+    #[test]
+    fn test_effective_video_encoder_codec_uses_static_head() {
+        let mut s = make_video_settings();
+        s.video_encoder = "h265".to_string();
+        assert_eq!(s.effective_video_encoder(), "hevc_nvenc");
+    }
+
+    #[test]
+    fn test_effective_video_encoder_legacy_name_passthrough() {
+        let mut s = make_video_settings();
+        s.video_encoder = "libx264".to_string();
+        assert_eq!(s.effective_video_encoder(), "libx264");
+    }
+
+    #[test]
+    fn test_push_video_encoder_codec_and_candidate_args() {
+        let mut s = make_video_settings();
+        s.video_encoder = "h265".to_string();
+        s.resolved_video_encoder = "libx265".to_string();
+        let mut args = Vec::new();
+        push_video_encoder(&mut args, &s);
+        let cv = args.iter().position(|a| a == "-c:v").unwrap();
+        assert_eq!(args[cv + 1], "libx265");
+        assert!(args.contains(&"-pix_fmt".to_string()));
+        assert!(args.contains(&"yuv420p".to_string()));
+        let tag = args.iter().position(|a| a == "-tag:v").unwrap();
+        assert_eq!(args[tag + 1], "hvc1", "HEVC codec-level arg applies regardless of encoder");
+    }
+
+    #[test]
+    fn test_push_video_encoder_hardware_candidate() {
+        let mut s = make_video_settings();
+        s.video_encoder = "av1".to_string();
+        s.resolved_video_encoder = "av1_nvenc".to_string();
+        let mut args = Vec::new();
+        push_video_encoder(&mut args, &s);
+        let cv = args.iter().position(|a| a == "-c:v").unwrap();
+        assert_eq!(args[cv + 1], "av1_nvenc");
+        assert!(!args.contains(&"-pix_fmt".to_string()), "HW candidates negotiate pix_fmt themselves");
+    }
+
+    #[test]
+    fn test_push_video_encoder_prores_args() {
+        let mut s = make_video_settings();
+        s.video_encoder = "prores".to_string();
+        s.resolved_video_encoder = "prores_ks".to_string();
+        s.container = "mov".to_string();
+        let mut args = Vec::new();
+        push_video_encoder(&mut args, &s);
+        let cv = args.iter().position(|a| a == "-c:v").unwrap();
+        assert_eq!(args[cv + 1], "prores_ks");
+        let prof = args.iter().position(|a| a == "-profile:v").unwrap();
+        assert_eq!(args[prof + 1], "0");
+        assert!(args.contains(&"yuv422p10le".to_string()));
+    }
+
+    // ── sanity check (codec-based) ───────────────────────────────────────
+
+    #[test]
+    fn test_sanity_check_no_encoder_for_codec() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("in.wav");
+        std::fs::write(&input, b"RIFF").unwrap();
+        let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
+        let err = conversion_sanity_check(
+            "mkv", "av1", "pcm_s24le",
+            &[input], tmp.path(), "out", &caps, None, None,
+        ).unwrap_err();
+        assert!(err.contains("No av1 encoder is available"), "got: {}", err);
+        assert!(err.contains("av1_nvenc"), "error should name expected encoders");
+    }
+
+    #[test]
+    fn test_sanity_check_codec_container_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("in.wav");
+        std::fs::write(&input, b"RIFF").unwrap();
+        let caps = make_caps(true, BTreeSet::from(["libsvtav1", "pcm_s24le"]), BTreeSet::from(["mxf", "matroska"]));
+        let err = conversion_sanity_check(
+            "mxf", "av1", "pcm_s24le",
+            &[input], tmp.path(), "out", &caps, None, None,
+        ).unwrap_err();
+        assert!(err.contains("not compatible with container"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_sanity_check_legacy_encoder_name_ok() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("in.wav");
+        std::fs::write(&input, b"RIFF").unwrap();
+        let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
+        assert!(conversion_sanity_check(
+            "mkv", "libx264", "pcm_s24le",
+            &[input], tmp.path(), "out", &caps, None, None,
+        ).is_ok(), "legacy concrete encoder names must keep passing");
     }
 
     // ── Video pipeline helpers ────────────────────────────────────────────
@@ -2337,8 +2712,9 @@ mod tests {
             drop_ltc_track: false,
             ltc_video_source: None,
             container: "mkv".to_string(),
-            video_encoder: "libx264".to_string(),
+            video_encoder: "h264".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
+            resolved_video_encoder: String::new(),
             output_folder: PathBuf::from("/tmp"),
             filename_prefix: "output".to_string(),
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),

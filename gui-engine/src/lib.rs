@@ -8,6 +8,7 @@ pub mod file_pattern;
 pub mod log_buffer;
 pub mod state;
 pub mod theme;
+pub mod video_codecs;
 pub mod timecode;
 
 // Re-export commonly-used types so GUI crates don't need direct deps
@@ -22,18 +23,22 @@ pub use audio_core::{
 // Re-export converter/file_pattern types for convenience
 pub use converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, available_video_encoders_for_container,
-    conversion_sanity_check, evaluate_readiness, find_timecode_at_offset,
-    format_blockers, format_ffmpeg_timecode,
+    available_containers, conversion_sanity_check, evaluate_readiness,
+    find_timecode_at_offset, format_blockers, format_ffmpeg_timecode,
     plan_video_outputs, query_ffmpeg_capabilities, select_best_combination,
     spawn_conversion, supported_audio_encoders, supported_containers,
-    supported_video_encoders, AudioKeep, ChannelMap, ConvertBlocker,
-    ConvertReadiness, ConversionPipeline, ConversionState, ConversionStatus,
-    ConverterSettings, VideoOutputStep, DEFAULT_AUDIO_SUFFIX,
-    DEFAULT_VIDEO_SUFFIX, FfmpegCapabilities, RecordingType,
-    SharedConversionState, CancelFlag, TimecodeMetadata,
+    AudioKeep, ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
+    ConversionState, ConversionStatus, ConverterSettings, StepFailure,
+    VideoOutputStep, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
+    FfmpegCapabilities, RecordingType, SharedConversionState, CancelFlag,
+    TimecodeMetadata,
 };
 pub use file_pattern::{default_output_filename, match_files_to_groups, match_files_all_patterns, wrap_user_selected_files, FileNamingPattern, BUILTIN_PATTERNS, CAMERA_PATTERNS};
+pub use video_codecs::{
+    available_video_codecs, codec_supports_container, describe_chain,
+    normalize_video_codec, resolve_encoder_chain, supported_video_codecs,
+    EncoderClass,
+};
 
 // Re-export ffprobe types
 pub use ffprobe::{extract_audio_channel, path_is_video, probe_video_audio, AudioStreamInfo, VideoAudioProbe};

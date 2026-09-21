@@ -467,14 +467,14 @@ export component ConverterSection {
                                 }
                             }
                         }
-                        // Video encoder
+                        // Video codec
                         VerticalLayout { spacing: 0px;
                             Rectangle {
                                 border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                                 background: AppColors.deep-bg; min-height: 28px;
                                 TouchArea { clicked => { root.open-popup = root.open-popup == 1 ? -1 : 1; } }
                                 VerticalLayout { padding: 4px; spacing: 2px;
-                                    Text { text: "Video encoder"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                    Text { text: "Video codec"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
                                     Text { text: root.video-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
                                 }
                             }

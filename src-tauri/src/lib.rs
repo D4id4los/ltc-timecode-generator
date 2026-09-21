@@ -337,6 +337,7 @@ fn start_convert(
         container: request.container,
         video_encoder: request.video_encoder,
         audio_encoder: request.audio_encoder,
+        resolved_video_encoder: String::new(),
         output_folder: PathBuf::from(&request.output_folder),
         filename_prefix: request.filename_prefix,
         audio_suffix_template: request.audio_suffix_template,
@@ -368,7 +369,7 @@ fn start_convert(
         Arc::new(Mutex::new(ConversionState::idle()));
     let cancel: gui_engine::converter::CancelFlag = Arc::new(AtomicBool::new(false));
 
-    let handle = spawn_conversion(settings, conv_state.clone(), cancel.clone());
+    let handle = spawn_conversion(settings, conv_state.clone(), cancel.clone(), Some(&caps));
 
     let mut active = state.active.lock().map_err(lock_err)?;
     *active = Some(ActiveConversion {

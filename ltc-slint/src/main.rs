@@ -11,12 +11,12 @@ use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
-    available_video_encoders_for_container, find_timecode_at_offset,
-    query_ffmpeg_capabilities, select_best_combination, spawn_conversion,
-    ChannelMap, ConversionPipeline, ConversionState, ConverterSettings,
-    DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, FfmpegCapabilities,
-    RecordingType, TimecodeMetadata,
+    find_timecode_at_offset, query_ffmpeg_capabilities, select_best_combination,
+    spawn_conversion, ChannelMap, ConversionPipeline, ConversionState,
+    ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
+    FfmpegCapabilities, RecordingType, TimecodeMetadata,
 };
+use gui_engine::video_codecs::{available_video_codecs, supported_video_codecs};
 use gui_engine::file_pattern::{match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::{self, FPS_OPTIONS};
@@ -58,7 +58,7 @@ fn update_converter_options(
         .iter().map(|(k, _)| SharedString::from(*k)).collect();
     ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(container_options)));
 
-    let video_options: Vec<SharedString> = available_video_encoders_for_container(container, caps)
+    let video_options: Vec<SharedString> = available_video_codecs(container, caps)
         .iter().map(|(k, _)| SharedString::from(*k)).collect();
     ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(video_options)));
 
@@ -98,7 +98,7 @@ fn _run_gui(
     let conv_selected_group_idx: Arc<Mutex<isize>> = Arc::new(Mutex::new(-1));
     let conv_channel_map: Arc<Mutex<ChannelMap>> = Arc::new(Mutex::new(ChannelMap::identity(0)));
     let conv_container: Arc<Mutex<String>> = Arc::new(Mutex::new("mkv".to_string()));
-    let conv_video_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("libsvtav1".to_string()));
+    let conv_video_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("av1".to_string()));
     let conv_audio_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("pcm_s24le".to_string()));
     let conv_output_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let conv_filename_prefix: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -190,7 +190,7 @@ fn _run_gui(
         let container_options: Vec<SharedString> = gui_engine::converter::supported_containers()
             .iter().map(|(key, _)| SharedString::from(*key)).collect();
         ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(container_options)));
-        let video_options: Vec<SharedString> = gui_engine::converter::supported_video_encoders()
+        let video_options: Vec<SharedString> = supported_video_codecs()
             .iter().map(|(key, _)| SharedString::from(*key)).collect();
         ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(video_options)));
         let audio_options: Vec<SharedString> = gui_engine::converter::supported_audio_encoders()
@@ -757,6 +757,7 @@ fn _run_gui(
         let audio_suffix_arc = conv_audio_suffix_template.clone();
         let video_suffix_arc = conv_video_suffix_template.clone();
         let pattern_arc2 = conv_selected_pattern.clone();
+        let caps_for_start = conv_ffmpeg_caps.clone();
         ui.on_conv_start(move || {
             let g = groups_data.lock().unwrap();
             let i = *idx.lock().unwrap();
@@ -828,6 +829,7 @@ fn _run_gui(
                 container: container.lock().unwrap().clone(),
                 video_encoder: venc.lock().unwrap().clone(),
                 audio_encoder: aenc.lock().unwrap().clone(),
+                resolved_video_encoder: String::new(),
                 output_folder: PathBuf::from(&folder_path),
                 filename_prefix,
                 audio_suffix_template: audio_suffix_val,
@@ -840,7 +842,8 @@ fn _run_gui(
             cancel.store(false, Ordering::Relaxed);
             let cs = state.clone();
             let cf = cancel.clone();
-            let h = spawn_conversion(settings, cs, cf);
+            let caps = caps_for_start.lock().unwrap().clone();
+            let h = spawn_conversion(settings, cs, cf, caps.as_ref());
             *handle.lock().unwrap() = Some(h);
         });
     }
@@ -931,13 +934,13 @@ fn _run_gui(
             if idx >= 0 && (idx as usize) < options.len() {
                 let key = options[idx as usize].0.to_string();
                 *container.lock().unwrap() = key.clone();
-                // Re-filter encoders for the new container
+                // Re-filter codecs/encoders for the new container
                 if let Some(ref c) = caps {
                     if c.has_ffmpeg {
-                        let vids: Vec<(&str, &str)> = available_video_encoders_for_container(&key, c);
+                        let codecs: Vec<(&str, &str)> = available_video_codecs(&key, c);
                         let auds: Vec<(&str, &str)> = available_audio_encoders_for_container(&key, c);
-                        if !vids.is_empty() {
-                            *venc_arc.lock().unwrap() = vids[0].0.to_string();
+                        if !codecs.is_empty() {
+                            *venc_arc.lock().unwrap() = codecs[0].0.to_string();
                         }
                         if !auds.is_empty() {
                             *aenc_arc.lock().unwrap() = auds[0].0.to_string();
@@ -961,9 +964,9 @@ fn _run_gui(
             let caps = caps_for_video.lock().unwrap().clone();
             let container = container_for_video.lock().unwrap().clone();
             let options: Vec<&str> = match caps {
-                Some(ref c) if c.has_ffmpeg => available_video_encoders_for_container(&container, c)
+                Some(ref c) if c.has_ffmpeg => available_video_codecs(&container, c)
                     .iter().map(|(k, _)| *k).collect(),
-                _ => gui_engine::converter::supported_video_encoders()
+                _ => supported_video_codecs()
                     .iter().map(|(k, _)| *k).collect(),
             };
             if idx >= 0 && (idx as usize) < options.len() {
