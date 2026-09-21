@@ -57,7 +57,7 @@ pub struct AppState {
     // Engine communication
     pub cmd_tx: Sender<GuiCommand>,
     engine_state: Arc<ArcSwap<AppStateSnapshot>>,
-    pub latest: AppStateSnapshot,
+    pub latest: Arc<AppStateSnapshot>,
 
     // Theme (derived from engine state each frame)
     pub theme: Theme,
@@ -134,6 +134,7 @@ impl AppState {
         F: Fn() -> FfmpegCapabilities + Send + 'static,
     {
         let initial = AppStateSnapshot::initial();
+        let is_dark = initial.is_dark_theme;
 
         // Restore last used converter folders from config
         let (selected_folder, file_groups, selected_group_idx, channel_map, recording_type, filename_prefix, naming_mode)
@@ -157,9 +158,9 @@ impl AppState {
 
         Self {
             cmd_tx,
-            latest: initial.clone(),
+            latest: Arc::new(initial),
             engine_state,
-            theme: if initial.is_dark_theme { Theme::Dark } else { Theme::Light },
+            theme: if is_dark { Theme::Dark } else { Theme::Light },
             active_tab: Tab::Clapper,
             show_faq: false,
             notifications: Vec::new(),
@@ -233,7 +234,7 @@ impl eframe::App for AppState {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 1. Sync latest state from engine
         let snapshot = self.engine_state.load();
-        self.latest = snapshot.as_ref().clone();
+        self.latest = Arc::clone(&snapshot);
 
         // 2. Derive trim offset from LTC result, auto-check split/drop
         if let Some(ref result) = self.latest.ltc_decode_result {
@@ -265,7 +266,7 @@ impl eframe::App for AppState {
         self.last_frame_time = Some(now);
 
         // 5. Process engine events into toasts
-        let events = std::mem::take(&mut self.latest.events);
+        let events = self.latest.events.clone();
         for evt in events {
             match evt {
                 AudioEvent::StreamError(msg) => {

@@ -295,14 +295,18 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                 .collect()
         };
 
+        // Clone cmd_tx before the UI closure to avoid borrowing `state`
+        // as a whole through method calls while `group` borrows `state.file_groups`.
+        let cmd_tx = state.cmd_tx.clone();
+
         // Ensure selected stream/channel is within range
         if is_video {
             let in_range = channel_options.iter().any(|o| {
                 o.stream == state.latest.ltc_selected_stream && o.channel == state.latest.ltc_selected_channel
             });
             if !in_range && !channel_options.is_empty() {
-                state.latest.ltc_selected_stream = channel_options[0].stream;
-                state.latest.ltc_selected_channel = channel_options[0].channel;
+                let _ = cmd_tx.send(GuiCommand::SetLtcDecodeStream(channel_options[0].stream));
+                let _ = cmd_tx.send(GuiCommand::SetLtcDecodeChannel(channel_options[0].channel));
             }
         } else {
             if state.ltc_file_idx >= channel_options.len() && !channel_options.is_empty() {
@@ -339,8 +343,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                             let is_sel = opt.stream == state.latest.ltc_selected_stream
                                 && opt.channel == state.latest.ltc_selected_channel;
                             if ui.selectable_label(is_sel, &opt.label).clicked() {
-                                state.latest.ltc_selected_stream = opt.stream;
-                                state.latest.ltc_selected_channel = opt.channel;
+                                let _ = cmd_tx.send(GuiCommand::SetLtcDecodeStream(opt.stream));
+                                let _ = cmd_tx.send(GuiCommand::SetLtcDecodeChannel(opt.channel));
                             }
                         }
                     } else {

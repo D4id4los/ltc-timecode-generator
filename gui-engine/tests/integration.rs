@@ -500,3 +500,30 @@ fn test_engine_reset_current_timecode() {
     assert_eq!(snapshot.current_timecode, snapshot.start_timecode);
     assert_eq!(snapshot.status_message, "Reset");
 }
+
+// ── LTC decode stream/channel selection ──────────────────────────────────
+
+#[test]
+fn test_engine_set_ltc_decode_stream() {
+    let snapshot = run_engine_with_command(GuiCommand::SetLtcDecodeStream(2), false);
+    assert_eq!(snapshot.ltc_selected_stream, 2);
+}
+
+#[test]
+fn test_engine_set_ltc_decode_channel() {
+    let snapshot = run_engine_with_command(GuiCommand::SetLtcDecodeChannel(3), false);
+    assert_eq!(snapshot.ltc_selected_channel, 3);
+}
+
+#[test]
+fn test_engine_set_ltc_decode_stream_and_channel() {
+    let snapshot = run_engine_with_commands(
+        vec![
+            GuiCommand::SetLtcDecodeStream(1),
+            GuiCommand::SetLtcDecodeChannel(2),
+        ],
+        false,
+    );
+    assert_eq!(snapshot.ltc_selected_stream, 1);
+    assert_eq!(snapshot.ltc_selected_channel, 2);
+}
