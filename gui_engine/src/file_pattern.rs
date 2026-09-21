@@ -31,31 +31,31 @@ pub static CAMERA_PATTERNS: &[FileNamingPattern] = &[
     FileNamingPattern {
         name: "Sony Handycam",
         description: "Sony Handycam — Cxxxx.MP4/MTS",
-        regex: r"^(C\d{4})\.(mp4|MP4|MTS|mts)$",
+        regex: r"^(.*C\d{4}.*)\.(mp4|MP4|MTS|mts|M4V|m4v|)$",
         channel_group_index: 0,
     },
     FileNamingPattern {
         name: "Sony FS100",
         description: "Sony FS100 — xxxxx.MTS",
-        regex: r"^(\d{5})\.(MTS|mts)$",
+        regex: r"^(.*\d{5}.*)\.(MTS|mts|M4V|m4v)$",
         channel_group_index: 0,
     },
     FileNamingPattern {
         name: "Canon",
         description: "Canon — MVI_xxxx.MP4",
-        regex: r"^(MVI_\d{4})\.(mp4|MP4)$",
+        regex: r"^(.*MVI_\d{4}.*)\.(mp4|MP4)$",
         channel_group_index: 0,
     },
     FileNamingPattern {
         name: "Panasonic",
         description: "Panasonic — GHxxxxx.MP4",
-        regex: r"^(GH\d{5})\.(mp4|MP4)$",
+        regex: r"^(.*GH\d{5}.*)\.(mp4|MP4)$",
         channel_group_index: 0,
     },
     FileNamingPattern {
         name: "GoPro",
         description: "GoPro — GOPRxxxx/GPxxxxxx.MP4",
-        regex: r"^(GOPR\d{4}|GP\d{6})\.(mp4|MP4)$",
+        regex: r"^(.*GOPR\d{4}|GP\d{6}.*)\.(mp4|MP4)$",
         channel_group_index: 0,
     },
 ];
