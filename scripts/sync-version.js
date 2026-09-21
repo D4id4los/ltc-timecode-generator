@@ -79,13 +79,13 @@ console.log('\nUpdating lock files...');
 run('npm install', '.');
 console.log('  ✓ package-lock.json');
 
-run('cargo generate-lockfile', '.');
+run('cargo update --workspace', '.');
 console.log('  ✓ Cargo.lock (workspace: audio-core + gui_engine + ltc-gui + ltc-slint)');
 
-run('cargo generate-lockfile --manifest-path src-tauri/Cargo.toml', '.');
+run('cargo update --workspace --manifest-path src-tauri/Cargo.toml', '.');
 console.log('  ✓ src-tauri/Cargo.lock');
 
-run('cargo generate-lockfile --manifest-path src-tauri-32bit/Cargo.toml', '.');
+run('cargo update --workspace --manifest-path src-tauri-32bit/Cargo.toml', '.');
 console.log('  ✓ src-tauri-32bit/Cargo.lock');
 
 // --- Stage all changed files for the npm version commit ---

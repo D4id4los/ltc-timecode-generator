@@ -257,7 +257,7 @@ npm version major    # 0.3.2 → 1.0.0
 
 The `"version"` npm lifecycle hook runs `scripts/sync-version.js` automatically during `npm version` — after bumping `package.json` but before the git commit and tag. The script:
 1. Propagates the version to `src-tauri/tauri.conf.json`, `src-tauri-32bit/tauri.conf.json`, and the `[package]` version in all six crate manifests: `audio-core/Cargo.toml`, `gui_engine/Cargo.toml`, `ltc-gui/Cargo.toml`, `ltc-slint/Cargo.toml`, `src-tauri/Cargo.toml`, `src-tauri-32bit/Cargo.toml`
-2. Updates `package-lock.json`, workspace `Cargo.lock` (covers all four workspace members), `src-tauri/Cargo.lock`, `src-tauri-32bit/Cargo.lock`
+2. Updates `package-lock.json`, workspace `Cargo.lock` (covers all four workspace members), `src-tauri/Cargo.lock`, `src-tauri-32bit/Cargo.lock` — lock files are synced with `cargo update --workspace`, which only re-locks the workspace/path-dep crate versions and never re-resolves third-party dependencies
 3. Stages all affected files with `git add` (they become part of the `npm version` commit)
 
 ### Manual sync (without bumping)
