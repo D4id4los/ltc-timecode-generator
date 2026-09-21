@@ -2,6 +2,7 @@ pub mod cli;
 pub mod command;
 pub mod converter;
 pub mod engine;
+pub mod ffprobe;
 pub mod file_pattern;
 pub mod log_buffer;
 pub mod state;
@@ -30,3 +31,6 @@ pub use converter::{
     TimecodeMetadata,
 };
 pub use file_pattern::{default_output_filename, match_files_to_groups, match_files_all_patterns, wrap_user_selected_files, FileNamingPattern, BUILTIN_PATTERNS, CAMERA_PATTERNS};
+
+// Re-export ffprobe types
+pub use ffprobe::{extract_audio_channel, path_is_video, probe_video_audio, AudioStreamInfo, VideoAudioProbe};

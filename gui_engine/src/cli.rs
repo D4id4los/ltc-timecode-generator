@@ -12,6 +12,7 @@ use clap::Parser;
 use log::{error, info, warn};
 
 use crate::command::GuiCommand;
+use crate::ffprobe;
 use crate::state::AppStateSnapshot;
 
 // ── Logger ──────────────────────────────────────────────────────────────
@@ -86,9 +87,20 @@ pub struct Cli {
     #[arg(long, short = 'd')]
     pub debug: bool,
 
-    /// Decode LTC from a WAV file and print results (implies headless)
+    /// Decode LTC from a WAV or video file and print results (implies headless).
+    /// Video files (mp4/mov/mkv/mts/mxf) are auto-detected: audio is extracted via
+    /// ffmpeg before decoding. Use --audio-stream and --audio-channel to select
+    /// which channel to decode from.
     #[arg(long)]
     pub decode: Option<String>,
+
+    /// Audio stream index within the video file (0-based, for --decode of video files)
+    #[arg(long, default_value_t = 0)]
+    pub audio_stream: usize,
+
+    /// Channel index within the selected audio stream (0-based, for --decode of video files)
+    #[arg(long, default_value_t = 0)]
+    pub audio_channel: usize,
 
     /// Decoder implementation: "builtin" (default) or "libltc"
     #[arg(long, default_value = "builtin", value_parser = clap::builder::PossibleValuesParser::new(["builtin", "libltc"]))]
@@ -512,37 +524,19 @@ pub fn parse_args() -> Cli {
 
 // ── LTC Decode mode ─────────────────────────────────────────────────────
 
-fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let path = cli
-        .decode
-        .as_ref()
-        .ok_or("--decode path required")?;
-    let use_libltc = cli.decoder == "libltc";
-
-    if cli.debug {
-        init_logger();
-    }
-
-    info!(
-        "Decoding LTC from '{}' with {} decoder at {:.2} fps{}",
-        path,
-        if use_libltc { "libltc" } else { "builtin" },
-        cli.decode_fps,
-        if cli.decode_drop_frame { " DF" } else { "" },
-    );
-
-    info!("Starting LTC decode (this may take a while for large files)...");
-
-    let result = if cli.single_pass {
-        info!("Using single-pass (non-chunked) decode");
-        eprintln!("Decoding (single-pass)...");
-        audio_core::decode_ltc_with_decoder(
-            Path::new(path), use_libltc, cli.decode_fps, cli.decode_drop_frame,
-        )?
+/// Run the actual decode on a WAV file (supports chunked or single-pass).
+fn run_decode_on_wav(
+    path: &Path,
+    use_libltc: bool,
+    single_pass: bool,
+    fps: f64,
+    drop_frame: bool,
+) -> Result<audio_core::LtcDetectionResult, String> {
+    if single_pass {
+        audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame)
     } else {
         let config = audio_core::DecodeConfig::default();
-        // Quick open to estimate chunk count
-        let chunk_count = match audio_core::WavChunkReader::open(Path::new(path)) {
+        let chunk_count = match audio_core::WavChunkReader::open(path) {
             Ok((reader, _)) => {
                 let total_mono = reader.total_mono_samples();
                 let sr = reader.sample_rate();
@@ -572,13 +566,8 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         if chunk_count <= 1 {
-            info!("Small file (1 chunk): using single-threaded decode");
-            eprintln!("Decoding (single-pass)...");
-            audio_core::decode_ltc_with_decoder(
-                Path::new(path), use_libltc, cli.decode_fps, cli.decode_drop_frame,
-            )?
+            audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame)
         } else {
-            eprint!("Decoding:   0%");
             let progress = audio_core::DecodeProgress::new(chunk_count);
             let completed_ref = progress.chunks_completed.clone();
             let total_chunks = chunk_count;
@@ -589,27 +578,30 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let done = completed_ref.load(std::sync::atomic::Ordering::Relaxed);
                     let pct = if total_chunks > 0 { (done * 100) / total_chunks } else { 100 };
                     eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
-                    if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline {
-                        break;
-                    }
+                    if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline { break; }
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             });
 
-            let result = audio_core::decode_ltc_chunked(
-                Path::new(path), use_libltc, cli.decode_fps, cli.decode_drop_frame,
-                config, &progress,
-            )?;
-
+            let result = audio_core::decode_ltc_chunked(path, use_libltc, fps, drop_frame, config, &progress)?;
             let _ = progress_handle.join();
             eprintln!("\rDecoding: 100%  (chunk {}/{})", total_chunks, total_chunks);
-            result
+            Ok(result)
         }
-    };
+    }
+}
 
+fn print_decode_results(
+    path: &Path,
+    result: &audio_core::LtcDetectionResult,
+    use_libltc: bool,
+    verbose: bool,
+    context_frames: u32,
+    list_timecodes: bool,
+) {
     println!();
     println!("=== LTC Decode Results ===");
-    println!("  File:          {}", path);
+    println!("  File:          {}", path.display());
     println!("  Decoder:       {}", if use_libltc { "libltc (C library)" } else { "builtin (Rust)" });
     println!("  Status:        {:?}", result.status);
     println!("  Sample rate:   {} Hz", result.sample_rate);
@@ -632,9 +624,7 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             last.timecode.seconds, last.timecode.frames);
     }
 
-    for detail in &result.details {
-        println!("  {}", detail);
-    }
+    for detail in &result.details { println!("  {}", detail); }
 
     if let Some(ref q) = result.quality {
         println!();
@@ -646,12 +636,11 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("  Summary:      {}", q.summary);
     }
 
-    if cli.verbose {
+    if verbose {
         if let Some(ref q) = result.quality {
-            let ctx = cli.context_frames as usize;
+            let ctx = context_frames as usize;
             let tc = &result.timecodes;
             let fps = result.detected_fps as f64;
-            let frame_duration = 1.0 / fps;
             let tc_to_secs = |ft: &audio_core::FrameTimecode| -> f64 {
                 ft.timecode.hours as f64 * 3600.0
                     + ft.timecode.minutes as f64 * 60.0
@@ -665,87 +654,76 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("=== Verbose Quality Report ===");
 
                 if !q.gap_edges.is_empty() {
-                    println!();
                     for (gi, &(prev_last, next_first)) in q.gap_edges.iter().enumerate() {
+                        println!();
                         println!("--- Gap {} ---", gi + 1);
                         let pre_start = prev_last.saturating_sub(ctx) + 1;
                         for j in pre_start..=prev_last {
                             let ft = &tc[j];
-                            println!(
-                                "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
-                                ft.frame_index, ft.timecode.hours,
-                                ft.timecode.minutes, ft.timecode.seconds,
-                                ft.timecode.frames, ft.timecode_secs,
-                            );
+                            println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
+                                ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         }
-                        let missing = ((tc_to_secs(&tc[next_first]) - tc_to_secs(&tc[prev_last]) - frame_duration) / frame_duration).round() as u32;
+                        let missing = ((tc_to_secs(&tc[next_first]) - tc_to_secs(&tc[prev_last]) - 1.0 / fps) / (1.0 / fps)).round() as u32;
                         println!("  ---- GAP ({} missing frame(s)) ----", missing);
                         let post_end = (next_first + ctx).min(tc.len());
                         for j in next_first..post_end {
                             let ft = &tc[j];
-                            println!(
-                                "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
-                                ft.frame_index, ft.timecode.hours,
-                                ft.timecode.minutes, ft.timecode.seconds,
-                                ft.timecode.frames, ft.timecode_secs,
-                            );
+                            println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
+                                ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         }
-                        println!();
                     }
                 }
 
                 if !q.glitch_indices.is_empty() {
                     for (gi, &idx) in q.glitch_indices.iter().enumerate() {
+                        println!();
                         println!("--- Glitch {} ---", gi + 1);
                         let pre_start = idx.saturating_sub(ctx);
                         for j in pre_start..idx {
                             let ft = &tc[j];
-                            println!(
-                                "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
-                                ft.frame_index, ft.timecode.hours,
-                                ft.timecode.minutes, ft.timecode.seconds,
-                                ft.timecode.frames, ft.timecode_secs,
-                            );
+                            println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
+                                ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         }
                         let ft = &tc[idx];
-                        println!(
-                            "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)  <<< GLITCH",
-                            ft.frame_index, ft.timecode.hours,
-                            ft.timecode.minutes, ft.timecode.seconds,
-                            ft.timecode.frames, ft.timecode_secs,
-                        );
+                        println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)  <<< GLITCH", ft.frame_index,
+                            ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         let post_end = (idx + 1 + ctx).min(tc.len());
                         for j in (idx + 1)..post_end {
                             let ft = &tc[j];
-                            println!(
-                                "  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
-                                ft.frame_index, ft.timecode.hours,
-                                ft.timecode.minutes, ft.timecode.seconds,
-                                ft.timecode.frames, ft.timecode_secs,
-                            );
+                            println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
+                                ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         }
-                        println!();
                     }
                 }
             }
         }
     }
 
-    if cli.list_timecodes {
+    if list_timecodes {
         println!("\n=== Decoded Timecodes ===");
         for ft in &result.timecodes {
             let sep = if result.drop_frame { ";" } else { ":" };
-            println!(
-                "  [{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  ({:.3}s)",
-                ft.frame_index,
-                ft.timecode.hours, ft.timecode.minutes,
-                ft.timecode.seconds, ft.timecode.frames,
-                ft.timecode_secs,
-            );
+            println!("  [{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  ({:.3}s)",
+                ft.frame_index, ft.timecode.hours, ft.timecode.minutes,
+                ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
         }
     }
-
     println!();
+}
+
+fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let path = cli.decode.as_ref().ok_or("--decode path required")?;
+    let path = Path::new(path);
+    let use_libltc = cli.decoder == "libltc";
+
+    if cli.debug { init_logger(); }
+
+    info!("Decoding LTC from '{}' with {} decoder at {:.2} fps{}",
+        path.display(), if use_libltc { "libltc" } else { "builtin" },
+        cli.decode_fps, if cli.decode_drop_frame { " DF" } else { "" });
+
+    let result = run_decode_on_wav(path, use_libltc, cli.single_pass, cli.decode_fps, cli.decode_drop_frame)?;
+    print_decode_results(path, &result, use_libltc, cli.verbose, cli.context_frames, cli.list_timecodes);
 
     Ok(())
 }
@@ -762,15 +740,107 @@ pub enum CliOutcome {
     },
 }
 
+fn run_decode_video(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let path = cli.decode.as_ref().ok_or("--decode path required")?;
+    let path = Path::new(path);
+
+    let use_libltc = cli.decoder == "libltc";
+
+    if cli.debug {
+        init_logger();
+    }
+
+    info!(
+        "Decoding LTC from video '{}' (stream={}, channel={}) with {} decoder at {:.2} fps{}",
+        path.display(),
+        cli.audio_stream,
+        cli.audio_channel,
+        if use_libltc { "libltc" } else { "builtin" },
+        cli.decode_fps,
+        if cli.decode_drop_frame { " DF" } else { "" },
+    );
+
+    // Probe the video file to validate it has audio streams
+    let probe = ffprobe::probe_video_audio(path)
+        .map_err(|e| format!("Failed to probe video: {}", e))?;
+
+    let stream_idx = cli.audio_stream;
+    let channel_idx = cli.audio_channel;
+
+    // Validate stream/channel indices
+    if stream_idx >= probe.streams.len() {
+        return Err(format!(
+            "Audio stream index {} out of range ({} streams available). Use --audio-stream to select.",
+            stream_idx,
+            probe.streams.len(),
+        ).into());
+    }
+    let stream = &probe.streams[stream_idx];
+    if channel_idx >= stream.channels {
+        return Err(format!(
+            "Channel index {} out of range for stream {} ({} channels available). Use --audio-channel to select.",
+            channel_idx,
+            stream_idx,
+            stream.channels,
+        ).into());
+    }
+
+    info!(
+        "Probed video: {} streams, streaming stream {} ({} ch) channel {} ({})",
+        probe.streams.len(),
+        stream_idx,
+        stream.channels,
+        channel_idx,
+        stream.codec_name,
+    );
+
+    // Extract audio channel to temp WAV
+    let tmp_dir = std::env::temp_dir();
+    let tmp_wav = tmp_dir.join(format!(
+        "ltc_extract_{}_{}_{}.wav",
+        std::process::id(),
+        stream_idx,
+        channel_idx,
+    ));
+
+    info!("Extracting audio stream {} channel {} to temp WAV...", stream_idx, channel_idx);
+    eprint!("Extracting audio from video...");
+    ffprobe::extract_audio_channel(path, stream_idx, channel_idx, &tmp_wav)
+        .map_err(|e| format!("Audio extraction failed: {}", e))?;
+    eprintln!(" done.");
+
+    let result = run_decode_on_wav(
+        &tmp_wav, use_libltc, cli.single_pass, cli.decode_fps, cli.decode_drop_frame,
+    )?;
+    print_decode_results(
+        path, &result, use_libltc, cli.verbose, cli.context_frames, cli.list_timecodes,
+    );
+
+    let _ = std::fs::remove_file(&tmp_wav);
+
+    Ok(())
+}
+
 pub fn process_cli(cli: Cli) -> CliOutcome {
     if cli.list_devices {
         list_devices_and_exit();
     }
 
-    if cli.decode.is_some() {
-        if let Err(e) = run_decode(cli) {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
+    if let Some(ref path_str) = cli.decode {
+        let path = Path::new(path_str);
+
+        if ffprobe::path_is_video(path) {
+            // Video file: use ffmpeg extraction
+            if let Err(e) = run_decode_video(cli) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        } else {
+            // WAV file (or unknown): try WAV decode
+            if let Err(e) = run_decode(cli) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
         return CliOutcome::Done;
     }
@@ -965,7 +1035,8 @@ mod tests {
             channel: "left".into(), volume: 0.25,
             sample_rate: None, duration: None,
             output_to_file: None, verbose: false, debug: false,
-            decode: None, decoder: "builtin".into(),
+            decode: None, audio_stream: 0, audio_channel: 0,
+            decoder: "builtin".into(),
             decode_fps: 25.0, decode_drop_frame: false,
             single_pass: false,
             context_frames: 3,

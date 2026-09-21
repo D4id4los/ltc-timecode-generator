@@ -48,6 +48,13 @@ export component ConverterSection {
     in-out property <[string]> decode-fps-options: [];
     in-out property <int> decode-fps-index: 1;
     in-out property <float> ltc-decode-progress: 0.0;
+
+    // Video audio probe (streams + channels)
+    in-out property <[string]> ltc-channel-names: [];
+    in-out property <int> ltc-selected-stream: 0;
+    in-out property <int> ltc-selected-channel: 0;
+    callback channel-selected(int);
+
     callback detect-ltc;
     callback decode-fps-selected(int);
     callback cancel-decode;
@@ -185,8 +192,8 @@ export component ConverterSection {
                         text: "Select a file and click Detect to verify LTC timecode is readable.";
                         color: AppColors.text-muted; font-size: 9px; wrap: word-wrap;
                     }
-                    HorizontalLayout { spacing: 6px;
-                        // File selector
+                    HorizontalLayout { spacing: 4px;
+                        // File/track selector
                         Rectangle {
                             border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                             background: AppColors.deep-bg; min-height: 28px;
@@ -206,6 +213,29 @@ export component ConverterSection {
                                         ? "Track " + (root.ltc-file-idx + 1)
                                         : root.ltc-file-names[root.ltc-file-idx])
                                     : "(no files)";
+                                color: AppColors.text-title; font-size: 10px; font-family: "monospace";
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        // Channel selector (shown for video when probe data is available)
+                        if (root.is-video-recording && root.ltc-channel-names.length > 0) : Rectangle {
+                            border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
+                            background: AppColors.deep-bg; min-height: 28px; max-width: 80px;
+                            TouchArea {
+                                clicked => {
+                                    if (root.ltc-selected-channel + 1 < root.ltc-channel-names.length) {
+                                        root.ltc-selected-channel += 1;
+                                        root.channel-selected(root.ltc-selected-channel);
+                                    } else {
+                                        root.ltc-selected-channel = 0;
+                                        root.channel-selected(0);
+                                    }
+                                }
+                            }
+                            Text {
+                                text: root.ltc-channel-names.length > 0
+                                    ? root.ltc-channel-names[root.ltc-selected-channel]
+                                    : "(ch)";
                                 color: AppColors.text-title; font-size: 10px; font-family: "monospace";
                                 horizontal-alignment: center; vertical-alignment: center;
                             }

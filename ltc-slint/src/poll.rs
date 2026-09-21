@@ -145,6 +145,25 @@ pub fn setup_poll_timer(
                 }
             }
 
+            // Sync video audio probe info
+            if let Some(ref probe) = s.ltc_probe {
+                let channel_names: Vec<SharedString> = probe
+                    .streams
+                    .iter()
+                    .flat_map(|s_info| {
+                        (0..s_info.channels).map(move |ch| {
+                            let label = if probe.streams.len() > 1 {
+                                format!("Stream {} Ch {}", s_info.stream_index + 1, ch + 1)
+                            } else {
+                                format!("Ch {}", ch + 1)
+                            };
+                            SharedString::from(label)
+                        })
+                    })
+                    .collect();
+                ui.set_ltc_channel_names(ModelRc::new(VecModel::from(channel_names)));
+            }
+
             // Sync decode progress every tick during active detection
             if s.ltc_is_detecting {
                 ui.set_ltc_decode_progress(s.ltc_decode_progress_pct);

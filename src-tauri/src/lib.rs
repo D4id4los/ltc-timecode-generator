@@ -133,25 +133,33 @@ fn detect_ltc_in_file(path: String, fps: f64, drop_frame: bool) -> Result<LtcDet
 }
 
 #[tauri::command]
-fn detect_ltc_in_video(path: String, track_index: usize, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
+fn detect_ltc_in_video(
+    path: String,
+    stream_index: usize,
+    channel_index: usize,
+    fps: f64,
+    drop_frame: bool,
+) -> Result<LtcDetectionResult, String> {
     let video_path = Path::new(&path);
     if !video_path.exists() {
         return Err(format!("Video file not found: {}", path));
     }
 
-    // Create a temporary WAV file for the extracted audio track
     let tmp_dir = std::env::temp_dir();
-    let tmp_wav = tmp_dir.join(format!("ltc_extract_{}.wav", std::process::id()));
+    let tmp_wav = tmp_dir.join(format!(
+        "ltc_extract_{}_{}_{}.wav",
+        std::process::id(),
+        stream_index,
+        channel_index,
+    ));
 
-    // Use ffmpeg to extract audio: select the specified channel from the first audio stream
-    // Map: 0:a:0 (first audio stream), then use pan filter to select the channel
-    let channel_filter = format!("pan=mono|FC=c{}", track_index);
+    let channel_filter = format!("pan=mono|FC=c{}", channel_index);
 
     let output = std::process::Command::new("ffmpeg")
         .args(&[
             "-y",
             "-i", &path,
-            "-map", "0:a:0",
+            "-map", &format!("0:a:{}", stream_index),
             "-af", &channel_filter,
             "-c:a", "pcm_s24le",
             "-f", "wav",
@@ -164,16 +172,20 @@ fn detect_ltc_in_video(path: String, track_index: usize, fps: f64, drop_frame: b
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp_wav);
-        return Err(format!("ffmpeg audio extraction failed for track {} in {}", track_index + 1, path));
+        return Err(format!(
+            "ffmpeg audio extraction failed: stream {} channel {} in {}",
+            stream_index, channel_index, path
+        ));
     }
 
-    // Run LTC decode on the extracted WAV
     let result = audio_core::decode_ltc_from_wav(&tmp_wav, fps, drop_frame);
-
-    // Clean up temp file
     let _ = std::fs::remove_file(&tmp_wav);
-
     result
+}
+
+#[tauri::command]
+fn probe_video_audio(path: String) -> Result<gui_engine::ffprobe::VideoAudioProbe, String> {
+    gui_engine::ffprobe::probe_video_audio(Path::new(&path))
 }
 
 // ── Converter commands ─────────────────────────────────────────────────────
@@ -319,6 +331,12 @@ fn start_convert(
         vec![None; input_files.len()]
     };
 
+    let trim_offsets = if request.trim_offsets_secs.is_empty() {
+        vec![0.0; input_files.len()]
+    } else {
+        request.trim_offsets_secs
+    };
+
     let settings = ConverterSettings {
         pipeline,
         input_files,
@@ -335,11 +353,7 @@ fn start_convert(
         audio_suffix_template: request.audio_suffix_template,
         video_suffix_template: request.video_suffix_template,
         trim_to_first_ltc: request.trim_to_first_ltc,
-        trim_offsets_secs: if request.trim_offsets_secs.is_empty() {
-            vec![0.0; input_files.len()]
-        } else {
-            request.trim_offsets_secs
-        },
+        trim_offsets_secs: trim_offsets,
         timecode_meta_per_file,
     };
 
@@ -458,6 +472,7 @@ pub fn run() {
             check_ffmpeg,
             detect_ltc_in_file,
             detect_ltc_in_video,
+            probe_video_audio,
             start_convert,
             get_conversion_progress,
             cancel_conversion,

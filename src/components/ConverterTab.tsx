@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from "react";
+import React, { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isTauri } from "../utils/audioBackend";
@@ -72,6 +72,20 @@ interface ConversionProgressInfo {
   status: string;
   progress: number;
   log: string;
+}
+
+// ── Audio probe types ──────────────────────────────────────────────────────────
+
+interface AudioStreamInfo {
+  stream_index: number;
+  channels: number;
+  codec_name: string;
+}
+
+interface VideoAudioProbe {
+  streams: AudioStreamInfo[];
+  total_audio_channels: number;
+  is_video_file: boolean;
 }
 
 // ── LTC detection types ──────────────────────────────────────────────────────
@@ -276,6 +290,11 @@ function TauriConverter() {
   const [ltcDetecting, setLtcDetecting] = useState(false);
   const [decodeFpsIdx, setDecodeFpsIdx] = useState(1);
 
+  // Video audio probe (streams + channels within each stream)
+  const [videoAudioInfo, setVideoAudioInfo] = useState<{ streams: AudioStreamInfo[]; total_audio_channels: number } | null>(null);
+  const [selectedStream, setSelectedStream] = useState(0);
+  const [selectedChannel, setSelectedChannel] = useState(0);
+
   const DECODE_FPS_OPTIONS = [
     { id: "24", name: "24 fps", fps: 24, dropFrame: false },
     { id: "25", name: "25 fps", fps: 25, dropFrame: false },
@@ -457,8 +476,26 @@ function TauriConverter() {
       setGenerateSyntheticVideo(false);
       setLtcResult(null);
       setLtcError(null);
+      setVideoAudioInfo(null);
+      setSelectedStream(0);
+      setSelectedChannel(0);
+
+      // If video, probe audio streams
+      if (group.recording_type === "VideoClipSequence" && n > 0) {
+        const folder = selectedFolder.endsWith("/") ? selectedFolder : selectedFolder + "/";
+        const videoPath = `${folder}${group.files[0]}`;
+        (async () => {
+          try {
+            const probe = await invoke<VideoAudioProbe>("probe_video_audio", { path: videoPath });
+            setVideoAudioInfo(probe);
+          } catch (e) {
+            console.warn("Failed to probe video audio:", e);
+            setVideoAudioInfo(null);
+          }
+        })();
+      }
     },
-    [fileGroups]
+    [fileGroups, selectedFolder]
   );
 
   // Channel matrix: swap on click
@@ -476,6 +513,23 @@ function TauriConverter() {
     []
   );
 
+  // Build channel options from probe data (for video) or from file list (for audio)
+  const channelOptions = useMemo(() => {
+    if (isVideo && videoAudioInfo) {
+      const opts: { stream: number; channel: number; label: string }[] = [];
+      for (const s of videoAudioInfo.streams) {
+        for (let ch = 0; ch < s.channels; ch++) {
+          const label = videoAudioInfo.streams.length > 1
+            ? `Stream ${s.stream_index + 1} Ch ${ch + 1}`
+            : `Track 1 ${ch === 0 ? 'L' : 'R'}`;
+          opts.push({ stream: s.stream_index, channel: ch, label });
+        }
+      }
+      return opts;
+    }
+    return [];
+  }, [isVideo, videoAudioInfo]);
+
   // LTC detection
   const handleDetectLtc = useCallback(async () => {
     if (selectedGroupIdx < 0) return;
@@ -492,7 +546,8 @@ function TauriConverter() {
       const result = isVideo
         ? await invoke<LtcDetectionResult>("detect_ltc_in_video", {
             path: filePath,
-            trackIndex: ltcFileIdx,
+            streamIndex: selectedStream,
+            channelIndex: selectedChannel,
             fps: opt.fps,
             dropFrame: opt.dropFrame,
           })
@@ -507,7 +562,7 @@ function TauriConverter() {
     } finally {
       setLtcDetecting(false);
     }
-  }, [selectedGroupIdx, fileGroups, ltcFileIdx, selectedFolder, decodeFpsIdx, isVideo]);
+  }, [selectedGroupIdx, fileGroups, ltcFileIdx, selectedFolder, decodeFpsIdx, isVideo, selectedStream, selectedChannel]);
 
   // Start conversion
   const handleStartConvert = useCallback(async () => {
@@ -696,19 +751,33 @@ function TauriConverter() {
 
           <div className="flex items-center gap-2 mb-3">
             <select
-              value={ltcFileIdx}
+              value={isVideo && videoAudioInfo ? `s${selectedStream}c${selectedChannel}` : String(ltcFileIdx)}
               onChange={(e) => {
-                setLtcFileIdx(Number(e.target.value));
+                const val = e.target.value;
+                if (isVideo && videoAudioInfo && val.startsWith('s')) {
+                  const parts = val.slice(1).split('c');
+                  setSelectedStream(Number(parts[0]));
+                  setSelectedChannel(Number(parts[1]));
+                } else {
+                  setLtcFileIdx(Number(val));
+                }
                 setLtcResult(null);
                 setLtcError(null);
               }}
               className="flex-1 px-3 py-2 bg-card-bg border border-border-main rounded-lg text-sm text-text-title font-mono focus:outline-none focus:border-[#FF5F1F]"
             >
-              {fileGroups[selectedGroupIdx].files.map((_, i) => (
-                <option key={i} value={i}>
-                  {isVideo ? `Track ${i + 1} (channel ${i + 1})` : fileGroups[selectedGroupIdx].files[i]}
-                </option>
-              ))}
+              {isVideo && videoAudioInfo
+                ? channelOptions.map((opt, i) => (
+                    <option key={i} value={`s${opt.stream}c${opt.channel}`}>
+                      {opt.label}
+                    </option>
+                  ))
+                : fileGroups[selectedGroupIdx].files.map((file, i) => (
+                    <option key={i} value={i}>
+                      {file}
+                    </option>
+                  ))
+              }
             </select>
             <div className="flex gap-1">
               {DECODE_FPS_OPTIONS.map((opt, i) => (

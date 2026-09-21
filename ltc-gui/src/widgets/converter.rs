@@ -119,11 +119,13 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
     });
 
     // File group selector (shows all matched groups with type badge)
-    if let Some(groups) = &state.file_groups {
+    let groups_clone = state.file_groups.clone();
+    if let Some(ref groups) = groups_clone {
         if groups.is_empty() {
             ui.label(RichText::new("No files matching any known pattern were found in this folder.")
                 .font(FontId::proportional(10.0)).color(colors.error_red));
         } else {
+            let mut probe_fn: Option<String> = None;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Recording:").font(FontId::proportional(10.0)).color(colors.text_muted));
                 let selected_text = state
@@ -162,10 +164,19 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                                 state.split_tracks = false;
                                 state.drop_ltc_track = false;
                                 state.per_file_trim_offsets = vec![0.0; num_ch];
+                                state.ltc_file_idx = 0;
+
+                                // Schedule probe for video files
+                                if group.recording_type == RecordingType::VideoClipSequence && !group.files.is_empty() {
+                                    probe_fn = Some(group.files[0].to_string_lossy().to_string());
+                                }
                             }
                         }
                     });
             });
+            if let Some(path) = probe_fn {
+                state.send(GuiCommand::ProbeVideo(path));
+            }
 
             if let Some(idx) = state.selected_group_idx {
                 if let Some(group) = groups.get(idx) {
@@ -221,33 +232,108 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
         }
 
         let is_video = state.recording_type == RecordingType::VideoClipSequence;
-        let track_label = if is_video { "Track" } else { "File" };
 
-        // ── Row 1: Track selection ──
+        // Build channel options from probe (for video) or file list (for audio)
+        struct ChannelOption {
+            stream: usize,
+            channel: usize,
+            label: String,
+        }
+
+        let channel_options: Vec<ChannelOption> = if is_video {
+            if let Some(ref probe) = state.latest.ltc_probe {
+                probe
+                    .streams
+                    .iter()
+                    .flat_map(|s| {
+                        (0..s.channels).map(move |ch| {
+                            let label = if probe.streams.len() > 1 {
+                                format!("Stream {} Ch {}", s.stream_index + 1, ch + 1)
+                            } else {
+                                format!("Track 1 {}", if ch == 0 { "L" } else { "R" })
+                            };
+                            ChannelOption {
+                                stream: s.stream_index,
+                                channel: ch,
+                                label,
+                            }
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![ChannelOption {
+                    stream: 0,
+                    channel: 0,
+                    label: "Probing…".to_string(),
+                }]
+            }
+        } else {
+            group
+                .unwrap()
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| ChannelOption {
+                    stream: i,
+                    channel: 0,
+                    label: f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string(),
+                })
+                .collect()
+        };
+
+        // Ensure selected stream/channel is within range
+        if is_video {
+            let in_range = channel_options.iter().any(|o| {
+                o.stream == state.latest.ltc_selected_stream && o.channel == state.latest.ltc_selected_channel
+            });
+            if !in_range && !channel_options.is_empty() {
+                state.latest.ltc_selected_stream = channel_options[0].stream;
+                state.latest.ltc_selected_channel = channel_options[0].channel;
+            }
+        } else {
+            if state.ltc_file_idx >= channel_options.len() && !channel_options.is_empty() {
+                state.ltc_file_idx = channel_options.len().saturating_sub(1);
+            }
+        }
+
+        // ── Row 1: Track/channel selection ──
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{}:", track_label)).font(FontId::proportional(10.0)).color(colors.text_muted));
+            ui.label(RichText::new("Source:").font(FontId::proportional(10.0)).color(colors.text_muted));
+
+            let current_label = if is_video {
+                channel_options
+                    .iter()
+                    .find(|o| {
+                        o.stream == state.latest.ltc_selected_stream
+                            && o.channel == state.latest.ltc_selected_channel
+                    })
+                    .map(|o| o.label.clone())
+                    .unwrap_or_else(|| "Select…".to_string())
+            } else {
+                channel_options
+                    .get(state.ltc_file_idx)
+                    .map(|o| o.label.clone())
+                    .unwrap_or_else(|| "Select…".to_string())
+            };
+
             egui::ComboBox::from_id_salt("ltc_file_combo")
-                .selected_text(format!(
-                    "{} {}",
-                    track_label,
-                    if is_video { format!("{}", state.ltc_file_idx + 1) } else {
-                        group.unwrap().files[state.ltc_file_idx]
-                            .file_name().and_then(|s| s.to_str()).unwrap_or("?")
-                            .to_string()
-                    }
-                ))
+                .selected_text(&current_label)
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
-                    for i in 0..file_count {
-                        let name = if is_video {
-                            format!("Track {} (channel {})", i + 1, i + 1)
-                        } else {
-                            group.unwrap().files[i]
-                                .file_name().and_then(|s| s.to_str()).unwrap_or("?")
-                                .to_string()
-                        };
-                        if ui.selectable_label(false, &name).clicked() {
-                            state.ltc_file_idx = i;
+                    if is_video {
+                        for opt in &channel_options {
+                            let is_sel = opt.stream == state.latest.ltc_selected_stream
+                                && opt.channel == state.latest.ltc_selected_channel;
+                            if ui.selectable_label(is_sel, &opt.label).clicked() {
+                                state.latest.ltc_selected_stream = opt.stream;
+                                state.latest.ltc_selected_channel = opt.channel;
+                            }
+                        }
+                    } else {
+                        for (i, opt) in channel_options.iter().enumerate() {
+                            if ui.selectable_label(i == state.ltc_file_idx, &opt.label).clicked() {
+                                state.ltc_file_idx = i;
+                            }
                         }
                     }
                 });
@@ -288,11 +374,22 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                     state.send(GuiCommand::CancelDecode);
                 }
             } else {
-                let file_path = group.unwrap().files[state.ltc_file_idx].to_string_lossy().to_string();
-                if ui.add(egui::Button::new(RichText::new("🔍 Detect LTC").font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
-                    .fill(ACCENT).min_size(egui::vec2(100.0, 24.0))).clicked()
-                {
-                    state.send(GuiCommand::ParseLtcFile(file_path));
+                if is_video {
+                    let file_path = group.unwrap().files[0].to_string_lossy().to_string();
+                    let stream_idx = state.latest.ltc_selected_stream;
+                    let channel_idx = state.latest.ltc_selected_channel;
+                    if ui.add(egui::Button::new(RichText::new("🔍 Detect LTC").font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
+                        .fill(ACCENT).min_size(egui::vec2(100.0, 24.0))).clicked()
+                    {
+                        state.send(GuiCommand::ParseLtcVideo(file_path, stream_idx, channel_idx));
+                    }
+                } else {
+                    let file_path = group.unwrap().files[state.ltc_file_idx].to_string_lossy().to_string();
+                    if ui.add(egui::Button::new(RichText::new("🔍 Detect LTC").font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
+                        .fill(ACCENT).min_size(egui::vec2(100.0, 24.0))).clicked()
+                    {
+                        state.send(GuiCommand::ParseLtcWavFile(file_path));
+                    }
                 }
             }
         });

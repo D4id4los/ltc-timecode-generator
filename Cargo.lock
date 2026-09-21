@@ -2411,6 +2411,7 @@ dependencies = [
  "log",
  "regex",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

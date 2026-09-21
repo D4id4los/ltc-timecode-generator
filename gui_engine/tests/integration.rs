@@ -29,7 +29,7 @@ fn make_wav_cli(path: &Path, fps: f64, drop_frame: bool, duration: f64, sample_r
         drop_frame,
         verbose: false,
         debug: false,
-        decode: None,
+        decode: None, audio_stream: 0, audio_channel: 0,
         decoder: "builtin".to_string(),
         decode_fps: fps,
         decode_drop_frame: drop_frame,
@@ -149,7 +149,7 @@ fn test_wav_roundtrip_44khz() {
         "expected no Error at 44kHz, got {:?}", result.status);
 }
 
-// ── Engine MPSC: ParseLtcFile ───────────────────────────────────────────
+// ── Engine MPSC: ParseLtcWavFile ────────────────────────────────────────
 
 #[test]
 fn test_engine_mpsc_parse_ltc_command() {
@@ -158,7 +158,7 @@ fn test_engine_mpsc_parse_ltc_command() {
     generate_wav(&path, 25.0, false, 1.0, 48000);
 
     let snapshot = run_engine_with_command(
-        GuiCommand::ParseLtcFile(path.to_string_lossy().to_string()),
+        GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string()),
         false,
     );
 
@@ -175,7 +175,7 @@ fn test_engine_mpsc_parse_ltc_command() {
 #[test]
 fn test_engine_mpsc_parse_invalid_file() {
     let snapshot = run_engine_with_command(
-        GuiCommand::ParseLtcFile("/tmp/nonexistent_ltc_test_file.wav".to_string()),
+        GuiCommand::ParseLtcWavFile("/tmp/nonexistent_ltc_test_file.wav".to_string()),
         false,
     );
 
@@ -393,7 +393,7 @@ fn test_engine_decode_generation_increments() {
     generate_wav(&path, 25.0, false, 1.0, 48000);
 
     let snapshot = run_engine_with_command(
-        GuiCommand::ParseLtcFile(path.to_string_lossy().to_string()),
+        GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string()),
         false,
     );
 
@@ -405,7 +405,7 @@ fn test_engine_decode_generation_increments() {
 #[test]
 fn test_engine_decode_error_on_nonexistent_file() {
     let snapshot = run_engine_with_command(
-        GuiCommand::ParseLtcFile("/tmp/definitely_not_a_real_ltc_file.wav".to_string()),
+        GuiCommand::ParseLtcWavFile("/tmp/definitely_not_a_real_ltc_file.wav".to_string()),
         false,
     );
 

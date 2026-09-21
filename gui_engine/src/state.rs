@@ -1,3 +1,4 @@
+use crate::ffprobe::VideoAudioProbe;
 use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
 
 // ── Clap log entry ──────────────────────────────────────────────────────
@@ -77,6 +78,12 @@ pub struct AppStateSnapshot {
     pub ltc_is_detecting: bool,
     pub ltc_decode_generation: u64,
 
+    // Video file probe info (populated by ProbeVideo command)
+    pub ltc_probe: Option<VideoAudioProbe>,
+    pub ltc_selected_stream: usize,
+    pub ltc_selected_channel: usize,
+    pub ltc_decode_is_video: bool,
+
     // Chunked decode progress
     pub ltc_decode_progress_pct: f32,       // 0.0..1.0
     pub ltc_decode_progress_str: String,    // "Chunk 3/12..."
@@ -140,6 +147,10 @@ impl AppStateSnapshot {
             ltc_decode_error: None,
             ltc_is_detecting: false,
             ltc_decode_generation: 0,
+            ltc_probe: None,
+            ltc_selected_stream: 0,
+            ltc_selected_channel: 0,
+            ltc_decode_is_video: false,
             ltc_decode_progress_pct: 0.0,
             ltc_decode_progress_str: String::new(),
         }

@@ -41,8 +41,16 @@ pub enum GuiCommand {
     // ── Decode FPS ──────────────────────────────────────────────────────
     SetDecodeFpsIndex(usize),
 
-    // ── Parsing / shutdown ──────────────────────────────────────────────
-    ParseLtcFile(String),
+    // ── LTC decode (WAV) ───────────────────────────────────────────────
+    ParseLtcWavFile(String),
+
+    // ── LTC decode (video) ─────────────────────────────────────────────
+    ProbeVideo(String),
+    ParseLtcVideo(String, usize, usize),
+    SetLtcDecodeStream(usize),
+    SetLtcDecodeChannel(usize),
+
+    // ── Shutdown ────────────────────────────────────────────────────────
     CancelDecode,
     Shutdown,
 

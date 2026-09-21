@@ -626,6 +626,7 @@ fn _run_gui(
         let split_arc = conv_split_tracks.clone();
         let drop_arc = conv_drop_ltc_track.clone();
         let folder_for_group = conv_folder_for_group.clone();
+        let cmd_group = cmd_tx.clone();
         ui.on_conv_select_group(move |group_idx| {
             let g = groups.lock().unwrap();
             let keys: Vec<String> = g.keys().cloned().collect();
@@ -648,14 +649,28 @@ fn _run_gui(
                     u.set_conv_selected_group_idx(group_idx);
                     u.set_conv_num_channels(n as i32);
                     u.set_conv_is_video_recording(is_video);
+                    u.set_ltc_selected_stream(0);
+                    u.set_ltc_selected_channel(0);
+                    u.set_ltc_channel_names(ModelRc::new(VecModel::<SharedString>::from(Vec::new())));
                     let map_vec: Vec<i32> = (0..n as i32).collect();
                     u.set_conv_channel_map(ModelRc::new(VecModel::from(map_vec)));
                     u.set_conv_output_folder(SharedString::from(folder.clone()));
                     u.set_conv_filename_prefix(SharedString::from(prefix.clone()));
                     u.set_conv_audio_suffix_template(SharedString::from(audio_suffix.lock().unwrap().clone()));
                     u.set_conv_video_suffix_template(SharedString::from(video_suffix.lock().unwrap().clone()));
-                    u.set_ltc_file_idx(1);
+                    u.set_ltc_file_idx(0);
                     u.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
+                }
+
+                // Auto-probe video files for audio streams
+                if is_video && !files.is_empty() {
+                    let folder_str = folder_for_group.lock().unwrap().clone();
+                    if !folder_str.is_empty() {
+                        let full_path = PathBuf::from(&folder_str).join(&files[0]);
+                        let _ = cmd_group.send(GuiCommand::ProbeVideo(
+                            full_path.to_string_lossy().to_string(),
+                        ));
+                    }
                 }
             }
         });
@@ -1011,6 +1026,7 @@ fn _run_gui(
         let groups = conv_file_groups.clone();
         let folder = conv_selected_folder.clone();
         let sel_idx = conv_selected_group_idx.clone();
+        let detect_engine_state = engine_state.clone();
         ui.on_ltc_detect(move || {
             let g = groups.lock().unwrap();
             let f = folder.lock().unwrap();
@@ -1020,11 +1036,8 @@ fn _run_gui(
             if (idx as usize) >= keys.len() { return; }
             let prefix = &keys[idx as usize];
             let files = g.get(prefix).cloned().unwrap_or_default();
-            let ltc_idx = 0; // Use first file as default
+            let ltc_idx = 0;
             if ltc_idx >= files.len() { return; }
-            // files contains filenames only; the callback in Slint was set up
-            // with conv_file_groups = BTreeMap<String, Vec<PathBuf>> where values
-            // are just filenames, so we join with folder to get full path
             let file_name = files[ltc_idx].file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
@@ -1035,9 +1048,57 @@ fn _run_gui(
                 u.set_ltc_result_text(SharedString::from(""));
                 u.set_ltc_error(SharedString::from(""));
             }
-            let _ = cmd.send(GuiCommand::ParseLtcFile(
-                full_path.to_string_lossy().to_string(),
-            ));
+            let is_video = gui_engine::ffprobe::path_is_video(&full_path);
+            if is_video {
+                // Read probe from state to translate flat channel index to (stream, channel)
+                let s = detect_engine_state.load();
+                let flat_idx = ui_weak.upgrade()
+                    .map(|u| u.get_ltc_selected_channel() as usize)
+                    .unwrap_or(0);
+                let (stream_idx, channel_idx) = s.ltc_probe.as_ref().map_or((0, 0), |probe| {
+                    let mut flat = 0usize;
+                    for st in &probe.streams {
+                        for ch in 0..st.channels {
+                            if flat == flat_idx {
+                                return (st.stream_index, ch);
+                            }
+                            flat += 1;
+                        }
+                    }
+                    (0, 0)
+                });
+                let _ = cmd.send(GuiCommand::ParseLtcVideo(
+                    full_path.to_string_lossy().to_string(),
+                    stream_idx,
+                    channel_idx,
+                ));
+            } else {
+                let _ = cmd.send(GuiCommand::ParseLtcWavFile(
+                    full_path.to_string_lossy().to_string(),
+                ));
+            }
+        });
+    }
+
+    // ── Channel selection callback (for video probe) ──────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        let chan_engine_state = engine_state.clone();
+        ui.on_channel_selected(move |flat_idx| {
+            let s = chan_engine_state.load();
+            if let Some(ref probe) = s.ltc_probe {
+                let mut flat = 0usize;
+                for st in &probe.streams {
+                    for ch in 0..st.channels {
+                        if flat == flat_idx as usize {
+                            let _ = cmd.send(GuiCommand::SetLtcDecodeStream(st.stream_index));
+                            let _ = cmd.send(GuiCommand::SetLtcDecodeChannel(ch));
+                            return;
+                        }
+                        flat += 1;
+                    }
+                }
+            }
         });
     }
 

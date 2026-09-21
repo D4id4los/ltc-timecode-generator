@@ -9,6 +9,7 @@ use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetecti
 use log::{debug, error, info, warn};
 
 use crate::command::GuiCommand;
+use crate::ffprobe;
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
 
@@ -401,7 +402,122 @@ fn process_command(
             }
         }
 
-        GuiCommand::ParseLtcFile(path) => {
+        GuiCommand::ProbeVideo(path) => {
+            info!("Probing video file for audio streams: {}", path);
+            match ffprobe::probe_video_audio(Path::new(&path)) {
+                Ok(probe) => {
+                    state.ltc_probe = Some(probe.clone());
+                    state.ltc_selected_stream = 0;
+                    state.ltc_selected_channel = 0;
+                    state.ltc_decode_is_video = true;
+                    state.status_message = format!(
+                        "Video probed: {} audio stream(s), {} total channel(s)",
+                        probe.streams.len(),
+                        probe.total_audio_channels,
+                    );
+                    info!("Probe succeeded: {} streams, {} channels — {}", probe.streams.len(), probe.total_audio_channels, path);
+                }
+                Err(e) => {
+                    state.ltc_probe = None;
+                    state.ltc_decode_error = Some(e.clone());
+                    state.ltc_decode_is_video = false;
+                    state.status_message = format!("Video probe failed: {}", e);
+                    error!("Video probe failed: {} — {}", path, e);
+                }
+            }
+        }
+
+        GuiCommand::ParseLtcVideo(path, stream_index, channel_index) => {
+            let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
+            info!(
+                "LTC video decode requested: {} (stream={}, channel={}, decoder={}, fps={})",
+                path, stream_index, channel_index, decoder_name, state.decode_fps,
+            );
+
+            state.ltc_is_detecting = true;
+            state.ltc_decode_result = None;
+            state.ltc_decode_error = None;
+            state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
+            state.status_message = format!(
+                "Extracting audio from: {} stream={} ch={}",
+                path, stream_index, channel_index,
+            );
+
+            let capture_gen = state.ltc_decode_generation;
+            let tx = decode_result_tx.clone();
+            let use_libltc = state.use_libltc;
+            let decode_fps = state.decode_fps;
+            let decode_drop_frame = state.decode_drop_frame;
+
+            std::thread::spawn(move || {
+                let tmp_dir = std::env::temp_dir();
+                let tmp_wav = tmp_dir.join(format!(
+                    "ltc_extract_{}_{}_{}.wav",
+                    std::process::id(),
+                    stream_index,
+                    channel_index,
+                ));
+
+                if let Err(e) = ffprobe::extract_audio_channel(
+                    Path::new(&path),
+                    stream_index,
+                    channel_index,
+                    &tmp_wav,
+                ) {
+                    let _ = tx.send(LtcDecodeResult {
+                        path,
+                        generation: capture_gen,
+                        result: Err(e),
+                    });
+                    return;
+                }
+
+                let wav_path = tmp_wav.clone();
+
+                let result = match WavChunkReader::open(&wav_path) {
+                    Ok((reader, _start)) => {
+                        let total_mono = reader.total_mono_samples();
+                        drop(reader);
+                        let config = DecodeConfig::default();
+                        let chunk_mono =
+                            (config.chunk_size_bytes / 3) as usize; // pcm_s24le = 3 bytes/sample
+                        let overlap_samples =
+                            (config.overlap_seconds * 48000.0) as usize;
+                        let chunk_mono = chunk_mono.max(overlap_samples * 2);
+
+                        if total_mono <= chunk_mono + overlap_samples {
+                            audio_core::decode_ltc_with_decoder(
+                                &wav_path, use_libltc, decode_fps, decode_drop_frame,
+                            )
+                        } else {
+                            audio_core::decode_ltc_chunked(
+                                &wav_path, use_libltc, decode_fps, decode_drop_frame,
+                                config, &DecodeProgress::new(1),
+                            )
+                        }
+                    }
+                    Err(e) => Err(format!("Failed to open extracted WAV: {}", e)),
+                };
+
+                let _ = std::fs::remove_file(&tmp_wav);
+
+                let _ = tx.send(LtcDecodeResult {
+                    path,
+                    generation: capture_gen,
+                    result,
+                });
+            });
+        }
+
+        GuiCommand::SetLtcDecodeStream(idx) => {
+            state.ltc_selected_stream = idx;
+        }
+
+        GuiCommand::SetLtcDecodeChannel(idx) => {
+            state.ltc_selected_channel = idx;
+        }
+
+        GuiCommand::ParseLtcWavFile(path) => {
             let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
             info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps);
 
