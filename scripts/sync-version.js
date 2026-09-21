@@ -31,41 +31,46 @@ if (!version) {
 
 console.log(`Syncing version ${version} to all files...`);
 
-// 1. src-tauri/tauri.conf.json (Tauri v2 — top-level "version")
-let tauriV2 = JSON.parse(read('src-tauri/tauri.conf.json'));
-tauriV2.version = version;
-write('src-tauri/tauri.conf.json', JSON.stringify(tauriV2, null, 2) + '\n');
-console.log('  ✓ src-tauri/tauri.conf.json');
+const TAURI_CONFS = [
+  {
+    path: 'src-tauri/tauri.conf.json',
+    apply: (json) => { json.version = version; },
+  },
+  {
+    path: 'src-tauri-32bit/tauri.conf.json',
+    apply: (json) => { json.package.version = version; },
+  },
+];
 
-// 2. src-tauri-32bit/tauri.conf.json (Tauri v1 — version under "package")
-let tauriV1 = JSON.parse(read('src-tauri-32bit/tauri.conf.json'));
-tauriV1.package.version = version;
-write('src-tauri-32bit/tauri.conf.json', JSON.stringify(tauriV1, null, 2) + '\n');
-console.log('  ✓ src-tauri-32bit/tauri.conf.json');
+for (const { path, apply } of TAURI_CONFS) {
+  const json = JSON.parse(read(path));
+  apply(json);
+  write(path, JSON.stringify(json, null, 2) + '\n');
+  console.log(`  ✓ ${path}`);
+}
 
-// 3. src-tauri/Cargo.toml
-let cargo = read('src-tauri/Cargo.toml');
-cargo = cargo.replace(/^version = ".*?"/m, `version = "${version}"`);
-write('src-tauri/Cargo.toml', cargo);
-console.log('  ✓ src-tauri/Cargo.toml');
+const CARGO_MANIFESTS = [
+  'audio-core/Cargo.toml',
+  'gui_engine/Cargo.toml',
+  'ltc-gui/Cargo.toml',
+  'ltc-slint/Cargo.toml',
+  'src-tauri/Cargo.toml',
+  'src-tauri-32bit/Cargo.toml',
+];
 
-// 4. src-tauri-32bit/Cargo.toml
-cargo = read('src-tauri-32bit/Cargo.toml');
-cargo = cargo.replace(/^version = ".*?"/m, `version = "${version}"`);
-write('src-tauri-32bit/Cargo.toml', cargo);
-console.log('  ✓ src-tauri-32bit/Cargo.toml');
+const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const packageVersionLine = new RegExp(`^version = "${escapedVersion}"`, 'm');
 
-// 5. audio-core/Cargo.toml
-cargo = read('audio-core/Cargo.toml');
-cargo = cargo.replace(/^version = ".*?"/m, `version = "${version}"`);
-write('audio-core/Cargo.toml', cargo);
-console.log('  ✓ audio-core/Cargo.toml');
-
-// 6. ltc-gui/Cargo.toml
-cargo = read('ltc-gui/Cargo.toml');
-cargo = cargo.replace(/^version = ".*?"/m, `version = "${version}"`);
-write('ltc-gui/Cargo.toml', cargo);
-console.log('  ✓ ltc-gui/Cargo.toml');
+for (const manifest of CARGO_MANIFESTS) {
+  let cargo = read(manifest);
+  cargo = cargo.replace(/^version = ".*?"/m, `version = "${version}"`);
+  if (!packageVersionLine.test(cargo)) {
+    console.error(`Error: failed to set [package] version in ${manifest}`);
+    process.exit(1);
+  }
+  write(manifest, cargo);
+  console.log(`  ✓ ${manifest}`);
+}
 
 // --- Update lock files ---
 
@@ -75,7 +80,7 @@ run('npm install', '.');
 console.log('  ✓ package-lock.json');
 
 run('cargo generate-lockfile', '.');
-console.log('  ✓ Cargo.lock (workspace: audio-core + ltc-gui)');
+console.log('  ✓ Cargo.lock (workspace: audio-core + gui_engine + ltc-gui + ltc-slint)');
 
 run('cargo generate-lockfile --manifest-path src-tauri/Cargo.toml', '.');
 console.log('  ✓ src-tauri/Cargo.lock');
@@ -86,11 +91,13 @@ console.log('  ✓ src-tauri-32bit/Cargo.lock');
 // --- Stage all changed files for the npm version commit ---
 
 console.log('\nStaging all changed files for git commit...');
-run('git add package.json package-lock.json Cargo.lock', '.');
-run('git add src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock', '.');
-run('git add src-tauri-32bit/tauri.conf.json src-tauri-32bit/Cargo.toml src-tauri-32bit/Cargo.lock', '.');
-run('git add audio-core/Cargo.toml', '.');
-run('git add Cargo.toml', 'ltc-gui');
+run(
+  'git add package.json package-lock.json Cargo.lock ' +
+    'src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock ' +
+    'src-tauri-32bit/tauri.conf.json src-tauri-32bit/Cargo.toml src-tauri-32bit/Cargo.lock ' +
+    'audio-core/Cargo.toml gui_engine/Cargo.toml ltc-gui/Cargo.toml ltc-slint/Cargo.toml',
+  '.',
+);
 console.log('  ✓ All files staged');
 
 console.log(`\nAll files synced to version ${version}. Lock files are up to date.`);
