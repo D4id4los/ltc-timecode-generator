@@ -10,6 +10,8 @@ use log::{info, warn};
 
 use audio_core::{FrameTimecode, Timecode};
 
+use crate::ffprobe::VideoAudioProbe;
+
 pub const DEFAULT_AUDIO_SUFFIX: &str = "_audio_track{:01d}";
 pub const DEFAULT_VIDEO_SUFFIX: &str = "_video_clip{:02d}";
 
@@ -485,6 +487,9 @@ pub struct ConverterSettings {
     pub channel_map: ChannelMap,
     pub split_tracks: bool,
     pub drop_ltc_track: bool,
+    /// For video pipeline: which (absolute_stream, channel) carries LTC.
+    /// `None` when no video probe result is available.
+    pub ltc_video_source: Option<(usize, usize)>,
 
     // ── Output Format ──
     pub container: String,
@@ -501,6 +506,101 @@ pub struct ConverterSettings {
     pub trim_to_first_ltc: bool,
     pub trim_offsets_secs: Vec<f64>,
     pub timecode_meta_per_file: Vec<Option<TimecodeMetadata>>,
+}
+
+// ── Video output planner ──────────────────────────────────────────────────
+
+/// Describes how audio should be kept in a non-split output.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioKeep {
+    /// Pass all audio through unchanged.
+    AllAudio,
+    /// Keep all audio except the given (stream_index, channel_index) pairs.
+    ChannelsExcept(Vec<(usize, usize)>),
+}
+
+/// A single step in a video-to-video conversion plan.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VideoOutputStep {
+    /// Split mode: video with no audio.
+    VideoOnly { file_idx: usize, output: PathBuf },
+    /// Mux mode: video with audio (possibly filtered).
+    VideoMux { file_idx: usize, output: PathBuf, keep: AudioKeep },
+    /// Extract a single audio channel to a separate file.
+    AudioChannel { file_idx: usize, stream_idx: usize, channel_idx: usize, output: PathBuf, format: String },
+}
+
+/// Plan the output steps for a video-to-video conversion, given probe results.
+///
+/// Returns a flat list of steps. The caller executes each step in order.
+pub fn plan_video_outputs(settings: &ConverterSettings, probe: &VideoAudioProbe) -> Vec<VideoOutputStep> {
+    let ext = extension_for_container(&settings.container);
+    let mut steps: Vec<VideoOutputStep> = Vec::new();
+
+    for file_idx in 0..settings.input_files.len() {
+        if settings.split_tracks {
+            // Video-only step
+            let video_out = settings.output_path_for_index("video", file_idx + 1, ext);
+            steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
+
+            // One AudioChannel per probed channel
+            for stream in &probe.streams {
+                for ch in 0..stream.channels {
+                    let ltc_match = settings.ltc_video_source == Some((stream.stream_index, ch));
+                    if settings.drop_ltc_track && ltc_match {
+                        continue;
+                    }
+                    let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
+                    let audio_idx = steps.iter().filter(|s| matches!(s, VideoOutputStep::AudioChannel { .. })).count() + 1;
+                    let audio_out = settings.output_path_for_index("audio", audio_idx, ext);
+                    steps.push(VideoOutputStep::AudioChannel {
+                        file_idx,
+                        stream_idx: stream.stream_index,
+                        channel_idx: ch,
+                        output: audio_out,
+                        format: fmt.to_string(),
+                    });
+                }
+            }
+        } else {
+            // Mux mode: one file per input
+            let video_out = settings.output_path_for_index("video", file_idx + 1, ext);
+
+            // Determine which (stream,channel) pairs to drop
+            let drop_pairs: Vec<(usize, usize)> = if settings.drop_ltc_track {
+                settings.ltc_video_source.into_iter().collect()
+            } else {
+                Vec::new()
+            };
+
+            if drop_pairs.is_empty() {
+                steps.push(VideoOutputStep::VideoMux {
+                    file_idx,
+                    output: video_out,
+                    keep: AudioKeep::AllAudio,
+                });
+            } else {
+                // Count surviving channels across all streams
+                let total_channels: usize = probe.streams.iter().map(|s| s.channels).sum();
+                let dropped_count: usize = drop_pairs.iter().filter(|(s, c)| {
+                    probe.streams.iter().any(|st| st.stream_index == *s && *c < st.channels)
+                }).count();
+
+                if dropped_count == total_channels {
+                    // All channels dropped → video only with -an
+                    steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
+                } else {
+                    steps.push(VideoOutputStep::VideoMux {
+                        file_idx,
+                        output: video_out,
+                        keep: AudioKeep::ChannelsExcept(drop_pairs),
+                    });
+                }
+            }
+        }
+    }
+
+    steps
 }
 
 impl ConverterSettings {
@@ -546,24 +646,53 @@ impl ConverterSettings {
     }
 
     /// Generate all output paths for this conversion.
+    ///
+    /// For `VideoPassthrough` pipelines, pass the probe results to get correct
+    /// per-channel audio paths.  `num_video_clips` is ignored for `VideoPassthrough`.
     pub fn all_output_paths(&self, num_audio_tracks: usize, num_video_clips: usize, extension: &str) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if self.split_tracks {
-            for i in 0..num_audio_tracks {
-                if self.drop_ltc_track && i == self.ltc_track_channel_index {
-                    continue;
+        match self.pipeline {
+            ConversionPipeline::VideoPassthrough => {
+                // For video pipeline, paths are determined by the planner.
+                let mut paths = Vec::new();
+                for file_idx in 0..self.input_files.len() {
+                    let input = &self.input_files[file_idx];
+                    if let Ok(probe) = crate::ffprobe::probe_video_audio(input) {
+                        let steps = plan_video_outputs(self, &probe);
+                        for step in &steps {
+                            match step {
+                                VideoOutputStep::VideoOnly { output, .. }
+                                | VideoOutputStep::VideoMux { output, .. }
+                                | VideoOutputStep::AudioChannel { output, .. } => {
+                                    paths.push(output.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        paths.push(self.output_path_for_index("video", file_idx + 1, extension));
+                    }
                 }
-                paths.push(self.output_path_for_index("audio", i + 1, extension));
+                paths
             }
-        } else {
-            // Single multi-track file: use prefix + extension
-            let filename = format!("{}.{}", self.filename_prefix, extension);
-            paths.push(self.output_folder.join(filename));
+            _ => {
+                // Audio-only pipeline
+                let mut paths = Vec::new();
+                if self.split_tracks {
+                    for i in 0..num_audio_tracks {
+                        if self.drop_ltc_track && i == self.ltc_track_channel_index {
+                            continue;
+                        }
+                        paths.push(self.output_path_for_index("audio", i + 1, extension));
+                    }
+                } else {
+                    let filename = format!("{}.{}", self.filename_prefix, extension);
+                    paths.push(self.output_folder.join(filename));
+                }
+                for i in 0..num_video_clips {
+                    paths.push(self.output_path_for_index("video", i + 1, extension));
+                }
+                paths
+            }
         }
-        for i in 0..num_video_clips {
-            paths.push(self.output_path_for_index("video", i + 1, extension));
-        }
-        paths
     }
 }
 
@@ -804,54 +933,210 @@ fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<Stri
     args
 }
 
-/// Build ffmpeg args for video-to-video pipeline.
-fn build_video_to_video_args(settings: &ConverterSettings, file_idx: usize) -> Vec<String> {
-    let mut args: Vec<String> = vec!["-y".to_string()];
-
+/// Build ffmpeg args for a video-only step (no audio).
+fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> Vec<String> {
     let input = &settings.input_files[file_idx];
     let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
 
+    let mut args: Vec<String> = vec!["-y".to_string()];
     if trim_secs > 0.001 {
         args.push("-ss".to_string());
         args.push(format!("{:.3}", trim_secs));
     }
     args.push("-i".to_string());
     args.push(input.to_string_lossy().to_string());
-
-    // Select the correct audio stream (channel index within first audio stream)
     args.push("-map".to_string());
     args.push("0:v".to_string());
+    args.push("-an".to_string());
 
-    if !settings.drop_ltc_track {
-        args.push("-map".to_string());
-        args.push("0:a?".to_string());
-    } else {
-        // Map all audio except the LTC track channel
-        args.push("-map".to_string());
-        args.push("0:a?".to_string()); // keep this and filter later
-    }
-
-    // Video encoder: try to use same codec (copy) if no re-encode needed
-    // For now, always transcode as requested
     push_video_encoder(&mut args, &settings.video_encoder);
 
-    // Audio encoder
-    args.push("-c:a".to_string());
-    args.push(settings.audio_encoder.clone());
-
-    // Per-file timecode metadata
     if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
         push_timecode_args(&mut args, tc);
     }
 
     args.push("-progress".to_string());
     args.push("pipe:2".to_string());
-
     let container = container_to_ffmpeg_format(&settings.container).to_string();
     args.push("-f".to_string());
     args.push(container);
-
     args
+}
+
+/// Build ffmpeg args for video-mux step (audio kept, possibly filtered).
+fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &AudioKeep, probe: &VideoAudioProbe) -> Vec<String> {
+    let input = &settings.input_files[file_idx];
+    let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
+
+    let mut args: Vec<String> = vec!["-y".to_string()];
+    if trim_secs > 0.001 {
+        args.push("-ss".to_string());
+        args.push(format!("{:.3}", trim_secs));
+    }
+    args.push("-i".to_string());
+    args.push(input.to_string_lossy().to_string());
+    args.push("-map".to_string());
+    args.push("0:v".to_string());
+
+    match keep {
+        AudioKeep::AllAudio => {
+            args.push("-map".to_string());
+            args.push("0:a?".to_string());
+            args.push("-c:a".to_string());
+            args.push(settings.audio_encoder.clone());
+        }
+        AudioKeep::ChannelsExcept(drop_pairs) => {
+            // Build a filter_complex that drops specific (stream, channel) pairs
+            let mut filter_parts: Vec<String> = Vec::new();
+            let mut output_labels: Vec<String> = Vec::new();
+            let mut filter_idx = 0;
+
+            for stream in &probe.streams {
+                let surviving_channels: Vec<usize> = (0..stream.channels)
+                    .filter(|ch| !drop_pairs.contains(&(stream.stream_index, *ch)))
+                    .collect();
+
+                if surviving_channels.is_empty() {
+                    continue;
+                }
+
+                if surviving_channels.len() == stream.channels {
+                    // Keep entire stream untouched
+                    output_labels.push(format!("0:{}", stream.stream_index));
+                } else if surviving_channels.len() == 1 {
+                    // Extract single channel with pan
+                    let label = format!("a{}", filter_idx);
+                    filter_idx += 1;
+                    filter_parts.push(format!(
+                        "[0:{}]pan=mono|FC=c{}[{}]",
+                        stream.stream_index, surviving_channels[0], label
+                    ));
+                    output_labels.push(format!("[{}]", label));
+                } else {
+                    // Multiple surviving channels from one stream: need multi-channel pan
+                    let ch_maps: Vec<String> = surviving_channels
+                        .iter()
+                        .enumerate()
+                        .map(|(out_ch, in_ch)| format!("c{}={}", out_ch, in_ch))
+                        .collect();
+                    let label = format!("a{}", filter_idx);
+                    filter_idx += 1;
+                    let layout = match surviving_channels.len() {
+                        1 => "mono",
+                        2 => "stereo",
+                        _ => "5.1",
+                    };
+                    let pan = format!("pan={}|{}", layout, ch_maps.join("|"));
+                    filter_parts.push(format!(
+                        "[0:{}]{}[{}]",
+                        stream.stream_index, pan, label
+                    ));
+                    output_labels.push(format!("[{}]", label));
+                }
+            }
+
+            if output_labels.is_empty() {
+                // No audio survived: drop all
+                args.push("-an".to_string());
+            } else {
+                if !filter_parts.is_empty() {
+                    args.push("-filter_complex".to_string());
+                    args.push(filter_parts.join(";"));
+                }
+                for label in &output_labels {
+                    args.push("-map".to_string());
+                    args.push(label.clone());
+                }
+                args.push("-c:a".to_string());
+                args.push(settings.audio_encoder.clone());
+            }
+        }
+    }
+
+    if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
+        push_timecode_args(&mut args, tc);
+    }
+
+    args.push("-progress".to_string());
+    args.push("pipe:2".to_string());
+    let container = container_to_ffmpeg_format(&settings.container).to_string();
+    args.push("-f".to_string());
+    args.push(container);
+    args
+}
+
+/// Build ffmpeg args for extracting a single audio channel from a video file.
+fn build_video_track_extract_args(
+    settings: &ConverterSettings,
+    file_idx: usize,
+    stream_idx: usize,
+    channel_idx: usize,
+    format: &str,
+) -> Vec<String> {
+    let input = &settings.input_files[file_idx];
+    let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
+
+    let mut args: Vec<String> = vec!["-y".to_string()];
+    if trim_secs > 0.001 {
+        args.push("-ss".to_string());
+        args.push(format!("{:.3}", trim_secs));
+    }
+    args.push("-i".to_string());
+    args.push(input.to_string_lossy().to_string());
+    args.push("-map".to_string());
+    args.push(format!("0:{}", stream_idx));
+    args.push("-af".to_string());
+    args.push(format!("pan=mono|FC=c{}", channel_idx));
+
+    if format == "wav" {
+        args.push("-c:a".to_string());
+        args.push("pcm_s24le".to_string());
+        args.push("-f".to_string());
+        args.push("wav".to_string());
+
+        // Add BWF time_reference if timecode metadata is available
+        if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
+            let sample_rate = 48000; // default; could be taken from probe
+            let total_secs = tc.start.hours as f64 * 3600.0
+                + tc.start.minutes as f64 * 60.0
+                + tc.start.seconds as f64
+                + tc.start.frames as f64 / tc.fps;
+            let time_reference = (total_secs * sample_rate as f64).round() as u64;
+            args.push("-write_bext".to_string());
+            args.push("1".to_string());
+            args.push("-metadata".to_string());
+            args.push(format!("time_reference={}", time_reference));
+        }
+    } else if format == "adts" {
+        args.push("-c:a".to_string());
+        args.push("aac".to_string());
+        args.push("-f".to_string());
+        args.push("adts".to_string());
+    } else {
+        args.push("-c:a".to_string());
+        args.push(settings.audio_encoder.clone());
+        args.push("-f".to_string());
+        args.push(format.to_string());
+    }
+
+    args.push("-progress".to_string());
+    args.push("pipe:2".to_string());
+    args
+}
+
+/// Dispatch to the correct video arg-builder based on step kind.
+fn build_video_to_video_args(settings: &ConverterSettings, step: &VideoOutputStep, probe: &VideoAudioProbe) -> Vec<String> {
+    match step {
+        VideoOutputStep::VideoOnly { file_idx, .. } => {
+            build_video_only_args(settings, *file_idx)
+        }
+        VideoOutputStep::VideoMux { file_idx, keep, .. } => {
+            build_video_mux_args(settings, *file_idx, keep, probe)
+        }
+        VideoOutputStep::AudioChannel { file_idx, stream_idx, channel_idx, format, .. } => {
+            build_video_track_extract_args(settings, *file_idx, *stream_idx, *channel_idx, format)
+        }
+    }
 }
 
 fn push_video_encoder(args: &mut Vec<String>, encoder: &str) {
@@ -935,8 +1220,8 @@ pub fn spawn_conversion(
             }
         };
         let extension = &output_extension;
-        let total_steps = match settings.pipeline {
-            ConversionPipeline::VideoPassthrough => settings.input_files.len(),
+        let mut total_steps = match settings.pipeline {
+            ConversionPipeline::VideoPassthrough => settings.input_files.len(), // placeholder, updated by run_video_to_video
             _ => if settings.split_tracks { settings.channel_map.num_channels() } else { 1 },
         };
         let mut overall_progress: f32 = 0.0;
@@ -974,7 +1259,7 @@ pub fn spawn_conversion(
                 run_audio_to_synthetic_video(&settings, extension, &state, &cancel, &mut overall_progress, &mut overall_log);
             }
             ConversionPipeline::VideoPassthrough => {
-                run_video_to_video(&settings, extension, &state, &cancel, total_steps, &mut overall_progress, &mut overall_log);
+                run_video_to_video(&settings, extension, &state, &cancel, &mut total_steps, &mut overall_progress, &mut overall_log);
             }
         }
 
@@ -1111,16 +1396,50 @@ fn run_video_to_video(
     extension: &str,
     state: &SharedConversionState,
     cancel: &CancelFlag,
-    total_steps: usize,
+    _total_steps: &mut usize,
     overall_progress: &mut f32,
     overall_log: &mut String,
 ) {
+    // Probe each file to build the plan
+    let mut steps: Vec<(Vec<String>, PathBuf)> = Vec::new();
+
     for file_idx in 0..settings.input_files.len() {
         if cancel.load(Ordering::Relaxed) { break; }
-        let args = build_video_to_video_args(settings, file_idx);
-        let output_path = settings.output_path_for_index("video", file_idx + 1, extension);
-        let step_progress = 1.0 / total_steps as f32;
-        run_ffmpeg_process(&args, &output_path, state, cancel, step_progress, overall_progress, overall_log, total_steps, file_idx + 1);
+
+        let input = &settings.input_files[file_idx];
+        let probe = crate::ffprobe::probe_video_audio(input);
+
+        match probe {
+            Ok(probe) => {
+                let file_steps = plan_video_outputs(settings, &probe);
+                for s in &file_steps {
+                    let args = build_video_to_video_args(settings, s, &probe);
+                    let output = match s {
+                        VideoOutputStep::VideoOnly { output, .. }
+                        | VideoOutputStep::VideoMux { output, .. }
+                        | VideoOutputStep::AudioChannel { output, .. } => output.clone(),
+                    };
+                    steps.push((args, output));
+                }
+            }
+            Err(e) => {
+                // Probe failure: warn, treat as no-audio, produce video-only output
+                warn!("Probe failed for '{}': {} — treating as no-audio", input.display(), e);
+                let output_path = settings.output_path_for_index("video", file_idx + 1, extension);
+                let args = build_video_only_args(settings, file_idx);
+                steps.push((args, output_path));
+            }
+        }
+    }
+
+    // Recalculate total steps from actual plan
+    *_total_steps = steps.len();
+
+    // Execute steps
+    for (step_idx, (args, output)) in steps.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) { break; }
+        let step_progress = 1.0 / steps.len().max(1) as f32;
+        run_ffmpeg_process(args, output, state, cancel, step_progress, overall_progress, overall_log, steps.len(), step_idx + 1);
         *overall_progress += step_progress;
     }
 }
@@ -1386,6 +1705,7 @@ mod tests {
             channel_map: ChannelMap::identity(2),
             split_tracks: false,
             drop_ltc_track: false,
+            ltc_video_source: None,
             container: "mkv".to_string(),
             video_encoder: "libx264".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
@@ -1984,5 +2304,257 @@ mod tests {
         assert!(keys.contains(&"libx264"));
         assert!(keys.contains(&"libx265"));
         assert!(!keys.contains(&"prores_ks"));
+    }
+
+    // ── Video pipeline helpers ────────────────────────────────────────────
+
+    fn make_video_settings() -> ConverterSettings {
+        ConverterSettings {
+            pipeline: ConversionPipeline::VideoPassthrough,
+            input_files: vec![PathBuf::from("/tmp/test.mp4")],
+            recording_type: RecordingType::VideoClipSequence,
+            ltc_track_channel_index: 0,
+            channel_map: ChannelMap::identity(1),
+            split_tracks: false,
+            drop_ltc_track: false,
+            ltc_video_source: None,
+            container: "mkv".to_string(),
+            video_encoder: "libx264".to_string(),
+            audio_encoder: "pcm_s24le".to_string(),
+            output_folder: PathBuf::from("/tmp"),
+            filename_prefix: "output".to_string(),
+            audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
+            video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
+            trim_to_first_ltc: false,
+            trim_offsets_secs: vec![0.0],
+            timecode_meta_per_file: vec![None],
+        }
+    }
+
+    fn make_stereo_probe() -> VideoAudioProbe {
+        VideoAudioProbe {
+            streams: vec![
+                crate::ffprobe::AudioStreamInfo {
+                    stream_index: 1,
+                    channels: 2,
+                    codec_name: "aac".to_string(),
+                    sample_rate: 48000,
+                },
+            ],
+            total_audio_channels: 2,
+            is_video_file: true,
+        }
+    }
+
+    fn make_mono_probe() -> VideoAudioProbe {
+        VideoAudioProbe {
+            streams: vec![
+                crate::ffprobe::AudioStreamInfo {
+                    stream_index: 1,
+                    channels: 1,
+                    codec_name: "aac".to_string(),
+                    sample_rate: 48000,
+                },
+            ],
+            total_audio_channels: 1,
+            is_video_file: true,
+        }
+    }
+
+    fn make_multi_stream_probe() -> VideoAudioProbe {
+        VideoAudioProbe {
+            streams: vec![
+                crate::ffprobe::AudioStreamInfo {
+                    stream_index: 1,
+                    channels: 2,
+                    codec_name: "aac".to_string(),
+                    sample_rate: 48000,
+                },
+                crate::ffprobe::AudioStreamInfo {
+                    stream_index: 2,
+                    channels: 1,
+                    codec_name: "pcm_s16le".to_string(),
+                    sample_rate: 48000,
+                },
+            ],
+            total_audio_channels: 3,
+            is_video_file: true,
+        }
+    }
+
+    // ── planner tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_plan_split_drop_stereo_ltc_at_1_0() {
+        let mut s = make_video_settings();
+        s.split_tracks = true;
+        s.drop_ltc_track = true;
+        s.ltc_video_source = Some((1, 0));
+        let probe = make_stereo_probe();
+        let steps = plan_video_outputs(&s, &probe);
+        // VideoOnly + AudioChannel for ch1 (ch0 dropped)
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(steps[0], VideoOutputStep::VideoOnly { .. }));
+        assert!(matches!(steps[1], VideoOutputStep::AudioChannel { channel_idx: 1, .. }));
+    }
+
+    #[test]
+    fn test_plan_split_no_drop_stereo() {
+        let mut s = make_video_settings();
+        s.split_tracks = true;
+        s.drop_ltc_track = false;
+        let probe = make_stereo_probe();
+        let steps = plan_video_outputs(&s, &probe);
+        // VideoOnly + AudioChannel ch0 + AudioChannel ch1
+        assert_eq!(steps.len(), 3);
+        assert!(matches!(steps[0], VideoOutputStep::VideoOnly { .. }));
+        assert!(matches!(steps[1], VideoOutputStep::AudioChannel { channel_idx: 0, .. }));
+        assert!(matches!(steps[2], VideoOutputStep::AudioChannel { channel_idx: 1, .. }));
+    }
+
+    #[test]
+    fn test_plan_split_drop_mono_ltc_at_1_0() {
+        let mut s = make_video_settings();
+        s.split_tracks = true;
+        s.drop_ltc_track = true;
+        s.ltc_video_source = Some((1, 0));
+        let probe = make_mono_probe();
+        let steps = plan_video_outputs(&s, &probe);
+        // VideoOnly only (the only channel is dropped)
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0], VideoOutputStep::VideoOnly { .. }));
+    }
+
+    #[test]
+    fn test_plan_multi_stream_global_channel_numbering() {
+        let mut s = make_video_settings();
+        s.split_tracks = true;
+        s.drop_ltc_track = true;
+        s.ltc_video_source = Some((2, 0)); // drop stream 2 ch 0 (the mono stream)
+        let probe = make_multi_stream_probe();
+        let steps = plan_video_outputs(&s, &probe);
+        // VideoOnly + AudioChannel(stream=1,ch=0) + AudioChannel(stream=1,ch=1) = 3
+        assert_eq!(steps.len(), 3);
+        assert!(matches!(steps[0], VideoOutputStep::VideoOnly { .. }));
+        assert!(matches!(steps[1], VideoOutputStep::AudioChannel { stream_idx: 1, channel_idx: 0, .. }));
+        assert!(matches!(steps[2], VideoOutputStep::AudioChannel { stream_idx: 1, channel_idx: 1, .. }));
+    }
+
+    #[test]
+    fn test_plan_no_split_no_drop() {
+        let s = make_video_settings();
+        let probe = make_stereo_probe();
+        let steps = plan_video_outputs(&s, &probe);
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0], VideoOutputStep::VideoMux { keep: AudioKeep::AllAudio, .. }));
+    }
+
+    #[test]
+    fn test_plan_no_split_drop_stereo() {
+        let mut s = make_video_settings();
+        s.drop_ltc_track = true;
+        s.ltc_video_source = Some((1, 0));
+        let probe = make_stereo_probe();
+        let steps = plan_video_outputs(&s, &probe);
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            VideoOutputStep::VideoMux { keep: AudioKeep::ChannelsExcept(pairs), .. } => {
+                assert_eq!(pairs.len(), 1);
+                assert_eq!(pairs[0], (1, 0));
+            }
+            other => panic!("expected VideoMux(ChannelsExcept), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_plan_no_split_drop_mono() {
+        let mut s = make_video_settings();
+        s.drop_ltc_track = true;
+        s.ltc_video_source = Some((1, 0));
+        let probe = make_mono_probe();
+        let steps = plan_video_outputs(&s, &probe);
+        assert_eq!(steps.len(), 1);
+        assert!(matches!(steps[0], VideoOutputStep::VideoOnly { .. }));
+    }
+
+    // ── arg builder tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_video_only_has_map_v_and_an() {
+        let s = make_video_settings();
+        let args = build_video_only_args(&s, 0);
+        assert!(args.contains(&"-map".to_string()));
+        let map_pos = args.iter().position(|a| a == "-map").unwrap();
+        assert_eq!(args[map_pos + 1], "0:v");
+        assert!(args.contains(&"-an".to_string()), "video-only must have -an");
+        assert!(!args.contains(&"-c:a".to_string()), "no -c:a in video-only");
+        assert!(!args.contains(&"0:a?".to_string()), "no 0:a? in video-only");
+    }
+
+    #[test]
+    fn test_build_video_mux_no_drop_has_audio_map() {
+        let s = make_video_settings();
+        let probe = make_stereo_probe();
+        let args = build_video_mux_args(&s, 0, &AudioKeep::AllAudio, &probe);
+        assert!(args.contains(&"-map".to_string()));
+        let map_v_pos = args.iter().position(|a| a == "0:v").expect("expected 0:v map");
+        assert!(map_v_pos > 0);
+        assert!(args.contains(&"0:a?".to_string()), "mux must map audio");
+        assert!(args.contains(&"-c:a".to_string()), "mux must have -c:a");
+    }
+
+    #[test]
+    fn test_build_video_mux_drop_stereo_has_pan_filter() {
+        let s = make_video_settings();
+        let probe = make_stereo_probe();
+        let keep = AudioKeep::ChannelsExcept(vec![(1, 0)]);
+        let args = build_video_mux_args(&s, 0, &keep, &probe);
+        // Should have -filter_complex with pan=mono|FC=c1
+        let fc_pos = args.iter().position(|a| a == "-filter_complex");
+        assert!(fc_pos.is_some(), "expected -filter_complex for dropped channel: {:?}", args);
+        let fc = &args[fc_pos.unwrap() + 1];
+        assert!(fc.contains("pan=mono|FC=c1"), "filter should keep channel 1, got: {}", fc);
+        assert!(fc.contains("[0:1]"), "filter should reference stream 1");
+        // Should have -map for filtered label
+        assert!(args.contains(&"[a0]".to_string()), "should map filtered output");
+    }
+
+    #[test]
+    fn test_build_video_track_extract_args_wav() {
+        let s = make_video_settings();
+        let args = build_video_track_extract_args(&s, 0, 1, 0, "wav");
+        let map_pos = args.iter().position(|a| a == "-map").unwrap();
+        assert_eq!(args[map_pos + 1], "0:1");
+        let af_pos = args.iter().position(|a| a == "-af").unwrap();
+        assert_eq!(args[af_pos + 1], "pan=mono|FC=c0");
+        let codec_pos = args.iter().position(|a| a == "-c:a").unwrap();
+        assert_eq!(args[codec_pos + 1], "pcm_s24le");
+        let f_pos = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(args[f_pos + 1], "wav");
+    }
+
+    #[test]
+    fn test_build_video_track_extract_args_aac() {
+        let s = make_video_settings();
+        let args = build_video_track_extract_args(&s, 0, 2, 1, "adts");
+        let map_pos = args.iter().position(|a| a == "-map").unwrap();
+        assert_eq!(args[map_pos + 1], "0:2");
+        let af_pos = args.iter().position(|a| a == "-af").unwrap();
+        assert_eq!(args[af_pos + 1], "pan=mono|FC=c1");
+        let codec_pos = args.iter().position(|a| a == "-c:a").unwrap();
+        assert_eq!(args[codec_pos + 1], "aac");
+        let f_pos = args.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(args[f_pos + 1], "adts");
+    }
+
+    #[test]
+    fn test_build_video_mux_all_audio_regression() {
+        // Regression guard: no split, no drop → same args as original behavior
+        let s = make_video_settings();
+        let probe = make_stereo_probe();
+        let args = build_video_mux_args(&s, 0, &AudioKeep::AllAudio, &probe);
+        assert!(args.contains(&"-map".to_string()));
+        assert!(args.contains(&"0:a?".to_string()));
+        assert!(args.contains(&"-c:a".to_string()));
     }
 }

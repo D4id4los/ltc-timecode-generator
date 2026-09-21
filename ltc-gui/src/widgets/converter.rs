@@ -1161,19 +1161,32 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     // Preview of output filenames
     if !state.filename_prefix.is_empty() {
         ui.add_space(4.0);
+        let total_probed = state.latest.ltc_probe.as_ref().map(|p| p.total_audio_channels).unwrap_or(0);
+        let num_video = if state.recording_type == RecordingType::VideoClipSequence {
+            state.selected_group_idx
+                .and_then(|idx| state.file_groups.as_ref()?.get(idx))
+                .map(|g| g.files.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let preview = if state.split_tracks {
-            let n = state.channel_map.num_channels();
+            let n = if state.recording_type == RecordingType::VideoClipSequence {
+                total_probed
+            } else {
+                state.channel_map.num_channels()
+            };
             let count = if state.drop_ltc_track { n.saturating_sub(1) } else { n };
             format!(
                 "↳ {} audio file(s) + {} video clip(s) in {}",
                 count,
-                if state.recording_type == RecordingType::VideoClipSequence { state.channel_map.num_channels() } else { 0 },
+                num_video,
                 state.output_folder.display(),
             )
         } else {
             format!(
                 "↳ 1 audio file + {} video clip(s) in {}",
-                if state.recording_type == RecordingType::VideoClipSequence { state.channel_map.num_channels() } else { 0 },
+                num_video,
                 state.output_folder.display(),
             )
         };
@@ -1353,6 +1366,13 @@ fn start_conversion(state: &mut AppState) {
         RecordingType::VideoClipSequence => ConversionPipeline::VideoPassthrough,
     };
 
+    let ltc_video_source = match state.recording_type {
+        RecordingType::VideoClipSequence => {
+            Some((state.latest.ltc_selected_stream, state.latest.ltc_selected_channel))
+        }
+        RecordingType::MultiTrackAudio => None,
+    };
+
     let settings = ConverterSettings {
         pipeline,
         input_files,
@@ -1361,6 +1381,7 @@ fn start_conversion(state: &mut AppState) {
         channel_map: state.channel_map.clone(),
         split_tracks: state.split_tracks,
         drop_ltc_track: state.drop_ltc_track,
+        ltc_video_source,
         container: state.container.clone(),
         video_encoder: state.video_encoder.clone(),
         audio_encoder: state.audio_encoder.clone(),

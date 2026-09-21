@@ -8,6 +8,7 @@ pub struct AudioStreamInfo {
     pub stream_index: usize,
     pub channels: usize,
     pub codec_name: String,
+    pub sample_rate: u32,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -63,10 +64,16 @@ pub fn probe_video_audio(path: &Path) -> Result<VideoAudioProbe, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+        let sample_rate = s
+            .get("sample_rate")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(48000);
         streams.push(AudioStreamInfo {
             stream_index: idx,
             channels: ch,
             codec_name: codec,
+            sample_rate,
         });
     }
 
@@ -240,6 +247,24 @@ mod tests {
         assert_eq!(args[map_pos + 1], "0:0");
         let af_pos = args.iter().position(|a| a == "-af").unwrap();
         assert_eq!(args[af_pos + 1], "pan=mono|FC=c3");
+    }
+
+    #[test]
+    fn test_parse_sample_rate_from_ffprobe_json() {
+        let json = r#"{"streams":[{"index":1,"codec_name":"aac","channels":2,"sample_rate":"48000"}]}"#;
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        let s = &parsed["streams"][0];
+        let sr = s["sample_rate"].as_str().and_then(|v| v.parse::<u32>().ok()).unwrap_or(48000);
+        assert_eq!(sr, 48000);
+    }
+
+    #[test]
+    fn test_parse_sample_rate_fallback_on_missing() {
+        let json = r#"{"streams":[{"index":1,"codec_name":"pcm_s16le","channels":1}]}"#;
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        let s = &parsed["streams"][0];
+        let sr = s["sample_rate"].as_str().and_then(|v| v.parse::<u32>().ok()).unwrap_or(48000);
+        assert_eq!(sr, 48000);
     }
 
     #[test]

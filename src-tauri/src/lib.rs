@@ -266,6 +266,10 @@ struct ConvertRequest {
     #[serde(default)]
     drop_ltc_track: bool,
     #[serde(default)]
+    ltc_video_source_stream: i32,
+    #[serde(default)]
+    ltc_video_source_channel: i32,
+    #[serde(default)]
     generate_synthetic_video: bool,
     #[serde(default)]
     trim_to_first_ltc: bool,
@@ -337,6 +341,13 @@ fn start_convert(
         request.trim_offsets_secs
     };
 
+    let ltc_video_source = match recording_type {
+        RecordingType::VideoClipSequence if request.ltc_video_source_stream >= 0 => {
+            Some((request.ltc_video_source_stream as usize, request.ltc_video_source_channel as usize))
+        }
+        _ => None,
+    };
+
     let settings = ConverterSettings {
         pipeline,
         input_files,
@@ -345,6 +356,7 @@ fn start_convert(
         channel_map,
         split_tracks: request.split_tracks,
         drop_ltc_track: request.drop_ltc_track,
+        ltc_video_source,
         container: request.container,
         video_encoder: request.video_encoder,
         audio_encoder: request.audio_encoder,

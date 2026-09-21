@@ -809,6 +809,13 @@ fn _run_gui(
                 RecordingType::MultiTrackAudio => ConversionPipeline::AudioOnly { generate_synthetic_video: generate_video },
                 RecordingType::VideoClipSequence => ConversionPipeline::VideoPassthrough,
             };
+            let ltc_video_source = match rec_type {
+                RecordingType::VideoClipSequence => {
+                    let s = eng_state.load();
+                    Some((s.ltc_selected_stream, s.ltc_selected_channel))
+                }
+                RecordingType::MultiTrackAudio => None,
+            };
             let settings = ConverterSettings {
                 pipeline,
                 input_files,
@@ -817,6 +824,7 @@ fn _run_gui(
                 channel_map: map,
                 split_tracks: split_val,
                 drop_ltc_track: drop_val,
+                ltc_video_source,
                 container: container.lock().unwrap().clone(),
                 video_encoder: venc.lock().unwrap().clone(),
                 audio_encoder: aenc.lock().unwrap().clone(),
