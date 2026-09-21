@@ -23,12 +23,13 @@ pub use audio_core::{
 // Re-export converter/file_pattern types for convenience
 pub use converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, conversion_sanity_check, evaluate_readiness,
+    available_containers, conversion_sanity_check,
+    conversion_sanity_check_with_naming, evaluate_readiness,
     find_timecode_at_offset, format_blockers, format_ffmpeg_timecode,
     plan_video_outputs, query_ffmpeg_capabilities, select_best_combination,
     spawn_conversion, supported_audio_encoders, supported_containers,
     AudioKeep, ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
-    ConversionState, ConversionStatus, ConverterSettings, StepFailure,
+    ConversionState, ConversionStatus, ConverterSettings, OutputNamingMode, StepFailure,
     VideoOutputStep, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
     FfmpegCapabilities, RecordingType, SharedConversionState, CancelFlag,
     TimecodeMetadata,

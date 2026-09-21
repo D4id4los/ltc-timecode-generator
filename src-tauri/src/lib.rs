@@ -342,6 +342,7 @@ fn start_convert(
         filename_prefix: request.filename_prefix,
         audio_suffix_template: request.audio_suffix_template,
         video_suffix_template: request.video_suffix_template,
+        naming_mode: gui_engine::converter::OutputNamingMode::PrefixTemplates,
         trim_to_first_ltc: request.trim_to_first_ltc,
         trim_offsets_secs: trim_offsets,
         timecode_meta_per_file,

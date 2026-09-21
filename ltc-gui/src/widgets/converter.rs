@@ -7,11 +7,11 @@ use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, conversion_sanity_check, evaluate_readiness,
+    available_containers, conversion_sanity_check_with_naming, evaluate_readiness,
     find_timecode_at_offset, format_blockers, query_ffmpeg_capabilities,
     spawn_conversion, supported_audio_encoders, supported_containers,
     ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
-    ConverterSettings, FfmpegCapabilities, RecordingType, TimecodeMetadata,
+    ConverterSettings, FfmpegCapabilities, OutputNamingMode, RecordingType, TimecodeMetadata,
 };
 use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
 use gui_engine::file_pattern::match_files_all_patterns;
@@ -170,6 +170,10 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                                 state.channel_map = ChannelMap::identity(num_ch);
                                 state.recording_type = group.recording_type.clone();
                                 state.filename_prefix = group.prefix.clone();
+                                state.naming_mode = match group.recording_type {
+                                    RecordingType::VideoClipSequence => OutputNamingMode::SourceStems,
+                                    RecordingType::MultiTrackAudio => OutputNamingMode::PrefixTemplates,
+                                };
                                 state.output_folder = state.selected_folder.clone().unwrap_or_default();
                                 state.split_tracks = false;
                                 state.drop_ltc_track = false;
@@ -1006,7 +1010,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             .map(|g| g.files.clone())
             .unwrap_or_default();
 
-        match conversion_sanity_check(
+        match conversion_sanity_check_with_naming(
             &state.container,
             &state.video_encoder,
             &state.audio_encoder,
@@ -1016,6 +1020,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             caps,
             Some(&state.audio_suffix_template),
             Some(&state.video_suffix_template),
+            Some(&state.naming_mode),
         ) {
             Ok(()) => {
                 let codec = normalize_video_codec(&state.video_encoder);
@@ -1165,38 +1170,58 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     });
 
     // Preview of output filenames
-    if !state.filename_prefix.is_empty() {
+    let has_group = state.selected_group_idx.is_some();
+    if has_group && (state.naming_mode == OutputNamingMode::SourceStems || !state.filename_prefix.is_empty()) {
         ui.add_space(4.0);
-        let total_probed = state.latest.ltc_probe.as_ref().map(|p| p.total_audio_channels).unwrap_or(0);
-        let num_video = if state.recording_type == RecordingType::VideoClipSequence {
-            state.selected_group_idx
-                .and_then(|idx| state.file_groups.as_ref()?.get(idx))
-                .map(|g| g.files.len())
-                .unwrap_or(0)
-        } else {
-            0
+        let ext = match state.container.as_str() {
+            "mp4" | "mov" | "mkv" | "mxf" | "webm" => state.container.clone(),
+            _ => "mkv".to_string(),
         };
-        let preview = if state.split_tracks {
-            let n = if state.recording_type == RecordingType::VideoClipSequence {
-                total_probed
+        let group = state.selected_group_idx
+            .and_then(|idx| state.file_groups.as_ref()?.get(idx));
+        let num_files = group.map(|g| g.files.len()).unwrap_or(0);
+        let is_source_stems = state.naming_mode == OutputNamingMode::SourceStems;
+        if is_source_stems && num_files > 0 {
+            // Show per-file output names
+            let lines: Vec<String> = group.unwrap().files.iter().enumerate().map(|(i, f)| {
+                let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                let suffix = state.video_suffix_template
+                    .replace("{:01d}", &format!("{:01}", i + 1))
+                    .replace("{:02d}", &format!("{:02}", i + 1))
+                    .replace("{:03d}", &format!("{:03}", i + 1));
+                format!("  {}{}.{}", stem, suffix, ext)
+            }).collect();
+            ui.label(RichText::new(format!("↳ {} output file(s):", num_files))
+                .font(FontId::proportional(9.0)).color(colors.text_secondary));
+            for line in lines {
+                ui.label(RichText::new(line)
+                    .font(FontId::monospace(8.5)).color(colors.text_muted));
+            }
+        } else {
+            let total_probed = state.latest.ltc_probe.as_ref().map(|p| p.total_audio_channels).unwrap_or(0);
+            let num_video = if state.recording_type == RecordingType::VideoClipSequence { num_files } else { 0 };
+            let preview = if state.split_tracks {
+                let n = if state.recording_type == RecordingType::VideoClipSequence {
+                    total_probed
+                } else {
+                    state.channel_map.num_channels()
+                };
+                let count = if state.drop_ltc_track { n.saturating_sub(1) } else { n };
+                format!(
+                    "↳ {} audio file(s) + {} video clip(s) in {}",
+                    count,
+                    num_video,
+                    state.output_folder.display(),
+                )
             } else {
-                state.channel_map.num_channels()
+                format!(
+                    "↳ 1 audio file + {} video clip(s) in {}",
+                    num_video,
+                    state.output_folder.display(),
+                )
             };
-            let count = if state.drop_ltc_track { n.saturating_sub(1) } else { n };
-            format!(
-                "↳ {} audio file(s) + {} video clip(s) in {}",
-                count,
-                num_video,
-                state.output_folder.display(),
-            )
-        } else {
-            format!(
-                "↳ 1 audio file + {} video clip(s) in {}",
-                num_video,
-                state.output_folder.display(),
-            )
-        };
-        ui.label(RichText::new(preview).font(FontId::proportional(9.0)).color(colors.text_secondary));
+            ui.label(RichText::new(preview).font(FontId::proportional(9.0)).color(colors.text_secondary));
+        }
     }
 
     // Trim to first LTC checkbox (renamed for clarity)
@@ -1273,7 +1298,7 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
     let sanity_ok = if can_convert {
         let caps = caps_opt.as_ref().unwrap();
         let input_files = selected_input_files(state);
-        conversion_sanity_check(
+        conversion_sanity_check_with_naming(
             &state.container,
             &state.video_encoder,
             &state.audio_encoder,
@@ -1283,6 +1308,7 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
             caps,
             Some(&state.audio_suffix_template),
             Some(&state.video_suffix_template),
+            Some(&state.naming_mode),
         )
         .is_ok()
     } else {
@@ -1396,6 +1422,7 @@ fn start_conversion(state: &mut AppState) {
         filename_prefix: state.filename_prefix.clone(),
         audio_suffix_template: state.audio_suffix_template.clone(),
         video_suffix_template: state.video_suffix_template.clone(),
+        naming_mode: state.naming_mode.clone(),
         trim_to_first_ltc: state.trim_ltc_start,
         trim_offsets_secs: trim_offsets,
         timecode_meta_per_file,

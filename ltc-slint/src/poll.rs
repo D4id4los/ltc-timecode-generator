@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gui_engine::converter::{ConversionState, ConversionStatus, FfmpegCapabilities};
+use gui_engine::converter::{ConversionState, ConversionStatus, FfmpegCapabilities, OutputNamingMode};
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode;
@@ -34,6 +34,7 @@ pub fn setup_poll_timer(
     conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>>,
     conv_sanity_msg: Arc<Mutex<String>>,
     conv_filename_prefix: Arc<Mutex<String>>,
+    conv_naming_mode: Arc<Mutex<OutputNamingMode>>,
     conv_file_groups: Arc<Mutex<BTreeMap<String, Vec<PathBuf>>>>,
     conv_selected_group_idx: Arc<Mutex<isize>>,
     conv_container: Arc<Mutex<String>>,
@@ -350,12 +351,13 @@ pub fn setup_poll_timer(
                 let aenc = conv_audio_encoder.lock().unwrap().clone();
                 let folder = conv_selected_folder.lock().unwrap().clone();
                 let filename_prefix = conv_filename_prefix.lock().unwrap().clone();
+                let naming_mode = conv_naming_mode.lock().unwrap().clone();
                 let mut msg = String::new();
                 match caps {
                     Some(ref c) if !c.has_ffmpeg => {
                         msg = "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.".to_string();
                     }
-                    Some(_) if filename_prefix.is_empty() => {
+                    Some(_) if !naming_mode.is_source_stems() && filename_prefix.is_empty() => {
                         msg = "No input group selected.".to_string();
                     }
                     Some(ref c) => {
@@ -374,9 +376,9 @@ pub fn setup_poll_timer(
                             Vec::new()
                         };
                         let output_folder = Path::new(&folder);
-                        if let Err(e) = gui_engine::converter::conversion_sanity_check(
+                        if let Err(e) = gui_engine::converter::conversion_sanity_check_with_naming(
                             &container, &venc, &aenc, &input_files, output_folder, &filename_prefix, c,
-                            None, None,
+                            None, None, Some(&naming_mode),
                         ) {
                             msg = e;
                         }

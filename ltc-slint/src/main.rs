@@ -14,7 +14,7 @@ use gui_engine::converter::{
     find_timecode_at_offset, query_ffmpeg_capabilities, select_best_combination,
     spawn_conversion, ChannelMap, ConversionPipeline, ConversionState,
     ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
-    FfmpegCapabilities, RecordingType, TimecodeMetadata,
+    FfmpegCapabilities, OutputNamingMode, RecordingType, TimecodeMetadata,
 };
 use gui_engine::video_codecs::{available_video_codecs, supported_video_codecs};
 use gui_engine::file_pattern::{match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
@@ -114,6 +114,7 @@ fn _run_gui(
     let conv_sanity_msg: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let conv_trim_to_first_ltc: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_trim_offset_secs: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    let conv_naming_mode: Arc<Mutex<OutputNamingMode>> = Arc::new(Mutex::new(OutputNamingMode::PrefixTemplates));
 
     let conv_folder_for_group = conv_selected_folder.clone();
     let conv_ffmpeg_caps_for_select = conv_ffmpeg_caps.clone();
@@ -668,6 +669,7 @@ fn _run_gui(
         let cmap = conv_channel_map.clone();
         let out_path = conv_output_path.clone();
         let prefix_arc = conv_filename_prefix.clone();
+        let naming_arc = conv_naming_mode.clone();
         let pattern_arc_sel = conv_selected_pattern.clone();
         let audio_suffix = conv_audio_suffix_template.clone();
         let video_suffix = conv_video_suffix_template.clone();
@@ -686,6 +688,11 @@ fn _run_gui(
                 *cmap.lock().unwrap() = ChannelMap::identity(n);
                 *idx.lock().unwrap() = group_idx as isize;
                 *prefix_arc.lock().unwrap() = prefix.clone();
+                *naming_arc.lock().unwrap() = if is_video {
+                    OutputNamingMode::SourceStems
+                } else {
+                    OutputNamingMode::PrefixTemplates
+                };
                 *out_path.lock().unwrap() = String::new();
                 *split_arc.lock().unwrap() = false;
                 *drop_arc.lock().unwrap() = false;
@@ -748,6 +755,7 @@ fn _run_gui(
         let venc = conv_video_encoder.clone();
         let aenc = conv_audio_encoder.clone();
         let name_prefix_arc = conv_filename_prefix.clone();
+        let naming_arc2 = conv_naming_mode.clone();
         let trim_flag = conv_trim_to_first_ltc.clone();
         let trim_offset = conv_trim_offset_secs.clone();
         let eng_state = engine_state.clone();
@@ -832,6 +840,7 @@ fn _run_gui(
                 resolved_video_encoder: String::new(),
                 output_folder: PathBuf::from(&folder_path),
                 filename_prefix,
+                naming_mode: naming_arc2.lock().unwrap().clone(),
                 audio_suffix_template: audio_suffix_val,
                 video_suffix_template: video_suffix_val,
                 trim_to_first_ltc: trim_flag_val,
@@ -1290,6 +1299,7 @@ fn _run_gui(
         conv_ffmpeg_caps,
         conv_sanity_msg,
         conv_filename_prefix,
+        conv_naming_mode,
         conv_file_groups,
         conv_selected_group_idx,
         conv_container,

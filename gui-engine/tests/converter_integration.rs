@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use gui_engine::converter::{
     query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionPipeline, ConversionState,
-    ConversionStatus, ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, RecordingType,
+    ConversionStatus, ConverterSettings, OutputNamingMode, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, RecordingType,
 };
 use gui_engine::video_codecs::resolve_encoder_chain;
 
@@ -104,6 +104,7 @@ fn test_conversion_progress_tracking() {
         filename_prefix: "test".to_string(),
         audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
         video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
+        naming_mode: OutputNamingMode::PrefixTemplates,
         trim_to_first_ltc: false,
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
@@ -211,6 +212,7 @@ fn make_test_settings(dir: &Path, input_files: Vec<std::path::PathBuf>) -> Conve
         filename_prefix: "test".to_string(),
         audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
         video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
+        naming_mode: OutputNamingMode::PrefixTemplates,
         trim_to_first_ltc: false,
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],

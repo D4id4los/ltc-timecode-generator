@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, FontId, RichText, Sense, Ui};
 use gui_engine::command::GuiCommand;
 use gui_engine::config;
-use gui_engine::converter::{ChannelMap, ConversionState, FfmpegCapabilities, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, query_ffmpeg_capabilities};
+use gui_engine::converter::{ChannelMap, ConversionState, FfmpegCapabilities, OutputNamingMode, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, query_ffmpeg_capabilities};
 use gui_engine::file_pattern::{match_files_all_patterns, MatchedGroup};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
@@ -100,6 +100,7 @@ pub struct AppState {
     pub filename_prefix: String,
     pub audio_suffix_template: String,
     pub video_suffix_template: String,
+    pub naming_mode: OutputNamingMode,
     pub conversion_state: SharedConversionState,
     pub cancel_flag: CancelFlag,
     pub convert_handle: Option<JoinHandle<()>>,
@@ -110,7 +111,7 @@ pub struct AppState {
     pub per_file_trim_offsets: Vec<f64>,
 }
 
-type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>, Option<usize>, ChannelMap, RecordingType, String);
+type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>, Option<usize>, ChannelMap, RecordingType, String, OutputNamingMode);
 
 impl AppState {
     pub fn new(
@@ -135,7 +136,7 @@ impl AppState {
         let initial = AppStateSnapshot::initial();
 
         // Restore last used converter folders from config
-        let (selected_folder, file_groups, selected_group_idx, channel_map, recording_type, filename_prefix)
+        let (selected_folder, file_groups, selected_group_idx, channel_map, recording_type, filename_prefix, naming_mode)
             = Self::restore_input_folder(&cfg);
         let output_folder = cfg.last_output_folder.map(PathBuf::from).unwrap_or_default();
 
@@ -184,6 +185,7 @@ impl AppState {
             audio_encoder: "pcm_s24le".to_string(),
             output_folder,
             filename_prefix,
+            naming_mode,
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
             conversion_state: Arc::new(Mutex::new(ConversionState::idle())),
@@ -200,19 +202,23 @@ impl AppState {
     fn restore_input_folder(cfg: &config::ConverterConfig) -> RestoredFolder {
         let folder = match cfg.last_input_folder {
             Some(ref p) => PathBuf::from(p),
-            None => return (None, None, None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new()),
+            None => return (None, None, None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new(), OutputNamingMode::PrefixTemplates),
         };
         if !folder.exists() {
-            return (None, None, None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new());
+            return (None, None, None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new(), OutputNamingMode::PrefixTemplates);
         }
         let groups = match_files_all_patterns(&folder);
         if groups.is_empty() {
-            return (Some(folder), Some(groups), None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new());
+            return (Some(folder), Some(groups), None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new(), OutputNamingMode::PrefixTemplates);
         }
         let num_files = groups[0].files.len();
         let rec_type = groups[0].recording_type.clone();
         let prefix = groups[0].prefix.clone();
-        (Some(folder), Some(groups), Some(0), ChannelMap::identity(num_files), rec_type, prefix)
+        let naming_mode = match rec_type {
+            RecordingType::VideoClipSequence => OutputNamingMode::SourceStems,
+            RecordingType::MultiTrackAudio => OutputNamingMode::PrefixTemplates,
+        };
+        (Some(folder), Some(groups), Some(0), ChannelMap::identity(num_files), rec_type, prefix, naming_mode)
     }
 
     pub fn send(&self, cmd: GuiCommand) {
