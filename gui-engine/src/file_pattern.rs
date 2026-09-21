@@ -8,21 +8,24 @@ pub struct FileNamingPattern {
     pub name: &'static str,
     pub description: &'static str,
     pub regex: &'static str,
-    pub channel_group_index: usize,
+    pub prefix_group: &'static str,
+    pub channel_group: Option<&'static str>,
 }
 
 pub static BUILTIN_PATTERNS: &[FileNamingPattern] = &[
     FileNamingPattern {
         name: "TASCAM",
         description: "Tascam Portacapture X8 — name prefix + S<channel>",
-        regex: r"^(.+?)S(\d+)$",
-        channel_group_index: 2,
+        regex: r"^(?P<prefix>.+?)S(?P<channel>\d+)$",
+        prefix_group: "prefix",
+        channel_group: Some("channel"),
     },
     FileNamingPattern {
         name: "* (any)",
         description: "Any file — select files directly",
         regex: r"^.*$",
-        channel_group_index: 2,
+        prefix_group: "prefix",
+        channel_group: None,
     },
 ];
 
@@ -31,32 +34,37 @@ pub static CAMERA_PATTERNS: &[FileNamingPattern] = &[
     FileNamingPattern {
         name: "Sony Handycam",
         description: "Sony Handycam — Cxxxx.MP4/MTS",
-        regex: r"^(.*C\d{4}.*)\.(mp4|MP4|MTS|mts|M4V|m4v|)$",
-        channel_group_index: 0,
+        regex: r"^(?P<prefix>.*C\d{4}.*)\.(?:mp4|MP4|MTS|mts|M4V|m4v|)$",
+        prefix_group: "prefix",
+        channel_group: None,
     },
     FileNamingPattern {
         name: "Sony FS100",
         description: "Sony FS100 — xxxxx.MTS",
-        regex: r"^(.*\d{5}.*)\.(MTS|mts|M4V|m4v)$",
-        channel_group_index: 0,
+        regex: r"^(?P<prefix>.*\d{5}.*)\.(?:MTS|mts|M4V|m4v)$",
+        prefix_group: "prefix",
+        channel_group: None,
     },
     FileNamingPattern {
         name: "Canon",
         description: "Canon — MVI_xxxx.MP4",
-        regex: r"^(.*MVI_\d{4}.*)\.(mp4|MP4)$",
-        channel_group_index: 0,
+        regex: r"^(?P<prefix>.*MVI_\d{4}.*)\.(?:mp4|MP4)$",
+        prefix_group: "prefix",
+        channel_group: None,
     },
     FileNamingPattern {
         name: "Panasonic",
         description: "Panasonic — GHxxxxx.MP4",
-        regex: r"^(.*GH\d{5}.*)\.(mp4|MP4)$",
-        channel_group_index: 0,
+        regex: r"^(?P<prefix>.*GH\d{5}.*)\.(?:mp4|MP4)$",
+        prefix_group: "prefix",
+        channel_group: None,
     },
     FileNamingPattern {
         name: "GoPro",
         description: "GoPro — GOPRxxxx/GPxxxxxx.MP4",
-        regex: r"^(.*GOPR\d{4}|GP\d{6}.*)\.(mp4|MP4)$",
-        channel_group_index: 0,
+        regex: r"^(?P<prefix>.*(?:GOPR\d{4}|GP\d{6}).*)\.(?:mp4|MP4)$",
+        prefix_group: "prefix",
+        channel_group: None,
     },
 ];
 
@@ -94,13 +102,16 @@ pub fn match_files_to_groups(
 
         if let Some(caps) = re.captures(&stem) {
             let prefix = caps
-                .get(1)
+                .name(pattern.prefix_group)
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default();
-            let _channel: u32 = caps
-                .get(pattern.channel_group_index)
-                .and_then(|m| m.as_str().parse().ok())
-                .unwrap_or(0);
+            let _channel: u32 = match pattern.channel_group {
+                Some(ch_name) => caps
+                    .name(ch_name)
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(0),
+                None => 0,
+            };
 
             groups
                 .entry(prefix)
@@ -114,16 +125,20 @@ pub fn match_files_to_groups(
             let a_stem = a.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let b_stem = b.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-            let a_ch: u32 = re
-                .captures(a_stem)
-                .and_then(|c| c.get(pattern.channel_group_index))
-                .and_then(|m| m.as_str().parse().ok())
-                .unwrap_or(u32::MAX);
-            let b_ch: u32 = re
-                .captures(b_stem)
-                .and_then(|c| c.get(pattern.channel_group_index))
-                .and_then(|m| m.as_str().parse().ok())
-                .unwrap_or(u32::MAX);
+            let a_ch: u32 = {
+                let ch_name = pattern.channel_group;
+                re.captures(a_stem)
+                    .and_then(|c| ch_name.and_then(move |n| c.name(n)))
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(u32::MAX)
+            };
+            let b_ch: u32 = {
+                let ch_name = pattern.channel_group;
+                re.captures(b_stem)
+                    .and_then(|c| ch_name.and_then(move |n| c.name(n)))
+                    .and_then(|m| m.as_str().parse().ok())
+                    .unwrap_or(u32::MAX)
+            };
 
             a_ch.cmp(&b_ch)
         });
@@ -205,7 +220,7 @@ pub fn match_files_all_patterns(folder: &Path) -> Vec<MatchedGroup> {
             // or against the stem (TASCAM pattern matches stem only)
             let match_str = if pattern.name == "TASCAM" { &stem } else { &file_name };
             if let Some(caps) = re.captures(match_str) {
-                let prefix = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let prefix = caps.name(pattern.prefix_group).map(|m| m.as_str().to_string()).unwrap_or_default();
                 used_stems.insert(dedup_key);
                 group_map.entry(prefix).or_default().push(path);
             }
@@ -224,14 +239,20 @@ pub fn match_files_all_patterns(folder: &Path) -> Vec<MatchedGroup> {
                 } else {
                     b.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string()
                 };
-                let a_ch: u32 = re.captures(&a_str)
-                    .and_then(|c| c.get(pattern.channel_group_index))
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(u32::MAX);
-                let b_ch: u32 = re.captures(&b_str)
-                    .and_then(|c| c.get(pattern.channel_group_index))
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(u32::MAX);
+                let a_ch: u32 = {
+                    let ch_name = pattern.channel_group;
+                    re.captures(&a_str)
+                        .and_then(|c| ch_name.and_then(move |n| c.name(n)))
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(u32::MAX)
+                };
+                let b_ch: u32 = {
+                    let ch_name = pattern.channel_group;
+                    re.captures(&b_str)
+                        .and_then(|c| ch_name.and_then(move |n| c.name(n)))
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(u32::MAX)
+                };
                 a_ch.cmp(&b_ch)
             });
 
@@ -456,7 +477,8 @@ mod tests {
             name: "bad",
             description: "broken regex",
             regex: r"[invalid",
-            channel_group_index: 1,
+            prefix_group: "prefix",
+            channel_group: Some("channel"),
         };
         let dir = tempfile::TempDir::new().unwrap();
         let result = match_files_to_groups(dir.path(), &bad_pattern);
@@ -476,18 +498,18 @@ mod tests {
 
     #[test]
     fn test_sony_handycam_pattern_matches() {
-        let re = Regex::new(r"^(C\d{4})\.(mp4|MP4|MTS|mts)$").unwrap();
+        let re = Regex::new(r"^(?P<prefix>C\d{4})\.(?:mp4|MP4|MTS|mts)$").unwrap();
         assert!(re.is_match("C0001.MP4"));
         assert!(re.is_match("C0002.mp4"));
         assert!(re.is_match("C0123.MTS"));
         assert!(re.is_match("C9999.mts"));
         let caps = re.captures("C0042.MP4").unwrap();
-        assert_eq!(caps.get(1).unwrap().as_str(), "C0042");
+        assert_eq!(caps.name("prefix").unwrap().as_str(), "C0042");
     }
 
     #[test]
     fn test_sony_handycam_pattern_rejects() {
-        let re = Regex::new(r"^(C\d{4})\.(mp4|MP4|MTS|mts)$").unwrap();
+        let re = Regex::new(r"^(?P<prefix>C\d{4})\.(?:mp4|MP4|MTS|mts)$").unwrap();
         assert!(!re.is_match("C00001.MP4"));   // 5 digits
         assert!(!re.is_match("C001.MP4"));      // 3 digits
         assert!(!re.is_match("D0001.MP4"));     // wrong prefix
@@ -496,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_sony_fs100_pattern_matches() {
-        let re = Regex::new(r"^(\d{5})\.(MTS|mts)$").unwrap();
+        let re = Regex::new(r"^(?P<prefix>\d{5})\.(?:MTS|mts)$").unwrap();
         assert!(re.is_match("00001.MTS"));
         assert!(re.is_match("12345.mts"));
         assert!(re.is_match("99999.MTS"));
@@ -506,11 +528,11 @@ mod tests {
 
     #[test]
     fn test_canon_pattern_matches() {
-        let re = Regex::new(r"^(MVI_\d{4})\.(mp4|MP4)$").unwrap();
+        let re = Regex::new(r"^(?P<prefix>MVI_\d{4})\.(?:mp4|MP4)$").unwrap();
         assert!(re.is_match("MVI_0001.mp4"));
         assert!(re.is_match("MVI_9999.MP4"));
         let caps = re.captures("MVI_0123.mp4").unwrap();
-        assert_eq!(caps.get(1).unwrap().as_str(), "MVI_0123");
+        assert_eq!(caps.name("prefix").unwrap().as_str(), "MVI_0123");
         assert!(!re.is_match("MVI_00001.mp4"));
         assert!(!re.is_match("MVI_000.MP4"));
         assert!(!re.is_match("MVX_0001.mp4"));
@@ -518,26 +540,26 @@ mod tests {
 
     #[test]
     fn test_panasonic_pattern_matches() {
-        let re = Regex::new(r"^(GH\d{5})\.(mp4|MP4)$").unwrap();
+        let re = Regex::new(r"^(?P<prefix>GH\d{5})\.(?:mp4|MP4)$").unwrap();
         assert!(re.is_match("GH00001.mp4"));
         assert!(re.is_match("GH12345.MP4"));
         let caps = re.captures("GH00001.mp4").unwrap();
-        assert_eq!(caps.get(1).unwrap().as_str(), "GH00001");
+        assert_eq!(caps.name("prefix").unwrap().as_str(), "GH00001");
         assert!(!re.is_match("GH0001.mp4"));
         assert!(!re.is_match("GH00001.mov"));
     }
 
     #[test]
     fn test_gopro_pattern_matches() {
-        let re = Regex::new(r"^(GOPR\d{4}|GP\d{6})\.(mp4|MP4)$").unwrap();
+        let re = Regex::new(r"^(?P<prefix>(?:GOPR\d{4}|GP\d{6}))\.(?:mp4|MP4)$").unwrap();
         assert!(re.is_match("GOPR0001.mp4"));
         assert!(re.is_match("GOPR9999.MP4"));
         assert!(re.is_match("GP000001.mp4"));
         assert!(re.is_match("GP123456.MP4"));
         let caps = re.captures("GOPR0042.mp4").unwrap();
-        assert_eq!(caps.get(1).unwrap().as_str(), "GOPR0042");
+        assert_eq!(caps.name("prefix").unwrap().as_str(), "GOPR0042");
         let caps = re.captures("GP000042.mp4").unwrap();
-        assert_eq!(caps.get(1).unwrap().as_str(), "GP000042");
+        assert_eq!(caps.name("prefix").unwrap().as_str(), "GP000042");
         assert!(!re.is_match("GOPR00001.mp4"));
         assert!(!re.is_match("GP00001.mp4"));
     }
