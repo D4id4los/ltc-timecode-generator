@@ -2,10 +2,42 @@
 
 * v0.4
 
-Main feature is a new much more performant slint based GUI.
+Main features are a new much more performant slint based GUI, a new convert
+tab that allows loading audio or video files with an LTC track and use that to
+produce clipped versions that have the correct timecode from LTC set, ready for
+import into a video editing software, and a major overhaul of the LTC decoding
+performance, robustness, and reporting.
 
 List of Changes:
 - Added Slint based GUI.
+- Added convert tab to all GUIs.
+- Refactored the shared GUI logic into a common gui-engine crate used by both
+  native GUIs (audio lifecycle, state management, CLI, decoding, conversion).
+- Major LTC decoding overhaul:
+  - Chunked parallel decoding of large files with progress display and
+    cancellation.
+  - Improved robustness against clock drift, better fallback handling, and
+    fixed phase-offset and chunk-overlap bugs.
+  - Added a timecode quality measure/report (confidence, gaps, glitches) with
+    a verbose CLI mode and copy-report buttons in the GUIs.
+  - Added a CLI flag to list all decoded timecodes in a file.
+  - Made the libltc decoder (--decoder libltc) selectable in the GUIs.
+  - Filter out bogus timecodes at the start of files.
+- Convert tab improvements:
+  - Support video files for LTC track selection and decoding.
+  - LTC-based trimming to the first detected timecode frame.
+  - Auto-enable split tracks & drop LTC track after LTC detection.
+  - Flexible user-defined file naming patterns for grouping input files.
+  - Remember last used input & output folders.
+- Unified and improved ffmpeg integration: single detection shared between
+  GUIs, better format/encoder capability querying and defaults, fixed mkv
+  detection, audio channel mapping, and split tracks on video files.
+- Changed supported sample rates to 44100 and 48000 Hz.
+- Fixed a bug in the TypeScript LTC generation, with regression tests in TS & Rust.
+- Added extensive unit & integration tests for audio-core and gui-engine.
+- Added clippy linting to the project and fixed warnings.
+- Unified default settings and colour definitions between the Rust GUIs.
+- Improved the version sync script to cover all crate manifests and lock files.
 
 * v0.3.3
 
