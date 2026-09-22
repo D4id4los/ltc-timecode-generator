@@ -112,6 +112,8 @@ pub struct AppState {
 
     // Latch: generation for which auto-settings (trim/split/drop) have been applied
     ltc_auto_applied_gen: u64,
+    // Latch: group generation for which auto-settings have been applied
+    ltc_group_auto_applied_gen: u64,
 }
 
 type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>, Option<usize>, ChannelMap, RecordingType, String, OutputNamingMode);
@@ -182,6 +184,7 @@ impl AppState {
             trim_offset_secs: 0.0,
             per_file_trim_offsets: Vec::new(),
             ltc_auto_applied_gen: 0,
+            ltc_group_auto_applied_gen: 0,
         }
     }
 
@@ -208,8 +211,9 @@ impl AppState {
     }
 
     /// Applies auto-settings (trim/split/drop) from a successful decode result,
-    /// but only once per `ltc_decode_generation` so user unticks survive.
+    /// but only once per generation so user unticks survive.
     fn sync_ltc_decode_auto_settings(&mut self) {
+        // Single-file decode (audio groups or single video)
         if let Some(ref result) = self.latest.ltc_decode_result {
             if matches!(result.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence)
                 && self.ltc_auto_applied_gen != self.latest.ltc_decode_generation
@@ -219,6 +223,21 @@ impl AppState {
                 self.split_tracks = true;
                 self.drop_ltc_track = true;
                 self.ltc_auto_applied_gen = self.latest.ltc_decode_generation;
+            }
+        }
+
+        // Group decode (video clip groups)
+        if !self.latest.ltc_group_is_detecting
+            && self.latest.ltc_group_done > 0
+            && self.latest.ltc_group_done >= self.latest.ltc_group_total
+            && self.ltc_group_auto_applied_gen != self.latest.ltc_group_decode_generation
+        {
+            let has_success = self.latest.ltc_group_results.iter().any(|r| r.is_some());
+            if has_success {
+                self.trim_ltc_start = true;
+                self.split_tracks = true;
+                self.drop_ltc_track = true;
+                self.ltc_group_auto_applied_gen = self.latest.ltc_group_decode_generation;
             }
         }
     }

@@ -47,6 +47,11 @@ pub enum GuiCommand {
     // ── LTC decode (video) ─────────────────────────────────────────────
     ProbeVideo(String),
     ParseLtcVideo(String, usize, usize),
+    /// Decode LTC from every video clip in a recording group.
+    /// `paths` are the full filesystem paths of all clips.
+    DecodeLtcVideoGroup { paths: Vec<String>, stream_index: usize, channel_index: usize },
+    /// Clear accumulated group decode results (sent on group re-selection).
+    ClearLtcGroupResults,
     SetLtcDecodeStream(usize),
     SetLtcDecodeChannel(usize),
 

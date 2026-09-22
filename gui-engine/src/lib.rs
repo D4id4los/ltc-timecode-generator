@@ -24,7 +24,7 @@ pub use audio_core::{
 // Re-export converter/file_pattern types for convenience
 pub use converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, conversion_sanity_check,
+    available_containers, build_per_file_trim_and_timecode, conversion_sanity_check,
     conversion_sanity_check_with_naming, evaluate_readiness,
     find_timecode_at_offset, format_blockers, format_ffmpeg_timecode,
     plan_concat_outputs, plan_video_outputs, query_ffmpeg_capabilities,

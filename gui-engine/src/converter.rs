@@ -1403,6 +1403,42 @@ pub fn shift_timecode_back(tc: &Timecode, delta_secs: f64, fps: f64, drop_frame:
     out
 }
 
+/// Build per-file trim offsets and timecode metadata from per-clip decode results.
+///
+/// For each clip with a successful decode:
+/// - `trim_secs` = `first_ltc_timecode_secs`
+/// - `timecode` = `find_timecode_at_offset(r.timecodes, trim_secs)`
+/// - For failed/missing decodes: `(0.0, None)`.
+///
+/// Useful for video clip groups where each clip has its own LTC signal.
+pub fn build_per_file_trim_and_timecode(
+    results: &[Option<&audio_core::LtcDetectionResult>],
+) -> (Vec<f64>, Vec<Option<TimecodeMetadata>>) {
+    let mut trims = Vec::with_capacity(results.len());
+    let mut metas = Vec::with_capacity(results.len());
+
+    for result_opt in results {
+        match result_opt {
+            Some(r) if matches!(r.status, audio_core::LtcDecodeStatus::Success | audio_core::LtcDecodeStatus::LowConfidence) => {
+                let trim = r.first_ltc_timecode_secs;
+                let meta = find_timecode_at_offset(&r.timecodes, trim).map(|tc| TimecodeMetadata {
+                    start: tc,
+                    fps: r.detected_fps as f64,
+                    drop_frame: r.drop_frame,
+                });
+                trims.push(trim);
+                metas.push(meta);
+            }
+            _ => {
+                trims.push(0.0);
+                metas.push(None);
+            }
+        }
+    }
+
+    (trims, metas)
+}
+
 /// Binary-search `timecodes` for the `FrameTimecode` closest to `offset_secs`
 /// and return its `Timecode` value.  Returns `None` if the slice is empty.
 pub fn find_timecode_at_offset(
@@ -3170,6 +3206,96 @@ mod tests {
         ];
         let found = find_timecode_at_offset(&tcs, 0.0).unwrap();
         assert_eq!(found.seconds, 5);
+    }
+
+    #[test]
+    fn test_build_per_file_trim_and_timecode_all_success() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let r1 = LtcDetectionResult {
+            first_ltc_timecode_secs: 10.5,
+            detected_fps: 25.0,
+            drop_frame: false,
+            timecodes: vec![
+                FrameTimecode { frame_index: 0, timecode: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 0.0 },
+                FrameTimecode { frame_index: 263, timecode: Timecode { hours: 1, minutes: 0, seconds: 10, frames: 12 }, timecode_secs: 10.5 },
+            ],
+            status: LtcDecodeStatus::Success,
+            valid_frames: 100,
+            total_possible_frames: 100,
+            total_audio_duration_secs: 11.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let r2 = LtcDetectionResult {
+            first_ltc_timecode_secs: 5.2,
+            detected_fps: 25.0,
+            drop_frame: false,
+            timecodes: vec![
+                FrameTimecode { frame_index: 0, timecode: Timecode { hours: 2, minutes: 0, seconds: 5, frames: 5 }, timecode_secs: 5.2 },
+            ],
+            status: LtcDecodeStatus::Success,
+            valid_frames: 80,
+            total_possible_frames: 100,
+            total_audio_duration_secs: 6.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let results: [Option<&LtcDetectionResult>; 2] = [Some(&r1), Some(&r2)];
+        let (trims, metas) = build_per_file_trim_and_timecode(&results);
+        assert_eq!(trims.len(), 2);
+        assert!((trims[0] - 10.5).abs() < 1e-9, "trim[0] should be 10.5, got {}", trims[0]);
+        assert!((trims[1] - 5.2).abs() < 1e-9, "trim[1] should be 5.2, got {}", trims[1]);
+        assert!(metas[0].is_some(), "meta[0] should be Some");
+        assert_eq!(metas[0].as_ref().unwrap().start.seconds, 10);
+        assert!(metas[1].is_some(), "meta[1] should be Some");
+        assert_eq!(metas[1].as_ref().unwrap().start.minutes, 0);
+        assert_eq!(metas[1].as_ref().unwrap().start.seconds, 5);
+    }
+
+    #[test]
+    fn test_build_per_file_trim_and_timecode_with_failures() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let r = LtcDetectionResult {
+            first_ltc_timecode_secs: 10.5,
+            detected_fps: 25.0,
+            drop_frame: false,
+            timecodes: vec![
+                FrameTimecode { frame_index: 0, timecode: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 0.0 },
+                FrameTimecode { frame_index: 263, timecode: Timecode { hours: 1, minutes: 0, seconds: 10, frames: 12 }, timecode_secs: 10.5 },
+            ],
+            status: LtcDecodeStatus::Success,
+            valid_frames: 100,
+            total_possible_frames: 100,
+            total_audio_duration_secs: 11.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let results: [Option<&LtcDetectionResult>; 3] = [Some(&r), None, Some(&r)];
+        let (trims, metas) = build_per_file_trim_and_timecode(&results);
+        assert_eq!(trims.len(), 3);
+        assert!((trims[0] - 10.5).abs() < 1e-9);
+        assert!((trims[1]).abs() < 1e-9, "failed clip should have trim 0.0");
+        assert!((trims[2] - 10.5).abs() < 1e-9);
+        assert!(metas[0].is_some());
+        assert!(metas[1].is_none(), "failed clip should have None meta");
+        assert!(metas[2].is_some());
+    }
+
+    #[test]
+    fn test_build_per_file_trim_and_timecode_empty() {
+        let results: [Option<&audio_core::LtcDetectionResult>; 0] = [];
+        let (trims, metas) = build_per_file_trim_and_timecode(&results);
+        assert!(trims.is_empty());
+        assert!(metas.is_empty());
     }
 
     #[test]

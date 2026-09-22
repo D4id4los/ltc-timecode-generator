@@ -11,7 +11,7 @@ use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
-    find_timecode_at_offset, select_best_combination,
+    build_per_file_trim_and_timecode, find_timecode_at_offset, select_best_combination,
     spawn_conversion, ChannelMap, ConversionPipeline, ConversionState,
     ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
     FfmpegCapabilities, OutputNamingMode, RecordingType, TimecodeMetadata,
@@ -708,6 +708,9 @@ fn _run_gui(
                     u.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
                 }
 
+                // Clear stale group decode results when switching groups
+                let _ = cmd_group.send(GuiCommand::ClearLtcGroupResults);
+
                 // Auto-probe video files for audio streams
                 if is_video && !files.is_empty() {
                     let folder_str = folder_for_group.lock().unwrap().clone();
@@ -771,30 +774,44 @@ fn _run_gui(
             let num_files = input_files.len();
             let map = cmap.lock().unwrap().clone();
             let trim_flag_val = *trim_flag.lock().unwrap();
-            let trim_secs = if trim_flag_val { *trim_offset.lock().unwrap() } else { 0.0 };
             let filename_prefix = name_prefix_arc.lock().unwrap().clone();
-            let trim_offsets_secs: Vec<f64> = if trim_flag_val && trim_secs > 0.001 {
-                vec![trim_secs; num_files]
-            } else {
-                vec![0.0; num_files]
-            };
-            let ltc_result = eng_state.load().ltc_decode_result.clone();
-            let timecode_meta_per_file: Vec<Option<TimecodeMetadata>> = if trim_flag_val && trim_secs > 0.001 {
-                (0..num_files).map(|_| {
-                    ltc_result.as_ref().and_then(|r| {
-                        use gui_engine::LtcDecodeStatus;
-                        if !matches!(r.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
-                            return None;
-                        }
-                        find_timecode_at_offset(&r.timecodes, trim_secs).map(|tc| TimecodeMetadata {
-                            start: tc,
-                            fps: r.detected_fps as f64,
-                            drop_frame: r.drop_frame,
+            let is_video_group = *pattern_arc2.lock().unwrap() == 1;
+            let snapshot = eng_state.load();
+
+            let (trim_offsets_secs, timecode_meta_per_file) = if trim_flag_val && is_video_group {
+                let group_results: Vec<Option<&gui_engine::LtcDetectionResult>> = snapshot.ltc_group_results
+                    .iter()
+                    .map(|r| r.as_ref())
+                    .collect();
+                build_per_file_trim_and_timecode(&group_results)
+            } else if trim_flag_val {
+                let trim_secs = *trim_offset.lock().unwrap();
+                let ltc_result = snapshot.ltc_decode_result.clone();
+                let trim_offsets_secs: Vec<f64> = if trim_secs > 0.001 {
+                    vec![trim_secs; num_files]
+                } else {
+                    vec![0.0; num_files]
+                };
+                let timecode_meta_per_file: Vec<Option<TimecodeMetadata>> = if trim_secs > 0.001 {
+                    (0..num_files).map(|_| {
+                        ltc_result.as_ref().and_then(|r| {
+                            use gui_engine::LtcDecodeStatus;
+                            if !matches!(r.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
+                                return None;
+                            }
+                            find_timecode_at_offset(&r.timecodes, trim_secs).map(|tc| TimecodeMetadata {
+                                start: tc,
+                                fps: r.detected_fps as f64,
+                                drop_frame: r.drop_frame,
+                            })
                         })
-                    })
-                }).collect()
+                    }).collect()
+                } else {
+                    vec![None; num_files]
+                };
+                (trim_offsets_secs, timecode_meta_per_file)
             } else {
-                vec![None; num_files]
+                (vec![0.0; num_files], vec![None; num_files])
             };
             let generate_video = *gen_synth.lock().unwrap();
             let split_val = *split_arc2.lock().unwrap();
@@ -1150,7 +1167,7 @@ u.set_conv_split_tracks(false);
             }
             let is_video = gui_engine::ffprobe::path_is_video(&full_path);
             if is_video {
-                // Read probe from state to translate flat channel index to (stream, channel)
+                // Batch-decode all files in the group
                 let s = detect_engine_state.load();
                 let flat_idx = ui_weak.upgrade()
                     .map(|u| u.get_ltc_selected_channel() as usize)
@@ -1167,11 +1184,16 @@ u.set_conv_split_tracks(false);
                     }
                     (0, 0)
                 });
-                let _ = cmd.send(GuiCommand::ParseLtcVideo(
-                    full_path.to_string_lossy().to_string(),
-                    stream_idx,
-                    channel_idx,
-                ));
+                // Build the full list of file paths for the batch decode
+                let folder_str = f.clone();
+                let paths: Vec<String> = files.iter()
+                    .map(|filename| PathBuf::from(&folder_str).join(filename).to_string_lossy().to_string())
+                    .collect();
+                let _ = cmd.send(GuiCommand::DecodeLtcVideoGroup {
+                    paths,
+                    stream_index: stream_idx,
+                    channel_index: channel_idx,
+                });
             } else {
                 let _ = cmd.send(GuiCommand::ParseLtcWavFile(
                     full_path.to_string_lossy().to_string(),

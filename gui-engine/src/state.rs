@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::converter::FfmpegCapabilities;
 use crate::ffprobe::VideoAudioProbe;
 use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
@@ -86,6 +88,20 @@ pub struct AppStateSnapshot {
     pub ltc_selected_channel: usize,
     pub ltc_decode_is_video: bool,
 
+    // LTC group (batch) decode — decode every clip in a video recording group
+    pub ltc_group_is_detecting: bool,
+    pub ltc_group_decode_generation: u64,
+    /// Paths of the group being decoded, index-aligned with results.
+    pub ltc_group_paths: Vec<PathBuf>,
+    /// Per-clip decode results (index matches ltc_group_paths).
+    pub ltc_group_results: Vec<Option<LtcDetectionResult>>,
+    /// Per-clip error messages when a clip's decode failed.
+    pub ltc_group_errors: Vec<Option<String>>,
+    /// Number of clips decoded so far.
+    pub ltc_group_done: usize,
+    /// Total number of clips in the batch.
+    pub ltc_group_total: usize,
+
     // Chunked decode progress
     pub ltc_decode_progress_pct: f32,       // 0.0..1.0
     pub ltc_decode_progress_str: String,    // "Chunk 3/12..."
@@ -160,6 +176,13 @@ impl AppStateSnapshot {
             ltc_decode_is_video: false,
             ltc_decode_progress_pct: 0.0,
             ltc_decode_progress_str: String::new(),
+            ltc_group_is_detecting: false,
+            ltc_group_decode_generation: 0,
+            ltc_group_paths: Vec::new(),
+            ltc_group_results: Vec::new(),
+            ltc_group_errors: Vec::new(),
+            ltc_group_done: 0,
+            ltc_group_total: 0,
             ffmpeg_caps: None,
             ffmpeg_probe_running: false,
         }
@@ -312,6 +335,20 @@ mod tests {
     #[test]
     fn test_initial_generation_zero() {
         assert_eq!(initial_state().generation, 0);
+    }
+
+    // ── LTC group decode defaults ──────────────────────────────────────────
+
+    #[test]
+    fn test_initial_group_decode_state() {
+        let s = initial_state();
+        assert!(!s.ltc_group_is_detecting);
+        assert_eq!(s.ltc_group_decode_generation, 0);
+        assert!(s.ltc_group_paths.is_empty());
+        assert!(s.ltc_group_results.is_empty());
+        assert!(s.ltc_group_errors.is_empty());
+        assert_eq!(s.ltc_group_done, 0);
+        assert_eq!(s.ltc_group_total, 0);
     }
 
     // ── Clone produces independent copy ───────────────────────────────────

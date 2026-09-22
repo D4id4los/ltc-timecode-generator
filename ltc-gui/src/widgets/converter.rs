@@ -7,7 +7,7 @@ use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, conversion_sanity_check_with_naming,
+    available_containers, build_per_file_trim_and_timecode, conversion_sanity_check_with_naming,
     evaluate_readiness, output_collision_warning,
     find_timecode_at_offset, format_blockers,
     preview_output_files, spawn_conversion, supported_audio_encoders, supported_containers,
@@ -165,6 +165,10 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                             );
                             if ui.selectable_label(false, label).clicked() {
                                 state.selected_group_idx = Some(i);
+                                // Clear stale group decode results from previous selection
+                                if group.recording_type == RecordingType::VideoClipSequence {
+                                    state.send(GuiCommand::ClearLtcGroupResults);
+                                }
                                 let num_ch = group.files.len();
                                 state.channel_map = ChannelMap::identity(num_ch);
                                 state.recording_type = group.recording_type.clone();
@@ -376,8 +380,10 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
             ui.add_space(8.0);
 
             let is_detecting = state.latest.ltc_is_detecting;
+            let is_group_detecting = state.latest.ltc_group_is_detecting;
+            let any_detecting = is_detecting || is_group_detecting;
 
-            if is_detecting {
+            if any_detecting {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
                 let progress_pct = state.latest.ltc_decode_progress_pct;
                 let progress_str = state.latest.ltc_decode_progress_str.clone();
@@ -392,13 +398,15 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                 }
             } else {
                 if is_video {
-                    let file_path = group.unwrap().files[0].to_string_lossy().to_string();
                     let stream_idx = state.latest.ltc_selected_stream;
                     let channel_idx = state.latest.ltc_selected_channel;
-                    if ui.add(egui::Button::new(RichText::new("🔍 Detect LTC").font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
-                        .fill(ACCENT).min_size(egui::vec2(100.0, 24.0))).clicked()
+                    if ui.add(egui::Button::new(RichText::new("🔍 Detect LTC All Clips").font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
+                        .fill(ACCENT).min_size(egui::vec2(140.0, 24.0))).clicked()
                     {
-                        state.send(GuiCommand::ParseLtcVideo(file_path, stream_idx, channel_idx));
+                        let paths: Vec<String> = group.unwrap().files.iter()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .collect();
+                        state.send(GuiCommand::DecodeLtcVideoGroup { paths, stream_index: stream_idx, channel_index: channel_idx });
                     }
                 } else {
                     let file_path = group.unwrap().files[state.ltc_file_idx].to_string_lossy().to_string();
@@ -414,22 +422,61 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_space(4.0);
 
-    let decode_result = state.latest.ltc_decode_result.clone();
-    let decode_error = state.latest.ltc_decode_error.clone();
+    // Show group decode results (video clip groups)
+    let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
+    let group_results: Vec<(String, Option<gui_engine::LtcDetectionResult>, Option<String>)> = {
+        let paths = &state.latest.ltc_group_paths;
+        let results = &state.latest.ltc_group_results;
+        let errors = &state.latest.ltc_group_errors;
+        paths.iter().enumerate().map(|(i, p)| {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+            let r = results.get(i).and_then(|r| r.clone());
+            let e = errors.get(i).and_then(|e| e.clone());
+            (name, r, e)
+        }).collect()
+    };
 
-    if let Some(ref error) = decode_error {
-        let error_frame = egui::Frame::new()
-            .fill(Color32::from_rgb(0x44, 0x11, 0x11))
-            .corner_radius(6.0)
-            .stroke(egui::Stroke::new(1.0, colors.error_red))
-            .inner_margin(egui::Margin::symmetric(10, 6));
-        error_frame.show(ui, |ui| {
-            ui.label(RichText::new(format!("❌ {}", error)).font(FontId::proportional(10.0)).color(colors.error_red));
-        });
-    }
+    if is_video_group && !group_results.is_empty() {
+        // Render per-clip group results
+        for (name, result_opt, error_opt) in &group_results {
+            let (icon, msg, msg_color) = match (result_opt, error_opt) {
+                (Some(_), _) => {
+                    ("✅", format!("{}: LTC detected", name), colors.success_green)
+                }
+                (None, Some(e)) => {
+                    ( "❌", format!("{}: {}", name, e), colors.error_red)
+                }
+                (None, None) => continue, // not yet decoded for this clip
+            };
+            let pill_frame = egui::Frame::new()
+                .fill(if result_opt.is_some() { colors.card_bg } else { Color32::from_rgb(0x44, 0x11, 0x11) })
+                .corner_radius(4.0)
+                .stroke(egui::Stroke::new(0.5, colors.border_main))
+                .inner_margin(egui::Margin::symmetric(6, 3));
+            pill_frame.show(ui, |ui| {
+                ui.label(RichText::new(format!("{} {}", icon, msg)).font(FontId::proportional(9.0)).color(msg_color));
+            });
+            ui.add_space(2.0);
+        }
+    } else {
+        // Show single-file decode result (audio-only, or single-file video)
+        let decode_result = state.latest.ltc_decode_result.clone();
+        let decode_error = state.latest.ltc_decode_error.clone();
 
-    if let Some(result) = decode_result {
-        render_ltc_result(ui, state, &result);
+        if let Some(ref error) = decode_error {
+            let error_frame = egui::Frame::new()
+                .fill(Color32::from_rgb(0x44, 0x11, 0x11))
+                .corner_radius(6.0)
+                .stroke(egui::Stroke::new(1.0, colors.error_red))
+                .inner_margin(egui::Margin::symmetric(10, 6));
+            error_frame.show(ui, |ui| {
+                ui.label(RichText::new(format!("❌ {}", error)).font(FontId::proportional(10.0)).color(colors.error_red));
+            });
+        }
+
+        if let Some(result) = decode_result {
+            render_ltc_result(ui, state, &result);
+        }
     }
 }
 
@@ -872,8 +919,12 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
 fn render_split_options(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let ltc_available = state.latest.ltc_decode_result.is_some();
     let is_video = state.recording_type == RecordingType::VideoClipSequence;
+    let ltc_available = if is_video {
+        state.latest.ltc_group_results.iter().any(|r| r.is_some())
+    } else {
+        state.latest.ltc_decode_result.is_some()
+    };
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -1308,8 +1359,14 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     }
 
     // Trim to first LTC checkbox (renamed for clarity)
-    let ltc_available = !state.latest.ltc_is_detecting
-        && (state.latest.ltc_decode_result.is_some() || state.latest.ltc_decode_error.is_some());
+    let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
+    let group_has_results = state.latest.ltc_group_results.iter().any(|r| r.is_some());
+    let ltc_available = !state.latest.ltc_is_detecting && !state.latest.ltc_group_is_detecting
+        && if is_video_group {
+            group_has_results
+        } else {
+            state.latest.ltc_decode_result.is_some() || state.latest.ltc_decode_error.is_some()
+        };
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_enabled(ltc_available, egui::Checkbox::new(
@@ -1494,33 +1551,44 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
 fn start_conversion(state: &mut AppState) {
     let mut settings = current_converter_settings(state);
     let num_files = settings.input_files.len();
+    let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
 
-    let trim_secs = if state.trim_ltc_start { state.trim_offset_secs } else { 0.0 };
-
-    // Override trim/timecode for actual conversion
-    settings.trim_offsets_secs = if num_files > 0 && state.trim_ltc_start {
-        vec![trim_secs; num_files]
+    if is_video_group && state.trim_ltc_start {
+        // Per-file trim & timecode from group decode results
+        let group_results: Vec<Option<&gui_engine::LtcDetectionResult>> = state.latest.ltc_group_results
+            .iter()
+            .map(|r| r.as_ref())
+            .collect();
+        let (trims, metas) = build_per_file_trim_and_timecode(&group_results);
+        settings.trim_offsets_secs = trims;
+        settings.timecode_meta_per_file = metas;
     } else {
-        vec![0.0; num_files]
-    };
+        // Single decode result (audio group or single-file) — same trim/TC for all files
+        let trim_secs = if state.trim_ltc_start { state.trim_offset_secs } else { 0.0 };
+        settings.trim_offsets_secs = if num_files > 0 && state.trim_ltc_start {
+            vec![trim_secs; num_files]
+        } else {
+            vec![0.0; num_files]
+        };
 
-    settings.timecode_meta_per_file = if state.trim_ltc_start && trim_secs > 0.001 {
-        let ltc_result = state.latest.ltc_decode_result.as_ref();
-        (0..num_files).map(|_| {
-            ltc_result.and_then(|r| {
-                if !matches!(r.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
-                    return None;
-                }
-                find_timecode_at_offset(&r.timecodes, trim_secs).map(|tc| TimecodeMetadata {
-                    start: tc,
-                    fps: r.detected_fps as f64,
-                    drop_frame: r.drop_frame,
+        settings.timecode_meta_per_file = if state.trim_ltc_start && trim_secs > 0.001 {
+            let ltc_result = state.latest.ltc_decode_result.as_ref();
+            (0..num_files).map(|_| {
+                ltc_result.and_then(|r| {
+                    if !matches!(r.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
+                        return None;
+                    }
+                    find_timecode_at_offset(&r.timecodes, trim_secs).map(|tc| TimecodeMetadata {
+                        start: tc,
+                        fps: r.detected_fps as f64,
+                        drop_frame: r.drop_frame,
+                    })
                 })
-            })
-        }).collect()
-    } else {
-        vec![None; num_files]
-    };
+            }).collect()
+        } else {
+            vec![None; num_files]
+        };
+    }
 
     *state.conversion_state.lock().unwrap() = ConversionState::idle();
     state.cancel_flag.store(false, Ordering::Relaxed);
