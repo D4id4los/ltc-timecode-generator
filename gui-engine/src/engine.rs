@@ -174,30 +174,7 @@ pub fn engine_main_with_probe<F>(
         }
 
         // 1.6 Drain ffmpeg capability probe result
-        if current.ffmpeg_probe_running {
-            loop {
-                match caps_rx.try_recv() {
-                    Ok(FfmpegProbeResult { caps }) => {
-                        current.ffmpeg_caps = Some(caps.clone());
-                        current.ffmpeg_probe_running = false;
-                        info!(
-                            "ffmpeg capability probe complete: {} encoder(s), {} format(s), hw_vaapi={}, hw_vulkan={}",
-                            caps.available_encoders.len(),
-                            caps.available_formats.len(),
-                            caps.hw.vaapi_device.is_some(),
-                            caps.hw.vulkan_available,
-                        );
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // Probe thread exited without sending — treat as no ffmpeg
-                        warn!("ffmpeg capability probe thread disconnected unexpectedly");
-                        current.ffmpeg_probe_running = false;
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                }
-            }
-        }
+        drain_ffmpeg_probe_result(&caps_rx, &mut current);
 
         // 1.7 Poll chunked decode progress
         if current.ltc_is_detecting {
@@ -944,11 +921,46 @@ fn attempt_recovery(
     }
 }
 
+/// Drain the ffmpeg capability probe result from the background thread.
+/// Returns `true` if the probe thread disconnected without sending a result
+/// (genuine probe failure), `false` otherwise.
+fn drain_ffmpeg_probe_result(
+    caps_rx: &std::sync::mpsc::Receiver<FfmpegProbeResult>,
+    current: &mut AppStateSnapshot,
+) -> bool {
+    if !current.ffmpeg_probe_running {
+        return false;
+    }
+    match caps_rx.try_recv() {
+        Ok(FfmpegProbeResult { caps }) => {
+            current.ffmpeg_caps = Some(caps.clone());
+            current.ffmpeg_probe_running = false;
+            info!(
+                "ffmpeg capability probe complete: {} encoder(s), {} format(s), hw_vaapi={}, hw_vulkan={}",
+                caps.available_encoders.len(),
+                caps.available_formats.len(),
+                caps.hw.vaapi_device.is_some(),
+                caps.hw.vulkan_available,
+            );
+            false
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            // Probe thread exited without sending — treat as no ffmpeg
+            warn!("ffmpeg capability probe thread disconnected unexpectedly");
+            current.ffmpeg_probe_running = false;
+            true
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::converter::HwDeviceCapabilities;
     use crate::state::AppStateSnapshot;
     use audio_core::Timecode;
+    use std::collections::BTreeSet;
 
     fn setup_state() -> AppStateSnapshot {
         AppStateSnapshot::initial()
@@ -1574,5 +1586,58 @@ mod tests {
             &mut None, &mut None);
         // Should not change since index is out of range
         assert_eq!(state.decode_fps_index, 1);
+    }
+
+    // ── drain_ffmpeg_probe_result ─────────────────────────────────────────
+
+    #[test]
+    fn test_drain_ffmpeg_probe_receives_result_and_clears_no_disconnect() {
+        let (tx, rx) = std::sync::mpsc::channel::<FfmpegProbeResult>();
+
+        let caps = FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: BTreeSet::new(),
+            available_formats: BTreeSet::new(),
+            hw: HwDeviceCapabilities::default(),
+            error_message: None,
+        };
+        tx.send(FfmpegProbeResult { caps: caps.clone() }).unwrap();
+        drop(tx);
+
+        let mut state = AppStateSnapshot::initial();
+        state.ffmpeg_probe_running = true;
+
+        let unexpected = drain_ffmpeg_probe_result(&rx, &mut state);
+
+        assert!(!unexpected, "should NOT report disconnect when result was received");
+        assert!(state.ffmpeg_caps.is_some(), "caps should be stored");
+        assert!(!state.ffmpeg_probe_running, "probe flag should be cleared");
+    }
+
+    #[test]
+    fn test_drain_ffmpeg_probe_disconnect_without_result_still_warns() {
+        let (tx, rx) = std::sync::mpsc::channel::<FfmpegProbeResult>();
+        drop(tx);
+
+        let mut state = AppStateSnapshot::initial();
+        state.ffmpeg_probe_running = true;
+
+        let unexpected = drain_ffmpeg_probe_result(&rx, &mut state);
+
+        assert!(unexpected, "should report disconnect when thread died without sending");
+        assert!(state.ffmpeg_caps.is_none(), "caps should NOT be stored");
+        assert!(!state.ffmpeg_probe_running, "probe flag should be cleared");
+    }
+
+    #[test]
+    fn test_drain_ffmpeg_probe_empty_noop_when_not_running() {
+        let (_tx, rx) = std::sync::mpsc::channel::<FfmpegProbeResult>();
+        let mut state = AppStateSnapshot::initial();
+        state.ffmpeg_probe_running = false;
+
+        let unexpected = drain_ffmpeg_probe_result(&rx, &mut state);
+
+        assert!(!unexpected);
+        assert!(state.ffmpeg_caps.is_none());
     }
 }
