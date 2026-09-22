@@ -1,5 +1,26 @@
 #+TITLE: Version History for LTC Timecode Generator
 
+
+* v0.4.2
+
+Main features are MS Windows compatibility fixes and convert tab UX
+improvements.
+
+List of Changes:
+- Convert tab:
+  - Search selected input directory recursively for recordings, so files in
+    subdirectories are found.
+  - Auto-select the first recording group found when a folder is picked.
+  - Fix progress bar hitting 100% while conversions are still ongoing.
+- GUI:
+  - Fix ltc-gui dropdown menus not resizing after first usage (e.g. recording
+    selector in the convert tab).
+  - Fix ltc-gui fullscreen not working on MS Windows — work around an egui/winit
+    bug where maximised + inner size on init produces a tiny, unresizable window.
+- Misc:
+  - Do not show cmd windows while spawning child processes on MS Windows (e.g.
+    ffmpeg calls in the converter and decoder).
+
 * v0.4.1
 
 Main features are codec-level video encoder selection with automatic hardware
