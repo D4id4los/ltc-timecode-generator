@@ -572,18 +572,6 @@ fn sanity_check_impl(
         ));
     }
 
-    // Collision warning when SourceStems mode + output folder overlaps inputs
-    if naming_mode.is_some_and(|m| m.is_source_stems()) && input_files.iter().any(|f| {
-        f.parent().map(|p| p == output_folder).unwrap_or(false)
-    }) {
-        return Err(
-            "Output folder is the same as the input folder. To avoid overwriting source files, \
-             a '_conv' suffix will be appended to output filenames. Consider choosing a \
-             different output folder."
-            .to_string()
-        );
-    }
-
     Ok(())
 }
 
@@ -1132,6 +1120,78 @@ impl ConverterSettings {
                 paths
             }
         }
+    }
+}
+
+/// Informational (non-blocking) note when planned output filenames would
+/// exactly collide with an input file. The collision is mitigated by
+/// [`ConverterSettings::output_path_for_file`] which inserts `_conv` into
+/// the filename automatically. Returns `None` when no collision exists.
+///
+/// The naming logic mirrors [`ConverterSettings::output_path_for_file`] and
+/// [`plan_video_outputs`]: for each input file the base name is derived from
+/// the naming mode, the video suffix template is expanded with index `i+1`,
+/// and the extension comes from the container (or per-input-file
+/// `copy_mode_container_for_input` when `copy_video` is true).
+pub fn output_collision_warning(
+    input_files: &[PathBuf],
+    output_folder: &Path,
+    filename_prefix: &str,
+    naming_mode: &OutputNamingMode,
+    video_suffix_template: &str,
+    container: &str,
+    copy_video: bool,
+) -> Option<String> {
+    let mut colliding: Vec<(String, String)> = Vec::new();
+
+    for (i, input) in input_files.iter().enumerate() {
+        let base = match naming_mode {
+            OutputNamingMode::SourceStems => match input.file_stem().and_then(|s| s.to_str()) {
+                Some(stem) => stem.to_string(),
+                None => continue,
+            },
+            OutputNamingMode::PrefixTemplates => {
+                if filename_prefix.is_empty() {
+                    continue;
+                }
+                filename_prefix.to_string()
+            }
+        };
+
+        let suffix = video_suffix_template
+            .replace("{:01d}", &format!("{:01}", i + 1))
+            .replace("{:02d}", &format!("{:02}", i + 1))
+            .replace("{:03d}", &format!("{:03}", i + 1));
+
+        let ext = if copy_video {
+            copy_mode_container_for_input(input)
+        } else {
+            extension_for_container(container)
+        };
+
+        let planned = output_folder.join(format!("{}{}.{}", base, suffix, ext));
+
+        if input_files.contains(&planned) {
+            let mitigated = output_folder.join(format!("{}_conv{}.{}", base, suffix, ext));
+            colliding.push((
+                planned.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                mitigated.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+            ));
+        }
+    }
+
+    if colliding.is_empty() {
+        None
+    } else {
+        let details: String = colliding.iter()
+            .map(|(orig, mitigated)| format!("'{}' will be written as '{}'", orig, mitigated))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!(
+            "Output folder is the same as the input folder. {} \
+             Consider choosing a different output folder.",
+            details
+        ))
     }
 }
 
@@ -4434,5 +4494,83 @@ mod tests {
         let tc_pos = args.iter().position(|a| a == "-timecode").expect("should have -timecode");
         assert_eq!(args[tc_pos + 1], "01:00:00:00");
         assert!(args.contains(&"-write_bext".to_string()), "WAV should have BWF");
+    }
+
+    // ── same-folder collision / output_collision_warning ─────────────────
+
+    #[test]
+    fn test_sanity_check_same_folder_source_stems_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("C0001.MP4");
+        std::fs::write(&input, b"dummy").unwrap();
+        let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
+        let result = conversion_sanity_check_with_naming(
+            "mkv", "h264", "pcm_s24le",
+            &[input], tmp.path(), "prefix", &caps,
+            Some("_audio_track{:01d}"), Some("_video_clip{:02d}"),
+            Some(&OutputNamingMode::SourceStems), false,
+        );
+        assert!(result.is_ok(),
+            "SourceStems + same folder + non-empty suffix should be Ok, got: {:?}",
+            result.err());
+    }
+
+    #[test]
+    fn test_collision_warning_none_when_suffix_differs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("C0001.MP4");
+        std::fs::write(&input, b"dummy").unwrap();
+        let msg = output_collision_warning(
+            &[input], tmp.path(), "prefix",
+            &OutputNamingMode::SourceStems, "_video_clip{:02d}",
+            "mkv", false,
+        );
+        assert!(msg.is_none(),
+            "non-empty suffix should prevent collision warning, got: {:?}", msg);
+    }
+
+    #[test]
+    fn test_collision_warning_some_on_true_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("C0001.mp4");
+        std::fs::write(&input, b"dummy").unwrap();
+        let msg = output_collision_warning(
+            std::slice::from_ref(&input), tmp.path(), "prefix",
+            &OutputNamingMode::SourceStems, "",
+            "mp4", true,
+        );
+        assert!(msg.is_some(), "empty suffix + same ext + copy mode should warn");
+        let text = msg.unwrap();
+        assert!(text.contains("_conv"), "message should mention _conv mitigation, got: {}", text);
+        assert!(text.contains("C0001.mp4"), "message should name the colliding file, got: {}", text);
+    }
+
+    #[test]
+    fn test_collision_warning_prefix_mode_no_false_positive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("C0001.MP4");
+        std::fs::write(&input, b"dummy").unwrap();
+        let msg = output_collision_warning(
+            &[input], tmp.path(), "out",
+            &OutputNamingMode::PrefixTemplates, "_video_clip{:02d}",
+            "mkv", false,
+        );
+        assert!(msg.is_none(),
+            "PrefixTemplates with non-colliding prefix should be None, got: {:?}", msg);
+    }
+
+    #[test]
+    fn test_collision_warning_copy_mode_ext_no_false() {
+        // MTS input → copy mode maps ext to mp4; output name won't match .mts input
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("C0001.MTS");
+        std::fs::write(&input, b"dummy").unwrap();
+        let msg = output_collision_warning(
+            &[input], tmp.path(), "prefix",
+            &OutputNamingMode::SourceStems, "_video_clip{:02d}",
+            "mkv", true,
+        );
+        assert!(msg.is_none(),
+            "MTS in copy mode → planned ext is mp4, no collision, got: {:?}", msg);
     }
 }

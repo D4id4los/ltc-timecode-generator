@@ -31,7 +31,7 @@ pub use converter::{
     select_best_combination,
     spawn_conversion, supported_audio_encoders, supported_containers,
     AudioKeep, ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
-    ConversionState, ConversionStatus, ConverterSettings, OutputNamingMode, StepFailure,
+    ConversionState, ConversionStatus, ConverterSettings, output_collision_warning, OutputNamingMode, StepFailure,
     VideoOutputStep, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
     FfmpegCapabilities, HwDeviceCapabilities, RecordingType, SharedConversionState, CancelFlag,
     TimecodeMetadata,

@@ -8,7 +8,7 @@ use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
     available_containers, conversion_sanity_check_with_naming, copy_mode_container_for_input,
-    evaluate_readiness,
+    evaluate_readiness, output_collision_warning,
     find_timecode_at_offset, format_blockers, query_ffmpeg_capabilities,
     spawn_conversion, supported_audio_encoders, supported_containers,
     ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
@@ -1108,6 +1108,27 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
                     ui.label(RichText::new(format!("⚠ {}", msg)).font(FontId::proportional(10.0)).color(colors.warning_amber));
                 });
             }
+        }
+
+        // Non-blocking collision warning (never disables the Convert button)
+        if let Some(note) = output_collision_warning(
+            &input_files,
+            &state.output_folder,
+            &state.filename_prefix,
+            &state.naming_mode,
+            &state.video_suffix_template,
+            &state.container,
+            copy_mode_active(state),
+        ) {
+            ui.add_space(4.0);
+            let warning_area = egui::Frame::new()
+                .fill(Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.08))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.2)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 6));
+            warning_area.show(ui, |ui| {
+                ui.label(RichText::new(format!("ℹ {}", note)).font(FontId::proportional(10.0)).color(colors.warning_amber));
+            });
         }
     }
 
