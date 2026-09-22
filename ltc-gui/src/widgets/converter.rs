@@ -457,27 +457,86 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     };
 
     if is_video_group && !group_results.is_empty() {
-        // Render per-clip group results
-        for (name, result_opt, error_opt) in &group_results {
-            let (icon, msg, msg_color) = match (result_opt, error_opt) {
-                (Some(_), _) => {
-                    ("✅", format!("{}: LTC detected", name), colors.success_green)
-                }
-                (None, Some(e)) => {
-                    ( "❌", format!("{}: {}", name, e), colors.error_red)
-                }
-                (None, None) => continue, // not yet decoded for this clip
-            };
-            let pill_frame = egui::Frame::new()
-                .fill(if result_opt.is_some() { colors.card_bg } else { Color32::from_rgb(0x44, 0x11, 0x11) })
-                .corner_radius(4.0)
-                .stroke(egui::Stroke::new(0.5, colors.border_main))
-                .inner_margin(egui::Margin::symmetric(6, 3));
-            pill_frame.show(ui, |ui| {
-                ui.label(RichText::new(format!("{} {}", icon, msg)).font(FontId::proportional(9.0)).color(msg_color));
-            });
-            ui.add_space(2.0);
-        }
+        // Per-clip expandable LTC detection results
+        let scroll_frame = egui::Frame::new()
+            .fill(colors.nested_bg)
+            .corner_radius(4.0)
+            .stroke(egui::Stroke::new(0.5, colors.border_main))
+            .inner_margin(egui::Margin::symmetric(4, 2));
+        scroll_frame.show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    for (i, (name, result_opt, error_opt)) in group_results.iter().enumerate() {
+                        match (result_opt, error_opt) {
+                            (Some(result), _) => {
+                                let (header_icon, header_color) = match &result.status {
+                                    gui_engine::LtcDecodeStatus::Success => ("✅", colors.success_green),
+                                    gui_engine::LtcDecodeStatus::LowConfidence => ("⚠️", colors.warning_amber),
+                                    gui_engine::LtcDecodeStatus::NoSyncWord => ("❌", colors.error_red),
+                                    gui_engine::LtcDecodeStatus::Error { .. } => ("❌", colors.error_red),
+                                };
+                                let summary = format_clip_ltc_summary(result);
+                                let salt = format!("clip_{}", i);
+                                egui::collapsing_header::CollapsingState::load_with_default_open(
+                                    ui.ctx(),
+                                    egui::Id::new(format!("ltc_clip_{}", i)),
+                                    false,
+                                )
+                                .show_header(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("{} {}", header_icon, name))
+                                                .font(FontId::proportional(10.0))
+                                                .color(header_color)
+                                                .strong(),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("  {}", summary))
+                                                .font(FontId::proportional(9.0))
+                                                .color(colors.text_muted),
+                                        );
+                                    });
+                                })
+                                .body(|ui| {
+                                    render_ltc_result(ui, state, result, &salt);
+                                });
+                            }
+                            (None, Some(e)) => {
+                                let pill_frame = egui::Frame::new()
+                                    .fill(Color32::from_rgb(0x44, 0x11, 0x11))
+                                    .corner_radius(4.0)
+                                    .stroke(egui::Stroke::new(0.5, colors.border_main))
+                                    .inner_margin(egui::Margin::symmetric(6, 3));
+                                pill_frame.show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("❌ {}: {}", name, e))
+                                            .font(FontId::proportional(9.0))
+                                            .color(colors.error_red),
+                                    );
+                                });
+                            }
+                            (None, None) => {
+                                if state.latest.ltc_group_is_detecting {
+                                    let pill_frame = egui::Frame::new()
+                                        .fill(colors.card_bg)
+                                        .corner_radius(4.0)
+                                        .stroke(egui::Stroke::new(0.5, colors.border_main))
+                                        .inner_margin(egui::Margin::symmetric(6, 3));
+                                    pill_frame.show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(format!("⏳ {}: decoding…", name))
+                                                .font(FontId::proportional(9.0))
+                                                .color(colors.text_muted),
+                                        );
+                                    });
+                                }
+                            }
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+        });
     } else {
         // Show single-file decode result (audio-only, or single-file video)
         let decode_result = state.latest.ltc_decode_result.clone();
@@ -495,12 +554,32 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
         }
 
         if let Some(result) = decode_result {
-            render_ltc_result(ui, state, &result);
+            render_ltc_result(ui, state, &result, "single");
         }
     }
 }
 
-fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::LtcDetectionResult) {
+fn format_clip_ltc_summary(result: &gui_engine::LtcDetectionResult) -> String {
+    let drop_flag = if result.drop_frame { " DF" } else { "" };
+    let fps_str = if result.detected_fps > 0.0 {
+        format!("{:.2}{drop_flag} fps", result.detected_fps)
+    } else {
+        "—".to_string()
+    };
+    match &result.status {
+        gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence => {
+            let tc = result.timecodes.first().map(|ftc| {
+                let sep = if result.drop_frame { ";" } else { ":" };
+                format!("{:02}{sep}{:02}{sep}{:02}{sep}{:02}", ftc.timecode.hours, ftc.timecode.minutes, ftc.timecode.seconds, ftc.timecode.frames)
+            }).unwrap_or_else(|| "—".to_string());
+            format!("{} · {} · trim {:.3}s", tc, fps_str, result.first_ltc_timecode_secs)
+        }
+        gui_engine::LtcDecodeStatus::NoSyncWord => "No LTC found".to_string(),
+        gui_engine::LtcDecodeStatus::Error { message } => format!("Error: {}", message),
+    }
+}
+
+fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::LtcDetectionResult, id_salt: &str) {
     let colors = state.theme.colors();
 
     let (status_icon, status_color, status_text) = match &result.status {
@@ -563,7 +642,7 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                 _ => "—".to_string(),
             };
 
-            let grid = egui::Grid::new("ltc_result_grid")
+            let grid = egui::Grid::new(format!("ltc_result_grid_{}", id_salt))
                 .num_columns(2)
                 .spacing([8.0, 2.0])
                 .striped(false);
@@ -683,7 +762,7 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                 ui.add_space(4.0);
                 egui::collapsing_header::CollapsingState::load_with_default_open(
                     ui.ctx(),
-                    egui::Id::new("ltc_timecode_list"),
+                    egui::Id::new(format!("ltc_timecode_list_{}", id_salt)),
                     false,
                 )
                 .show_header(ui, |ui| {
@@ -736,7 +815,7 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                 ui.add_space(2.0);
                 egui::collapsing_header::CollapsingState::load_with_default_open(
                     ui.ctx(),
-                    egui::Id::new("ltc_debug_details"),
+                    egui::Id::new(format!("ltc_debug_details_{}", id_salt)),
                     false,
                 )
                 .show_header(ui, |ui| {
@@ -1741,5 +1820,104 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gui_engine::{LtcDetectionResult, FrameTimecode, Timecode, LtcDecodeStatus};
+
+    fn make_result(status: LtcDecodeStatus, fps: f32, timecodes: Vec<FrameTimecode>,
+                   first_secs: f64, drop_frame: bool) -> LtcDetectionResult {
+        let confidence = if matches!(&status, LtcDecodeStatus::Success) { 0.95 } else { 0.5 };
+        LtcDetectionResult {
+            status,
+            detected_fps: fps,
+            drop_frame,
+            total_possible_frames: timecodes.len() as u32,
+            valid_frames: timecodes.len() as u32,
+            timecodes,
+            avg_confidence: confidence,
+            details: Vec::new(),
+            total_audio_duration_secs: 10.0,
+            sample_rate: 48000,
+            processing_time_ms: 15.0,
+            first_ltc_timecode_secs: first_secs,
+            quality: None,
+        }
+    }
+
+    fn tc_frame(h: u32, m: u32, s: u32, f: u32, secs: f64) -> FrameTimecode {
+        FrameTimecode {
+            frame_index: secs as u32,
+            timecode: Timecode { hours: h, minutes: m, seconds: s, frames: f },
+            timecode_secs: secs,
+        }
+    }
+
+    #[test]
+    fn summary_success_with_timecodes() {
+        let tcs = vec![tc_frame(1, 0, 0, 0, 0.0), tc_frame(1, 0, 0, 24, 0.96)];
+        let result = make_result(LtcDecodeStatus::Success, 25.0, tcs, 0.0, false);
+        let s = super::format_clip_ltc_summary(&result);
+        assert!(s.contains("01:00:00:00"), "expected start TC in summary, got: {}", s);
+        assert!(s.contains("25.00 fps"), "expected fps in summary, got: {}", s);
+        assert!(s.contains("trim 0.000"), "expected trim in summary, got: {}", s);
+    }
+
+    #[test]
+    fn summary_drop_frame() {
+        let tcs = vec![tc_frame(1, 0, 0, 0, 0.0)];
+        let result = make_result(LtcDecodeStatus::Success, 29.97, tcs, 0.5, true);
+        let s = super::format_clip_ltc_summary(&result);
+        assert!(s.contains("01;00;00;00"), "expected DF sep in summary, got: {}", s);
+        assert!(s.contains("DF"), "expected DF flag in summary, got: {}", s);
+        assert!(s.contains("trim 0.500"), "expected trim in summary, got: {}", s);
+    }
+
+    #[test]
+    fn summary_low_confidence() {
+        let tcs = vec![tc_frame(2, 10, 30, 15, 50.0)];
+        let result = make_result(LtcDecodeStatus::LowConfidence, 24.0, tcs, 50.0, false);
+        let s = super::format_clip_ltc_summary(&result);
+        assert!(s.contains("02:10:30:15"), "expected start TC, got: {}", s);
+        assert!(s.contains("24.00"), "expected fps, got: {}", s);
+        assert!(s.contains("trim 50.000"), "expected trim, got: {}", s);
+    }
+
+    #[test]
+    fn summary_no_sync_word() {
+        let result = make_result(LtcDecodeStatus::NoSyncWord, 0.0, vec![], 0.0, false);
+        let s = super::format_clip_ltc_summary(&result);
+        assert_eq!(s, "No LTC found");
+    }
+
+    #[test]
+    fn summary_error_status() {
+        let result = LtcDetectionResult {
+            status: LtcDecodeStatus::Error { message: "permission denied".into() },
+            detected_fps: 0.0,
+            drop_frame: false,
+            total_possible_frames: 0,
+            valid_frames: 0,
+            timecodes: vec![],
+            avg_confidence: 0.0,
+            details: vec![],
+            total_audio_duration_secs: 0.0,
+            sample_rate: 0,
+            processing_time_ms: 0.0,
+            first_ltc_timecode_secs: 0.0,
+            quality: None,
+        };
+        let s = super::format_clip_ltc_summary(&result);
+        assert_eq!(s, "Error: permission denied");
+    }
+
+    #[test]
+    fn summary_empty_timecodes_fallback() {
+        let result = make_result(LtcDecodeStatus::Success, 25.0, vec![], 0.0, false);
+        let s = super::format_clip_ltc_summary(&result);
+        assert!(s.contains("—"), "expected dash fallback for empty timecodes, got: {}", s);
+        assert!(s.contains("25.00 fps"), "expected fps, got: {}", s);
     }
 }
