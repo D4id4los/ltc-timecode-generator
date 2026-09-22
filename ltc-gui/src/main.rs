@@ -24,7 +24,7 @@ fn main() {
                     .with_min_inner_size([300.0, 300.0])
                     .with_title("LTC Timecode Generator"),
                 glow_options: eframe::egui_glow::GlowConfiguration {
-                    vsync: false,
+                    vsync: true,
                     ..Default::default()
                 },
                 ..Default::default()

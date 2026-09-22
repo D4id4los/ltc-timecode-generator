@@ -15,6 +15,7 @@ use crate::timecode;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(40);
 const TARGET_ARM_ANGLE: f32 = -25.0 * std::f32::consts::PI / 180.0;
+const ARM_SETTLE_EPS: f32 = 1.0 * std::f32::consts::PI / 180.0; // 1 degree
 const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 const MAX_CLAP_LOGS: usize = 1000;
 const BUFFER_SIZE: u32 = 0;
@@ -171,6 +172,12 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
         // 5. Animation: arm angle exponential decay toward rest position at 4.0/s
         current.clap_arm_angle += (TARGET_ARM_ANGLE - current.clap_arm_angle)
             * (1.0 - (-4.0 * dt).exp());
+
+        // 5.5 Determine whether clap animation is still visibly in progress.
+        // The GUI uses this flag to decide whether to render at 60 fps
+        // (for smooth animation) or to throttle to a lower rate.
+        current.clap_animating = current.clap_flash_alpha > 0.0
+            || (current.clap_arm_angle - TARGET_ARM_ANGLE).abs() > ARM_SETTLE_EPS;
 
         // 6. System time
         current.system_time = timecode::chrono_now_string();

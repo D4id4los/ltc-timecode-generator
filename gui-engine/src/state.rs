@@ -55,6 +55,7 @@ pub struct AppStateSnapshot {
     // Animation (engine-computed)
     pub clap_flash_alpha: f32,
     pub clap_arm_angle: f32,
+    pub clap_animating: bool,
 
     // Theme
     pub is_dark_theme: bool,
@@ -135,6 +136,7 @@ impl AppStateSnapshot {
             logs: Vec::new(),
             clap_flash_alpha: 0.0,
             clap_arm_angle: -25.0f32.to_radians(),
+            clap_animating: false,
             is_dark_theme: false,
             status_message: "Ready".to_string(),
             system_time: String::new(),

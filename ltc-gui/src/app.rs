@@ -232,6 +232,30 @@ impl AppState {
 
 }
 
+// ── Repaint interval computation ──────────────────────────────────────────
+
+/// egui 0.35 (ContextImpl::request_repaint_after, context.rs:148-151) subtracts
+/// `predicted_dt` (fixed at 1/60 s — eframe/egui-winit never override it) from
+/// every requested delay to avoid over-shooting.  We must compensate by adding
+/// the same duration back, and floor the result to ensure a call with `≤ predicted_dt`
+/// after compensation never becomes zero (which would cause an unbounded render
+/// storm — see profiling analysis for context).
+fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
+    let predicted_dt = Duration::from_secs_f64(1.0 / 60.0);
+    let floor = predicted_dt + Duration::from_millis(1);
+
+    let base = if s.is_playing || s.ltc_is_detecting {
+        let interval = Duration::from_secs_f64(1.0 / s.fps.max(1.0));
+        interval.min(Duration::from_millis(40))
+    } else if s.clap_animating {
+        Duration::from_secs_f64(1.0 / 60.0)
+    } else {
+        Duration::from_secs(1)
+    };
+
+    (base + predicted_dt).max(floor)
+}
+
 // ── egui App ────────────────────────────────────────────────────────────
 
 impl eframe::App for AppState {
@@ -298,14 +322,7 @@ impl eframe::App for AppState {
         }
 
         // 7. Repaint scheduling
-        if self.latest.is_playing || self.latest.ltc_is_detecting {
-            let interval = Duration::from_secs_f64(1.0 / self.latest.fps.max(1.0));
-            ctx.request_repaint_after(interval.min(Duration::from_millis(40)));
-        } else if self.latest.clap_flash_alpha > 0.0 || self.latest.clap_arm_angle < -24.0f32.to_radians() {
-            ctx.request_repaint_after(Duration::from_secs_f64(1.0 / 60.0));
-        } else {
-            ctx.request_repaint_after(Duration::from_secs(1));
-        }
+        ctx.request_repaint_after(next_repaint_interval(&self.latest));
 
         // 8. Keyboard shortcuts
         let any_focused = ctx.memory(|m| m.focused().is_some());
@@ -872,5 +889,99 @@ mod tests {
         assert!(!app.ffmpeg_probe_started.load(std::sync::atomic::Ordering::Relaxed));
         assert!(app.ffmpeg_caps.lock().unwrap().is_none());
         assert!(app.selected_folder.is_none());
+    }
+
+    // ── next_repaint_interval ──────────────────────────────────────────────
+
+    fn make_snapshot() -> AppStateSnapshot {
+        AppStateSnapshot::initial()
+    }
+
+    #[test]
+    fn repaint_interval_idle_returns_approx_1s() {
+        let s = make_snapshot();
+        // Idle: not playing, not detecting, not animating.
+        let dur = next_repaint_interval(&s);
+        assert!(dur > Duration::from_secs(1));
+        assert!(dur < Duration::from_secs_f64(1.1)); // 1.0167s is well under 1.1s
+    }
+
+    #[test]
+    fn repaint_interval_idle_never_below_floor() {
+        let s = make_snapshot();
+        let dur = next_repaint_interval(&s);
+        let floor = Duration::from_secs_f64(1.0 / 60.0) + Duration::from_millis(1);
+        assert!(dur >= floor);
+    }
+
+    #[test]
+    fn repaint_interval_playing_24fps_returns_approx_58ms() {
+        let mut s = make_snapshot();
+        s.is_playing = true;
+        s.fps = 24.0;
+        let dur = next_repaint_interval(&s);
+        // base = min(41.67ms, 40ms) = 40ms → request = 56.67ms
+        assert!(dur > Duration::from_millis(50) && dur < Duration::from_millis(65));
+    }
+
+    #[test]
+    fn repaint_interval_playing_25fps_returns_approx_57ms() {
+        let mut s = make_snapshot();
+        s.is_playing = true;
+        s.fps = 25.0;
+        let dur = next_repaint_interval(&s);
+        // base = min(40ms, 40ms) = 40ms → request = 56.67ms
+        assert!(dur > Duration::from_millis(50) && dur < Duration::from_millis(65));
+    }
+
+    #[test]
+    fn repaint_interval_playing_30fps_returns_approx_50ms() {
+        let mut s = make_snapshot();
+        s.is_playing = true;
+        s.fps = 30.0;
+        let dur = next_repaint_interval(&s);
+        // base = min(33.33ms, 40ms) = 33.33ms → request = 50ms
+        assert!(dur > Duration::from_millis(44) && dur < Duration::from_millis(56));
+    }
+
+    #[test]
+    fn repaint_interval_detecting_same_as_playing() {
+        let mut s = make_snapshot();
+        s.ltc_is_detecting = true;
+        s.fps = 24.0;
+        let dur_detect = next_repaint_interval(&s);
+        let mut s2 = make_snapshot();
+        s2.is_playing = true;
+        s2.fps = 24.0;
+        let dur_play = next_repaint_interval(&s2);
+        assert!((dur_detect.as_secs_f64() - dur_play.as_secs_f64()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn repaint_interval_clap_animating_returns_approx_33ms() {
+        let mut s = make_snapshot();
+        s.clap_animating = true;
+        let dur = next_repaint_interval(&s);
+        // base = 16.67ms → request = 33.33ms
+        assert!(dur > Duration::from_millis(28) && dur < Duration::from_millis(38));
+    }
+
+    #[test]
+    fn repaint_interval_all_non_idle_never_below_floor() {
+        let floor = Duration::from_secs_f64(1.0 / 60.0) + Duration::from_millis(1);
+        // playing
+        let mut s = make_snapshot();
+        s.is_playing = true;
+        s.fps = 30.0;
+        assert!(next_repaint_interval(&s) >= floor);
+        // detecting
+        let mut s2 = make_snapshot();
+        s2.ltc_is_detecting = true;
+        s2.fps = 24.0;
+        assert!(next_repaint_interval(&s2) >= floor);
+        // animating
+        let mut s3 = make_snapshot();
+        s3.clap_animating = true;
+        assert!(next_repaint_interval(&s3) >= floor);
     }
 }
