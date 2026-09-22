@@ -63,6 +63,10 @@ pub fn engine_main_with_probe<F>(
     let (caps_tx, caps_rx) =
         std::sync::mpsc::channel::<FfmpegProbeResult>();
 
+    // Internal result channel for file duration probe
+    let (dur_tx, dur_rx) =
+        std::sync::mpsc::channel::<DurationResult>();
+
     // Spawn the ffmpeg capability probe on a background thread
     std::thread::Builder::new()
         .name("ffmpeg-probe".into())
@@ -79,6 +83,10 @@ pub fn engine_main_with_probe<F>(
     // Group (batch) decode cancel tracking
     let mut group_cancel: Option<Arc<AtomicBool>> = None;
 
+    // Duration probe tracking
+    let mut dur_total: usize = 0;
+    let mut dur_done: usize = 0;
+
     loop {
         let now = Instant::now();
         let dt = (now - last_tick).as_secs_f32();
@@ -92,6 +100,23 @@ pub fn engine_main_with_probe<F>(
                     let _ = core.stop_output();
                     info!("Engine shutdown via Shutdown command");
                     return;
+                }
+                Ok(GuiCommand::ProbeFileDurations(paths)) => {
+                    current.file_durations_generation += 1;
+                    let gen = current.file_durations_generation;
+                    current.file_durations.clear();
+                    dur_total = paths.len();
+                    dur_done = 0;
+                    let tx = dur_tx.clone();
+                    std::thread::Builder::new()
+                        .name("duration-probe".into())
+                        .spawn(move || {
+                            for path in paths {
+                                let secs = crate::duration::file_duration_secs(&path);
+                                let _ = tx.send(DurationResult { path, generation: gen, secs });
+                            }
+                        })
+                        .expect("failed to spawn duration-probe thread");
                 }
                 Ok(cmd) => {
                     process_command(
@@ -252,7 +277,28 @@ pub fn engine_main_with_probe<F>(
         // 1.7 Drain ffmpeg capability probe result
         drain_ffmpeg_probe_result(&caps_rx, &mut current);
 
-        // 1.8 Poll chunked / group decode progress
+        // 1.8 Drain file duration probe results
+        loop {
+            match dur_rx.try_recv() {
+                Ok(DurationResult { path, generation, secs }) => {
+                    if generation == current.file_durations_generation {
+                        current.file_durations.insert(path, secs);
+                        current.file_durations_version = current.file_durations_version.wrapping_add(1);
+                        dur_done += 1;
+                        if dur_done >= dur_total {
+                            info!("File duration probe complete: {}/{} files", dur_done, dur_total);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("Duration probe channel disconnected");
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // 1.9 Poll chunked / group decode progress
         if current.ltc_is_detecting {
             if let Some((total, ref completed)) = decode_progress {
                 let done = completed.load(Ordering::Relaxed);
@@ -319,6 +365,13 @@ struct LtcDecodeResult {
     path: String,
     generation: u64,
     result: Result<LtcDetectionResult, String>,
+}
+
+/// Internal message sent from a spawned duration-probe thread back to the engine loop.
+struct DurationResult {
+    path: std::path::PathBuf,
+    generation: u64,
+    secs: Option<f64>,
 }
 
 /// Internal message sent from a spawned group-decode thread back to the engine loop.
@@ -891,6 +944,10 @@ fn process_command(
         GuiCommand::SecondDown => { stepper_second(state, -1); }
         GuiCommand::FrameUp => { stepper_frame(state, 1); }
         GuiCommand::FrameDown => { stepper_frame(state, -1); }
+
+        GuiCommand::ProbeFileDurations(_) => {
+            // Handled in the command drain loop (engine_main) before reaching process_command
+        }
 
         GuiCommand::Shutdown => {
             // Handled in the command drain loop before reaching process_command

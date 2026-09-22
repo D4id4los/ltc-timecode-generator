@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::converter::FfmpegCapabilities;
@@ -109,6 +110,18 @@ pub struct AppStateSnapshot {
     // ffmpeg capability probe (engine-owned, async)
     pub ffmpeg_caps: Option<FfmpegCapabilities>,
     pub ffmpeg_probe_running: bool,
+
+    // File duration probe (engine-owned, async)
+    /// Per-file durations keyed by full path. `None` meaning the file
+    /// could not be probed (unreadable, no ffprobe, etc).
+    pub file_durations: HashMap<PathBuf, Option<f64>>,
+    /// Monotonically increasing generation — only results matching the
+    /// current generation are accepted (discards stale results from
+    /// rapid re-scans).
+    pub file_durations_generation: u64,
+    /// Monotonically increasing version — incremented on each successful
+    /// duration insertion so poll.rs can detect changes.
+    pub file_durations_version: u64,
 }
 
 impl AppStateSnapshot {
@@ -185,6 +198,9 @@ impl AppStateSnapshot {
             ltc_group_total: 0,
             ffmpeg_caps: None,
             ffmpeg_probe_running: false,
+            file_durations: HashMap::new(),
+            file_durations_generation: 0,
+            file_durations_version: 0,
         }
     }
 }

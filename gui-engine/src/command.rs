@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use audio_core::Timecode;
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,12 @@ pub enum GuiCommand {
     ClearLtcGroupResults,
     SetLtcDecodeStream(usize),
     SetLtcDecodeChannel(usize),
+
+    // ── Duration probe ─────────────────────────────────────────────────
+    /// Probe file durations for converter recording groups.
+    /// The engine spawns a background worker that publishes results into
+    /// `AppStateSnapshot.file_durations` as they become available.
+    ProbeFileDurations(Vec<PathBuf>),
 
     // ── Shutdown ────────────────────────────────────────────────────────
     CancelDecode,

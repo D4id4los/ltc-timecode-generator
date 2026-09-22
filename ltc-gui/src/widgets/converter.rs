@@ -15,6 +15,7 @@ use gui_engine::converter::{
     ConverterSettings, FfmpegCapabilities, OutputKind, OutputNamingMode, RecordingType, TimecodeMetadata,
 };
 use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
+use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::file_pattern::match_files_all_patterns;
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::LtcDecodeStatus;
@@ -119,7 +120,17 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                 config::save_input_folder(&path);
 
                 // Apply all patterns simultaneously
-                state.file_groups = Some(match_files_all_patterns(&path));
+                let groups = match_files_all_patterns(&path);
+                let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
+                    let paths: Vec<std::path::PathBuf> = if g.recording_type == RecordingType::MultiTrackAudio {
+                        g.files.first().cloned().into_iter().collect()
+                    } else {
+                        g.files.clone()
+                    };
+                    paths
+                }).collect();
+                state.file_groups = Some(groups);
+                state.send(GuiCommand::ProbeFileDurations(probe_paths));
                 state.selected_group_idx = None;
                 state.ltc_file_idx = 1; // default to track 2
                 state.trim_ltc_start = false;
@@ -155,13 +166,22 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                                 .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
                                 .collect::<Vec<_>>()
                                 .join(", ");
+                            let dur_text = {
+                                let durs: Vec<Option<f64>> = group.files.iter()
+                                    .map(|f| state.latest.file_durations.get(f).copied().flatten())
+                                    .collect();
+                                group_duration_secs(&group.recording_type, &durs)
+                                    .map(|s| format!("  ·  {}", format_duration_secs(s)))
+                                    .unwrap_or_default()
+                            };
                             let label = format!(
-                                "{}  [{}]  ({} file{}: {})",
+                                "{}  [{}]  ({} file{}: {}){}",
                                 group.prefix,
                                 type_badge,
                                 group.files.len(),
                                 if group.files.len() == 1 { "" } else { "s" },
-                                detail
+                                detail,
+                                dur_text,
                             );
                             if ui.selectable_label(false, label).clicked() {
                                 state.selected_group_idx = Some(i);

@@ -142,9 +142,17 @@ fn _run_gui(
                             }).collect::<Vec<_>>()
                         )),
                         channel_count: files.len() as i32,
+                        duration_text: SharedString::from(""),
                     }
                 }).collect();
                 ui.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(model)));
+                // Probe durations for restored groups
+                let probe_paths: Vec<std::path::PathBuf> = matched.values().flat_map(|files| {
+                    files.first().cloned().into_iter().collect::<Vec<_>>()
+                }).collect();
+                if !probe_paths.is_empty() {
+                    let _ = cmd_tx.send(GuiCommand::ProbeFileDurations(probe_paths));
+                }
             }
         }
         if let Some(ref out_path) = cfg.last_output_folder {
@@ -521,6 +529,7 @@ fn _run_gui(
         let venc_for_folder = conv_video_encoder.clone();
         let aenc_for_folder = conv_audio_encoder.clone();
         let container_for_folder = conv_container.clone();
+        let cmd_folder = cmd_tx.clone();
         ui.on_conv_select_folder(move || {
             let pat = *pattern_arc.lock().unwrap();
             if pat == 0 {
@@ -553,9 +562,16 @@ fn _run_gui(
                                     }).collect::<Vec<_>>()
                                 )),
                                 channel_count: files.len() as i32,
+                                duration_text: SharedString::from(""),
                             }
                         }).collect();
                         u.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(model)));
+                        let probe_paths: Vec<std::path::PathBuf> = matched.values().flat_map(|files| {
+                            files.first().cloned().into_iter().collect::<Vec<_>>()
+                        }).collect();
+                        if !probe_paths.is_empty() {
+                            let _ = cmd_folder.send(GuiCommand::ProbeFileDurations(probe_paths));
+                        }
                     }
                 }
             } else {
@@ -591,12 +607,19 @@ fn _run_gui(
                                         }).collect::<Vec<_>>()
                                     )),
                                     channel_count: files.len() as i32,
+                                    duration_text: SharedString::from(""),
                                 }
                             }).collect();
                             u.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(model)));
-                        }
+                            let probe_paths: Vec<std::path::PathBuf> = matched.values().flat_map(|files| {
+                                files.first().cloned().into_iter().collect::<Vec<_>>()
+                            }).collect();
+                            if !probe_paths.is_empty() {
+                                let _ = cmd_folder.send(GuiCommand::ProbeFileDurations(probe_paths));
+                            }
                     }
                 }
+            }
             }
             // Caps are probed asynchronously by the engine; use whatever we have.
             // Poll will apply defaults + update dropdowns when caps arrive.
@@ -1348,6 +1371,7 @@ u.set_conv_split_tracks(false);
         conv_naming_mode,
         conv_file_groups,
         conv_selected_group_idx,
+        conv_selected_pattern.clone(),
         conv_container,
         conv_video_encoder,
         conv_audio_encoder,

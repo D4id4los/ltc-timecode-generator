@@ -2,6 +2,7 @@ pub mod cli;
 pub mod command;
 pub mod config;
 pub mod converter;
+pub mod duration;
 pub mod engine;
 pub mod ffprobe;
 pub mod file_pattern;
@@ -46,3 +47,6 @@ pub use video_codecs::{
 
 // Re-export ffprobe types
 pub use ffprobe::{extract_audio_channel, path_is_video, probe_video_audio, AudioStreamInfo, VideoAudioProbe};
+
+// Re-export duration helpers
+pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs};

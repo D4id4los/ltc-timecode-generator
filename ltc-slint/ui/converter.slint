@@ -172,9 +172,12 @@ export component ConverterSection {
                         HorizontalLayout { padding: 6px; spacing: 6px;
                             Text { text: group.prefix; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
                             Text {
-                                text: root.selected-pattern == 0
-                                    ? "(" + group.channel-count + " ch)"
-                                    : "(" + group.channel-count + " file" + (group.channel-count == 1 ? "" : "s") + ")";
+                                text: {
+                                    let base = root.selected-pattern == 0
+                                        ? "(" + group.channel-count + " ch)"
+                                        : "(" + group.channel-count + " file" + (group.channel-count == 1 ? "" : "s") + ")";
+                                    if group.duration-text != "" { base + "  ·  " + group.duration-text } else { base }
+                                }
                                 color: AppColors.text-muted; font-size: 9px;
                                 horizontal-stretch: 1; vertical-alignment: center;
                             }

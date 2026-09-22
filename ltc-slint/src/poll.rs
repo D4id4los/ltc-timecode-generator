@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gui_engine::converter::{ConversionState, ConversionStatus, FfmpegCapabilities, OutputNamingMode, select_best_combination};
+use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode;
@@ -16,7 +17,7 @@ use slint::{ModelRc, SharedString, VecModel};
 use crate::toast::{push_toast, ToastItem};
 use crate::timecode_helpers::set_tc_segments;
 use crate::update_converter_options;
-use crate::{AppColors, AppWindow, LogEntry};
+use crate::{AppColors, AppWindow, FileGroupInfo, LogEntry};
 use slint::ComponentHandle;
 use slint::Global;
 
@@ -50,6 +51,7 @@ pub fn setup_poll_timer(
     conv_naming_mode: Arc<Mutex<OutputNamingMode>>,
     conv_file_groups: Arc<Mutex<BTreeMap<String, Vec<PathBuf>>>>,
     conv_selected_group_idx: Arc<Mutex<isize>>,
+    _conv_selected_pattern: Arc<Mutex<i32>>,
     conv_container: Arc<Mutex<String>>,
     conv_video_encoder: Arc<Mutex<String>>,
     conv_audio_encoder: Arc<Mutex<String>>,
@@ -67,6 +69,9 @@ pub fn setup_poll_timer(
 
     // Latch: track when ffmpeg caps have been mirrored into conv_ffmpeg_caps
     let last_caps_loaded: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+
+    // Latch: track file duration version to rebuild group model
+    let last_duration_gen: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
 
     let poll_timer = slint::Timer::default();
     poll_timer.start(
@@ -376,7 +381,37 @@ pub fn setup_poll_timer(
                 }
             }
 
-            // 21. Conversion state sync
+            // 21. File group duration sync — rebuild model when new durations arrive
+            {
+                let current_gen = s.file_durations_version;
+                let mut last = last_duration_gen.lock().unwrap();
+                if current_gen != *last {
+                    *last = current_gen;
+                    let groups = conv_file_groups.lock().unwrap();
+                    let new_model: Vec<FileGroupInfo> = groups.iter().map(|(prefix, files)| {
+                        let durs: Vec<Option<f64>> = files.iter()
+                            .map(|f| s.file_durations.get(f).copied().flatten())
+                            .collect();
+                        let dur_text = group_duration_secs(
+                            &gui_engine::converter::RecordingType::MultiTrackAudio, &durs,
+                        ).map(format_duration_secs).unwrap_or_default();
+                        FileGroupInfo {
+                            prefix: SharedString::from(prefix),
+                            files: ModelRc::new(VecModel::<SharedString>::from(
+                                files.iter().map(|f| {
+                                    SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+                                }).collect::<Vec<_>>()
+                            )),
+                            channel_count: files.len() as i32,
+                            duration_text: SharedString::from(dur_text),
+                        }
+                    }).collect();
+                    drop(groups);
+                    ui.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(new_model)));
+                }
+            }
+
+            // 22. Conversion state sync
             // (renumbered from 20/21/22/... — the "read conv_ffmpeg_caps for has-ffmpeg/error"
             //  block was folded into the mirror logic above)
             {

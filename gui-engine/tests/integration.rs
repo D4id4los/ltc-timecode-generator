@@ -528,3 +528,60 @@ fn test_engine_set_ltc_decode_stream_and_channel() {
     assert_eq!(snapshot.ltc_selected_stream, 1);
     assert_eq!(snapshot.ltc_selected_channel, 2);
 }
+
+// ── File duration probe ──────────────────────────────────────────────────
+
+#[test]
+fn test_engine_probe_file_durations_wav() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path1 = dir.path().join("ch1.wav");
+    let path2 = dir.path().join("ch2.wav");
+
+    // Create two WAVs with known durations
+    let spec = hound::WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    {
+        let mut w = hound::WavWriter::create(&path1, spec).unwrap();
+        for _ in 0..96000 { w.write_sample(0i16).unwrap(); }
+        w.finalize().unwrap();
+    }
+    {
+        let mut w = hound::WavWriter::create(&path2, spec).unwrap();
+        for _ in 0..48000 { w.write_sample(0i16).unwrap(); }
+        w.finalize().unwrap();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-test".into())
+        .spawn(move || {
+            gui_engine::engine::engine_main(rx, state_clone, false);
+        })
+        .expect("failed to spawn engine thread");
+
+    tx.send(GuiCommand::ProbeFileDurations(vec![path1.clone(), path2.clone()])).unwrap();
+
+    // Poll until both durations appear in the snapshot
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let snapshot: AppStateSnapshot = state.load().as_ref().clone();
+        if snapshot.file_durations.len() >= 2 {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("timeout waiting for file durations");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    let snapshot: AppStateSnapshot = state.load().as_ref().clone();
+    let dur1 = snapshot.file_durations.get(&path1).expect("missing path1").expect("path1 duration should be Some");
+    let dur2 = snapshot.file_durations.get(&path2).expect("missing path2").expect("path2 duration should be Some");
+    assert!((dur1 - 2.0).abs() < 0.001, "expected 2.0s for path1, got {}", dur1);
+    assert!((dur2 - 1.0).abs() < 0.001, "expected 1.0s for path2, got {}", dur2);
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}

@@ -142,7 +142,7 @@ impl AppState {
             = Self::restore_input_folder(&cfg);
         let output_folder = cfg.last_output_folder.map(PathBuf::from).unwrap_or_default();
 
-        Self {
+        let result = Self {
             cmd_tx,
             latest: Arc::new(initial),
             engine_state,
@@ -185,7 +185,24 @@ impl AppState {
             per_file_trim_offsets: Vec::new(),
             ltc_auto_applied_gen: 0,
             ltc_group_auto_applied_gen: 0,
+        };
+
+        // Send duration probe for restored groups
+        if let Some(ref groups) = result.file_groups {
+            let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
+                let paths: Vec<std::path::PathBuf> = if g.recording_type == RecordingType::MultiTrackAudio {
+                    g.files.first().cloned().into_iter().collect()
+                } else {
+                    g.files.clone()
+                };
+                paths
+            }).collect();
+            if !probe_paths.is_empty() {
+                let _ = result.cmd_tx.send(GuiCommand::ProbeFileDurations(probe_paths));
+            }
         }
+
+        result
     }
 
     fn restore_input_folder(cfg: &config::ConverterConfig) -> RestoredFolder {
