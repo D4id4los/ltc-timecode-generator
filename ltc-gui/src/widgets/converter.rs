@@ -1166,15 +1166,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
         }
 
         // Non-blocking collision warning (never disables the Convert button)
-        if let Some(note) = output_collision_warning(
-            &input_files,
-            &state.output_folder,
-            &state.filename_prefix,
-            &state.naming_mode,
-            &state.video_suffix_template,
-            &state.container,
-            copy_mode_active(state),
-        ) {
+        if let Some(note) = output_collision_warning(&current_converter_settings(state)) {
             ui.add_space(4.0);
             let warning_area = egui::Frame::new()
                 .fill(Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.08))

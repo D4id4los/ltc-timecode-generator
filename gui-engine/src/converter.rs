@@ -979,14 +979,10 @@ impl ConverterSettings {
         self.output_path_for_file(kind, 0, index, extension)
     }
 
-    /// Build the output path for a single output file given a source-file index,
-    /// a track/clip index, and an extension derived from the container.
-    ///
-    /// In `SourceStems` mode the base name comes from the source file's stem;
-    /// in `PrefixTemplates` mode the `filename_prefix` field is used.
-    /// If the computed output path would collide with an input file path,
-    /// `_conv` is appended before the extension.
-    pub fn output_path_for_file(&self, kind: &str, file_idx: usize, index: usize, extension: &str) -> PathBuf {
+    /// Like [`output_path_for_file`] but returns both the final (possibly
+    /// `_conv`‑mitigated) path and the unguarded name.  When there is no input‑
+    /// file collision the two paths are identical.
+    pub fn output_path_for_file_checked(&self, kind: &str, file_idx: usize, index: usize, extension: &str) -> (PathBuf, PathBuf) {
         let base = self.output_base_for_file(file_idx);
         let suffix = match kind {
             "audio" => self.audio_suffix_template
@@ -1000,13 +996,32 @@ impl ConverterSettings {
             _ => String::new(),
         };
         let filename = format!("{}{}.{}", base, suffix, extension);
-        let path = self.output_folder.join(&filename);
-        if self.input_files.iter().any(|input| input == &path) {
+        let unguarded = self.output_folder.join(&filename);
+        if self.input_files.iter().any(|input| input == &unguarded) {
             let alt = format!("{}_conv{}.{}", base, suffix, extension);
-            self.output_folder.join(&alt)
+            (self.output_folder.join(&alt), unguarded)
         } else {
-            path
+            (unguarded.clone(), unguarded)
         }
+    }
+
+    /// Build the output path for a single output file given a source-file index,
+    /// a track/clip index, and an extension derived from the container.
+    ///
+    /// In `SourceStems` mode the base name comes from the source file's stem;
+    /// in `PrefixTemplates` mode the `filename_prefix` field is used.
+    /// If the computed output path would collide with an input file path,
+    /// `_conv` is appended before the extension.
+    pub fn output_path_for_file(&self, kind: &str, file_idx: usize, index: usize, extension: &str) -> PathBuf {
+        self.output_path_for_file_checked(kind, file_idx, index, extension).0
+    }
+
+    /// Build the output path for a merged (non‑split) audio file, including
+    /// the suffix‑template expansion with index 0 and the input‑file collision
+    /// guard.  This is the canonical name for the single audio output when
+    /// `split_tracks` is `false`.
+    pub fn merged_audio_output_path(&self, extension: &str) -> PathBuf {
+        self.output_path_for_file("audio", 0, 0, extension)
     }
 
     /// Return the base name (stem without extension / index suffix) for a
@@ -1116,8 +1131,7 @@ impl ConverterSettings {
                         paths.push(self.output_path_for_index("audio", i + 1, extension));
                     }
                 } else {
-                    let filename = format!("{}.{}", self.filename_prefix, extension);
-                    paths.push(self.output_folder.join(filename));
+                    paths.push(self.merged_audio_output_path(extension));
                 }
                 for i in 0..num_video_clips {
                     paths.push(self.output_path_for_index("video", i + 1, extension));
@@ -1224,8 +1238,10 @@ pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAu
                     });
                 }
             } else {
-                let audio_path = settings.output_folder.join(format!("{}.{}", settings.filename_prefix, aext));
-                previews.push(PreviewOutput { kind: OutputKind::Audio, path: audio_path });
+                previews.push(PreviewOutput {
+                    kind: OutputKind::Audio,
+                    path: settings.merged_audio_output_path(aext),
+                });
             }
 
             if generate_synthetic_video {
@@ -1246,55 +1262,65 @@ pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAu
 /// [`ConverterSettings::output_path_for_file`] which inserts `_conv` into
 /// the filename automatically. Returns `None` when no collision exists.
 ///
-/// The naming logic mirrors [`ConverterSettings::output_path_for_file`] and
-/// [`plan_video_outputs`]: for each input file the base name is derived from
-/// the naming mode, the video suffix template is expanded with index `i+1`,
-/// and the extension comes from the container (or per-input-file
-/// `copy_mode_container_for_input` when `copy_video` is true).
-pub fn output_collision_warning(
-    input_files: &[PathBuf],
-    output_folder: &Path,
-    filename_prefix: &str,
-    naming_mode: &OutputNamingMode,
-    video_suffix_template: &str,
-    container: &str,
-    copy_video: bool,
-) -> Option<String> {
+/// Enumerates all outputs the pipeline would produce by calling the **same**
+/// naming primitive (`output_path_for_file_checked`) the planners use, so
+/// naming and collision logic is never duplicated.  Covers video, audio
+/// (split + merged), and synthetic-video outputs.
+pub fn output_collision_warning(settings: &ConverterSettings) -> Option<String> {
+    let input_files = &settings.input_files;
     let mut colliding: Vec<(String, String)> = Vec::new();
 
-    for (i, input) in input_files.iter().enumerate() {
-        let base = match naming_mode {
-            OutputNamingMode::SourceStems => match input.file_stem().and_then(|s| s.to_str()) {
-                Some(stem) => stem.to_string(),
-                None => continue,
-            },
-            OutputNamingMode::PrefixTemplates => {
-                if filename_prefix.is_empty() {
-                    continue;
+    match settings.pipeline {
+        ConversionPipeline::VideoPassthrough => {
+            for i in 0..input_files.len() {
+                let ext = if settings.copy_video {
+                    copy_mode_container_for_input(&settings.input_files[i])
+                } else {
+                    extension_for_container(&settings.container)
+                };
+                let (guarded, unguarded) = settings.output_path_for_file_checked("video", i, i + 1, ext);
+                if guarded != unguarded {
+                    colliding.push((
+                        unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                        guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                    ));
                 }
-                filename_prefix.to_string()
             }
-        };
-
-        let suffix = video_suffix_template
-            .replace("{:01d}", &format!("{:01}", i + 1))
-            .replace("{:02d}", &format!("{:02}", i + 1))
-            .replace("{:03d}", &format!("{:03}", i + 1));
-
-        let ext = if copy_video {
-            copy_mode_container_for_input(input)
-        } else {
-            extension_for_container(container)
-        };
-
-        let planned = output_folder.join(format!("{}{}.{}", base, suffix, ext));
-
-        if input_files.contains(&planned) {
-            let mitigated = output_folder.join(format!("{}_conv{}.{}", base, suffix, ext));
-            colliding.push((
-                planned.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                mitigated.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-            ));
+        }
+        ConversionPipeline::AudioOnly { generate_synthetic_video } => {
+            let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+            if settings.split_tracks {
+                for i in 0..settings.channel_map.num_channels() {
+                    if settings.drop_ltc_track && i == settings.ltc_track_channel_index {
+                        continue;
+                    }
+                    let (guarded, unguarded) = settings.output_path_for_file_checked("audio", 0, i + 1, aext);
+                    if guarded != unguarded {
+                        colliding.push((
+                            unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                            guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                        ));
+                    }
+                }
+            } else {
+                let (guarded, unguarded) = settings.output_path_for_file_checked("audio", 0, 0, aext);
+                if guarded != unguarded {
+                    colliding.push((
+                        unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                        guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                    ));
+                }
+            }
+            if generate_synthetic_video {
+                let ext = extension_for_container(&settings.container);
+                let (guarded, unguarded) = settings.output_path_for_file_checked("video", 0, 1, ext);
+                if guarded != unguarded {
+                    colliding.push((
+                        unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                        guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+                    ));
+                }
+            }
         }
     }
 
@@ -3537,9 +3563,10 @@ mod tests {
         let mut s = make_settings_audio_only();
         s.split_tracks = false;
         let paths = s.all_output_paths(2, 3, "mkv");
-        // 1 audio file (multi-track) + 3 video clips = 4
+        // 1 merged audio (suffix-expanded with index 0) + 3 video clips = 4
         assert_eq!(paths.len(), 4, "expected 4 paths");
-        assert!(paths[0].to_string_lossy().ends_with("output.mkv"));
+        assert!(paths[0].to_string_lossy().ends_with("audio_track0.mkv"),
+            "expected merged audio with suffix, got {}", paths[0].display());
         assert!(paths[1].to_string_lossy().ends_with("video_clip01.mkv"));
         assert!(paths[2].to_string_lossy().ends_with("video_clip02.mkv"));
         assert!(paths[3].to_string_lossy().ends_with("video_clip03.mkv"));
@@ -5123,11 +5150,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("C0001.MP4");
         std::fs::write(&input, b"dummy").unwrap();
-        let msg = output_collision_warning(
-            &[input], tmp.path(), "prefix",
-            &OutputNamingMode::SourceStems, "_video_clip{:02d}",
-            "mkv", false,
-        );
+        let s = ConverterSettings {
+            pipeline: ConversionPipeline::VideoPassthrough,
+            input_files: vec![input],
+            output_folder: tmp.path().to_path_buf(),
+            filename_prefix: "prefix".to_string(),
+            naming_mode: OutputNamingMode::SourceStems,
+            video_suffix_template: "_video_clip{:02d}".to_string(),
+            container: "mkv".to_string(),
+            copy_video: false,
+            ..make_settings_audio_only()
+        };
+        let msg = output_collision_warning(&s);
         assert!(msg.is_none(),
             "non-empty suffix should prevent collision warning, got: {:?}", msg);
     }
@@ -5137,11 +5171,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("C0001.mp4");
         std::fs::write(&input, b"dummy").unwrap();
-        let msg = output_collision_warning(
-            std::slice::from_ref(&input), tmp.path(), "prefix",
-            &OutputNamingMode::SourceStems, "",
-            "mp4", true,
-        );
+        let s = ConverterSettings {
+            pipeline: ConversionPipeline::VideoPassthrough,
+            input_files: vec![input],
+            output_folder: tmp.path().to_path_buf(),
+            filename_prefix: "prefix".to_string(),
+            naming_mode: OutputNamingMode::SourceStems,
+            video_suffix_template: String::new(),
+            container: "mp4".to_string(),
+            copy_video: true,
+            ..make_settings_audio_only()
+        };
+        let msg = output_collision_warning(&s);
         assert!(msg.is_some(), "empty suffix + same ext + copy mode should warn");
         let text = msg.unwrap();
         assert!(text.contains("_conv"), "message should mention _conv mitigation, got: {}", text);
@@ -5153,11 +5194,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("C0001.MP4");
         std::fs::write(&input, b"dummy").unwrap();
-        let msg = output_collision_warning(
-            &[input], tmp.path(), "out",
-            &OutputNamingMode::PrefixTemplates, "_video_clip{:02d}",
-            "mkv", false,
-        );
+        let s = ConverterSettings {
+            pipeline: ConversionPipeline::VideoPassthrough,
+            input_files: vec![input],
+            output_folder: tmp.path().to_path_buf(),
+            filename_prefix: "out".to_string(),
+            naming_mode: OutputNamingMode::PrefixTemplates,
+            video_suffix_template: "_video_clip{:02d}".to_string(),
+            container: "mkv".to_string(),
+            copy_video: false,
+            ..make_settings_audio_only()
+        };
+        let msg = output_collision_warning(&s);
         assert!(msg.is_none(),
             "PrefixTemplates with non-colliding prefix should be None, got: {:?}", msg);
     }
@@ -5168,12 +5216,106 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("C0001.MTS");
         std::fs::write(&input, b"dummy").unwrap();
-        let msg = output_collision_warning(
-            &[input], tmp.path(), "prefix",
-            &OutputNamingMode::SourceStems, "_video_clip{:02d}",
-            "mkv", true,
-        );
+        let s = ConverterSettings {
+            pipeline: ConversionPipeline::VideoPassthrough,
+            input_files: vec![input],
+            output_folder: tmp.path().to_path_buf(),
+            filename_prefix: "prefix".to_string(),
+            naming_mode: OutputNamingMode::SourceStems,
+            video_suffix_template: "_video_clip{:02d}".to_string(),
+            container: "mkv".to_string(),
+            copy_video: true,
+            ..make_settings_audio_only()
+        };
+        let msg = output_collision_warning(&s);
         assert!(msg.is_none(),
             "MTS in copy mode → planned ext is mp4, no collision, got: {:?}", msg);
+    }
+
+    // ── Audio-only collision / _conv guard tests ──────────────────────
+
+    #[test]
+    fn test_all_output_paths_non_split_collision_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        // planned merged audio with default suffix template + index 0
+        let input_path = dir.path().join("output_audio_track0.wav");
+        std::fs::write(&input_path, b"dummy").unwrap();
+        let mut s = make_settings_audio_only();
+        s.split_tracks = false;
+        s.output_folder = dir.path().to_path_buf();
+        s.input_files = vec![input_path];
+
+        let paths = s.all_output_paths(1, 0, "wav");
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name.contains("_conv"), "expected _conv suffix for colliding merged audio, got {}", name);
+    }
+
+    #[test]
+    fn test_preview_output_files_non_split_collision_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("output_audio_track0.wav");
+        std::fs::write(&input_path, b"dummy").unwrap();
+        let mut s = make_settings_audio_only();
+        s.split_tracks = false;
+        s.output_folder = dir.path().to_path_buf();
+        s.input_files = vec![input_path];
+
+        let previews = preview_output_files(&s, None);
+        assert!(!previews.is_empty(), "should have at least one preview output");
+        let audio_previews: Vec<_> = previews.iter().filter(|p| p.kind == OutputKind::Audio).collect();
+        assert!(!audio_previews.is_empty(), "should have an audio preview");
+        let name = audio_previews[0].path.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name.contains("_conv"), "expected _conv suffix for colliding merged audio in preview, got {}", name);
+    }
+
+    #[test]
+    fn test_collision_warning_audio_merged_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("output_audio_track0.wav");
+        std::fs::write(&input_path, b"dummy").unwrap();
+        let mut s = make_settings_audio_only();
+        s.split_tracks = false;
+        s.output_folder = dir.path().to_path_buf();
+        s.input_files = vec![input_path];
+
+        let msg = output_collision_warning(&s);
+        assert!(msg.is_some(), "merged audio collision should trigger warning");
+        let text = msg.unwrap();
+        assert!(text.contains("_conv"), "warning should mention _conv, got: {}", text);
+    }
+
+    #[test]
+    fn test_collision_warning_audio_split_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        // Track 1 will be output_audio_track1.wav
+        let input_path = dir.path().join("output_audio_track1.wav");
+        std::fs::write(&input_path, b"dummy").unwrap();
+        let mut s = make_settings_audio_only();
+        s.split_tracks = true;
+        s.drop_ltc_track = false;
+        s.output_folder = dir.path().to_path_buf();
+        s.input_files = vec![input_path];
+
+        let msg = output_collision_warning(&s);
+        assert!(msg.is_some(), "split audio collision should trigger warning");
+        let text = msg.unwrap();
+        assert!(text.contains("_conv"), "warning should mention _conv, got: {}", text);
+    }
+
+    #[test]
+    fn test_collision_warning_audio_no_false_positive_when_ext_differs() {
+        // Audio output is .wav but input is .mp4 → no collision
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("output_audio_track0.mp4");
+        std::fs::write(&input_path, b"dummy").unwrap();
+        let mut s = make_settings_audio_only();
+        s.split_tracks = false;
+        s.output_folder = dir.path().to_path_buf();
+        s.input_files = vec![input_path];
+
+        let msg = output_collision_warning(&s);
+        assert!(msg.is_none(),
+            "different extension should prevent false positive, got: {:?}", msg);
     }
 }
