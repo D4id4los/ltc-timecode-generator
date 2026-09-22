@@ -69,6 +69,7 @@ fn generate_ltc_wav(dir: &Path, name: &str, fps: f64, duration: f64, channels: &
         single_pass: false,
         context_frames: 3,
         list_timecodes: false,
+        autostart: false,
     };
     gui_engine::cli::generate_wav(cli).expect("LTC WAV generation failed");
     path

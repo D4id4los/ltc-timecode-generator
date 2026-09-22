@@ -126,6 +126,10 @@ pub struct Cli {
     /// Print all decoded timecodes from the LTC file
     #[arg(short = 't', long = "list-timecodes", help = "Print all decoded LTC timecodes")]
     pub list_timecodes: bool,
+
+    /// Start LTC generation immediately when the GUI opens (GUI mode only)
+    #[arg(long)]
+    pub autostart: bool,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -877,6 +881,10 @@ pub fn process_cli(cli: Cli) -> CliOutcome {
         })
         .expect("failed to spawn gui-engine thread");
 
+    if cli.autostart {
+        let _ = cmd_tx.send(GuiCommand::StartLtc);
+    }
+
     CliOutcome::RunGui {
         cmd_tx,
         state,
@@ -997,6 +1005,20 @@ mod tests {
         assert_eq!(timecode_fmt(&tc).len(), 11);
     }
 
+    // ── autostart ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_autostart_flag_parsed() {
+        let cli = Cli::try_parse_from(["test", "--autostart"]).unwrap();
+        assert!(cli.autostart, "--autostart should set autostart=true");
+    }
+
+    #[test]
+    fn test_autostart_default_false() {
+        let cli = Cli::try_parse_from(["test"]).unwrap();
+        assert!(!cli.autostart, "default autostart should be false");
+    }
+
     // ── resolve_device ────────────────────────────────────────────────────
 
     fn make_devices() -> Vec<AudioDeviceInfo> {
@@ -1043,6 +1065,7 @@ mod tests {
             single_pass: false,
             context_frames: 3,
             list_timecodes: false,
+            autostart: false,
         }
     }
 
