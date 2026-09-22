@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "ltc-timecode-generator",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "identifier": "at.agere.ltc-timecode-generator",
   "build": {
     "frontendDist": "../dist",

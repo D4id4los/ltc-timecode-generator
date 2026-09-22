@@ -1,6 +1,6 @@
 [package]
 name = "gui-engine"
-version = "0.4.1"
+version = "0.4.2"
 description = "Shared GUI engine glue for the LTC Timecode Generator — owns AudioCore + state, drives egui and Slint frontends"
 authors = ["Daidalos"]
 edition = "2021"

@@ -317,7 +317,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "cpal",
  "hound",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arc-swap",
  "audio-core",
@@ -2568,7 +2568,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "ltc-timecode-generator"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "audio-core",
  "gui-engine",
