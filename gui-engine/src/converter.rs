@@ -2483,6 +2483,63 @@ enum StepEntry {
     AudioOnly(VideoOutputStep),
 }
 
+/// Minimum output file size (in bytes) that suggests ffmpeg actually produced
+/// real encoded/copied content (not just a muxer header).  Muxer headers are
+/// typically ≪ 4 KiB (WAV = 44 B, mkv ~1 KiB, mp4 ftyp = few hundred B).
+const MIN_PRODUCED_OUTPUT_BYTES: u64 = 4096;
+
+/// Parse an `out_time=` progress line from `-progress pipe:2` output.
+/// Returns `Some(duration_seconds)` when the line contains a valid
+/// `out_time=HH:MM:SS.ssssss` value (including 0.0), and `None` for
+/// `N/A`, suffix keys (`out_time_us`, `out_time_ms`), or unrelated lines.
+fn parse_out_time(line: &str) -> Option<f64> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE
+        .get_or_init(|| regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap());
+    let caps = re.captures(line)?;
+    let raw = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+    // out_time_us= or out_time_ms= must not match: the regex pattern matches
+    // "out_time=" but "out_time_us=" also starts with "out_time=…" — check
+    // the suffix to reject those variants.
+    let tail = &raw["out_time".len()..];
+    if !tail.starts_with('=') {
+        return None;
+    }
+    let h: f64 = caps[1].parse().unwrap_or(0.0);
+    let m: f64 = caps[2].parse().unwrap_or(0.0);
+    let s: f64 = caps[3].parse().unwrap_or(0.0);
+    let frac: f64 = caps[4].parse().unwrap_or(0.0) / 1_000_000.0;
+    Some(h * 3600.0 + m * 60.0 + s + frac)
+}
+
+/// Classify an ffmpeg step failure as retryable (`EncoderInit`) or
+/// terminal (`Fatal`).  Considers both `produced_output` (from log
+/// parsing) and a file-size sanity check so encoder-init failures that
+/// leave a header-only (or zero-length) file are correctly retried.
+fn classify_step_failure(produced_output: bool, output: &Path, code: &str) -> StepFailure {
+    // File-size sanity check: even without log-progress, a real output file
+    // strongly suggests that the encoder did produce some data before failing.
+    let file_output = std::fs::metadata(output)
+        .map(|m| m.len())
+        .unwrap_or(0)
+        >= MIN_PRODUCED_OUTPUT_BYTES;
+    if file_output && !produced_output {
+        info!(
+            "classify_step_failure: produced_output=false but output file is {} bytes — treating as Fatal",
+            std::fs::metadata(output).map(|m| m.len()).unwrap_or(0)
+        );
+    }
+    if produced_output || file_output {
+        StepFailure::Fatal(format!("ffmpeg exited with code {}", code))
+    } else {
+        StepFailure::EncoderInit(format!(
+            "ffmpeg exited with code {} before producing output",
+            code
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_process(
     args: &[String],
@@ -2530,7 +2587,6 @@ fn run_ffmpeg_process(
     // encoder-init failures (nothing produced → retryable) from real
     // transcoding failures (progress was made → fatal).
     let mut produced_output = false;
-    let out_time_re = regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
     let duration_re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
     let mut total_duration_secs: Option<f64> = None;
 
@@ -2562,13 +2618,7 @@ fn run_ffmpeg_process(
             }
         }
 
-        if let Some(caps) = out_time_re.captures(&line) {
-            let h: f64 = caps[1].parse().unwrap_or(0.0);
-            let m: f64 = caps[2].parse().unwrap_or(0.0);
-            let s: f64 = caps[3].parse().unwrap_or(0.0);
-            let frac: f64 = caps[4].parse().unwrap_or(0.0) / 1_000_000.0;
-            let current_secs = h * 3600.0 + m * 60.0 + s + frac;
-
+        if let Some(current_secs) = parse_out_time(&line) {
             if current_secs > 0.0 {
                 produced_output = true;
             }
@@ -2585,7 +2635,8 @@ fn run_ffmpeg_process(
 
         if line.trim() == "progress=end" {
             step_progress = 1.0;
-            produced_output = true;
+            // Do NOT set produced_output here — ffmpeg emits progress=end
+            // even on encoder-init failures that produced no output.
         }
 
         let combined = *overall_progress + step_progress * step_progress_weight;
@@ -2610,14 +2661,11 @@ fn run_ffmpeg_process(
             let code = status.code().map(|c| c.to_string()).unwrap_or("unknown".into());
             warn!("{} ffmpeg exited with code {}: {}", step_label, code, output.display());
             overall_log.push_str(&format!("\n\n--- FFMPEG EXITED WITH CODE {} ---", code));
-            if produced_output {
-                Err(StepFailure::Fatal(format!("ffmpeg exited with code {}", code)))
-            } else {
-                Err(StepFailure::EncoderInit(format!(
-                    "ffmpeg exited with code {} before producing output",
-                    code
-                )))
+            let classification = classify_step_failure(produced_output, output, &code);
+            if matches!(classification, StepFailure::EncoderInit(_)) {
+                let _ = std::fs::remove_file(output);
             }
+            Err(classification)
         }
         Err(e) => {
             warn!("{} ffmpeg error: {}", step_label, e);
@@ -3330,23 +3378,126 @@ mod tests {
     }
 
     #[test]
-    fn test_progress_end_line_detected() {
-        let line = "progress=end";
-        assert_eq!(line.trim(), "progress=end");
+    fn test_parse_out_time_happy_path() {
+        // ffmpeg -progress output uses 6‑digit fractional microseconds
+        assert_eq!(parse_out_time("out_time=00:00:01.200000"), Some(1.2));
+        assert_eq!(parse_out_time("out_time=00:01:02.030000"), Some(62.03));
+        assert!((parse_out_time("out_time=00:00:00.000000").unwrap() - 0.0).abs() < 1e-12);
     }
 
     #[test]
-    fn test_progress_continue_not_mistaken_for_end() {
-        let line = "progress=continue";
-        assert_ne!(line.trim(), "progress=end");
+    fn test_parse_out_time_na() {
+        assert_eq!(parse_out_time("out_time=N/A"), None);
     }
 
     #[test]
-    fn test_non_matching_lines_do_not_trigger_out_time() {
-        let re = regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap();
-        assert!(re.captures("frame=  123 fps= 45").is_none());
-        assert!(re.captures("size=    1024kB time=00:00:04.56").is_none());
-        assert!(re.captures("").is_none());
+    fn test_parse_out_time_key_suffixes() {
+        // _us and _ms variants must NOT match
+        assert_eq!(parse_out_time("out_time_us=N/A"), None);
+        assert_eq!(parse_out_time("out_time_ms=0"), None);
+    }
+
+    #[test]
+    fn test_parse_out_time_progress_lines() {
+        assert_eq!(parse_out_time("progress=end"), None);
+        assert_eq!(parse_out_time("progress=continue"), None);
+    }
+
+    #[test]
+    fn test_parse_out_time_stderr_time_not_mistaken() {
+        // stderr "time=" / "time:" lines must not match
+        assert_eq!(parse_out_time("time=00:01:23.45"), None);
+        assert_eq!(parse_out_time("size=    1024kB time=00:00:04.56"), None);
+    }
+
+    #[test]
+    fn test_parse_out_time_empty() {
+        assert_eq!(parse_out_time(""), None);
+    }
+
+    #[test]
+    fn test_classify_step_failure_no_output_file_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("nonexistent.mkv");
+        assert!(matches!(
+            classify_step_failure(false, &p, "187"),
+            StepFailure::EncoderInit(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_step_failure_no_output_zero_byte() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("empty.mkv");
+        std::fs::write(&p, b"").unwrap();
+        assert!(matches!(
+            classify_step_failure(false, &p, "187"),
+            StepFailure::EncoderInit(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_step_failure_no_output_header_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("header.mkv");
+        // 44 bytes — typical WAV header size, well under 4 KiB
+        std::fs::write(&p, [0u8; 44]).unwrap();
+        assert!(matches!(
+            classify_step_failure(false, &p, "187"),
+            StepFailure::EncoderInit(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_step_failure_real_output_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("real.mkv");
+        // 8 KiB — above the 4 KiB threshold, suggests real data
+        std::fs::write(&p, [0u8; 8192]).unwrap();
+        assert!(matches!(
+            classify_step_failure(false, &p, "1"),
+            StepFailure::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn test_classify_step_failure_produced_output_trumps_no_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("missing_but_produced.mkv");
+        assert!(matches!(
+            classify_step_failure(true, &p, "1"),
+            StepFailure::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn regress_nvenc_progress_end_is_retryable() {
+        // Reproduce the exact stderr lines from the user's failing
+        // av1_nvenc run: out_time=N/A, progress=end, 0-byte output.
+        // Without the fix this was misclassified as Fatal.
+        let lines = &[
+            "frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A",
+            "out_time=N/A",
+            "out_time_us=N/A",
+            "progress=end",
+            "Conversion failed!",
+        ];
+        let mut produced = false;
+        for line in lines {
+            if let Some(secs) = parse_out_time(line) {
+                if secs > 0.0 {
+                    produced = true;
+                }
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("failed.mkv");
+        std::fs::write(&p, b"").unwrap();
+        assert!(!produced, "no out_time with value > 0 should have been parsed");
+        assert!(matches!(
+            classify_step_failure(produced, &p, "187"),
+            StepFailure::EncoderInit(_)
+        ));
     }
 
     // ── ConversionState tests ───────────────────────────────────────────
