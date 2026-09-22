@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(FPS_OPTIONS[1].fps, 25.0);
         assert_eq!(FPS_OPTIONS[2].name, "29.97 ND");
         assert_eq!(FPS_OPTIONS[3].name, "29.97 DF");
-        assert_eq!(FPS_OPTIONS[3].drop_frame, true);
+        assert!(FPS_OPTIONS[3].drop_frame);
         assert_eq!(FPS_OPTIONS[4].name, "30 fps");
         assert_eq!(FPS_OPTIONS[4].fps, 30.0);
     }

@@ -576,7 +576,9 @@ fn run_decode_on_wav(
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
                 loop {
                     let done = completed_ref.load(std::sync::atomic::Ordering::Relaxed);
-                    let pct = if total_chunks > 0 { (done * 100) / total_chunks } else { 100 };
+                    let pct = (done.checked_mul(100))
+                        .and_then(|v| v.checked_div(total_chunks))
+                        .unwrap_or(100);
                     eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
                     if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline { break; }
                     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -658,16 +660,14 @@ fn print_decode_results(
                         println!();
                         println!("--- Gap {} ---", gi + 1);
                         let pre_start = prev_last.saturating_sub(ctx) + 1;
-                        for j in pre_start..=prev_last {
-                            let ft = &tc[j];
+                        for ft in &tc[pre_start..=prev_last] {
                             println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
                                 ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         }
                         let missing = ((tc_to_secs(&tc[next_first]) - tc_to_secs(&tc[prev_last]) - 1.0 / fps) / (1.0 / fps)).round() as u32;
                         println!("  ---- GAP ({} missing frame(s)) ----", missing);
                         let post_end = (next_first + ctx).min(tc.len());
-                        for j in next_first..post_end {
-                            let ft = &tc[j];
+                        for ft in &tc[next_first..post_end] {
                             println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
                                 ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         }
@@ -679,8 +679,7 @@ fn print_decode_results(
                         println!();
                         println!("--- Glitch {} ---", gi + 1);
                         let pre_start = idx.saturating_sub(ctx);
-                        for j in pre_start..idx {
-                            let ft = &tc[j];
+                        for ft in &tc[pre_start..idx] {
                             println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
                                 ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         }
@@ -688,8 +687,7 @@ fn print_decode_results(
                         println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)  <<< GLITCH", ft.frame_index,
                             ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         let post_end = (idx + 1 + ctx).min(tc.len());
-                        for j in (idx + 1)..post_end {
-                            let ft = &tc[j];
+                        for ft in &tc[(idx + 1)..post_end] {
                             println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
                                 ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
                         }

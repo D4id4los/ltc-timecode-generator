@@ -13,7 +13,8 @@ exclude = [
 
 [workspace.lints.clippy]
 # Levels for selected clippy lint groups. Add per-lint overrides here.
-style = "warn"
-correctness = "warn"
-complexity = "warn"
-perf = "warn"
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+too_many_arguments = "allow"

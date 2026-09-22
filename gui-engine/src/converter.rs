@@ -521,7 +521,7 @@ fn sanity_check_impl(
     }
 
     // Collision warning when SourceStems mode + output folder overlaps inputs
-    if naming_mode.map_or(false, |m| m.is_source_stems()) && input_files.iter().any(|f| {
+    if naming_mode.is_some_and(|m| m.is_source_stems()) && input_files.iter().any(|f| {
         f.parent().map(|p| p == output_folder).unwrap_or(false)
     }) {
         return Err(
@@ -879,10 +879,7 @@ pub fn plan_concat_outputs(
                 continue;
             }
         }
-        let segments: Vec<(usize, usize, usize)> = tracks_segments[track_idx]
-            .iter()
-            .copied()
-            .collect();
+        let segments: Vec<(usize, usize, usize)> = tracks_segments[track_idx].to_vec();
         if segments.is_empty() {
             continue;
         }
@@ -1515,7 +1512,7 @@ fn build_concat_audio_args(
     let mut args: Vec<String> = vec!["-y".to_string()];
 
     // Input files with per-clip trim
-    for (_i, &(file_idx, _stream_idx, _channel_idx)) in segments.iter().enumerate() {
+    for &(file_idx, _stream_idx, _channel_idx) in segments.iter() {
         let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
         push_input_with_trim(&mut args, &settings.input_files[file_idx], trim_secs);
     }
@@ -2184,7 +2181,7 @@ fn run_video_to_video(
         }
     } else {
         // Normal per-file planning (no concat)
-        for (_file_idx, probe_opt) in probes.iter().enumerate() {
+        for probe_opt in probes.iter() {
             let probe = match probe_opt {
                 Some(p) => p.clone(),
                 None => VideoAudioProbe {
@@ -3882,7 +3879,8 @@ mod tests {
     fn test_output_path_collision_fallback() {
         // Input file collides with computed output path when suffix is empty
         // in source-stems mode and output folder == input folder.
-        let input_path = tempfile::TempDir::new().unwrap().into_path().join("C0001.mp4");
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("C0001.mp4");
         std::fs::write(&input_path, b"dummy").unwrap();
         let out_dir = input_path.parent().unwrap().to_path_buf();
 

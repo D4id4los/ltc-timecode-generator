@@ -934,7 +934,7 @@ fn estimate_noise_floor(samples: &[f32]) -> f32 {
         return 1e-10;
     }
     let window_count = 4usize;
-    let window_size = (total / window_count).max(100).min(10_000);
+    let window_size = (total / window_count).clamp(100, 10_000);
     let mut best_median = f32::MAX;
     for w in 0..window_count {
         let start = (total * w / window_count).min(total.saturating_sub(window_size));

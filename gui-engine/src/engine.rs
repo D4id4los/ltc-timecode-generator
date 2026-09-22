@@ -559,7 +559,7 @@ fn process_command(
                     let total_mono = reader.total_mono_samples();
                     let sr = reader.sample_rate();
                     let ch = reader.channels();
-                    let spec = reader.spec().clone();
+                    let spec = *reader.spec();
                     let bytes_per_mono = (ch as u64) * (spec.bits_per_sample as u64 / 8);
                     let config = DecodeConfig::default();
                     let chunk_mono = (config.chunk_size_bytes / bytes_per_mono.max(1)) as usize;

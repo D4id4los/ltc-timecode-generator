@@ -821,11 +821,8 @@ pub fn decode_ltc_chunked(
     // Calculate chunk boundaries (in mono samples)
     // chunk_bytes = chunk_size_bytes (raw audio bytes, all channels)
     let bytes_per_mono_sample = (channels as u64) * (chunk_reader.spec.bits_per_sample as u64 / 8);
-    let chunk_mono_samples = if bytes_per_mono_sample > 0 {
-        (config.chunk_size_bytes / bytes_per_mono_sample) as usize
-    } else {
-        total_mono / 4  // fallback
-    };
+    let chunk_mono_samples = (config.chunk_size_bytes.checked_div(bytes_per_mono_sample)
+        .map(|v| v as usize)).unwrap_or(total_mono / 4);
     let overlap_samples = (config.overlap_seconds * sample_rate as f64) as usize;
     let chunk_mono_samples = chunk_mono_samples.max(overlap_samples * 2);
 
@@ -1267,6 +1264,461 @@ pub fn suggest_sample_rate() -> u32 {
 
 /// Available sample rate options for UI display.
 pub const SAMPLE_RATE_OPTIONS: &[u32] = &[44100, 48000];
+
+// Re-export LTC decoder types for convenience
+pub use ltc_decoder::{
+    apply_coherent_first_timecode, compute_ltc_quality, decode_ltc_from_wav, decode_ltc_samples,
+    find_first_coherent_index, quick_check_ltc, FrameTimecode, LtcDecodeStatus,
+    LtcDetectionResult, LtcQualityReport,
+};
+pub use ltc_decoder_libltc::{decode_ltc_from_wav_libltc, decode_ltc_samples_libltc};
+
+/// Decode LTC from a WAV file, selecting the decoder implementation.
+/// `fps` and `drop_frame` specify the expected frame rate (no auto-detection).
+/// Set `use_libltc = true` to use the libltc C library decoder.
+pub fn decode_ltc_with_decoder(
+    path: &std::path::Path,
+    use_libltc: bool,
+    fps: f64,
+    drop_frame: bool,
+) -> Result<LtcDetectionResult, String> {
+    if use_libltc {
+        decode_ltc_from_wav_libltc(path, fps, drop_frame)
+    } else {
+        decode_ltc_from_wav(path, fps, drop_frame)
+    }
+}
+
+// ── Device enumeration ─────────────────────────────────────────────────────
+
+const PLUGIN_KEYWORDS: &[&str] = &[
+    "Discard all samples",
+    "Rate Converter Plugin",
+    "Samplerate Library",
+    "Speex Resampler",
+    "JACK Audio",
+    "Open Sound System",
+    "PipeWire Sound Server",
+    "PulseAudio Sound Server",
+    "Speex DSP",
+    "channel upmix",
+    "channel downmix",
+    "Plugin for",
+];
+
+fn is_valid_device(name: &str, host_id: &cpal::HostId) -> bool {
+    let host_name = host_id.name();
+    if host_name == "pipewire" || host_name == "pulseaudio" {
+        return true;
+    }
+    !PLUGIN_KEYWORDS.iter().any(|kw| name.contains(kw))
+}
+
+fn collect_device_configs(device: &cpal::Device) -> (Vec<String>, u16, u16, u32, u32, u32, u32) {
+    let configs: Vec<_> = device
+        .supported_output_configs()
+        .map(|c| c.collect())
+        .unwrap_or_default();
+    let mut formats: Vec<String> = Vec::new();
+    let mut min_channels = u16::MAX;
+    let mut max_channels = u16::MIN;
+    let mut min_rate = u32::MAX;
+    let mut max_rate = u32::MIN;
+    let mut min_buffer = u32::MAX;
+    let mut max_buffer = u32::MIN;
+    for cfg in &configs {
+        let f = sample_format_name(cfg.sample_format());
+        if !formats.iter().any(|x| x == f) {
+            formats.push(f.to_string());
+        }
+        min_channels = min_channels.min(cfg.channels());
+        max_channels = max_channels.max(cfg.channels());
+        min_rate = min_rate.min(cfg.min_sample_rate());
+        max_rate = max_rate.max(cfg.max_sample_rate());
+        match cfg.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                min_buffer = min_buffer.min(*min);
+                max_buffer = max_buffer.max(*max);
+            }
+            cpal::SupportedBufferSize::Unknown => {}
+        }
+    }
+    (formats, min_channels, max_channels, min_rate, max_rate, min_buffer, max_buffer)
+}
+
+fn log_device_supported_configs(device: &cpal::Device, label: &str) {
+    match device.supported_output_configs() {
+        Ok(configs) => {
+            let configs: Vec<_> = configs.collect();
+            let mut formats: Vec<&'static str> = Vec::new();
+            let mut min_channels = u16::MAX;
+            let mut max_channels = u16::MIN;
+            let mut min_rate = u32::MAX;
+            let mut max_rate = u32::MIN;
+            let mut min_buffer = u32::MAX;
+            let mut max_buffer = u32::MIN;
+            for cfg in &configs {
+                let f = sample_format_name(cfg.sample_format());
+                if !formats.contains(&f) {
+                    formats.push(f);
+                }
+                min_channels = min_channels.min(cfg.channels());
+                max_channels = max_channels.max(cfg.channels());
+                min_rate = min_rate.min(cfg.min_sample_rate());
+                max_rate = max_rate.max(cfg.max_sample_rate());
+                match cfg.buffer_size() {
+                    cpal::SupportedBufferSize::Range { min, max } => {
+                        min_buffer = min_buffer.min(*min);
+                        max_buffer = max_buffer.max(*max);
+                    }
+                    cpal::SupportedBufferSize::Unknown => {}
+                }
+            }
+            let ch_range = if min_channels == max_channels {
+                format!("{}", min_channels)
+            } else {
+                format!("{}-{}", min_channels, max_channels)
+            };
+            let rate_range = if min_rate == max_rate {
+                format!("{}", min_rate)
+            } else {
+                format!("{}-{}", min_rate, max_rate)
+            };
+            let buf = if min_buffer <= max_buffer && min_buffer != u32::MAX {
+                if min_buffer == max_buffer {
+                    format!("buffer={}", min_buffer)
+                } else {
+                    format!("buffer={}-{}", min_buffer, max_buffer)
+                }
+            } else {
+                String::from("buffer=unknown")
+            };
+            info!(
+                "  Device {}: formats=[{}], channels={}, rates={}, {}",
+                label,
+                formats.join(", "),
+                ch_range,
+                rate_range,
+                buf,
+            );
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            if is_permanent_device_error(&err_str) {
+                warn!("  Device {}: skipped (error: {})", label, err_str);
+            }
+        }
+    }
+}
+
+pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+    let host = cpal::default_host();
+    let host_id = host.id();
+    let default_device = host.default_output_device();
+    let default_name = default_device.as_ref().map(|d| d.to_string());
+
+    let mut seen = HashSet::new();
+    let mut devices: Vec<AudioDeviceInfo> = Vec::new();
+
+    if let Some(ref dev) = default_device {
+        let name = dev.to_string();
+        if !name.is_empty() {
+            match dev.supported_output_configs() {
+                Ok(_) => {
+                    seen.insert(name.clone());
+                    let (formats, ch_min, ch_max, rate_min, rate_max, buf_min, buf_max) = collect_device_configs(dev);
+                    devices.push(AudioDeviceInfo {
+                        id: String::from("default"),
+                        name: format!("{} (Default)", name),
+                        is_default: true,
+                        formats,
+                        channels_min: if ch_min != u16::MAX { ch_min } else { 0 },
+                        channels_max: if ch_max != u16::MIN { ch_max } else { 0 },
+                        sample_rate_min: if rate_min != u32::MAX { rate_min } else { 0 },
+                        sample_rate_max: if rate_max != u32::MIN { rate_max } else { 0 },
+                        buffer_min: if buf_min != u32::MAX { buf_min } else { 0 },
+                        buffer_max: if buf_max != u32::MIN { buf_max } else { 0 },
+                    });
+                    log_device_supported_configs(dev, &format!("\"{}\" (Default)", name));
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if is_permanent_device_error(&err_str) {
+                        warn!("Skipping default device '{}': {}", name, err_str);
+                    } else {
+                        seen.insert(name.clone());
+                        devices.push(AudioDeviceInfo {
+                            id: String::from("default"),
+                            name: format!("{} (Default)", name),
+                            is_default: true,
+                            formats: Vec::new(),
+                            channels_min: 0,
+                            channels_max: 0,
+                            sample_rate_min: 0,
+                            sample_rate_max: 0,
+                            buffer_min: 0,
+                            buffer_max: 0,
+                        });
+                        log_device_supported_configs(dev, &format!("\"{}\" (Default)", name));
+                    }
+                }
+            }
+        }
+    }
+
+    for device in host
+        .output_devices()
+        .map_err(|e| format!("Failed to enumerate output devices: {}", e))?
+    {
+        let name = device.to_string();
+        if name.is_empty() || !is_valid_device(&name, &host_id) {
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        match device.supported_output_configs() {
+            Ok(_) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                if is_permanent_device_error(&err_str) {
+                    warn!("Skipping device '{}': {}", name, err_str);
+                    continue;
+                }
+            }
+        }
+        log_device_supported_configs(&device, &format!("\"{}\"", name));
+        let (formats, ch_min, ch_max, rate_min, rate_max, buf_min, buf_max) = collect_device_configs(&device);
+        let is_default = default_name.as_deref() == Some(&name);
+        devices.push(AudioDeviceInfo {
+            id: name.clone(),
+            name,
+            is_default,
+            formats,
+            channels_min: if ch_min != u16::MAX { ch_min } else { 0 },
+            channels_max: if ch_max != u16::MIN { ch_max } else { 0 },
+            sample_rate_min: if rate_min != u32::MAX { rate_min } else { 0 },
+            sample_rate_max: if rate_max != u32::MIN { rate_max } else { 0 },
+            buffer_min: if buf_min != u32::MAX { buf_min } else { 0 },
+            buffer_max: if buf_max != u32::MIN { buf_max } else { 0 },
+        });
+    }
+
+    devices.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
+
+    info!("Found {} audio devices", devices.len());
+
+    Ok(devices)
+}
+
+// ── LTC scheduler thread ───────────────────────────────────────────────────
+
+fn ltc_scheduler_thread(
+    ltc_producer: Arc<Mutex<HeapProducer<f32>>>,
+    ltc: Arc<Mutex<LtcStreamState>>,
+    stop_signal: Arc<AtomicBool>,
+    underrun_count: Arc<AtomicU64>,
+    callback_counter: Arc<AtomicU64>,
+    events: Arc<Mutex<Vec<AudioEvent>>>,
+) {
+    info!("LTC scheduler thread started");
+
+    // Attempt to elevate thread priority for tighter scheduling
+    #[cfg(not(target_os = "macos"))]
+    match thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max) {
+        Ok(_) => info!("LTC scheduler thread priority elevated to Max"),
+        Err(e) => warn!("Could not set thread priority: {:?}", e),
+    }
+    #[cfg(target_os = "macos")]
+    info!("LTC scheduler thread priority not elevated (macOS)");
+
+    let mut frame_buf: Vec<f32> = Vec::new();
+    let mut frame_count: u64 = 0;
+    let mut drop_count: u64 = 0;
+    let mut last_drop_event: u64 = 0;
+    let mut last_callback_value: u64 = 0;
+    let mut last_callback_check: Instant = Instant::now();
+    let mut last_underrun_value: u64 = 0;
+
+    // ── Watchdog recovery state (event-driven sliding window) ──
+    let mut recovery_attempts: u8 = 0;
+    let mut first_failure: Option<Instant> = None;
+
+    loop {
+        if stop_signal.load(Ordering::Relaxed) {
+            info!("LTC scheduler thread stopped via stop signal");
+            return;
+        }
+
+        let (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, mut last_level, new_accumulator) = {
+            let state = match ltc.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("LTC scheduler: state mutex poisoned: {}", e);
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            };
+            if !state.running {
+                drop(state);
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+
+            let now = Instant::now();
+            if now < state.next_frame_time {
+                let sleep = state.next_frame_time - now;
+                let target = state.next_frame_time;
+                drop(state);
+                // Hybrid sleep: OS sleep until 2ms before deadline, then spin-loop
+                if sleep > Duration::from_millis(2) {
+                    std::thread::sleep(sleep - Duration::from_millis(2));
+                }
+                while Instant::now() < target {
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+
+            let tc = state.tc;
+            let fps = state.fps;
+            let drop_frame = state.drop_frame;
+            let ltc_channel = state.ltc_channel.clone();
+            let ltc_volume = state.ltc_volume;
+            let frame_dur = state.frame_duration;
+            let last_level = state.last_level;
+
+            // Sample accumulator: track fractional-sample remainder across frames
+            let (frame_samples, spb, acc) = ltc_encoder::compute_frame_sample_count(
+                state.exact_samples_per_frame,
+                state.base_samples,
+                state.samples_accumulator,
+            );
+
+            (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, frame_samples, spb, last_level, acc)
+        };
+
+        // ── Watchdog: check if audio callback is still alive ──
+        let current_callback = callback_counter.load(Ordering::Relaxed);
+        if current_callback == last_callback_value {
+            if last_callback_check.elapsed() > Duration::from_millis(500) {
+                error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
+
+                // Sliding window: reset counter if last failure was >10s ago
+                let now = Instant::now();
+                if let Some(first) = first_failure {
+                    if now.duration_since(first) > Duration::from_secs(10) {
+                        recovery_attempts = 0;
+                        first_failure = None;
+                    }
+                }
+
+                if recovery_attempts < 3 {
+                    recovery_attempts += 1;
+                    if first_failure.is_none() {
+                        first_failure = Some(now);
+                    }
+                    warn!("LTC scheduler: recovery attempt {}/3", recovery_attempts);
+                    if let Ok(mut ev) = events.lock() {
+                        ev.push(AudioEvent::RecoveryNeeded {
+                            reason: format!("callback stalled for 500ms (attempt {}/3)", recovery_attempts),
+                        });
+                    }
+                    // Reset watchdog timer so we don't immediately re-trigger
+                    last_callback_value = current_callback;
+                    last_callback_check = Instant::now();
+                    // Sleep a short time before checking again so the main thread can act
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                } else {
+                    error!("LTC scheduler: 3 recovery attempts exhausted — stream permanently dead");
+                    if let Ok(mut ev) = events.lock() {
+                        ev.push(AudioEvent::StreamDead);
+                    }
+                    return;
+                }
+            }
+        } else {
+            // Callback is alive — reset recovery state
+            last_callback_value = current_callback;
+            last_callback_check = Instant::now();
+            recovery_attempts = 0;
+            first_failure = None;
+        }
+
+        // ── Watchdog: check for underruns ──
+        let current_underrun = underrun_count.load(Ordering::Relaxed);
+        if current_underrun > last_underrun_value {
+            let new_underruns = current_underrun - last_underrun_value;
+            warn!("LTC scheduler: detected {} callback underruns (total: {})", new_underruns, current_underrun);
+            if let Ok(mut ev) = events.lock() {
+                ev.push(AudioEvent::Underrun);
+            }
+            last_underrun_value = current_underrun;
+        }
+
+        // ── Generate LTC frame ──
+        let needed = total_samples * 2;
+        frame_buf.resize(needed, 0.0);
+
+        generate_ltc_frame_stereo(
+            &tc,
+            drop_frame,
+            total_samples,
+            samples_per_bit,
+            ltc_volume,
+            &ltc_channel,
+            &mut last_level,
+            &mut frame_buf[..needed],
+        );
+
+        // ── Push samples into lock-free ring buffer ──
+        {
+            let mut producer = match ltc_producer.lock() {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("LTC scheduler: producer mutex poisoned: {}", e);
+                    return;
+                }
+            };
+            let pushed = producer.push_slice(&frame_buf[..needed]);
+            if pushed < needed {
+                drop_count += 1;
+                if drop_count <= 1 || drop_count % 100 == 0 {
+                    warn!("LTC scheduler: ring buffer full, dropped frame #{} (pushed {}/{}, total drops: {})",
+                        frame_count, pushed, needed, drop_count);
+                }
+                if drop_count - last_drop_event >= 100 {
+                    if let Ok(mut ev) = events.lock() {
+                        ev.push(AudioEvent::FramesDropped { total: drop_count });
+                    }
+                    last_drop_event = drop_count;
+                }
+            }
+        }
+
+        frame_count += 1;
+        if frame_count % 1000 == 0 {
+            info!("LTC scheduler: frame={}, drops={}, channel={}, fps={}, tc={:02}:{:02}:{:02}:{:02}",
+                frame_count, drop_count, ltc_channel,
+                fps, tc.hours, tc.minutes, tc.seconds, tc.frames);
+        }
+
+        {
+            let mut state = match ltc.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("LTC scheduler: state mutex poisoned updating state: {}", e);
+                    return;
+                }
+            };
+            state.last_level = last_level;
+            state.tc = increment_timecode(&state.tc, fps, drop_frame);
+            state.next_frame_time += frame_dur;
+            state.samples_accumulator = new_accumulator;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2074,11 +2526,7 @@ mod tests {
         // Allow small tolerance (1-2 frames) since non-chunked decoder's bit-extraction
         // based total_possible may differ from the stream-based count used by chunked.
         // The key assertion: both decode essentially the same number of frames.
-        let diff = if chunked.valid_frames > direct.valid_frames {
-            chunked.valid_frames - direct.valid_frames
-        } else {
-            direct.valid_frames - chunked.valid_frames
-        };
+        let diff = chunked.valid_frames.abs_diff(direct.valid_frames);
         assert!(diff <= 2,
             "single chunk: chunked={} != direct={} (diff={})",
             chunked.valid_frames, direct.valid_frames, diff);
@@ -2162,11 +2610,7 @@ mod tests {
         let direct = crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(&path, fps, false).unwrap();
 
         // Allow 2-frame tolerance: chunk boundaries may lose a frame at each edge
-        let diff = if chunked.valid_frames > direct.valid_frames {
-            chunked.valid_frames - direct.valid_frames
-        } else {
-            direct.valid_frames - chunked.valid_frames
-        };
+        let diff = chunked.valid_frames.abs_diff(direct.valid_frames);
         assert!(diff <= 2,
             "chunked libltc merge lost frames: chunked={} vs direct={} (diff={})",
             chunked.valid_frames, direct.valid_frames, diff);
@@ -2496,460 +2940,5 @@ mod tests {
         // Error details should mention read failure
         let has_read_error = result.details.iter().any(|d| d.contains("Failed to read"));
         assert!(has_read_error, "expected detail mentioning 'Failed to read', got: {:?}", result.details);
-    }
-}
-
-// Re-export LTC decoder types for convenience
-pub use ltc_decoder::{
-    apply_coherent_first_timecode, compute_ltc_quality, decode_ltc_from_wav, decode_ltc_samples,
-    find_first_coherent_index, quick_check_ltc, FrameTimecode, LtcDecodeStatus,
-    LtcDetectionResult, LtcQualityReport,
-};
-pub use ltc_decoder_libltc::{decode_ltc_from_wav_libltc, decode_ltc_samples_libltc};
-
-/// Decode LTC from a WAV file, selecting the decoder implementation.
-/// `fps` and `drop_frame` specify the expected frame rate (no auto-detection).
-/// Set `use_libltc = true` to use the libltc C library decoder.
-pub fn decode_ltc_with_decoder(
-    path: &std::path::Path,
-    use_libltc: bool,
-    fps: f64,
-    drop_frame: bool,
-) -> Result<LtcDetectionResult, String> {
-    if use_libltc {
-        decode_ltc_from_wav_libltc(path, fps, drop_frame)
-    } else {
-        decode_ltc_from_wav(path, fps, drop_frame)
-    }
-}
-
-// ── Device enumeration ─────────────────────────────────────────────────────
-
-const PLUGIN_KEYWORDS: &[&str] = &[
-    "Discard all samples",
-    "Rate Converter Plugin",
-    "Samplerate Library",
-    "Speex Resampler",
-    "JACK Audio",
-    "Open Sound System",
-    "PipeWire Sound Server",
-    "PulseAudio Sound Server",
-    "Speex DSP",
-    "channel upmix",
-    "channel downmix",
-    "Plugin for",
-];
-
-fn is_valid_device(name: &str, host_id: &cpal::HostId) -> bool {
-    let host_name = host_id.name();
-    if host_name == "pipewire" || host_name == "pulseaudio" {
-        return true;
-    }
-    !PLUGIN_KEYWORDS.iter().any(|kw| name.contains(kw))
-}
-
-fn collect_device_configs(device: &cpal::Device) -> (Vec<String>, u16, u16, u32, u32, u32, u32) {
-    let configs: Vec<_> = device
-        .supported_output_configs()
-        .map(|c| c.collect())
-        .unwrap_or_default();
-    let mut formats: Vec<String> = Vec::new();
-    let mut min_channels = u16::MAX;
-    let mut max_channels = u16::MIN;
-    let mut min_rate = u32::MAX;
-    let mut max_rate = u32::MIN;
-    let mut min_buffer = u32::MAX;
-    let mut max_buffer = u32::MIN;
-    for cfg in &configs {
-        let f = sample_format_name(cfg.sample_format());
-        if !formats.iter().any(|x| x == f) {
-            formats.push(f.to_string());
-        }
-        min_channels = min_channels.min(cfg.channels());
-        max_channels = max_channels.max(cfg.channels());
-        min_rate = min_rate.min(cfg.min_sample_rate());
-        max_rate = max_rate.max(cfg.max_sample_rate());
-        match cfg.buffer_size() {
-            cpal::SupportedBufferSize::Range { min, max } => {
-                min_buffer = min_buffer.min(*min);
-                max_buffer = max_buffer.max(*max);
-            }
-            cpal::SupportedBufferSize::Unknown => {}
-        }
-    }
-    (formats, min_channels, max_channels, min_rate, max_rate, min_buffer, max_buffer)
-}
-
-fn log_device_supported_configs(device: &cpal::Device, label: &str) {
-    match device.supported_output_configs() {
-        Ok(configs) => {
-            let configs: Vec<_> = configs.collect();
-            let mut formats: Vec<&'static str> = Vec::new();
-            let mut min_channels = u16::MAX;
-            let mut max_channels = u16::MIN;
-            let mut min_rate = u32::MAX;
-            let mut max_rate = u32::MIN;
-            let mut min_buffer = u32::MAX;
-            let mut max_buffer = u32::MIN;
-            for cfg in &configs {
-                let f = sample_format_name(cfg.sample_format());
-                if !formats.contains(&f) {
-                    formats.push(f);
-                }
-                min_channels = min_channels.min(cfg.channels());
-                max_channels = max_channels.max(cfg.channels());
-                min_rate = min_rate.min(cfg.min_sample_rate());
-                max_rate = max_rate.max(cfg.max_sample_rate());
-                match cfg.buffer_size() {
-                    cpal::SupportedBufferSize::Range { min, max } => {
-                        min_buffer = min_buffer.min(*min);
-                        max_buffer = max_buffer.max(*max);
-                    }
-                    cpal::SupportedBufferSize::Unknown => {}
-                }
-            }
-            let ch_range = if min_channels == max_channels {
-                format!("{}", min_channels)
-            } else {
-                format!("{}-{}", min_channels, max_channels)
-            };
-            let rate_range = if min_rate == max_rate {
-                format!("{}", min_rate)
-            } else {
-                format!("{}-{}", min_rate, max_rate)
-            };
-            let buf = if min_buffer <= max_buffer && min_buffer != u32::MAX {
-                if min_buffer == max_buffer {
-                    format!("buffer={}", min_buffer)
-                } else {
-                    format!("buffer={}-{}", min_buffer, max_buffer)
-                }
-            } else {
-                String::from("buffer=unknown")
-            };
-            info!(
-                "  Device {}: formats=[{}], channels={}, rates={}, {}",
-                label,
-                formats.join(", "),
-                ch_range,
-                rate_range,
-                buf,
-            );
-        }
-        Err(e) => {
-            let err_str = e.to_string();
-            if is_permanent_device_error(&err_str) {
-                warn!("  Device {}: skipped (error: {})", label, err_str);
-            }
-        }
-    }
-}
-
-pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
-    let host = cpal::default_host();
-    let host_id = host.id();
-    let default_device = host.default_output_device();
-    let default_name = default_device.as_ref().map(|d| d.to_string());
-
-    let mut seen = HashSet::new();
-    let mut devices: Vec<AudioDeviceInfo> = Vec::new();
-
-    if let Some(ref dev) = default_device {
-        let name = dev.to_string();
-        if !name.is_empty() {
-            match dev.supported_output_configs() {
-                Ok(_) => {
-                    seen.insert(name.clone());
-                    let (formats, ch_min, ch_max, rate_min, rate_max, buf_min, buf_max) = collect_device_configs(dev);
-                    devices.push(AudioDeviceInfo {
-                        id: String::from("default"),
-                        name: format!("{} (Default)", name),
-                        is_default: true,
-                        formats,
-                        channels_min: if ch_min != u16::MAX { ch_min } else { 0 },
-                        channels_max: if ch_max != u16::MIN { ch_max } else { 0 },
-                        sample_rate_min: if rate_min != u32::MAX { rate_min } else { 0 },
-                        sample_rate_max: if rate_max != u32::MIN { rate_max } else { 0 },
-                        buffer_min: if buf_min != u32::MAX { buf_min } else { 0 },
-                        buffer_max: if buf_max != u32::MIN { buf_max } else { 0 },
-                    });
-                    log_device_supported_configs(dev, &format!("\"{}\" (Default)", name));
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if is_permanent_device_error(&err_str) {
-                        warn!("Skipping default device '{}': {}", name, err_str);
-                    } else {
-                        seen.insert(name.clone());
-                        devices.push(AudioDeviceInfo {
-                            id: String::from("default"),
-                            name: format!("{} (Default)", name),
-                            is_default: true,
-                            formats: Vec::new(),
-                            channels_min: 0,
-                            channels_max: 0,
-                            sample_rate_min: 0,
-                            sample_rate_max: 0,
-                            buffer_min: 0,
-                            buffer_max: 0,
-                        });
-                        log_device_supported_configs(dev, &format!("\"{}\" (Default)", name));
-                    }
-                }
-            }
-        }
-    }
-
-    for device in host
-        .output_devices()
-        .map_err(|e| format!("Failed to enumerate output devices: {}", e))?
-    {
-        let name = device.to_string();
-        if name.is_empty() || !is_valid_device(&name, &host_id) {
-            continue;
-        }
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        match device.supported_output_configs() {
-            Ok(_) => {}
-            Err(e) => {
-                let err_str = e.to_string();
-                if is_permanent_device_error(&err_str) {
-                    warn!("Skipping device '{}': {}", name, err_str);
-                    continue;
-                }
-            }
-        }
-        log_device_supported_configs(&device, &format!("\"{}\"", name));
-        let (formats, ch_min, ch_max, rate_min, rate_max, buf_min, buf_max) = collect_device_configs(&device);
-        let is_default = default_name.as_deref() == Some(&name);
-        devices.push(AudioDeviceInfo {
-            id: name.clone(),
-            name,
-            is_default,
-            formats,
-            channels_min: if ch_min != u16::MAX { ch_min } else { 0 },
-            channels_max: if ch_max != u16::MIN { ch_max } else { 0 },
-            sample_rate_min: if rate_min != u32::MAX { rate_min } else { 0 },
-            sample_rate_max: if rate_max != u32::MIN { rate_max } else { 0 },
-            buffer_min: if buf_min != u32::MAX { buf_min } else { 0 },
-            buffer_max: if buf_max != u32::MIN { buf_max } else { 0 },
-        });
-    }
-
-    devices.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
-
-    info!("Found {} audio devices", devices.len());
-
-    Ok(devices)
-}
-
-// ── LTC scheduler thread ───────────────────────────────────────────────────
-
-fn ltc_scheduler_thread(
-    ltc_producer: Arc<Mutex<HeapProducer<f32>>>,
-    ltc: Arc<Mutex<LtcStreamState>>,
-    stop_signal: Arc<AtomicBool>,
-    underrun_count: Arc<AtomicU64>,
-    callback_counter: Arc<AtomicU64>,
-    events: Arc<Mutex<Vec<AudioEvent>>>,
-) {
-    info!("LTC scheduler thread started");
-
-    // Attempt to elevate thread priority for tighter scheduling
-    #[cfg(not(target_os = "macos"))]
-    match thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max) {
-        Ok(_) => info!("LTC scheduler thread priority elevated to Max"),
-        Err(e) => warn!("Could not set thread priority: {:?}", e),
-    }
-    #[cfg(target_os = "macos")]
-    info!("LTC scheduler thread priority not elevated (macOS)");
-
-    let mut frame_buf: Vec<f32> = Vec::new();
-    let mut frame_count: u64 = 0;
-    let mut drop_count: u64 = 0;
-    let mut last_drop_event: u64 = 0;
-    let mut last_callback_value: u64 = 0;
-    let mut last_callback_check: Instant = Instant::now();
-    let mut last_underrun_value: u64 = 0;
-
-    // ── Watchdog recovery state (event-driven sliding window) ──
-    let mut recovery_attempts: u8 = 0;
-    let mut first_failure: Option<Instant> = None;
-
-    loop {
-        if stop_signal.load(Ordering::Relaxed) {
-            info!("LTC scheduler thread stopped via stop signal");
-            return;
-        }
-
-        let (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, mut last_level, new_accumulator) = {
-            let state = match ltc.lock() {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("LTC scheduler: state mutex poisoned: {}", e);
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-            };
-            if !state.running {
-                drop(state);
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-
-            let now = Instant::now();
-            if now < state.next_frame_time {
-                let sleep = state.next_frame_time - now;
-                let target = state.next_frame_time;
-                drop(state);
-                // Hybrid sleep: OS sleep until 2ms before deadline, then spin-loop
-                if sleep > Duration::from_millis(2) {
-                    std::thread::sleep(sleep - Duration::from_millis(2));
-                }
-                while Instant::now() < target {
-                    std::hint::spin_loop();
-                }
-                continue;
-            }
-
-            let tc = state.tc;
-            let fps = state.fps;
-            let drop_frame = state.drop_frame;
-            let ltc_channel = state.ltc_channel.clone();
-            let ltc_volume = state.ltc_volume;
-            let frame_dur = state.frame_duration;
-            let last_level = state.last_level;
-
-            // Sample accumulator: track fractional-sample remainder across frames
-            let (frame_samples, spb, acc) = ltc_encoder::compute_frame_sample_count(
-                state.exact_samples_per_frame,
-                state.base_samples,
-                state.samples_accumulator,
-            );
-
-            (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, frame_samples, spb, last_level, acc)
-        };
-
-        // ── Watchdog: check if audio callback is still alive ──
-        let current_callback = callback_counter.load(Ordering::Relaxed);
-        if current_callback == last_callback_value {
-            if last_callback_check.elapsed() > Duration::from_millis(500) {
-                error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
-
-                // Sliding window: reset counter if last failure was >10s ago
-                let now = Instant::now();
-                if let Some(first) = first_failure {
-                    if now.duration_since(first) > Duration::from_secs(10) {
-                        recovery_attempts = 0;
-                        first_failure = None;
-                    }
-                }
-
-                if recovery_attempts < 3 {
-                    recovery_attempts += 1;
-                    if first_failure.is_none() {
-                        first_failure = Some(now);
-                    }
-                    warn!("LTC scheduler: recovery attempt {}/3", recovery_attempts);
-                    if let Ok(mut ev) = events.lock() {
-                        ev.push(AudioEvent::RecoveryNeeded {
-                            reason: format!("callback stalled for 500ms (attempt {}/3)", recovery_attempts),
-                        });
-                    }
-                    // Reset watchdog timer so we don't immediately re-trigger
-                    last_callback_value = current_callback;
-                    last_callback_check = Instant::now();
-                    // Sleep a short time before checking again so the main thread can act
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                } else {
-                    error!("LTC scheduler: 3 recovery attempts exhausted — stream permanently dead");
-                    if let Ok(mut ev) = events.lock() {
-                        ev.push(AudioEvent::StreamDead);
-                    }
-                    return;
-                }
-            }
-        } else {
-            // Callback is alive — reset recovery state
-            last_callback_value = current_callback;
-            last_callback_check = Instant::now();
-            recovery_attempts = 0;
-            first_failure = None;
-        }
-
-        // ── Watchdog: check for underruns ──
-        let current_underrun = underrun_count.load(Ordering::Relaxed);
-        if current_underrun > last_underrun_value {
-            let new_underruns = current_underrun - last_underrun_value;
-            warn!("LTC scheduler: detected {} callback underruns (total: {})", new_underruns, current_underrun);
-            if let Ok(mut ev) = events.lock() {
-                ev.push(AudioEvent::Underrun);
-            }
-            last_underrun_value = current_underrun;
-        }
-
-        // ── Generate LTC frame ──
-        let needed = total_samples * 2;
-        frame_buf.resize(needed, 0.0);
-
-        generate_ltc_frame_stereo(
-            &tc,
-            drop_frame,
-            total_samples,
-            samples_per_bit,
-            ltc_volume,
-            &ltc_channel,
-            &mut last_level,
-            &mut frame_buf[..needed],
-        );
-
-        // ── Push samples into lock-free ring buffer ──
-        {
-            let mut producer = match ltc_producer.lock() {
-                Ok(p) => p,
-                Err(e) => {
-                    error!("LTC scheduler: producer mutex poisoned: {}", e);
-                    return;
-                }
-            };
-            let pushed = producer.push_slice(&frame_buf[..needed]);
-            if pushed < needed {
-                drop_count += 1;
-                if drop_count <= 1 || drop_count % 100 == 0 {
-                    warn!("LTC scheduler: ring buffer full, dropped frame #{} (pushed {}/{}, total drops: {})",
-                        frame_count, pushed, needed, drop_count);
-                }
-                if drop_count - last_drop_event >= 100 {
-                    if let Ok(mut ev) = events.lock() {
-                        ev.push(AudioEvent::FramesDropped { total: drop_count });
-                    }
-                    last_drop_event = drop_count;
-                }
-            }
-        }
-
-        frame_count += 1;
-        if frame_count % 1000 == 0 {
-            info!("LTC scheduler: frame={}, drops={}, channel={}, fps={}, tc={:02}:{:02}:{:02}:{:02}",
-                frame_count, drop_count, ltc_channel,
-                fps, tc.hours, tc.minutes, tc.seconds, tc.frames);
-        }
-
-        {
-            let mut state = match ltc.lock() {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("LTC scheduler: state mutex poisoned updating state: {}", e);
-                    return;
-                }
-            };
-            state.last_level = last_level;
-            state.tc = increment_timecode(&state.tc, fps, drop_frame);
-            state.next_frame_time += frame_dur;
-            state.samples_accumulator = new_accumulator;
-        }
     }
 }
