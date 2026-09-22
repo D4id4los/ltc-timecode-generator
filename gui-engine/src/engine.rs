@@ -161,7 +161,7 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
 
         // 3. Drain events from AudioCore
         for event in core.drain_events() {
-            handle_event(event, &core, &mut current, &mut recovery_attempts);
+            handle_event(event, &core, &mut current, &mut recovery_attempts, &mut last_device_id);
         }
 
         // 4. Animation: flash alpha decays at 2.0/s
@@ -800,6 +800,7 @@ fn handle_event(
     core: &AudioCore,
     state: &mut AppStateSnapshot,
     recovery_attempts: &mut u8,
+    last_device_id: &mut Option<String>,
 ) {
     let event_str = match &event {
         AudioEvent::StreamError(msg) => format!("Audio stream error: {}", msg),
@@ -819,15 +820,19 @@ fn handle_event(
 
     match event {
         AudioEvent::StreamDead => {
-            state.is_playing = false;
-            state.status_message = "Stream dead".to_string();
+            // Full teardown-and-recreate: drop the orphaned cpal::Stream,
+            // wait for OS driver cleanup, then re-init and restart if playing.
+            // The scheduler watchdog already exhausted 3 soft-recovery attempts
+            // before emitting StreamDead, so this is the final hard reset.
+            state.status_message = "Stream dead — performing hard reset".to_string();
+            attempt_recovery(core, state, recovery_attempts, last_device_id);
         }
         AudioEvent::RecoveryNeeded { .. } | AudioEvent::StreamDied => {
             if *recovery_attempts < MAX_RECOVERY_ATTEMPTS {
                 *recovery_attempts += 1;
                 state.status_message =
                     format!("Recovery attempt {}/{}", recovery_attempts, MAX_RECOVERY_ATTEMPTS);
-                attempt_recovery(core, state, recovery_attempts);
+                attempt_recovery(core, state, recovery_attempts, last_device_id);
             } else {
                 state.is_playing = false;
                 state.status_message = "Recovery exhausted".to_string();
@@ -843,6 +848,7 @@ fn attempt_recovery(
     core: &AudioCore,
     state: &mut AppStateSnapshot,
     recovery_attempts: &mut u8,
+    last_device_id: &mut Option<String>,
 ) {
     let was_playing = state.is_playing;
     let stored_tc = state.current_timecode;
@@ -852,7 +858,11 @@ fn attempt_recovery(
     state.audio_initialized = false;
     state.is_playing = false;
 
-    if ensure_audio_init(core, state, &mut None, recovery_attempts)
+    // Allow 150ms for the OS audio driver to release the hardware lock
+    // (ALSA/PulseAudio/PipeWire cleanup after dropping the cpal::Stream)
+    std::thread::sleep(Duration::from_millis(150));
+
+    if ensure_audio_init(core, state, last_device_id, recovery_attempts)
         && was_playing
     {
         let _ = core.reset_ltc(stored_tc);

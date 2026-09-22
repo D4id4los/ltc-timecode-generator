@@ -78,7 +78,8 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   └── ui/                       # app.slint (root) + clapper/clock/converter/settings/status/theme/types/widgets.slint
 ├── audio-core/                   # Shared Rust audio crate (LTC generation + cpal output + decoders)
 │   └── src/
-│       ├── lib.rs                # AudioCore, device listing, chunked decode, error classification
+│       ├── audio_output.rs       # AudioCore, device/stream lifecycle, config selection, error classification, scheduler thread
+│       ├── lib.rs                # Types + re-exports + WavChunkReader + chunked decode
 │       ├── ltc_encoder.rs        # get_ltc_bits, increment_timecode, generate_ltc_frame_stereo
 │       ├── ltc_decoder.rs        # Builtin decoder + quality report
 │       └── ltc_decoder_libltc.rs # libltc-binding decoder
@@ -218,7 +219,8 @@ The Slint GUI follows the same pattern as ltc-gui — thin shell over `gui-engin
 ## audio-core Crate
 
 The `audio-core` crate provides the raw audio engine, split by concern:
-- **`lib.rs`** — `AudioCore` (cpal output stream, ring buffers 128K LTC + 32K beep, scheduler thread, wake lock, event queue); `list_audio_devices()` / `AudioDeviceInfo`; chunked parallel WAV decode (`WavChunkReader`, `DecodeConfig`, `DecodeProgress`, `decode_ltc_chunked`); `decode_ltc_with_decoder()`; error classification (`is_transient_audio_error`, `is_permanent_device_error`); `suggest_sample_rate()`; `SAMPLE_RATE_OPTIONS = &[44100, 48000]`.
+- **`audio_output.rs`** — `AudioCore` (cpal output stream, ring buffers 128K LTC + 32K beep, scheduler thread, wake lock, event queue); `list_audio_devices()` / `AudioDeviceInfo`; config selection, stream building, device enumeration; error classification (`is_transient_audio_error`, `is_permanent_device_error`); `suggest_sample_rate()`; `SAMPLE_RATE_OPTIONS = &[44100, 48000]`. Extracted from `lib.rs` to isolate all device/stream lifecycle logic.
+- **`lib.rs`** — public types (`Timecode`, `AudioEvent`, `AudioDeviceInfo`) + re-exports from `audio_output` + chunked parallel WAV decode (`WavChunkReader`, `DecodeConfig`, `DecodeProgress`, `decode_ltc_chunked`); `decode_ltc_with_decoder()`.
 - **`ltc_encoder.rs`** — `get_ltc_bits()` (80-bit bi-phase mark frame), `increment_timecode()`, `compute_frame_sample_count()`, `generate_ltc_frame_stereo()`.
 - **`ltc_decoder.rs`** — builtin pure-Rust decoder: `decode_ltc_samples()` / `decode_ltc_from_wav()`, first-coherent-frame alignment, `compute_ltc_quality()` (confidence, gaps, glitches), `quick_check_ltc()`; types `LtcDetectionResult`, `FrameTimecode`, `LtcQualityReport`, `LtcDecodeStatus`.
 - **`ltc_decoder_libltc.rs`** — `decode_ltc_from_wav_libltc()` / `decode_ltc_samples_libltc()` via the `libltc-rs` binding (requires system `libltc`).
