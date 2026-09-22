@@ -995,22 +995,22 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
         apply_available_defaults(&mut state.container, &mut state.video_encoder, &mut state.audio_encoder, caps);
     }
 
-    let containers: Vec<(&str, &str)> = if let Some(ref caps) = caps_opt {
-        available_containers(caps)
+    let containers: Vec<(String, String)> = if let Some(ref caps) = caps_opt {
+        available_containers(caps).iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     } else {
-        supported_containers()
+        supported_containers().iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };
 
-    let video_encoders = if let Some(ref caps) = caps_opt {
+    let video_encoders: Vec<(String, String)> = if let Some(ref caps) = caps_opt {
         available_video_codecs(&state.container, caps)
     } else {
-        supported_video_codecs()
+        supported_video_codecs().iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };
 
-    let audio_encoders = if let Some(ref caps) = caps_opt {
-        available_audio_encoders_for_container(&state.container, caps)
+    let audio_encoders: Vec<(String, String)> = if let Some(ref caps) = caps_opt {
+        available_audio_encoders_for_container(&state.container, caps).iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     } else {
-        supported_audio_encoders()
+        supported_audio_encoders().iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };
 
     // Clone values to avoid borrow conflicts with FnMut closures
@@ -1208,7 +1208,7 @@ fn render_format_row(
     ui: &mut Ui,
     label: &str,
     current: &str,
-    options: &[(&str, &str)],
+    options: &[(String, String)],
     on_change: &mut dyn FnMut(&str),
     colors: &crate::theme::ThemeColors,
 ) {
@@ -1231,9 +1231,9 @@ fn render_format_row(
 /// When the container changes, re-select video codec/audio encoders that are
 /// compatible with the new container (and available in ffmpeg).
 fn re_select_encoders_for_container(state: &mut AppState, caps: &FfmpegCapabilities) {
-    let codecs_available: Vec<&str> = available_video_codecs(&state.container, caps)
-        .iter()
-        .map(|(k, _)| *k)
+    let available = available_video_codecs(&state.container, caps);
+    let codecs_available: Vec<&str> = available.iter()
+        .map(|(k, _)| k.as_str())
         .collect();
     let codec = normalize_video_codec(&state.video_encoder);
     if !codecs_available.is_empty() && !codecs_available.contains(&codec) {

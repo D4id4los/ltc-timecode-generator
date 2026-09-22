@@ -233,17 +233,40 @@ pub fn resolve_encoder_chain(codec_id: &str, caps: &FfmpegCapabilities) -> Vec<S
         .collect()
 }
 
+/// Returns true when the resolved encoder chain for a codec contains at least
+/// one hardware encoder candidate.  Used by the GUI to flag HW-accelerated
+/// codecs in the dropdown.
+pub fn codec_has_available_hardware_encoder(
+    codec_id: &str,
+    caps: &FfmpegCapabilities,
+) -> bool {
+    resolve_encoder_chain(codec_id, caps)
+        .iter()
+        .any(|name| matches!(encoder_class(name), Some(EncoderClass::Hardware)))
+}
+
 /// Intersection of supported codecs with (a) container compatibility and
 /// (b) at least one available ffmpeg encoder. This is the dropdown source.
+///
+/// The description string in each tuple is the human-readable label, with
+/// `" [HW accel. available]"` appended when the codec has a working hardware
+/// encoder.
 pub fn available_video_codecs(
     container: &str,
     caps: &FfmpegCapabilities,
-) -> Vec<(&'static str, &'static str)> {
+) -> Vec<(String, String)> {
     VIDEO_CODECS
         .iter()
         .filter(|c| c.containers.contains(&container))
         .filter(|c| !resolve_encoder_chain(c.id, caps).is_empty())
-        .map(|c| (c.id, c.label))
+        .map(|c| {
+            let label = if codec_has_available_hardware_encoder(c.id, caps) {
+                format!("{} [HW accel. available]", c.label)
+            } else {
+                c.label.to_string()
+            };
+            (c.id.to_string(), label)
+        })
         .collect()
 }
 
@@ -465,7 +488,7 @@ mod tests {
         // mov: prores, dnxhd, h264, h265, av1 — only h264/h265 have candidates
         let c = caps(["libx264", "libx265", "pcm_s24le"]);
         let available = available_video_codecs("mov", &c);
-        let ids: Vec<&str> = available.iter().map(|(k, _)| *k).collect();
+        let ids: Vec<&str> = available.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(ids, vec!["h264", "h265"]);
     }
 
@@ -473,9 +496,9 @@ mod tests {
     fn test_available_video_codecs_excludes_codec_without_candidates() {
         // av1 listed in mkv but no AV1 encoder installed
         let c = caps(["libx264"]);
-        let ids: Vec<&str> = available_video_codecs("mkv", &c)
-            .iter()
-            .map(|(k, _)| *k)
+        let available = available_video_codecs("mkv", &c);
+        let ids: Vec<&str> = available.iter()
+            .map(|(k, _)| k.as_str())
             .collect();
         assert!(!ids.contains(&"av1"));
         assert!(ids.contains(&"h264"));
@@ -548,5 +571,18 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), supported_video_codecs().len());
+    }
+
+    #[test]
+    fn test_available_video_codecs_hw_annotation() {
+        let c = caps(["av1_nvenc", "libsvtav1", "pcm_s24le", "matroska"]);
+        let available = available_video_codecs("mkv", &c);
+        let av1_label = available.iter().find(|(k, _)| k == "av1").map(|(_, l)| l.as_str());
+        assert!(av1_label.unwrap().contains("[HW accel. available]"));
+        // h264 only has libx264 (software) → no HW annotation
+        let c2 = caps(["libx264", "pcm_s24le"]);
+        let available2 = available_video_codecs("mp4", &c2);
+        let h264_label = available2.iter().find(|(k, _)| k == "h264").map(|(_, l)| l.as_str());
+        assert!(!h264_label.unwrap().contains("[HW accel. available]"));
     }
 }

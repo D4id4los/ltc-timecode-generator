@@ -59,7 +59,7 @@ pub(crate) fn update_converter_options(
     ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(container_options)));
 
     let video_options: Vec<SharedString> = available_video_codecs(container, caps)
-        .iter().map(|(k, _)| SharedString::from(*k)).collect();
+        .iter().map(|(k, desc)| SharedString::from(format!("{} — {}", k, desc))).collect();
     ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(video_options)));
 
     let audio_options: Vec<SharedString> = available_audio_encoders_for_container(container, caps)
@@ -195,7 +195,7 @@ fn _run_gui(
             .iter().map(|(key, _)| SharedString::from(*key)).collect();
         ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(container_options)));
         let video_options: Vec<SharedString> = supported_video_codecs()
-            .iter().map(|(key, _)| SharedString::from(*key)).collect();
+            .iter().map(|(key, desc)| SharedString::from(format!("{} — {}", key, desc))).collect();
         ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(video_options)));
         let audio_options: Vec<SharedString> = gui_engine::converter::supported_audio_encoders()
             .iter().map(|(key, _)| SharedString::from(*key)).collect();
@@ -965,10 +965,10 @@ u.set_conv_split_tracks(false);
                 // Re-filter codecs/encoders for the new container
                 if let Some(ref c) = caps {
                     if c.has_ffmpeg {
-                        let codecs: Vec<(&str, &str)> = available_video_codecs(&key, c);
+                        let codecs = available_video_codecs(&key, c);
                         let auds: Vec<(&str, &str)> = available_audio_encoders_for_container(&key, c);
                         if !codecs.is_empty() {
-                            *venc_arc.lock().unwrap() = codecs[0].0.to_string();
+                            *venc_arc.lock().unwrap() = codecs[0].0.clone();
                         }
                         if !auds.is_empty() {
                             *aenc_arc.lock().unwrap() = auds[0].0.to_string();
@@ -991,14 +991,13 @@ u.set_conv_split_tracks(false);
         ui.on_conv_video_selected(move |idx| {
             let caps = caps_for_video.lock().unwrap().clone();
             let container = container_for_video.lock().unwrap().clone();
-            let options: Vec<&str> = match caps {
-                Some(ref c) if c.has_ffmpeg => available_video_codecs(&container, c)
-                    .iter().map(|(k, _)| *k).collect(),
+            let options: Vec<(String, String)> = match caps {
+                Some(ref c) if c.has_ffmpeg => available_video_codecs(&container, c),
                 _ => supported_video_codecs()
-                    .iter().map(|(k, _)| *k).collect(),
+                    .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             };
             if idx >= 0 && (idx as usize) < options.len() {
-                let key = options[idx as usize].to_string();
+                let key = options[idx as usize].0.clone();
                 *venc.lock().unwrap() = key.clone();
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_video_encoder(SharedString::from(key));

@@ -2928,8 +2928,8 @@ pub fn apply_available_defaults(
         *audio_encoder = a;
         return;
     }
-    let codecs: Vec<&str> = video_codecs::available_video_codecs(container, caps)
-        .iter().map(|(k, _)| *k).collect();
+    let available = video_codecs::available_video_codecs(container, caps);
+    let codecs: Vec<&str> = available.iter().map(|(k, _)| k.as_str()).collect();
     let auds: Vec<&str> =
         available_audio_encoders_for_container(container, caps).iter().map(|(k, _)| *k).collect();
     if !codecs.contains(&video_encoder.as_str()) || !auds.contains(&audio_encoder.as_str()) {
@@ -3829,10 +3829,10 @@ mod tests {
             hw: HwDeviceCapabilities::default(),
         };
         let available = video_codecs::available_video_codecs("mov", &caps);
-        let keys: Vec<&str> = available.iter().map(|(k, _)| *k).collect();
-        assert!(keys.contains(&"h264"));
-        assert!(keys.contains(&"h265"));
-        assert!(!keys.contains(&"prores"), "prores_ks not installed → codec hidden");
+        let keys: Vec<String> = available.into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"h264".to_string()));
+        assert!(keys.contains(&"h265".to_string()));
+        assert!(!keys.contains(&"prores".to_string()), "prores_ks not installed → codec hidden");
     }
 
     // ── Encoder fallback tracking ────────────────────────────────────────
