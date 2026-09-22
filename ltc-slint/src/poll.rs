@@ -21,6 +21,17 @@ use slint::Global;
 
 const POLL_INTERVAL_MS: u64 = 40;
 
+/// Returns `true` if the auto-settings (trim/split/drop) should be applied
+/// for this decode result, given the current and last-applied generation.
+fn should_auto_apply_ltc_settings(
+    decode_generation: u64,
+    last_applied_gen: u64,
+    status: &gui_engine::LtcDecodeStatus,
+) -> bool {
+    matches!(status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence)
+        && decode_generation != last_applied_gen
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn setup_poll_timer(
     ui: &AppWindow,
@@ -50,7 +61,7 @@ pub fn setup_poll_timer(
     let ui_weak = ui.as_weak();
     let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let last_device_key: Arc<Mutex<(usize, String)>> = Arc::new(Mutex::new((0, String::new())));
-    let last_ltc_decode_gen: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let last_auto_applied_gen: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
 
     let poll_timer = slint::Timer::default();
     poll_timer.start(
@@ -74,82 +85,83 @@ pub fn setup_poll_timer(
             // 3. Theme sync
             AppColors::get(&ui).set_theme_dark(s.is_dark_theme);
 
-            // 3.5 LTC decode state sync
+            // 3.5 LTC decode state sync (display unconditional, auto-set once per generation)
             {
-                let mut last = last_ltc_decode_gen.lock().unwrap();
-                if s.ltc_decode_generation != *last {
-                    *last = s.ltc_decode_generation;
-                    if s.ltc_is_detecting {
-                        ui.set_ltc_status(SharedString::from("detecting"));
-                        ui.set_ltc_result_text(SharedString::from(""));
-                        ui.set_ltc_error(SharedString::from(""));
-                    } else if let Some(ref err) = s.ltc_decode_error {
-                        ui.set_ltc_status(SharedString::from("error"));
-                        ui.set_ltc_result_text(SharedString::from(""));
-                        ui.set_ltc_error(SharedString::from(err));
-                    } else if let Some(ref r) = s.ltc_decode_result {
-                        let is_detected = matches!(r.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence);
-                        let status_str = match &r.status {
-                            gui_engine::LtcDecodeStatus::Success => "success",
-                            gui_engine::LtcDecodeStatus::LowConfidence => "low_confidence",
-                            gui_engine::LtcDecodeStatus::NoSyncWord => "no_sync",
-                            gui_engine::LtcDecodeStatus::Error { .. } => "error",
-                        };
-                        if is_detected {
-                            let offset = r.first_ltc_timecode_secs;
-                            *conv_trim_offset_secs.lock().unwrap() = offset;
-                            ui.set_trim_offset_secs(offset as f32);
-                            *conv_trim_to_first_ltc.lock().unwrap() = true;
-                            ui.set_trim_to_first_ltc(true);
-                            *conv_split_tracks.lock().unwrap() = true;
-                            ui.set_conv_split_tracks(true);
-                            *conv_drop_ltc_track.lock().unwrap() = true;
-                            ui.set_conv_drop_ltc_track(true);
-                        }
-                        let drop_flag = if r.drop_frame { " DF" } else { "" };
-                        let fps_str = if r.detected_fps > 0.0 {
-                            format!("{:.2} fps{}", r.detected_fps, drop_flag)
-                        } else {
-                            "—".to_string()
-                        };
-                        let first = r.timecodes.first().map(|t| t.timecode);
-                        let last_tc = r.timecodes.last().map(|t| t.timecode);
-                        let tc_range = match (first, last_tc) {
-                            (Some(f), Some(l)) => {
-                                let sep = if r.drop_frame { ";" } else { ":" };
-                                format!(
-                                    "{:02}{sep}{:02}{sep}{:02}{sep}{:02} → {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
-                                    f.hours, f.minutes, f.seconds, f.frames,
-                                    l.hours, l.minutes, l.seconds, l.frames,
-                                )
-                            }
-                            _ => "—".to_string(),
-                        };
-                        ui.set_ltc_status(SharedString::from(status_str));
-                        let quality_str = r.quality.as_ref().map(|q| {
-                            let issues = if q.edit_count > 0 {
-                                format!("{} edit(s)", q.edit_count)
-                            } else if q.glitch_count > 0 || q.gap_count > 0 {
-                                format!("{}/{} gap/glitch", q.gap_count, q.glitch_count)
-                            } else if q.missing_frames > 0 {
-                                format!("{} missing", q.missing_frames)
-                            } else {
-                                "perfect".to_string()
-                            };
-                            format!(" | Quality: {:.0}% ({}) {}", q.score * 100.0, q.grade, issues)
-                        }).unwrap_or_default();
-                        ui.set_ltc_result_text(SharedString::from(format!(
-                            "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms{}",
-                            fps_str,
-                            r.avg_confidence * 100.0,
-                            r.valid_frames,
-                            r.total_possible_frames,
-                            tc_range,
-                            r.processing_time_ms,
-                            quality_str,
-                        )));
-                        ui.set_ltc_error(SharedString::from(""));
+                let mut last_auto = last_auto_applied_gen.lock().unwrap();
+
+                if s.ltc_is_detecting {
+                    ui.set_ltc_status(SharedString::from("detecting"));
+                    ui.set_ltc_result_text(SharedString::from(""));
+                    ui.set_ltc_error(SharedString::from(""));
+                } else if let Some(ref err) = s.ltc_decode_error {
+                    ui.set_ltc_status(SharedString::from("error"));
+                    ui.set_ltc_result_text(SharedString::from(""));
+                    ui.set_ltc_error(SharedString::from(err));
+                } else if let Some(ref r) = s.ltc_decode_result {
+                    let status_str = match &r.status {
+                        gui_engine::LtcDecodeStatus::Success => "success",
+                        gui_engine::LtcDecodeStatus::LowConfidence => "low_confidence",
+                        gui_engine::LtcDecodeStatus::NoSyncWord => "no_sync",
+                        gui_engine::LtcDecodeStatus::Error { .. } => "error",
+                    };
+
+                    // Auto-set: once per decode generation (user unticks survive)
+                    if should_auto_apply_ltc_settings(s.ltc_decode_generation, *last_auto, &r.status) {
+                        *last_auto = s.ltc_decode_generation;
+                        let offset = r.first_ltc_timecode_secs;
+                        *conv_trim_offset_secs.lock().unwrap() = offset;
+                        ui.set_trim_offset_secs(offset as f32);
+                        *conv_trim_to_first_ltc.lock().unwrap() = true;
+                        ui.set_trim_to_first_ltc(true);
+                        *conv_split_tracks.lock().unwrap() = true;
+                        ui.set_conv_split_tracks(true);
+                        *conv_drop_ltc_track.lock().unwrap() = true;
+                        ui.set_conv_drop_ltc_track(true);
                     }
+
+                    let drop_flag = if r.drop_frame { " DF" } else { "" };
+                    let fps_str = if r.detected_fps > 0.0 {
+                        format!("{:.2} fps{}", r.detected_fps, drop_flag)
+                    } else {
+                        "—".to_string()
+                    };
+                    let first = r.timecodes.first().map(|t| t.timecode);
+                    let last_tc = r.timecodes.last().map(|t| t.timecode);
+                    let tc_range = match (first, last_tc) {
+                        (Some(f), Some(l)) => {
+                            let sep = if r.drop_frame { ";" } else { ":" };
+                            format!(
+                                "{:02}{sep}{:02}{sep}{:02}{sep}{:02} → {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
+                                f.hours, f.minutes, f.seconds, f.frames,
+                                l.hours, l.minutes, l.seconds, l.frames,
+                            )
+                        }
+                        _ => "—".to_string(),
+                    };
+                    ui.set_ltc_status(SharedString::from(status_str));
+                    let quality_str = r.quality.as_ref().map(|q| {
+                        let issues = if q.edit_count > 0 {
+                            format!("{} edit(s)", q.edit_count)
+                        } else if q.glitch_count > 0 || q.gap_count > 0 {
+                            format!("{}/{} gap/glitch", q.gap_count, q.glitch_count)
+                        } else if q.missing_frames > 0 {
+                            format!("{} missing", q.missing_frames)
+                        } else {
+                            "perfect".to_string()
+                        };
+                        format!(" | Quality: {:.0}% ({}) {}", q.score * 100.0, q.grade, issues)
+                    }).unwrap_or_default();
+                    ui.set_ltc_result_text(SharedString::from(format!(
+                        "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms{}",
+                        fps_str,
+                        r.avg_confidence * 100.0,
+                        r.valid_frames,
+                        r.total_possible_frames,
+                        tc_range,
+                        r.processing_time_ms,
+                        quality_str,
+                    )));
+                    ui.set_ltc_error(SharedString::from(""));
                 }
             }
 
@@ -400,4 +412,48 @@ pub fn setup_poll_timer(
     );
 
     Box::leak(Box::new(poll_timer));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_auto_apply_ltc_settings;
+
+    #[test]
+    fn auto_apply_on_success_new_gen() {
+        assert!(should_auto_apply_ltc_settings(1, 0, &gui_engine::LtcDecodeStatus::Success));
+    }
+
+    #[test]
+    fn auto_apply_on_low_confidence_new_gen() {
+        assert!(should_auto_apply_ltc_settings(1, 0, &gui_engine::LtcDecodeStatus::LowConfidence));
+    }
+
+    #[test]
+    fn auto_apply_skips_same_gen() {
+        assert!(!should_auto_apply_ltc_settings(1, 1, &gui_engine::LtcDecodeStatus::Success));
+    }
+
+    #[test]
+    fn auto_apply_skips_nosync() {
+        assert!(!should_auto_apply_ltc_settings(1, 0, &gui_engine::LtcDecodeStatus::NoSyncWord));
+    }
+
+    #[test]
+    fn auto_apply_skips_error() {
+        assert!(!should_auto_apply_ltc_settings(1, 0, &gui_engine::LtcDecodeStatus::Error { message: "x".into() }));
+    }
+
+    #[test]
+    fn auto_apply_noop_when_gen_zero_and_no_decode() {
+        // Initial state: gen 0, last_applied 0 → should not apply
+        assert!(!should_auto_apply_ltc_settings(0, 0, &gui_engine::LtcDecodeStatus::Success));
+    }
+
+    #[test]
+    fn auto_apply_reapplies_after_new_generation() {
+        // gen=1 → apply; gen=1 → skip; gen=2 → apply again
+        assert!(should_auto_apply_ltc_settings(1, 0, &gui_engine::LtcDecodeStatus::Success));
+        assert!(!should_auto_apply_ltc_settings(1, 1, &gui_engine::LtcDecodeStatus::Success));
+        assert!(should_auto_apply_ltc_settings(2, 1, &gui_engine::LtcDecodeStatus::Success));
+    }
 }

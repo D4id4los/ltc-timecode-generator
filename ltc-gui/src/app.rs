@@ -111,6 +111,9 @@ pub struct AppState {
     pub trim_ltc_start: bool,
     pub trim_offset_secs: f64,
     pub per_file_trim_offsets: Vec<f64>,
+
+    // Latch: generation for which auto-settings (trim/split/drop) have been applied
+    ltc_auto_applied_gen: u64,
 }
 
 type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>, Option<usize>, ChannelMap, RecordingType, String, OutputNamingMode);
@@ -201,6 +204,7 @@ impl AppState {
             trim_ltc_start: false,
             trim_offset_secs: 0.0,
             per_file_trim_offsets: Vec::new(),
+            ltc_auto_applied_gen: 0,
         }
     }
 
@@ -224,6 +228,22 @@ impl AppState {
             RecordingType::MultiTrackAudio => OutputNamingMode::PrefixTemplates,
         };
         (Some(folder), Some(groups), Some(0), ChannelMap::identity(num_files), rec_type, prefix, naming_mode)
+    }
+
+    /// Applies auto-settings (trim/split/drop) from a successful decode result,
+    /// but only once per `ltc_decode_generation` so user unticks survive.
+    fn sync_ltc_decode_auto_settings(&mut self) {
+        if let Some(ref result) = self.latest.ltc_decode_result {
+            if matches!(result.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence)
+                && self.ltc_auto_applied_gen != self.latest.ltc_decode_generation
+            {
+                self.trim_offset_secs = result.first_ltc_timecode_secs;
+                self.trim_ltc_start = true;
+                self.split_tracks = true;
+                self.drop_ltc_track = true;
+                self.ltc_auto_applied_gen = self.latest.ltc_decode_generation;
+            }
+        }
     }
 
     pub fn send(&self, cmd: GuiCommand) {
@@ -264,15 +284,8 @@ impl eframe::App for AppState {
         let snapshot = self.engine_state.load();
         self.latest = Arc::clone(&snapshot);
 
-        // 2. Derive trim offset from LTC result, auto-check split/drop
-        if let Some(ref result) = self.latest.ltc_decode_result {
-            if matches!(result.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence) {
-                self.trim_offset_secs = result.first_ltc_timecode_secs;
-                self.trim_ltc_start = true;
-                self.split_tracks = true;
-                self.drop_ltc_track = true;
-            }
-        }
+        // 2. Derive trim offset from LTC result, auto-check split/drop (once per generation)
+        self.sync_ltc_decode_auto_settings();
 
         // 3. Maximize once
         if !self.has_requested_maximize {
@@ -816,8 +829,52 @@ impl AppState {
 mod tests {
     use super::*;
     use gui_engine::converter::FfmpegCapabilities;
+    use gui_engine::LtcDecodeStatus;
+    use gui_engine::LtcDetectionResult;
+    use gui_engine::LtcQualityReport;
     use std::sync::mpsc;
     use std::collections::BTreeSet;
+
+    fn make_successful_result(first_tc_secs: f64) -> LtcDetectionResult {
+        LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            total_possible_frames: 100,
+            valid_frames: 100,
+            timecodes: vec![],
+            avg_confidence: 0.95,
+            details: vec![],
+            total_audio_duration_secs: 4.0,
+            sample_rate: 48000,
+            processing_time_ms: 10.0,
+            first_ltc_timecode_secs: first_tc_secs,
+            quality: Some(LtcQualityReport {
+                score: 0.95,
+                grade: "Excellent".to_string(),
+                missing_frames: 0,
+                gap_count: 0,
+                glitch_count: 0,
+                edit_count: 0,
+                max_drift_secs: 0.001,
+                drift_rate: 0.0,
+                largest_block: 100,
+                summary: "No issues".to_string(),
+                gap_edges: vec![],
+                glitch_indices: vec![],
+            }),
+        }
+    }
+
+    fn snapshot_with_decode(
+        generation: u64,
+        result: Option<LtcDetectionResult>,
+    ) -> AppStateSnapshot {
+        let mut s = AppStateSnapshot::initial();
+        s.ltc_decode_generation = generation;
+        s.ltc_decode_result = result;
+        s
+    }
 
     fn dummy_caps() -> FfmpegCapabilities {
         FfmpegCapabilities {
@@ -983,5 +1040,92 @@ mod tests {
         let mut s3 = make_snapshot();
         s3.clap_animating = true;
         assert!(next_repaint_interval(&s3) >= floor);
+    }
+
+    // ── sync_ltc_decode_auto_settings tests ──────────────────────────────
+
+    fn app_with_no_decode_state() -> super::AppState {
+        let (tx, _) = mpsc::channel();
+        super::AppState::new_with_config_and_probe(
+            tx,
+            dummy_state(),
+            dummy_log_buffer(),
+            gui_engine::config::ConverterConfig::default(),
+            dummy_caps,
+        )
+    }
+
+    #[test]
+    fn auto_set_applies_once_per_decode_generation() {
+        let mut app = app_with_no_decode_state();
+        app.latest = Arc::new(snapshot_with_decode(1, Some(make_successful_result(10.5))));
+
+        app.sync_ltc_decode_auto_settings();
+        assert!(app.trim_ltc_start, "trim_ltc_start should be set");
+        assert!(app.split_tracks, "split_tracks should be set");
+        assert!(app.drop_ltc_track, "drop_ltc_track should be set");
+        assert!((app.trim_offset_secs - 10.5).abs() < 1e-9);
+
+        // Untick all — should stay unticked on subsequent calls
+        app.trim_ltc_start = false;
+        app.split_tracks = false;
+        app.drop_ltc_track = false;
+        app.trim_offset_secs = 0.0;
+
+        app.sync_ltc_decode_auto_settings();
+        assert!(!app.trim_ltc_start, "should remain unticked after user override");
+        assert!(!app.split_tracks, "should remain unticked after user override");
+        assert!(!app.drop_ltc_track, "should remain unticked after user override");
+        assert!((app.trim_offset_secs).abs() < 1e-9, "offset should not be re-applied");
+    }
+
+    #[test]
+    fn auto_set_reapplies_on_new_decode_generation() {
+        let mut app = app_with_no_decode_state();
+        // First decode — applied once
+        app.latest = Arc::new(snapshot_with_decode(1, Some(make_successful_result(10.0))));
+        app.sync_ltc_decode_auto_settings();
+        assert!(app.split_tracks);
+
+        // Untick
+        app.split_tracks = false;
+
+        // Simulate a new decode on a different file: generation bumps up, new result
+        app.latest = Arc::new(snapshot_with_decode(2, Some(make_successful_result(20.0))));
+        app.sync_ltc_decode_auto_settings();
+        assert!(app.split_tracks, "should re-apply on new generation");
+        assert!((app.trim_offset_secs - 20.0).abs() < 1e-9, "offset should be from latest decode");
+    }
+
+    #[test]
+    fn auto_set_skips_unsuccessful_status() {
+        let mut app = app_with_no_decode_state();
+        // NoSyncWord
+        app.latest = Arc::new(snapshot_with_decode(1, Some(LtcDetectionResult {
+            status: LtcDecodeStatus::NoSyncWord,
+            ..make_successful_result(5.0)
+        })));
+        app.sync_ltc_decode_auto_settings();
+        assert!(!app.split_tracks, "should not set for NoSyncWord");
+
+        // Error
+        app.latest = Arc::new(snapshot_with_decode(2, Some(LtcDetectionResult {
+            status: LtcDecodeStatus::Error { message: "test error".into() },
+            ..make_successful_result(5.0)
+        })));
+        app.sync_ltc_decode_auto_settings();
+        assert!(!app.split_tracks, "should not set for Error");
+    }
+
+    #[test]
+    fn auto_set_noop_without_result() {
+        let mut app = app_with_no_decode_state();
+        app.latest = Arc::new(snapshot_with_decode(1, None));
+        // Should not panic and leave state unchanged
+        app.sync_ltc_decode_auto_settings();
+        assert!(!app.split_tracks);
+        assert!(!app.drop_ltc_track);
+        assert!(!app.trim_ltc_start);
+        assert!((app.trim_offset_secs).abs() < 1e-9);
     }
 }
