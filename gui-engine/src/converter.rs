@@ -2432,7 +2432,6 @@ fn run_audio_to_audio(
                 mark_conversion_failed(state, overall_log);
                 return;
             }
-            *overall_progress += step_progress;
         }
     } else {
         let tc = settings
@@ -2632,7 +2631,6 @@ fn run_video_to_video(
                         step_idx + 1,
                     )
                 };
-                *overall_progress += step_progress;
                 if !ok {
                     if settings.copy_video {
                         mark_conversion_failed(state, overall_log);
@@ -2652,7 +2650,6 @@ fn run_video_to_video(
                     mark_conversion_failed(state, overall_log);
                     break;
                 }
-                *overall_progress += step_progress;
             }
         }
     }

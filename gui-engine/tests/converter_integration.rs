@@ -630,3 +630,109 @@ concat_audio: false,
         duration,
     );
 }
+
+#[test]
+fn test_progress_stays_below_100_until_all_steps_done() {
+    let caps = query_ffmpeg_capabilities();
+    if !caps.has_ffmpeg {
+        eprintln!("Skipping: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut input_files = Vec::new();
+    for i in 0..4 {
+        let path = dir.path().join(format!("ch{}.wav", i));
+        create_test_wav(&path, 48000, 60.0, 8000);
+        input_files.push(path);
+    }
+
+    let settings = ConverterSettings {
+        pipeline: ConversionPipeline::AudioOnly { generate_synthetic_video: false },
+        input_files,
+        recording_type: RecordingType::MultiTrackAudio,
+        ltc_track_channel_index: 0,
+        channel_map: ChannelMap::identity(4),
+        split_tracks: true,
+        drop_ltc_track: false,
+        ltc_video_source: None,
+        container: "mkv".to_string(),
+        copy_video: false,
+        video_encoder: "h264".to_string(),
+        audio_encoder: "pcm_s24le".to_string(),
+        resolved_video_encoder: String::new(),
+        output_folder: dir.path().to_path_buf(),
+        filename_prefix: "test".to_string(),
+        audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
+        video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
+        naming_mode: OutputNamingMode::PrefixTemplates,
+        trim_to_first_ltc: false,
+        trim_offsets_secs: vec![0.0; 4],
+        timecode_meta_per_file: vec![None; 4],
+        concat_audio: false,
+        resolved_hw_device: None,
+    };
+
+    let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
+    let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut running_progress_samples: Vec<f32> = Vec::new();
+    let mut max_running_progress: f32 = 0.0;
+
+    loop {
+        let (status, progress) = {
+            let s = state.lock().unwrap();
+            let status = s.status.clone();
+            let progress = match &status {
+                ConversionStatus::Running { progress } => *progress,
+                _ => 0.0,
+            };
+            (status, progress)
+        };
+
+        match &status {
+            ConversionStatus::Running { .. } => {
+                running_progress_samples.push(progress);
+                max_running_progress = max_running_progress.max(progress);
+                if Instant::now() > deadline {
+                    cancel.store(true, Ordering::Relaxed);
+                    panic!(
+                        "Timed out after {} polls. max_running_progress={:.4}, samples: {:?}",
+                        running_progress_samples.len(),
+                        max_running_progress,
+                        running_progress_samples,
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            ConversionStatus::Completed => {
+                handle.join().expect("conversion thread panicked");
+
+                let high_progress_count = running_progress_samples
+                    .iter()
+                    .filter(|&&p| p >= 0.999)
+                    .count();
+
+                assert!(
+                    high_progress_count <= 2,
+                    "Expected ≤ 2 Running samples with progress ≥ 0.999, got {} ({} total samples). \
+                     This indicates double-counting: 'overall_progress' advanced by 2× per step, \
+                     so the bar hit the 1.0 cap early. Samples: {:?}",
+                    high_progress_count,
+                    running_progress_samples.len(),
+                    running_progress_samples,
+                );
+                return;
+            }
+            ConversionStatus::Failed { error_log } => {
+                handle.join().expect("conversion thread panicked");
+                panic!("Conversion failed: {}", error_log);
+            }
+            ConversionStatus::Idle => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
