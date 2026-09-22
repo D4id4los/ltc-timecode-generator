@@ -195,7 +195,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                     .and_then(|idx| groups.get(idx))
                     .map(|g| group_display_key(&g.prefix, &g.rel_dir))
                     .unwrap_or_else(|| "Select a recording…".to_string());
-                egui::ComboBox::from_id_salt("group_combo")
+                egui::ComboBox::from_id_salt(format!("group_combo_{}", groups.len()))
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
                         for (i, group) in groups.iter().enumerate() {
@@ -378,7 +378,12 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                     .unwrap_or_else(|| "Select…".to_string())
             };
 
-            egui::ComboBox::from_id_salt("ltc_file_combo")
+            let combo_salt = format!(
+                "ltc_file_combo_{}_{}",
+                if is_video { "video" } else { "audio" },
+                channel_options.len(),
+            );
+            egui::ComboBox::from_id_salt(combo_salt)
                 .selected_text(&current_label)
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
@@ -1326,7 +1331,7 @@ fn render_format_row(
 ) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{}:", label)).font(FontId::proportional(10.0)).color(colors.text_muted));
-        egui::ComboBox::from_id_salt(format!("fmt_{}", label))
+        egui::ComboBox::from_id_salt(format!("fmt_{}_{}", label, options.len()))
             .selected_text(current)
             .show_ui(ui, |ui| {
                 for (key, desc) in options {
