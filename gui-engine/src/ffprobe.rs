@@ -1,5 +1,7 @@
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use crate::subprocess::no_window_command;
 
 use log::{error, info, warn};
 
@@ -28,7 +30,7 @@ pub fn path_is_video(path: &Path) -> bool {
 }
 
 pub fn probe_video_audio(path: &Path) -> Result<VideoAudioProbe, String> {
-    let output = Command::new("ffprobe")
+    let output = no_window_command("ffprobe")
         .args([
             "-v", "quiet",
             "-print_format", "json",
@@ -153,7 +155,7 @@ pub fn extract_audio_channel(
 
     let args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
 
-    let output = Command::new("ffmpeg")
+    let output = no_window_command("ffmpeg")
         .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -243,7 +245,7 @@ pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
     let window_start = (offset_secs - 15.0).max(0.0);
     let interval = format!("{:.3}%{:.3}", window_start, offset_secs + 0.05);
 
-    let output = match Command::new("ffprobe")
+    let output = match no_window_command("ffprobe")
         .args([
             "-v", "error",
             "-select_streams", "v:0",

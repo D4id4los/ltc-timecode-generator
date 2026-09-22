@@ -1,7 +1,7 @@
 use std::path::Path;
-use std::process::Command;
 
 use crate::converter::RecordingType;
+use crate::subprocess::no_window_command;
 
 /// Read the duration (seconds) of an audio/video file.
 /// WAV files use a fast header-only parse via `hound`; other files use ffprobe.
@@ -60,7 +60,7 @@ fn wav_duration_secs(path: &Path) -> Option<f64> {
 // ── ffprobe duration ──────────────────────────────────────────────────────
 
 fn run_ffprobe_duration(path: &Path) -> Option<f64> {
-    let output = Command::new("ffprobe")
+    let output = no_window_command("ffprobe")
         .args([
             "-v", "error",
             "-show_entries", "format=duration",

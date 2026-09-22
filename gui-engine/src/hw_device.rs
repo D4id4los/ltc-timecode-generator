@@ -6,10 +6,11 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::converter::HwDeviceCapabilities;
+use crate::subprocess::no_window_command;
 use crate::video_codecs::{candidate_args, EncoderClass, HwFramePath, VIDEO_CODECS};
 
 // ── VAAPI render-node enumeration ────────────────────────────────────────
@@ -60,7 +61,7 @@ pub fn list_vaapi_render_nodes(dir: &Path) -> Vec<PathBuf> {
 /// status. Returns `true` when the device initialises successfully.
 pub fn probe_vaapi(ffmpeg: &str, device: &Path) -> bool {
     let dev_str = device.to_string_lossy();
-    Command::new(ffmpeg)
+    no_window_command(ffmpeg)
         .args(["-v", "error", "-init_hw_device", &format!("vaapi={}", dev_str), "-h"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -72,7 +73,7 @@ pub fn probe_vaapi(ffmpeg: &str, device: &Path) -> bool {
 /// Run `ffmpeg -v error -init_hw_device vulkan -h` and check exit status.
 /// Returns `true` when a Vulkan device initialises successfully.
 pub fn probe_vulkan(ffmpeg: &str) -> bool {
-    Command::new(ffmpeg)
+    no_window_command(ffmpeg)
         .args(["-v", "error", "-init_hw_device", "vulkan", "-h"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -205,7 +206,7 @@ pub fn run_with_timeout(child: &mut Child, timeout: Duration) -> Option<bool> {
 /// return `true` if it succeeds within the timeout.
 pub fn test_encode(ffmpeg: &str, encoder: &str, hw_frames: Option<HwFramePath>, vaapi_device: Option<&str>) -> bool {
     let args = build_test_encode_args(ffmpeg, encoder, hw_frames, vaapi_device);
-    let mut child = match Command::new(ffmpeg)
+    let mut child = match no_window_command(ffmpeg)
         .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

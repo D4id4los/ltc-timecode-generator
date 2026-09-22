@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -11,6 +11,7 @@ use log::{info, warn};
 use audio_core::{FrameTimecode, Timecode};
 
 use crate::ffprobe::VideoAudioProbe;
+use crate::subprocess::no_window_command;
 use crate::video_codecs;
 
 pub const DEFAULT_AUDIO_SUFFIX: &str = "_audio_track{:01d}";
@@ -126,7 +127,7 @@ pub struct FfmpegCapabilities {
 }
 
 pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
-    let version_ok = Command::new("ffmpeg")
+    let version_ok = no_window_command("ffmpeg")
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -190,7 +191,7 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
 }
 
 fn run_ffmpeg_list(args: &[&str], filter_fn: fn(&str) -> bool) -> BTreeSet<String> {
-    let output = Command::new("ffmpeg")
+    let output = no_window_command("ffmpeg")
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2744,7 +2745,7 @@ fn run_ffmpeg_process(
         s.current_line = args_str;
     }
 
-    let mut child = match Command::new("ffmpeg")
+    let mut child = match no_window_command("ffmpeg")
         .args(&full_args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

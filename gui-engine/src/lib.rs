@@ -9,6 +9,7 @@ pub mod file_pattern;
 pub mod hw_device;
 pub mod log_buffer;
 pub mod state;
+pub mod subprocess;
 pub mod theme;
 pub mod video_codecs;
 pub mod timecode;
