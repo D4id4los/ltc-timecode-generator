@@ -309,6 +309,27 @@ fn format_available_in_ffmpeg(format: &str, caps: &FfmpegCapabilities) -> bool {
     caps.available_formats.contains(ffmpeg_name)
 }
 
+/// Output container for stream-copy mode, derived from the input file's
+/// extension. Same-container copies are the most faithful; MPEG-TS based
+/// recordings (mts/m2ts/ts) remux into MP4 so `-timecode` metadata is
+/// available, and everything else lands in Matroska which accepts nearly
+/// every codec combination.
+pub fn copy_mode_container_for_input(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "mp4" | "m4v" => "mp4",
+        "mov" => "mov",
+        "mkv" => "mkv",
+        "mxf" => "mxf",
+        "mts" | "m2ts" | "m2t" | "ts" => "mp4",
+        _ => "mkv",
+    }
+}
+
 /// Returns `Ok(())` or an user-facing error explaining *why* the combination
 /// is invalid.
 ///
@@ -328,9 +349,29 @@ pub fn conversion_sanity_check(
     audio_suffix: Option<&str>,
     video_suffix: Option<&str>,
 ) -> Result<(), String> {
-    conversion_sanity_check_with_naming(
+    sanity_check_impl(
         container, video_codec, audio_encoder, input_files, output_folder,
-        filename_prefix, caps, audio_suffix, video_suffix, None,
+        filename_prefix, caps, audio_suffix, video_suffix, None, false,
+    )
+}
+
+/// Stream-copy variant of [`conversion_sanity_check`]: the video stream is
+/// not re-encoded, so the video codec selection is irrelevant and its
+/// availability/compatibility checks are skipped.
+pub fn conversion_sanity_check_copy(
+    container: &str,
+    video_codec: &str,
+    audio_encoder: &str,
+    input_files: &[PathBuf],
+    output_folder: &Path,
+    filename_prefix: &str,
+    caps: &FfmpegCapabilities,
+    audio_suffix: Option<&str>,
+    video_suffix: Option<&str>,
+) -> Result<(), String> {
+    sanity_check_impl(
+        container, video_codec, audio_encoder, input_files, output_folder,
+        filename_prefix, caps, audio_suffix, video_suffix, None, true,
     )
 }
 
@@ -345,6 +386,27 @@ pub fn conversion_sanity_check_with_naming(
     audio_suffix: Option<&str>,
     video_suffix: Option<&str>,
     naming_mode: Option<&OutputNamingMode>,
+    copy_video: bool,
+) -> Result<(), String> {
+    sanity_check_impl(
+        container, video_codec, audio_encoder, input_files, output_folder,
+        filename_prefix, caps, audio_suffix, video_suffix, naming_mode, copy_video,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sanity_check_impl(
+    container: &str,
+    video_codec: &str,
+    audio_encoder: &str,
+    input_files: &[PathBuf],
+    output_folder: &Path,
+    filename_prefix: &str,
+    caps: &FfmpegCapabilities,
+    audio_suffix: Option<&str>,
+    video_suffix: Option<&str>,
+    naming_mode: Option<&OutputNamingMode>,
+    copy_video: bool,
 ) -> Result<(), String> {
     if !caps.has_ffmpeg {
         return Err("ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH."
@@ -390,26 +452,28 @@ pub fn conversion_sanity_check_with_naming(
         ConverterSettings::validate_suffix_template_for_mode(suffix, nm)?;
     }
 
-    let codec_id = video_codecs::normalize_video_codec(video_codec);
-    if video_codecs::find_codec(codec_id).is_none() {
-        let known: Vec<&str> = video_codecs::supported_video_codecs()
-            .iter()
-            .map(|(k, _)| *k)
-            .collect();
-        return Err(format!(
-            "Unknown video codec '{}'. Supported codecs: {}.",
-            video_codec,
-            known.join(", ")
-        ));
-    }
+    if !copy_video {
+        let codec_id = video_codecs::normalize_video_codec(video_codec);
+        if video_codecs::find_codec(codec_id).is_none() {
+            let known: Vec<&str> = video_codecs::supported_video_codecs()
+                .iter()
+                .map(|(k, _)| *k)
+                .collect();
+            return Err(format!(
+                "Unknown video codec '{}'. Supported codecs: {}.",
+                video_codec,
+                known.join(", ")
+            ));
+        }
 
-    if video_codecs::resolve_encoder_chain(codec_id, caps).is_empty() {
-        return Err(format!(
-            "No {} encoder is available in your ffmpeg installation \
-             (needs one of: {}). Run `ffmpeg -encoders` to see available encoders.",
-            codec_id,
-            video_codecs::static_encoder_chain(codec_id).join(", ")
-        ));
+        if video_codecs::resolve_encoder_chain(codec_id, caps).is_empty() {
+            return Err(format!(
+                "No {} encoder is available in your ffmpeg installation \
+                 (needs one of: {}). Run `ffmpeg -encoders` to see available encoders.",
+                codec_id,
+                video_codecs::static_encoder_chain(codec_id).join(", ")
+            ));
+        }
     }
 
     if !encoder_available_in_ffmpeg(audio_encoder, caps) {
@@ -421,7 +485,11 @@ pub fn conversion_sanity_check_with_naming(
         ));
     }
 
-    if !video_codecs::codec_supports_container(codec_id, container) {
+    if !copy_video && !video_codecs::codec_supports_container(
+        video_codecs::normalize_video_codec(video_codec),
+        container,
+    ) {
+        let codec_id = video_codecs::normalize_video_codec(video_codec);
         return Err(format!(
             "Video codec '{}' is not compatible with container format '{}'. \
              {}",
@@ -527,6 +595,12 @@ pub struct ConverterSettings {
 
     // ── Output Format ──
     pub container: String,
+    /// Stream-copy mode ("Leave Video Encoding Untouched"): the video stream
+    /// is remuxed without re-encoding. The container is derived from the
+    /// input file and the video codec selection is ignored. Cuts snap to the
+    /// nearest video keyframe at-or-before the trim offset.
+    /// Only meaningful for `ConversionPipeline::VideoPassthrough`.
+    pub copy_video: bool,
     /// Video *codec* id ("av1", "h265", …). Legacy concrete encoder names
     /// are accepted and normalized via `video_codecs::normalize_video_codec`.
     pub video_encoder: String,
@@ -547,6 +621,11 @@ pub struct ConverterSettings {
     pub trim_to_first_ltc: bool,
     pub trim_offsets_secs: Vec<f64>,
     pub timecode_meta_per_file: Vec<Option<TimecodeMetadata>>,
+
+    // ── Concatenation ──
+    /// When true and `split_tracks` + `VideoClipSequence`: produce one audio
+    /// file per track concatenated across all clips instead of per-clip files.
+    pub concat_audio: bool,
 }
 
 // ── Video output planner ──────────────────────────────────────────────────
@@ -569,6 +648,13 @@ pub enum VideoOutputStep {
     VideoMux { file_idx: usize, output: PathBuf, keep: AudioKeep },
     /// Extract a single audio channel to a separate file.
     AudioChannel { file_idx: usize, stream_idx: usize, channel_idx: usize, output: PathBuf, format: String },
+    /// Concatenate a single audio track across multiple video clips (one output per track).
+    AudioChannelConcat {
+        segments: Vec<(usize, usize, usize)>,  // (file_idx, stream_idx, channel_idx) per clip
+        output: PathBuf,
+        format: String,
+        sample_rate: u32,
+    },
 }
 
 impl VideoOutputStep {
@@ -577,7 +663,8 @@ impl VideoOutputStep {
         match self {
             VideoOutputStep::VideoOnly { output, .. }
             | VideoOutputStep::VideoMux { output, .. }
-            | VideoOutputStep::AudioChannel { output, .. } => output,
+            | VideoOutputStep::AudioChannel { output, .. }
+            | VideoOutputStep::AudioChannelConcat { output, .. } => output,
         }
     }
 }
@@ -653,6 +740,162 @@ pub fn plan_video_outputs(settings: &ConverterSettings, probe: &VideoAudioProbe)
     }
 
     steps
+}
+
+/// Build the flat channel list for a probe: `(stream_idx, channel_idx)` in
+/// stream-then-channel order. Returns `None` if the probe has no audio.
+fn probe_channel_list(probe: &VideoAudioProbe) -> Option<Vec<(usize, usize)>> {
+    let mut channels = Vec::new();
+    for s in &probe.streams {
+        for ch in 0..s.channels {
+            channels.push((s.stream_index, ch));
+        }
+    }
+    if channels.is_empty() { None } else { Some(channels) }
+}
+
+/// Plan audio-concatenation steps for a `VideoClipSequence` with
+/// `split_tracks = true` and `concat_audio = true`.
+///
+/// Returns a `(Vec<VideoOutputStep>, String)` where the string is a
+/// warning log (empty when consistent or already handled).
+/// When channel layouts or sample rates differ across clips, falls back to
+/// per-clip `AudioChannel` steps and populates the warning string.
+pub fn plan_concat_outputs(
+    settings: &ConverterSettings,
+    all_probes: &[Option<VideoAudioProbe>],
+) -> (Vec<VideoOutputStep>, String) {
+    let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+    let mut steps: Vec<VideoOutputStep> = Vec::new();
+    let mut warnings = String::new();
+
+    // Build per-clip channel lists, skipping probes without audio.
+    let clip_channels: Vec<Option<Vec<(usize, usize)>>> = all_probes
+        .iter()
+        .map(|p| p.as_ref().and_then(probe_channel_list))
+        .collect();
+
+    // Determine the reference layout from the first clip with audio.
+    let reference = match clip_channels.iter().find_map(|c| c.as_ref()) {
+        Some(r) => r.clone(),
+        None => return (steps, warnings), // no audio anywhere → no concat steps
+    };
+
+    // Determine sample rate from first clip's first stream.
+    let sample_rate: u32 = all_probes
+        .iter()
+        .find_map(|p| p.as_ref())
+        .and_then(|p| p.streams.first())
+        .map(|s| s.sample_rate)
+        .unwrap_or(48000);
+
+    // Verify consistency and build segments
+    let num_tracks = reference.len();
+    let mut tracks_segments: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); num_tracks];
+
+    let mut consistent = true;
+    for (file_idx, opt_cl) in clip_channels.iter().enumerate() {
+        match opt_cl {
+            Some(cl) => {
+                // Check layout matches reference
+                if cl.len() != num_tracks {
+                    consistent = false;
+                    break;
+                }
+                // Check stream-channel pairs match (order-sensitive)
+                if cl.iter().zip(&reference).any(|(a, b)| a != b) {
+                    consistent = false;
+                    break;
+                }
+                // Check sample rate
+                if let Some(p) = &all_probes[file_idx] {
+                    if let Some(s) = p.streams.first() {
+                        if s.sample_rate != sample_rate {
+                            consistent = false;
+                            break;
+                        }
+                    }
+                }
+                // Add segments for each track
+                for track_idx in 0..num_tracks {
+                    let (stream_idx, channel_idx) = cl[track_idx];
+                    tracks_segments[track_idx].push((file_idx, stream_idx, channel_idx));
+                }
+            }
+            None => {
+                // Clip has no audio — still need to contribute nothing for
+                // this track. We must either skip it from concat or pad.
+                // For simplicity: skip the clip from all tracks.
+                // This creates a gap but avoids issues. Log warning.
+                warnings.push_str(&format!(
+                    "Warning: clip {} has no audio; excluded from concatenation.\n",
+                    settings.input_files[file_idx].display()
+                ));
+                // Don't mark as inconsistent — just skip.
+            }
+        }
+    }
+
+    if !consistent {
+        // Layout mismatch — fall back to per-clip AudioChannel steps
+        warnings.push_str(
+            "Warning: audio channel layouts differ across clips — falling back to per-clip audio outputs.\n"
+        );
+        let fallback: Vec<VideoOutputStep> = all_probes
+            .iter()
+            .enumerate()
+            .filter_map(|(fi, p)| p.as_ref().map(|probe| (fi, probe)))
+            .flat_map(|(fi, probe)| {
+                let mut file_steps = Vec::new();
+                for s in &probe.streams {
+                    for ch in 0..s.channels {
+                        let ltc_match = settings.ltc_video_source == Some((s.stream_index, ch));
+                        if settings.drop_ltc_track && ltc_match {
+                            continue;
+                        }
+                        let audio_idx = file_steps.len() + 1;
+                        let audio_out = settings.output_path_for_file("audio", fi, audio_idx, aext);
+                        file_steps.push(VideoOutputStep::AudioChannel {
+                            file_idx: fi,
+                            stream_idx: s.stream_index,
+                            channel_idx: ch,
+                            output: audio_out,
+                            format: fmt.to_string(),
+                        });
+                    }
+                }
+                file_steps
+            })
+            .collect();
+        return (fallback, warnings);
+    }
+
+    // Build one AudioChannelConcat step per surviving track
+    for track_idx in 0..num_tracks {
+        // Check if this track should be dropped (LTC track)
+        if settings.drop_ltc_track {
+            let (ref_stream, ref_ch) = reference[track_idx];
+            if settings.ltc_video_source == Some((ref_stream, ref_ch)) {
+                continue;
+            }
+        }
+        let segments: Vec<(usize, usize, usize)> = tracks_segments[track_idx]
+            .iter()
+            .copied()
+            .collect();
+        if segments.is_empty() {
+            continue;
+        }
+        let audio_out = settings.output_path_for_file("audio", 0, track_idx + 1, aext);
+        steps.push(VideoOutputStep::AudioChannelConcat {
+            segments,
+            output: audio_out,
+            format: fmt.to_string(),
+            sample_rate,
+        });
+    }
+
+    (steps, warnings)
 }
 
 impl ConverterSettings {
@@ -763,21 +1006,55 @@ impl ConverterSettings {
             ConversionPipeline::VideoPassthrough => {
                 // For video pipeline, paths are determined by the planner.
                 let mut paths = Vec::new();
-                for file_idx in 0..self.input_files.len() {
-                    let input = &self.input_files[file_idx];
-                    if let Ok(probe) = crate::ffprobe::probe_video_audio(input) {
-                        let steps = plan_video_outputs(self, &probe);
-                        for step in &steps {
-                            match step {
-                                VideoOutputStep::VideoOnly { output, .. }
-                                | VideoOutputStep::VideoMux { output, .. }
-                                | VideoOutputStep::AudioChannel { output, .. } => {
-                                    paths.push(output.clone());
-                                }
+
+                let use_concat = self.concat_audio
+                    && self.split_tracks
+                    && self.recording_type == RecordingType::VideoClipSequence;
+
+                if use_concat {
+                    // Probe all files, emit video paths + concat audio paths
+                    let mut probes: Vec<Option<VideoAudioProbe>> = Vec::new();
+                    for file_idx in 0..self.input_files.len() {
+                        let input = &self.input_files[file_idx];
+                        match crate::ffprobe::probe_video_audio(input) {
+                            Ok(probe) => {
+                                // Emit video path (split mode → VideoOnly per file)
+                                let ext = extension_for_container(&self.container);
+                                let video_out = self.output_path_for_file("video", file_idx, file_idx + 1, ext);
+                                paths.push(video_out);
+                                probes.push(Some(probe));
+                            }
+                            Err(_) => {
+                                paths.push(self.output_path_for_file("video", file_idx, file_idx + 1, extension));
+                                probes.push(None);
                             }
                         }
-                    } else {
-                        paths.push(self.output_path_for_file("video", file_idx, file_idx + 1, extension));
+                    }
+                    let (concat_steps, _warning) = plan_concat_outputs(self, &probes);
+                    for step in &concat_steps {
+                        if let VideoOutputStep::AudioChannelConcat { output, .. } = step {
+                            paths.push(output.clone());
+                        }
+                    }
+                } else {
+                    // Normal per-file planning
+                    for file_idx in 0..self.input_files.len() {
+                        let input = &self.input_files[file_idx];
+                        if let Ok(probe) = crate::ffprobe::probe_video_audio(input) {
+                            let steps = plan_video_outputs(self, &probe);
+                            for step in &steps {
+                                match step {
+                                    VideoOutputStep::VideoOnly { output, .. }
+                                    | VideoOutputStep::VideoMux { output, .. }
+                                    | VideoOutputStep::AudioChannel { output, .. }
+                                    | VideoOutputStep::AudioChannelConcat { output, .. } => {
+                                        paths.push(output.clone());
+                                    }
+                                }
+                            }
+                        } else {
+                            paths.push(self.output_path_for_file("video", file_idx, file_idx + 1, extension));
+                        }
                     }
                 }
                 paths
@@ -834,6 +1111,65 @@ pub fn format_ffmpeg_timecode(tc: &Timecode, drop_frame: bool) -> String {
         "{:02}:{:02}:{:02}{}{:02}",
         tc.hours, tc.minutes, tc.seconds, frame_sep, tc.frames
     )
+}
+
+/// Step a `Timecode` back by one frame at the given frame rate.
+///
+/// Drop-frame aware (SMPTE 12M-1): frames 0 and 1 do not exist at the start
+/// of minutes whose number is not divisible by 10, so stepping back from
+/// frame 2 of such a minute lands on the last frame of the previous minute.
+/// The inverse of `audio_core::increment_timecode`.
+fn decrement_timecode_frame(tc: &Timecode, fps: f64, drop_frame: bool) -> Timecode {
+    let max_frames = fps.ceil() as u32;
+    let mut h = tc.hours;
+    let mut m = tc.minutes;
+    let mut s = tc.seconds;
+    let mut f = tc.frames;
+
+    // Drop-frame skipped frames: (m % 10 != 0, s == 0, f <= 1) does not exist.
+    if drop_frame && s == 0 && m % 10 != 0 && f <= 1 {
+        if m > 0 {
+            m -= 1;
+        } else {
+            m = 59;
+            h = if h == 0 { 23 } else { h - 1 };
+        }
+        return Timecode { hours: h, minutes: m, seconds: 59, frames: max_frames - 1 };
+    }
+
+    if f > 0 {
+        f -= 1;
+    } else if s > 0 {
+        s -= 1;
+        f = max_frames - 1;
+    } else {
+        if m > 0 {
+            m -= 1;
+        } else {
+            m = 59;
+            h = if h == 0 { 23 } else { h - 1 };
+        }
+        s = 59;
+        f = max_frames - 1;
+    }
+
+    Timecode { hours: h, minutes: m, seconds: s, frames: f }
+}
+
+/// Shift a `Timecode` back by `delta_secs` worth of frames at the given
+/// frame rate (drop-frame aware). Used to re-anchor start-timecode metadata
+/// when a stream-copy trim is snapped to an earlier video keyframe.
+pub fn shift_timecode_back(tc: &Timecode, delta_secs: f64, fps: f64, drop_frame: bool) -> Timecode {
+    let mut out = *tc;
+    if delta_secs <= 0.0 || fps <= 0.0 {
+        return out;
+    }
+    let mut frames = (delta_secs * fps).round() as u64;
+    while frames > 0 {
+        out = decrement_timecode_frame(&out, fps, drop_frame);
+        frames -= 1;
+    }
+    out
 }
 
 /// Binary-search `timecodes` for the `FrameTimecode` closest to `offset_secs`
@@ -981,13 +1317,25 @@ fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<Stri
 
     // Timecode from first file
     if let Some(Some(ref tc)) = settings.timecode_meta_per_file.first() {
-        push_timecode_args(&mut args, tc);
+        push_timecode_args(&mut args, tc, true);
     }
 
     args.push("-shortest".to_string());
     push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
 
     args
+}
+
+/// Push the video encoding args for the selected mode: stream copy
+/// (`-c:v copy`, no encoder-specific args) when `settings.copy_video` is set,
+/// otherwise the resolved encoder chain from the codec registry.
+fn push_video_codec_args(args: &mut Vec<String>, settings: &ConverterSettings) {
+    if settings.copy_video {
+        args.push("-c:v".to_string());
+        args.push("copy".to_string());
+        return;
+    }
+    push_video_encoder(args, settings);
 }
 
 /// Build ffmpeg args for a video-only step (no audio).
@@ -1001,10 +1349,10 @@ fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> Vec<S
     args.push("0:v".to_string());
     args.push("-an".to_string());
 
-    push_video_encoder(&mut args, settings);
+    push_video_codec_args(&mut args, settings);
 
     if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
-        push_timecode_args(&mut args, tc);
+        push_timecode_args(&mut args, tc, !settings.copy_video);
     }
 
     push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
@@ -1026,7 +1374,12 @@ fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &Au
             args.push("-map".to_string());
             args.push("0:a?".to_string());
             args.push("-c:a".to_string());
-            args.push(settings.audio_encoder.clone());
+            if settings.copy_video {
+                // Untouched mode: audio is stream-copied alongside the video.
+                args.push("copy".to_string());
+            } else {
+                args.push(settings.audio_encoder.clone());
+            }
         }
         AudioKeep::ChannelsExcept(drop_pairs) => {
             // Build a filter_complex that drops specific (stream, channel) pairs
@@ -1090,16 +1443,18 @@ fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &Au
                     args.push("-map".to_string());
                     args.push(label.clone());
                 }
+                // Channel filtering requires decoding the audio, so it is
+                // re-encoded even in copy mode; the video stream stays copied.
                 args.push("-c:a".to_string());
                 args.push(settings.audio_encoder.clone());
             }
         }
     }
 
-    push_video_encoder(&mut args, settings);
+    push_video_codec_args(&mut args, settings);
 
     if let Some(Some(ref tc)) = settings.timecode_meta_per_file.get(file_idx) {
-        push_timecode_args(&mut args, tc);
+        push_timecode_args(&mut args, tc, !settings.copy_video);
     }
 
     push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
@@ -1148,6 +1503,58 @@ fn build_video_track_extract_args(
     args
 }
 
+/// Build ffmpeg args for a concatenated audio track across multiple clips.
+/// Each clip contributes one channel extracted via pan, then all are joined
+/// with the concat filter. Produces a single audio output per call.
+fn build_concat_audio_args(
+    settings: &ConverterSettings,
+    segments: &[(usize, usize, usize)],
+    format: &str,
+    sample_rate: u32,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-y".to_string()];
+
+    // Input files with per-clip trim
+    for (_i, &(file_idx, _stream_idx, _channel_idx)) in segments.iter().enumerate() {
+        let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
+        push_input_with_trim(&mut args, &settings.input_files[file_idx], trim_secs);
+    }
+
+    let n = segments.len();
+    let mut filter_parts: Vec<String> = Vec::new();
+
+    // Per-clip: pan the specific (stream, channel) to mono
+    for (i, &(_file_idx, stream_idx, channel_idx)) in segments.iter().enumerate() {
+        filter_parts.push(format!(
+            "[{}:{}]pan=mono|FC=c{}[a{}]",
+            i, stream_idx, channel_idx, i
+        ));
+    }
+
+    // Concat all audio segments
+    let concat_inputs: String = (0..n).map(|i| format!("[a{}]", i)).collect::<Vec<_>>().join("");
+    filter_parts.push(format!(
+        "{}concat=n={}:v=0:a=1[out]",
+        concat_inputs, n
+    ));
+
+    args.push("-filter_complex".to_string());
+    args.push(filter_parts.join(";"));
+    args.push("-map".to_string());
+    args.push("[out]".to_string());
+    args.push("-vn".to_string());
+    args.push("-c:a".to_string());
+    args.push(settings.audio_encoder.clone());
+
+    // Timecode metadata from clip 0
+    if let Some(Some(ref tc)) = settings.timecode_meta_per_file.first() {
+        push_audio_timecode_args(&mut args, tc, format, sample_rate);
+    }
+
+    push_output_trailer(&mut args, format);
+    args
+}
+
 /// Dispatch to the correct video arg-builder based on step kind.
 fn build_video_to_video_args(settings: &ConverterSettings, step: &VideoOutputStep, probe: &VideoAudioProbe) -> Vec<String> {
     match step {
@@ -1165,6 +1572,9 @@ fn build_video_to_video_args(settings: &ConverterSettings, step: &VideoOutputSte
                 .map(|s| s.sample_rate)
                 .unwrap_or(48000);
             build_video_track_extract_args(settings, *file_idx, *stream_idx, *channel_idx, format, sample_rate)
+        }
+        VideoOutputStep::AudioChannelConcat { .. } => {
+            panic!("AudioChannelConcat must be executed directly via run_ffmpeg_process, not through build_video_to_video_args")
         }
     }
 }
@@ -1205,14 +1615,21 @@ fn push_video_encoder(args: &mut Vec<String>, settings: &ConverterSettings) {
     }
 }
 
-fn push_timecode_args(args: &mut Vec<String>, tc: &TimecodeMetadata) {
+/// Push timecode metadata args for a video output file.
+///
+/// When `force_frame_rate` is true (encode mode) the stream's frame rate is
+/// also pinned via `-r`; in stream-copy mode the original timing must be
+/// preserved, so `-r` is omitted.
+fn push_timecode_args(args: &mut Vec<String>, tc: &TimecodeMetadata, force_frame_rate: bool) {
     let tc_str = format_ffmpeg_timecode(&tc.start, tc.drop_frame);
     args.push("-timecode".to_string());
     args.push(tc_str);
     args.push("-write_tmcd".to_string());
     args.push("1".to_string());
-    args.push("-r".to_string());
-    args.push(format!("{:.3}", tc.fps));
+    if force_frame_rate {
+        args.push("-r".to_string());
+        args.push(format!("{:.3}", tc.fps));
+    }
 }
 
 /// Compute the BWF `time_reference` value (sample offset since midnight)
@@ -1399,6 +1816,59 @@ fn run_video_step_with_fallback(
     false
 }
 
+// ── Stream-copy preparation ─────────────────────────────────────────────
+
+/// Prepare `ConverterSettings` for a stream-copy conversion:
+///
+/// 1. Derive the output container from the first input file (all clips in a
+///    group share a container; a mixed group logs a warning).
+/// 2. Snap each non-zero trim offset to the nearest video keyframe
+///    at-or-before it (`ffprobe` packet scan) so `-c copy` cuts land exactly
+///    on the snap point.
+/// 3. Re-anchor the per-file start timecode to the snapped offset so the
+///    embedded timecode matches the actual first video frame.
+fn prepare_copy_mode(settings: &mut ConverterSettings) {
+    if let Some(first) = settings.input_files.first() {
+        let container = copy_mode_container_for_input(first);
+        let mixed = settings
+            .input_files
+            .iter()
+            .any(|f| copy_mode_container_for_input(f) != container);
+        if mixed {
+            warn!(
+                "Mixed input containers in copy mode; using '{}' for all outputs",
+                container
+            );
+        }
+        settings.container = container.to_string();
+    }
+
+    for i in 0..settings.trim_offsets_secs.len() {
+        let raw = settings.trim_offsets_secs[i];
+        if raw <= 0.001 {
+            continue;
+        }
+        let Some(path) = settings.input_files.get(i) else {
+            continue;
+        };
+        let snapped = crate::ffprobe::snap_trim_to_keyframe(path, raw);
+        let delta = raw - snapped;
+        if delta <= 0.001 {
+            continue;
+        }
+        info!(
+            "Copy mode: trim for '{}' snapped {:.3}s → {:.3}s (keyframe)",
+            path.display(),
+            raw,
+            snapped
+        );
+        settings.trim_offsets_secs[i] = snapped;
+        if let Some(Some(meta)) = settings.timecode_meta_per_file.get_mut(i) {
+            meta.start = shift_timecode_back(&meta.start, delta, meta.fps, meta.drop_frame);
+        }
+    }
+}
+
 // ── Spawn conversion ─────────────────────────────────────────────────────
 
 /// Spawn a conversion on a background thread.
@@ -1414,13 +1884,19 @@ pub fn spawn_conversion(
     caps: Option<&FfmpegCapabilities>,
 ) -> JoinHandle<()> {
     // Resolve the codec → encoder chain on the caller thread (cheap, and
-    // avoids moving the `caps` borrow into the spawned thread).
+    // avoids moving the `caps` borrow into the spawned thread). Skipped in
+    // stream-copy mode where no encoder is used at all.
+    let copy_mode_requested = settings.copy_video
+        && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough);
     let codec_id = video_codecs::normalize_video_codec(&settings.video_encoder).to_string();
-    let mut chain: Vec<String> = caps
-        .filter(|c| c.has_ffmpeg)
-        .map(|c| video_codecs::resolve_encoder_chain(&codec_id, c))
-        .unwrap_or_default();
-    if chain.is_empty() {
+    let mut chain: Vec<String> = if copy_mode_requested {
+        Vec::new()
+    } else {
+        caps.filter(|c| c.has_ffmpeg)
+            .map(|c| video_codecs::resolve_encoder_chain(&codec_id, c))
+            .unwrap_or_default()
+    };
+    if chain.is_empty() && !copy_mode_requested {
         // No capability info (or stale): try the full static chain and
         // let the runtime fallback sort it out.
         chain = video_codecs::static_encoder_chain(&codec_id);
@@ -1428,12 +1904,25 @@ pub fn spawn_conversion(
 
     std::thread::spawn(move || {
         let mut settings = settings;
+        let copy_mode = settings.copy_video
+            && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough);
+        if copy_mode {
+            prepare_copy_mode(&mut settings);
+        }
         let mut fallback = EncoderFallback::new(chain);
-        info!(
-            "Encoder chain for codec '{}': {}",
-            codec_id,
-            fallback.remaining().join(" → ")
-        );
+        if copy_mode {
+            info!(
+                "Video stream copy mode: video will not be re-encoded \
+                 (container '{}', video codec selection ignored)",
+                settings.container
+            );
+        } else {
+            info!(
+                "Encoder chain for codec '{}': {}",
+                codec_id,
+                fallback.remaining().join(" → ")
+            );
+        }
 
         let (output_format, output_extension) = match settings.pipeline {
             ConversionPipeline::AudioOnly { generate_synthetic_video: false } => {
@@ -1497,10 +1986,14 @@ pub fn spawn_conversion(
         if matches!(final_status, ConversionStatus::Failed { .. }) {
             info!("Conversion failed - see log for details.");
         } else {
-            let encoder_line = fallback
-                .resolved()
-                .map(|e| format!("\nVideo encoder used: {}", e))
-                .unwrap_or_default();
+            let encoder_line = if copy_mode {
+                "\nVideo stream: copied (no re-encode)".to_string()
+            } else {
+                fallback
+                    .resolved()
+                    .map(|e| format!("\nVideo encoder used: {}", e))
+                    .unwrap_or_default()
+            };
             let mut s = state.lock().unwrap();
             s.status = ConversionStatus::Completed;
             s.ffmpeg_output = format!(
@@ -1639,7 +2132,7 @@ fn run_audio_to_synthetic_video(
 #[allow(clippy::too_many_arguments)]
 fn run_video_to_video(
     settings: &mut ConverterSettings,
-    extension: &str,
+    _extension: &str,
     fallback: &mut EncoderFallback,
     state: &SharedConversionState,
     cancel: &CancelFlag,
@@ -1647,71 +2140,155 @@ fn run_video_to_video(
     overall_progress: &mut f32,
     overall_log: &mut String,
 ) {
-    // Phase 1: probe each file and build the step plan (encoder args are
-    // built lazily per attempt so the fallback can substitute encoders).
-    let mut planned: Vec<(VideoOutputStep, VideoAudioProbe)> = Vec::new();
+    // Phase 1: probe each file
+    let mut probes: Vec<Option<VideoAudioProbe>> = Vec::new();
 
     for file_idx in 0..settings.input_files.len() {
         if cancel.load(Ordering::Relaxed) { break; }
-
         let input = &settings.input_files[file_idx];
-        let probe = crate::ffprobe::probe_video_audio(input);
-
-        match probe {
+        match crate::ffprobe::probe_video_audio(input) {
             Ok(probe) => {
-                for s in plan_video_outputs(settings, &probe) {
-                    planned.push((s, probe.clone()));
-                }
+                probes.push(Some(probe));
             }
             Err(e) => {
-                // Probe failure: warn, treat as no-audio, produce video-only output
                 warn!("Probe failed for '{}': {} — treating as no-audio", input.display(), e);
-                let output_path = settings.output_path_for_index("video", file_idx + 1, extension);
-                let step = VideoOutputStep::VideoOnly { file_idx, output: output_path };
-                planned.push((
-                    step,
-                    VideoAudioProbe {
-                        streams: Vec::new(),
-                        total_audio_channels: 0,
-                        is_video_file: true,
-                    },
-                ));
+                probes.push(None);
             }
         }
     }
 
-    // Recalculate total steps from actual plan
-    *_total_steps = planned.len();
+    // Phase 2: build step plan
+    let mut steps: Vec<StepEntry> = Vec::new();
 
-    // Phase 2: execute steps with encoder fallback
-    for (step_idx, (step, probe)) in planned.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) { break; }
-        let output = match step {
-            VideoOutputStep::VideoOnly { output, .. }
-            | VideoOutputStep::VideoMux { output, .. }
-            | VideoOutputStep::AudioChannel { output, .. } => output.clone(),
-        };
-        let step_progress = 1.0 / planned.len().max(1) as f32;
-        let mut build_args =
-            |s: &ConverterSettings| build_video_to_video_args(s, step, probe);
-        let ok = run_video_step_with_fallback(
-            settings,
-            fallback,
-            &mut build_args,
-            &output,
-            state,
-            cancel,
-            step_progress,
-            overall_progress,
-            overall_log,
-            planned.len(),
-            step_idx + 1,
-        );
-        *overall_progress += step_progress;
-        if !ok {
-            break;
+    let use_concat = settings.concat_audio
+        && settings.split_tracks
+        && settings.recording_type == RecordingType::VideoClipSequence;
+
+    if use_concat {
+        let ext = extension_for_container(&settings.container);
+        // Video-only steps per file
+        for file_idx in 0..settings.input_files.len() {
+            if cancel.load(Ordering::Relaxed) { break; }
+            let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
+            steps.push(StepEntry::Video(VideoOutputStep::VideoOnly { file_idx, output: video_out }));
+        }
+
+        // Concat audio steps
+        let (concat_steps, warning) = plan_concat_outputs(settings, &probes);
+        if !warning.is_empty() {
+            warn!("{}", warning.trim());
+            overall_log.push_str(&format!("\n--- {}\n", warning.trim()));
+        }
+        for cs in concat_steps {
+            steps.push(StepEntry::AudioOnly(cs));
+        }
+    } else {
+        // Normal per-file planning (no concat)
+        for (_file_idx, probe_opt) in probes.iter().enumerate() {
+            let probe = match probe_opt {
+                Some(p) => p.clone(),
+                None => VideoAudioProbe {
+                    streams: Vec::new(),
+                    total_audio_channels: 0,
+                    is_video_file: true,
+                },
+            };
+            for s in plan_video_outputs(settings, &probe) {
+                steps.push(StepEntry::Video(s));
+            }
         }
     }
+
+    // Recalculate total steps
+    *_total_steps = steps.len();
+
+    // Phase 3: execute steps
+    for (step_idx, entry) in steps.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) { break; }
+
+        match entry {
+            StepEntry::Video(step) => {
+                let output = match step {
+                    VideoOutputStep::VideoOnly { output, .. }
+                    | VideoOutputStep::VideoMux { output, .. }
+                    | VideoOutputStep::AudioChannel { output, .. }
+                    | VideoOutputStep::AudioChannelConcat { output, .. } => output.clone(),
+                };
+                let step_progress = 1.0 / steps.len().max(1) as f32;
+                // Find the probe for this step — for AudioChannel steps we
+                // need the file's probe. For concat steps, any probe works
+                // for the purpose of build_video_to_video_args (but concat
+                // steps should never reach this path).
+                let probe = probes.first().cloned().flatten().unwrap_or(VideoAudioProbe {
+                    streams: Vec::new(),
+                    total_audio_channels: 0,
+                    is_video_file: true,
+                });
+                let mut build_args =
+                    |s: &ConverterSettings| build_video_to_video_args(s, step, &probe);
+                // Copy mode runs without the encoder fallback: no encoder is
+                // involved, so any failure is fatal for the run.
+                let ok = if settings.copy_video {
+                    match run_ffmpeg_process(
+                        &build_args(settings),
+                        &output,
+                        state,
+                        cancel,
+                        step_progress,
+                        overall_progress,
+                        overall_log,
+                        steps.len(),
+                        step_idx + 1,
+                    ) {
+                        Ok(()) => true,
+                        Err(_) => false,
+                    }
+                } else {
+                    run_video_step_with_fallback(
+                        settings,
+                        fallback,
+                        &mut build_args,
+                        &output,
+                        state,
+                        cancel,
+                        step_progress,
+                        overall_progress,
+                        overall_log,
+                        steps.len(),
+                        step_idx + 1,
+                    )
+                };
+                *overall_progress += step_progress;
+                if !ok {
+                    if settings.copy_video {
+                        mark_conversion_failed(state, overall_log);
+                    }
+                    break;
+                }
+            }
+            StepEntry::AudioOnly(step) => {
+                let (output, args) = match step {
+                    VideoOutputStep::AudioChannelConcat { segments, output, format, sample_rate } => {
+                        (output.clone(), build_concat_audio_args(settings, segments, format, *sample_rate))
+                    }
+                    _ => unreachable!(),
+                };
+                let step_progress = 1.0 / steps.len().max(1) as f32;
+                if run_ffmpeg_process(&args, &output, state, cancel, step_progress, overall_progress, overall_log, steps.len(), step_idx + 1).is_err() {
+                    mark_conversion_failed(state, overall_log);
+                    break;
+                }
+                *overall_progress += step_progress;
+            }
+        }
+    }
+}
+
+/// Internal: discriminates steps that go through the video encoder fallback
+/// from steps that are audio-only and go directly to run_ffmpeg_process.
+enum StepEntry {
+    Video(VideoOutputStep),
+    AudioOnly(VideoOutputStep),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1990,6 +2567,7 @@ mod tests {
             drop_ltc_track: false,
             ltc_video_source: None,
             container: "mkv".to_string(),
+            copy_video: false,
             video_encoder: "h264".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
             resolved_video_encoder: String::new(),
@@ -2001,6 +2579,7 @@ mod tests {
             trim_to_first_ltc: false,
             trim_offsets_secs: vec![0.0; 2],
             timecode_meta_per_file: vec![None; 2],
+            concat_audio: false,
         }
     }
 
@@ -2810,6 +3389,7 @@ mod tests {
             drop_ltc_track: false,
             ltc_video_source: None,
             container: "mkv".to_string(),
+            copy_video: false,
             video_encoder: "h264".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
             resolved_video_encoder: String::new(),
@@ -2821,6 +3401,7 @@ mod tests {
             trim_to_first_ltc: false,
             trim_offsets_secs: vec![0.0],
             timecode_meta_per_file: vec![None],
+            concat_audio: false,
         }
     }
 
@@ -3051,6 +3632,177 @@ mod tests {
         assert!(args.contains(&"-c:a".to_string()));
     }
 
+    // ── Stream-copy mode ("Leave Video Encoding Untouched") ─────────────
+
+    fn make_copy_settings() -> ConverterSettings {
+        let mut s = make_video_settings();
+        s.copy_video = true;
+        s
+    }
+
+    fn codec_after_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+    }
+
+    #[test]
+    fn test_copy_mode_container_for_input() {
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.mp4")), "mp4");
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.m4v")), "mp4");
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/CLIP.MOV")), "mov");
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.mkv")), "mkv");
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.MXF")), "mxf");
+        // MPEG-TS based recordings remux into MP4 (keeps -timecode support)
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.mts")), "mp4");
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.M2TS")), "mp4");
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.ts")), "mp4");
+        // Everything else lands in Matroska
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.avi")), "mkv");
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.webm")), "mkv");
+        assert_eq!(copy_mode_container_for_input(Path::new("/x/noext")), "mkv");
+    }
+
+    #[test]
+    fn test_shift_timecode_back_ndf() {
+        let tc = Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 };
+        // 1.5 s at 25 fps = 37.5 frames → rounds to 38
+        let out = shift_timecode_back(&tc, 1.5, 25.0, false);
+        assert_eq!(format_ffmpeg_timecode(&out, false), "00:59:58:12");
+    }
+
+    #[test]
+    fn test_shift_timecode_back_zero_is_identity() {
+        let tc = Timecode { hours: 1, minutes: 0, seconds: 0, frames: 12 };
+        let out = shift_timecode_back(&tc, 0.0, 25.0, false);
+        assert_eq!(out, tc);
+        let out = shift_timecode_back(&tc, -3.0, 25.0, false);
+        assert_eq!(out, tc);
+    }
+
+    #[test]
+    fn test_shift_timecode_back_drop_frame_skips_nonexistent() {
+        // 29.97 DF: minute 1 starts at frame 2 — frames 0/1 don't exist.
+        // Shifting back 2 frames from 01:01:00;02 must land on 01:00:59;29,
+        // never on the nonexistent 01:01:00;00.
+        let tc = Timecode { hours: 1, minutes: 1, seconds: 0, frames: 2 };
+        let out = shift_timecode_back(&tc, 2.0 / 29.97, 29.97, true);
+        assert_eq!(format_ffmpeg_timecode(&out, true), "01:00:59;29");
+    }
+
+    #[test]
+    fn test_shift_timecode_back_drop_frame_minute_start() {
+        // 01:00:00;00 minus one frame → 00:59:59;29 (minute 0 keeps frame 0)
+        let tc = Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 };
+        let out = shift_timecode_back(&tc, 1.0 / 29.97, 29.97, true);
+        assert_eq!(format_ffmpeg_timecode(&out, true), "00:59:59;29");
+    }
+
+    #[test]
+    fn test_shift_timecode_back_wraps_midnight() {
+        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let out = shift_timecode_back(&tc, 1.0 / 25.0, 25.0, false);
+        assert_eq!(format_ffmpeg_timecode(&out, false), "23:59:59:24");
+    }
+
+    #[test]
+    fn test_shift_timecode_back_roundtrip_with_increment() {
+        // Decrement must be the exact inverse of audio_core::increment_timecode
+        let mut tc = Timecode { hours: 12, minutes: 34, seconds: 56, frames: 7 };
+        for _ in 0..200 {
+            tc = audio_core::increment_timecode(&tc, 25.0, false);
+        }
+        let out = shift_timecode_back(&tc, 200.0 / 25.0, 25.0, false);
+        assert_eq!(out, Timecode { hours: 12, minutes: 34, seconds: 56, frames: 7 });
+    }
+
+    #[test]
+    fn test_build_video_only_args_copy_mode() {
+        let s = make_copy_settings();
+        let args = build_video_only_args(&s, 0);
+        assert_eq!(codec_after_flag(&args, "-c:v"), Some(&"copy".to_string()),
+            "copy mode must stream-copy the video, args: {:?}", args);
+        assert!(!args.contains(&"-r".to_string()),
+            "output -r must not be forced on a copied stream");
+        // Timecode metadata is still written in copy mode
+        let s2 = make_copy_settings();
+        let mut s2 = s2;
+        s2.timecode_meta_per_file[0] = Some(TimecodeMetadata {
+            start: Timecode { hours: 9, minutes: 0, seconds: 0, frames: 0 },
+            fps: 25.0,
+            drop_frame: false,
+        });
+        let args = build_video_only_args(&s2, 0);
+        assert_eq!(codec_after_flag(&args, "-c:v"), Some(&"copy".to_string()));
+        let tc_pos = args.iter().position(|a| a == "-timecode").expect("timecode kept in copy mode");
+        assert_eq!(args[tc_pos + 1], "09:00:00:00");
+        assert!(args.contains(&"-write_tmcd".to_string()));
+        assert!(!args.contains(&"-r".to_string()));
+        // No encoder-specific pixel format args
+        assert!(!args.contains(&"yuv420p".to_string()));
+    }
+
+    #[test]
+    fn test_build_video_mux_args_copy_mode_all_audio_copies_audio() {
+        let s = make_copy_settings();
+        let probe = make_stereo_probe();
+        let args = build_video_mux_args(&s, 0, &AudioKeep::AllAudio, &probe);
+        assert_eq!(codec_after_flag(&args, "-c:v"), Some(&"copy".to_string()));
+        assert_eq!(codec_after_flag(&args, "-c:a"), Some(&"copy".to_string()),
+            "unfiltered audio must be stream-copied too, args: {:?}", args);
+        assert!(!args.contains(&"-r".to_string()));
+    }
+
+    #[test]
+    fn test_build_video_mux_args_copy_mode_drop_channel_reencodes_audio_only() {
+        let mut s = make_copy_settings();
+        s.audio_encoder = "pcm_s24le".to_string();
+        let probe = make_stereo_probe();
+        let keep = AudioKeep::ChannelsExcept(vec![(1, 0)]);
+        let args = build_video_mux_args(&s, 0, &keep, &probe);
+        assert_eq!(codec_after_flag(&args, "-c:v"), Some(&"copy".to_string()),
+            "video must stay copied even when audio is filtered");
+        assert_eq!(codec_after_flag(&args, "-c:a"), Some(&"pcm_s24le".to_string()),
+            "channel filtering requires re-encoding only the audio");
+        assert!(args.contains(&"-filter_complex".to_string()));
+    }
+
+    #[test]
+    fn test_build_video_only_args_encode_mode_unchanged() {
+        // Regression: without copy_video the encoder path is untouched
+        let mut s = make_video_settings();
+        s.resolved_video_encoder = "libx264".to_string();
+        let args = build_video_only_args(&s, 0);
+        assert_eq!(codec_after_flag(&args, "-c:v"), Some(&"libx264".to_string()));
+        assert!(args.contains(&"-pix_fmt".to_string()));
+    }
+
+    #[test]
+    fn test_sanity_check_copy_mode_skips_video_codec_validation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("in.mp4");
+        std::fs::write(&input, b"fake").unwrap();
+        // caps with no video encoders at all — encode mode would fail
+        let caps = make_caps(true, BTreeSet::from(["pcm_s24le"]), BTreeSet::from(["mp4"]));
+
+        // Copy mode: unknown codec id is irrelevant, conversion is valid
+        assert!(conversion_sanity_check(
+            "mp4", "weird-codec", "pcm_s24le",
+            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None,
+        ).is_err(), "encode mode with unknown codec must fail");
+
+        assert!(conversion_sanity_check_copy(
+            "mp4", "weird-codec", "pcm_s24le",
+            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None,
+        ).is_ok(), "copy mode must not validate the video codec");
+
+        // Copy mode still validates the container against ffmpeg
+        assert!(conversion_sanity_check_copy(
+            "webp", "weird-codec", "pcm_s24le",
+            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None,
+        ).is_err(), "copy mode must still reject unavailable containers");
+    }
+
     // ── Output naming mode tests ──────────────────────────────────────────
 
     #[test]
@@ -3205,5 +3957,159 @@ mod tests {
         // Audio channels should also use per-file stems
         assert!(steps[1].output().to_string_lossy().contains("C0001"), "audio 0 stems from C0001");
         assert!(steps[4].output().to_string_lossy().contains("C0002"), "audio 3 stems from C0002");
+    }
+
+    // ── Concat planner tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_plan_concat_stereo_no_drop() {
+        let mut s = make_video_settings();
+        s.split_tracks = true;
+        s.concat_audio = true;
+        s.input_files = vec![
+            PathBuf::from("/tmp/C0001.MP4"),
+            PathBuf::from("/tmp/C0002.MP4"),
+        ];
+        let probe = make_stereo_probe();
+        let all_probes = vec![Some(probe.clone()), Some(probe)];
+        let (steps, warning) = plan_concat_outputs(&s, &all_probes);
+        assert!(warning.is_empty(), "expected no warning, got: {}", warning);
+        // 2 concat steps for 2 tracks (ch0, ch1), no video steps here
+        assert_eq!(steps.len(), 2);
+        for (i, step) in steps.iter().enumerate() {
+            match step {
+                VideoOutputStep::AudioChannelConcat { segments, output, .. } => {
+                    assert_eq!(segments.len(), 2, "track {} should have 2 segments", i);
+                    // Each segment references the correct file index
+                    assert_eq!(segments[0].0, 0);
+                    assert_eq!(segments[1].0, 1);
+                    assert!(output.to_string_lossy().contains(&format!("audio_track{}", i + 1)),
+                        "output should have track {}: {}", i + 1, output.display());
+                }
+                other => panic!("expected AudioChannelConcat, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_plan_concat_drop_ltc_track() {
+        let mut s = make_video_settings();
+        s.split_tracks = true;
+        s.concat_audio = true;
+        s.drop_ltc_track = true;
+        s.ltc_video_source = Some((1, 0)); // drop channel 0 (stream 1, ch 0)
+        s.input_files = vec![
+            PathBuf::from("/tmp/C0001.MP4"),
+            PathBuf::from("/tmp/C0002.MP4"),
+        ];
+        let probe = make_stereo_probe();
+        let all_probes = vec![Some(probe.clone()), Some(probe)];
+        let (steps, _warning) = plan_concat_outputs(&s, &all_probes);
+        // Only 1 surviving channel (ch1), so 1 concat step
+        assert_eq!(steps.len(), 1);
+        match &steps[0] {
+            VideoOutputStep::AudioChannelConcat { segments, .. } => {
+                assert_eq!(segments.len(), 2);
+                // Both segments should reference channel_idx == 1
+                assert_eq!(segments[0].2, 1);
+                assert_eq!(segments[1].2, 1);
+            }
+            other => panic!("expected AudioChannelConcat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_plan_concat_inconsistent_layout_fallback() {
+        let mut s = make_video_settings();
+        s.split_tracks = true;
+        s.concat_audio = true;
+        s.input_files = vec![
+            PathBuf::from("/tmp/C0001.MP4"),
+            PathBuf::from("/tmp/C0002.MP4"),
+        ];
+        let stereo = make_stereo_probe();
+        let mono = make_mono_probe();
+        let all_probes = vec![Some(stereo), Some(mono)];
+        let (steps, warning) = plan_concat_outputs(&s, &all_probes);
+        // Should fall back to per-clip AudioChannel steps
+        assert!(!warning.is_empty(), "expected fallback warning");
+        assert!(warning.contains("falling back"), "warning should mention fallback");
+        for step in &steps {
+            assert!(
+                matches!(step, VideoOutputStep::AudioChannel { .. }),
+                "expected AudioChannel fallback, got {:?}", step
+            );
+        }
+    }
+
+    // ── Concat arg builder tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_build_concat_audio_args_basic() {
+        let mut s = make_video_settings();
+        s.input_files = vec![
+            PathBuf::from("/tmp/C0001.MP4"),
+            PathBuf::from("/tmp/C0002.MP4"),
+        ];
+        s.trim_offsets_secs = vec![1.5, 2.0];
+        let segments = vec![(0, 1, 0), (1, 1, 0)];
+        let args = build_concat_audio_args(&s, &segments, "wav", 48000);
+        // Should have two input files with -ss
+        let input_positions: Vec<usize> = args.iter().enumerate()
+            .filter(|(_, a)| a.contains("-i"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(input_positions.len(), 2, "should have 2 -i inputs");
+        // Should have -ss before each input
+        assert!(args.contains(&"-ss".to_string()), "should have at least one -ss");
+        let ss_positions: Vec<usize> = args.iter().enumerate()
+            .filter(|(_, a)| *a == "-ss")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ss_positions.len(), 2, "should have 2 -ss flags");
+        assert!(
+            args[ss_positions[0] + 1].contains("1.5"),
+            "first -ss should be 1.5, got: {}", args[ss_positions[0] + 1]
+        );
+        assert!(
+            args[ss_positions[1] + 1].contains("2.0"),
+            "second -ss should be 2.0, got: {}", args[ss_positions[1] + 1]
+        );
+        // Should have -filter_complex with pan and concat
+        let fc_pos = args.iter().position(|a| a == "-filter_complex").expect("should have -filter_complex");
+        let fc = &args[fc_pos + 1];
+        assert!(fc.contains("pan=mono|FC=c0"), "should have pan for ch0");
+        assert!(fc.contains("[0:1]"), "should reference first input's stream 1");
+        assert!(fc.contains("[1:1]"), "should reference second input's stream 1");
+        assert!(fc.contains("concat=n=2:v=0:a=1"), "should concat 2 segments");
+        assert!(fc.contains("[out]"), "filter_complex should produce [out]");
+        // Should have -map [out]
+        let map_pos = args.iter().position(|a| a == "-map").expect("should have -map");
+        assert_eq!(args[map_pos + 1], "[out]");
+        assert!(args.contains(&"-vn".to_string()), "should have -vn for audio-only");
+        assert!(args.contains(&"-c:a".to_string()), "should have -c:a");
+        // Should have -f wav
+        let f_pos = args.iter().position(|a| a == "-f").expect("should have -f");
+        assert_eq!(args[f_pos + 1], "wav");
+    }
+
+    #[test]
+    fn test_build_concat_audio_args_timecode() {
+        let mut s = make_video_settings();
+        s.input_files = vec![
+            PathBuf::from("/tmp/C0001.MP4"),
+            PathBuf::from("/tmp/C0002.MP4"),
+        ];
+        s.timecode_meta_per_file[0] = Some(TimecodeMetadata {
+            start: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            fps: 25.0,
+            drop_frame: false,
+        });
+        let segments = vec![(0, 1, 0), (1, 1, 0)];
+        let args = build_concat_audio_args(&s, &segments, "wav", 48000);
+        // Should have timecode metadata from clip 0
+        let tc_pos = args.iter().position(|a| a == "-timecode").expect("should have -timecode");
+        assert_eq!(args[tc_pos + 1], "01:00:00:00");
+        assert!(args.contains(&"-write_bext".to_string()), "WAV should have BWF");
     }
 }

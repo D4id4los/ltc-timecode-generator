@@ -7,7 +7,8 @@ use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, conversion_sanity_check_with_naming, evaluate_readiness,
+    available_containers, conversion_sanity_check_with_naming, copy_mode_container_for_input,
+    evaluate_readiness,
     find_timecode_at_offset, format_blockers, query_ffmpeg_capabilities,
     spawn_conversion, supported_audio_encoders, supported_containers,
     ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
@@ -78,6 +79,13 @@ fn step_header(ui: &mut Ui, number: &str, label: &str, colors: &crate::theme::Th
         });
         ui.label(RichText::new(label).font(FontId::proportional(12.0)).color(colors.text_title).strong());
     });
+}
+
+/// True when "Leave Video Encoding Untouched" applies. Stream copy is only
+/// meaningful for the video pipeline (audio-only recordings have no video
+/// stream to copy, and synthetic video must be encoded).
+fn copy_mode_active(state: &AppState) -> bool {
+    state.leave_video_untouched && state.recording_type == RecordingType::VideoClipSequence
 }
 
 // ── Step 1: File selection ─────────────────────────────────────────────
@@ -874,18 +882,38 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 fn render_split_options(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let ltc_available = state.latest.ltc_decode_result.is_some();
+    let is_video = state.recording_type == RecordingType::VideoClipSequence;
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
+        let prev_split = state.split_tracks;
         ui.add(egui::Checkbox::new(
             &mut state.split_tracks,
             "Split tracks into separate files",
         ));
+        if prev_split && !state.split_tracks && state.concat_audio {
+            state.concat_audio = false;
+        }
         ui.add_enabled(ltc_available, egui::Checkbox::new(
             &mut state.drop_ltc_track,
             "Drop LTC track",
         ));
     });
+    if is_video && state.split_tracks {
+        ui.horizontal(|ui| {
+            ui.add(egui::Checkbox::new(
+                &mut state.concat_audio,
+                "Concatenate audio tracks across clips (one file per track)",
+            ));
+        });
+        if state.concat_audio {
+            ui.label(
+                RichText::new("ℹ Audio from all clips will be joined into one file per track (in clip order).")
+                    .font(FontId::proportional(9.0))
+                    .color(colors.text_secondary),
+            );
+        }
+    }
     if state.split_tracks {
         ui.label(
             RichText::new("ℹ Each input track will be written to its own file. Channel mapping greets are preserved.")
@@ -939,21 +967,34 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     let is_narrow = ui.available_width() < 400.0;
     if is_narrow {
         ui.vertical(|ui| {
+            if state.recording_type == RecordingType::VideoClipSequence {
+                ui.checkbox(&mut state.leave_video_untouched, "Leave video encoding untouched (stream copy)");
+                if copy_mode_active(state) {
+                    ui.label(
+                        RichText::new("Video is copied without re-encoding (much faster). Cuts snap to the nearest keyframe before the trim point.")
+                            .font(FontId::proportional(9.0))
+                            .color(colors.text_muted),
+                    );
+                }
+                ui.add_space(4.0);
+            }
             ui.label(RichText::new("VIDEO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
             ui.add_space(4.0);
-            {
-                let mut update_container = |v: &str| {
-                    state.container = v.to_string();
-                    if let Some(ref caps) = caps_opt {
-                        re_select_encoders_for_container(state, caps);
-                    }
-                };
-                render_format_row(ui, "Container", &cur_container, &containers, &mut update_container, &colors);
-            }
-            {
-                let mut update_video = |v: &str| state.video_encoder = v.to_string();
-                render_format_row(ui, "Video codec", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
-            }
+            ui.add_enabled_ui(!copy_mode_active(state), |ui| {
+                {
+                    let mut update_container = |v: &str| {
+                        state.container = v.to_string();
+                        if let Some(ref caps) = caps_opt {
+                            re_select_encoders_for_container(state, caps);
+                        }
+                    };
+                    render_format_row(ui, "Container", &cur_container, &containers, &mut update_container, &colors);
+                }
+                {
+                    let mut update_video = |v: &str| state.video_encoder = v.to_string();
+                    render_format_row(ui, "Video codec", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
+                }
+            });
 
             if state.recording_type == RecordingType::MultiTrackAudio {
                 ui.checkbox(&mut state.generate_synthetic_video, "Generate synthetic video (blue background)");
@@ -972,21 +1013,34 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     } else {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
+                if state.recording_type == RecordingType::VideoClipSequence {
+                    ui.checkbox(&mut state.leave_video_untouched, "Leave video encoding untouched (stream copy)");
+                    if copy_mode_active(state) {
+                        ui.label(
+                            RichText::new("Video is copied without re-encoding (much faster). Cuts snap to the nearest keyframe before the trim point.")
+                                .font(FontId::proportional(9.0))
+                                .color(colors.text_muted),
+                        );
+                    }
+                    ui.add_space(4.0);
+                }
                 ui.label(RichText::new("VIDEO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
                 ui.add_space(4.0);
-                {
-                    let mut update_container = |v: &str| {
-                        state.container = v.to_string();
-                        if let Some(ref caps) = caps_opt {
-                            re_select_encoders_for_container(state, caps);
-                        }
-                    };
-                    render_format_row(ui, "Container", &cur_container, &containers, &mut update_container, &colors);
-                }
-                {
-                    let mut update_video = |v: &str| state.video_encoder = v.to_string();
-                    render_format_row(ui, "Video codec", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
-                }
+                ui.add_enabled_ui(!copy_mode_active(state), |ui| {
+                    {
+                        let mut update_container = |v: &str| {
+                            state.container = v.to_string();
+                            if let Some(ref caps) = caps_opt {
+                                re_select_encoders_for_container(state, caps);
+                            }
+                        };
+                        render_format_row(ui, "Container", &cur_container, &containers, &mut update_container, &colors);
+                    }
+                    {
+                        let mut update_video = |v: &str| state.video_encoder = v.to_string();
+                        render_format_row(ui, "Video codec", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
+                    }
+                });
                 if state.recording_type == RecordingType::MultiTrackAudio {
                     ui.checkbox(&mut state.generate_synthetic_video, "Generate synthetic video");
                 }
@@ -1025,15 +1079,24 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             Some(&state.audio_suffix_template),
             Some(&state.video_suffix_template),
             Some(&state.naming_mode),
+            copy_mode_active(state),
         ) {
             Ok(()) => {
-                let codec = normalize_video_codec(&state.video_encoder);
-                let chain = describe_chain(codec, caps);
-                ui.label(
-                    RichText::new(format!("✓ Settings are compatible — {} via {}", codec, chain))
-                        .font(FontId::proportional(10.0))
-                        .color(colors.success_green),
-                );
+                if copy_mode_active(state) {
+                    ui.label(
+                        RichText::new("✓ Settings are compatible — video stream will be copied (no re-encode)")
+                            .font(FontId::proportional(10.0))
+                            .color(colors.success_green),
+                    );
+                } else {
+                    let codec = normalize_video_codec(&state.video_encoder);
+                    let chain = describe_chain(codec, caps);
+                    ui.label(
+                        RichText::new(format!("✓ Settings are compatible — {} via {}", codec, chain))
+                            .font(FontId::proportional(10.0))
+                            .color(colors.success_green),
+                    );
+                }
             }
             Err(msg) => {
                 let warning_area = egui::Frame::new()
@@ -1177,9 +1240,18 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     let has_group = state.selected_group_idx.is_some();
     if has_group && (state.naming_mode == OutputNamingMode::SourceStems || !state.filename_prefix.is_empty()) {
         ui.add_space(4.0);
-        let ext = match state.container.as_str() {
-            "mp4" | "mov" | "mkv" | "mxf" | "webm" => state.container.clone(),
-            _ => "mkv".to_string(),
+        let ext = if copy_mode_active(state) {
+            // Container is derived from the input file in copy mode
+            selected_input_files(state)
+                .first()
+                .map(|f| copy_mode_container_for_input(f))
+                .unwrap_or("mkv")
+                .to_string()
+        } else {
+            match state.container.as_str() {
+                "mp4" | "mov" | "mkv" | "mxf" | "webm" => state.container.clone(),
+                _ => "mkv".to_string(),
+            }
         };
         let group = state.selected_group_idx
             .and_then(|idx| state.file_groups.as_ref()?.get(idx));
@@ -1211,9 +1283,15 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
                     state.channel_map.num_channels()
                 };
                 let count = if state.drop_ltc_track { n.saturating_sub(1) } else { n };
+                let audio_label = if state.concat_audio && state.recording_type == RecordingType::VideoClipSequence {
+                    "concatenated audio file(s)"
+                } else {
+                    "audio file(s)"
+                };
                 format!(
-                    "↳ {} audio file(s) + {} video clip(s) in {}",
+                    "↳ {} {} + {} video clip(s) in {}",
                     count,
+                    audio_label,
                     num_video,
                     state.output_folder.display(),
                 )
@@ -1313,6 +1391,7 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
             Some(&state.audio_suffix_template),
             Some(&state.video_suffix_template),
             Some(&state.naming_mode),
+            copy_mode_active(state),
         )
         .is_ok()
     } else {
@@ -1325,7 +1404,11 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
         } else {
             "CONVERT AUDIO FILES"
         },
-        RecordingType::VideoClipSequence => "CONVERT VIDEO CLIPS",
+        RecordingType::VideoClipSequence => if copy_mode_active(state) {
+            "CONVERT VIDEO CLIPS (STREAM COPY)"
+        } else {
+            "CONVERT VIDEO CLIPS"
+        },
     };
 
     ui.add_enabled_ui(can_convert && sanity_ok, |ui| {
@@ -1417,8 +1500,10 @@ fn start_conversion(state: &mut AppState) {
         channel_map: state.channel_map.clone(),
         split_tracks: state.split_tracks,
         drop_ltc_track: state.drop_ltc_track,
+        concat_audio: state.concat_audio,
         ltc_video_source,
         container: state.container.clone(),
+        copy_video: copy_mode_active(state),
         video_encoder: state.video_encoder.clone(),
         audio_encoder: state.audio_encoder.clone(),
         resolved_video_encoder: String::new(),

@@ -253,6 +253,8 @@ struct ConvertRequest {
     #[serde(default)]
     trim_offsets_secs: Vec<f64>,
     #[serde(default)]
+    concat_audio: bool,
+    #[serde(default)]
     timecode_hours: Option<u32>,
     #[serde(default)]
     timecode_minutes: Option<u32>,
@@ -335,6 +337,7 @@ fn start_convert(
         drop_ltc_track: request.drop_ltc_track,
         ltc_video_source,
         container: request.container,
+        copy_video: false,
         video_encoder: request.video_encoder,
         audio_encoder: request.audio_encoder,
         resolved_video_encoder: String::new(),
@@ -346,6 +349,7 @@ fn start_convert(
         trim_to_first_ltc: request.trim_to_first_ltc,
         trim_offsets_secs: trim_offsets,
         timecode_meta_per_file,
+        concat_audio: request.concat_audio,
     };
 
     let caps = query_ffmpeg_capabilities();

@@ -12,8 +12,10 @@ export component ConverterSection {
     in-out property <[int]> channel-map: [];
     in-out property <bool> split-tracks: false;
     in-out property <bool> drop-ltc-track: false;
+    in-out property <bool> concat-audio: false;
     in-out property <bool> generate-synthetic-video: false;
     in-out property <bool> is-video-recording: false;
+    in-out property <bool> copy-video: false;
     in-out property <string> container: "mkv";
     in-out property <string> video-encoder: "libsvtav1";
     in-out property <string> audio-encoder: "pcm_s24le";
@@ -72,7 +74,9 @@ export component ConverterSection {
     callback audio-selected(int);
     callback toggle-split-tracks;
     callback toggle-drop-ltc-track;
+    callback toggle-concat-audio;
     callback toggle-synthetic-video;
+    callback toggle-copy-video;
     callback select-output-folder;
     callback filename-prefix-changed(string);
     callback audio-suffix-changed(string);
@@ -421,6 +425,23 @@ export component ConverterSection {
                             }
                             Text { text: "Drop LTC track"; color: AppColors.text-title; font-size: 9px; vertical-alignment: center; }
                         }
+                        HorizontalLayout {
+                            visible: root.is-video-recording && root.split-tracks;
+                            spacing: 4px;
+                            Rectangle {
+                                width: 14px; height: 14px; border-radius: 3px;
+                                border-width: 1px;
+                                border-color: root.concat-audio ? AppColors.accent : AppColors.border-main;
+                                background: root.concat-audio ? AppColors.accent : transparent;
+                                TouchArea { clicked => { root.toggle-concat-audio(); } }
+                                Text {
+                                    visible: root.concat-audio;
+                                    text: "✓"; color: black; font-size: 10px; font-weight: 700;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                            }
+                            Text { text: "Concatenate audio across clips"; color: AppColors.text-title; font-size: 9px; vertical-alignment: center; }
+                        }
                     }
                 }
 
@@ -441,14 +462,35 @@ export component ConverterSection {
                     // ── Video Format column ──
                     VerticalLayout { horizontal-stretch: 1; spacing: 6px;
                         Text { text: "VIDEO FORMAT"; color: AppColors.text-title; font-size: 10px; font-weight: 700; }
+                        // Stream copy checkbox (video recordings)
+                        if (root.is-video-recording) : HorizontalLayout { spacing: 4px;
+                            Rectangle {
+                                width: 14px; height: 14px; border-radius: 3px;
+                                border-width: 1px;
+                                border-color: root.copy-video ? AppColors.accent : AppColors.border-main;
+                                background: root.copy-video ? AppColors.accent : transparent;
+                                TouchArea { clicked => { root.toggle-copy-video(); } }
+                                Text {
+                                    visible: root.copy-video;
+                                    text: "✓"; color: black; font-size: 10px; font-weight: 700;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                            }
+                            Text { text: "Leave video encoding untouched (stream copy)"; color: AppColors.text-title; font-size: 9px; vertical-alignment: center; }
+                        }
+                        if (root.is-video-recording && root.copy-video) : Text {
+                            text: "Video is copied without re-encoding (much faster).\nCuts snap to the nearest keyframe before the trim point.";
+                            color: AppColors.text-muted; font-size: 8px; wrap: word-wrap;
+                        }
                         // Container
                         VerticalLayout { spacing: 0px;
                             Rectangle {
+                                opacity: root.copy-video ? 0.4 : 1.0;
                                 border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                                 background: AppColors.deep-bg; min-height: 28px;
-                                TouchArea { clicked => { root.open-popup = root.open-popup == 0 ? -1 : 0; } }
+                                TouchArea { clicked => { if (!root.copy-video) { root.open-popup = root.open-popup == 0 ? -1 : 0; } } }
                                 VerticalLayout { padding: 4px; spacing: 2px;
-                                    Text { text: "Container"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                    Text { text: root.copy-video ? "Container (matches input)" : "Container"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
                                     Text { text: root.container; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
                                 }
                             }
@@ -470,12 +512,13 @@ export component ConverterSection {
                         // Video codec
                         VerticalLayout { spacing: 0px;
                             Rectangle {
+                                opacity: root.copy-video ? 0.4 : 1.0;
                                 border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                                 background: AppColors.deep-bg; min-height: 28px;
-                                TouchArea { clicked => { root.open-popup = root.open-popup == 1 ? -1 : 1; } }
+                                TouchArea { clicked => { if (!root.copy-video) { root.open-popup = root.open-popup == 1 ? -1 : 1; } } }
                                 VerticalLayout { padding: 4px; spacing: 2px;
-                                    Text { text: "Video codec"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
-                                    Text { text: root.video-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                                    Text { text: root.copy-video ? "Video codec (stream copied)" : "Video codec"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                    Text { text: root.copy-video ? "copy (untouched)" : root.video-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
                                 }
                             }
                             if (root.open-popup == 1) : VerticalLayout { spacing: 1px; padding-top: 2px;

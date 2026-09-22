@@ -91,9 +91,11 @@ export component AppWindow inherits Window {
     in-out property <[int]> conv-channel-map: [];
     in-out property <bool> conv-split-tracks: false;
     in-out property <bool> conv-drop-ltc-track: false;
+    in-out property <bool> conv-concat-audio: false;
     in-out property <bool> conv-generate-synthetic-video: false;
     in-out property <bool> conv-is-video-recording: false;
     in-out property <string> conv-container: "mkv";
+    in-out property <bool> conv-copy-video: false;
     in-out property <string> conv-video-encoder: "libsvtav1";
     in-out property <string> conv-audio-encoder: "pcm_s24le";
     in-out property <string> conv-output-folder: "";
@@ -193,7 +195,9 @@ export component AppWindow inherits Window {
     callback conv-video-suffix-changed(string);
     callback toggle-split-tracks;
     callback toggle-drop-ltc-track;
+    callback toggle-concat-audio;
     callback toggle-synthetic-video;
+    callback toggle-copy-video;
     callback conv-select-pattern(int);
     callback toggle-trim-ltc;
 
@@ -672,9 +676,11 @@ export component AppWindow inherits Window {
                     channel-map: root.conv-channel-map;
                     split-tracks: root.conv-split-tracks;
                     drop-ltc-track: root.conv-drop-ltc-track;
+                    concat-audio: root.conv-concat-audio;
                     generate-synthetic-video: root.conv-generate-synthetic-video;
                     is-video-recording: root.conv-is-video-recording;
                     container: root.conv-container;
+                    copy-video: root.conv-copy-video;
                     video-encoder: root.conv-video-encoder;
                     audio-encoder: root.conv-audio-encoder;
                     output-folder: root.conv-output-folder;
@@ -709,7 +715,9 @@ export component AppWindow inherits Window {
                     video-suffix-changed(val) => { root.conv-video-suffix-changed(val); }
                     toggle-split-tracks => { root.toggle-split-tracks(); }
                     toggle-drop-ltc-track => { root.toggle-drop-ltc-track(); }
+                    toggle-concat-audio => { root.toggle-concat-audio(); }
                     toggle-synthetic-video => { root.toggle-synthetic-video(); }
+                    toggle-copy-video => { root.toggle-copy-video(); }
                     select-pattern(idx) => { root.conv-select-pattern(idx); }
                 }
                     }

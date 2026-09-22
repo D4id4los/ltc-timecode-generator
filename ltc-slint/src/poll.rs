@@ -40,6 +40,7 @@ pub fn setup_poll_timer(
     conv_container: Arc<Mutex<String>>,
     conv_video_encoder: Arc<Mutex<String>>,
     conv_audio_encoder: Arc<Mutex<String>>,
+    conv_copy_video: Arc<Mutex<bool>>,
     conv_selected_folder: Arc<Mutex<String>>,
     conv_trim_offset_secs: Arc<Mutex<f64>>,
     conv_trim_to_first_ltc: Arc<Mutex<bool>>,
@@ -349,6 +350,7 @@ pub fn setup_poll_timer(
                 let container = conv_container.lock().unwrap().clone();
                 let venc = conv_video_encoder.lock().unwrap().clone();
                 let aenc = conv_audio_encoder.lock().unwrap().clone();
+                let copy_video = *conv_copy_video.lock().unwrap();
                 let folder = conv_selected_folder.lock().unwrap().clone();
                 let filename_prefix = conv_filename_prefix.lock().unwrap().clone();
                 let naming_mode = conv_naming_mode.lock().unwrap().clone();
@@ -378,7 +380,7 @@ pub fn setup_poll_timer(
                         let output_folder = Path::new(&folder);
                         if let Err(e) = gui_engine::converter::conversion_sanity_check_with_naming(
                             &container, &venc, &aenc, &input_files, output_folder, &filename_prefix, c,
-                            None, None, Some(&naming_mode),
+                            None, None, Some(&naming_mode), copy_video,
                         ) {
                             msg = e;
                         }

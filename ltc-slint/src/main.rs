@@ -104,7 +104,9 @@ fn _run_gui(
     let conv_filename_prefix: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let conv_split_tracks: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_drop_ltc_track: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let conv_concat_audio: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_generate_synthetic_video: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let conv_copy_video: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_audio_suffix_template: Arc<Mutex<String>> = Arc::new(Mutex::new(DEFAULT_AUDIO_SUFFIX.to_string()));
     let conv_video_suffix_template: Arc<Mutex<String>> = Arc::new(Mutex::new(DEFAULT_VIDEO_SUFFIX.to_string()));
     let conv_state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
@@ -675,6 +677,7 @@ fn _run_gui(
         let video_suffix = conv_video_suffix_template.clone();
         let split_arc = conv_split_tracks.clone();
         let drop_arc = conv_drop_ltc_track.clone();
+        let concat_arc_group = conv_concat_audio.clone();
         let folder_for_group = conv_folder_for_group.clone();
         let cmd_group = cmd_tx.clone();
         ui.on_conv_select_group(move |group_idx| {
@@ -696,6 +699,7 @@ fn _run_gui(
                 *out_path.lock().unwrap() = String::new();
                 *split_arc.lock().unwrap() = false;
                 *drop_arc.lock().unwrap() = false;
+                *concat_arc_group.lock().unwrap() = false;
                 let folder = folder_for_group.lock().unwrap().clone();
                 let ltc_file_names: Vec<SharedString> = files.iter().map(|f| {
                     SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
@@ -762,10 +766,12 @@ fn _run_gui(
         let gen_synth = conv_generate_synthetic_video.clone();
         let split_arc2 = conv_split_tracks.clone();
         let drop_arc2 = conv_drop_ltc_track.clone();
+        let concat_arc = conv_concat_audio.clone();
         let audio_suffix_arc = conv_audio_suffix_template.clone();
         let video_suffix_arc = conv_video_suffix_template.clone();
         let pattern_arc2 = conv_selected_pattern.clone();
         let caps_for_start = conv_ffmpeg_caps.clone();
+        let copy_video_arc = conv_copy_video.clone();
         ui.on_conv_start(move || {
             let g = groups_data.lock().unwrap();
             let i = *idx.lock().unwrap();
@@ -806,6 +812,7 @@ fn _run_gui(
             let generate_video = *gen_synth.lock().unwrap();
             let split_val = *split_arc2.lock().unwrap();
             let drop_val = *drop_arc2.lock().unwrap();
+            let concat_val = *concat_arc.lock().unwrap();
             let audio_suffix_val = audio_suffix_arc.lock().unwrap().clone();
             let video_suffix_val = video_suffix_arc.lock().unwrap().clone();
             let ltc_idx = 1;
@@ -825,16 +832,20 @@ fn _run_gui(
                 }
                 RecordingType::MultiTrackAudio => None,
             };
+            let copy_video_val = *copy_video_arc.lock().unwrap()
+                && matches!(rec_type, RecordingType::VideoClipSequence);
             let settings = ConverterSettings {
                 pipeline,
                 input_files,
                 recording_type: rec_type,
                 ltc_track_channel_index: ltc_idx,
                 channel_map: map,
-                split_tracks: split_val,
-                drop_ltc_track: drop_val,
+split_tracks: split_val,
+            drop_ltc_track: drop_val,
+            concat_audio: concat_val,
                 ltc_video_source,
                 container: container.lock().unwrap().clone(),
+                copy_video: copy_video_val,
                 video_encoder: venc.lock().unwrap().clone(),
                 audio_encoder: aenc.lock().unwrap().clone(),
                 resolved_video_encoder: String::new(),
@@ -892,6 +903,7 @@ fn _run_gui(
         let prefix_arc = conv_filename_prefix.clone();
         let split_arc3 = conv_split_tracks.clone();
         let drop_arc3 = conv_drop_ltc_track.clone();
+        let concat_arc3 = conv_concat_audio.clone();
         let gen_arc2 = conv_generate_synthetic_video.clone();
         let audio_suffix_arc2 = conv_audio_suffix_template.clone();
         let video_suffix_arc2 = conv_video_suffix_template.clone();
@@ -905,6 +917,7 @@ fn _run_gui(
             *prefix_arc.lock().unwrap() = String::new();
             *split_arc3.lock().unwrap() = false;
             *drop_arc3.lock().unwrap() = false;
+            *concat_arc3.lock().unwrap() = false;
             *gen_arc2.lock().unwrap() = false;
             *audio_suffix_arc2.lock().unwrap() = DEFAULT_AUDIO_SUFFIX.to_string();
             *video_suffix_arc2.lock().unwrap() = DEFAULT_VIDEO_SUFFIX.to_string();
@@ -917,8 +930,9 @@ fn _run_gui(
                 u.set_conv_channel_map(ModelRc::new(VecModel::<i32>::from(vec![])));
                 u.set_conv_output_folder(SharedString::from(""));
                 u.set_conv_filename_prefix(SharedString::from(""));
-                u.set_conv_split_tracks(false);
-                u.set_conv_drop_ltc_track(false);
+u.set_conv_split_tracks(false);
+                    u.set_conv_drop_ltc_track(false);
+                    u.set_conv_concat_audio(false);
                 u.set_conv_generate_synthetic_video(false);
                 u.set_conv_audio_suffix_template(SharedString::from(DEFAULT_AUDIO_SUFFIX));
                 u.set_conv_video_suffix_template(SharedString::from(DEFAULT_VIDEO_SUFFIX));
@@ -1084,6 +1098,17 @@ fn _run_gui(
         });
     }
     {
+        let concat_arc = conv_concat_audio.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_concat_audio(move || {
+            let mut f = concat_arc.lock().unwrap();
+            *f = !*f;
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_concat_audio(*f);
+            }
+        });
+    }
+    {
         let gen_arc = conv_generate_synthetic_video.clone();
         let ui_weak = ui.as_weak();
         ui.on_toggle_synthetic_video(move || {
@@ -1091,6 +1116,17 @@ fn _run_gui(
             *f = !*f;
             if let Some(u) = ui_weak.upgrade() {
                 u.set_conv_generate_synthetic_video(*f);
+            }
+        });
+    }
+    {
+        let copy_arc = conv_copy_video.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_copy_video(move || {
+            let mut f = copy_arc.lock().unwrap();
+            *f = !*f;
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_copy_video(*f);
             }
         });
     }
@@ -1305,6 +1341,7 @@ fn _run_gui(
         conv_container,
         conv_video_encoder,
         conv_audio_encoder,
+        conv_copy_video.clone(),
         conv_selected_folder,
         conv_trim_offset_secs,
         conv_trim_to_first_ltc,

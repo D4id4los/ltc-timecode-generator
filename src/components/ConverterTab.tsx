@@ -52,6 +52,7 @@ interface ConvertRequest {
   ltc_track_channel_index: number;
   split_tracks: boolean;
   drop_ltc_track: boolean;
+  concat_audio: boolean;
   generate_synthetic_video: boolean;
   trim_to_first_ltc: boolean;
   trim_offsets_secs: number[];
@@ -275,6 +276,7 @@ function TauriConverter() {
   const [numChannels, setNumChannels] = useState<number>(0);
   const [splitTracks, setSplitTracks] = useState(false);
   const [dropLtcTrack, setDropLtcTrack] = useState(false);
+  const [concatAudio, setConcatAudio] = useState(false);
 
   // Output format
   const [container, setContainer] = useState<string>("mkv");
@@ -497,6 +499,7 @@ function TauriConverter() {
       setFilenamePrefix(group.prefix);
       setSplitTracks(false);
       setDropLtcTrack(false);
+      setConcatAudio(false);
       setGenerateSyntheticVideo(false);
       setLtcResult(null);
       setLtcError(null);
@@ -638,6 +641,7 @@ function TauriConverter() {
       ltc_track_channel_index: ltcFileIdx,
       split_tracks: splitTracks,
       drop_ltc_track: dropLtcTrack,
+      concat_audio: concatAudio,
       generate_synthetic_video: generateSyntheticVideo,
       trim_to_first_ltc: trimToFirstLtc,
       trim_offsets_secs: trimOffsets,
@@ -906,7 +910,10 @@ function TauriConverter() {
               <input
                 type="checkbox"
                 checked={splitTracks}
-                onChange={(e) => setSplitTracks(e.target.checked)}
+                onChange={(e) => {
+                setSplitTracks(e.target.checked);
+                if (!e.target.checked && concatAudio) setConcatAudio(false);
+              }}
                 className="accent-[#FF5F1F]"
               />
               Split tracks into separate files
@@ -921,6 +928,17 @@ function TauriConverter() {
               />
               Drop LTC track
             </label>
+            {recordingType === 'VideoClipSequence' && splitTracks && (
+              <label className="flex items-center gap-1.5 text-xs text-text-secondary">
+                <input
+                  type="checkbox"
+                  checked={concatAudio}
+                  onChange={(e) => setConcatAudio(e.target.checked)}
+                  className="accent-[#FF5F1F]"
+                />
+                Concatenate audio across clips
+              </label>
+            )}
           </div>
         </>
       )}

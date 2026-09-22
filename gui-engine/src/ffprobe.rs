@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use log::{error, info};
+use log::{error, info, warn};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AudioStreamInfo {
@@ -196,6 +196,107 @@ fn stderr_tail(s: &str, max_chars: usize) -> String {
     format!("…{}", tail)
 }
 
+// ── Keyframe lookup (stream-copy trim snapping) ──────────────────────────
+
+/// Parse ffprobe packet JSON (`-show_entries packet=pts_time,flags`) and
+/// return the timestamp of the **last video keyframe at-or-before**
+/// `offset_secs`.
+///
+/// Packets may appear out of order (B-frame reordering), so all entries are
+/// scanned and the maximum qualifying keyframe timestamp wins. Returns
+/// `None` when no keyframe qualifies.
+pub fn parse_last_keyframe(json: &str, offset_secs: f64) -> Option<f64> {
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    let packets = parsed.get("packets")?.as_array()?;
+    let mut best: Option<f64> = None;
+    for p in packets {
+        let flags = p.get("flags").and_then(|v| v.as_str()).unwrap_or("");
+        if !flags.contains('K') {
+            continue;
+        }
+        let pts = p
+            .get("pts_time")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<f64>().ok())
+            .or_else(|| p.get("pts_time").and_then(|v| v.as_f64()));
+        if let Some(pts) = pts {
+            if pts <= offset_secs + 0.001 && best.map_or(true, |b| pts > b) {
+                best = Some(pts);
+            }
+        }
+    }
+    best
+}
+
+/// Find the timestamp of the last video keyframe at-or-before `offset_secs`
+/// in `path`, for snapping stream-copy trims to keyframe boundaries.
+///
+/// Returns `offset_secs` unchanged when probing fails (degrades to an
+/// unsnapped cut) and `0.0` when the file has no keyframe at-or-before the
+/// offset within the scan window (cut from the start of the file).
+pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
+    if offset_secs <= 0.05 {
+        return 0.0;
+    }
+
+    // Generous lookback window; camera GOPs are typically ≤ 2 s.
+    let window_start = (offset_secs - 15.0).max(0.0);
+    let interval = format!("{:.3}%{:.3}", window_start, offset_secs + 0.05);
+
+    let output = match Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time,flags",
+            "-read_intervals", &interval,
+            "-of", "json",
+            &path.to_string_lossy(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            warn!(
+                "Keyframe probe failed for '{}' (offset {:.3}s): {}",
+                path.display(),
+                offset_secs,
+                stderr_tail(stderr.trim(), 200)
+            );
+            return offset_secs;
+        }
+        Err(e) => {
+            warn!("Failed to run ffprobe for keyframe lookup: {}", e);
+            return offset_secs;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match parse_last_keyframe(&stdout, offset_secs) {
+        Some(kf) => {
+            if (kf - offset_secs).abs() > 0.001 {
+                info!(
+                    "Trim {:.3}s snaps to keyframe at {:.3}s in '{}'",
+                    offset_secs,
+                    kf,
+                    path.display()
+                );
+            }
+            kf
+        }
+        None => {
+            warn!(
+                "No keyframe found at-or-before {:.3}s in '{}' — trimming from file start",
+                offset_secs,
+                path.display()
+            );
+            0.0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +379,66 @@ mod tests {
         let tail = stderr_tail(&long, 10);
         assert_eq!(tail, "…0123456789");
         assert_eq!(tail.chars().count(), 11);
+    }
+
+    // ── parse_last_keyframe ──────────────────────────────────────────────
+
+    /// Real ffprobe output shape (timestamps absolute, packets unordered
+    /// due to B-frame reordering) from a 25 fps H.264 clip with GOP 50.
+    const KEYFRAME_JSON: &str = r#"{
+        "packets": [
+            { "pts_time": "1.080000", "flags": "___" },
+            { "pts_time": "0.000000", "flags": "K__" },
+            { "pts_time": "1.040000", "flags": "___" },
+            { "pts_time": "0.960000", "flags": "___" },
+            { "pts_time": "2.000000", "flags": "K__" },
+            { "pts_time": "2.160000", "flags": "___" },
+            { "pts_time": "2.040000", "flags": "___" }
+        ]
+    }"#;
+
+    #[test]
+    fn test_parse_last_keyframe_picks_max_qualifying() {
+        // Offset mid-GOP: last keyframe at or before 3.0 is 2.0
+        assert_eq!(parse_last_keyframe(KEYFRAME_JSON, 3.0), Some(2.0));
+        assert_eq!(parse_last_keyframe(KEYFRAME_JSON, 2.0), Some(2.0));
+        assert_eq!(parse_last_keyframe(KEYFRAME_JSON, 2.0001), Some(2.0));
+    }
+
+    #[test]
+    fn test_parse_last_keyframe_first_gop() {
+        assert_eq!(parse_last_keyframe(KEYFRAME_JSON, 0.5), Some(0.0));
+        assert_eq!(parse_last_keyframe(KEYFRAME_JSON, 0.0), Some(0.0));
+    }
+
+    #[test]
+    fn test_parse_last_keyframe_none_before_any_keyframe() {
+        // Negative offsets have no keyframe
+        assert_eq!(parse_last_keyframe(KEYFRAME_JSON, -1.0), None);
+    }
+
+    #[test]
+    fn test_parse_last_keyframe_empty_or_garbage() {
+        assert_eq!(parse_last_keyframe(r#"{"packets": []}"#, 5.0), None);
+        assert_eq!(parse_last_keyframe("not json", 5.0), None);
+        assert_eq!(parse_last_keyframe(r#"{"other": 1}"#, 5.0), None);
+    }
+
+    #[test]
+    fn test_parse_last_keyframe_flags_without_k_ignored() {
+        let json = r#"{"packets": [
+            { "pts_time": "1.0", "flags": "__" },
+            { "pts_time": "2.0", "flags": "___" }
+        ]}"#;
+        assert_eq!(parse_last_keyframe(json, 5.0), None);
+    }
+
+    #[test]
+    fn test_parse_last_keyframe_mixed_k_flags() {
+        // Discard/corrupt flag combos like "K_" or "-K-" still count
+        let json = r#"{"packets": [
+            { "pts_time": "1.5", "flags": "K_" }
+        ]}"#;
+        assert_eq!(parse_last_keyframe(json, 5.0), Some(1.5));
     }
 }
