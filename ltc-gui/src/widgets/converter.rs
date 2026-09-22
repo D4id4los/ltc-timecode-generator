@@ -1515,6 +1515,7 @@ fn start_conversion(state: &mut AppState) {
         trim_to_first_ltc: state.trim_ltc_start,
         trim_offsets_secs: trim_offsets,
         timecode_meta_per_file,
+        resolved_hw_device: None,
     };
 
     *state.conversion_state.lock().unwrap() = ConversionState::idle();

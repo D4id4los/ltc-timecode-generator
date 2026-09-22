@@ -110,8 +110,9 @@ fn test_conversion_progress_tracking() {
         trim_to_first_ltc: false,
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
-        concat_audio: false,
-    };
+concat_audio: false,
+            resolved_hw_device: None,
+        };
 
     let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
     let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -221,6 +222,7 @@ fn make_test_settings(dir: &Path, input_files: Vec<std::path::PathBuf>) -> Conve
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
         concat_audio: false,
+        resolved_hw_device: None,
     }
 }
 
@@ -421,6 +423,7 @@ fn test_concat_audio_across_two_video_clips() {
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
         concat_audio: true,
+        resolved_hw_device: None,
     };
 
     let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
@@ -572,8 +575,9 @@ fn test_copy_mode_streams_video_and_derives_container() {
             fps: 25.0,
             drop_frame: false,
         })],
-        concat_audio: false,
-    };
+concat_audio: false,
+            resolved_hw_device: None,
+        };
 
     let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
     let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));

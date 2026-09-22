@@ -5,6 +5,7 @@ pub mod converter;
 pub mod engine;
 pub mod ffprobe;
 pub mod file_pattern;
+pub mod hw_device;
 pub mod log_buffer;
 pub mod state;
 pub mod theme;
@@ -32,14 +33,14 @@ pub use converter::{
     AudioKeep, ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
     ConversionState, ConversionStatus, ConverterSettings, OutputNamingMode, StepFailure,
     VideoOutputStep, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
-    FfmpegCapabilities, RecordingType, SharedConversionState, CancelFlag,
+    FfmpegCapabilities, HwDeviceCapabilities, RecordingType, SharedConversionState, CancelFlag,
     TimecodeMetadata,
 };
 pub use file_pattern::{default_output_filename, match_files_to_groups, match_files_all_patterns, wrap_user_selected_files, FileNamingPattern, BUILTIN_PATTERNS, CAMERA_PATTERNS};
 pub use video_codecs::{
     available_video_codecs, codec_supports_container, describe_chain,
-    normalize_video_codec, resolve_encoder_chain, supported_video_codecs,
-    EncoderClass,
+    find_candidate, hw_frames_for, normalize_video_codec,
+    resolve_encoder_chain, supported_video_codecs, EncoderClass, HwFramePath,
 };
 
 // Re-export ffprobe types

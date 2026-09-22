@@ -808,6 +808,7 @@ mod tests {
             available_encoders: BTreeSet::new(),
             available_formats: BTreeSet::new(),
             error_message: None,
+            hw: gui_engine::HwDeviceCapabilities::default(),
         }
     }
 

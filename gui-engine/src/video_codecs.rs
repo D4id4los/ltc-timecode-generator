@@ -4,13 +4,13 @@
 //! instead of a concrete ffmpeg encoder. At conversion time the codec is
 //! resolved into an ordered chain of concrete ffmpeg encoders: hardware
 //! accelerated candidates first (NVENC / QSV / AMF / MediaFoundation /
-//! V4L2 mem2mem), software encoders last as fallbacks.
+//! VAAPI / Vulkan / V4L2 mem2mem), software encoders last as fallbacks.
 //!
-//! Only encoders that accept ordinary software frame input are listed here
-//! (they work with a plain `-c:v <name>` plus the static args below).
-//! `*_vaapi` and `*_vulkan` encoders additionally require an initialized
-//! hardware device (`-init_hw_device` / `-filter_hw_device`) plus a
-//! `format=nv12,hwupload` filter stage, so they are deferred to a follow-up.
+//! Candidates that carry a non-[`None`] [`hw_frames`](EncoderCandidate::hw_frames)
+//! need hw-frame plumbing — a `-init_hw_device` / `-filter_hw_device` prelude
+//! and a `format=nv12,hwupload` filter stage.  Availability of these
+//! candidates is gated by [`FfmpegCapabilities::hw`] so the dropdown and
+//! readiness checks stay accurate without a real hardware device.
 
 use crate::converter::FfmpegCapabilities;
 
@@ -22,14 +22,27 @@ pub enum EncoderClass {
     Software,
 }
 
+/// Which kind of hardware-frame path an encoder requires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HwFramePath {
+    /// VAAPI — needs a DRM render node path (`-init_hw_device vaapi=…`).
+    Vaapi,
+    /// Vulkan — needs `-init_hw_device vulkan` (no device path required).
+    Vulkan,
+}
+
 /// A concrete ffmpeg encoder and its per-encoder argument requirements.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EncoderCandidate {
     pub name: &'static str,
     pub class: EncoderClass,
     /// Extra ffmpeg args required by this encoder (e.g. `-pix_fmt yuv420p`),
     /// applied after `-c:v` and after the codec-level args.
     pub args: &'static [(&'static str, &'static str)],
+    /// When `Some`, this encoder requires hw-frame plumbing (pre-input device
+    /// init + `-vf format=nv12,hwupload`). The variant selects the kind of
+    /// device that must be initialized.
+    pub hw_frames: Option<HwFramePath>,
 }
 
 /// A user-facing video codec: what the dropdown shows, which containers it
@@ -53,6 +66,9 @@ const HW: EncoderClass = EncoderClass::Hardware;
 const SW: EncoderClass = EncoderClass::Software;
 const NO_ARGS: &[(&str, &str)] = &[];
 const YUV420P: &[(&str, &str)] = &[("pix_fmt", "yuv420p")];
+const NO_HW: Option<HwFramePath> = None;
+const VAAPI_FRAMES: Option<HwFramePath> = Some(HwFramePath::Vaapi);
+const VULKAN_FRAMES: Option<HwFramePath> = Some(HwFramePath::Vulkan);
 
 pub static VIDEO_CODECS: &[VideoCodecSpec] = &[
     VideoCodecSpec {
@@ -61,8 +77,8 @@ pub static VIDEO_CODECS: &[VideoCodecSpec] = &[
         containers: &["mov", "mkv"],
         codec_args: NO_ARGS,
         candidates: &[
-            EncoderCandidate { name: "prores_ks", class: SW, args: &[("profile:v", "0"), ("pix_fmt", "yuv422p10le")] },
-            EncoderCandidate { name: "prores_aw", class: SW, args: &[("pix_fmt", "yuv422p10le")] },
+            EncoderCandidate { name: "prores_ks", class: SW, args: &[("profile:v", "0"), ("pix_fmt", "yuv422p10le")], hw_frames: NO_HW },
+            EncoderCandidate { name: "prores_aw", class: SW, args: &[("pix_fmt", "yuv422p10le")], hw_frames: NO_HW },
         ],
     },
     VideoCodecSpec {
@@ -75,6 +91,7 @@ pub static VIDEO_CODECS: &[VideoCodecSpec] = &[
                 name: "dnxhd",
                 class: SW,
                 args: &[("pix_fmt", "yuv422p"), ("profile:v", "dnxhd"), ("b:v", "36M")],
+                hw_frames: NO_HW,
             },
         ],
     },
@@ -84,12 +101,14 @@ pub static VIDEO_CODECS: &[VideoCodecSpec] = &[
         containers: &["mkv", "mov", "mp4", "mxf"],
         codec_args: NO_ARGS,
         candidates: &[
-            EncoderCandidate { name: "h264_nvenc", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "h264_qsv", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "h264_amf", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "h264_mf", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "h264_v4l2m2m", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "libx264", class: SW, args: YUV420P },
+            EncoderCandidate { name: "h264_nvenc",   class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "h264_qsv",     class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "h264_amf",     class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "h264_mf",      class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "h264_vaapi",   class: HW, args: NO_ARGS, hw_frames: VAAPI_FRAMES },
+            EncoderCandidate { name: "h264_vulkan",  class: HW, args: NO_ARGS, hw_frames: VULKAN_FRAMES },
+            EncoderCandidate { name: "h264_v4l2m2m", class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "libx264",      class: SW, args: YUV420P, hw_frames: NO_HW },
         ],
     },
     VideoCodecSpec {
@@ -98,12 +117,14 @@ pub static VIDEO_CODECS: &[VideoCodecSpec] = &[
         containers: &["mkv", "mov", "mp4", "mxf"],
         codec_args: &[("tag:v", "hvc1")],
         candidates: &[
-            EncoderCandidate { name: "hevc_nvenc", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "hevc_qsv", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "hevc_amf", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "hevc_mf", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "hevc_v4l2m2m", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "libx265", class: SW, args: YUV420P },
+            EncoderCandidate { name: "hevc_nvenc",   class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "hevc_qsv",     class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "hevc_amf",     class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "hevc_mf",      class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "hevc_vaapi",   class: HW, args: NO_ARGS, hw_frames: VAAPI_FRAMES },
+            EncoderCandidate { name: "hevc_vulkan",  class: HW, args: NO_ARGS, hw_frames: VULKAN_FRAMES },
+            EncoderCandidate { name: "hevc_v4l2m2m", class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "libx265",      class: SW, args: YUV420P, hw_frames: NO_HW },
         ],
     },
     VideoCodecSpec {
@@ -112,12 +133,14 @@ pub static VIDEO_CODECS: &[VideoCodecSpec] = &[
         containers: &["mkv", "mov", "mp4"],
         codec_args: NO_ARGS,
         candidates: &[
-            EncoderCandidate { name: "av1_nvenc", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "av1_qsv", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "av1_amf", class: HW, args: NO_ARGS },
-            EncoderCandidate { name: "libsvtav1", class: SW, args: YUV420P },
-            EncoderCandidate { name: "libaom-av1", class: SW, args: YUV420P },
-            EncoderCandidate { name: "librav1e", class: SW, args: YUV420P },
+            EncoderCandidate { name: "av1_nvenc",  class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "av1_qsv",    class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "av1_amf",    class: HW, args: NO_ARGS, hw_frames: NO_HW },
+            EncoderCandidate { name: "av1_vaapi",  class: HW, args: NO_ARGS, hw_frames: VAAPI_FRAMES },
+            EncoderCandidate { name: "av1_vulkan", class: HW, args: NO_ARGS, hw_frames: VULKAN_FRAMES },
+            EncoderCandidate { name: "libsvtav1",  class: SW, args: YUV420P, hw_frames: NO_HW },
+            EncoderCandidate { name: "libaom-av1", class: SW, args: YUV420P, hw_frames: NO_HW },
+            EncoderCandidate { name: "librav1e",   class: SW, args: YUV420P, hw_frames: NO_HW },
         ],
     },
 ];
@@ -148,12 +171,23 @@ pub fn is_known_encoder(name: &str) -> bool {
         .any(|c| c.candidates.iter().any(|cand| cand.name == name))
 }
 
-/// Per-encoder args for a concrete encoder; empty for unknown names.
-pub fn candidate_args(encoder: &str) -> &'static [(&'static str, &'static str)] {
+/// Find a single [`EncoderCandidate`] by encoder name.
+pub fn find_candidate(name: &str) -> Option<&'static EncoderCandidate> {
     VIDEO_CODECS
         .iter()
         .flat_map(|c| c.candidates.iter())
-        .find(|cand| cand.name == encoder)
+        .find(|cand| cand.name == name)
+}
+
+/// Returns the [`HwFramePath`] for an encoder when it requires hw frames, or
+/// `None` if the encoder is unknown or accepts plain software frames.
+pub fn hw_frames_for(encoder: &str) -> Option<HwFramePath> {
+    find_candidate(encoder).and_then(|c| c.hw_frames)
+}
+
+/// Per-encoder args for a concrete encoder; empty for unknown names.
+pub fn candidate_args(encoder: &str) -> &'static [(&'static str, &'static str)] {
+    find_candidate(encoder)
         .map(|cand| cand.args)
         .unwrap_or(NO_ARGS)
 }
@@ -164,11 +198,7 @@ pub fn codec_args(codec_id: &str) -> &'static [(&'static str, &'static str)] {
 }
 
 pub fn encoder_class(encoder: &str) -> Option<EncoderClass> {
-    VIDEO_CODECS
-        .iter()
-        .flat_map(|c| c.candidates.iter())
-        .find(|cand| cand.name == encoder)
-        .map(|cand| cand.class)
+    find_candidate(encoder).map(|cand| cand.class)
 }
 
 // ── Resolution ───────────────────────────────────────────────────────────
@@ -186,10 +216,20 @@ pub fn static_encoder_chain(codec_id: &str) -> Vec<String> {
 /// Ordered, ffmpeg-available encoder candidates for a codec: hardware
 /// candidates first, software fallbacks last. Empty when the ffmpeg build
 /// lists none of the codec's candidates.
+///
+/// Candidates that require hw-frame plumbing (VAAPI / Vulkan) are included
+/// only when a suitable device is reported in [`FfmpegCapabilities::hw`].
 pub fn resolve_encoder_chain(codec_id: &str, caps: &FfmpegCapabilities) -> Vec<String> {
     static_encoder_chain(codec_id)
         .into_iter()
-        .filter(|name| caps.available_encoders.contains(name.as_str()))
+        .filter(|name| {
+            caps.available_encoders.contains(name.as_str())
+                && match hw_frames_for(name) {
+                    Some(HwFramePath::Vaapi) => caps.hw.vaapi_device.is_some(),
+                    Some(HwFramePath::Vulkan) => caps.hw.vulkan_available,
+                    None => true,
+                }
+        })
         .collect()
 }
 
@@ -257,6 +297,7 @@ pub fn describe_chain(codec_id: &str, caps: &FfmpegCapabilities) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::converter::HwDeviceCapabilities;
     use std::collections::BTreeSet;
 
     fn caps<I: IntoIterator<Item = &'static str>>(encoders: I) -> FfmpegCapabilities {
@@ -265,6 +306,24 @@ mod tests {
             available_encoders: encoders.into_iter().map(String::from).collect(),
             available_formats: BTreeSet::new(),
             error_message: None,
+            hw: HwDeviceCapabilities::default(),
+        }
+    }
+
+    fn caps_with_hw<I: IntoIterator<Item = &'static str>>(
+        encoders: I,
+        vaapi_device: Option<&str>,
+        vulkan: bool,
+    ) -> FfmpegCapabilities {
+        FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: encoders.into_iter().map(String::from).collect(),
+            available_formats: BTreeSet::new(),
+            error_message: None,
+            hw: HwDeviceCapabilities {
+                vaapi_device: vaapi_device.map(String::from),
+                vulkan_available: vulkan,
+            },
         }
     }
 
@@ -284,12 +343,26 @@ mod tests {
     fn test_static_chain_orders_hardware_first() {
         assert_eq!(
             strs(&static_encoder_chain("av1")),
-            vec!["av1_nvenc", "av1_qsv", "av1_amf", "libsvtav1", "libaom-av1", "librav1e"]
+            vec![
+                "av1_nvenc", "av1_qsv", "av1_amf",
+                "av1_vaapi", "av1_vulkan",
+                "libsvtav1", "libaom-av1", "librav1e",
+            ]
         );
         assert_eq!(
             strs(&static_encoder_chain("h265")),
             vec![
-                "hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_mf", "hevc_v4l2m2m", "libx265"
+                "hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_mf",
+                "hevc_vaapi", "hevc_vulkan",
+                "hevc_v4l2m2m", "libx265",
+            ]
+        );
+        assert_eq!(
+            strs(&static_encoder_chain("h264")),
+            vec![
+                "h264_nvenc", "h264_qsv", "h264_amf", "h264_mf",
+                "h264_vaapi", "h264_vulkan",
+                "h264_v4l2m2m", "libx264",
             ]
         );
         assert_eq!(strs(&static_encoder_chain("prores")), vec!["prores_ks", "prores_aw"]);
@@ -298,12 +371,51 @@ mod tests {
 
     #[test]
     fn test_resolve_chain_filters_availability_and_keeps_priority() {
+        // av1_vaapi / av1_vulkan are in both the registry and the encoder
+        // list, but no hw device is available → they must be filtered out.
         let c = caps(LINUX_AV1.iter().copied());
-        // av1_vaapi / av1_vulkan exist in ffmpeg but are not registry
-        // candidates (they need hw-frame plumbing), so they are filtered out.
         assert_eq!(
             strs(&resolve_encoder_chain("av1", &c)),
             vec!["av1_nvenc", "av1_qsv", "libsvtav1", "libaom-av1", "librav1e"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_chain_includes_vaapi_when_device_available() {
+        let c = caps_with_hw(
+            ["av1_vaapi", "libsvtav1", "pcm_s24le"],
+            Some("/dev/dri/renderD128"),
+            false,
+        );
+        assert_eq!(
+            strs(&resolve_encoder_chain("av1", &c)),
+            vec!["av1_vaapi", "libsvtav1"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_chain_includes_vulkan_when_available() {
+        let c = caps_with_hw(
+            ["av1_vulkan", "libsvtav1", "pcm_s24le"],
+            None,
+            true,
+        );
+        assert_eq!(
+            strs(&resolve_encoder_chain("av1", &c)),
+            vec!["av1_vulkan", "libsvtav1"]
+        );
+    }
+
+    #[test]
+    fn test_resolve_chain_excludes_vaapi_when_device_not_available() {
+        let c = caps_with_hw(
+            [ "av1_vaapi", "libsvtav1", "pcm_s24le"],
+            None,
+            false,
+        );
+        assert_eq!(
+            strs(&resolve_encoder_chain("av1", &c)),
+            vec!["libsvtav1"]
         );
     }
 
@@ -380,7 +492,7 @@ mod tests {
         assert_eq!(normalize_video_codec("libx265"), "h265");
         assert_eq!(normalize_video_codec("prores_ks"), "prores");
         assert_eq!(normalize_video_codec("dnxhd"), "dnxhd");
-        // Hardware variants not in the registry
+        // VAAPI / Vulkan names (now in the registry but also caught by prefix)
         assert_eq!(normalize_video_codec("h264_vaapi"), "h264");
         assert_eq!(normalize_video_codec("hevc_vaapi"), "h265");
         assert_eq!(normalize_video_codec("av1_vulkan"), "av1");
@@ -392,6 +504,7 @@ mod tests {
     fn test_candidate_and_codec_args() {
         assert_eq!(candidate_args("libx264"), YUV420P);
         assert_eq!(candidate_args("av1_nvenc"), NO_ARGS);
+        assert_eq!(candidate_args("av1_vaapi"), NO_ARGS);
         assert_eq!(candidate_args("nonexistent"), NO_ARGS);
         assert_eq!(codec_args("h265"), &[("tag:v", "hvc1")]);
         assert_eq!(codec_args("h264"), NO_ARGS);
@@ -400,8 +513,25 @@ mod tests {
     #[test]
     fn test_encoder_class() {
         assert_eq!(encoder_class("av1_nvenc"), Some(EncoderClass::Hardware));
+        assert_eq!(encoder_class("av1_vaapi"), Some(EncoderClass::Hardware));
+        assert_eq!(encoder_class("av1_vulkan"), Some(EncoderClass::Hardware));
         assert_eq!(encoder_class("libsvtav1"), Some(EncoderClass::Software));
         assert_eq!(encoder_class("nope"), None);
+    }
+
+    #[test]
+    fn test_find_candidate_and_hw_frames() {
+        let cand = find_candidate("av1_vaapi").unwrap();
+        assert_eq!(cand.name, "av1_vaapi");
+        assert_eq!(cand.hw_frames, Some(HwFramePath::Vaapi));
+
+        let cand = find_candidate("hevc_vulkan").unwrap();
+        assert_eq!(cand.name, "hevc_vulkan");
+        assert_eq!(cand.hw_frames, Some(HwFramePath::Vulkan));
+
+        assert_eq!(find_candidate("no_such_encoder"), None);
+        assert_eq!(hw_frames_for("av1_nvenc"), None);
+        assert_eq!(hw_frames_for("no_such_encoder"), None);
     }
 
     #[test]

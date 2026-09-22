@@ -70,12 +70,59 @@ impl ChannelMap {
 
 // ── ffmpeg capabilities ──────────────────────────────────────────────────
 
+/// Hardware device info resolved for a concrete encoder at conversion time.
+#[derive(Clone, Debug)]
+pub enum ResolvedHwDevice {
+    Vaapi { device_path: String },
+    Vulkan,
+}
+
+impl ResolvedHwDevice {
+    /// Prelude args: `-init_hw_device <type>[=name[:device]]` +
+    /// `-filter_hw_device <name>` — must appear before `-i`.
+    fn prelude_args(&self) -> Vec<String> {
+        match self {
+            ResolvedHwDevice::Vaapi { device_path } => vec![
+                "-init_hw_device".to_string(),
+                format!("vaapi=vaapi0:{}", device_path),
+                "-filter_hw_device".to_string(),
+                "vaapi0".to_string(),
+            ],
+            ResolvedHwDevice::Vulkan => vec![
+                "-init_hw_device".to_string(),
+                "vulkan=vulkan0".to_string(),
+                "-filter_hw_device".to_string(),
+                "vulkan0".to_string(),
+            ],
+        }
+    }
+}
+
+/// Hardware-device availability context carried into the encoder fallback
+/// loop.  Derived from [`FfmpegCapabilities::hw`] at spawn time.
+#[derive(Clone, Debug, Default)]
+struct HwDeviceContext {
+    vaapi_device: Option<String>,
+    vulkan_available: bool,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct HwDeviceCapabilities {
+    /// First probed VAAPI DRM render node path (e.g. `/dev/dri/renderD128`).
+    /// `None` when no VAAPI device was found or when the platform is not Linux.
+    pub vaapi_device: Option<String>,
+    /// Whether a Vulkan device was successfully initialized via ffmpeg.
+    pub vulkan_available: bool,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FfmpegCapabilities {
     pub has_ffmpeg: bool,
     pub available_encoders: BTreeSet<String>,
     pub available_formats: BTreeSet<String>,
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub hw: HwDeviceCapabilities,
 }
 
 pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
@@ -95,6 +142,7 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
                 error_message: Some(
                     "ffmpeg found but returned a non-zero exit status".to_string(),
                 ),
+                hw: HwDeviceCapabilities::default(),
             };
         }
         Err(e) => {
@@ -109,6 +157,7 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
                 available_encoders: BTreeSet::new(),
                 available_formats: BTreeSet::new(),
                 error_message: Some(msg),
+                hw: HwDeviceCapabilities::default(),
             };
         }
     }
@@ -121,11 +170,14 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
         flags.contains('E')
     });
 
+    let hw = crate::hw_device::discover("ffmpeg", &encoders);
+
     FfmpegCapabilities {
         has_ffmpeg: true,
         available_encoders: encoders,
         available_formats: formats,
         error_message: None,
+        hw,
     }
 }
 
@@ -609,6 +661,10 @@ pub struct ConverterSettings {
     /// time (hardware candidates first). Empty until resolved; the arg
     /// builders then prefer it over the static chain head.
     pub resolved_video_encoder: String,
+    /// Hardware device info resolved together with `resolved_video_encoder`.
+    /// `None` for software encoders, stream-copy mode, or when no hardware
+    /// device is available (the candidate will be skipped).
+    pub resolved_hw_device: Option<ResolvedHwDevice>,
 
     // ── Output Naming ──
     pub output_folder: PathBuf,
@@ -1266,9 +1322,12 @@ fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<Stri
 
         let mut args: Vec<String> = vec![
         "-y".to_string(),
+    ];
+    push_hw_device_prelude(&mut args, settings);
+    args.extend([
         "-f".to_string(), "lavfi".to_string(),
         "-i".to_string(), "color=c=blue:s=1280x720:r=25".to_string(),
-    ];
+    ]);
 
     for f in &settings.input_files {
         args.push("-i".to_string());
@@ -1341,6 +1400,7 @@ fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> Vec<S
     let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
 
     let mut args: Vec<String> = vec!["-y".to_string()];
+    push_hw_device_prelude(&mut args, settings);
     push_input_with_trim(&mut args, input, trim_secs);
     args.push("-map".to_string());
     args.push("0:v".to_string());
@@ -1362,6 +1422,7 @@ fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &Au
     let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
 
     let mut args: Vec<String> = vec!["-y".to_string()];
+    push_hw_device_prelude(&mut args, settings);
     push_input_with_trim(&mut args, input, trim_secs);
     args.push("-map".to_string());
     args.push("0:v".to_string());
@@ -1597,11 +1658,35 @@ fn push_output_trailer(args: &mut Vec<String>, format: &str) {
 /// Push the video encoding args: `-c:v <resolved encoder>` plus codec-level
 /// args (e.g. `-tag:v hvc1` for HEVC) and the resolved encoder's own args
 /// (e.g. `-pix_fmt yuv420p`), from the codec registry.
+/// Push pre-input hw-device args (`-init_hw_device` / `-filter_hw_device`)
+/// when the resolved encoder requires hw-frame plumbing.
+///
+/// Must be called **before** the first `-i` in the arg list.
+/// No-op in stream-copy mode or when no hw device is resolved.
+fn push_hw_device_prelude(args: &mut Vec<String>, settings: &ConverterSettings) {
+    if settings.copy_video {
+        return;
+    }
+    if let Some(ref hw) = settings.resolved_hw_device {
+        args.extend(hw.prelude_args());
+    }
+}
+
+/// Push the video encoding args: `-c:v <resolved encoder>` plus codec-level
+/// args (e.g. `-tag:v hvc1` for HEVC) and the resolved encoder's own args
+/// (e.g. `-pix_fmt yuv420p`), from the codec registry.
+///
+/// When the resolved encoder requires hw-frame plumbing (VAAPI / Vulkan),
+/// also pushes `-vf format=nv12,hwupload`.
 fn push_video_encoder(args: &mut Vec<String>, settings: &ConverterSettings) {
     let codec_id = video_codecs::normalize_video_codec(&settings.video_encoder);
     let encoder = settings.effective_video_encoder();
     args.push("-c:v".to_string());
     args.push(encoder.clone());
+
+    // Check if this encoder needs hw-frame upload
+    let needs_hw_upload = video_codecs::hw_frames_for(&encoder).is_some();
+
     for (key, value) in video_codecs::codec_args(codec_id) {
         args.push(format!("-{}", key));
         args.push((*value).to_string());
@@ -1609,6 +1694,10 @@ fn push_video_encoder(args: &mut Vec<String>, settings: &ConverterSettings) {
     for (key, value) in video_codecs::candidate_args(&encoder) {
         args.push(format!("-{}", key));
         args.push((*value).to_string());
+    }
+    if needs_hw_upload {
+        args.push("-vf".to_string());
+        args.push("format=nv12,hwupload".to_string());
     }
 }
 
@@ -1686,18 +1775,24 @@ fn mark_conversion_failed(state: &SharedConversionState, overall_log: &str) {
 /// candidates first, software fallbacks last. Encoders that failed to
 /// initialize are memoized so later steps skip them; the first successful
 /// encoder is pinned for the rest of the run.
+///
+/// Also holds a [`HwDeviceContext`] so candidates that require hw-frame
+/// plumbing (VAAPI / Vulkan) are skipped immediately when no device is
+/// available, without invoking ffmpeg.
 struct EncoderFallback {
     chain: Vec<String>,
     failed: BTreeSet<String>,
     resolved: Option<String>,
+    hw_ctx: HwDeviceContext,
 }
 
 impl EncoderFallback {
-    fn new(chain: Vec<String>) -> Self {
+    fn new_with_hw(chain: Vec<String>, hw_ctx: HwDeviceContext) -> Self {
         EncoderFallback {
             chain,
             failed: BTreeSet::new(),
             resolved: None,
+            hw_ctx,
         }
     }
 
@@ -1724,6 +1819,21 @@ impl EncoderFallback {
 
     fn resolved(&self) -> Option<&str> {
         self.resolved.as_deref()
+    }
+}
+
+/// Returns the [`ResolvedHwDevice`] for a candidate encoder, or `None` when
+/// the candidate does not require hw frames or when no suitable device is
+/// known.  This is called in the fallback loop before building args.
+fn resolve_device_for_candidate(encoder: &str, ctx: &HwDeviceContext) -> Option<ResolvedHwDevice> {
+    match video_codecs::hw_frames_for(encoder) {
+        Some(video_codecs::HwFramePath::Vaapi) => {
+            ctx.vaapi_device.clone().map(|path| ResolvedHwDevice::Vaapi { device_path: path })
+        }
+        Some(video_codecs::HwFramePath::Vulkan) if ctx.vulkan_available => {
+            Some(ResolvedHwDevice::Vulkan)
+        }
+        _ => None,
     }
 }
 
@@ -1761,6 +1871,22 @@ fn run_video_step_with_fallback(
             return false;
         }
         settings.resolved_video_encoder = encoder.clone();
+        settings.resolved_hw_device = resolve_device_for_candidate(&encoder, &fallback.hw_ctx);
+
+        // Skip hw-frames candidates when no device is available (fast demotion
+        // without spawning ffmpeg).
+        if video_codecs::hw_frames_for(&encoder).is_some() && settings.resolved_hw_device.is_none() {
+            let msg = format!(
+                "--- no hardware device available for '{}'; skipping ---",
+                encoder
+            );
+            warn!("{}", msg);
+            overall_log.push_str(&format!("\n--- {} ---\n", msg));
+            fallback.note_failure(&encoder);
+            attempt += 1;
+            continue;
+        }
+
         let args = build_args(settings);
         match run_ffmpeg_process(
             &args,
@@ -1899,6 +2025,15 @@ pub fn spawn_conversion(
         chain = video_codecs::static_encoder_chain(&codec_id);
     }
 
+    // Extract hw context from capabilities for the spawned thread.
+    let hw_ctx = caps
+        .filter(|c| c.has_ffmpeg)
+        .map(|c| HwDeviceContext {
+            vaapi_device: c.hw.vaapi_device.clone(),
+            vulkan_available: c.hw.vulkan_available,
+        })
+        .unwrap_or_default();
+
     std::thread::spawn(move || {
         let mut settings = settings;
         let copy_mode = settings.copy_video
@@ -1906,7 +2041,7 @@ pub fn spawn_conversion(
         if copy_mode {
             prepare_copy_mode(&mut settings);
         }
-        let mut fallback = EncoderFallback::new(chain);
+        let mut fallback = EncoderFallback::new_with_hw(chain, hw_ctx);
         if copy_mode {
             info!(
                 "Video stream copy mode: video will not be re-encoded \
@@ -2577,6 +2712,7 @@ mod tests {
             trim_offsets_secs: vec![0.0; 2],
             timecode_meta_per_file: vec![None; 2],
             concat_audio: false,
+            resolved_hw_device: None,
         }
     }
 
@@ -2593,6 +2729,7 @@ mod tests {
             available_encoders: encoders.into_iter().map(String::from).collect(),
             available_formats: formats.into_iter().map(String::from).collect(),
             error_message: None,
+            hw: HwDeviceCapabilities::default(),
         }
     }
 
@@ -2628,6 +2765,7 @@ mod tests {
             available_encoders: BTreeSet::new(),
             available_formats: BTreeSet::new(),
             error_message: Some("ffmpeg found but returned non-zero exit status".to_string()),
+            hw: HwDeviceCapabilities::default(),
         };
         let r = evaluate_readiness(true, false, false, Some(&caps));
         assert_eq!(r.blockers, vec![ConvertBlocker::FfmpegMissing(Some("ffmpeg found but returned non-zero exit status".to_string()))]);
@@ -3198,6 +3336,7 @@ mod tests {
             ]),
             available_formats: BTreeSet::from(["mov".into(), "matroska".into(), "mp4".into()]),
             error_message: None,
+            hw: HwDeviceCapabilities::default(),
         };
         let (c, v, a) = select_best_combination(&caps);
         assert_eq!((c.as_str(), v.as_str(), a.as_str()), ("mov", "prores", "pcm_s24le"));
@@ -3214,6 +3353,7 @@ mod tests {
             ]),
             available_formats: BTreeSet::from(["mxf".into(), "matroska".into()]),
             error_message: None,
+            hw: HwDeviceCapabilities::default(),
         };
         let (c, v, a) = select_best_combination(&caps);
         assert_eq!((c.as_str(), v.as_str(), a.as_str()), ("mxf", "dnxhd", "pcm_s24le"));
@@ -3230,6 +3370,7 @@ mod tests {
             ]),
             available_formats: BTreeSet::from(["mov".into()]),
             error_message: None,
+            hw: HwDeviceCapabilities::default(),
         };
         let available = video_codecs::available_video_codecs("mov", &caps);
         let keys: Vec<&str> = available.iter().map(|(k, _)| *k).collect();
@@ -3242,7 +3383,7 @@ mod tests {
 
     #[test]
     fn test_encoder_fallback_remaining_skips_failed() {
-        let mut fb = EncoderFallback::new(vec!["av1_nvenc".into(), "libsvtav1".into(), "libaom-av1".into()]);
+        let mut fb = EncoderFallback::new_with_hw(vec!["av1_nvenc".into(), "libsvtav1".into(), "libaom-av1".into()], HwDeviceContext::default());
         assert_eq!(fb.remaining(), vec!["av1_nvenc", "libsvtav1", "libaom-av1"]);
         fb.note_failure("av1_nvenc");
         assert_eq!(fb.remaining(), vec!["libsvtav1", "libaom-av1"]);
@@ -3252,7 +3393,7 @@ mod tests {
 
     #[test]
     fn test_encoder_fallback_pins_resolved_encoder() {
-        let mut fb = EncoderFallback::new(vec!["av1_nvenc".into(), "libsvtav1".into()]);
+        let mut fb = EncoderFallback::new_with_hw(vec!["av1_nvenc".into(), "libsvtav1".into()], HwDeviceContext::default());
         fb.note_success("av1_nvenc");
         assert_eq!(fb.remaining(), vec!["av1_nvenc"], "pinned encoder is reused");
         assert_eq!(fb.resolved(), Some("av1_nvenc"));
@@ -3260,10 +3401,59 @@ mod tests {
 
     #[test]
     fn test_encoder_fallback_exhausted_chain() {
-        let mut fb = EncoderFallback::new(vec!["av1_nvenc".into()]);
+        let mut fb = EncoderFallback::new_with_hw(vec!["av1_nvenc".into()], HwDeviceContext::default());
         fb.note_failure("av1_nvenc");
         assert!(fb.remaining().is_empty());
         assert_eq!(fb.resolved(), None);
+    }
+
+    #[test]
+    fn test_resolve_device_for_candidate_vaapi_available() {
+        let ctx = HwDeviceContext {
+            vaapi_device: Some("/dev/dri/renderD128".to_string()),
+            vulkan_available: false,
+        };
+        let hw = resolve_device_for_candidate("h264_vaapi", &ctx).unwrap();
+        assert!(matches!(hw, ResolvedHwDevice::Vaapi { device_path } if device_path == "/dev/dri/renderD128"));
+    }
+
+    #[test]
+    fn test_resolve_device_for_candidate_vaapi_unavailable() {
+        let ctx = HwDeviceContext {
+            vaapi_device: None,
+            vulkan_available: false,
+        };
+        assert!(resolve_device_for_candidate("h264_vaapi", &ctx).is_none());
+    }
+
+    #[test]
+    fn test_resolve_device_for_candidate_vulkan_available() {
+        let ctx = HwDeviceContext {
+            vaapi_device: None,
+            vulkan_available: true,
+        };
+        let hw = resolve_device_for_candidate("h264_vulkan", &ctx).unwrap();
+        assert!(matches!(hw, ResolvedHwDevice::Vulkan));
+    }
+
+    #[test]
+    fn test_resolve_device_for_candidate_vulkan_unavailable() {
+        let ctx = HwDeviceContext {
+            vaapi_device: None,
+            vulkan_available: false,
+        };
+        assert!(resolve_device_for_candidate("h264_vulkan", &ctx).is_none());
+    }
+
+    #[test]
+    fn test_resolve_device_for_candidate_software_encoder() {
+        let ctx = HwDeviceContext {
+            vaapi_device: Some("/dev/dri/renderD128".to_string()),
+            vulkan_available: true,
+        };
+        // Software encoders return None regardless of available devices.
+        assert!(resolve_device_for_candidate("libx264", &ctx).is_none());
+        assert!(resolve_device_for_candidate("av1_nvenc", &ctx).is_none());
     }
 
     // ── effective_video_encoder / push_video_encoder ─────────────────────
@@ -3330,6 +3520,140 @@ mod tests {
         let prof = args.iter().position(|a| a == "-profile:v").unwrap();
         assert_eq!(args[prof + 1], "0");
         assert!(args.contains(&"yuv422p10le".to_string()));
+    }
+
+    // ── hw-device prelude (push_hw_device_prelude) ────────────────────────
+
+    #[test]
+    fn test_push_hw_device_prelude_vaapi() {
+        let mut s = make_video_settings();
+        s.resolved_hw_device = Some(ResolvedHwDevice::Vaapi {
+            device_path: "/dev/dri/renderD128".to_string(),
+        });
+        let mut args = vec!["-y".to_string()];
+        push_hw_device_prelude(&mut args, &s);
+        assert!(args.contains(&"-init_hw_device".to_string()));
+        let init = args.iter().position(|a| a == "-init_hw_device").unwrap();
+        assert_eq!(args[init + 1], "vaapi=vaapi0:/dev/dri/renderD128");
+        let filter = args.iter().position(|a| a == "-filter_hw_device").unwrap();
+        assert_eq!(args[filter + 1], "vaapi0");
+        // Prelude comes after -y, before any -i
+        assert_eq!(args[0], "-y");
+    }
+
+    #[test]
+    fn test_push_hw_device_prelude_vulkan() {
+        let mut s = make_video_settings();
+        s.resolved_hw_device = Some(ResolvedHwDevice::Vulkan);
+        let mut args = vec!["-y".to_string()];
+        push_hw_device_prelude(&mut args, &s);
+        let init = args.iter().position(|a| a == "-init_hw_device").unwrap();
+        assert_eq!(args[init + 1], "vulkan=vulkan0");
+        let filter = args.iter().position(|a| a == "-filter_hw_device").unwrap();
+        assert_eq!(args[filter + 1], "vulkan0");
+    }
+
+    #[test]
+    fn test_push_hw_device_prelude_copy_mode_noop() {
+        let mut s = make_video_settings();
+        s.copy_video = true;
+        s.resolved_hw_device = Some(ResolvedHwDevice::Vaapi {
+            device_path: "/dev/dri/renderD128".to_string(),
+        });
+        let mut args = vec!["-y".to_string()];
+        push_hw_device_prelude(&mut args, &s);
+        // Only -y, nothing added
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn test_push_hw_device_prelude_none_noop() {
+        let mut s = make_video_settings();
+        s.resolved_hw_device = None;
+        let mut args = vec!["-y".to_string()];
+        push_hw_device_prelude(&mut args, &s);
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn test_push_video_encoder_hwupload_for_hw_frames_candidate() {
+        let mut s = make_video_settings();
+        s.video_encoder = "h264".to_string();
+        s.resolved_video_encoder = "h264_vaapi".to_string();
+        let mut args = Vec::new();
+        push_video_encoder(&mut args, &s);
+        let cv = args.iter().position(|a| a == "-c:v").unwrap();
+        assert_eq!(args[cv + 1], "h264_vaapi");
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert_eq!(args[vf + 1], "format=nv12,hwupload");
+    }
+
+    #[test]
+    fn test_push_video_encoder_no_hwupload_for_software_candidate() {
+        let mut s = make_video_settings();
+        s.video_encoder = "h264".to_string();
+        s.resolved_video_encoder = "libx264".to_string();
+        let mut args = Vec::new();
+        push_video_encoder(&mut args, &s);
+        assert!(args.contains(&"-c:v".to_string()));
+        assert!(!args.contains(&"-vf".to_string()));
+    }
+
+    #[test]
+    fn test_push_video_encoder_hwupload_for_vulkan() {
+        let mut s = make_video_settings();
+        s.video_encoder = "av1".to_string();
+        s.resolved_video_encoder = "av1_vulkan".to_string();
+        let mut args = Vec::new();
+        push_video_encoder(&mut args, &s);
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert_eq!(args[vf + 1], "format=nv12,hwupload");
+    }
+
+    #[test]
+    fn test_build_video_only_args_prelude_before_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("test.mp4");
+        std::fs::write(&input, b"dummy").unwrap();
+        let mut s = make_video_settings();
+        s.input_files = vec![input.clone()];
+        s.resolved_video_encoder = "h264_vaapi".to_string();
+        s.resolved_hw_device = Some(ResolvedHwDevice::Vaapi {
+            device_path: "/dev/dri/renderD128".to_string(),
+        });
+        // Use the builder that actually processes the input
+        let args = build_video_only_args(&s, 0);
+        let y_pos = args.iter().position(|a| a == "-y").unwrap();
+        let init_pos = args.iter().position(|a| a == "-init_hw_device").unwrap();
+        let i_pos = args.iter().position(|a| a == "-i").unwrap();
+        // -init_hw_device comes after -y but before -i
+        assert!(y_pos < init_pos, "-y must come before -init_hw_device");
+        assert!(init_pos < i_pos, "-init_hw_device must come before -i");
+    }
+
+    #[test]
+    fn test_build_video_mux_args_prelude_before_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let input = tmp.path().join("test.mp4");
+        std::fs::write(&input, b"dummy").unwrap();
+        let mut s = make_video_settings();
+        s.input_files = vec![input.clone()];
+        s.resolved_video_encoder = "h264_vaapi".to_string();
+        s.resolved_hw_device = Some(ResolvedHwDevice::Vaapi {
+            device_path: "/dev/dri/renderD128".to_string(),
+        });
+        // Minimal probe: empty streams since we keep AllAudio
+        let probe = VideoAudioProbe {
+            total_audio_channels: 1,
+            is_video_file: true,
+            streams: vec![],
+        };
+        let args = build_video_mux_args(&s, 0, &AudioKeep::AllAudio, &probe);
+        let y_pos = args.iter().position(|a| a == "-y").unwrap();
+        let init_pos = args.iter().position(|a| a == "-init_hw_device").unwrap();
+        let i_pos = args.iter().position(|a| a == "-i").unwrap();
+        assert!(y_pos < init_pos, "-y before -init_hw_device");
+        assert!(init_pos < i_pos, "-init_hw_device before -i");
     }
 
     // ── sanity check (codec-based) ───────────────────────────────────────
@@ -3399,6 +3723,7 @@ mod tests {
             trim_offsets_secs: vec![0.0],
             timecode_meta_per_file: vec![None],
             concat_audio: false,
+            resolved_hw_device: None,
         }
     }
 

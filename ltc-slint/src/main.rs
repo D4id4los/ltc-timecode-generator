@@ -857,6 +857,7 @@ split_tracks: split_val,
                 trim_to_first_ltc: trim_flag_val,
                 trim_offsets_secs,
                 timecode_meta_per_file,
+                resolved_hw_device: None,
             };
             *state.lock().unwrap() = ConversionState::idle();
             cancel.store(false, Ordering::Relaxed);
