@@ -16,7 +16,7 @@ use gui_engine::converter::{
 };
 use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
-use gui_engine::file_pattern::match_files_all_patterns;
+use gui_engine::file_pattern::{match_files_all_patterns, MatchedGroup};
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::LtcDecodeStatus;
 
@@ -89,6 +89,41 @@ fn copy_mode_active(state: &AppState) -> bool {
     state.leave_video_untouched && state.recording_type == RecordingType::VideoClipSequence
 }
 
+pub(crate) fn apply_group_selection(
+    state: &mut AppState,
+    groups: &[MatchedGroup],
+    idx: usize,
+) -> Vec<GuiCommand> {
+    let group = &groups[idx];
+    let mut cmds = Vec::new();
+
+    state.selected_group_idx = Some(idx);
+
+    if group.recording_type == RecordingType::VideoClipSequence {
+        cmds.push(GuiCommand::ClearLtcGroupResults);
+    }
+
+    let num_ch = group.files.len();
+    state.channel_map = ChannelMap::identity(num_ch);
+    state.recording_type = group.recording_type.clone();
+    state.filename_prefix = group.prefix.clone();
+    state.naming_mode = match group.recording_type {
+        RecordingType::VideoClipSequence => OutputNamingMode::SourceStems,
+        RecordingType::MultiTrackAudio => OutputNamingMode::PrefixTemplates,
+    };
+    state.output_folder = state.selected_folder.clone().unwrap_or_default();
+    state.split_tracks = false;
+    state.drop_ltc_track = false;
+    state.per_file_trim_offsets = vec![0.0; num_ch];
+    state.ltc_file_idx = 0;
+
+    if group.recording_type == RecordingType::VideoClipSequence && !group.files.is_empty() {
+        cmds.push(GuiCommand::ProbeVideo(group.files[0].to_string_lossy().to_string()));
+    }
+
+    cmds
+}
+
 // ── Step 1: File selection ─────────────────────────────────────────────
 
 fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
@@ -129,11 +164,19 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                     };
                     paths
                 }).collect();
-                state.file_groups = Some(groups);
+                let group_count = groups.len();
+                state.file_groups = Some(groups.clone());
                 state.send(GuiCommand::ProbeFileDurations(probe_paths));
-                state.selected_group_idx = None;
-                state.ltc_file_idx = 1; // default to track 2
                 state.trim_ltc_start = false;
+                if group_count > 0 {
+                    let cmds = apply_group_selection(state, &groups, 0);
+                    for cmd in cmds {
+                        state.send(cmd);
+                    }
+                } else {
+                    state.selected_group_idx = None;
+                    state.ltc_file_idx = 1;
+                }
             }
         }
     });
@@ -145,7 +188,6 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
             ui.label(RichText::new("No files matching any known pattern were found in this folder.")
                 .font(FontId::proportional(10.0)).color(colors.error_red));
         } else {
-            let mut probe_fn: Option<String> = None;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Recording:").font(FontId::proportional(10.0)).color(colors.text_muted));
                 let selected_text = state
@@ -184,36 +226,14 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                                 dur_text,
                             );
                             if ui.selectable_label(false, label).clicked() {
-                                state.selected_group_idx = Some(i);
-                                // Clear stale group decode results from previous selection
-                                if group.recording_type == RecordingType::VideoClipSequence {
-                                    state.send(GuiCommand::ClearLtcGroupResults);
-                                }
-                                let num_ch = group.files.len();
-                                state.channel_map = ChannelMap::identity(num_ch);
-                                state.recording_type = group.recording_type.clone();
-                                state.filename_prefix = group.prefix.clone();
-                                state.naming_mode = match group.recording_type {
-                                    RecordingType::VideoClipSequence => OutputNamingMode::SourceStems,
-                                    RecordingType::MultiTrackAudio => OutputNamingMode::PrefixTemplates,
-                                };
-                                state.output_folder = state.selected_folder.clone().unwrap_or_default();
-                                state.split_tracks = false;
-                                state.drop_ltc_track = false;
-                                state.per_file_trim_offsets = vec![0.0; num_ch];
-                                state.ltc_file_idx = 0;
-
-                                // Schedule probe for video files
-                                if group.recording_type == RecordingType::VideoClipSequence && !group.files.is_empty() {
-                                    probe_fn = Some(group.files[0].to_string_lossy().to_string());
+                                let cmds = apply_group_selection(state, groups, i);
+                                for cmd in cmds {
+                                    state.send(cmd);
                                 }
                             }
                         }
                     });
             });
-            if let Some(path) = probe_fn {
-                state.send(GuiCommand::ProbeVideo(path));
-            }
 
             if let Some(idx) = state.selected_group_idx {
                 if let Some(group) = groups.get(idx) {

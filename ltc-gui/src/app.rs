@@ -116,7 +116,7 @@ pub struct AppState {
     ltc_group_auto_applied_gen: u64,
 }
 
-type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>, Option<usize>, ChannelMap, RecordingType, String, OutputNamingMode);
+type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>);
 
 impl AppState {
     pub fn new(
@@ -138,11 +138,10 @@ impl AppState {
         let is_dark = initial.is_dark_theme;
 
         // Restore last used converter folders from config
-        let (selected_folder, file_groups, selected_group_idx, channel_map, recording_type, filename_prefix, naming_mode)
-            = Self::restore_input_folder(&cfg);
+        let (selected_folder, file_groups) = Self::restore_input_folder(&cfg);
         let output_folder = cfg.last_output_folder.map(PathBuf::from).unwrap_or_default();
 
-        let result = Self {
+        let mut result = Self {
             cmd_tx,
             latest: Arc::new(initial),
             engine_state,
@@ -158,12 +157,12 @@ impl AppState {
             log_buffer,
             ltc_file_idx: 0,
             _selected_pattern: 0,
-            selected_folder,
+            selected_folder: selected_folder.clone(),
             selected_files: None,
-            file_groups,
-            selected_group_idx,
-            channel_map,
-            recording_type,
+            file_groups: file_groups.clone(),
+            selected_group_idx: None,
+            channel_map: ChannelMap::identity(0),
+            recording_type: RecordingType::MultiTrackAudio,
             generate_synthetic_video: false,
             split_tracks: false,
             drop_ltc_track: false,
@@ -173,8 +172,8 @@ impl AppState {
             video_encoder: "av1".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
             output_folder,
-            filename_prefix,
-            naming_mode,
+            filename_prefix: String::new(),
+            naming_mode: OutputNamingMode::PrefixTemplates,
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
             conversion_state: Arc::new(Mutex::new(ConversionState::idle())),
@@ -186,6 +185,16 @@ impl AppState {
             ltc_auto_applied_gen: 0,
             ltc_group_auto_applied_gen: 0,
         };
+
+        // Auto-select first group (clone groups to avoid borrow conflict with mutation)
+        if let Some(ref groups) = result.file_groups.clone() {
+            if !groups.is_empty() {
+                let cmds = crate::widgets::converter::apply_group_selection(&mut result, groups, 0);
+                for cmd in cmds {
+                    let _ = result.cmd_tx.send(cmd);
+                }
+            }
+        }
 
         // Send duration probe for restored groups
         if let Some(ref groups) = result.file_groups {
@@ -208,23 +217,13 @@ impl AppState {
     fn restore_input_folder(cfg: &config::ConverterConfig) -> RestoredFolder {
         let folder = match cfg.last_input_folder {
             Some(ref p) => PathBuf::from(p),
-            None => return (None, None, None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new(), OutputNamingMode::PrefixTemplates),
+            None => return (None, None),
         };
         if !folder.exists() {
-            return (None, None, None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new(), OutputNamingMode::PrefixTemplates);
+            return (None, None);
         }
         let groups = match_files_all_patterns(&folder);
-        if groups.is_empty() {
-            return (Some(folder), Some(groups), None, ChannelMap::identity(0), RecordingType::MultiTrackAudio, String::new(), OutputNamingMode::PrefixTemplates);
-        }
-        let num_files = groups[0].files.len();
-        let rec_type = groups[0].recording_type.clone();
-        let prefix = groups[0].prefix.clone();
-        let naming_mode = match rec_type {
-            RecordingType::VideoClipSequence => OutputNamingMode::SourceStems,
-            RecordingType::MultiTrackAudio => OutputNamingMode::PrefixTemplates,
-        };
-        (Some(folder), Some(groups), Some(0), ChannelMap::identity(num_files), rec_type, prefix, naming_mode)
+        (Some(folder), Some(groups))
     }
 
     /// Applies auto-settings (trim/split/drop) from a successful decode result,
@@ -1073,5 +1072,79 @@ mod tests {
         assert!(!app.drop_ltc_track);
         assert!(!app.trim_ltc_start);
         assert!((app.trim_offset_secs).abs() < 1e-9);
+    }
+
+    // ── apply_group_selection tests ─────────────────────────────────────
+
+    #[test]
+    fn apply_group_selection_audio_sets_correct_state() {
+        use gui_engine::file_pattern::MatchedGroup;
+        use crate::widgets::converter::apply_group_selection;
+
+        let mut app = app_with_no_decode_state();
+        let folder = PathBuf::from("/some/folder");
+        app.selected_folder = Some(folder.clone());
+
+        let group = MatchedGroup {
+            prefix: "TEST".to_string(),
+            pattern_name: "TASCAM",
+            recording_type: RecordingType::MultiTrackAudio,
+            files: vec![
+                PathBuf::from("TEST_S01.wav"),
+                PathBuf::from("TEST_S02.wav"),
+            ],
+        };
+        let groups = vec![group];
+
+        let cmds = apply_group_selection(&mut app, &groups, 0);
+
+        assert_eq!(app.selected_group_idx, Some(0));
+        assert_eq!(app.channel_map.num_channels(), 2);
+        assert_eq!(app.channel_map.mapping(), &[0, 1]);
+        assert_eq!(app.recording_type, RecordingType::MultiTrackAudio);
+        assert_eq!(app.filename_prefix, "TEST");
+        assert_eq!(app.naming_mode, OutputNamingMode::PrefixTemplates);
+        assert_eq!(app.output_folder, folder);
+        assert!(!app.split_tracks);
+        assert!(!app.drop_ltc_track);
+        assert_eq!(app.per_file_trim_offsets, vec![0.0, 0.0]);
+        assert_eq!(app.ltc_file_idx, 0);
+        assert!(cmds.is_empty(), "audio group should return no commands");
+    }
+
+    #[test]
+    fn apply_group_selection_video_returns_probe_and_clear() {
+        use gui_engine::file_pattern::MatchedGroup;
+        use crate::widgets::converter::apply_group_selection;
+
+        let mut app = app_with_no_decode_state();
+        let folder = PathBuf::from("/some/folder");
+        app.selected_folder = Some(folder.clone());
+
+        let group = MatchedGroup {
+            prefix: "CLIP".to_string(),
+            pattern_name: "GoPro",
+            recording_type: RecordingType::VideoClipSequence,
+            files: vec![
+                PathBuf::from("GOPR0001.MP4"),
+                PathBuf::from("GOPR0002.MP4"),
+            ],
+        };
+        let groups = vec![group];
+
+        let cmds = apply_group_selection(&mut app, &groups, 0);
+
+        assert_eq!(app.selected_group_idx, Some(0));
+        assert_eq!(app.recording_type, RecordingType::VideoClipSequence);
+        assert_eq!(app.filename_prefix, "CLIP");
+        assert_eq!(app.naming_mode, OutputNamingMode::SourceStems);
+        assert!(!app.split_tracks);
+        assert!(!app.drop_ltc_track);
+        assert_eq!(app.per_file_trim_offsets, vec![0.0, 0.0]);
+        assert_eq!(app.ltc_file_idx, 0);
+
+        assert_eq!(cmds.len(), 2, "video group should return 2 commands");
+        assert!(matches!(cmds[0], GuiCommand::ClearLtcGroupResults));
+        assert!(matches!(&cmds[1], GuiCommand::ProbeVideo(p) if p.contains("GOPR0001.MP4")));
     }
 }

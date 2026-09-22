@@ -38,6 +38,95 @@ mod toast;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Shared converter group-selection logic: mutates the Arc-wrapped state and
+/// updates the Slint UI properties. Used by both manual group-selection,
+/// folder/file-picker auto-select, and startup restore.
+#[derive(Clone)]
+struct ConvSelectionCtx {
+    cmap: Arc<Mutex<ChannelMap>>,
+    pat: Arc<Mutex<i32>>,
+    idx: Arc<Mutex<isize>>,
+    prefix: Arc<Mutex<String>>,
+    naming: Arc<Mutex<OutputNamingMode>>,
+    output: Arc<Mutex<String>>,
+    split: Arc<Mutex<bool>>,
+    drop: Arc<Mutex<bool>>,
+    concat: Arc<Mutex<bool>>,
+    folder: Arc<Mutex<String>>,
+    audio_suffix: Arc<Mutex<String>>,
+    video_suffix: Arc<Mutex<String>>,
+    cmd_tx: mpsc::Sender<GuiCommand>,
+    ui_weak: Option<slint::Weak<AppWindow>>,
+}
+
+impl ConvSelectionCtx {
+    fn apply(&self, groups: &BTreeMap<String, Vec<PathBuf>>, group_idx: isize) {
+        let ui = self.ui_weak.as_ref().and_then(|w| w.upgrade());
+        self.apply_inner(groups, group_idx, ui.as_ref());
+    }
+
+    fn apply_inner(
+        &self,
+        groups: &BTreeMap<String, Vec<PathBuf>>,
+        group_idx: isize,
+        ui: Option<&AppWindow>,
+    ) {
+        let keys: Vec<String> = groups.keys().cloned().collect();
+        if group_idx < 0 || (group_idx as usize) >= keys.len() {
+            return;
+        }
+        let prefix = keys[group_idx as usize].clone();
+        let files = groups.get(&prefix).cloned().unwrap_or_default();
+        let n = files.len();
+        let pat = *self.pat.lock().unwrap();
+        let is_video = pat == 1 && n == 1;
+
+        *self.cmap.lock().unwrap() = ChannelMap::identity(n);
+        *self.idx.lock().unwrap() = group_idx;
+        *self.prefix.lock().unwrap() = prefix.clone();
+        *self.naming.lock().unwrap() = if is_video {
+            OutputNamingMode::SourceStems
+        } else {
+            OutputNamingMode::PrefixTemplates
+        };
+        *self.output.lock().unwrap() = String::new();
+        *self.split.lock().unwrap() = false;
+        *self.drop.lock().unwrap() = false;
+        *self.concat.lock().unwrap() = false;
+        let folder = self.folder.lock().unwrap().clone();
+
+        let ltc_file_names: Vec<SharedString> = files.iter().map(|f| {
+            SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+        }).collect();
+
+        if let Some(u) = ui {
+            u.set_conv_selected_group_idx(group_idx as i32);
+            u.set_conv_num_channels(n as i32);
+            u.set_conv_is_video_recording(is_video);
+            u.set_ltc_selected_stream(0);
+            u.set_ltc_selected_channel(0);
+            u.set_ltc_channel_names(ModelRc::new(VecModel::<SharedString>::from(Vec::new())));
+            let map_vec: Vec<i32> = (0..n as i32).collect();
+            u.set_conv_channel_map(ModelRc::new(VecModel::from(map_vec)));
+            u.set_conv_output_folder(SharedString::from(folder.clone()));
+            u.set_conv_filename_prefix(SharedString::from(prefix.clone()));
+            u.set_conv_audio_suffix_template(SharedString::from(self.audio_suffix.lock().unwrap().clone()));
+            u.set_conv_video_suffix_template(SharedString::from(self.video_suffix.lock().unwrap().clone()));
+            u.set_ltc_file_idx(0);
+            u.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
+        }
+
+        let _ = self.cmd_tx.send(GuiCommand::ClearLtcGroupResults);
+
+        if is_video && !files.is_empty() {
+            let full_path = PathBuf::from(&folder).join(&files[0]);
+            let _ = self.cmd_tx.send(GuiCommand::ProbeVideo(
+                full_path.to_string_lossy().to_string(),
+            ));
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = gui_engine::cli::parse_args();
 
@@ -124,6 +213,23 @@ fn _run_gui(
     let conv_folder_for_group = conv_selected_folder.clone();
     let conv_ffmpeg_caps_for_select = conv_ffmpeg_caps.clone();
 
+    let conv_sel_ctx = ConvSelectionCtx {
+        cmap: conv_channel_map.clone(),
+        pat: conv_selected_pattern.clone(),
+        idx: conv_selected_group_idx.clone(),
+        prefix: conv_filename_prefix.clone(),
+        naming: conv_naming_mode.clone(),
+        output: conv_output_path.clone(),
+        split: conv_split_tracks.clone(),
+        drop: conv_drop_ltc_track.clone(),
+        concat: conv_concat_audio.clone(),
+        folder: conv_selected_folder.clone(),
+        audio_suffix: conv_audio_suffix_template.clone(),
+        video_suffix: conv_video_suffix_template.clone(),
+        cmd_tx: cmd_tx.clone(),
+        ui_weak: Some(ui.as_weak()),
+    };
+
     // ── Restore last used converter folders from config ─────────────────────
     {
         let cfg = config::load();
@@ -133,7 +239,6 @@ fn _run_gui(
                 *conv_selected_folder.lock().unwrap() = folder.clone();
                 let matched = match_files_to_groups(path, &BUILTIN_PATTERNS[0]);
                 *conv_file_groups.lock().unwrap() = matched.clone();
-                *conv_selected_group_idx.lock().unwrap() = -1;
                 ui.set_conv_selected_folder(SharedString::from(folder.as_str()));
                 let model: Vec<FileGroupInfo> = matched.iter().map(|(prefix, files)| {
                     FileGroupInfo {
@@ -154,6 +259,10 @@ fn _run_gui(
                 }).collect();
                 if !probe_paths.is_empty() {
                     let _ = cmd_tx.send(GuiCommand::ProbeFileDurations(probe_paths));
+                }
+                // Auto-select first group
+                if !matched.is_empty() {
+                    conv_sel_ctx.apply(&matched, 0);
                 }
             }
         }
@@ -527,11 +636,11 @@ fn _run_gui(
         let files_arc = conv_selected_files.clone();
         let folder = conv_selected_folder.clone();
         let groups = conv_file_groups.clone();
-        let idx = conv_selected_group_idx.clone();
         let venc_for_folder = conv_video_encoder.clone();
         let aenc_for_folder = conv_audio_encoder.clone();
         let container_for_folder = conv_container.clone();
         let cmd_folder = cmd_tx.clone();
+        let ctx_folder = conv_sel_ctx.clone();
         ui.on_conv_select_folder(move || {
             let pat = *pattern_arc.lock().unwrap();
             if pat == 0 {
@@ -551,8 +660,6 @@ fn _run_gui(
                     let pattern = &BUILTIN_PATTERNS[0];
                     let matched = match_files_to_groups(&path, pattern);
                     *groups.lock().unwrap() = matched.clone();
-                    *idx.lock().unwrap() = -1;
-
                     if let Some(u) = ui_weak.upgrade() {
                         u.set_conv_selected_folder(SharedString::from(path_str));
                         let model: Vec<FileGroupInfo> = matched.iter().map(|(prefix, files)| {
@@ -575,6 +682,10 @@ fn _run_gui(
                             let _ = cmd_folder.send(GuiCommand::ProbeFileDurations(probe_paths));
                         }
                     }
+                    // Auto-select first group
+                    if !matched.is_empty() {
+                        ctx_folder.apply(&matched, 0);
+                    }
                 }
             } else {
                 // * (any): file picker
@@ -596,8 +707,6 @@ fn _run_gui(
                         config::save_input_folder(parent_path);
                         let matched = wrap_user_selected_files(paths);
                         *groups.lock().unwrap() = matched.clone();
-                        *idx.lock().unwrap() = -1;
-
                         if let Some(u) = ui_weak.upgrade() {
                             u.set_conv_selected_folder(SharedString::from(parent));
                             let model: Vec<FileGroupInfo> = matched.iter().map(|(prefix, files)| {
@@ -619,6 +728,10 @@ fn _run_gui(
                             if !probe_paths.is_empty() {
                                 let _ = cmd_folder.send(GuiCommand::ProbeFileDurations(probe_paths));
                             }
+                    }
+                    // Auto-select first group
+                    if !matched.is_empty() {
+                        ctx_folder.apply(&matched, 0);
                     }
                 }
             }
@@ -677,76 +790,11 @@ fn _run_gui(
         });
     }
     {
-        let ui_weak = ui.as_weak();
         let groups = conv_file_groups.clone();
-        let idx = conv_selected_group_idx.clone();
-        let cmap = conv_channel_map.clone();
-        let out_path = conv_output_path.clone();
-        let prefix_arc = conv_filename_prefix.clone();
-        let naming_arc = conv_naming_mode.clone();
-        let pattern_arc_sel = conv_selected_pattern.clone();
-        let audio_suffix = conv_audio_suffix_template.clone();
-        let video_suffix = conv_video_suffix_template.clone();
-        let split_arc = conv_split_tracks.clone();
-        let drop_arc = conv_drop_ltc_track.clone();
-        let concat_arc_group = conv_concat_audio.clone();
-        let folder_for_group = conv_folder_for_group.clone();
-        let cmd_group = cmd_tx.clone();
+        let ctx_group = conv_sel_ctx.clone();
         ui.on_conv_select_group(move |group_idx| {
             let g = groups.lock().unwrap();
-            let keys: Vec<String> = g.keys().cloned().collect();
-            if group_idx >= 0 && (group_idx as usize) < keys.len() {
-                let prefix = keys[group_idx as usize].clone();
-                let files = g.get(&prefix).cloned().unwrap_or_default();
-                let n = files.len();
-                let is_video = *pattern_arc_sel.lock().unwrap() == 1 && n == 1;
-                *cmap.lock().unwrap() = ChannelMap::identity(n);
-                *idx.lock().unwrap() = group_idx as isize;
-                *prefix_arc.lock().unwrap() = prefix.clone();
-                *naming_arc.lock().unwrap() = if is_video {
-                    OutputNamingMode::SourceStems
-                } else {
-                    OutputNamingMode::PrefixTemplates
-                };
-                *out_path.lock().unwrap() = String::new();
-                *split_arc.lock().unwrap() = false;
-                *drop_arc.lock().unwrap() = false;
-                *concat_arc_group.lock().unwrap() = false;
-                let folder = folder_for_group.lock().unwrap().clone();
-                let ltc_file_names: Vec<SharedString> = files.iter().map(|f| {
-                    SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
-                }).collect();
-                if let Some(u) = ui_weak.upgrade() {
-                    u.set_conv_selected_group_idx(group_idx);
-                    u.set_conv_num_channels(n as i32);
-                    u.set_conv_is_video_recording(is_video);
-                    u.set_ltc_selected_stream(0);
-                    u.set_ltc_selected_channel(0);
-                    u.set_ltc_channel_names(ModelRc::new(VecModel::<SharedString>::from(Vec::new())));
-                    let map_vec: Vec<i32> = (0..n as i32).collect();
-                    u.set_conv_channel_map(ModelRc::new(VecModel::from(map_vec)));
-                    u.set_conv_output_folder(SharedString::from(folder.clone()));
-                    u.set_conv_filename_prefix(SharedString::from(prefix.clone()));
-                    u.set_conv_audio_suffix_template(SharedString::from(audio_suffix.lock().unwrap().clone()));
-                    u.set_conv_video_suffix_template(SharedString::from(video_suffix.lock().unwrap().clone()));
-                    u.set_ltc_file_idx(0);
-                    u.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
-                }
-
-                // Clear stale group decode results when switching groups
-                let _ = cmd_group.send(GuiCommand::ClearLtcGroupResults);
-
-                // Auto-probe video files for audio streams
-                if is_video && !files.is_empty() {
-                    let folder_str = folder_for_group.lock().unwrap().clone();
-                    if !folder_str.is_empty() {
-                        let full_path = PathBuf::from(&folder_str).join(&files[0]);
-                        let _ = cmd_group.send(GuiCommand::ProbeVideo(
-                            full_path.to_string_lossy().to_string(),
-                        ));
-                    }
-                }
-            }
+            ctx_group.apply(&g, group_idx as isize);
         });
     }
     {
@@ -1390,4 +1438,117 @@ u.set_conv_split_tracks(false);
 
     info!("LTC Slint GUI shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    fn make_ctx() -> (ConvSelectionCtx, mpsc::Receiver<GuiCommand>) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ConvSelectionCtx {
+            cmap: Arc::new(Mutex::new(ChannelMap::identity(0))),
+            pat: Arc::new(Mutex::new(0)),
+            idx: Arc::new(Mutex::new(-1)),
+            prefix: Arc::new(Mutex::new(String::new())),
+            naming: Arc::new(Mutex::new(OutputNamingMode::PrefixTemplates)),
+            output: Arc::new(Mutex::new(String::new())),
+            split: Arc::new(Mutex::new(false)),
+            drop: Arc::new(Mutex::new(false)),
+            concat: Arc::new(Mutex::new(false)),
+            folder: Arc::new(Mutex::new("/test/folder".to_string())),
+            audio_suffix: Arc::new(Mutex::new("_audio_track{:01d}".to_string())),
+            video_suffix: Arc::new(Mutex::new("_video_clip{:02d}".to_string())),
+            cmd_tx: tx,
+            ui_weak: None,
+        };
+        (ctx, rx)
+    }
+
+    fn make_audio_groups() -> BTreeMap<String, Vec<PathBuf>> {
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "TEST".to_string(),
+            vec![
+                PathBuf::from("TEST_S01.wav"),
+                PathBuf::from("TEST_S02.wav"),
+            ],
+        );
+        groups
+    }
+
+    fn make_video_groups() -> BTreeMap<String, Vec<PathBuf>> {
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "CLIP".to_string(),
+            vec![
+                PathBuf::from("GOPR0001.MP4"),
+            ],
+        );
+        groups
+    }
+
+    #[test]
+    fn apply_audio_group_sets_correct_state() {
+        let (ctx, rx) = make_ctx();
+        let groups = make_audio_groups();
+
+        ctx.apply_inner(&groups, 0, None);
+
+        assert_eq!(*ctx.idx.lock().unwrap(), 0);
+        assert_eq!(ctx.cmap.lock().unwrap().num_channels(), 2);
+        assert_eq!(*ctx.prefix.lock().unwrap(), "TEST");
+        assert_eq!(*ctx.naming.lock().unwrap(), OutputNamingMode::PrefixTemplates);
+        assert!(!*ctx.split.lock().unwrap());
+        assert!(!*ctx.drop.lock().unwrap());
+        assert!(!*ctx.concat.lock().unwrap());
+        assert_eq!(*ctx.output.lock().unwrap(), "");
+
+        // Audio group: pat=0, so no ProbeVideo; ClearLtcGroupResults sent
+        let cmd = rx.try_recv().unwrap();
+        assert!(matches!(cmd, GuiCommand::ClearLtcGroupResults));
+        assert!(rx.try_recv().is_err(), "no second command for audio");
+    }
+
+    #[test]
+    fn apply_video_group_sends_probe() {
+        let (ctx, rx) = make_ctx();
+        *ctx.pat.lock().unwrap() = 1;
+        let groups = make_video_groups();
+
+        ctx.apply_inner(&groups, 0, None);
+
+        assert_eq!(*ctx.idx.lock().unwrap(), 0);
+        assert_eq!(*ctx.prefix.lock().unwrap(), "CLIP");
+        assert_eq!(*ctx.naming.lock().unwrap(), OutputNamingMode::SourceStems);
+
+        let cmd1 = rx.try_recv().unwrap();
+        assert!(matches!(cmd1, GuiCommand::ClearLtcGroupResults));
+        let cmd2 = rx.try_recv().unwrap();
+        match cmd2 {
+            GuiCommand::ProbeVideo(ref p) => assert!(p.contains("GOPR0001.MP4")),
+            _ => panic!("expected ProbeVideo, got {:?}", cmd2),
+        }
+        assert!(rx.try_recv().is_err(), "no third command");
+    }
+
+    #[test]
+    fn apply_out_of_range_is_noop() {
+        let (ctx, rx) = make_ctx();
+        let groups = make_audio_groups();
+
+        // Negative index
+        ctx.apply_inner(&groups, -1, None);
+        assert_eq!(*ctx.idx.lock().unwrap(), -1);
+
+        // Index beyond length
+        ctx.apply_inner(&groups, 5, None);
+        assert_eq!(*ctx.idx.lock().unwrap(), -1);
+
+        assert!(rx.try_recv().is_err(), "no commands sent");
+    }
 }
