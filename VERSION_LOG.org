@@ -1,5 +1,53 @@
 #+TITLE: Version History for LTC Timecode Generator
 
+* v0.4.1
+
+Main features are codec-level video encoder selection with automatic hardware
+fallback in the convert tab, a stream-copy mode that leaves video encoding
+untouched, and audio device robustness improvements.
+
+List of Changes:
+- Convert tab:
+  - Reworked video encoding to codec-level selection (av1, h264, h265, prores,
+    dnxhd) with priority-ordered encoder chains — hardware encoders first,
+    software fallbacks; failed encoders are skipped for the rest of the run and
+    the encoder actually used is reported on completion.
+  - Added VAAPI & Vulkan hardware encoder support alongside the existing
+    nvenc/qsv/amf/mf/v4l2m2m candidates.
+  - Run a detailed ffmpeg capability probe at startup; both GUIs now only
+    offer containers/encoders that actually work, with a label showing whether
+    hardware acceleration is supported per encoding.
+  - Added a "Leave Video Encoding Untouched" (stream copy) mode: audio tracks
+    are still extracted, the video is not re-encoded; trim points snap to the
+    nearest video keyframe and the embedded start timecode is re-anchored so
+    it matches the first video frame.
+  - Show recording duration in the recording dropdown menu.
+  - Expandable LTC decode result details for clip groups in ltc-gui.
+  - Multi-file recording sequences now produce per-file output names
+    (C0004-audio-track1 instead of C0003-audio-track2).
+  - More robust file pattern matching using named capture groups.
+  - Bug fixes: encoder fallback chain never ran on encoder init failure;
+    output file preview was wrong for video clip groups and conversion encoded
+    every output twice with inconsistent audio numbering; LTC decoding &
+    timecode handling in multi-clip video files; convert-tab state management
+    bugs in both native GUIs (track selector stored in ephemeral frame state,
+    now snapshot is read-only); file name collision detection now checks
+    individual file names and is a warning instead of a blocking error;
+    ffmpeg probe thread exited uncleanly.
+- Audio & GUI robustness/performance:
+  - Refactored audio-core (playback code extracted to audio_output.rs) and
+    made device handling more robust: StreamDead now triggers full recovery,
+    default buffer size selection, and stream playback starts only after the
+    ring buffer is prefilled.
+  - Fixed egui GUI performance: a broken clap-animation check caused constant
+    immediate repaints (busy loop); the GUI now sleeps when idle.
+  - Added a GUI performance measurement script (perf-test/) and an
+    --autostart flag for benchmark runs.
+- Misc:
+  - Added Windows cross-compilation instructions for the libltc dependency to
+    the README.
+  - Fixed clippy warnings.
+
 * v0.4
 
 Main features are a new much more performant slint based GUI, a new convert
