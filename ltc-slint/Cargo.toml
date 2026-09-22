@@ -1,6 +1,6 @@
 [package]
 name = "ltc-slint"
-version = "0.4.0"
+version = "0.4.1"
 description = "Slint-based GUI spike for the LTC Timecode Generator"
 authors = ["Daidalos"]
 edition = "2021"

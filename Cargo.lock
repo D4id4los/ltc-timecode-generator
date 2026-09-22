@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "audio-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cpal",
  "hound",
@@ -2420,7 +2420,7 @@ checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
 name = "gui-engine"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "audio-core",
@@ -3557,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "ltc-gui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "eframe",
  "egui",
@@ -3567,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "ltc-slint"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arboard",
  "gui-engine",
