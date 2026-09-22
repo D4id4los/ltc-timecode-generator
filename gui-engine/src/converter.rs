@@ -172,13 +172,21 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
 
     let hw = crate::hw_device::discover("ffmpeg", &encoders);
 
-    FfmpegCapabilities {
+    let mut caps = FfmpegCapabilities {
         has_ffmpeg: true,
         available_encoders: encoders,
         available_formats: formats,
         error_message: None,
         hw,
-    }
+    };
+
+    // Validate hardware encoder candidates with a 1-frame test encode.
+    // Non-functional encoders (missing driver, incompatible GPU, etc.) are
+    // removed from available_encoders so they never appear in the dropdown
+    // or the encoder chain.
+    crate::hw_device::validate_hw_encoders(&mut caps.available_encoders, &caps.hw);
+
+    caps
 }
 
 fn run_ffmpeg_list(args: &[&str], filter_fn: fn(&str) -> bool) -> BTreeSet<String> {

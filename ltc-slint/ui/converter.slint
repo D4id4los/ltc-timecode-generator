@@ -5,6 +5,7 @@ import { ScrollView } from "std-widgets.slint";
 export component ConverterSection {
     in-out property <bool> has-ffmpeg: false;
     in-out property <string> ffmpeg-error: "";
+    in-out property <bool> ffmpeg-probing: false;
     in-out property <string> selected-folder: "";
     in-out property <[FileGroupInfo]> file-groups: [];
     in-out property <int> selected-group-idx: -1;
@@ -603,6 +604,15 @@ export component ConverterSection {
                     HorizontalLayout { padding: 8px; spacing: 6px;
                         Text { text: "⚠"; color: AppColors.amber; font-size: 12px; }
                         Text { text: root.sanity-msg; color: AppColors.amber; font-size: 10px; wrap: word-wrap; horizontal-stretch: 1; }
+                    }
+                }
+                if (!root.has-ffmpeg && root.ffmpeg-error == "" && root.ffmpeg-probing) : Rectangle {
+                    border-radius: 6px;
+                    border-width: 1px; border-color: AppColors.border-main;
+                    min-height: 24px;
+                    HorizontalLayout { padding: 8px; spacing: 6px;
+                        Text { text: "⏳"; color: AppColors.text-muted; font-size: 12px; }
+                        Text { text: "Probing ffmpeg capabilities…"; color: AppColors.text-muted; font-size: 10px; wrap: word-wrap; horizontal-stretch: 1; }
                     }
                 }
                 if (!root.has-ffmpeg && root.ffmpeg-error != "") : Rectangle {

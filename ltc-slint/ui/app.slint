@@ -84,6 +84,7 @@ export component AppWindow inherits Window {
     // ── Converter properties ──
     in-out property <bool> conv-has-ffmpeg: false;
     in-out property <string> conv-ffmpeg-error: "";
+    in-out property <bool> conv-ffmpeg-probing: false;
     in-out property <string> conv-selected-folder: "";
     in-out property <[FileGroupInfo]> conv-file-groups: [];
     in-out property <int> conv-selected-group-idx: -1;
@@ -669,6 +670,7 @@ export component AppWindow inherits Window {
                     cancel-decode => { root.cancel-decode(); }
                     has-ffmpeg: root.conv-has-ffmpeg;
                     ffmpeg-error: root.conv-ffmpeg-error;
+                    ffmpeg-probing: root.conv-ffmpeg-probing;
                     selected-folder: root.conv-selected-folder;
                     file-groups: root.conv-file-groups;
                     selected-group-idx: root.conv-selected-group-idx;

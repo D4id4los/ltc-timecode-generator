@@ -9,7 +9,7 @@ use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
     available_containers, conversion_sanity_check_with_naming,
     evaluate_readiness, output_collision_warning,
-    find_timecode_at_offset, format_blockers, query_ffmpeg_capabilities,
+    find_timecode_at_offset, format_blockers,
     preview_output_files, spawn_conversion, supported_audio_encoders, supported_containers,
     ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
     ConverterSettings, FfmpegCapabilities, OutputKind, OutputNamingMode, RecordingType, TimecodeMetadata,
@@ -123,15 +123,6 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                 state.selected_group_idx = None;
                 state.ltc_file_idx = 1; // default to track 2
                 state.trim_ltc_start = false;
-
-                let guard = state.ffmpeg_probe_started.clone();
-                let caps_arc = state.ffmpeg_caps.clone();
-                if !guard.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::spawn(move || {
-                        let result = query_ffmpeg_capabilities();
-                        *caps_arc.lock().unwrap() = Some(result);
-                    });
-                }
             }
         }
     });
@@ -934,7 +925,20 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
 
 fn render_output_format(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let caps_opt = state.ffmpeg_caps.lock().unwrap().clone();
+    let caps_opt = state.latest.ffmpeg_caps.clone();
+
+    // While the ffmpeg capability probe is still running, show a placeholder.
+    if caps_opt.is_none() && state.latest.ffmpeg_probe_running {
+        ui.label(
+            RichText::new("Probing ffmpeg capabilities…")
+                .font(FontId::proportional(10.0))
+                .color(colors.text_muted),
+        );
+        if state.recording_type == RecordingType::VideoClipSequence {
+            ui.checkbox(&mut state.leave_video_untouched, "Leave video encoding untouched (stream copy)");
+        }
+        return;
+    }
 
     if let Some(ref caps) = caps_opt {
         apply_available_defaults(&mut state.container, &mut state.video_encoder, &mut state.audio_encoder, caps);
@@ -1364,7 +1368,7 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
         return;
     }
 
-    let caps_opt = state.ffmpeg_caps.lock().unwrap().clone();
+    let caps_opt = state.latest.ffmpeg_caps.clone();
 
     let readiness = evaluate_readiness(
         state.selected_group_idx.is_some(),
@@ -1523,7 +1527,7 @@ fn start_conversion(state: &mut AppState) {
 
     let cs = state.conversion_state.clone();
     let cf = state.cancel_flag.clone();
-    let caps = state.ffmpeg_caps.lock().unwrap().clone();
+    let caps = state.latest.ffmpeg_caps.clone();
     state.convert_handle = Some(spawn_conversion(settings, cs, cf, caps.as_ref()));
 }
 

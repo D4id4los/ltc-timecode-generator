@@ -9,6 +9,7 @@ use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetecti
 use log::{debug, error, info, warn};
 
 use crate::command::GuiCommand;
+use crate::converter::{query_ffmpeg_capabilities, FfmpegCapabilities};
 use crate::ffprobe;
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
@@ -21,8 +22,27 @@ const MAX_CLAP_LOGS: usize = 1000;
 const BUFFER_SIZE: u32 = 0;
 
 pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnapshot>>, use_libltc: bool) {
+    engine_main_with_probe(cmd_rx, state, use_libltc, query_ffmpeg_capabilities)
+}
+
+/// Internal message sent from the ffmpeg-capability probe thread.
+struct FfmpegProbeResult {
+    caps: FfmpegCapabilities,
+}
+
+/// Like [`engine_main`] but accepts an injectable capability-probe function
+/// for testing.
+pub fn engine_main_with_probe<F>(
+    cmd_rx: Receiver<GuiCommand>,
+    state: Arc<ArcSwap<AppStateSnapshot>>,
+    use_libltc: bool,
+    probe_fn: F,
+) where
+    F: FnOnce() -> FfmpegCapabilities + Send + 'static,
+{
     let mut current = AppStateSnapshot::initial();
     current.use_libltc = use_libltc;
+    current.ffmpeg_probe_running = true;
     let core = AudioCore::new();
     let mut last_tick = Instant::now();
 
@@ -34,6 +54,19 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
     // Internal result channel for async decode operations
     let (decode_result_tx, decode_result_rx) =
         std::sync::mpsc::channel::<LtcDecodeResult>();
+
+    // Internal result channel for ffmpeg capability probe
+    let (caps_tx, caps_rx) =
+        std::sync::mpsc::channel::<FfmpegProbeResult>();
+
+    // Spawn the ffmpeg capability probe on a background thread
+    std::thread::Builder::new()
+        .name("ffmpeg-probe".into())
+        .spawn(move || {
+            let caps = probe_fn();
+            let _ = caps_tx.send(FfmpegProbeResult { caps });
+        })
+        .expect("failed to spawn ffmpeg-probe thread");
 
     // Chunked decode progress / cancel tracking
     let mut decode_cancel: Option<Arc<AtomicBool>> = None;
@@ -140,7 +173,33 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
             }
         }
 
-        // 1.6 Poll chunked decode progress
+        // 1.6 Drain ffmpeg capability probe result
+        if current.ffmpeg_probe_running {
+            loop {
+                match caps_rx.try_recv() {
+                    Ok(FfmpegProbeResult { caps }) => {
+                        current.ffmpeg_caps = Some(caps.clone());
+                        current.ffmpeg_probe_running = false;
+                        info!(
+                            "ffmpeg capability probe complete: {} encoder(s), {} format(s), hw_vaapi={}, hw_vulkan={}",
+                            caps.available_encoders.len(),
+                            caps.available_formats.len(),
+                            caps.hw.vaapi_device.is_some(),
+                            caps.hw.vulkan_available,
+                        );
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Probe thread exited without sending — treat as no ffmpeg
+                        warn!("ffmpeg capability probe thread disconnected unexpectedly");
+                        current.ffmpeg_probe_running = false;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                }
+            }
+        }
+
+        // 1.7 Poll chunked decode progress
         if current.ltc_is_detecting {
             if let Some((total, ref completed)) = decode_progress {
                 let done = completed.load(Ordering::Relaxed);

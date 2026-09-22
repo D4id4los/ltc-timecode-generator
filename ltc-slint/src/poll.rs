@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gui_engine::converter::{ConversionState, ConversionStatus, FfmpegCapabilities, OutputNamingMode};
+use gui_engine::converter::{ConversionState, ConversionStatus, FfmpegCapabilities, OutputNamingMode, select_best_combination};
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode;
@@ -15,6 +15,7 @@ use slint::{ModelRc, SharedString, VecModel};
 
 use crate::toast::{push_toast, ToastItem};
 use crate::timecode_helpers::set_tc_segments;
+use crate::update_converter_options;
 use crate::{AppColors, AppWindow, LogEntry};
 use slint::ComponentHandle;
 use slint::Global;
@@ -43,6 +44,7 @@ pub fn setup_poll_timer(
     pulse_phase: Arc<Mutex<f64>>,
     conv_state: Arc<Mutex<ConversionState>>,
     conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>>,
+    conv_ffmpeg_probing: Arc<Mutex<bool>>,
     conv_sanity_msg: Arc<Mutex<String>>,
     conv_filename_prefix: Arc<Mutex<String>>,
     conv_naming_mode: Arc<Mutex<OutputNamingMode>>,
@@ -62,6 +64,9 @@ pub fn setup_poll_timer(
     let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let last_device_key: Arc<Mutex<(usize, String)>> = Arc::new(Mutex::new((0, String::new())));
     let last_auto_applied_gen: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+
+    // Latch: track when ffmpeg caps have been mirrored into conv_ffmpeg_caps
+    let last_caps_loaded: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     let poll_timer = slint::Timer::default();
     poll_timer.start(
@@ -335,16 +340,45 @@ pub fn setup_poll_timer(
                 }
             }
 
-            // 20. Converter state sync
+            // 20. ffmpeg capability probe state sync
             {
-                let caps = conv_ffmpeg_caps.lock().unwrap();
-                if let Some(ref c) = *caps {
-                    ui.set_conv_has_ffmpeg(c.has_ffmpeg);
-                    if let Some(ref msg) = c.error_message {
+                // Mirror probing flag from engine snapshot every tick
+                *conv_ffmpeg_probing.lock().unwrap() = s.ffmpeg_probe_running;
+                ui.set_conv_ffmpeg_probing(s.ffmpeg_probe_running);
+
+                // Mirror engine-probed caps into the GUI-side Arc<Mutex> when they first arrive.
+                // The latch ensures this runs exactly once per session.
+                if s.ffmpeg_caps.is_some() && !*last_caps_loaded.lock().unwrap() {
+                    *last_caps_loaded.lock().unwrap() = true;
+                    let caps = s.ffmpeg_caps.clone().unwrap();
+                    *conv_ffmpeg_caps.lock().unwrap() = Some(caps.clone());
+                    ui.set_conv_has_ffmpeg(caps.has_ffmpeg);
+                    if let Some(ref msg) = caps.error_message {
                         ui.set_conv_ffmpeg_error(SharedString::from(msg));
                     }
+                    // Apply intelligent defaults and update dropdown models
+                    let current_container = conv_container.lock().unwrap().clone();
+                    let (def_c, def_v, def_a) = select_best_combination(&caps);
+                    if current_container != def_c {
+                        *conv_container.lock().unwrap() = def_c.clone();
+                        ui.set_conv_container(SharedString::from(def_c));
+                    }
+                    if *conv_video_encoder.lock().unwrap() != def_v {
+                        *conv_video_encoder.lock().unwrap() = def_v.clone();
+                        ui.set_conv_video_encoder(SharedString::from(def_v));
+                    }
+                    if *conv_audio_encoder.lock().unwrap() != def_a {
+                        *conv_audio_encoder.lock().unwrap() = def_a.clone();
+                        ui.set_conv_audio_encoder(SharedString::from(def_a));
+                    }
+                    let container_guard = conv_container.lock().unwrap();
+                    update_converter_options(&ui, &caps, &container_guard);
                 }
             }
+
+            // 21. Conversion state sync
+            // (renumbered from 20/21/22/... — the "read conv_ffmpeg_caps for has-ffmpeg/error"
+            //  block was folded into the mirror logic above)
             {
                 let cs = conv_state.lock().unwrap();
                 let (status_str, progress) = match &cs.status {

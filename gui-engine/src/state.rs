@@ -1,3 +1,4 @@
+use crate::converter::FfmpegCapabilities;
 use crate::ffprobe::VideoAudioProbe;
 use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
 
@@ -88,6 +89,10 @@ pub struct AppStateSnapshot {
     // Chunked decode progress
     pub ltc_decode_progress_pct: f32,       // 0.0..1.0
     pub ltc_decode_progress_str: String,    // "Chunk 3/12..."
+
+    // ffmpeg capability probe (engine-owned, async)
+    pub ffmpeg_caps: Option<FfmpegCapabilities>,
+    pub ffmpeg_probe_running: bool,
 }
 
 impl AppStateSnapshot {
@@ -155,6 +160,8 @@ impl AppStateSnapshot {
             ltc_decode_is_video: false,
             ltc_decode_progress_pct: 0.0,
             ltc_decode_progress_str: String::new(),
+            ffmpeg_caps: None,
+            ffmpeg_probe_running: false,
         }
     }
 }

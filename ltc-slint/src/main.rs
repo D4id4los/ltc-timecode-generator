@@ -11,7 +11,7 @@ use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
-    find_timecode_at_offset, query_ffmpeg_capabilities, select_best_combination,
+    find_timecode_at_offset, select_best_combination,
     spawn_conversion, ChannelMap, ConversionPipeline, ConversionState,
     ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
     FfmpegCapabilities, OutputNamingMode, RecordingType, TimecodeMetadata,
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Update the Slint dropdown models for container/video/audio options
 /// based on ffmpeg capabilities and current container selection.
-fn update_converter_options(
+pub(crate) fn update_converter_options(
     ui: &AppWindow,
     caps: &FfmpegCapabilities,
     container: &str,
@@ -113,6 +113,7 @@ fn _run_gui(
     let conv_cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let conv_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     let conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>> = Arc::new(Mutex::new(None));
+    let conv_ffmpeg_probing: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_sanity_msg: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let conv_trim_to_first_ltc: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_trim_offset_secs: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
@@ -597,43 +598,29 @@ fn _run_gui(
                     }
                 }
             }
-            let caps = conv_ffmpeg_caps_for_select.clone();
-            let ui_weak2 = ui_weak.clone();
-            let container_for_update = container_for_folder.clone();
-            let venc_for_update = venc_for_folder.clone();
-            let aenc_for_update = aenc_for_folder.clone();
-            std::thread::spawn(move || {
-                let mut c = caps.lock().unwrap();
-                if c.is_none() {
-                    *c = Some(query_ffmpeg_capabilities());
-                }
-                if let Some(ref caps_data) = *c {
-                    if let Some(u) = ui_weak2.upgrade() {
-                        u.set_conv_has_ffmpeg(caps_data.has_ffmpeg);
-                        if let Some(ref msg) = caps_data.error_message {
-                            u.set_conv_ffmpeg_error(SharedString::from(msg));
-                        }
-                        let current_container = container_for_update.lock().unwrap().clone();
-                        // Apply intelligent defaults
-                        let (def_c, def_v, def_a) = select_best_combination(caps_data);
-                        if current_container != def_c {
-                            *container_for_update.lock().unwrap() = def_c.clone();
-                            u.set_conv_container(SharedString::from(def_c.clone()));
-                        }
-                        if *venc_for_update.lock().unwrap() != def_v {
-                            *venc_for_update.lock().unwrap() = def_v.clone();
-                            u.set_conv_video_encoder(SharedString::from(def_v));
-                        }
-                        if *aenc_for_update.lock().unwrap() != def_a {
-                            *aenc_for_update.lock().unwrap() = def_a.clone();
-                            u.set_conv_audio_encoder(SharedString::from(def_a));
-                        }
-                        // Update dropdown models to show only available options
-                        let cur_container = container_for_update.lock().unwrap().clone();
-                        update_converter_options(&u, caps_data, &cur_container);
+            // Caps are probed asynchronously by the engine; use whatever we have.
+            // Poll will apply defaults + update dropdowns when caps arrive.
+            let caps_guard = conv_ffmpeg_caps_for_select.lock().unwrap();
+            if let Some(ref caps_data) = *caps_guard {
+                if let Some(u) = ui_weak.upgrade() {
+                    let current_container = container_for_folder.lock().unwrap().clone();
+                    let (def_c, def_v, def_a) = select_best_combination(caps_data);
+                    if current_container != def_c {
+                        *container_for_folder.lock().unwrap() = def_c.clone();
+                        u.set_conv_container(SharedString::from(def_c));
                     }
+                    if *venc_for_folder.lock().unwrap() != def_v {
+                        *venc_for_folder.lock().unwrap() = def_v.clone();
+                        u.set_conv_video_encoder(SharedString::from(def_v));
+                    }
+                    if *aenc_for_folder.lock().unwrap() != def_a {
+                        *aenc_for_folder.lock().unwrap() = def_a.clone();
+                        u.set_conv_audio_encoder(SharedString::from(def_a));
+                    }
+                    update_converter_options(&u, caps_data, &current_container);
                 }
-            });
+            }
+            drop(caps_guard);
         });
     }
     // ── Pattern selection callback ──
@@ -1334,6 +1321,7 @@ u.set_conv_split_tracks(false);
         pulse_phase,
         conv_state,
         conv_ffmpeg_caps,
+        conv_ffmpeg_probing,
         conv_sanity_msg,
         conv_filename_prefix,
         conv_naming_mode,
