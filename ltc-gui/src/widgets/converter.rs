@@ -16,7 +16,7 @@ use gui_engine::converter::{
 };
 use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
-use gui_engine::file_pattern::{match_files_all_patterns, MatchedGroup};
+use gui_engine::file_pattern::{group_display_key, match_files_all_patterns, MatchedGroup};
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::LtcDecodeStatus;
 
@@ -193,8 +193,8 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                 let selected_text = state
                     .selected_group_idx
                     .and_then(|idx| groups.get(idx))
-                    .map(|g| g.prefix.as_str())
-                    .unwrap_or("Select a recording…");
+                    .map(|g| group_display_key(&g.prefix, &g.rel_dir))
+                    .unwrap_or_else(|| "Select a recording…".to_string());
                 egui::ComboBox::from_id_salt("group_combo")
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
@@ -216,9 +216,10 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                                     .map(|s| format!("  ·  {}", format_duration_secs(s)))
                                     .unwrap_or_default()
                             };
+                            let display_key = group_display_key(&group.prefix, &group.rel_dir);
                             let label = format!(
                                 "{}  [{}]  ({} file{}: {}){}",
-                                group.prefix,
+                                display_key,
                                 type_badge,
                                 group.files.len(),
                                 if group.files.len() == 1 { "" } else { "s" },

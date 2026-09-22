@@ -170,6 +170,7 @@ fn probe_video_audio(path: String) -> Result<gui_engine::ffprobe::VideoAudioProb
 #[derive(serde::Serialize)]
 struct FileGroupInfo {
     prefix: String,
+    rel_dir: String,
     files: Vec<String>,
     channel_count: usize,
     pattern_name: String,
@@ -192,10 +193,15 @@ fn scan_folder_for_groups(folder_path: String, _pattern_index: usize) -> Result<
     let result = groups
         .into_iter()
         .map(|g| {
-            let file_names: Vec<String> = g
+            let file_paths: Vec<String> = g
                 .files
                 .iter()
-                .map(|f| f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string())
+                .map(|f| {
+                    f.strip_prefix(&folder_path)
+                        .unwrap_or(f)
+                        .to_string_lossy()
+                        .to_string()
+                })
                 .collect();
             let rt = match g.recording_type {
                 RecordingType::MultiTrackAudio => "MultiTrackAudio",
@@ -203,7 +209,8 @@ fn scan_folder_for_groups(folder_path: String, _pattern_index: usize) -> Result<
             };
             FileGroupInfo {
                 prefix: g.prefix,
-                files: file_names,
+                rel_dir: g.rel_dir,
+                files: file_paths,
                 channel_count: g.files.len(),
                 pattern_name: g.pattern_name.to_string(),
                 recording_type: rt.to_string(),

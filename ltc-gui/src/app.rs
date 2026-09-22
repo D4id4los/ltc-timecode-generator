@@ -1087,6 +1087,7 @@ mod tests {
 
         let group = MatchedGroup {
             prefix: "TEST".to_string(),
+            rel_dir: String::new(),
             pattern_name: "TASCAM",
             recording_type: RecordingType::MultiTrackAudio,
             files: vec![
@@ -1123,6 +1124,7 @@ mod tests {
 
         let group = MatchedGroup {
             prefix: "CLIP".to_string(),
+            rel_dir: String::new(),
             pattern_name: "GoPro",
             recording_type: RecordingType::VideoClipSequence,
             files: vec![

@@ -76,6 +76,7 @@ impl ConvSelectionCtx {
             return;
         }
         let prefix = keys[group_idx as usize].clone();
+        let raw_prefix = gui_engine::file_pattern::group_key_prefix(&prefix).to_string();
         let files = groups.get(&prefix).cloned().unwrap_or_default();
         let n = files.len();
         let pat = *self.pat.lock().unwrap();
@@ -83,7 +84,7 @@ impl ConvSelectionCtx {
 
         *self.cmap.lock().unwrap() = ChannelMap::identity(n);
         *self.idx.lock().unwrap() = group_idx;
-        *self.prefix.lock().unwrap() = prefix.clone();
+        *self.prefix.lock().unwrap() = raw_prefix;
         *self.naming.lock().unwrap() = if is_video {
             OutputNamingMode::SourceStems
         } else {

@@ -39,7 +39,7 @@ pub use converter::{
     FfmpegCapabilities, HwDeviceCapabilities, RecordingType, SharedConversionState, CancelFlag,
     TimecodeMetadata,
 };
-pub use file_pattern::{default_output_filename, match_files_to_groups, match_files_all_patterns, wrap_user_selected_files, FileNamingPattern, BUILTIN_PATTERNS, CAMERA_PATTERNS};
+pub use file_pattern::{default_output_filename, group_display_key, group_key_prefix, match_files_to_groups, match_files_all_patterns, wrap_user_selected_files, FileNamingPattern, BUILTIN_PATTERNS, CAMERA_PATTERNS};
 pub use video_codecs::{
     available_video_codecs, codec_supports_container, describe_chain,
     find_candidate, hw_frames_for, normalize_video_codec,

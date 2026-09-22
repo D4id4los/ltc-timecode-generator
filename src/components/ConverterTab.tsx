@@ -28,6 +28,7 @@ interface FfmpegCaps {
 
 interface FileGroupInfo {
   prefix: string;
+  rel_dir: string;
   files: string[];
   channel_count: number;
   pattern_name: string;
@@ -736,7 +737,7 @@ function TauriConverter() {
             <div className="space-y-1">
               {fileGroups.map((g, i) => (
                 <button
-                  key={g.prefix}
+                  key={`${g.prefix}-${g.rel_dir}`}
                   onClick={() => handleSelectGroup(i)}
                   className={`w-full text-left px-3 py-2 rounded-lg border text-sm transition-colors ${
                     selectedGroupIdx === i
@@ -744,7 +745,9 @@ function TauriConverter() {
                       : "border-border-main bg-card-bg text-text-muted hover:border-[#FF5F1F]/50"
                   }`}
                 >
-                  <span className="font-mono font-semibold">{g.prefix}</span>
+                  <span className="font-mono font-semibold">
+                    {g.rel_dir ? `${g.prefix} (${g.rel_dir})` : g.prefix}
+                  </span>
                   <span className={`text-xs ml-2 px-1.5 py-0.5 rounded ${
                     g.recording_type === "MultiTrackAudio"
                       ? "bg-blue-500/20 text-blue-400"
