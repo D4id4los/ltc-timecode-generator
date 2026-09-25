@@ -7,10 +7,10 @@ use gui_engine::command::{GuiCommand, ConverterCommand};
 use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, build_per_file_trim_and_timecode, conversion_sanity_check,
+    available_containers, build_per_file_start_timecodes, conversion_sanity_check,
     evaluate_readiness, output_collision_warning,
-    find_timecode_at_offset, format_blockers,
-    preview_output_files, spawn_conversion, supported_audio_encoders, supported_containers,
+    format_blockers,
+    preview_output_files, spawn_conversion, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
     ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
     ConverterSettings, FfmpegCapabilities, OutputKind, RecordingType, TimecodeMetadata,
 };
@@ -172,7 +172,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                 let group_count = groups.len();
                 state.file_groups = Some(groups.clone());
                 state.send(GuiCommand::ProbeFileDurations(probe_paths));
-                state.trim_ltc_start = false;
+                state.set_start_from_ltc = false;
                 if group_count > 0 {
                     let cmds = apply_group_selection(state, &groups, 0);
                     for cmd in cmds {
@@ -1492,7 +1492,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
         }
     }
 
-    // Trim to first LTC checkbox (renamed for clarity)
+    // Set start time from LTC checkbox
     let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
     let group_has_results = state.latest.ltc_group_results.iter().any(|r| r.is_some());
     let ltc_available = !state.latest.ltc_is_detecting && !state.latest.ltc_group_is_detecting
@@ -1504,15 +1504,29 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_enabled(ltc_available, egui::Checkbox::new(
-            &mut state.trim_ltc_start,
-            "Cut and Set Start Time to First LTC Frame",
+            &mut state.set_start_from_ltc,
+            "Set Start Time from LTC",
         ));
-        if state.trim_ltc_start && state.trim_offset_secs > 0.001 {
-            ui.label(
-                RichText::new(format!("(trim {:.3}s of silence, set timecode from LTC)", state.trim_offset_secs))
-                    .font(FontId::proportional(10.0))
-                    .color(colors.text_muted),
-            );
+        if state.set_start_from_ltc {
+            let tc_text = if is_video_group {
+                state.latest.ltc_group_results.first()
+                    .and_then(|r| r.as_ref())
+                    .and_then(|r| start_timecode_from_ltc(r))
+                    .map(|m| gui_engine::converter::format_ffmpeg_timecode(&m.start, m.drop_frame))
+                    .unwrap_or_default()
+            } else {
+                state.latest.ltc_decode_result.as_ref()
+                    .and_then(|r| start_timecode_from_ltc(r))
+                    .map(|m| gui_engine::converter::format_ffmpeg_timecode(&m.start, m.drop_frame))
+                    .unwrap_or_default()
+            };
+            if !tc_text.is_empty() {
+                ui.label(
+                    RichText::new(format!("(no cut; starts at {})", tc_text))
+                        .font(FontId::proportional(10.0))
+                        .color(colors.text_muted),
+                );
+            }
         }
         if !ltc_available && !state.latest.ltc_is_detecting {
             ui.label(
@@ -1673,7 +1687,7 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
         filename_prefix: state.filename_prefix.clone(),
         audio_suffix_template: state.audio_suffix_template.clone(),
         video_suffix_template: state.video_suffix_template.clone(),
-        trim_to_first_ltc: state.trim_ltc_start,
+        set_start_from_ltc: state.set_start_from_ltc,
         trim_offsets_secs: vec![0.0; selected_input_files(state).len()],
         timecode_meta_per_file: vec![None; selected_input_files(state).len()],
         resolved_hw_device: None,
@@ -1685,41 +1699,25 @@ fn start_conversion(state: &mut AppState) {
     let num_files = settings.input_files.len();
     let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
 
-    if is_video_group && state.trim_ltc_start {
-        // Per-file trim & timecode from group decode results
-        let group_results: Vec<Option<&gui_engine::LtcDetectionResult>> = state.latest.ltc_group_results
-            .iter()
-            .map(|r| r.as_ref())
-            .collect();
-        let (trims, metas) = build_per_file_trim_and_timecode(&group_results);
-        settings.trim_offsets_secs = trims;
-        settings.timecode_meta_per_file = metas;
+    if state.set_start_from_ltc {
+        settings.trim_offsets_secs = vec![0.0; num_files];
+        if is_video_group {
+            // Per-file start timecode from group decode results
+            let group_results: Vec<Option<&gui_engine::LtcDetectionResult>> = state.latest.ltc_group_results
+                .iter()
+                .map(|r| r.as_ref())
+                .collect();
+            settings.timecode_meta_per_file = build_per_file_start_timecodes(&group_results);
+        } else {
+            // Single decode result → same metadata for all files
+            settings.timecode_meta_per_file = (0..num_files).map(|_| {
+                state.latest.ltc_decode_result.as_ref()
+                    .and_then(|r| start_timecode_from_ltc(r))
+            }).collect();
+        }
     } else {
-        // Single decode result (audio group or single-file) — same trim/TC for all files
-        let trim_secs = if state.trim_ltc_start { state.trim_offset_secs } else { 0.0 };
-        settings.trim_offsets_secs = if num_files > 0 && state.trim_ltc_start {
-            vec![trim_secs; num_files]
-        } else {
-            vec![0.0; num_files]
-        };
-
-        settings.timecode_meta_per_file = if state.trim_ltc_start && trim_secs > 0.001 {
-            let ltc_result = state.latest.ltc_decode_result.as_ref();
-            (0..num_files).map(|_| {
-                ltc_result.and_then(|r| {
-                    if !matches!(r.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
-                        return None;
-                    }
-                    find_timecode_at_offset(&r.timecodes, trim_secs).map(|tc| TimecodeMetadata {
-                        start: tc,
-                        fps: r.detected_fps as f64,
-                        drop_frame: r.drop_frame,
-                    })
-                })
-            }).collect()
-        } else {
-            vec![None; num_files]
-        };
+        settings.trim_offsets_secs = vec![0.0; num_files];
+        settings.timecode_meta_per_file = vec![None; num_files];
     }
 
     *state.conversion_state.lock().unwrap() = ConversionState::idle();

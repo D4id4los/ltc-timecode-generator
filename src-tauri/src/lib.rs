@@ -256,7 +256,7 @@ struct ConvertRequest {
     #[serde(default)]
     generate_synthetic_video: bool,
     #[serde(default)]
-    trim_to_first_ltc: bool,
+    set_start_from_ltc: bool,
     #[serde(default)]
     trim_offsets_secs: Vec<f64>,
     #[serde(default)]
@@ -353,7 +353,7 @@ fn start_convert(
         filename_prefix: request.filename_prefix,
         audio_suffix_template: request.audio_suffix_template,
         video_suffix_template: request.video_suffix_template,
-        trim_to_first_ltc: request.trim_to_first_ltc,
+        set_start_from_ltc: request.set_start_from_ltc,
         trim_offsets_secs: trim_offsets,
         timecode_meta_per_file,
         concat_audio: request.concat_audio,
@@ -484,7 +484,7 @@ fn preview_converter_outputs(request: ConvertRequest) -> Result<Vec<PreviewOutpu
         filename_prefix: request.filename_prefix,
         audio_suffix_template: request.audio_suffix_template,
         video_suffix_template: request.video_suffix_template,
-        trim_to_first_ltc: request.trim_to_first_ltc,
+        set_start_from_ltc: request.set_start_from_ltc,
         trim_offsets_secs: vec![0.0; request.input_files.len()],
         timecode_meta_per_file: vec![None; request.input_files.len()],
         concat_audio: request.concat_audio,

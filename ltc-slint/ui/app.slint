@@ -111,8 +111,9 @@ export component AppWindow inherits Window {
     in-out property <[string]> conv-container-options: [];
     in-out property <[string]> conv-video-encoder-options: [];
     in-out property <[string]> conv-audio-encoder-options: [];
-    in-out property <bool> trim-to-first-ltc: false;
-    in-out property <float> trim-offset-secs: 0.0;
+    in-out property <bool> set-start-from-ltc: false;
+    in-out property <float> ltc-offset-secs: 0.0;
+    in-out property <string> ltc-start-tc-text: "";
 
     // ── LTC detection properties ──
     in-out property <int> ltc-file-idx: 0;
@@ -200,7 +201,7 @@ export component AppWindow inherits Window {
     callback toggle-synthetic-video;
     callback toggle-copy-video;
     callback conv-select-pattern(int);
-    callback toggle-trim-ltc;
+    callback toggle-set-start-ltc;
 
     // ── Tab navigation ──
     callback tab-clicked(int);
@@ -697,9 +698,10 @@ export component AppWindow inherits Window {
                     video-encoder-options: root.conv-video-encoder-options;
                     audio-encoder-options: root.conv-audio-encoder-options;
                     selected-pattern: root.conv-selected-pattern;
-                    trim-to-first-ltc: root.trim-to-first-ltc;
-                    trim-offset-secs: root.trim-offset-secs;
-                    toggle-trim-ltc => { root.toggle-trim-ltc(); }
+                    set-start-from-ltc: root.set-start-from-ltc;
+                    ltc-offset-secs: root.ltc-offset-secs;
+                    ltc-start-tc-text: root.ltc-start-tc-text;
+                    toggle-set-start-ltc => { root.toggle-set-start-ltc(); }
                     select-folder => { root.conv-select-folder(); }
                     select-group(idx) => { root.conv-select-group(idx); }
                     map-cell-clicked(row, col) => { root.conv-map-cell-clicked(row, col); }

@@ -27,12 +27,14 @@ pub use audio_core::{
 // Re-export converter/file_pattern types for convenience
 pub use converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, build_per_file_trim_and_timecode, conversion_sanity_check,
+    available_containers, build_per_file_start_timecodes,
+    build_per_file_trim_and_timecode, conversion_sanity_check,
     evaluate_readiness,
     find_timecode_at_offset, format_blockers, format_ffmpeg_timecode,
     plan_concat_outputs, plan_video_outputs, query_ffmpeg_capabilities,
     select_best_combination,
-    spawn_conversion, supported_audio_encoders, supported_containers,
+    spawn_conversion, start_timecode_from_ltc,
+    supported_audio_encoders, supported_containers,
     AudioKeep, ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
     ConversionState, ConversionStatus, ConverterSettings, output_collision_warning,
     OutputKind, PreviewOutput, preview_output_files, StepFailure,

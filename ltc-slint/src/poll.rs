@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gui_engine::converter::{ConversionState, ConversionStatus, FfmpegCapabilities, select_best_combination};
+use gui_engine::converter::{start_timecode_from_ltc, ConversionState, ConversionStatus, FfmpegCapabilities, select_best_combination};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::AppStateSnapshot;
@@ -56,8 +56,8 @@ pub fn setup_poll_timer(
     conv_audio_encoder: Arc<Mutex<String>>,
     conv_copy_video: Arc<Mutex<bool>>,
     conv_selected_folder: Arc<Mutex<String>>,
-    conv_trim_offset_secs: Arc<Mutex<f64>>,
-    conv_trim_to_first_ltc: Arc<Mutex<bool>>,
+    conv_ltc_offset_secs: Arc<Mutex<f64>>,
+    conv_set_start_from_ltc: Arc<Mutex<bool>>,
     conv_split_tracks: Arc<Mutex<bool>>,
     conv_drop_ltc_track: Arc<Mutex<bool>>,
 ) {
@@ -117,11 +117,16 @@ pub fn setup_poll_timer(
                     // Auto-set: once per decode generation (user unticks survive)
                     if should_auto_apply_ltc_settings(s.ltc_decode_generation, *last_auto, &r.status) {
                         *last_auto = s.ltc_decode_generation;
-                        let offset = r.first_ltc_timecode_secs;
-                        *conv_trim_offset_secs.lock().unwrap() = offset;
-                        ui.set_trim_offset_secs(offset as f32);
-                        *conv_trim_to_first_ltc.lock().unwrap() = true;
-                        ui.set_trim_to_first_ltc(true);
+                        *conv_ltc_offset_secs.lock().unwrap() = r.first_ltc_timecode_secs;
+                        *conv_set_start_from_ltc.lock().unwrap() = true;
+                        ui.set_set_start_from_ltc(true);
+                        if let Some(meta) = start_timecode_from_ltc(r) {
+                            let sep = if meta.drop_frame { ";" } else { ":" };
+                            let tc = meta.start;
+                            let tc_text = format!("{:02}{sep}{:02}{sep}{:02}{sep}{:02}",
+                                tc.hours, tc.minutes, tc.seconds, tc.frames);
+                            ui.set_ltc_start_tc_text(SharedString::from(tc_text));
+                        }
                         *conv_split_tracks.lock().unwrap() = true;
                         ui.set_conv_split_tracks(true);
                         *conv_drop_ltc_track.lock().unwrap() = true;

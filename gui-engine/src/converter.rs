@@ -614,7 +614,7 @@ pub struct ConverterSettings {
     pub video_suffix_template: String,
 
     // ── Trimming & Timecode (per file) ──
-    pub trim_to_first_ltc: bool,
+    pub set_start_from_ltc: bool,
     pub trim_offsets_secs: Vec<f64>,
     pub timecode_meta_per_file: Vec<Option<TimecodeMetadata>>,
 
@@ -1351,6 +1351,62 @@ pub fn shift_timecode_back(tc: &Timecode, delta_secs: f64, fps: f64, drop_frame:
         frames -= 1;
     }
     out
+}
+
+/// Compute the start timecode for a clip from its LTC decode result without
+/// cutting  the leading non-LTC region.
+///
+/// The start timecode is determined by taking the timecode value of the first
+/// secure LTC frame (first frame of the first coherent run) and counting frames
+/// backwards to the beginning of the file.  Drop-frame and midnight wrap are
+/// handled.
+///
+/// Returns `None` when the decode status is not `Success` or `LowConfidence`,
+/// the timecodes list is empty, or the frame rate is ≤ 0.
+///
+/// Logs a warning when the first frame is not part of a secure (≥2 second)
+/// coherent run —  this is a best-effort fallback.
+pub fn start_timecode_from_ltc(result: &audio_core::LtcDetectionResult) -> Option<TimecodeMetadata> {
+    use audio_core::LtcDecodeStatus;
+    if !matches!(result.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
+        return None;
+    }
+    if result.timecodes.is_empty() || result.detected_fps <= 0.0 {
+        return None;
+    }
+    let fps = result.detected_fps as f64;
+    let first = &result.timecodes[0];
+    let offset = if result.first_ltc_timecode_secs > 0.0 {
+        result.first_ltc_timecode_secs
+    } else {
+        first.timecode_secs
+    };
+    let secure = audio_core::find_first_coherent_index(
+        &result.timecodes, fps, result.drop_frame,
+    ) == Some(0);
+    if !secure {
+        warn!(
+            "start_timecode_from_ltc: first timecode at {:.3}s is not part of a secure coherent \
+             run (>=2s); using best-effort",
+            offset,
+        );
+    }
+    let start = shift_timecode_back(&first.timecode, offset, fps, result.drop_frame);
+    Some(TimecodeMetadata { start, fps, drop_frame: result.drop_frame })
+}
+
+/// Build per-file start timecode metadata from per-clip decode results (no
+/// trimming —  full-duration outputs).
+///
+/// For each clip with a successful / low-confidence decode the metadata start
+/// timecode is computed via [`start_timecode_from_ltc`] (backwards frame count
+/// from the first secure LTC frame).  Failed / missing clips get `None`.
+pub fn build_per_file_start_timecodes(
+    results: &[Option<&audio_core::LtcDetectionResult>],
+) -> Vec<Option<TimecodeMetadata>> {
+    results.iter().map(|r| {
+        r.and_then(|r| start_timecode_from_ltc(r))
+    }).collect()
 }
 
 /// Build per-file trim offsets and timecode metadata from per-clip decode results.
@@ -2917,7 +2973,7 @@ mod tests {
             filename_prefix: "output".to_string(),
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
-            trim_to_first_ltc: false,
+            set_start_from_ltc: false,
             trim_offsets_secs: vec![0.0; 2],
             timecode_meta_per_file: vec![None; 2],
             concat_audio: false,
@@ -4141,7 +4197,7 @@ mod tests {
             filename_prefix: "output".to_string(),
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
-            trim_to_first_ltc: false,
+            set_start_from_ltc: false,
             trim_offsets_secs: vec![0.0],
             timecode_meta_per_file: vec![None],
             concat_audio: false,
@@ -5267,5 +5323,257 @@ mod tests {
         let msg = output_collision_warning(&s);
         assert!(msg.is_none(),
             "different extension should prevent false positive, got: {:?}", msg);
+    }
+
+    // ── start_timecode_from_ltc tests ─────────────────────────────────────
+
+    #[test]
+    fn test_start_timecode_from_ltc_ndf() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let result = LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 5.0,
+            timecodes: vec![
+                FrameTimecode { frame_index: 125, timecode: Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 5.0 },
+            ],
+            valid_frames: 200,
+            total_possible_frames: 200,
+            total_audio_duration_secs: 10.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let meta = start_timecode_from_ltc(&result).unwrap();
+        let expected = shift_timecode_back(&Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 }, 5.0, 25.0, false);
+        assert_eq!(meta.start, expected, "NDF start TC mismatch");
+        assert!((meta.fps - 25.0).abs() < 1e-9);
+        assert!(!meta.drop_frame);
+    }
+
+    #[test]
+    fn test_start_timecode_from_ltc_df() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let result = LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 29.97,
+            drop_frame: true,
+            first_ltc_timecode_secs: 2.0 / 29.97,
+            timecodes: vec![
+                FrameTimecode { frame_index: 2, timecode: Timecode { hours: 1, minutes: 1, seconds: 0, frames: 2 }, timecode_secs: 2.0 / 29.97 },
+            ],
+            valid_frames: 200,
+            total_possible_frames: 200,
+            total_audio_duration_secs: 10.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let meta = start_timecode_from_ltc(&result).unwrap();
+        let expected = shift_timecode_back(&Timecode { hours: 1, minutes: 1, seconds: 0, frames: 2 }, 2.0 / 29.97, 29.97, true);
+        assert_eq!(meta.start, expected, "DF start TC mismatch (should skip nonexistent frames)");
+        assert!(meta.drop_frame);
+    }
+
+    #[test]
+    fn test_start_timecode_from_ltc_wraps_midnight() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let result = LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 1.0 / 25.0,
+            timecodes: vec![
+                FrameTimecode { frame_index: 1, timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 1.0 / 25.0 },
+            ],
+            valid_frames: 100,
+            total_possible_frames: 100,
+            total_audio_duration_secs: 5.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let meta = start_timecode_from_ltc(&result).unwrap();
+        let expected = shift_timecode_back(&Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 }, 1.0 / 25.0, 25.0, false);
+        assert_eq!(meta.start, expected, "midnight wrap start TC mismatch");
+    }
+
+    #[test]
+    fn test_start_timecode_from_ltc_none_failed_status() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let result = LtcDetectionResult {
+            status: LtcDecodeStatus::Error { message: "fail".into() },
+            detected_fps: 25.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 0.0,
+            timecodes: vec![
+                FrameTimecode { frame_index: 0, timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 0.0 },
+            ],
+            valid_frames: 0,
+            total_possible_frames: 0,
+            total_audio_duration_secs: 0.0,
+            avg_confidence: 0.0,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        assert!(start_timecode_from_ltc(&result).is_none(), "Error status should yield None");
+    }
+
+    #[test]
+    fn test_start_timecode_from_ltc_none_empty_timecodes() {
+        use audio_core::{LtcDecodeStatus, LtcDetectionResult};
+        let result = LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 0.0,
+            timecodes: vec![],
+            valid_frames: 0,
+            total_possible_frames: 0,
+            total_audio_duration_secs: 0.0,
+            avg_confidence: 0.0,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        assert!(start_timecode_from_ltc(&result).is_none(), "empty timecodes should yield None");
+    }
+
+    #[test]
+    fn test_start_timecode_from_ltc_none_nosync() {
+        use audio_core::{LtcDecodeStatus, LtcDetectionResult};
+        let result = LtcDetectionResult {
+            status: LtcDecodeStatus::NoSyncWord,
+            detected_fps: 0.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 0.0,
+            timecodes: vec![],
+            valid_frames: 0,
+            total_possible_frames: 0,
+            total_audio_duration_secs: 0.0,
+            avg_confidence: 0.0,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        assert!(start_timecode_from_ltc(&result).is_none(), "NoSyncWord status should yield None");
+    }
+
+    #[test]
+    fn test_start_timecode_from_ltc_low_confidence() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let result = LtcDetectionResult {
+            status: LtcDecodeStatus::LowConfidence,
+            detected_fps: 25.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 3.0,
+            timecodes: vec![
+                FrameTimecode { frame_index: 75, timecode: Timecode { hours: 1, minutes: 0, seconds: 10, frames: 0 }, timecode_secs: 3.0 },
+            ],
+            valid_frames: 50,
+            total_possible_frames: 200,
+            total_audio_duration_secs: 10.0,
+            avg_confidence: 0.35,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let meta = start_timecode_from_ltc(&result);
+        assert!(meta.is_some(), "LowConfidence should still produce metadata");
+    }
+
+    #[test]
+    fn test_build_per_file_start_timecodes_all_success() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let r1 = LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 5.0,
+            timecodes: vec![
+                FrameTimecode { frame_index: 125, timecode: Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 5.0 },
+            ],
+            valid_frames: 100,
+            total_possible_frames: 100,
+            total_audio_duration_secs: 10.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let r2 = LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 2.5,
+            timecodes: vec![
+                FrameTimecode { frame_index: 63, timecode: Timecode { hours: 2, minutes: 0, seconds: 5, frames: 0 }, timecode_secs: 2.5 },
+            ],
+            valid_frames: 80,
+            total_possible_frames: 100,
+            total_audio_duration_secs: 6.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let results: [Option<&LtcDetectionResult>; 2] = [Some(&r1), Some(&r2)];
+        let metas = build_per_file_start_timecodes(&results);
+        assert_eq!(metas.len(), 2);
+        assert!(metas[0].is_some(), "meta[0] should be Some");
+        let expected0 = shift_timecode_back(&Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 }, 5.0, 25.0, false);
+        assert_eq!(metas[0].as_ref().unwrap().start, expected0);
+        assert!(metas[1].is_some(), "meta[1] should be Some");
+        let expected1 = shift_timecode_back(&Timecode { hours: 2, minutes: 0, seconds: 5, frames: 0 }, 2.5, 25.0, false);
+        assert_eq!(metas[1].as_ref().unwrap().start, expected1);
+    }
+
+    #[test]
+    fn test_build_per_file_start_timecodes_with_failures() {
+        use audio_core::{FrameTimecode, LtcDecodeStatus, LtcDetectionResult, Timecode};
+        let r = LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            first_ltc_timecode_secs: 5.0,
+            timecodes: vec![
+                FrameTimecode { frame_index: 125, timecode: Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 5.0 },
+            ],
+            valid_frames: 100,
+            total_possible_frames: 100,
+            total_audio_duration_secs: 10.0,
+            avg_confidence: 0.95,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            quality: None,
+            details: vec![],
+        };
+        let results: [Option<&LtcDetectionResult>; 3] = [Some(&r), None, Some(&r)];
+        let metas = build_per_file_start_timecodes(&results);
+        assert_eq!(metas.len(), 3);
+        assert!(metas[0].is_some());
+        assert!(metas[1].is_none(), "failed clip should have None meta");
+        assert!(metas[2].is_some());
+    }
+
+    #[test]
+    fn test_build_per_file_start_timecodes_empty() {
+        let results: [Option<&audio_core::LtcDetectionResult>; 0] = [];
+        let metas = build_per_file_start_timecodes(&results);
+        assert!(metas.is_empty());
     }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getLTCBits, incrementTimecode } from "./ltcGenerator";
+import { getLTCBits, incrementTimecode, decrementTimecode, shiftTimecodeBack } from "./ltcGenerator";
 import { GOLDEN_VECTORS } from "./ltcGoldenVectors";
 import type { Timecode } from "./types";
 
@@ -77,5 +77,51 @@ describe("encoded timecode sequence continuity", () => {
       expect(n).toBe(prev + 1);
       prev = n;
     }
+  });
+});
+
+describe("decrementTimecode", () => {
+  it("decrement is inverse of increment", () => {
+    let tc: Timecode = { hours: 12, minutes: 34, seconds: 56, frames: 7 };
+    for (let i = 0; i < 200; i++) {
+      tc = incrementTimecode(tc, 25, false);
+    }
+    const back = shiftTimecodeBack(tc, 200 / 25, 25, false);
+    expect(back).toEqual({ hours: 12, minutes: 34, seconds: 56, frames: 7 });
+  });
+
+  it("decrements NDF: shift back 5s = 125 frames", () => {
+    const tc: Timecode = { hours: 2, minutes: 0, seconds: 0, frames: 0 };
+    const out = shiftTimecodeBack(tc, 5.0, 25, false);
+    expect(out.hours).toBe(1);
+    expect(out.minutes).toBe(59);
+    expect(out.seconds).toBe(55);
+    expect(out.frames).toBe(0);
+  });
+
+  it("decrements DF: skips nonexistent frames at minute boundary", () => {
+    // 29.97 DF: minute 1 starts at frame 2 — frames 0/1 don't exist.
+    // Shifting back 2 frames from 01:01:00;02 must land on 01:00:59;29.
+    const tc: Timecode = { hours: 1, minutes: 1, seconds: 0, frames: 2 };
+    const out = shiftTimecodeBack(tc, 2 / 29.97, 29.97, true);
+    expect(out.hours).toBe(1);
+    expect(out.minutes).toBe(0);
+    expect(out.seconds).toBe(59);
+    expect(out.frames).toBe(29);
+  });
+
+  it("wraps midnight correctly", () => {
+    const tc: Timecode = { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+    const out = shiftTimecodeBack(tc, 1 / 25, 25, false);
+    expect(out.hours).toBe(23);
+    expect(out.minutes).toBe(59);
+    expect(out.seconds).toBe(59);
+    expect(out.frames).toBe(24);
+  });
+
+  it("zero delta is identity", () => {
+    const tc: Timecode = { hours: 1, minutes: 0, seconds: 0, frames: 12 };
+    expect(shiftTimecodeBack(tc, 0, 25, false)).toEqual(tc);
+    expect(shiftTimecodeBack(tc, -3, 25, false)).toEqual(tc);
   });
 });

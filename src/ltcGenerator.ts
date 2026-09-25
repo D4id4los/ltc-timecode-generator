@@ -135,6 +135,72 @@ export function incrementTimecode(
 }
 
 /**
+ * Decrements the timecode by exactly 1 frame, respecting the given frame rate and drop-frame rule.
+ * Inverse of `incrementTimecode`.
+ */
+export function decrementTimecode(
+  tc: Timecode,
+  fps: number,
+  dropFrame: boolean
+): Timecode {
+  let { hours, minutes, seconds, frames } = tc;
+  const maxFrames = Math.ceil(fps);
+
+  // Drop-frame skipped frames: (minutes % 10 !== 0, seconds == 0, frames <= 1) does not exist.
+  if (dropFrame && seconds === 0 && minutes % 10 !== 0 && frames <= 1) {
+    if (minutes > 0) {
+      minutes--;
+    } else {
+      minutes = 59;
+      hours = hours === 0 ? 23 : hours - 1;
+    }
+    seconds = 59;
+    frames = maxFrames - 1;
+    return { hours, minutes, seconds, frames };
+  }
+
+  if (frames > 0) {
+    frames--;
+  } else if (seconds > 0) {
+    seconds--;
+    frames = maxFrames - 1;
+  } else {
+    if (minutes > 0) {
+      minutes--;
+    } else {
+      minutes = 59;
+      hours = hours === 0 ? 23 : hours - 1;
+    }
+    seconds = 59;
+    frames = maxFrames - 1;
+  }
+
+  return { hours, minutes, seconds, frames };
+}
+
+/**
+ * Shift a `Timecode` back by `deltaSecs` worth of frames at the given
+ * frame rate (drop-frame aware).  Inverse of repeated `incrementTimecode`.
+ */
+export function shiftTimecodeBack(
+  tc: Timecode,
+  deltaSecs: number,
+  fps: number,
+  dropFrame: boolean
+): Timecode {
+  if (deltaSecs <= 0 || fps <= 0) {
+    return { ...tc };
+  }
+  let frames = Math.round(deltaSecs * fps);
+  let out = { ...tc };
+  while (frames > 0) {
+    out = decrementTimecode(out, fps, dropFrame);
+    frames--;
+  }
+  return out;
+}
+
+/**
  * Formats a Timecode object into standard visual form (HH:MM:SS:FF)
  */
 export function timecodeToString(

@@ -105,8 +105,8 @@ pub struct AppState {
     pub conversion_state: SharedConversionState,
     pub cancel_flag: CancelFlag,
     pub convert_handle: Option<JoinHandle<()>>,
-    pub trim_ltc_start: bool,
-    pub trim_offset_secs: f64,
+    pub set_start_from_ltc: bool,
+    pub ltc_offset_secs: f64,
     pub per_file_trim_offsets: Vec<f64>,
 
     // Latch: generation for which auto-settings (trim/split/drop) have been applied
@@ -181,8 +181,8 @@ impl AppState {
             conversion_state: Arc::new(Mutex::new(ConversionState::idle())),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             convert_handle: None,
-            trim_ltc_start: false,
-            trim_offset_secs: 0.0,
+            set_start_from_ltc: false,
+            ltc_offset_secs: 0.0,
             per_file_trim_offsets: Vec::new(),
             ltc_auto_applied_gen: 0,
             ltc_group_auto_applied_gen: 0,
@@ -250,8 +250,8 @@ impl AppState {
             if matches!(result.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence)
                 && self.ltc_auto_applied_gen != self.latest.ltc_decode_generation
             {
-                self.trim_offset_secs = result.first_ltc_timecode_secs;
-                self.trim_ltc_start = true;
+                self.ltc_offset_secs = result.first_ltc_timecode_secs;
+                self.set_start_from_ltc = true;
                 self.split_tracks = true;
                 self.drop_ltc_track = true;
                 self.ltc_auto_applied_gen = self.latest.ltc_decode_generation;
@@ -266,7 +266,7 @@ impl AppState {
         {
             let has_success = self.latest.ltc_group_results.iter().any(|r| r.is_some());
             if has_success {
-                self.trim_ltc_start = true;
+                self.set_start_from_ltc = true;
                 self.split_tracks = true;
                 self.drop_ltc_track = true;
                 self.ltc_group_auto_applied_gen = self.latest.ltc_group_decode_generation;
@@ -1040,22 +1040,22 @@ mod tests {
         app.latest = Arc::new(snapshot_with_decode(1, Some(make_successful_result(10.5))));
 
         app.sync_ltc_decode_auto_settings();
-        assert!(app.trim_ltc_start, "trim_ltc_start should be set");
+        assert!(app.set_start_from_ltc, "set_start_from_ltc should be set");
         assert!(app.split_tracks, "split_tracks should be set");
         assert!(app.drop_ltc_track, "drop_ltc_track should be set");
-        assert!((app.trim_offset_secs - 10.5).abs() < 1e-9);
+        assert!((app.ltc_offset_secs - 10.5).abs() < 1e-9);
 
         // Untick all — should stay unticked on subsequent calls
-        app.trim_ltc_start = false;
+        app.set_start_from_ltc = false;
         app.split_tracks = false;
         app.drop_ltc_track = false;
-        app.trim_offset_secs = 0.0;
+        app.ltc_offset_secs = 0.0;
 
         app.sync_ltc_decode_auto_settings();
-        assert!(!app.trim_ltc_start, "should remain unticked after user override");
+        assert!(!app.set_start_from_ltc, "should remain unticked after user override");
         assert!(!app.split_tracks, "should remain unticked after user override");
         assert!(!app.drop_ltc_track, "should remain unticked after user override");
-        assert!((app.trim_offset_secs).abs() < 1e-9, "offset should not be re-applied");
+        assert!((app.ltc_offset_secs).abs() < 1e-9, "offset should not be re-applied");
     }
 
     #[test]
@@ -1073,7 +1073,7 @@ mod tests {
         app.latest = Arc::new(snapshot_with_decode(2, Some(make_successful_result(20.0))));
         app.sync_ltc_decode_auto_settings();
         assert!(app.split_tracks, "should re-apply on new generation");
-        assert!((app.trim_offset_secs - 20.0).abs() < 1e-9, "offset should be from latest decode");
+        assert!((app.ltc_offset_secs - 20.0).abs() < 1e-9, "offset should be from latest decode");
     }
 
     #[test]
@@ -1104,8 +1104,8 @@ mod tests {
         app.sync_ltc_decode_auto_settings();
         assert!(!app.split_tracks);
         assert!(!app.drop_ltc_track);
-        assert!(!app.trim_ltc_start);
-        assert!((app.trim_offset_secs).abs() < 1e-9);
+        assert!(!app.set_start_from_ltc);
+        assert!((app.ltc_offset_secs).abs() < 1e-9);
     }
 
     // ── apply_group_selection tests ─────────────────────────────────────

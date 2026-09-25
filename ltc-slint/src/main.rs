@@ -13,7 +13,7 @@ use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers,
-    build_per_file_trim_and_timecode, find_timecode_at_offset, select_best_combination,
+    build_per_file_start_timecodes, select_best_combination, start_timecode_from_ltc,
     spawn_conversion, ChannelMap, ConversionPipeline, ConversionState,
     ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
     FfmpegCapabilities, RecordingType, TimecodeMetadata,
@@ -201,8 +201,8 @@ fn _run_gui(
     let conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>> = Arc::new(Mutex::new(None));
     let conv_ffmpeg_probing: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_sanity_msg: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let conv_trim_to_first_ltc: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    let conv_trim_offset_secs: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    let conv_set_start_from_ltc: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let conv_ltc_offset_secs: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let conv_folder_for_group = conv_selected_folder.clone();
     let conv_ffmpeg_caps_for_select = conv_ffmpeg_caps.clone();
 
@@ -814,8 +814,8 @@ fn _run_gui(
         let venc = conv_video_encoder.clone();
         let aenc = conv_audio_encoder.clone();
         let name_prefix_arc = conv_filename_prefix.clone();
-        let trim_flag = conv_trim_to_first_ltc.clone();
-        let trim_offset = conv_trim_offset_secs.clone();
+        let trim_flag = conv_set_start_from_ltc.clone();
+        let _trim_offset = conv_ltc_offset_secs.clone();
         let eng_state = engine_state.clone();
         let gen_synth = conv_generate_synthetic_video.clone();
         let split_arc2 = conv_split_tracks.clone();
@@ -847,33 +847,14 @@ fn _run_gui(
                     .iter()
                     .map(|r| r.as_ref())
                     .collect();
-                build_per_file_trim_and_timecode(&group_results)
+                let metas = build_per_file_start_timecodes(&group_results);
+                (vec![0.0; num_files], metas)
             } else if trim_flag_val {
-                let trim_secs = *trim_offset.lock().unwrap();
-                let ltc_result = snapshot.ltc_decode_result.clone();
-                let trim_offsets_secs: Vec<f64> = if trim_secs > 0.001 {
-                    vec![trim_secs; num_files]
-                } else {
-                    vec![0.0; num_files]
-                };
-                let timecode_meta_per_file: Vec<Option<TimecodeMetadata>> = if trim_secs > 0.001 {
-                    (0..num_files).map(|_| {
-                        ltc_result.as_ref().and_then(|r| {
-                            use gui_engine::LtcDecodeStatus;
-                            if !matches!(r.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
-                                return None;
-                            }
-                            find_timecode_at_offset(&r.timecodes, trim_secs).map(|tc| TimecodeMetadata {
-                                start: tc,
-                                fps: r.detected_fps as f64,
-                                drop_frame: r.drop_frame,
-                            })
-                        })
-                    }).collect()
-                } else {
-                    vec![None; num_files]
-                };
-                (trim_offsets_secs, timecode_meta_per_file)
+                let metas: Vec<Option<TimecodeMetadata>> = (0..num_files).map(|_| {
+                    snapshot.ltc_decode_result.as_ref()
+                        .and_then(|r| start_timecode_from_ltc(r))
+                }).collect();
+                (vec![0.0; num_files], metas)
             } else {
                 (vec![0.0; num_files], vec![None; num_files])
             };
@@ -921,7 +902,7 @@ split_tracks: split_val,
                 filename_prefix,
                 audio_suffix_template: audio_suffix_val,
                 video_suffix_template: video_suffix_val,
-                trim_to_first_ltc: trim_flag_val,
+                set_start_from_ltc: trim_flag_val,
                 trim_offsets_secs,
                 timecode_meta_per_file,
                 resolved_hw_device: None,
@@ -942,13 +923,13 @@ split_tracks: split_val,
         });
     }
     {
-        let trim_flag = conv_trim_to_first_ltc.clone();
+        let trim_flag = conv_set_start_from_ltc.clone();
         let ui_weak = ui.as_weak();
-        ui.on_toggle_trim_ltc(move || {
+        ui.on_toggle_set_start_ltc(move || {
             let mut f = trim_flag.lock().unwrap();
             *f = !*f;
             if let Some(u) = ui_weak.upgrade() {
-                u.set_trim_to_first_ltc(*f);
+                u.set_set_start_from_ltc(*f);
             }
         });
     }
@@ -1416,8 +1397,8 @@ u.set_conv_split_tracks(false);
         conv_audio_encoder,
         conv_copy_video.clone(),
         conv_selected_folder,
-        conv_trim_offset_secs,
-        conv_trim_to_first_ltc,
+        conv_ltc_offset_secs,
+        conv_set_start_from_ltc,
         conv_split_tracks.clone(),
         conv_drop_ltc_track.clone(),
     );

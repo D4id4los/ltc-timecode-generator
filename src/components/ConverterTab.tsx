@@ -2,6 +2,7 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isTauri } from "../utils/audioBackend";
+import { shiftTimecodeBack } from "../ltcGenerator";
 import {
   Upload,
   FolderOpen,
@@ -55,7 +56,7 @@ interface ConvertRequest {
   drop_ltc_track: boolean;
   concat_audio: boolean;
   generate_synthetic_video: boolean;
-  trim_to_first_ltc: boolean;
+  set_start_from_ltc: boolean;
   trim_offsets_secs: number[];
   timecode_hours?: number;
   timecode_minutes?: number;
@@ -333,9 +334,9 @@ function TauriConverter() {
   // Derived: is this a video recording?
   const isVideo = recordingType === "VideoClipSequence";
 
-  // Trim to first LTC
-  const [trimToFirstLtc, setTrimToFirstLtc] = useState(false);
-  const [trimOffsetSecs, setTrimOffsetSecs] = useState(0);
+  // Set start time from LTC
+  const [setStartFromLtc, setSetStartFromLtc] = useState(false);
+  const [ltcOffsetSecs, setLtcOffsetSecs] = useState(0);
 
   // Sanity check
   const [sanityMsg, setSanityMsg] = useState<string>("");
@@ -439,19 +440,19 @@ function TauriConverter() {
     setSanityMsg("");
   }, [container, videoEncoder, audioEncoder, outputFolder, filenamePrefix, ffmpegCaps, selectedGroupIdx, fileGroups]);
 
-  // Derive trim offset from LTC result
+  // Derive LTC offset from result
   useEffect(() => {
     if (ltcResult && (ltcResult.status.type === "Success" || ltcResult.status.type === "LowConfidence") && ltcResult.first_ltc_timecode_secs > 0) {
-      setTrimOffsetSecs(ltcResult.first_ltc_timecode_secs);
+      setLtcOffsetSecs(ltcResult.first_ltc_timecode_secs);
     } else if (!ltcResult) {
-      setTrimOffsetSecs(0);
+      setLtcOffsetSecs(0);
     }
   }, [ltcResult]);
 
-  // Auto-enable trim on successful/low-confidence LTC decode
+  // Auto-enable set-start-from-LTC on successful/low-confidence decode
   useEffect(() => {
     if (ltcResult && (ltcResult.status.type === "Success" || ltcResult.status.type === "LowConfidence")) {
-      setTrimToFirstLtc(true);
+      setSetStartFromLtc(true);
     }
   }, [ltcResult]);
 
@@ -600,29 +601,23 @@ function TauriConverter() {
     const folder = selectedFolder.endsWith("/") ? selectedFolder : selectedFolder + "/";
     const inputFiles = group.files.map((f) => `${folder}${f}`);
 
-    const trimSecs = trimToFirstLtc ? trimOffsetSecs : 0;
     const numFiles = inputFiles.length;
 
-    // Per-file trim offsets
-    const trimOffsets = Array(numFiles).fill(trimSecs);
+    // No cutting — trim offsets are always zero
+    const trimOffsets = Array(numFiles).fill(0);
 
-    // Find the LTC timecode closest to trim offset
+    // Compute start timecode from first secure LTC frame (backwards from first detected frame)
     let timecodeFields: Partial<ConvertRequest> = {};
-    if (trimSecs > 0.001 && ltcResult && ltcResult.timecodes.length > 0 &&
+    if (setStartFromLtc && ltcResult && ltcResult.timecodes.length > 0 &&
         (ltcResult.status.type === "Success" || ltcResult.status.type === "LowConfidence")) {
-      const tcs = ltcResult.timecodes;
-      let lo = 0, hi = tcs.length - 1;
-      while (lo < hi) {
-        const mid = (lo + hi) >>> 1;
-        if (tcs[mid].timecode_secs < trimSecs) lo = mid + 1;
-        else hi = mid;
-      }
-      const closest = tcs[lo];
+      const first = ltcResult.timecodes[0];
+      const offset = ltcResult.first_ltc_timecode_secs > 0 ? ltcResult.first_ltc_timecode_secs : first.timecode_secs;
+      const start = shiftTimecodeBack(first.timecode, offset, ltcResult.detected_fps, ltcResult.drop_frame);
       timecodeFields = {
-        timecode_hours: closest.timecode.hours,
-        timecode_minutes: closest.timecode.minutes,
-        timecode_seconds: closest.timecode.seconds,
-        timecode_frames: closest.timecode.frames,
+        timecode_hours: start.hours,
+        timecode_minutes: start.minutes,
+        timecode_seconds: start.seconds,
+        timecode_frames: start.frames,
         timecode_fps: ltcResult.detected_fps,
         timecode_drop_frame: ltcResult.drop_frame,
       };
@@ -644,7 +639,7 @@ function TauriConverter() {
       drop_ltc_track: dropLtcTrack,
       concat_audio: concatAudio,
       generate_synthetic_video: generateSyntheticVideo,
-      trim_to_first_ltc: trimToFirstLtc,
+      set_start_from_ltc: setStartFromLtc,
       trim_offsets_secs: trimOffsets,
       ...timecodeFields,
     };
@@ -682,7 +677,7 @@ function TauriConverter() {
       setConvStatus("failed");
       setConvLog(String(e));
     }
-  }, [selectedGroupIdx, fileGroups, selectedFolder, channelMap, container, videoEncoder, audioEncoder, outputFolder, filenamePrefix, audioSuffix, videoSuffix, recordingType, ltcFileIdx, splitTracks, dropLtcTrack, generateSyntheticVideo, trimToFirstLtc, trimOffsetSecs, ltcResult]);
+  }, [selectedGroupIdx, fileGroups, selectedFolder, channelMap, container, videoEncoder, audioEncoder, outputFolder, filenamePrefix, audioSuffix, videoSuffix, recordingType, ltcFileIdx, splitTracks, dropLtcTrack, generateSyntheticVideo, setStartFromLtc, ltcOffsetSecs, ltcResult]);
 
   // Cancel conversion
   const handleCancel = useCallback(async () => {
@@ -1090,15 +1085,15 @@ function TauriConverter() {
         <div className="flex items-center gap-2">
           <input
             type="checkbox"
-            checked={trimToFirstLtc}
+            checked={setStartFromLtc}
             disabled={ltcDetecting || (ltcResult === null && ltcError === null)}
-            onChange={(e) => setTrimToFirstLtc(e.target.checked)}
+            onChange={(e) => setSetStartFromLtc(e.target.checked)}
             className="accent-[#FF5F1F]"
           />
-          <label className={"text-xs " + (trimToFirstLtc && trimOffsetSecs > 0 ? "text-text-secondary" : "text-text-muted")}>
-            Cut and Set Start Time to First LTC Frame
-            {trimToFirstLtc && trimOffsetSecs > 0 && (
-              <span className="text-text-muted ml-1">(trim {trimOffsetSecs.toFixed(3)}s of silence)</span>
+          <label className={"text-xs " + (setStartFromLtc ? "text-text-secondary" : "text-text-muted")}>
+            Set Start Time from LTC
+            {setStartFromLtc && ltcResult && ltcResult.timecodes.length > 0 && (
+              <span className="text-text-muted ml-1">(no cut)</span>
             )}
             {!ltcResult && !ltcError && !ltcDetecting && (
               <span className="text-[10px] text-text-muted ml-1 italic">(Detect LTC first)</span>
