@@ -97,6 +97,11 @@ pub(crate) fn apply_group_selection(
     let group = &groups[idx];
     let mut cmds = Vec::new();
 
+    log::info!(
+        "Recording selected in UI: idx={}, type={:?}, {} file(s)",
+        idx, group.recording_type, group.files.len(),
+    );
+
     state.selected_group_idx = Some(idx);
 
     if group.recording_type == RecordingType::VideoClipSequence {
@@ -113,11 +118,9 @@ pub(crate) fn apply_group_selection(
     state.per_file_trim_offsets = vec![0.0; num_ch];
     state.ltc_file_idx = 0;
 
-    if group.recording_type == RecordingType::VideoClipSequence && !group.files.is_empty() {
-        cmds.push(GuiCommand::ProbeVideo(group.files[0].to_string_lossy().to_string()));
-    }
-
-    // Notify engine to manage per-recording state (probes, stale LTC state)
+    // Notify engine to manage per-recording state (probes, stale LTC state).
+    // For video groups, the engine's converter clip probe populates ltc_probe
+    // automatically, so no separate ProbeVideo command is needed.
     cmds.push(GuiCommand::Converter(ConverterCommand::SelectRecording(idx)));
 
     cmds

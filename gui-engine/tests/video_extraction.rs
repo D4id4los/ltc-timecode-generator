@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use gui_engine::command::GuiCommand;
+use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::{
     decode_ltc_from_wav, extract_audio_channel, path_is_video, probe_video_audio, LtcDecodeStatus,
@@ -366,4 +366,110 @@ fn test_engine_parse_ltc_video_rejects_out_of_range_stream() {
     );
     assert!(snapshot.ltc_decode_result.is_none());
     assert!(!snapshot.ltc_is_detecting);
+}
+
+// ── Regression: SelectRecording must not leave ltc_probe permanently cleared ─
+
+#[test]
+fn test_select_recording_preserves_ltc_probe() {
+    if !ffmpeg_tooling_available() {
+        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ltc_wav = generate_ltc_wav(dir.path(), "ltc.wav", 25.0, 2.0, "both");
+    // Name must match a camera pattern so SelectFolder creates a VideoClipSequence group.
+    let mp4 = mux_video_fixture(dir.path(), "C0001.MP4", &ltc_wav, false);
+    let mp4_str = mp4.to_string_lossy().to_string();
+
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-vtest".into())
+        .spawn(move || {
+            gui_engine::engine::engine_main(rx, state_clone, false);
+        })
+        .expect("failed to spawn engine thread");
+
+    // Reproduce the GUI's command order: SelectFolder → ProbeVideo → SelectRecording.
+    // SelectRecording wipes ltc_probe, but the conv-probe drain must restore it.
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    tx.send(GuiCommand::ProbeVideo(mp4_str)).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
+
+    // Wait until the converter clip probe completes.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let snapshot = state.load().as_ref().clone();
+        if snapshot.generation > 0 && !snapshot.converter.probes_loading {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("converter clip probe did not complete within 60s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let snapshot = state.load().as_ref().clone();
+    assert!(
+        snapshot.ltc_probe.is_some(),
+        "ltc_probe must be populated after converter clip probe completes"
+    );
+    assert!(
+        snapshot.ltc_decode_is_video,
+        "ltc_decode_is_video must be true for a video-clip group"
+    );
+    assert!(!snapshot.converter.probes_loading);
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}
+
+#[test]
+fn test_select_recording_without_folder_does_not_probe() {
+    // No ffmpeg needed — the engine has no files to probe when SelectFolder
+    // was never sent, so the else branch fires.
+
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-vtest".into())
+        .spawn(move || {
+            gui_engine::engine::engine_main(rx, state_clone, false);
+        })
+        .expect("failed to spawn engine thread");
+
+    // Send SelectRecording without SelectFolder — engine groups are empty.
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
+
+    // Wait for one tick to process the command
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = state.load().as_ref().clone();
+        // probes_loading is set to true on entry; the else branch sets it
+        // to false so this is the signal the command was processed.
+        if snapshot.generation > 0 && !snapshot.converter.probes_loading {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("engine did not process SelectRecording within 10s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let snapshot = state.load().as_ref().clone();
+    assert!(
+        snapshot.ltc_probe.is_none(),
+        "ltc_probe must remain None when no folder was selected (no group to probe)",
+    );
+    assert!(!snapshot.converter.probes_loading);
+    assert!(!snapshot.ltc_decode_is_video);
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
 }

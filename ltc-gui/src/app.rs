@@ -184,6 +184,20 @@ impl AppState {
             ltc_group_auto_applied_gen: 0,
         };
 
+        // Sync the engine's group list with the restored folder before sending
+        // any SelectRecording — otherwise the engine's group list is empty and
+        // SelectRecording silently skips the clip probe, leaving ltc_probe unset.
+        if let Some(ref folder) = selected_folder {
+            let _ = result.cmd_tx.send(GuiCommand::Converter(
+                gui_engine::command::ConverterCommand::SelectFolder(folder.clone()),
+            ));
+            log::info!(
+                "Restored converter folder from config: {} ({} group(s))",
+                folder.display(),
+                file_groups.as_ref().map_or(0, |g| g.len()),
+            );
+        }
+
         // Auto-select first group (clone groups to avoid borrow conflict with mutation)
         if let Some(ref groups) = result.file_groups.clone() {
             if !groups.is_empty() {
@@ -1142,9 +1156,48 @@ mod tests {
         assert_eq!(app.per_file_trim_offsets, vec![0.0, 0.0]);
         assert_eq!(app.ltc_file_idx, 0);
 
-        assert_eq!(cmds.len(), 3, "video group should return 3 commands");
+        assert_eq!(cmds.len(), 2, "video group should return 2 commands");
         assert!(matches!(cmds[0], GuiCommand::ClearLtcGroupResults));
-        assert!(matches!(&cmds[1], GuiCommand::ProbeVideo(p) if p.contains("GOPR0001.MP4")));
-        assert!(matches!(&cmds[2], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
+        assert!(matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
+    }
+
+    #[test]
+    fn startup_restore_sends_select_folder_to_engine() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Dummy file — it only needs to exist so match_files_all_patterns finds a group.
+        let mp4_path = dir.path().join("C0001.MP4");
+        std::fs::write(&mp4_path, b"dummy").unwrap();
+
+        let cfg = gui_engine::config::ConverterConfig {
+            last_input_folder: Some(dir.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel();
+        // Build AppState with the restore config — this must send SelectFolder + SelectRecording.
+        let _app = super::AppState::new_with_config(
+            tx,
+            dummy_state(),
+            dummy_log_buffer(),
+            cfg,
+        );
+
+        // Drain all commands sent during construction.
+        let cmds: Vec<GuiCommand> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+
+        // The very first command must be SelectFolder so the engine populates its
+        // group list before SelectRecording arrives.
+        let first = cmds.first().expect("expected at least one command");
+        assert!(
+            matches!(first, GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectFolder(p)) if p == dir.path()),
+            "first command must be SelectFolder, got: {:?}", first
+        );
+
+        // Somewhere in the list there must be a SelectRecording(0) for the
+        // auto-selected first group.
+        let has_select_recording = cmds.iter().any(|cmd| {
+            matches!(cmd, GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0)))
+        });
+        assert!(has_select_recording, "expected a SelectRecording(0) command");
     }
 }

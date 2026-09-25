@@ -124,6 +124,11 @@ pub fn engine_main_with_probe<F>(
                 }
                 Ok(GuiCommand::Converter(crate::command::ConverterCommand::SelectFolder(path))) => {
                     let groups = crate::file_pattern::match_files_all_patterns(&path);
+                    info!(
+                        "Converter folder selected: {} — {} group(s) matched",
+                        path.display(),
+                        groups.len(),
+                    );
                     current.converter.groups = groups;
                     current.converter.selected_group_idx = None;
                     current.converter.probes.clear();
@@ -132,6 +137,7 @@ pub fn engine_main_with_probe<F>(
                     current.converter.conversion_state = ConversionState::idle();
                 }
                 Ok(GuiCommand::Converter(crate::command::ConverterCommand::SelectRecording(idx))) => {
+                    let group_count = current.converter.groups.len();
                     // Reset per-recording state
                     current.converter.selected_group_idx = Some(idx);
                     current.converter.probes.clear();
@@ -155,12 +161,17 @@ pub fn engine_main_with_probe<F>(
 
                     // Spawn background probing of all files in the group
                     if let Some(group) = current.converter.groups.get(idx) {
+                        info!(
+                            "Recording selected: idx={} of {} engine group(s), type={:?}, {} file(s) — spawning clip probe",
+                            idx, group_count, group.recording_type, group.files.len(),
+                        );
                         let files = group.files.clone();
                         let gen = current.converter.probes_generation;
                         let conv_probe_tx = conv_probe_tx.clone();
                         std::thread::Builder::new()
                             .name("conv-probe".into())
                             .spawn(move || {
+                                info!("Converter clip probe started: {} file(s)", files.len());
                                 let probes: Vec<Option<VideoAudioProbe>> = files.iter()
                                     .map(|f| crate::ffprobe::probe_video_audio(f).ok())
                                     .collect();
@@ -168,6 +179,10 @@ pub fn engine_main_with_probe<F>(
                             })
                             .expect("failed to spawn converter probe thread");
                     } else {
+                        warn!(
+                            "Recording selected: idx={} but engine has {} group(s) — probe skipped (was the folder sent to the engine?)",
+                            idx, group_count,
+                        );
                         current.converter.probes_loading = false;
                     }
                 }
@@ -356,9 +371,37 @@ pub fn engine_main_with_probe<F>(
             match conv_probe_rx.try_recv() {
                 Ok(ConverterProbeResult { probes, generation }) => {
                     if generation == current.converter.probes_generation {
+                        // Populate ltc_probe for video groups so the LTC source
+                        // dropdown works even when the GUI sends SelectRecording
+                        // (which clears ltc_probe) before or after ProbeVideo.
+                        if let Some(ref idx) = current.converter.selected_group_idx {
+                            if let Some(group) = current.converter.groups.get(*idx) {
+                                if group.recording_type == crate::converter::RecordingType::VideoClipSequence {
+                                    if let Some(Some(ref probe)) = probes.first() {
+                                        current.ltc_probe = Some(probe.clone());
+                                        current.ltc_selected_stream = 0;
+                                        current.ltc_selected_channel = 0;
+                                        current.ltc_decode_is_video = true;
+                                        info!(
+                                            "LTC source probe set from clip probe: {} stream(s), {} channel(s)",
+                                            probe.streams.len(),
+                                            probe.total_audio_channels,
+                                        );
+                                    } else {
+                                        warn!("LTC source probe unavailable: first clip probe failed");
+                                        current.status_message = "Video probe failed — no audio streams detected.".to_string();
+                                    }
+                                }
+                            }
+                        }
                         current.converter.probes = probes;
                         current.converter.probes_loading = false;
                         info!("Converter clip probe complete: {} files", current.converter.probes.len());
+                    } else {
+                        warn!(
+                            "Discarding stale converter clip probe result (gen {} != current {})",
+                            generation, current.converter.probes_generation,
+                        );
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
