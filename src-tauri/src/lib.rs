@@ -8,9 +8,9 @@ use audio_core::{
     Timecode,
 };
 use gui_engine::converter::{
-    self, query_ffmpeg_capabilities, spawn_conversion, ChannelMap, ConversionPipeline,
-    ConversionState, ConversionStatus, ConverterSettings, FfmpegCapabilities, RecordingType,
-    TimecodeMetadata,
+    self, preview_output_files, query_ffmpeg_capabilities, spawn_conversion, ChannelMap,
+    ConversionPipeline, ConversionState, ConversionStatus, ConverterSettings, FfmpegCapabilities,
+    OutputKind, RecordingType, TimecodeMetadata,
 };
 use gui_engine::file_pattern::{self, match_files_all_patterns, BUILTIN_PATTERNS, MatchedGroup};
 
@@ -348,11 +348,11 @@ fn start_convert(
         video_encoder: request.video_encoder,
         audio_encoder: request.audio_encoder,
         resolved_video_encoder: String::new(),
+        resolved_hw_device: None,
         output_folder: PathBuf::from(&request.output_folder),
         filename_prefix: request.filename_prefix,
         audio_suffix_template: request.audio_suffix_template,
         video_suffix_template: request.video_suffix_template,
-        naming_mode: gui_engine::converter::OutputNamingMode::PrefixTemplates,
         trim_to_first_ltc: request.trim_to_first_ltc,
         trim_offsets_secs: trim_offsets,
         timecode_meta_per_file,
@@ -370,6 +370,7 @@ fn start_convert(
         &caps,
         Some(&settings.audio_suffix_template),
         Some(&settings.video_suffix_template),
+        false,
     ) {
         return Ok(ConvertResponse {
             success: false,
@@ -436,6 +437,72 @@ fn cancel_conversion(state: tauri::State<'_, ConverterManager>) {
     }
 }
 
+#[derive(serde::Serialize)]
+struct PreviewOutputInfo {
+    kind: String,
+    path: String,
+}
+
+#[tauri::command]
+fn preview_converter_outputs(request: ConvertRequest) -> Result<Vec<PreviewOutputInfo>, String> {
+    let input_files: Vec<PathBuf> = request.input_files.iter().map(PathBuf::from).collect();
+    let channel_map = ChannelMap::from_mapping(request.channel_map);
+
+    let pipeline = match request.recording_type.as_str() {
+        "VideoClipSequence" => ConversionPipeline::VideoPassthrough,
+        _ => ConversionPipeline::AudioOnly { generate_synthetic_video: request.generate_synthetic_video },
+    };
+
+    let recording_type = match request.recording_type.as_str() {
+        "VideoClipSequence" => RecordingType::VideoClipSequence,
+        _ => RecordingType::MultiTrackAudio,
+    };
+
+    let ltc_video_source = match recording_type {
+        RecordingType::VideoClipSequence if request.ltc_video_source_stream >= 0 => {
+            Some((request.ltc_video_source_stream as usize, request.ltc_video_source_channel as usize))
+        }
+        _ => None,
+    };
+
+    let settings = ConverterSettings {
+        pipeline,
+        input_files,
+        recording_type,
+        ltc_track_channel_index: request.ltc_track_channel_index,
+        channel_map,
+        split_tracks: request.split_tracks,
+        drop_ltc_track: request.drop_ltc_track,
+        ltc_video_source,
+        container: request.container,
+        copy_video: false,
+        video_encoder: request.video_encoder,
+        audio_encoder: request.audio_encoder,
+        resolved_video_encoder: String::new(),
+        resolved_hw_device: None,
+        output_folder: PathBuf::from(&request.output_folder),
+        filename_prefix: request.filename_prefix,
+        audio_suffix_template: request.audio_suffix_template,
+        video_suffix_template: request.video_suffix_template,
+        trim_to_first_ltc: request.trim_to_first_ltc,
+        trim_offsets_secs: vec![0.0; request.input_files.len()],
+        timecode_meta_per_file: vec![None; request.input_files.len()],
+        concat_audio: request.concat_audio,
+    };
+
+    let previews = preview_output_files(&settings, None);
+    Ok(previews
+        .into_iter()
+        .map(|p| PreviewOutputInfo {
+            kind: match p.kind {
+                OutputKind::Video => "video".to_string(),
+                OutputKind::Audio => "audio".to_string(),
+            },
+            path: p.path.to_string_lossy().to_string(),
+        })
+        .collect())
+}
+
 // ── App entry point ────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -478,6 +545,7 @@ pub fn run() {
             start_convert,
             get_conversion_progress,
             cancel_conversion,
+            preview_converter_outputs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

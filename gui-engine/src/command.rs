@@ -63,6 +63,10 @@ pub enum GuiCommand {
     /// `AppStateSnapshot.file_durations` as they become available.
     ProbeFileDurations(Vec<PathBuf>),
 
+    // ── Converter (engine-owned) ───────────────────────────────────────
+    /// Manage converter state in the engine.
+    Converter(ConverterCommand),
+
     // ── Shutdown ────────────────────────────────────────────────────────
     CancelDecode,
     Shutdown,
@@ -80,4 +84,19 @@ pub enum GuiCommand {
     SecondDown,
     FrameUp,
     FrameDown,
+}
+
+/// Commands for the engine-owned converter subsystem.
+#[derive(Debug, Clone)]
+pub enum ConverterCommand {
+    /// Scan a folder and discover recording groups.
+    SelectFolder(PathBuf),
+    /// Select a recording group by index (resets per-recording state).
+    SelectRecording(usize),
+    /// Toggle trim to first LTC frame.
+    SetTrimEnabled(bool),
+    /// Start conversion with current settings.
+    StartConversion,
+    /// Cancel an in-flight conversion.
+    CancelConversion,
 }

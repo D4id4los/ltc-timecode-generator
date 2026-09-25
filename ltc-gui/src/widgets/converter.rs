@@ -3,16 +3,16 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
-use gui_engine::command::GuiCommand;
+use gui_engine::command::{GuiCommand, ConverterCommand};
 use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, build_per_file_trim_and_timecode, conversion_sanity_check_with_naming,
+    available_containers, build_per_file_trim_and_timecode, conversion_sanity_check,
     evaluate_readiness, output_collision_warning,
     find_timecode_at_offset, format_blockers,
     preview_output_files, spawn_conversion, supported_audio_encoders, supported_containers,
     ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
-    ConverterSettings, FfmpegCapabilities, OutputKind, OutputNamingMode, RecordingType, TimecodeMetadata,
+    ConverterSettings, FfmpegCapabilities, OutputKind, RecordingType, TimecodeMetadata,
 };
 use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
@@ -107,10 +107,6 @@ pub(crate) fn apply_group_selection(
     state.channel_map = ChannelMap::identity(num_ch);
     state.recording_type = group.recording_type.clone();
     state.filename_prefix = group.prefix.clone();
-    state.naming_mode = match group.recording_type {
-        RecordingType::VideoClipSequence => OutputNamingMode::SourceStems,
-        RecordingType::MultiTrackAudio => OutputNamingMode::PrefixTemplates,
-    };
     state.output_folder = state.selected_folder.clone().unwrap_or_default();
     state.split_tracks = false;
     state.drop_ltc_track = false;
@@ -120,6 +116,9 @@ pub(crate) fn apply_group_selection(
     if group.recording_type == RecordingType::VideoClipSequence && !group.files.is_empty() {
         cmds.push(GuiCommand::ProbeVideo(group.files[0].to_string_lossy().to_string()));
     }
+
+    // Notify engine to manage per-recording state (probes, stale LTC state)
+    cmds.push(GuiCommand::Converter(ConverterCommand::SelectRecording(idx)));
 
     cmds
 }
@@ -154,7 +153,10 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                 state.selected_files = None;
                 config::save_input_folder(&path);
 
-                // Apply all patterns simultaneously
+                // Notify engine to scan folder and manage groups
+                state.send(GuiCommand::Converter(ConverterCommand::SelectFolder(path.clone())));
+
+                // Apply all patterns simultaneously (local for immediate UI)
                 let groups = match_files_all_patterns(&path);
                 let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
                     let paths: Vec<std::path::PathBuf> = if g.recording_type == RecordingType::MultiTrackAudio {
@@ -1248,7 +1250,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             .map(|g| g.files.clone())
             .unwrap_or_default();
 
-        match conversion_sanity_check_with_naming(
+        match conversion_sanity_check(
             &state.container,
             &state.video_encoder,
             &state.audio_encoder,
@@ -1258,7 +1260,6 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             caps,
             Some(&state.audio_suffix_template),
             Some(&state.video_suffix_template),
-            Some(&state.naming_mode),
             copy_mode_active(state),
         ) {
             Ok(()) => {
@@ -1431,13 +1432,12 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
 
     // Preview of output filenames
     let has_group = state.selected_group_idx.is_some();
-    if has_group && (state.naming_mode == OutputNamingMode::SourceStems || !state.filename_prefix.is_empty()) {
+    if has_group && !state.filename_prefix.is_empty() {
         ui.add_space(4.0);
         let settings = current_converter_settings(state);
         let previews = preview_output_files(&settings, state.latest.ltc_probe.as_ref());
-        let is_source_stems = state.naming_mode == OutputNamingMode::SourceStems;
 
-        if is_source_stems && !previews.is_empty() {
+        if !previews.is_empty() {
             let count = previews.len();
             ui.label(RichText::new(format!("↳ {} output file(s):", count))
                 .font(FontId::proportional(9.0)).color(colors.text_secondary));
@@ -1452,25 +1452,6 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
                 };
                 ui.label(RichText::new(format!("  {} {}", icon, display_name))
                     .font(FontId::monospace(8.5)).color(colors.text_muted));
-            }
-        } else {
-            let num_video = previews.iter().filter(|p| matches!(p.kind, OutputKind::Video)).count();
-            let num_audio = previews.iter().filter(|p| matches!(p.kind, OutputKind::Audio)).count();
-            let audio_label = if state.concat_audio && state.recording_type == RecordingType::VideoClipSequence {
-                "concatenated audio file(s)"
-            } else {
-                "audio file(s)"
-            };
-            if num_video > 0 {
-                ui.label(RichText::new(format!(
-                    "↳ {} {} + {} video clip(s) in {}",
-                    num_audio, audio_label, num_video, state.output_folder.display(),
-                )).font(FontId::proportional(9.0)).color(colors.text_secondary));
-            } else {
-                ui.label(RichText::new(format!(
-                    "↳ {} {} in {}",
-                    num_audio, audio_label, state.output_folder.display(),
-                )).font(FontId::proportional(9.0)).color(colors.text_secondary));
             }
         }
     }
@@ -1555,7 +1536,7 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
     let sanity_ok = if can_convert {
         let caps = caps_opt.as_ref().unwrap();
         let input_files = selected_input_files(state);
-        conversion_sanity_check_with_naming(
+        conversion_sanity_check(
             &state.container,
             &state.video_encoder,
             &state.audio_encoder,
@@ -1565,7 +1546,6 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
             caps,
             Some(&state.audio_suffix_template),
             Some(&state.video_suffix_template),
-            Some(&state.naming_mode),
             copy_mode_active(state),
         )
         .is_ok()
@@ -1657,7 +1637,6 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
         filename_prefix: state.filename_prefix.clone(),
         audio_suffix_template: state.audio_suffix_template.clone(),
         video_suffix_template: state.video_suffix_template.clone(),
-        naming_mode: state.naming_mode.clone(),
         trim_to_first_ltc: state.trim_ltc_start,
         trim_offsets_secs: vec![0.0; selected_input_files(state).len()],
         timecode_meta_per_file: vec![None; selected_input_files(state).len()],

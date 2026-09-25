@@ -6,6 +6,7 @@ pub mod duration;
 pub mod engine;
 pub mod ffprobe;
 pub mod file_pattern;
+pub mod naming;
 pub mod hw_device;
 pub mod log_buffer;
 pub mod state;
@@ -27,14 +28,14 @@ pub use audio_core::{
 pub use converter::{
     apply_available_defaults, available_audio_encoders_for_container,
     available_containers, build_per_file_trim_and_timecode, conversion_sanity_check,
-    conversion_sanity_check_with_naming, evaluate_readiness,
+    evaluate_readiness,
     find_timecode_at_offset, format_blockers, format_ffmpeg_timecode,
     plan_concat_outputs, plan_video_outputs, query_ffmpeg_capabilities,
     select_best_combination,
     spawn_conversion, supported_audio_encoders, supported_containers,
     AudioKeep, ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
     ConversionState, ConversionStatus, ConverterSettings, output_collision_warning,
-    OutputKind, OutputNamingMode, PreviewOutput, preview_output_files, StepFailure,
+    OutputKind, PreviewOutput, preview_output_files, StepFailure,
     VideoOutputStep, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
     FfmpegCapabilities, HwDeviceCapabilities, RecordingType, SharedConversionState, CancelFlag,
     TimecodeMetadata,

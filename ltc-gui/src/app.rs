@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, FontId, RichText, Sense, Ui};
 use gui_engine::command::GuiCommand;
 use gui_engine::config;
-use gui_engine::converter::{ChannelMap, ConversionState, OutputNamingMode, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX};
+use gui_engine::converter::{ChannelMap, ConversionState, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX};
 use gui_engine::file_pattern::{match_files_all_patterns, MatchedGroup};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
@@ -102,7 +102,6 @@ pub struct AppState {
     pub filename_prefix: String,
     pub audio_suffix_template: String,
     pub video_suffix_template: String,
-    pub naming_mode: OutputNamingMode,
     pub conversion_state: SharedConversionState,
     pub cancel_flag: CancelFlag,
     pub convert_handle: Option<JoinHandle<()>>,
@@ -173,7 +172,6 @@ impl AppState {
             audio_encoder: "pcm_s24le".to_string(),
             output_folder,
             filename_prefix: String::new(),
-            naming_mode: OutputNamingMode::PrefixTemplates,
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
             conversion_state: Arc::new(Mutex::new(ConversionState::idle())),
@@ -1104,13 +1102,13 @@ mod tests {
         assert_eq!(app.channel_map.mapping(), &[0, 1]);
         assert_eq!(app.recording_type, RecordingType::MultiTrackAudio);
         assert_eq!(app.filename_prefix, "TEST");
-        assert_eq!(app.naming_mode, OutputNamingMode::PrefixTemplates);
         assert_eq!(app.output_folder, folder);
         assert!(!app.split_tracks);
         assert!(!app.drop_ltc_track);
         assert_eq!(app.per_file_trim_offsets, vec![0.0, 0.0]);
         assert_eq!(app.ltc_file_idx, 0);
-        assert!(cmds.is_empty(), "audio group should return no commands");
+        assert_eq!(cmds.len(), 1, "audio group should return 1 command (SelectRecording)");
+        assert!(matches!(cmds[0], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
     }
 
     #[test]
@@ -1139,14 +1137,14 @@ mod tests {
         assert_eq!(app.selected_group_idx, Some(0));
         assert_eq!(app.recording_type, RecordingType::VideoClipSequence);
         assert_eq!(app.filename_prefix, "CLIP");
-        assert_eq!(app.naming_mode, OutputNamingMode::SourceStems);
         assert!(!app.split_tracks);
         assert!(!app.drop_ltc_track);
         assert_eq!(app.per_file_trim_offsets, vec![0.0, 0.0]);
         assert_eq!(app.ltc_file_idx, 0);
 
-        assert_eq!(cmds.len(), 2, "video group should return 2 commands");
+        assert_eq!(cmds.len(), 3, "video group should return 3 commands");
         assert!(matches!(cmds[0], GuiCommand::ClearLtcGroupResults));
         assert!(matches!(&cmds[1], GuiCommand::ProbeVideo(p) if p.contains("GOPR0001.MP4")));
+        assert!(matches!(&cmds[2], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
     }
 }

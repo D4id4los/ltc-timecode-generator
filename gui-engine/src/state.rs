@@ -1,9 +1,49 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::converter::FfmpegCapabilities;
+use crate::converter::{ConversionState, FfmpegCapabilities, RecordingType};
 use crate::ffprobe::VideoAudioProbe;
+use crate::file_pattern::MatchedGroup;
 use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
+
+// ── Converter snapshot (engine-owned) ─────────────────────────────────
+
+/// Engine-managed converter state: group list, per-clip probes, and
+/// conversion status.  The individual settings fields (prefix, suffixes,
+/// container, codecs, …) remain GUI-local because they are light strings
+/// with no stale-state risk — only probes, conversion, and groups need
+/// engine ownership.
+#[derive(Clone, Debug)]
+pub struct ConverterSnapshot {
+    /// File groups discovered in the current converter folder.
+    /// Empty when no folder has been selected.
+    pub groups: Vec<MatchedGroup>,
+    /// Index of the selected group, or `None`.
+    pub selected_group_idx: Option<usize>,
+    /// Per-file audio/video probes for the selected recording.
+    /// Index-aligned with the group's files.
+    pub probes: Vec<Option<VideoAudioProbe>>,
+    /// True while probes are being loaded (background ffprobe).
+    pub probes_loading: bool,
+    /// Generation counter — incremented on each recording selection so
+    /// GUIs can discard stale probe results.
+    pub probes_generation: u64,
+    /// Conversion state (idle/running/completed/failed).
+    /// Owned by the engine; GUIs only read it.
+    pub conversion_state: ConversionState,
+}
+
+impl ConverterSnapshot {
+    pub fn is_recording_selected(&self) -> bool {
+        self.selected_group_idx.is_some()
+    }
+
+    pub fn selected_recording_type(&self) -> Option<RecordingType> {
+        self.selected_group_idx.and_then(|idx| {
+            self.groups.get(idx).map(|g| g.recording_type.clone())
+        })
+    }
+}
 
 // ── Clap log entry ──────────────────────────────────────────────────────
 
@@ -122,6 +162,9 @@ pub struct AppStateSnapshot {
     /// Monotonically increasing version — incremented on each successful
     /// duration insertion so poll.rs can detect changes.
     pub file_durations_version: u64,
+
+    // Engine-owned converter state
+    pub converter: ConverterSnapshot,
 }
 
 impl AppStateSnapshot {
@@ -201,6 +244,14 @@ impl AppStateSnapshot {
             file_durations: HashMap::new(),
             file_durations_generation: 0,
             file_durations_version: 0,
+            converter: ConverterSnapshot {
+                groups: Vec::new(),
+                selected_group_idx: None,
+                probes: Vec::new(),
+                probes_loading: false,
+                probes_generation: 0,
+                conversion_state: ConversionState::idle(),
+            },
         }
     }
 }

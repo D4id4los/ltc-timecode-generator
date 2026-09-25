@@ -11,11 +11,13 @@ use log::{info, warn};
 use audio_core::{FrameTimecode, Timecode};
 
 use crate::ffprobe::VideoAudioProbe;
+use crate::naming::{self, NameTemplate};
 use crate::subprocess::no_window_command;
 use crate::video_codecs;
 
-pub const DEFAULT_AUDIO_SUFFIX: &str = "_audio_track{:01d}";
-pub const DEFAULT_VIDEO_SUFFIX: &str = "_video_clip{:02d}";
+pub use crate::naming::DEFAULT_AUDIO_SUFFIX;
+pub use crate::naming::DEFAULT_VIDEO_SUFFIX;
+pub use crate::naming::DEFAULT_PREFIX;
 
 // ── Channel mapping ──────────────────────────────────────────────────────
 
@@ -391,14 +393,6 @@ pub fn copy_mode_container_for_input(path: &Path) -> &'static str {
     }
 }
 
-/// Returns `Ok(())` or an user-facing error explaining *why* the combination
-/// is invalid.
-///
-/// The `audio_suffix` and `video_suffix` parameters are optional suffix templates
-/// to validate. Pass `None` to skip suffix validation.
-///
-/// `video_codec` is a codec id ("av1", "h265", …); legacy concrete encoder
-/// names are accepted and normalized.
 pub fn conversion_sanity_check(
     container: &str,
     video_codec: &str,
@@ -409,49 +403,11 @@ pub fn conversion_sanity_check(
     caps: &FfmpegCapabilities,
     audio_suffix: Option<&str>,
     video_suffix: Option<&str>,
-) -> Result<(), String> {
-    sanity_check_impl(
-        container, video_codec, audio_encoder, input_files, output_folder,
-        filename_prefix, caps, audio_suffix, video_suffix, None, false,
-    )
-}
-
-/// Stream-copy variant of [`conversion_sanity_check`]: the video stream is
-/// not re-encoded, so the video codec selection is irrelevant and its
-/// availability/compatibility checks are skipped.
-pub fn conversion_sanity_check_copy(
-    container: &str,
-    video_codec: &str,
-    audio_encoder: &str,
-    input_files: &[PathBuf],
-    output_folder: &Path,
-    filename_prefix: &str,
-    caps: &FfmpegCapabilities,
-    audio_suffix: Option<&str>,
-    video_suffix: Option<&str>,
-) -> Result<(), String> {
-    sanity_check_impl(
-        container, video_codec, audio_encoder, input_files, output_folder,
-        filename_prefix, caps, audio_suffix, video_suffix, None, true,
-    )
-}
-
-pub fn conversion_sanity_check_with_naming(
-    container: &str,
-    video_codec: &str,
-    audio_encoder: &str,
-    input_files: &[PathBuf],
-    output_folder: &Path,
-    filename_prefix: &str,
-    caps: &FfmpegCapabilities,
-    audio_suffix: Option<&str>,
-    video_suffix: Option<&str>,
-    naming_mode: Option<&OutputNamingMode>,
     copy_video: bool,
 ) -> Result<(), String> {
     sanity_check_impl(
         container, video_codec, audio_encoder, input_files, output_folder,
-        filename_prefix, caps, audio_suffix, video_suffix, naming_mode, copy_video,
+        filename_prefix, caps, audio_suffix, video_suffix, copy_video,
     )
 }
 
@@ -466,7 +422,6 @@ fn sanity_check_impl(
     caps: &FfmpegCapabilities,
     audio_suffix: Option<&str>,
     video_suffix: Option<&str>,
-    naming_mode: Option<&OutputNamingMode>,
     copy_video: bool,
 ) -> Result<(), String> {
     if !caps.has_ffmpeg {
@@ -484,9 +439,8 @@ fn sanity_check_impl(
         }
     }
 
-    let prefix_required = naming_mode.map_or(true, |m| !m.is_source_stems());
-    if prefix_required && filename_prefix.is_empty() {
-        return Err("No output filename prefix specified.".to_string());
+    if filename_prefix.is_empty() && audio_suffix.unwrap_or("").is_empty() && video_suffix.unwrap_or("").is_empty() {
+        return Err("No output filename prefix or suffix specified.".to_string());
     }
 
     if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
@@ -504,13 +458,19 @@ fn sanity_check_impl(
         ));
     }
 
-    // Validate suffix templates (if provided)
-    let nm = naming_mode.unwrap_or(&OutputNamingMode::PrefixTemplates);
-    if let Some(suffix) = audio_suffix {
-        ConverterSettings::validate_suffix_template_for_mode(suffix, nm)?;
+    // Validate templates (if provided) — using the named-placeholder system
+    if let Some(t) = audio_suffix {
+        if !t.is_empty() {
+            naming::validate_template(t).map_err(|e| format!("Invalid audio suffix template: {}", e))?;
+        }
     }
-    if let Some(suffix) = video_suffix {
-        ConverterSettings::validate_suffix_template_for_mode(suffix, nm)?;
+    if let Some(t) = video_suffix {
+        if !t.is_empty() {
+            naming::validate_template(t).map_err(|e| format!("Invalid video suffix template: {}", e))?;
+        }
+    }
+    if !filename_prefix.is_empty() {
+        naming::validate_template(filename_prefix).map_err(|e| format!("Invalid filename prefix: {}", e))?;
     }
 
     if !copy_video {
@@ -606,22 +566,6 @@ pub enum RecordingType {
     VideoClipSequence,
 }
 
-// ── Output naming mode ───────────────────────────────────────────────────
-
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum OutputNamingMode {
-    /// Use `filename_prefix` + suffix templates (existing behavior).
-    PrefixTemplates,
-    /// For each video clip, derive the base name from the source file's stem.
-    SourceStems,
-}
-
-impl OutputNamingMode {
-    pub fn is_source_stems(&self) -> bool {
-        matches!(self, OutputNamingMode::SourceStems)
-    }
-}
-
 // ── Conversion settings ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -668,7 +612,6 @@ pub struct ConverterSettings {
     pub filename_prefix: String,
     pub audio_suffix_template: String,
     pub video_suffix_template: String,
-    pub naming_mode: OutputNamingMode,
 
     // ── Trimming & Timecode (per file) ──
     pub trim_to_first_ltc: bool,
@@ -983,23 +926,43 @@ impl ConverterSettings {
     /// Like [`output_path_for_file`] but returns both the final (possibly
     /// `_conv`‑mitigated) path and the unguarded name.  When there is no input‑
     /// file collision the two paths are identical.
+    ///
+    /// The naming context is built from:
+    /// - `{filename}` = stem of `input_files[file_idx]`
+    /// - `{clip}` = `file_idx + 1` (1-based clip number)
+    /// - `{track}` = `index` (1-based output index, clamped to 1)
     pub fn output_path_for_file_checked(&self, kind: &str, file_idx: usize, index: usize, extension: &str) -> (PathBuf, PathBuf) {
-        let base = self.output_base_for_file(file_idx);
-        let suffix = match kind {
-            "audio" => self.audio_suffix_template
-                .replace("{:01d}", &format!("{:01}", index))
-                .replace("{:02d}", &format!("{:02}", index))
-                .replace("{:03d}", &format!("{:03}", index)),
-            "video" => self.video_suffix_template
-                .replace("{:01d}", &format!("{:01}", index))
-                .replace("{:02d}", &format!("{:02}", index))
-                .replace("{:03d}", &format!("{:03}", index)),
-            _ => String::new(),
+        let naming_ctx = naming::NamingContext {
+            filename: self.input_files.get(file_idx)
+                .and_then(|p| p.file_stem())
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            clip: file_idx + 1,
+            track: index.max(1),
         };
-        let filename = format!("{}{}.{}", base, suffix, extension);
+
+        let prefix_expanded = NameTemplate::parse(&self.filename_prefix)
+            .unwrap_or_else(|_| NameTemplate::parse("{filename}").unwrap())
+            .expand(&naming_ctx);
+
+        let suffix_template_str = match kind {
+            "audio" => &self.audio_suffix_template,
+            "video" => &self.video_suffix_template,
+            _ => "",
+        };
+        let suffix_expanded = if suffix_template_str.is_empty() {
+            String::new()
+        } else {
+            NameTemplate::parse(suffix_template_str)
+                .unwrap_or_else(|_| NameTemplate::parse("").unwrap())
+                .expand(&naming_ctx)
+        };
+
+        let filename = format!("{}{}.{}", prefix_expanded, suffix_expanded, extension);
         let unguarded = self.output_folder.join(&filename);
         if self.input_files.iter().any(|input| input == &unguarded) {
-            let alt = format!("{}_conv{}.{}", base, suffix, extension);
+            let alt = format!("{}{}_conv.{}", prefix_expanded, suffix_expanded, extension);
             (self.output_folder.join(&alt), unguarded)
         } else {
             (unguarded.clone(), unguarded)
@@ -1009,8 +972,10 @@ impl ConverterSettings {
     /// Build the output path for a single output file given a source-file index,
     /// a track/clip index, and an extension derived from the container.
     ///
-    /// In `SourceStems` mode the base name comes from the source file's stem;
-    /// in `PrefixTemplates` mode the `filename_prefix` field is used.
+    /// Both `filename_prefix`, `audio_suffix_template`, and `video_suffix_template`
+    /// support named placeholders: `{filename}`, `{clip}`, `{track}` and zero-padded
+    /// variants `{clip:0Nd}`, `{track:0Nd}`.
+    ///
     /// If the computed output path would collide with an input file path,
     /// `_conv` is appended before the extension.
     pub fn output_path_for_file(&self, kind: &str, file_idx: usize, index: usize, extension: &str) -> PathBuf {
@@ -1023,48 +988,6 @@ impl ConverterSettings {
     /// `split_tracks` is `false`.
     pub fn merged_audio_output_path(&self, extension: &str) -> PathBuf {
         self.output_path_for_file("audio", 0, 0, extension)
-    }
-
-    /// Return the base name (stem without extension / index suffix) for a
-    /// given source file index, respecting the naming mode.
-    pub fn output_base_for_file(&self, file_idx: usize) -> String {
-        match self.naming_mode {
-            OutputNamingMode::SourceStems => {
-                self.input_files.get(file_idx)
-                    .and_then(|p| p.file_stem())
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| self.filename_prefix.clone())
-            }
-            OutputNamingMode::PrefixTemplates => self.filename_prefix.clone(),
-        }
-    }
-
-    /// Validate a suffix template: returns an error if the template
-    /// contains no recognized placeholder but would produce duplicates.
-    /// When `naming_mode` is `SourceStems`, the placeholder requirement is
-    /// waived because source-file stems guarantee uniqueness across clips.
-    pub fn validate_suffix_template(template: &str) -> Result<(), String> {
-        Self::validate_suffix_template_for_mode(template, &OutputNamingMode::PrefixTemplates)
-    }
-
-    fn validate_suffix_template_for_mode(template: &str, naming_mode: &OutputNamingMode) -> Result<(), String> {
-        if template.is_empty() {
-            return Ok(());
-        }
-        if naming_mode.is_source_stems() {
-            return Ok(());
-        }
-        let has_placeholder = template.contains("{:01d}")
-            || template.contains("{:02d}")
-            || template.contains("{:03d}");
-        if has_placeholder {
-            return Ok(());
-        }
-        Err("Suffix template must contain at least one placeholder \
-             ({:01d}, {:02d}, or {:03d}) to ensure unique filenames. \
-             Examples: _audio_track{:01d} or _clip{:02d}"
-            .to_string())
     }
 
     /// Generate all output paths for this conversion.
@@ -2994,7 +2917,6 @@ mod tests {
             filename_prefix: "output".to_string(),
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
-            naming_mode: OutputNamingMode::PrefixTemplates,
             trim_to_first_ltc: false,
             trim_offsets_secs: vec![0.0; 2],
             timecode_meta_per_file: vec![None; 2],
@@ -3523,23 +3445,39 @@ mod tests {
 
     #[test]
     fn test_output_path_for_index_audio_01d() {
-        let s = make_settings_audio_only();
+        let s = ConverterSettings {
+            filename_prefix: "output".to_string(),
+            audio_suffix_template: "_audio_track{track:01d}".to_string(),
+            video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
+            ..make_settings_audio_only()
+        };
         let path = s.output_path_for_index("audio", 1, "wav");
         assert_eq!(path.to_string_lossy(), "/tmp/output_audio_track1.wav");
     }
 
     #[test]
     fn test_output_path_for_index_audio_02d() {
-        let s = make_settings_audio_only();
+        let s = ConverterSettings {
+            filename_prefix: "output".to_string(),
+            audio_suffix_template: "_audio_track{track:01d}".to_string(),
+            video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
+            ..make_settings_audio_only()
+        };
         let path = s.output_path_for_index("audio", 10, "wav");
         assert_eq!(path.to_string_lossy(), "/tmp/output_audio_track10.wav");
     }
 
     #[test]
     fn test_output_path_for_index_video_02d() {
-        let s = make_settings_audio_only();
+        let s = ConverterSettings {
+            filename_prefix: "output".to_string(),
+            video_suffix_template: "_video_clip{clip:02d}".to_string(),
+            audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
+            ..make_settings_audio_only()
+        };
         let path = s.output_path_for_index("video", 2, "mov");
-        assert_eq!(path.to_string_lossy(), "/tmp/output_video_clip02.mov");
+        // clip = file_idx + 1 = 1 when calling output_path_for_index
+        assert_eq!(path.to_string_lossy(), "/tmp/output_video_clip01.mov");
     }
 
     #[test]
@@ -3548,6 +3486,7 @@ mod tests {
         s.split_tracks = true;
         s.drop_ltc_track = true;
         s.ltc_track_channel_index = 1;
+        s.audio_suffix_template = "_audio_track{track:01d}".to_string();
         let paths = s.all_output_paths(4, 0, "wav");
         // LTC track (index 1) should be dropped, so 3 audio paths
         assert_eq!(paths.len(), 3, "expected 3 paths (4 tracks - 1 LTC dropped)");
@@ -3560,10 +3499,13 @@ mod tests {
     fn test_all_output_paths_with_video_clips() {
         let mut s = make_settings_audio_only();
         s.split_tracks = false;
+        s.audio_suffix_template = "_audio_track{track:01d}".to_string();
+        s.video_suffix_template = "_video_clip{track:02d}".to_string();
         let paths = s.all_output_paths(2, 3, "mkv");
         // 1 merged audio (suffix-expanded with index 0) + 3 video clips = 4
         assert_eq!(paths.len(), 4, "expected 4 paths");
-        assert!(paths[0].to_string_lossy().ends_with("audio_track0.mkv"),
+        // Merged audio uses index=0 → track=1 (clamped from 0)
+        assert!(paths[0].to_string_lossy().ends_with("audio_track1.mkv"),
             "expected merged audio with suffix, got {}", paths[0].display());
         assert!(paths[1].to_string_lossy().ends_with("video_clip01.mkv"));
         assert!(paths[2].to_string_lossy().ends_with("video_clip02.mkv"));
@@ -4147,7 +4089,7 @@ mod tests {
         let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
         let err = conversion_sanity_check(
             "mkv", "av1", "pcm_s24le",
-            &[input], tmp.path(), "out", &caps, None, None,
+            &[input], tmp.path(), "out", &caps, None, None, false,
         ).unwrap_err();
         assert!(err.contains("No av1 encoder is available"), "got: {}", err);
         assert!(err.contains("av1_nvenc"), "error should name expected encoders");
@@ -4161,7 +4103,7 @@ mod tests {
         let caps = make_caps(true, BTreeSet::from(["libsvtav1", "pcm_s24le"]), BTreeSet::from(["mxf", "matroska"]));
         let err = conversion_sanity_check(
             "mxf", "av1", "pcm_s24le",
-            &[input], tmp.path(), "out", &caps, None, None,
+            &[input], tmp.path(), "out", &caps, None, None, false,
         ).unwrap_err();
         assert!(err.contains("not compatible with container"), "got: {}", err);
     }
@@ -4174,7 +4116,7 @@ mod tests {
         let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
         assert!(conversion_sanity_check(
             "mkv", "libx264", "pcm_s24le",
-            &[input], tmp.path(), "out", &caps, None, None,
+            &[input], tmp.path(), "out", &caps, None, None, false,
         ).is_ok(), "legacy concrete encoder names must keep passing");
     }
 
@@ -4199,7 +4141,6 @@ mod tests {
             filename_prefix: "output".to_string(),
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
-            naming_mode: OutputNamingMode::PrefixTemplates,
             trim_to_first_ltc: false,
             trim_offsets_secs: vec![0.0],
             timecode_meta_per_file: vec![None],
@@ -4395,7 +4336,7 @@ mod tests {
             PathBuf::from("/tmp/clip_B.mov"),
         ];
         s.split_tracks = true;
-        s.naming_mode = OutputNamingMode::SourceStems;
+        s.audio_suffix_template = "_audio_track{track:01d}".to_string();
         let probe = make_stereo_probe();
 
         // No LTC drop → both channels survive per file.
@@ -4433,7 +4374,6 @@ mod tests {
         s.split_tracks = true;
         s.drop_ltc_track = true;
         s.ltc_video_source = Some((1, 0));
-        s.naming_mode = OutputNamingMode::SourceStems;
         let probe = make_stereo_probe();
 
         let previews = preview_output_files(&s, Some(&probe));
@@ -4454,7 +4394,6 @@ mod tests {
             PathBuf::from("/tmp/clip_B.mov"),
         ];
         s.split_tracks = true;
-        s.naming_mode = OutputNamingMode::SourceStems;
         let probe = make_stereo_probe();
 
         let previews = preview_output_files(&s, Some(&probe));
@@ -4491,7 +4430,6 @@ mod tests {
         let mut s = make_video_settings();
         s.input_files = vec![PathBuf::from("/tmp/clip.mov")];
         s.copy_video = true;
-        s.naming_mode = OutputNamingMode::SourceStems;
         let probe = make_stereo_probe();
 
         let previews = preview_output_files(&s, Some(&probe));
@@ -4798,68 +4736,79 @@ mod tests {
         // Copy mode: unknown codec id is irrelevant, conversion is valid
         assert!(conversion_sanity_check(
             "mp4", "weird-codec", "pcm_s24le",
-            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None,
+            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None, false,
         ).is_err(), "encode mode with unknown codec must fail");
 
-        assert!(conversion_sanity_check_copy(
+        assert!(conversion_sanity_check(
             "mp4", "weird-codec", "pcm_s24le",
-            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None,
+            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None, true,
         ).is_ok(), "copy mode must not validate the video codec");
 
         // Copy mode still validates the container against ffmpeg
-        assert!(conversion_sanity_check_copy(
+        assert!(conversion_sanity_check(
             "webp", "weird-codec", "pcm_s24le",
-            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None,
+            std::slice::from_ref(&input), tmp.path(), "out", &caps, None, None, true,
         ).is_err(), "copy mode must still reject unavailable containers");
     }
 
     // ── Output naming mode tests ──────────────────────────────────────────
 
     #[test]
-    fn test_output_base_for_file_prefix_mode() {
+    fn test_output_path_for_file_prefix_mode_basename() {
         let s = ConverterSettings {
             filename_prefix: "session1".to_string(),
-            naming_mode: OutputNamingMode::PrefixTemplates,
             input_files: vec![
                 PathBuf::from("/tmp/C0001.MP4"),
                 PathBuf::from("/tmp/C0002.MP4"),
             ],
+            output_folder: PathBuf::from("/out"),
+            container: "mp4".to_string(),
+            video_suffix_template: String::new(),
+            audio_suffix_template: String::new(),
             ..make_settings_audio_only()
         };
-        assert_eq!(s.output_base_for_file(0), "session1");
-        assert_eq!(s.output_base_for_file(1), "session1");
-        assert_eq!(s.output_base_for_file(99), "session1");
+        let ext = "mp4";
+        assert!(s.output_path_for_file("video", 0, 1, ext).to_string_lossy().ends_with("/out/session1.mp4"),
+            "prefix mode should produce prefix.ext for all files");
+        assert!(s.output_path_for_file("video", 1, 1, ext).to_string_lossy().ends_with("/out/session1.mp4"),
+            "prefix mode should produce same name for file 1");
     }
 
     #[test]
-    fn test_output_base_for_file_source_stems_mode() {
+    fn test_output_path_for_file_source_stems_basename() {
         let s = ConverterSettings {
-            filename_prefix: "session1".to_string(),
-            naming_mode: OutputNamingMode::SourceStems,
+            filename_prefix: "{filename}".to_string(),
             input_files: vec![
                 PathBuf::from("/tmp/C0001.MP4"),
                 PathBuf::from("/tmp/C0002.MP4"),
                 PathBuf::from("/tmp/C0003.MP4"),
             ],
+            output_folder: PathBuf::from("/out"),
+            container: "mp4".to_string(),
+            video_suffix_template: String::new(),
+            audio_suffix_template: String::new(),
             ..make_settings_audio_only()
         };
-        assert_eq!(s.output_base_for_file(0), "C0001");
-        assert_eq!(s.output_base_for_file(1), "C0002");
-        assert_eq!(s.output_base_for_file(2), "C0003");
+        let ext = "mp4";
+        assert!(s.output_path_for_file("video", 0, 1, ext).to_string_lossy().ends_with("/out/C0001.mp4"),
+            "expected C0001, got {}", s.output_path_for_file("video", 0, 1, ext).display());
+        assert!(s.output_path_for_file("video", 1, 1, ext).to_string_lossy().ends_with("/out/C0002.mp4"),
+            "expected C0002, got {}", s.output_path_for_file("video", 1, 1, ext).display());
+        assert!(s.output_path_for_file("video", 2, 1, ext).to_string_lossy().ends_with("/out/C0003.mp4"),
+            "expected C0003, got {}", s.output_path_for_file("video", 2, 1, ext).display());
     }
 
     #[test]
     fn test_output_path_for_file_source_stems_naming() {
         let s = ConverterSettings {
-            filename_prefix: "ignored".to_string(),
-            naming_mode: OutputNamingMode::SourceStems,
+            filename_prefix: "{filename}".to_string(),
             input_files: vec![
                 PathBuf::from("/tmp/C0001.MP4"),
                 PathBuf::from("/tmp/C0002.MP4"),
             ],
             output_folder: PathBuf::from("/out"),
             container: "mkv".to_string(),
-            video_suffix_template: "_clip{:02d}".to_string(),
+            video_suffix_template: "_clip{clip:02d}".to_string(),
             ..make_settings_audio_only()
         };
         let ext = "mkv";
@@ -4873,14 +4822,12 @@ mod tests {
 
     #[test]
     fn test_output_path_for_file_prefix_mode_unchanged() {
-        // PrefixTemplates mode must produce the same name as before
         let s = ConverterSettings {
             filename_prefix: "session".to_string(),
-            naming_mode: OutputNamingMode::PrefixTemplates,
             input_files: vec![PathBuf::from("/tmp/C0001.MP4")],
             output_folder: PathBuf::from("/out"),
             container: "mkv".to_string(),
-            video_suffix_template: "_video_clip{:02d}".to_string(),
+            video_suffix_template: "_video_clip{clip:02d}".to_string(),
             ..make_settings_audio_only()
         };
         let p0 = s.output_path_for_file("video", 0, 1, "mkv");
@@ -4898,8 +4845,7 @@ mod tests {
         let out_dir = input_path.parent().unwrap().to_path_buf();
 
         let s = ConverterSettings {
-            filename_prefix: String::new(),
-            naming_mode: OutputNamingMode::SourceStems,
+            filename_prefix: "{filename}".to_string(),
             input_files: vec![input_path.clone()],
             output_folder: out_dir,
             container: "mp4".to_string(),
@@ -4913,22 +4859,22 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_suffix_template_source_stems_relaxed() {
-        // In SourceStems mode, a template without placeholders is valid
-        assert!(ConverterSettings::validate_suffix_template_for_mode("_sync", &OutputNamingMode::SourceStems).is_ok());
-        assert!(ConverterSettings::validate_suffix_template_for_mode("", &OutputNamingMode::SourceStems).is_ok());
-        // In PrefixTemplates mode, no-placeholder templates should still fail
-        assert!(ConverterSettings::validate_suffix_template_for_mode("_sync", &OutputNamingMode::PrefixTemplates).is_err());
+    fn test_validate_suffix_template() {
+        assert!(naming::validate_template("_sync").is_ok());
+        assert!(naming::validate_template("").is_ok());
+        assert!(naming::validate_template("{filename}").is_ok());
+        assert!(naming::validate_template("{unknown}").is_err());
     }
 
     #[test]
     fn test_plan_video_mux_source_stems_naming() {
         let mut s = make_video_settings();
-        s.naming_mode = OutputNamingMode::SourceStems;
         s.input_files = vec![
             PathBuf::from("/tmp/C0001.MP4"),
             PathBuf::from("/tmp/C0002.MP4"),
         ];
+        s.filename_prefix = "{filename}".to_string();
+        s.video_suffix_template = String::new();
         let probe = make_stereo_probe();
         let steps = plan_video_outputs(&s, &probe);
         assert_eq!(steps.len(), 2, "2 clips → 2 mux steps");
@@ -4949,8 +4895,10 @@ mod tests {
     #[test]
     fn test_plan_video_split_source_stems_naming() {
         let mut s = make_video_settings();
-        s.naming_mode = OutputNamingMode::SourceStems;
         s.split_tracks = true;
+        s.filename_prefix = "{filename}".to_string();
+        s.video_suffix_template = "_video_clip{clip:02d}".to_string();
+        s.audio_suffix_template = "_audio_track{track:01d}".to_string();
         s.input_files = vec![
             PathBuf::from("/tmp/C0001.MP4"),
             PathBuf::from("/tmp/C0002.MP4"),
@@ -4977,6 +4925,7 @@ mod tests {
         let mut s = make_video_settings();
         s.split_tracks = true;
         s.concat_audio = true;
+        s.audio_suffix_template = "_audio_track{track:01d}".to_string();
         s.input_files = vec![
             PathBuf::from("/tmp/C0001.MP4"),
             PathBuf::from("/tmp/C0002.MP4"),
@@ -5132,11 +5081,10 @@ mod tests {
         let input = tmp.path().join("C0001.MP4");
         std::fs::write(&input, b"dummy").unwrap();
         let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
-        let result = conversion_sanity_check_with_naming(
+        let result = conversion_sanity_check(
             "mkv", "h264", "pcm_s24le",
             &[input], tmp.path(), "prefix", &caps,
-            Some("_audio_track{:01d}"), Some("_video_clip{:02d}"),
-            Some(&OutputNamingMode::SourceStems), false,
+            Some("_audio_track{track:01d}"), Some("_video_clip{clip:02d}"), false,
         );
         assert!(result.is_ok(),
             "SourceStems + same folder + non-empty suffix should be Ok, got: {:?}",
@@ -5153,8 +5101,7 @@ mod tests {
             input_files: vec![input],
             output_folder: tmp.path().to_path_buf(),
             filename_prefix: "prefix".to_string(),
-            naming_mode: OutputNamingMode::SourceStems,
-            video_suffix_template: "_video_clip{:02d}".to_string(),
+            video_suffix_template: "_video_clip{clip:02d}".to_string(),
             container: "mkv".to_string(),
             copy_video: false,
             ..make_settings_audio_only()
@@ -5173,8 +5120,7 @@ mod tests {
             pipeline: ConversionPipeline::VideoPassthrough,
             input_files: vec![input],
             output_folder: tmp.path().to_path_buf(),
-            filename_prefix: "prefix".to_string(),
-            naming_mode: OutputNamingMode::SourceStems,
+            filename_prefix: "C0001".to_string(),
             video_suffix_template: String::new(),
             container: "mp4".to_string(),
             copy_video: true,
@@ -5197,8 +5143,7 @@ mod tests {
             input_files: vec![input],
             output_folder: tmp.path().to_path_buf(),
             filename_prefix: "out".to_string(),
-            naming_mode: OutputNamingMode::PrefixTemplates,
-            video_suffix_template: "_video_clip{:02d}".to_string(),
+            video_suffix_template: "_video_clip{clip:02d}".to_string(),
             container: "mkv".to_string(),
             copy_video: false,
             ..make_settings_audio_only()
@@ -5219,8 +5164,7 @@ mod tests {
             input_files: vec![input],
             output_folder: tmp.path().to_path_buf(),
             filename_prefix: "prefix".to_string(),
-            naming_mode: OutputNamingMode::SourceStems,
-            video_suffix_template: "_video_clip{:02d}".to_string(),
+            video_suffix_template: "_video_clip{clip:02d}".to_string(),
             container: "mkv".to_string(),
             copy_video: true,
             ..make_settings_audio_only()
@@ -5235,13 +5179,14 @@ mod tests {
     #[test]
     fn test_all_output_paths_non_split_collision_guard() {
         let dir = tempfile::tempdir().unwrap();
-        // planned merged audio with default suffix template + index 0
         let input_path = dir.path().join("output_audio_track0.wav");
         std::fs::write(&input_path, b"dummy").unwrap();
         let mut s = make_settings_audio_only();
         s.split_tracks = false;
         s.output_folder = dir.path().to_path_buf();
         s.input_files = vec![input_path];
+        s.filename_prefix = "output_audio_track0".to_string();
+        s.audio_suffix_template = String::new();
 
         let paths = s.all_output_paths(1, 0, "wav");
         assert_eq!(paths.len(), 1);
@@ -5258,6 +5203,8 @@ mod tests {
         s.split_tracks = false;
         s.output_folder = dir.path().to_path_buf();
         s.input_files = vec![input_path];
+        s.filename_prefix = "output_audio_track0".to_string();
+        s.audio_suffix_template = String::new();
 
         let previews = preview_output_files(&s, None);
         assert!(!previews.is_empty(), "should have at least one preview output");
@@ -5276,6 +5223,8 @@ mod tests {
         s.split_tracks = false;
         s.output_folder = dir.path().to_path_buf();
         s.input_files = vec![input_path];
+        s.filename_prefix = "output_audio_track0".to_string();
+        s.audio_suffix_template = String::new();
 
         let msg = output_collision_warning(&s);
         assert!(msg.is_some(), "merged audio collision should trigger warning");
@@ -5286,7 +5235,6 @@ mod tests {
     #[test]
     fn test_collision_warning_audio_split_reported() {
         let dir = tempfile::tempdir().unwrap();
-        // Track 1 will be output_audio_track1.wav
         let input_path = dir.path().join("output_audio_track1.wav");
         std::fs::write(&input_path, b"dummy").unwrap();
         let mut s = make_settings_audio_only();
@@ -5294,6 +5242,8 @@ mod tests {
         s.drop_ltc_track = false;
         s.output_folder = dir.path().to_path_buf();
         s.input_files = vec![input_path];
+        s.filename_prefix = "output_audio_track".to_string();
+        s.audio_suffix_template = "{track}".to_string();
 
         let msg = output_collision_warning(&s);
         assert!(msg.is_some(), "split audio collision should trigger warning");
@@ -5311,6 +5261,8 @@ mod tests {
         s.split_tracks = false;
         s.output_folder = dir.path().to_path_buf();
         s.input_files = vec![input_path];
+        s.filename_prefix = "output_audio_track0".to_string();
+        s.audio_suffix_template = String::new();
 
         let msg = output_collision_warning(&s);
         assert!(msg.is_none(),

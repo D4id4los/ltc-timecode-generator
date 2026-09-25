@@ -16,7 +16,7 @@ use gui_engine::converter::{
     build_per_file_trim_and_timecode, find_timecode_at_offset, select_best_combination,
     spawn_conversion, ChannelMap, ConversionPipeline, ConversionState,
     ConverterSettings, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
-    FfmpegCapabilities, OutputNamingMode, RecordingType, TimecodeMetadata,
+    FfmpegCapabilities, RecordingType, TimecodeMetadata,
 };
 use gui_engine::video_codecs::{available_video_codecs, supported_video_codecs};
 use gui_engine::file_pattern::{match_files_to_groups, wrap_user_selected_files, BUILTIN_PATTERNS};
@@ -47,7 +47,6 @@ struct ConvSelectionCtx {
     pat: Arc<Mutex<i32>>,
     idx: Arc<Mutex<isize>>,
     prefix: Arc<Mutex<String>>,
-    naming: Arc<Mutex<OutputNamingMode>>,
     output: Arc<Mutex<String>>,
     split: Arc<Mutex<bool>>,
     drop: Arc<Mutex<bool>>,
@@ -85,11 +84,6 @@ impl ConvSelectionCtx {
         *self.cmap.lock().unwrap() = ChannelMap::identity(n);
         *self.idx.lock().unwrap() = group_idx;
         *self.prefix.lock().unwrap() = raw_prefix;
-        *self.naming.lock().unwrap() = if is_video {
-            OutputNamingMode::SourceStems
-        } else {
-            OutputNamingMode::PrefixTemplates
-        };
         *self.output.lock().unwrap() = String::new();
         *self.split.lock().unwrap() = false;
         *self.drop.lock().unwrap() = false;
@@ -209,8 +203,6 @@ fn _run_gui(
     let conv_sanity_msg: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let conv_trim_to_first_ltc: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let conv_trim_offset_secs: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
-    let conv_naming_mode: Arc<Mutex<OutputNamingMode>> = Arc::new(Mutex::new(OutputNamingMode::PrefixTemplates));
-
     let conv_folder_for_group = conv_selected_folder.clone();
     let conv_ffmpeg_caps_for_select = conv_ffmpeg_caps.clone();
 
@@ -219,7 +211,6 @@ fn _run_gui(
         pat: conv_selected_pattern.clone(),
         idx: conv_selected_group_idx.clone(),
         prefix: conv_filename_prefix.clone(),
-        naming: conv_naming_mode.clone(),
         output: conv_output_path.clone(),
         split: conv_split_tracks.clone(),
         drop: conv_drop_ltc_track.clone(),
@@ -823,7 +814,6 @@ fn _run_gui(
         let venc = conv_video_encoder.clone();
         let aenc = conv_audio_encoder.clone();
         let name_prefix_arc = conv_filename_prefix.clone();
-        let naming_arc2 = conv_naming_mode.clone();
         let trim_flag = conv_trim_to_first_ltc.clone();
         let trim_offset = conv_trim_offset_secs.clone();
         let eng_state = engine_state.clone();
@@ -929,7 +919,6 @@ split_tracks: split_val,
                 resolved_video_encoder: String::new(),
                 output_folder: PathBuf::from(&folder_path),
                 filename_prefix,
-                naming_mode: naming_arc2.lock().unwrap().clone(),
                 audio_suffix_template: audio_suffix_val,
                 video_suffix_template: video_suffix_val,
                 trim_to_first_ltc: trim_flag_val,
@@ -1419,7 +1408,6 @@ u.set_conv_split_tracks(false);
         conv_ffmpeg_probing,
         conv_sanity_msg,
         conv_filename_prefix,
-        conv_naming_mode,
         conv_file_groups,
         conv_selected_group_idx,
         conv_selected_pattern.clone(),
@@ -1456,7 +1444,6 @@ mod tests {
             pat: Arc::new(Mutex::new(0)),
             idx: Arc::new(Mutex::new(-1)),
             prefix: Arc::new(Mutex::new(String::new())),
-            naming: Arc::new(Mutex::new(OutputNamingMode::PrefixTemplates)),
             output: Arc::new(Mutex::new(String::new())),
             split: Arc::new(Mutex::new(false)),
             drop: Arc::new(Mutex::new(false)),
@@ -1503,7 +1490,6 @@ mod tests {
         assert_eq!(*ctx.idx.lock().unwrap(), 0);
         assert_eq!(ctx.cmap.lock().unwrap().num_channels(), 2);
         assert_eq!(*ctx.prefix.lock().unwrap(), "TEST");
-        assert_eq!(*ctx.naming.lock().unwrap(), OutputNamingMode::PrefixTemplates);
         assert!(!*ctx.split.lock().unwrap());
         assert!(!*ctx.drop.lock().unwrap());
         assert!(!*ctx.concat.lock().unwrap());
@@ -1525,7 +1511,6 @@ mod tests {
 
         assert_eq!(*ctx.idx.lock().unwrap(), 0);
         assert_eq!(*ctx.prefix.lock().unwrap(), "CLIP");
-        assert_eq!(*ctx.naming.lock().unwrap(), OutputNamingMode::SourceStems);
 
         let cmd1 = rx.try_recv().unwrap();
         assert!(matches!(cmd1, GuiCommand::ClearLtcGroupResults));

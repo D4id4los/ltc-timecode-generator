@@ -9,8 +9,8 @@ use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetecti
 use log::{debug, error, info, warn};
 
 use crate::command::GuiCommand;
-use crate::converter::{query_ffmpeg_capabilities, FfmpegCapabilities};
-use crate::ffprobe;
+use crate::converter::{query_ffmpeg_capabilities, ConversionState, FfmpegCapabilities};
+use crate::ffprobe::{self, VideoAudioProbe};
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
 
@@ -67,6 +67,10 @@ pub fn engine_main_with_probe<F>(
     let (dur_tx, dur_rx) =
         std::sync::mpsc::channel::<DurationResult>();
 
+    // Internal result channel for converter clip probe
+    let (conv_probe_tx, conv_probe_rx) =
+        std::sync::mpsc::channel::<ConverterProbeResult>();
+
     // Spawn the ffmpeg capability probe on a background thread
     std::thread::Builder::new()
         .name("ffmpeg-probe".into())
@@ -117,6 +121,55 @@ pub fn engine_main_with_probe<F>(
                             }
                         })
                         .expect("failed to spawn duration-probe thread");
+                }
+                Ok(GuiCommand::Converter(crate::command::ConverterCommand::SelectFolder(path))) => {
+                    let groups = crate::file_pattern::match_files_all_patterns(&path);
+                    current.converter.groups = groups;
+                    current.converter.selected_group_idx = None;
+                    current.converter.probes.clear();
+                    current.converter.probes_loading = false;
+                    current.converter.probes_generation = 0;
+                    current.converter.conversion_state = ConversionState::idle();
+                }
+                Ok(GuiCommand::Converter(crate::command::ConverterCommand::SelectRecording(idx))) => {
+                    // Reset per-recording state
+                    current.converter.selected_group_idx = Some(idx);
+                    current.converter.probes.clear();
+                    current.converter.probes_loading = true;
+                    current.converter.probes_generation += 1;
+                    current.converter.conversion_state = ConversionState::idle();
+                    // Clear stale LTC decode state
+                    current.ltc_probe = None;
+                    current.ltc_selected_stream = 0;
+                    current.ltc_selected_channel = 0;
+                    current.ltc_decode_is_video = false;
+                    current.ltc_decode_result = None;
+                    current.ltc_decode_error = None;
+                    current.ltc_is_detecting = false;
+                    current.ltc_group_results.clear();
+                    current.ltc_group_errors.clear();
+                    current.ltc_group_paths.clear();
+                    current.ltc_group_done = 0;
+                    current.ltc_group_total = 0;
+                    current.status_message = "Recording selected — probing…".to_string();
+
+                    // Spawn background probing of all files in the group
+                    if let Some(group) = current.converter.groups.get(idx) {
+                        let files = group.files.clone();
+                        let gen = current.converter.probes_generation;
+                        let conv_probe_tx = conv_probe_tx.clone();
+                        std::thread::Builder::new()
+                            .name("conv-probe".into())
+                            .spawn(move || {
+                                let probes: Vec<Option<VideoAudioProbe>> = files.iter()
+                                    .map(|f| crate::ffprobe::probe_video_audio(f).ok())
+                                    .collect();
+                                let _ = conv_probe_tx.send(ConverterProbeResult { probes, generation: gen });
+                            })
+                            .expect("failed to spawn converter probe thread");
+                    } else {
+                        current.converter.probes_loading = false;
+                    }
                 }
                 Ok(cmd) => {
                     process_command(
@@ -298,7 +351,25 @@ pub fn engine_main_with_probe<F>(
             }
         }
 
-        // 1.9 Poll chunked / group decode progress
+        // 1.9 Drain converter clip probe results
+        loop {
+            match conv_probe_rx.try_recv() {
+                Ok(ConverterProbeResult { probes, generation }) => {
+                    if generation == current.converter.probes_generation {
+                        current.converter.probes = probes;
+                        current.converter.probes_loading = false;
+                        info!("Converter clip probe complete: {} files", current.converter.probes.len());
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("Converter probe channel disconnected");
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // 1.10 Poll chunked / group decode progress
         if current.ltc_is_detecting {
             if let Some((total, ref completed)) = decode_progress {
                 let done = completed.load(Ordering::Relaxed);
@@ -372,6 +443,12 @@ struct DurationResult {
     path: std::path::PathBuf,
     generation: u64,
     secs: Option<f64>,
+}
+
+/// Internal message sent from the converter-probe thread back to the engine loop.
+struct ConverterProbeResult {
+    probes: Vec<Option<VideoAudioProbe>>,
+    generation: u64,
 }
 
 /// Internal message sent from a spawned group-decode thread back to the engine loop.
@@ -948,6 +1025,23 @@ fn process_command(
         GuiCommand::ProbeFileDurations(_) => {
             // Handled in the command drain loop (engine_main) before reaching process_command
         }
+
+        GuiCommand::Converter(ref cmd) => match cmd {
+            crate::command::ConverterCommand::SelectFolder(_)
+            | crate::command::ConverterCommand::SelectRecording(_) => {
+                // Handled in the command drain loop before reaching process_command
+            }
+            crate::command::ConverterCommand::SetTrimEnabled(_) => {
+                // Trim is GUI-local; engine just acknowledges
+            }
+            crate::command::ConverterCommand::StartConversion => {
+                // Conversion is spawned by the GUI (settings are GUI-local);
+                // this can be extended when settings move to the engine.
+            }
+            crate::command::ConverterCommand::CancelConversion => {
+                // Cancel is handled via CancelFlag owned by the GUI.
+            }
+        },
 
         GuiCommand::Shutdown => {
             // Handled in the command drain loop before reaching process_command
