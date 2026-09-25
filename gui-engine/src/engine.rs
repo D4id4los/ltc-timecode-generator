@@ -265,6 +265,9 @@ pub fn engine_main_with_probe<F>(
                                 }
                             }
                         }
+                    } else {
+                        warn!("Discarding stale decode result: generation={}, expected={}, path={}",
+                            generation, current.ltc_decode_generation, path);
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -332,6 +335,9 @@ pub fn engine_main_with_probe<F>(
                             current.ltc_decode_progress_str = String::new();
                             info!("LTC group decode complete: {}/{} ok, {}/{} failed", successes, current.ltc_group_total, failures, current.ltc_group_total);
                         }
+                    } else {
+                        warn!("Discarding stale group result: generation={}, expected={}, clip_index={}, path={}",
+                            generation, current.ltc_group_decode_generation, index, path);
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -773,6 +779,14 @@ fn process_command(
                 info!("CancelDecode: signaling group decode cancel flag");
                 cancel.store(true, Ordering::Relaxed);
             }
+            // Mark single + group decode as finished so the UI doesn't stay
+            // stuck in "detecting" state when the canceled thread returns
+            // early without sending a result.
+            state.ltc_is_detecting = false;
+            state.ltc_group_is_detecting = false;
+            state.ltc_decode_progress_pct = 1.0;
+            state.ltc_decode_progress_str = String::new();
+            state.status_message = "Decode canceled by user".to_string();
         }
 
         GuiCommand::DecodeLtcVideoGroup { paths, stream_index, channel_index } => {
@@ -819,9 +833,14 @@ fn process_command(
                             return;
                         }
 
+                        info!("LTC group decode clip {}/{} started: {}", idx + 1, total, path);
                         let result = decode_one_video_clip(
                             path, stream_index, channel_index,
                             use_libltc, decode_fps, decode_drop_frame, capture_gen,
+                        );
+                        info!("LTC group decode clip {}/{} finished: {} — {}",
+                            idx + 1, total, path,
+                            if result.is_ok() { "OK" } else { "FAILED" },
                         );
 
                         if cancel_flag.load(Ordering::Relaxed) {
@@ -835,6 +854,7 @@ fn process_command(
                             result,
                         });
                     }
+                    info!("LTC group decode thread finished — all {} clips processed", total);
                 })
                 .expect("failed to spawn LTC group decode thread");
         }

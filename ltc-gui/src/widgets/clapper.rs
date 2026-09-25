@@ -241,7 +241,9 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                 .stroke(egui::Stroke::new(1.0, colors.border_main))
                 .inner_margin(egui::Margin::same(10));
             logs_frame.show(ui, |ui| {
-                egui::ScrollArea::vertical().max_height(200.0).min_scrolled_height(176.0).show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(crate::ids::clap_log_scroll())
+                    .max_height(200.0).min_scrolled_height(176.0).show(ui, |ui| {
                     if s.logs.is_empty() {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);

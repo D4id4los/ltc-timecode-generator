@@ -585,3 +585,32 @@ fn test_engine_probe_file_durations_wav() {
     drop(tx);
     handle.join().expect("engine thread panicked");
 }
+
+#[test]
+fn cancel_decode_clears_is_detecting_and_sets_status() {
+    let snapshot = run_engine_with_commands(vec![
+        GuiCommand::ParseLtcWavFile("/nonexistent/bogus_file_for_test.wav".to_string()),
+        GuiCommand::CancelDecode,
+    ], false);
+    assert!(!snapshot.ltc_is_detecting,
+        "CancelDecode should clear ltc_is_detecting");
+    assert_eq!(snapshot.status_message, "Decode canceled by user",
+        "CancelDecode should update status_message");
+}
+
+#[test]
+fn cancel_decode_also_clears_group_detecting() {
+    let snapshot = run_engine_with_commands(vec![
+        GuiCommand::DecodeLtcVideoGroup {
+            paths: vec!["/nonexistent/bogus_clip_1.wav".to_string()],
+            stream_index: 0,
+            channel_index: 0,
+        },
+        GuiCommand::CancelDecode,
+    ], false);
+    assert!(!snapshot.ltc_group_is_detecting,
+        "CancelDecode should clear ltc_group_is_detecting");
+    assert!(!snapshot.ltc_is_detecting,
+        "CancelDecode should clear ltc_is_detecting");
+    assert_eq!(snapshot.status_message, "Decode canceled by user");
+}

@@ -113,6 +113,9 @@ pub struct AppState {
     ltc_auto_applied_gen: u64,
     // Latch: group generation for which auto-settings have been applied
     ltc_group_auto_applied_gen: u64,
+
+    // Diagnostic: last group decode generation that was logged to avoid spam
+    pub last_logged_group_decode_gen: u64,
 }
 
 type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>);
@@ -166,6 +169,7 @@ impl AppState {
             split_tracks: false,
             drop_ltc_track: false,
             concat_audio: false,
+            last_logged_group_decode_gen: 0,
             container: "mkv".to_string(),
             leave_video_untouched: false,
             video_encoder: "av1".to_string(),
@@ -402,6 +406,7 @@ impl eframe::App for AppState {
         ui.painter().rect_filled(clip_rect, 0.0, bg);
 
         egui::ScrollArea::both()
+            .id_salt(crate::ids::root_scroll())
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 8.0);
@@ -832,19 +837,36 @@ impl AppState {
             .resizable(true)
             .collapsible(true);
         window.show(ui.ctx(), |ui| {
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    if let Ok(buf) = self.log_buffer.lock() {
-                        for entry in buf.entries.iter() {
-                            ui.label(
-                                RichText::new(entry)
-                                    .font(FontId::monospace(10.0))
-                                    .color(colors.text_muted),
-                            );
+            ui.vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(crate::ids::debug_log_scroll())
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if let Ok(buf) = self.log_buffer.lock() {
+                            for entry in buf.entries.iter() {
+                                ui.label(
+                                    RichText::new(entry)
+                                        .font(FontId::monospace(10.0))
+                                        .color(colors.text_muted),
+                                );
+                            }
                         }
-                    }
+                    });
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("📋 Copy Log").clicked() {
+                            let mut text = String::new();
+                            if let Ok(buf) = self.log_buffer.lock() {
+                                for entry in buf.entries.iter() {
+                                    text.push_str(entry);
+                                    text.push('\n');
+                                }
+                            }
+                            ui.ctx().copy_text(text);
+                        }
+                    });
                 });
+            });
         });
     }
 }

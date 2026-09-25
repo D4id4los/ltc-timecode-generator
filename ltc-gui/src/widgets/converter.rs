@@ -488,6 +488,24 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     };
 
     if is_video_group && !group_results.is_empty() {
+        // Change-gated logging for Windows diagnostics
+        {
+            let gen = state.latest.ltc_group_decode_generation;
+            if gen != state.last_logged_group_decode_gen {
+                state.last_logged_group_decode_gen = gen;
+                let some_count = group_results.iter().filter(|(_, r, _)| r.is_some()).count();
+                let err_count = group_results.iter().filter(|(_, _, e)| e.is_some()).count();
+                let none_count = group_results.iter().filter(|(_, r, e)| r.is_none() && e.is_none()).count();
+                log::info!(
+                    "GROUP VIEW: paths={} results={} errors={} detecting={} done/total={}/{} gen={} none={} recording={:?}",
+                    group_results.len(), some_count, err_count,
+                    state.latest.ltc_group_is_detecting,
+                    state.latest.ltc_group_done, state.latest.ltc_group_total, gen,
+                    none_count,
+                    state.recording_type,
+                );
+            }
+        }
         // Per-clip expandable LTC detection results
         let scroll_frame = egui::Frame::new()
             .fill(colors.nested_bg)
@@ -496,6 +514,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
             .inner_margin(egui::Margin::symmetric(4, 2));
         scroll_frame.show(ui, |ui| {
             egui::ScrollArea::vertical()
+                .id_salt(crate::ids::ltc_group_results_scroll())
                 .max_height(260.0)
                 .show(ui, |ui| {
                     for (i, (name, result_opt, error_opt)) in group_results.iter().enumerate() {
@@ -557,6 +576,19 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                                     pill_frame.show(ui, |ui| {
                                         ui.label(
                                             RichText::new(format!("⏳ {}: decoding…", name))
+                                                .font(FontId::proportional(9.0))
+                                                .color(colors.text_muted),
+                                        );
+                                    });
+                                } else {
+                                    let pill_frame = egui::Frame::new()
+                                        .fill(colors.card_bg)
+                                        .corner_radius(4.0)
+                                        .stroke(egui::Stroke::new(0.5, colors.border_main))
+                                        .inner_margin(egui::Margin::symmetric(6, 3));
+                                    pill_frame.show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(format!("❓ {}: no result", name))
                                                 .font(FontId::proportional(9.0))
                                                 .color(colors.text_muted),
                                         );
@@ -811,6 +843,7 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                         .inner_margin(egui::Margin::symmetric(6, 4));
                     scroll_frame.show(ui, |ui| {
                         egui::ScrollArea::vertical()
+                            .id_salt(crate::ids::clip_timecodes_scroll(id_salt))
                             .max_height(120.0)
                             .show(ui, |ui| {
                                 for ftc in &result.timecodes {
@@ -1736,6 +1769,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                 .inner_margin(egui::Margin::symmetric(8, 4));
             log_frame.show(ui, |ui| {
                 egui::ScrollArea::vertical()
+                    .id_salt(crate::ids::ffmpeg_log_running_scroll())
                     .max_height(log_height)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
@@ -1771,6 +1805,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                 .inner_margin(egui::Margin::symmetric(8, 4));
             log_frame.show(ui, |ui| {
                 egui::ScrollArea::vertical()
+                    .id_salt(crate::ids::ffmpeg_log_completed_scroll())
                     .max_height(80.0)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
@@ -1808,6 +1843,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                 .inner_margin(egui::Margin::symmetric(8, 4));
             log_frame.show(ui, |ui| {
                 egui::ScrollArea::vertical()
+                    .id_salt(crate::ids::ffmpeg_log_failed_scroll())
                     .max_height(200.0)
                     .stick_to_bottom(false)
                     .show(ui, |ui| {
