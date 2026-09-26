@@ -109,7 +109,12 @@ pub(crate) fn apply_group_selection(
     }
 
     let num_ch = group.files.len();
-    state.channel_map = ChannelMap::identity(num_ch);
+    // For audio, files == channels; for video, matrix is sized from probe later
+    state.channel_map = if group.recording_type == RecordingType::VideoClipSequence {
+        ChannelMap::identity(0)
+    } else {
+        ChannelMap::identity(num_ch)
+    };
     state.recording_type = group.recording_type.clone();
     state.filename_prefix = group.prefix.clone();
     state.output_folder = state.selected_folder.clone().unwrap_or_default();
@@ -973,20 +978,87 @@ fn format_ltc_report_text(result: &gui_engine::LtcDetectionResult) -> String {
 
 // ── Step 2: Channel mapping matrix ──────────────────────────────────────
 
+fn sync_channel_map_from_probe(state: &mut AppState) {
+    let is_video = state.recording_type == RecordingType::VideoClipSequence;
+    let expected = if is_video {
+        state.latest.ltc_probe.as_ref().map(|p| p.total_audio_channels).unwrap_or(0)
+    } else {
+        // Audio: the group's file count = channel count
+        state.selected_group_idx
+            .and_then(|idx| state.file_groups.as_ref()?.get(idx))
+            .map(|g| g.files.len())
+            .unwrap_or(0)
+    };
+    if state.channel_map.num_channels() != expected {
+        state.channel_map = ChannelMap::identity(expected);
+    }
+}
+
+/// Build channel labels for the matrix rows. For video, show track labels
+/// (e.g. "T1 L", "T1 R", "S2 C1"). For audio, show "CH n".
+fn channel_row_labels(state: &AppState) -> Vec<String> {
+    if state.recording_type == RecordingType::VideoClipSequence {
+        if let Some(ref probe) = state.latest.ltc_probe {
+            let mut labels = Vec::new();
+            for s in &probe.streams {
+                for ch in 0..s.channels {
+                    let label = if probe.streams.len() > 1 {
+                        format!("S{} C{}", s.stream_index, ch + 1)
+                    } else if s.channels == 2 {
+                        format!("T1 {}", if ch == 0 { "L" } else { "R" })
+                    } else {
+                        format!("Ch {}", ch + 1)
+                    };
+                    labels.push(label);
+                }
+            }
+            return labels;
+        }
+    }
+    state.selected_group_idx
+        .and_then(|idx| state.file_groups.as_ref()?.get(idx))
+        .map(|g| (0..g.files.len()).map(|i| format!("CH {}", i + 1)).collect())
+        .unwrap_or_default()
+}
+
 fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
+    sync_channel_map_from_probe(state);
     let colors = state.theme.colors();
+    let is_video = state.recording_type == RecordingType::VideoClipSequence;
     let n = state.channel_map.num_channels();
 
     if n == 0 {
-        ui.label(RichText::new("No channels to map.").font(FontId::proportional(10.0)).color(colors.text_muted));
+        if is_video && state.latest.ltc_probe.is_none() {
+            ui.label(RichText::new("Probing clip audio…").font(FontId::proportional(10.0)).color(colors.text_muted));
+        } else {
+            ui.label(RichText::new("No channels to map.").font(FontId::proportional(10.0)).color(colors.text_muted));
+        }
         return;
     }
 
     ui.label(RichText::new("Click a radio button to swap the input channel (row) with the channel currently mapped to the selected output (column).").font(FontId::proportional(9.0)).color(colors.text_secondary));
     ui.add_space(6.0);
 
+    let row_labels = channel_row_labels(state);
+    let ltc_row = if is_video {
+        state.latest.ltc_probe.as_ref().and_then(|probe| {
+            let mut idx = 0usize;
+            for s in &probe.streams {
+                for ch in 0..s.channels {
+                    if s.stream_index == state.latest.ltc_selected_stream && ch == state.latest.ltc_selected_channel {
+                        return Some(idx);
+                    }
+                    idx += 1;
+                }
+            }
+            None
+        })
+    } else {
+        None
+    };
+
     let cell_size = 36.0;
-    let label_width = 40.0;
+    let label_width = 44.0;
     let header_height = 24.0;
     let total_width = label_width + cell_size * n as f32 + 8.0;
     let total_height = header_height + cell_size * n as f32 + 8.0;
@@ -995,7 +1067,8 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
     struct CellPos { cx: f32, cy: f32, row: usize, col: usize }
     let mut cells: Vec<CellPos> = Vec::new();
     let mut header_positions: Vec<(f32, f32, String)> = Vec::new();
-    let mut row_labels: Vec<(f32, f32, String)> = Vec::new();
+    let mut row_label_data: Vec<(f32, f32, String)> = Vec::new();
+    let mut row_is_ltc: Vec<bool> = Vec::new();
 
     for col in 0..n {
         let x = label_width + col as f32 * cell_size + cell_size / 2.0;
@@ -1005,7 +1078,10 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
     for row in 0..n {
         let y0 = header_height + row as f32 * cell_size;
-        row_labels.push((4.0, y0 + cell_size / 2.0, format!("CH {}", row + 1)));
+        let label = row_labels.get(row).cloned().unwrap_or_else(|| format!("CH {}", row + 1));
+        let is_ltc = ltc_row == Some(row);
+        row_label_data.push((4.0, y0 + cell_size / 2.0, label));
+        row_is_ltc.push(is_ltc);
 
         for col in 0..n {
             let cx = label_width + col as f32 * cell_size + cell_size / 2.0;
@@ -1029,14 +1105,16 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
         );
     }
 
-    // Draw row labels
-    for (x, y, text) in &row_labels {
+    // Draw row labels (LTC row highlighted with accent)
+    for (i, (x, y, text)) in row_label_data.iter().enumerate() {
+        let color = if row_is_ltc[i] { ACCENT } else { colors.text_title };
+        let prefix = if row_is_ltc[i] { "● " } else { "  " };
         painter.text(
             egui::pos2(origin.x + x, origin.y + y),
             egui::Align2::LEFT_CENTER,
-            text.as_str(),
-            FontId::monospace(10.0),
-            colors.text_title,
+            format!("{}{}", prefix, text),
+            FontId::monospace(9.0),
+            color,
         );
     }
 
@@ -1045,20 +1123,25 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
         let cx = origin.x + cell.cx;
         let cy = origin.y + cell.cy;
         let is_selected = state.channel_map.get(cell.row) == cell.col;
+        let is_ltc_row = row_is_ltc[cell.row];
 
         let radius = 10.0;
-        let stroke = if is_selected {
-            egui::Stroke::new(2.5, ACCENT)
-        } else {
-            egui::Stroke::new(1.0, colors.border_main)
-        };
-        let fill = if is_selected {
+        let fill_color = if is_ltc_row && !is_selected {
+            ACCENT.linear_multiply(0.12)
+        } else if is_selected {
             ACCENT.linear_multiply(0.3)
         } else {
             colors.deep_bg
         };
+        let stroke = if is_selected {
+            egui::Stroke::new(2.5, ACCENT)
+        } else if is_ltc_row {
+            egui::Stroke::new(1.0, ACCENT.linear_multiply(0.5))
+        } else {
+            egui::Stroke::new(1.0, colors.border_main)
+        };
         painter.circle_stroke(egui::pos2(cx, cy), radius, stroke);
-        painter.circle_filled(egui::pos2(cx, cy), radius - 2.0, fill);
+        painter.circle_filled(egui::pos2(cx, cy), radius - 2.0, fill_color);
     }
 
     // Handle clicks (separate from painter)
@@ -1069,7 +1152,6 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
         let is_selected = state.channel_map.get(cell.row) == cell.col;
         let hitbox = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(cell_size, cell_size));
 
-        // Use response's interact_rect to sense clicks on sub-regions
         let click_id = egui::Id::new(("chan_map", cell.row, cell.col));
         let clicked = ui.interact(hitbox, click_id, egui::Sense::click()).clicked();
         if clicked && !is_selected {

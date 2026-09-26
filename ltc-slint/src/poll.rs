@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gui_engine::converter::{start_timecode_from_ltc, ConversionState, ConversionStatus, FfmpegCapabilities, select_best_combination};
+use gui_engine::converter::{start_timecode_from_ltc, ChannelMap, ConversionState, ConversionStatus, FfmpegCapabilities, select_best_combination};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::AppStateSnapshot;
@@ -60,6 +60,7 @@ pub fn setup_poll_timer(
     conv_set_start_from_ltc: Arc<Mutex<bool>>,
     conv_split_tracks: Arc<Mutex<bool>>,
     conv_drop_ltc_track: Arc<Mutex<bool>>,
+    conv_channel_map: Arc<Mutex<ChannelMap>>,
 ) {
     let ui_weak = ui.as_weak();
     let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -68,6 +69,9 @@ pub fn setup_poll_timer(
 
     // Latch: track when ffmpeg caps have been mirrored into conv_ffmpeg_caps
     let last_caps_loaded: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+
+    // Latch: probe channel count for resizing conv_channel_map
+    let last_probe_channels: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 
     // Latch: track file duration version to rebuild group model
     let last_duration_gen: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
@@ -181,21 +185,42 @@ pub fn setup_poll_timer(
 
             // Sync video audio probe info
             if let Some(ref probe) = s.ltc_probe {
-                let channel_names: Vec<SharedString> = probe
-                    .streams
-                    .iter()
-                    .flat_map(|s_info| {
-                        (0..s_info.channels).map(move |ch| {
-                            let label = if probe.streams.len() > 1 {
-                                format!("Stream {} Ch {}", s_info.stream_index + 1, ch + 1)
-                            } else {
-                                format!("Ch {}", ch + 1)
-                            };
-                            SharedString::from(label)
-                        })
-                    })
-                    .collect();
-                ui.set_ltc_channel_names(ModelRc::new(VecModel::from(channel_names)));
+                let mut channel_names_vec: Vec<SharedString> = Vec::new();
+                let mut ltc_row_idx: i32 = -1;
+                for s_info in &probe.streams {
+                    for ch in 0..s_info.channels {
+                        let idx = channel_names_vec.len();
+                        let label = if probe.streams.len() > 1 {
+                            format!("S{} C{}", s_info.stream_index, ch + 1)
+                        } else if s_info.channels == 2 {
+                            format!("T1 {}", if ch == 0 { "L" } else { "R" })
+                        } else {
+                            format!("Ch {}", ch + 1)
+                        };
+                        channel_names_vec.push(SharedString::from(label));
+                        if s_info.stream_index == s.ltc_selected_stream && ch == s.ltc_selected_channel {
+                            ltc_row_idx = idx as i32;
+                        }
+                    }
+                }
+                ui.set_ltc_channel_names(ModelRc::new(VecModel::from(channel_names_vec)));
+                ui.set_conv_ltc_row_index(ltc_row_idx);
+            }
+
+            // Resize conv_channel_map when probe arrives for video recordings
+            if ui.get_conv_is_video_recording() {
+                let expected = s.ltc_probe.as_ref().map(|p| p.total_audio_channels).unwrap_or(0);
+                let mut last = last_probe_channels.lock().unwrap();
+                if expected != *last {
+                    *last = expected;
+                    if expected != 0 {
+                        let new_channels = expected as i32;
+                        let map_vec: Vec<i32> = (0..new_channels).collect();
+                        *conv_channel_map.lock().unwrap() = ChannelMap::identity(new_channels as usize);
+                        ui.set_conv_num_channels(new_channels);
+                        ui.set_conv_channel_map(ModelRc::new(VecModel::from(map_vec)));
+                    }
+                }
             }
 
             // Sync decode progress every tick during active detection (single or group)

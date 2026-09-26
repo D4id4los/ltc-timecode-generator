@@ -69,6 +69,12 @@ impl ChannelMap {
             .unwrap_or(input_row);
         self.mapping.swap(input_row, swapped_input);
     }
+
+    /// Given an output column, return the input row that maps to it
+    /// (`mapping[input] == output`).
+    pub fn input_for_output(&self, output: usize) -> Option<usize> {
+        self.mapping.iter().position(|&o| o == output)
+    }
 }
 
 // ── ffmpeg capabilities ──────────────────────────────────────────────────
@@ -633,6 +639,10 @@ pub enum AudioKeep {
     AllAudio,
     /// Keep all audio except the given (stream_index, channel_index) pairs.
     ChannelsExcept(Vec<(usize, usize)>),
+    /// Reorder/select audio channels: the Vec lists physical
+    /// (stream_index, channel_index) pairs in the desired output order.
+    /// Implicitly drops any channel not in the list.
+    Reordered(Vec<(usize, usize)>),
 }
 
 /// A single step in a video-to-video conversion plan.
@@ -669,60 +679,103 @@ impl VideoOutputStep {
 ///
 /// Returns a flat list of steps for `file_idx` only. Audio channels are
 /// numbered per-file (track 1 = first surviving channel of this file).
+/// When `settings.channel_map` is non-identity the output order follows the
+/// mapping: output track N corresponds to input `channel_map.input_for_output(N)`.
 fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize, probe: &VideoAudioProbe) -> Vec<VideoOutputStep> {
     let ext = extension_for_container(&settings.container);
     let mut steps: Vec<VideoOutputStep> = Vec::new();
+    let channels = probe_channel_list(probe).unwrap_or_default();
+    let input_n = channels.len();
+    let map_n = settings.channel_map.num_channels();
 
     if settings.split_tracks {
         let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
         steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
 
-        for stream in &probe.streams {
-            for ch in 0..stream.channels {
-                let ltc_match = settings.ltc_video_source == Some((stream.stream_index, ch));
-                if settings.drop_ltc_track && ltc_match {
-                    continue;
-                }
-                let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
-                let audio_idx = steps.iter().filter(|s| matches!(s, VideoOutputStep::AudioChannel { .. })).count() + 1;
-                let audio_out = settings.output_path_for_file("audio", file_idx, audio_idx, aext);
-                steps.push(VideoOutputStep::AudioChannel {
-                    file_idx,
-                    stream_idx: stream.stream_index,
-                    channel_idx: ch,
-                    output: audio_out,
-                    format: fmt.to_string(),
-                });
+        let mut emitted = 0usize;
+        // Iterate outputs in mapping order
+        for output_k in 0..map_n {
+            let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
+                continue;
+            };
+            if input_i >= input_n {
+                continue;
             }
+            let (stream_idx, channel_idx) = channels[input_i];
+            let ltc_match = settings.ltc_video_source == Some((stream_idx, channel_idx));
+            if settings.drop_ltc_track && ltc_match {
+                continue;
+            }
+            let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+            emitted += 1;
+            let audio_out = settings.output_path_for_file("audio", file_idx, emitted, aext);
+            steps.push(VideoOutputStep::AudioChannel {
+                file_idx,
+                stream_idx,
+                channel_idx,
+                output: audio_out,
+                format: fmt.to_string(),
+            });
         }
     } else {
         let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
 
-        let drop_pairs: Vec<(usize, usize)> = if settings.drop_ltc_track {
-            settings.ltc_video_source.into_iter().collect()
-        } else {
-            Vec::new()
-        };
+        // Determine whether the mapping is identity
+        let is_identity = (0..map_n).eq(settings.channel_map.mapping().iter().copied())
+            && map_n == input_n;
 
-        if drop_pairs.is_empty() {
-            steps.push(VideoOutputStep::VideoMux {
-                file_idx,
-                output: video_out,
-                keep: AudioKeep::AllAudio,
-            });
+        if is_identity {
+            // Identity mapping — use existing fast paths
+            let drop_pairs: Vec<(usize, usize)> = if settings.drop_ltc_track {
+                settings.ltc_video_source.into_iter().collect()
+            } else {
+                Vec::new()
+            };
+            if drop_pairs.is_empty() {
+                steps.push(VideoOutputStep::VideoMux {
+                    file_idx,
+                    output: video_out,
+                    keep: AudioKeep::AllAudio,
+                });
+            } else {
+                let total_channels: usize = probe.streams.iter().map(|s| s.channels).sum();
+                let dropped_count: usize = drop_pairs.iter().filter(|(s, c)| {
+                    probe.streams.iter().any(|st| st.stream_index == *s && *c < st.channels)
+                }).count();
+                if dropped_count == total_channels {
+                    steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
+                } else {
+                    steps.push(VideoOutputStep::VideoMux {
+                        file_idx,
+                        output: video_out,
+                        keep: AudioKeep::ChannelsExcept(drop_pairs),
+                    });
+                }
+            }
         } else {
-            let total_channels: usize = probe.streams.iter().map(|s| s.channels).sum();
-            let dropped_count: usize = drop_pairs.iter().filter(|(s, c)| {
-                probe.streams.iter().any(|st| st.stream_index == *s && *c < st.channels)
-            }).count();
-
-            if dropped_count == total_channels {
+            // Non-identity mapping → build reordered physical channel list
+            let mut ordered: Vec<(usize, usize)> = Vec::new();
+            for output_k in 0..map_n {
+                let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
+                    continue;
+                };
+                if input_i >= input_n {
+                    continue;
+                }
+                let pair = channels[input_i];
+                let ltc_match = settings.ltc_video_source == Some(pair);
+                if settings.drop_ltc_track && ltc_match {
+                    continue;
+                }
+                ordered.push(pair);
+            }
+            if ordered.is_empty() {
                 steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
             } else {
                 steps.push(VideoOutputStep::VideoMux {
                     file_idx,
                     output: video_out,
-                    keep: AudioKeep::ChannelsExcept(drop_pairs),
+                    keep: AudioKeep::Reordered(ordered),
                 });
             }
         }
@@ -871,20 +924,29 @@ pub fn plan_concat_outputs(
         return (fallback, warnings);
     }
 
-    // Build one AudioChannelConcat step per surviving track
-    for track_idx in 0..num_tracks {
-        // Check if this track should be dropped (LTC track)
+    // Build one AudioChannelConcat step per surviving (mapped) output
+    let map_n = settings.channel_map.num_channels();
+    let mut emitted = 0usize;
+    for output_k in 0..map_n {
+        let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
+            continue;
+        };
+        if input_i >= num_tracks {
+            continue;
+        }
+        // Check if this output should be dropped (LTC channel)
         if settings.drop_ltc_track {
-            let (ref_stream, ref_ch) = reference[track_idx];
+            let (ref_stream, ref_ch) = reference[input_i];
             if settings.ltc_video_source == Some((ref_stream, ref_ch)) {
                 continue;
             }
         }
-        let segments: Vec<(usize, usize, usize)> = tracks_segments[track_idx].to_vec();
+        let segments: Vec<(usize, usize, usize)> = tracks_segments[input_i].to_vec();
         if segments.is_empty() {
             continue;
         }
-        let audio_out = settings.output_path_for_file("audio", 0, track_idx + 1, aext);
+        emitted += 1;
+        let audio_out = settings.output_path_for_file("audio", 0, emitted, aext);
         steps.push(VideoOutputStep::AudioChannelConcat {
             segments,
             output: audio_out,
@@ -1726,6 +1788,34 @@ fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &Au
                 args.push("-c:a".to_string());
                 args.push(settings.audio_encoder.clone());
             }
+        }
+        AudioKeep::Reordered(ordered_pairs) => {
+            // Build a filter_complex that extracts each physical channel as
+            // mono and merges them in the desired output order via amerge.
+            let mut filter_parts: Vec<String> = Vec::new();
+            for (i, &(stream_idx, channel_idx)) in ordered_pairs.iter().enumerate() {
+                let label = format!("a{}", i);
+                filter_parts.push(format!(
+                    "[0:{}]pan=mono|FC=c{}[{}]",
+                    stream_idx, channel_idx, label
+                ));
+            }
+            let n = ordered_pairs.len();
+            let merge_inputs: Vec<String> = (0..n).map(|i| format!("[a{}]", i)).collect();
+            filter_parts.push(format!(
+                "{}amerge=inputs={}[out]",
+                merge_inputs.join(""),
+                n
+            ));
+            if !filter_parts.is_empty() {
+                args.push("-filter_complex".to_string());
+                args.push(filter_parts.join(";"));
+            }
+            args.push("-map".to_string());
+            args.push("[out]".to_string());
+            // Reorder requires decoding/re-encoding the audio
+            args.push("-c:a".to_string());
+            args.push(settings.audio_encoder.clone());
         }
     }
 
@@ -2950,6 +3040,53 @@ mod tests {
     use super::*;
     use crate::ffprobe::AudioStreamInfo;
     use std::path::PathBuf;
+
+    // ── ChannelMap unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_channel_map_identity_size() {
+        let m = ChannelMap::identity(4);
+        assert_eq!(m.num_channels(), 4);
+        assert_eq!(m.mapping(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_channel_map_from_mapping() {
+        let m = ChannelMap::from_mapping(vec![1, 0, 3, 2]);
+        assert_eq!(m.num_channels(), 4);
+        assert_eq!(m.get(0), 1);
+        assert_eq!(m.get(2), 3);
+    }
+
+    #[test]
+    fn test_channel_map_input_for_output() {
+        let m = ChannelMap::from_mapping(vec![2, 0, 1]);
+        // mapping: input 0→out2, input 1→out0, input 2→out1
+        assert_eq!(m.input_for_output(0), Some(1));
+        assert_eq!(m.input_for_output(1), Some(2));
+        assert_eq!(m.input_for_output(2), Some(0));
+        assert_eq!(m.input_for_output(99), None);
+    }
+
+    #[test]
+    fn test_channel_map_input_for_output_identity() {
+        let m = ChannelMap::identity(3);
+        assert_eq!(m.input_for_output(0), Some(0));
+        assert_eq!(m.input_for_output(1), Some(1));
+        assert_eq!(m.input_for_output(2), Some(2));
+    }
+
+    #[test]
+    fn test_channel_map_swap() {
+        let mut m = ChannelMap::identity(4);
+        m.swap(0, 2);
+        // input 0 → out2  (since input 3 → out2, so input0 swaps with input3? no...)
+        // swap(0,2): input_row=0, target_output=2
+        // position(|&out| out == 2) = 2 (input2→out2)
+        // swap(0, 2) → mapping: [2, 1, 0, 3]
+        assert_eq!(m.get(0), 2);
+        assert_eq!(m.get(2), 0);
+    }
 
     fn make_settings_audio_only() -> ConverterSettings {
         ConverterSettings {
@@ -4261,6 +4398,7 @@ mod tests {
     #[test]
     fn test_plan_split_drop_stereo_ltc_at_1_0() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.split_tracks = true;
         s.drop_ltc_track = true;
         s.ltc_video_source = Some((1, 0));
@@ -4275,6 +4413,7 @@ mod tests {
     #[test]
     fn test_plan_split_no_drop_stereo() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.split_tracks = true;
         s.drop_ltc_track = false;
         let probe = make_stereo_probe();
@@ -4302,6 +4441,7 @@ mod tests {
     #[test]
     fn test_plan_multi_stream_global_channel_numbering() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(3);
         s.split_tracks = true;
         s.drop_ltc_track = true;
         s.ltc_video_source = Some((2, 0)); // drop stream 2 ch 0 (the mono stream)
@@ -4316,7 +4456,8 @@ mod tests {
 
     #[test]
     fn test_plan_no_split_no_drop() {
-        let s = make_video_settings();
+        let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         let probe = make_stereo_probe();
         let steps = plan_video_outputs(&s, &probe);
         assert_eq!(steps.len(), 1);
@@ -4326,6 +4467,7 @@ mod tests {
     #[test]
     fn test_plan_no_split_drop_stereo() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.drop_ltc_track = true;
         s.ltc_video_source = Some((1, 0));
         let probe = make_stereo_probe();
@@ -4356,6 +4498,7 @@ mod tests {
     #[test]
     fn test_plan_video_outputs_for_file_no_duplicates() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.input_files = vec![
             PathBuf::from("/tmp/clip_A.mov"),
             PathBuf::from("/tmp/clip_B.mov"),
@@ -4387,6 +4530,7 @@ mod tests {
     #[test]
     fn test_plan_per_file_audio_numbering() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.input_files = vec![
             PathBuf::from("/tmp/clip_A.mov"),
             PathBuf::from("/tmp/clip_B.mov"),
@@ -4423,6 +4567,7 @@ mod tests {
     #[test]
     fn test_preview_video_split_stereo_drop_ltc() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.input_files = vec![
             PathBuf::from("/tmp/clip_A.mov"),
             PathBuf::from("/tmp/clip_B.mov"),
@@ -4445,6 +4590,7 @@ mod tests {
     #[test]
     fn test_preview_video_split_no_drop() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.input_files = vec![
             PathBuf::from("/tmp/clip_A.mov"),
             PathBuf::from("/tmp/clip_B.mov"),
@@ -4460,6 +4606,7 @@ mod tests {
     #[test]
     fn test_preview_video_no_split() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.input_files = vec![
             PathBuf::from("/tmp/clip_A.mov"),
             PathBuf::from("/tmp/clip_B.mov"),
@@ -4498,6 +4645,7 @@ mod tests {
     #[test]
     fn test_preview_concat_audio() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.input_files = vec![
             PathBuf::from("/tmp/clip_A.mov"),
             PathBuf::from("/tmp/clip_B.mov"),
@@ -4925,6 +5073,7 @@ mod tests {
     #[test]
     fn test_plan_video_mux_source_stems_naming() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.input_files = vec![
             PathBuf::from("/tmp/C0001.MP4"),
             PathBuf::from("/tmp/C0002.MP4"),
@@ -4951,6 +5100,7 @@ mod tests {
     #[test]
     fn test_plan_video_split_source_stems_naming() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.split_tracks = true;
         s.filename_prefix = "{filename}".to_string();
         s.video_suffix_template = "_video_clip{clip:02d}".to_string();
@@ -4979,6 +5129,7 @@ mod tests {
     #[test]
     fn test_plan_concat_stereo_no_drop() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.split_tracks = true;
         s.concat_audio = true;
         s.audio_suffix_template = "_audio_track{track:01d}".to_string();
@@ -5010,6 +5161,7 @@ mod tests {
     #[test]
     fn test_plan_concat_drop_ltc_track() {
         let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
         s.split_tracks = true;
         s.concat_audio = true;
         s.drop_ltc_track = true;

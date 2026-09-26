@@ -57,6 +57,8 @@ export component ConverterSection {
     in-out property <[string]> ltc-channel-names: [];
     in-out property <int> ltc-selected-stream: 0;
     in-out property <int> ltc-selected-channel: 0;
+    // Index of the LTC channel in the flat channel list (-1 = unknown)
+    in-out property <int> conv-ltc-row-index: -1;
     callback channel-selected(int);
 
     callback detect-ltc;
@@ -380,12 +382,15 @@ export component ConverterSection {
                         }
                     }
                     // Matrix rows
-                    for row in root.num-channels : HorizontalLayout { spacing: 4px;
+for row in root.num-channels : HorizontalLayout { spacing: 4px;
                         Rectangle {
-                            width: 36px; height: 30px;
-                            Text { text: "CH " + (row + 1); color: AppColors.text-title;
-                                   font-size: 9px; font-family: "monospace"; font-weight: 600;
-                                   vertical-alignment: center; }
+                            width: 46px; height: 30px;
+                            Text {
+                                text: row < root.ltc-channel-names.length ? root.ltc-channel-names[row] : "CH " + (row + 1);
+                                color: row == root.conv-ltc-row-index ? AppColors.accent : AppColors.text-title;
+                                font-size: 9px; font-family: "monospace"; font-weight: 600;
+                                vertical-alignment: center;
+                            }
                         }
                         for col in root.num-channels : Rectangle {
                             width: 30px; height: 30px;

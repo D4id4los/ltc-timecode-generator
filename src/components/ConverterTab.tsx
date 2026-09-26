@@ -495,9 +495,10 @@ function TauriConverter() {
       const group = fileGroups[idx];
       if (!group) return;
       const n = group.files.length;
-      setNumChannels(n);
+      const isVideo = group.recording_type === "VideoClipSequence";
+      setNumChannels(isVideo ? 0 : n);
       setRecordingType(group.recording_type);
-      setChannelMap(Array.from({ length: n }, (_, i) => i));
+      setChannelMap(isVideo ? [] : Array.from({ length: n }, (_, i) => i));
       setFilenamePrefix(group.prefix);
       setSplitTracks(false);
       setDropLtcTrack(false);
@@ -510,7 +511,7 @@ function TauriConverter() {
       setSelectedChannel(0);
 
       // If video, probe audio streams
-      if (group.recording_type === "VideoClipSequence" && n > 0) {
+      if (isVideo && n > 0) {
         const folder = selectedFolder.endsWith("/") ? selectedFolder : selectedFolder + "/";
         const videoPath = `${folder}${group.files[0]}`;
         (async () => {
@@ -526,6 +527,15 @@ function TauriConverter() {
     },
     [fileGroups, selectedFolder]
   );
+
+  // When video probe arrives, resize channel map to fit total channels
+  useEffect(() => {
+    if (isVideo && videoAudioInfo) {
+      const totalCh = videoAudioInfo.streams.reduce((sum: number, s: { channels: number }) => sum + s.channels, 0);
+      setNumChannels(totalCh);
+      setChannelMap(Array.from({ length: totalCh }, (_, i) => i));
+    }
+  }, [isVideo, videoAudioInfo]);
 
   // Channel matrix: swap on click
   const handleMatrixClick = useCallback(

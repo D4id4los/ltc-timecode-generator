@@ -79,9 +79,13 @@ impl ConvSelectionCtx {
         let files = groups.get(&prefix).cloned().unwrap_or_default();
         let n = files.len();
         let pat = *self.pat.lock().unwrap();
-        let is_video = pat == 1 && n == 1;
+        let is_video = pat == 1;
 
-        *self.cmap.lock().unwrap() = ChannelMap::identity(n);
+        *self.cmap.lock().unwrap() = if is_video {
+            ChannelMap::identity(0)
+        } else {
+            ChannelMap::identity(n)
+        };
         *self.idx.lock().unwrap() = group_idx;
         *self.prefix.lock().unwrap() = raw_prefix;
         *self.output.lock().unwrap() = String::new();
@@ -96,13 +100,18 @@ impl ConvSelectionCtx {
 
         if let Some(u) = ui {
             u.set_conv_selected_group_idx(group_idx as i32);
-            u.set_conv_num_channels(n as i32);
+            if is_video {
+                u.set_conv_num_channels(0);
+                u.set_conv_channel_map(ModelRc::new(VecModel::from(Vec::<i32>::new())));
+            } else {
+                u.set_conv_num_channels(n as i32);
+                let map_vec: Vec<i32> = (0..n as i32).collect();
+                u.set_conv_channel_map(ModelRc::new(VecModel::from(map_vec)));
+            }
             u.set_conv_is_video_recording(is_video);
             u.set_ltc_selected_stream(0);
             u.set_ltc_selected_channel(0);
             u.set_ltc_channel_names(ModelRc::new(VecModel::<SharedString>::from(Vec::new())));
-            let map_vec: Vec<i32> = (0..n as i32).collect();
-            u.set_conv_channel_map(ModelRc::new(VecModel::from(map_vec)));
             u.set_conv_output_folder(SharedString::from(folder.clone()));
             u.set_conv_filename_prefix(SharedString::from(prefix.clone()));
             u.set_conv_audio_suffix_template(SharedString::from(self.audio_suffix.lock().unwrap().clone()));
@@ -865,7 +874,7 @@ fn _run_gui(
             let audio_suffix_val = audio_suffix_arc.lock().unwrap().clone();
             let video_suffix_val = video_suffix_arc.lock().unwrap().clone();
             let ltc_idx = 1;
-            let rec_type = if *pattern_arc2.lock().unwrap() == 1 && num_files == 1 {
+            let rec_type = if *pattern_arc2.lock().unwrap() == 1 {
                 RecordingType::VideoClipSequence
             } else {
                 RecordingType::MultiTrackAudio
@@ -1401,6 +1410,7 @@ u.set_conv_split_tracks(false);
         conv_set_start_from_ltc,
         conv_split_tracks.clone(),
         conv_drop_ltc_track.clone(),
+        conv_channel_map.clone(),
     );
 
     info!("LTC Slint GUI initialized, showing window");
