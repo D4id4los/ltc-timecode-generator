@@ -1,6 +1,48 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* v0.4.3
+
+Main features are a reworked set-start-time-from-LTC workflow that no longer
+trims files, multi-clip recording fixes, and unified file naming.
+
+List of Changes:
+- Convert tab:
+  - Replace "Cut and Set Start Time to First LTC Frame" with "Set Start Time
+    from LTC" — conversions no longer cut the leading non-LTC region; instead
+    the start timecode is computed from the first secure LTC frame (first
+    frame of a >=2s run of consecutive, glitch-free timecodes) by counting
+    frames back to the file start, and embedded via -timecode metadata.
+    Outputs keep their full duration.
+  - Fix LTC decode progress to work with multi-clip recordings (ffmpeg audio
+    extraction + LTC detection both show progress).
+  - Map audio channels instead of clips for videos: the channel mapping
+    matrix now operates on audio channels of a clip; split/concat/mux all
+    honor the mapping.
+  - Refactor & unify file naming across preview and conversion via
+    NameTemplate with named placeholders ({filename}, {clip:0Nd},
+    {track:0Nd}).
+  - Metadata-only mode: Added a mode that changes metadata and filename
+    in-place, never re-encoding audio or video.
+- ltc-gui:
+  - Fix LTC source selection stuck at "Probing…" for video clips — ordering
+    bug where ProbeVideo was sent before SelectRecording, which wiped the
+    probe state. Also send SelectFolder during restore before auto-selecting
+    a recording; warn when SelectRecording references an unknown group.
+  - Fix egui widget & scrollArea ID duplication when processing multiple
+    recordings in one session.
+- ltc-slint:
+  - Reset per-recording state (LTC decode report, conversion status,
+    start-from-LTC checkbox, concat option) when selecting a different
+    recording.
+  - Multi-clip camera groups correctly classified as VideoClipSequence
+    (was: single-file groups only).
+- Engine:
+  - Add SelectRecording and ClearRecordingDecodeState commands; bump decode
+    generations so stale results are discarded after a recording switch.
+  - Add start_timecode_from_ltc() and build_per_file_start_timecodes();
+    rename trim_to_first_ltc -> set_start_from_ltc.
+
 * v0.4.2
 
 Main features are MS Windows compatibility fixes and convert tab UX
