@@ -129,6 +129,8 @@ export component AppWindow inherits Window {
     in-out property <int> ltc-selected-channel: 0;
     in-out property <int> ltc-selected-stream: 0;
     in-out property <int> conv-ltc-row-index: -1;
+    in-out property <bool> conv-ltc-probe-failed: false;
+    in-out property <bool> conv-ltc-probe-loading: false;
 
     // ── Tab state ──
     in-out property <int> active-tab: 0;
@@ -669,6 +671,8 @@ export component AppWindow inherits Window {
                     ltc-selected-channel: root.ltc-selected-channel;
                     ltc-selected-stream: root.ltc-selected-stream;
                     conv-ltc-row-index: root.conv-ltc-row-index;
+                    ltc-probe-failed: root.conv-ltc-probe-failed;
+                    ltc-probe-loading: root.conv-ltc-probe-loading;
                     detect-ltc => { root.ltc-detect(); }
                     channel-selected(val) => { root.channel-selected(val); }
                     decode-fps-selected(val) => { root.decode-fps-selected(val); }

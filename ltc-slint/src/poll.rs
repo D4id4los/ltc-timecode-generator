@@ -212,6 +212,20 @@ pub fn setup_poll_timer(
                 }
                 ui.set_ltc_channel_names(ModelRc::new(VecModel::from(channel_names_vec)));
                 ui.set_conv_ltc_row_index(ltc_row_idx);
+            } else {
+                // No probe data (still loading or failed) — clear stale names
+                // from the previous recording.
+                ui.set_ltc_channel_names(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+                ui.set_conv_ltc_row_index(-1);
+            }
+
+            // Probe-status flags for video recordings
+            if ui.get_conv_is_video_recording() {
+                ui.set_conv_ltc_probe_loading(s.converter.probes_loading);
+                ui.set_conv_ltc_probe_failed(s.ltc_probe.is_none() && !s.converter.probes_loading);
+            } else {
+                ui.set_conv_ltc_probe_loading(false);
+                ui.set_conv_ltc_probe_failed(false);
             }
 
             // Resize conv_channel_map when probe arrives for video recordings

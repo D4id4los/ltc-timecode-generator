@@ -60,6 +60,8 @@ export component ConverterSection {
     in-out property <int> ltc-selected-channel: 0;
     // Index of the LTC channel in the flat channel list (-1 = unknown)
     in-out property <int> conv-ltc-row-index: -1;
+    in-out property <bool> ltc-probe-failed: false;
+    in-out property <bool> ltc-probe-loading: false;
     callback channel-selected(int);
 
     callback detect-ltc;
@@ -250,6 +252,24 @@ export component ConverterSection {
                                     ? root.ltc-channel-names[root.ltc-selected-channel]
                                     : "(ch)";
                                 color: AppColors.text-title; font-size: 10px; font-family: "monospace";
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        // Probe progress / failure indicator for video
+                        if (root.is-video-recording && root.ltc-probe-loading) : Rectangle {
+                            min-height: 28px; max-width: 80px;
+                            Text {
+                                text: "Probing…";
+                                color: AppColors.text-muted; font-size: 9px; font-family: "monospace";
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        if (root.is-video-recording && root.ltc-probe-failed) : Rectangle {
+                            border-radius: 6px; border-width: 1px; border-color: AppColors.red;
+                            background: AppColors.deep-bg; min-height: 28px; max-width: 80px;
+                            Text {
+                                text: "Probe failed";
+                                color: AppColors.red; font-size: 9px; font-family: "monospace";
                                 horizontal-alignment: center; vertical-alignment: center;
                             }
                         }

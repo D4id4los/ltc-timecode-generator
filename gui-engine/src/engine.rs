@@ -193,8 +193,8 @@ pub fn engine_main_with_probe<F>(
                             .name("conv-probe".into())
                             .spawn(move || {
                                 info!("Converter clip probe started: {} file(s)", files.len());
-                                let probes: Vec<Option<VideoAudioProbe>> = files.iter()
-                                    .map(|f| crate::ffprobe::probe_video_audio(f).ok())
+                                let probes: Vec<Result<VideoAudioProbe, String>> = files.iter()
+                                    .map(|f| crate::ffprobe::probe_video_audio(f).map_err(|e| e.to_string()))
                                     .collect();
                                 let _ = conv_probe_tx.send(ConverterProbeResult { probes, generation: gen });
                             })
@@ -408,24 +408,32 @@ pub fn engine_main_with_probe<F>(
                         if let Some(ref idx) = current.converter.selected_group_idx {
                             if let Some(group) = current.converter.groups.get(*idx) {
                                 if group.recording_type == crate::converter::RecordingType::VideoClipSequence {
-                                    if let Some(Some(ref probe)) = probes.first() {
+                                    // Use the first successful probe (not necessarily
+                                    // probes[0] — a failed clip should not hide a
+                                    // successful later one).
+                                    if let Some(Ok(ref probe)) = probes.iter().find(|r| r.is_ok()) {
                                         current.ltc_probe = Some(probe.clone());
                                         current.ltc_selected_stream = 0;
                                         current.ltc_selected_channel = 0;
                                         current.ltc_decode_is_video = true;
+                                        current.ltc_decode_error = None;
                                         info!(
                                             "LTC source probe set from clip probe: {} stream(s), {} channel(s)",
                                             probe.streams.len(),
                                             probe.total_audio_channels,
                                         );
                                     } else {
-                                        warn!("LTC source probe unavailable: first clip probe failed");
-                                        current.status_message = "Video probe failed — no audio streams detected.".to_string();
+                                        let err = probes.iter().find_map(|r| {
+                                            if let Err(ref e) = r { Some(e.clone()) } else { None }
+                                        }).unwrap_or_else(|| "No audio streams detected.".to_string());
+                                        warn!("LTC source probe unavailable: all probes failed — {}", err);
+                                        current.ltc_decode_error = Some(format!("LTC source probe failed: {}", err));
+                                        current.status_message = format!("Video probe failed: {}", err);
                                     }
                                 }
                             }
                         }
-                        current.converter.probes = probes;
+                        current.converter.probes = probes.iter().map(|r| r.as_ref().ok().cloned()).collect();
                         current.converter.probes_loading = false;
                         info!("Converter clip probe complete: {} files", current.converter.probes.len());
                     } else {
@@ -533,7 +541,7 @@ struct DurationResult {
 
 /// Internal message sent from the converter-probe thread back to the engine loop.
 struct ConverterProbeResult {
-    probes: Vec<Option<VideoAudioProbe>>,
+    probes: Vec<Result<VideoAudioProbe, String>>,
     generation: u64,
 }
 

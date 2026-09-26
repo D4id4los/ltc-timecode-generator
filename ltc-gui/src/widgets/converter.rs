@@ -321,6 +321,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
             stream: usize,
             channel: usize,
             label: String,
+            disabled: bool,
         }
 
         let channel_options: Vec<ChannelOption> = if is_video {
@@ -339,16 +340,20 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                                 stream: s.stream_index,
                                 channel: ch,
                                 label,
+                                disabled: false,
                             }
                         })
                     })
                     .collect()
-            } else {
+            } else if state.latest.converter.probes_loading {
                 vec![ChannelOption {
                     stream: 0,
                     channel: 0,
                     label: "Probing…".to_string(),
+                    disabled: true,
                 }]
+            } else {
+                vec![]
             }
         } else {
             group
@@ -360,6 +365,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                     stream: i,
                     channel: 0,
                     label: f.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string(),
+                    disabled: false,
                 })
                 .collect()
         };
@@ -416,7 +422,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                         for opt in &channel_options {
                             let is_sel = opt.stream == state.latest.ltc_selected_stream
                                 && opt.channel == state.latest.ltc_selected_channel;
-                            if ui.selectable_label(is_sel, &opt.label).clicked() {
+                            if ui.selectable_label(is_sel, &opt.label).clicked() && !opt.disabled {
                                 let _ = cmd_tx.send(GuiCommand::SetLtcDecodeStream(opt.stream));
                                 let _ = cmd_tx.send(GuiCommand::SetLtcDecodeChannel(opt.channel));
                             }
@@ -1044,7 +1050,11 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
     if n == 0 {
         if is_video && state.latest.ltc_probe.is_none() {
-            ui.label(RichText::new("Probing clip audio…").font(FontId::proportional(10.0)).color(colors.text_muted));
+            if state.latest.converter.probes_loading {
+                ui.label(RichText::new("Probing clip audio…").font(FontId::proportional(10.0)).color(colors.text_muted));
+            } else {
+                ui.label(RichText::new("Clip audio probe failed.").font(FontId::proportional(10.0)).color(colors.error_red));
+            }
         } else {
             ui.label(RichText::new("No channels to map.").font(FontId::proportional(10.0)).color(colors.text_muted));
         }

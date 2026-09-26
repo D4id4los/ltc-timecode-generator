@@ -639,6 +639,110 @@ fn test_engine_parse_ltc_video_rejects_out_of_range_stream() {
     assert!(!snapshot.ltc_is_detecting);
 }
 
+// ── Regression: probe failure must publish ltc_decode_error ──
+
+#[test]
+fn test_select_recording_probe_failure_publishes_error() {
+    // No ffmpeg/ffprobe needed — the file is garbage and ffprobe will fail.
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("C0001.MP4"), b"not a video file").unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-vtest".into())
+        .spawn(move || {
+            gui_engine::engine::engine_main(rx, state_clone, false);
+        })
+        .expect("failed to spawn engine thread");
+
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = state.load().as_ref().clone();
+        if snapshot.generation > 0 && !snapshot.converter.probes_loading {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("converter clip probe did not complete within 30s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let snapshot = state.load().as_ref().clone();
+    assert!(
+        snapshot.ltc_decode_error.is_some(),
+        "ltc_decode_error must be set when clip probe fails (was {:?})",
+        snapshot.ltc_decode_error,
+    );
+    assert!(
+        snapshot.ltc_probe.is_none(),
+        "ltc_probe must remain None when clip probe fails",
+    );
+    assert!(!snapshot.converter.probes_loading);
+    assert!(!snapshot.ltc_decode_is_video);
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}
+
+#[test]
+fn test_select_recording_probe_falls_back_to_successful_clip() {
+    // The first clip is garbage (ffprobe fails), but the second is a valid
+    // muxed video. The engine should fall back to the successful probe.
+    if !ffmpeg_tooling_available() {
+        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("C0001.MP4"), b"not a video file").unwrap();
+    let ltc_wav = generate_ltc_wav(dir.path(), "ltc.wav", 25.0, 2.0, "both");
+    let _mp4 = mux_video_fixture(dir.path(), "C0002.MP4", &ltc_wav, false);
+
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-vtest".into())
+        .spawn(move || {
+            gui_engine::engine::engine_main(rx, state_clone, false);
+        })
+        .expect("failed to spawn engine thread");
+
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let snapshot = state.load().as_ref().clone();
+        if snapshot.generation > 0 && !snapshot.converter.probes_loading {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("converter clip probe did not complete within 60s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let snapshot = state.load().as_ref().clone();
+    assert!(
+        snapshot.ltc_probe.is_some(),
+        "ltc_probe must be populated from a later successful clip when the first fails",
+    );
+    assert!(snapshot.ltc_decode_error.is_none(), "ltc_decode_error must be None when at least one clip succeeds: {:?}", snapshot.ltc_decode_error);
+    assert!(!snapshot.converter.probes_loading);
+    assert!(snapshot.ltc_decode_is_video);
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}
+
 // ── Regression: SelectRecording must not leave ltc_probe permanently cleared ─
 
 #[test]
