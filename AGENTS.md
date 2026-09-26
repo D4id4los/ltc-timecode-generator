@@ -58,7 +58,8 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── log_buffer.rs         # LogBuffer ring buffer + init_logger (canonical logger)
 │   │   ├── theme.rs              # Shared dark/light ThemeColors palettes used by both Rust GUIs
 │   │   ├── converter.rs          # ffmpeg conversion pipelines (see Converter section)
-│   │   ├── file_pattern.rs       # Camera/recorder filename patterns + file grouping
+│   │   ├── tagger.rs            # In-place timecode tagging (native MOV/MP4 + WAV bext + ffmpeg fallback)
+│   │   ├── file_pattern.rs      # Camera/recorder filename patterns + file grouping
 │   │   ├── ffprobe.rs            # ffprobe video/audio probing + ffmpeg channel extraction
 │   │   └── config.rs             # Converter config persistence (last input/output folders)
 │   └── tests/                    # integration.rs, converter_integration.rs, video_extraction.rs
@@ -165,8 +166,9 @@ The converter turns raw recordings into deliverables: trim each file to its firs
 
 ### Components
 - **`converter.rs`** — core pipeline:
-  - `ConversionPipeline`: `AudioOnly { generate_synthetic_video }` (multi-track WAV → audio/video outputs) and `VideoPassthrough` (camera clips → video outputs).
+  - `ConversionPipeline`: `AudioOnly { generate_synthetic_video }` (multi-track WAV → audio/video outputs), `VideoPassthrough` (camera clips → video outputs), and `MetadataOnly` (tag originals in place, rename, extract audio).
   - `ConverterSettings`: input files, `RecordingType` (MultiTrackAudio / VideoClipSequence), `ChannelMap` (input→output permutation), `split_tracks` / `drop_ltc_track` / `ltc_video_source`, container + video codec / audio encoder, output folder + naming templates (defaults `_audio_track{:01d}` / `_video_clip{:02d}`), `trim_to_first_ltc` + per-file trim offsets, per-file `TimecodeMetadata` (start TC, fps, drop-frame).
+  - `conversion_sanity_check_metadata_only()` — lightweight preflight for `MetadataOnly` pipeline (only ffmpeg, file existence, template validation).
   - **Video encoder selection is codec-level** (see `video_codecs.rs` below): `ConverterSettings.video_encoder` stores a codec id (`"av1"`, `"h265"`, …); `resolved_video_encoder` holds the concrete ffmpeg encoder chosen at conversion time.
   - `query_ffmpeg_capabilities()` probes ffmpeg once; after listing encoders/formats and discovering HW devices (VAAPI/Vulkan), it **validates each hardware encoder candidate with a 1-frame test encode** (`-f lavfi -i testsrc=... -c:v <enc> -f null -` with 10s timeout). Non-functional encoders (missing driver, incompatible GPU) are removed from `available_encoders` so they never appear in the dropdown or encoder chain. `available_*_for_container()` filters audio encoders/containers; `select_best_combination()` picks defaults (codec-aware); `apply_available_defaults()` repairs stale settings.
   - `plan_video_outputs()` → ordered `VideoOutputStep` list (`VideoOnly`, `VideoMux` with `AudioKeep`, `AudioChannel` extraction); caller executes each step.
@@ -182,9 +184,10 @@ The converter turns raw recordings into deliverables: trim each file to its firs
 - **`file_pattern.rs`** — groups input files by naming convention. `BUILTIN_PATTERNS` (TASCAM Portacapture X8 `nameS<ch>`, `*` any) + `CAMERA_PATTERNS` (Sony Handycam, Sony FS100, Canon `MVI_`, Panasonic `GH`, GoPro `GOPR`/`GP`). `match_files_to_groups()` / `wrap_user_selected_files()` / `match_files_all_patterns()`; `default_output_filename()` derives the output name from the group.
 - **`ffprobe.rs`** — `probe_video_audio()` (ffprobe JSON → `VideoAudioProbe` with per-stream channels/codec/sample-rate), `path_is_video()`, `extract_audio_channel()` (ffmpeg extraction used by decode), `snap_trim_to_keyframe()` / `parse_last_keyframe()` (keyframe packet scan used by stream-copy trim snapping).
 - **`config.rs`** — persists last input/output folders to `<config_dir>/ltc-timecode-generator/converter_config.json`.
+- **`tagger.rs`** — in-place timecode metadata tagger: dispatches MOV/MP4 (native O(1) in-place tagger: trailing moov → free + appended tmcd track + tiny mdat), WAV with existing bext (patches time_reference), and ffmpeg stream-copy remux (temp file + atomic rename) as fallback for other containers. `tag_file()` dispatches. `run_tagging()` runs batch tagging with progress/cancel for the metadata-only pipeline.
 
 ### Flow
-Select files → group by naming pattern → probe (ffprobe) → (ffmpeg capabilities already probed async at engine startup) → readiness/blockers check → channel mapping + LTC track handling → trim-to-first-LTC + timecode metadata → `spawn_conversion` (progress + cancel).
+Select files → group by naming pattern → probe (ffprobe) → (ffmpeg capabilities already probed async at engine startup) → readiness/blockers check → channel mapping + LTC track handling → trim-to-first-LTC + timecode metadata → `spawn_conversion` (progress + cancel). `MetadataOnly` pipeline skips trimming and encoder checks: originals are tagged in place (native MP4/MOV or ffmpeg remux), renamed, and audio extracted per channel. See `run_metadata_only()` and `tagger::tag_file()`.
 
 ## Native Rust GUI (`ltc-gui/`)
 

@@ -97,6 +97,7 @@ export component AppWindow inherits Window {
     in-out property <bool> conv-is-video-recording: false;
     in-out property <string> conv-container: "mkv";
     in-out property <bool> conv-copy-video: false;
+    in-out property <bool> conv-metadata-only: false;
     in-out property <string> conv-video-encoder: "libsvtav1";
     in-out property <string> conv-audio-encoder: "pcm_s24le";
     in-out property <string> conv-output-folder: "";
@@ -201,6 +202,7 @@ export component AppWindow inherits Window {
     callback toggle-concat-audio;
     callback toggle-synthetic-video;
     callback toggle-copy-video;
+    callback toggle-metadata-only;
     callback conv-select-pattern(int);
     callback toggle-set-start-ltc;
 
@@ -686,6 +688,7 @@ export component AppWindow inherits Window {
                     is-video-recording: root.conv-is-video-recording;
                     container: root.conv-container;
                     copy-video: root.conv-copy-video;
+                    metadata-only: root.conv-metadata-only;
                     video-encoder: root.conv-video-encoder;
                     audio-encoder: root.conv-audio-encoder;
                     output-folder: root.conv-output-folder;
@@ -724,6 +727,7 @@ export component AppWindow inherits Window {
                     toggle-concat-audio => { root.toggle-concat-audio(); }
                     toggle-synthetic-video => { root.toggle-synthetic-video(); }
                     toggle-copy-video => { root.toggle-copy-video(); }
+                    toggle-metadata-only => { root.toggle-metadata-only(); }
                     select-pattern(idx) => { root.conv-select-pattern(idx); }
                 }
                     }

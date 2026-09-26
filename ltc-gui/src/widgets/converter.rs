@@ -9,7 +9,7 @@ use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
     available_containers, build_per_file_start_timecodes, conversion_sanity_check,
-    evaluate_readiness, output_collision_warning,
+    conversion_sanity_check_metadata_only, evaluate_readiness, output_collision_warning,
     format_blockers,
     preview_output_files, spawn_conversion, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
     ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
@@ -87,7 +87,9 @@ fn step_header(ui: &mut Ui, number: &str, label: &str, colors: &crate::theme::Th
 /// meaningful for the video pipeline (audio-only recordings have no video
 /// stream to copy, and synthetic video must be encoded).
 fn copy_mode_active(state: &AppState) -> bool {
-    state.leave_video_untouched && state.recording_type == RecordingType::VideoClipSequence
+    !state.metadata_only
+        && state.leave_video_untouched
+        && state.recording_type == RecordingType::VideoClipSequence
 }
 
 pub(crate) fn apply_group_selection(
@@ -119,6 +121,7 @@ pub(crate) fn apply_group_selection(
     state.output_folder = state.selected_folder.clone().unwrap_or_default();
     state.split_tracks = false;
     state.drop_ltc_track = false;
+    state.metadata_only = false;
     state.set_start_from_ltc = false;
     state.ltc_offset_secs = 0.0;
     state.concat_audio = false;
@@ -1336,9 +1339,18 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
                     }
                     ui.add_space(4.0);
                 }
+                ui.checkbox(&mut state.metadata_only, "Metadata only (tag + rename, extract audio)");
+                if state.metadata_only {
+                    ui.label(
+                        RichText::new("Originals are tagged in place with the start timecode and renamed. Audio is extracted to the output folder. No re-encoding.")
+                            .font(FontId::proportional(9.0))
+                            .color(colors.text_muted),
+                    );
+                    ui.add_space(4.0);
+                }
                 ui.label(RichText::new("VIDEO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
                 ui.add_space(4.0);
-                ui.add_enabled_ui(!copy_mode_active(state), |ui| {
+                ui.add_enabled_ui(!copy_mode_active(state) && !state.metadata_only, |ui| {
                     {
                         let mut update_container = |v: &str| {
                             state.container = v.to_string();
@@ -1363,10 +1375,10 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
             ui.vertical(|ui| {
                 ui.label(RichText::new("AUDIO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
                 ui.add_space(4.0);
-                {
+                ui.add_enabled_ui(!state.metadata_only, |ui| {
                     let mut update_audio = |v: &str| state.audio_encoder = v.to_string();
                     render_format_row(ui, "Audio encoder", &cur_audio_encoder, &audio_encoders, &mut update_audio, &colors);
-                }
+                });
             });
         });
     }
@@ -1680,34 +1692,50 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
     let sanity_ok = if can_convert {
         let caps = caps_opt.as_ref().unwrap();
         let input_files = selected_input_files(state);
-        conversion_sanity_check(
-            &state.container,
-            &state.video_encoder,
-            &state.audio_encoder,
-            &input_files,
-            &state.output_folder,
-            &state.filename_prefix,
-            caps,
-            Some(&state.audio_suffix_template),
-            Some(&state.video_suffix_template),
-            copy_mode_active(state),
-        )
-        .is_ok()
+        if state.metadata_only {
+            conversion_sanity_check_metadata_only(
+                &input_files,
+                &state.output_folder,
+                &state.filename_prefix,
+                caps,
+                Some(&state.audio_suffix_template),
+                Some(&state.video_suffix_template),
+            )
+            .is_ok()
+        } else {
+            conversion_sanity_check(
+                &state.container,
+                &state.video_encoder,
+                &state.audio_encoder,
+                &input_files,
+                &state.output_folder,
+                &state.filename_prefix,
+                caps,
+                Some(&state.audio_suffix_template),
+                Some(&state.video_suffix_template),
+                copy_mode_active(state),
+            )
+            .is_ok()
+        }
     } else {
         false
     };
 
-    let button_label = match state.recording_type {
-        RecordingType::MultiTrackAudio => if state.generate_synthetic_video {
-            "CONVERT WITH SYNTHETIC VIDEO"
-        } else {
-            "CONVERT AUDIO FILES"
-        },
-        RecordingType::VideoClipSequence => if copy_mode_active(state) {
-            "CONVERT VIDEO CLIPS (STREAM COPY)"
-        } else {
-            "CONVERT VIDEO CLIPS"
-        },
+    let button_label = if state.metadata_only {
+        "TAG + EXTRACT (METADATA ONLY)"
+    } else {
+        match state.recording_type {
+            RecordingType::MultiTrackAudio => if state.generate_synthetic_video {
+                "CONVERT WITH SYNTHETIC VIDEO"
+            } else {
+                "CONVERT AUDIO FILES"
+            },
+            RecordingType::VideoClipSequence => if copy_mode_active(state) {
+                "CONVERT VIDEO CLIPS (STREAM COPY)"
+            } else {
+                "CONVERT VIDEO CLIPS"
+            },
+        }
     };
 
     ui.add_enabled_ui(can_convert && sanity_ok, |ui| {
@@ -1750,11 +1778,15 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
 /// the preview without needing an LTC decode result.
 fn current_converter_settings(state: &AppState) -> ConverterSettings {
     let input_files = selected_input_files(state);
-    let pipeline = match state.recording_type {
-        RecordingType::MultiTrackAudio => {
-            ConversionPipeline::AudioOnly { generate_synthetic_video: state.generate_synthetic_video }
+    let pipeline = if state.metadata_only {
+        ConversionPipeline::MetadataOnly
+    } else {
+        match state.recording_type {
+            RecordingType::MultiTrackAudio => {
+                ConversionPipeline::AudioOnly { generate_synthetic_video: state.generate_synthetic_video }
+            }
+            RecordingType::VideoClipSequence => ConversionPipeline::VideoPassthrough,
         }
-        RecordingType::VideoClipSequence => ConversionPipeline::VideoPassthrough,
     };
     let ltc_video_source = match state.recording_type {
         RecordingType::VideoClipSequence => {

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gui_engine::converter::{start_timecode_from_ltc, ChannelMap, ConversionState, ConversionStatus, FfmpegCapabilities, select_best_combination};
+use gui_engine::converter::{conversion_sanity_check_metadata_only, start_timecode_from_ltc, ChannelMap, ConversionState, ConversionStatus, FfmpegCapabilities, select_best_combination};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::AppStateSnapshot;
@@ -56,6 +56,7 @@ pub fn setup_poll_timer(
     conv_video_encoder: Arc<Mutex<String>>,
     conv_audio_encoder: Arc<Mutex<String>>,
     conv_copy_video: Arc<Mutex<bool>>,
+    conv_metadata_only: Arc<Mutex<bool>>,
     conv_selected_folder: Arc<Mutex<String>>,
     conv_ltc_offset_secs: Arc<Mutex<f64>>,
     conv_set_start_from_ltc: Arc<Mutex<bool>>,
@@ -493,6 +494,7 @@ pub fn setup_poll_timer(
                 let venc = conv_video_encoder.lock().unwrap().clone();
                 let aenc = conv_audio_encoder.lock().unwrap().clone();
                 let copy_video = *conv_copy_video.lock().unwrap();
+                let metadata_only = *conv_metadata_only.lock().unwrap();
                 let folder = conv_selected_folder.lock().unwrap().clone();
                 let filename_prefix = conv_filename_prefix.lock().unwrap().clone();
                 let mut msg = String::new();
@@ -519,7 +521,14 @@ pub fn setup_poll_timer(
                             Vec::new()
                         };
                         let output_folder = Path::new(&folder);
-                        if let Err(e) = gui_engine::converter::conversion_sanity_check(
+                        if metadata_only {
+                            if let Err(e) = conversion_sanity_check_metadata_only(
+                                &input_files, output_folder, &filename_prefix, c,
+                                None, None,
+                            ) {
+                                msg = e;
+                            }
+                        } else if let Err(e) = gui_engine::converter::conversion_sanity_check(
                             &container, &venc, &aenc, &input_files, output_folder, &filename_prefix, c,
                             None, None, copy_video,
                         ) {

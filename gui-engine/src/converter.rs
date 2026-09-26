@@ -550,6 +550,68 @@ fn sanity_check_impl(
     Ok(())
 }
 
+/// Sanity check for `MetadataOnly` pipeline — no codec/container checks,
+/// only ffmpeg presence, file existence, and naming-template validity.
+pub fn conversion_sanity_check_metadata_only(
+    input_files: &[PathBuf],
+    output_folder: &Path,
+    filename_prefix: &str,
+    caps: &FfmpegCapabilities,
+    audio_suffix: Option<&str>,
+    video_suffix: Option<&str>,
+) -> Result<(), String> {
+    if !caps.has_ffmpeg {
+        return Err(
+            "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH."
+                .to_string(),
+        );
+    }
+
+    if input_files.is_empty() {
+        return Err("No input files selected.".to_string());
+    }
+
+    for f in input_files {
+        if !f.exists() {
+            return Err(format!("Input file does not exist: {}", f.display()));
+        }
+    }
+
+    if filename_prefix.is_empty()
+        && audio_suffix.unwrap_or("").is_empty()
+        && video_suffix.unwrap_or("").is_empty()
+    {
+        return Err("No output filename prefix or suffix specified.".to_string());
+    }
+
+    if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
+        return Err(format!(
+            "Output directory does not exist: {}",
+            output_folder.display()
+        ));
+    }
+
+    // Validate templates
+    if let Some(t) = audio_suffix {
+        if !t.is_empty() {
+            naming::validate_template(t)
+                .map_err(|e| format!("Invalid audio suffix template: {}", e))?;
+        }
+    }
+    if let Some(t) = video_suffix {
+        if !t.is_empty() {
+            naming::validate_template(t)
+                .map_err(|e| format!("Invalid video suffix template: {}", e))?;
+        }
+    }
+    if !filename_prefix.is_empty() {
+        naming::validate_template(filename_prefix)
+            .map_err(|e| format!("Invalid filename prefix: {}", e))?;
+    }
+
+    Ok(())
+}
+
 // ── Pipeline mode ────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -562,6 +624,11 @@ pub enum ConversionPipeline {
     /// Input: video files (MP4, MTS). Output: video with original video
     /// transcoded if codec differs from source.
     VideoPassthrough,
+    /// Metadata-only mode: tag originals with start timecode, rename in
+    /// place, extract audio from videos as per-channel WAVs.  No re-encode,
+    /// no trimming, no full-file copy (tagging is in-place or fast
+    /// stream-copy remux).
+    MetadataOnly,
 }
 
 // ── Recording type ──────────────────────────────────────────────────────
@@ -1240,6 +1307,34 @@ pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAu
 
             previews
         }
+        ConversionPipeline::MetadataOnly => {
+            let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+            let mut previews = Vec::new();
+            // Only audio extractions are written to output folder; video
+            // files are tagged and renamed in place.
+            if settings.recording_type == RecordingType::VideoClipSequence {
+                let num_channels = settings.channel_map.num_channels();
+                if settings.split_tracks {
+                    for i in 0..num_channels {
+                        if settings.drop_ltc_track && i == settings.ltc_track_channel_index {
+                            continue;
+                        }
+                        previews.push(PreviewOutput {
+                            kind: OutputKind::Audio,
+                            path: settings.output_path_for_index("audio", i + 1, aext),
+                        });
+                    }
+                } else {
+                    previews.push(PreviewOutput {
+                        kind: OutputKind::Audio,
+                        path: settings.merged_audio_output_path(aext),
+                    });
+                }
+            }
+            // Tagged/renamed video files aren't shown in the preview
+            // since they stay in place (same folder).
+            previews
+        }
     }
 }
 
@@ -1305,6 +1400,51 @@ pub fn output_collision_warning(settings: &ConverterSettings) -> Option<String> 
                         unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
                         guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
                     ));
+                }
+            }
+        }
+        ConversionPipeline::MetadataOnly => {
+            let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+            if settings.recording_type == RecordingType::VideoClipSequence {
+                if settings.split_tracks {
+                    for i in 0..settings.channel_map.num_channels() {
+                        if settings.drop_ltc_track && i == settings.ltc_track_channel_index {
+                            continue;
+                        }
+                        let (guarded, unguarded) =
+                            settings.output_path_for_file_checked("audio", 0, i + 1, aext);
+                        if guarded != unguarded {
+                            colliding.push((
+                                unguarded
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("?")
+                                    .to_string(),
+                                guarded
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("?")
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    let (guarded, unguarded) =
+                        settings.output_path_for_file_checked("audio", 0, 0, aext);
+                    if guarded != unguarded {
+                        colliding.push((
+                            unguarded
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .to_string(),
+                            guarded
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -2318,18 +2458,19 @@ pub fn spawn_conversion(
 ) -> JoinHandle<()> {
     // Resolve the codec → encoder chain on the caller thread (cheap, and
     // avoids moving the `caps` borrow into the spawned thread). Skipped in
-    // stream-copy mode where no encoder is used at all.
-    let copy_mode_requested = settings.copy_video
-        && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough);
+    // stream-copy mode and metadata-only mode where no encoder is used.
+    let no_encoder_needed = matches!(settings.pipeline, ConversionPipeline::MetadataOnly)
+        || (settings.copy_video
+            && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough));
     let codec_id = video_codecs::normalize_video_codec(&settings.video_encoder).to_string();
-    let mut chain: Vec<String> = if copy_mode_requested {
+    let mut chain: Vec<String> = if no_encoder_needed {
         Vec::new()
     } else {
         caps.filter(|c| c.has_ffmpeg)
             .map(|c| video_codecs::resolve_encoder_chain(&codec_id, c))
             .unwrap_or_default()
     };
-    if chain.is_empty() && !copy_mode_requested {
+    if chain.is_empty() && !no_encoder_needed {
         // No capability info (or stale): try the full static chain and
         // let the runtime fallback sort it out.
         chain = video_codecs::static_encoder_chain(&codec_id);
@@ -2348,8 +2489,16 @@ pub fn spawn_conversion(
         let mut settings = settings;
         let copy_mode = settings.copy_video
             && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough);
+        let metadata_only = matches!(settings.pipeline, ConversionPipeline::MetadataOnly);
         if copy_mode {
             prepare_copy_mode(&mut settings);
+        } else if metadata_only {
+            // No trimming: force all trims to 0.  The start timecode was
+            // already computed by build_per_file_start_timecodes (no-trim
+            // variant) in the GUI, so it already accounts for the full
+            // file duration.
+            settings.trim_offsets_secs =
+                vec![0.0; settings.trim_offsets_secs.len()];
         }
         let mut fallback = EncoderFallback::new_with_hw(chain, hw_ctx);
         if copy_mode {
@@ -2371,6 +2520,10 @@ pub fn spawn_conversion(
                 let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
                 (fmt.to_string(), ext.to_string())
             }
+            ConversionPipeline::MetadataOnly => {
+                let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
+                (fmt.to_string(), ext.to_string())
+            }
             _ => {
                 let ext = extension_for_container(&settings.container);
                 (container_to_ffmpeg_format(&settings.container).to_string(), ext.to_string())
@@ -2379,6 +2532,15 @@ pub fn spawn_conversion(
         let extension = &output_extension;
         let mut total_steps = match settings.pipeline {
             ConversionPipeline::VideoPassthrough => settings.input_files.len(), // placeholder, updated by run_video_to_video
+            ConversionPipeline::MetadataOnly => {
+                // 1 tag + 1 rename per file, plus audio extract steps if video
+                let per_file_steps = if settings.recording_type == RecordingType::VideoClipSequence {
+                    2 + if settings.split_tracks { settings.channel_map.num_channels().max(1) } else { 1 }
+                } else {
+                    2 // tag + rename for WAV recordings (no audio extract)
+                };
+                settings.input_files.len() * per_file_steps
+            }
             _ => if settings.split_tracks { settings.channel_map.num_channels() } else { 1 },
         };
         let mut overall_progress: f32 = 0.0;
@@ -2418,6 +2580,9 @@ pub fn spawn_conversion(
             ConversionPipeline::VideoPassthrough => {
                 run_video_to_video(&mut settings, extension, &mut fallback, &state, &cancel, &mut total_steps, &mut overall_progress, &mut overall_log);
             }
+            ConversionPipeline::MetadataOnly => {
+                run_metadata_only(&settings, &state, &cancel, total_steps, &mut overall_progress, &mut overall_log);
+            }
         }
 
         // Only set Completed if not already Failed (run_* functions set Failed on error)
@@ -2428,7 +2593,9 @@ pub fn spawn_conversion(
         if matches!(final_status, ConversionStatus::Failed { .. }) {
             info!("Conversion failed - see log for details.");
         } else {
-            let encoder_line = if copy_mode {
+            let encoder_line = if metadata_only {
+                "\nTags written in place, audio extracted as PCM WAV".to_string()
+            } else if copy_mode {
                 "\nVideo stream: copied (no re-encode)".to_string()
             } else {
                 fallback
@@ -2720,6 +2887,286 @@ fn run_video_to_video(
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Compute the in-place rename target for a source file in metadata-only mode.
+/// The new name is derived from the prefix + video-suffix templates but the
+/// file stays in its original directory (not moved to `output_folder`).
+fn rename_target_in_source_dir(settings: &ConverterSettings, file_idx: usize, ext: &str) -> PathBuf {
+    let naming_ctx = naming::NamingContext {
+        filename: settings
+            .input_files
+            .get(file_idx)
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        clip: file_idx + 1,
+        track: (file_idx + 1).max(1),
+    };
+
+    let prefix_expanded = naming::NameTemplate::parse(&settings.filename_prefix)
+        .unwrap_or_else(|_| naming::NameTemplate::parse("{filename}").unwrap())
+        .expand(&naming_ctx);
+
+    let suffix_expanded = if settings.video_suffix_template.is_empty() {
+        String::new()
+    } else {
+        naming::NameTemplate::parse(&settings.video_suffix_template)
+            .unwrap_or_else(|_| naming::NameTemplate::parse("").unwrap())
+            .expand(&naming_ctx)
+    };
+
+    let new_filename = format!("{}{}.{}", prefix_expanded, suffix_expanded, ext);
+
+    // Stay in the source file's directory
+    let source_dir = settings
+        .input_files
+        .get(file_idx)
+        .and_then(|p| p.parent())
+        .unwrap_or(Path::new("."));
+    source_dir.join(&new_filename)
+}
+
+/// Run a metadata-only pipeline: tag originals, rename in place, extract
+/// audio tracks from video files as per-channel WAVs.
+#[allow(clippy::too_many_arguments)]
+fn run_metadata_only(
+    settings: &ConverterSettings,
+    state: &SharedConversionState,
+    cancel: &CancelFlag,
+    total_steps: usize,
+    overall_progress: &mut f32,
+    overall_log: &mut String,
+) {
+    let input_files = &settings.input_files;
+    let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+    let is_video = settings.recording_type == RecordingType::VideoClipSequence;
+
+    for file_idx in 0..input_files.len() {
+        if cancel.load(Ordering::Relaxed) {
+            overall_log.push_str("\n--- CANCELLED ---\n");
+            let mut s = state.lock().unwrap();
+            s.status = ConversionStatus::Failed {
+                error_log: "Cancelled by user".into(),
+            };
+            return;
+        }
+
+        let input_path = &input_files[file_idx];
+        let tc = settings.timecode_meta_per_file.get(file_idx).and_then(|m| m.as_ref());
+
+        // ── Step A: Extract audio (video only) ──────────────────────────
+        let probed: Option<crate::ffprobe::VideoAudioProbe> = if is_video {
+            match crate::ffprobe::probe_video_audio(input_path) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    let msg = format!(
+                        "✗ {} — probe failed: {} (skipping audio extraction)\n",
+                        input_path.display(),
+                        e
+                    );
+                    log::warn!("{}", msg.trim());
+                    overall_log.push_str(&msg);
+                    let sw = 1.0 / total_steps as f32;
+                    *overall_progress += sw;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref probe) = probed {
+            let channels: Vec<(usize, usize)> = probe
+                .streams
+                .iter()
+                .flat_map(|s| (0..s.channels).map(move |ch| (s.stream_index, ch)))
+                .collect();
+            let map_n = settings.channel_map.num_channels();
+            let use_split = settings.split_tracks && map_n > 0;
+            let step_weight = 1.0 / total_steps as f32;
+
+            if use_split {
+                let mut emitted = 0usize;
+                for output_k in 0..map_n {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
+                        continue;
+                    };
+                    if input_i >= channels.len() {
+                        continue;
+                    }
+                    let (stream_idx, ch_idx) = channels[input_i];
+                    let is_ltc = settings.ltc_video_source == Some((stream_idx, ch_idx));
+                    if settings.drop_ltc_track && is_ltc {
+                        continue;
+                    }
+                    emitted += 1;
+                    let output_path =
+                        settings.output_path_for_file("audio", file_idx, emitted, aext);
+                    let sample_rate = probe
+                        .streams
+                        .iter()
+                        .find(|s| s.stream_index == stream_idx)
+                        .map(|s| s.sample_rate)
+                        .unwrap_or(48000);
+                    let args = build_video_track_extract_args(
+                        settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
+                    );
+                    if run_ffmpeg_process(
+                        &args, &output_path, state, cancel,
+                        step_weight, overall_progress, overall_log,
+                        total_steps, file_idx * 3 + 1,
+                    )
+                    .is_err()
+                    {
+                        let msg = format!(
+                            "✗ {} — audio extraction failed\n",
+                            input_path.display()
+                        );
+                        overall_log.push_str(&msg);
+                    }
+                }
+                if emitted == 0 {
+                    *overall_progress += step_weight;
+                }
+            } else {
+                let output_path = settings.merged_audio_output_path(aext);
+                let (stream_idx, ch_idx) = channels.first().copied().unwrap_or((0, 0));
+                let sample_rate = probe
+                    .streams
+                    .first()
+                    .map(|s| s.sample_rate)
+                    .unwrap_or(48000);
+                let args = build_video_track_extract_args(
+                    settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
+                );
+                if run_ffmpeg_process(
+                    &args, &output_path, state, cancel,
+                    step_weight, overall_progress, overall_log,
+                    total_steps, file_idx * 3 + 1,
+                )
+                .is_err()
+                {
+                    let msg = format!(
+                        "✗ {} — audio extraction failed\n",
+                        input_path.display()
+                    );
+                    overall_log.push_str(&msg);
+                }
+            }
+        } else if !is_video {
+            // WAV recordings: no audio extraction needed
+            let sw = 1.0 / total_steps as f32;
+            *overall_progress += sw;
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            overall_log.push_str("\n--- CANCELLED ---\n");
+            let mut s = state.lock().unwrap();
+            s.status = ConversionStatus::Failed {
+                error_log: "Cancelled by user".into(),
+            };
+            return;
+        }
+
+        // ── Step B: Tag original with start timecode ────────────────────
+        if let Some(tc_meta) = tc {
+            match crate::tagger::tag_file(input_path, tc_meta) {
+                Ok(outcome) => {
+                    let msg = match outcome {
+                        crate::tagger::TagOutcome::TaggedInPlace => {
+                            format!("✓ {} — tagged in place\n", input_path.display())
+                        }
+                        crate::tagger::TagOutcome::TaggedViaFfmpeg => {
+                            format!("✓ {} — tagged via ffmpeg\n", input_path.display())
+                        }
+                        crate::tagger::TagOutcome::Skipped { reason } => {
+                            format!("⚠ {} — skipped tagging: {}\n", input_path.display(), reason)
+                        }
+                    };
+                    overall_log.push_str(&msg);
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "✗ {} — tagging failed: {}\n",
+                        input_path.display(),
+                        e
+                    );
+                    log::error!("{}", msg.trim());
+                    overall_log.push_str(&msg);
+                }
+            }
+        } else {
+            let msg = format!(
+                "⚠ {} — no start timecode available, skipping tagging\n",
+                input_path.display()
+            );
+            log::warn!("{}", msg.trim());
+            overall_log.push_str(&msg);
+        }
+
+        // ── Step C: Rename original (in place) ──────────────────────────
+        if !settings.filename_prefix.is_empty() {
+            let ext = input_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("bin");
+            let new_path = rename_target_in_source_dir(settings, file_idx, ext);
+            if new_path != *input_path {
+                if new_path.exists() {
+                    let msg = format!(
+                        "⚠ {} — rename target '{}' already exists, skipping rename\n",
+                        input_path.display(),
+                        new_path.display()
+                    );
+                    log::warn!("{}", msg.trim());
+                    overall_log.push_str(&msg);
+                } else {
+                    match std::fs::rename(input_path, &new_path) {
+                        Ok(()) => {
+                            let msg = format!(
+                                "✓ {} → {}\n",
+                                input_path.display(),
+                                new_path.display()
+                            );
+                            overall_log.push_str(&msg);
+                        }
+                        Err(e) => {
+                            let msg = format!(
+                                "✗ {} — rename failed: {}\n",
+                                input_path.display(),
+                                e
+                            );
+                            log::error!("{}", msg.trim());
+                            overall_log.push_str(&msg);
+                        }
+                    }
+                }
+            } else {
+                // Same name — nothing to do
+            }
+        }
+
+        // Progress update
+        let step_weight = 1.0 / total_steps as f32;
+        *overall_progress += step_weight;
+        {
+            let mut s = state.lock().unwrap();
+            s.status = ConversionStatus::Running {
+                progress: overall_progress.min(1.0),
+            };
+            s.current_line = format!(
+                "[{}/{}] {} — done",
+                file_idx + 1,
+                input_files.len(),
+                input_path.display()
+            );
         }
     }
 }

@@ -11,6 +11,7 @@ pub mod hw_device;
 pub mod log_buffer;
 pub mod state;
 pub mod subprocess;
+pub mod tagger;
 pub mod theme;
 pub mod video_codecs;
 pub mod timecode;
@@ -29,6 +30,7 @@ pub use converter::{
     apply_available_defaults, available_audio_encoders_for_container,
     available_containers, build_per_file_start_timecodes,
     build_per_file_trim_and_timecode, conversion_sanity_check,
+    conversion_sanity_check_metadata_only,
     evaluate_readiness,
     find_timecode_at_offset, format_blockers, format_ffmpeg_timecode,
     plan_concat_outputs, plan_video_outputs, query_ffmpeg_capabilities,

@@ -17,6 +17,7 @@ export component ConverterSection {
     in-out property <bool> generate-synthetic-video: false;
     in-out property <bool> is-video-recording: false;
     in-out property <bool> copy-video: false;
+    in-out property <bool> metadata-only: false;
     in-out property <string> container: "mkv";
     in-out property <string> video-encoder: "libsvtav1";
     in-out property <string> audio-encoder: "pcm_s24le";
@@ -81,6 +82,7 @@ export component ConverterSection {
     callback toggle-concat-audio;
     callback toggle-synthetic-video;
     callback toggle-copy-video;
+    callback toggle-metadata-only;
     callback select-output-folder;
     callback filename-prefix-changed(string);
     callback audio-suffix-changed(string);
@@ -492,15 +494,35 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                             text: "Video is copied without re-encoding (much faster).\nCuts snap to the nearest keyframe before the trim point.";
                             color: AppColors.text-muted; font-size: 8px; wrap: word-wrap;
                         }
+                        // Metadata-only checkbox (both recording types)
+                        HorizontalLayout { spacing: 4px; padding-top: 4px; padding-bottom: 4px;
+                            Rectangle {
+                                width: 14px; height: 14px; border-radius: 3px;
+                                border-width: 1px;
+                                border-color: root.metadata-only ? AppColors.accent : AppColors.border-main;
+                                background: root.metadata-only ? AppColors.accent : transparent;
+                                TouchArea { clicked => { root.toggle-metadata-only(); } }
+                                Text {
+                                    visible: root.metadata-only;
+                                    text: "✓"; color: black; font-size: 10px; font-weight: 700;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                            }
+                            Text { text: "Metadata only (tag + rename, extract audio)"; color: AppColors.text-title; font-size: 9px; wrap: word-wrap; }
+                        }
+                        if (root.metadata-only) : Text {
+                            text: "Originals tagged in place with start timecode and renamed. Audio extracted to output folder. No re-encoding.";
+                            color: AppColors.text-muted; font-size: 8px; wrap: word-wrap;
+                        }
                         // Container
                         VerticalLayout { spacing: 0px;
                             Rectangle {
-                                opacity: root.copy-video ? 0.4 : 1.0;
+                                opacity: (root.copy-video || root.metadata-only) ? 0.4 : 1.0;
                                 border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                                 background: AppColors.deep-bg; min-height: 28px;
-                                TouchArea { clicked => { if (!root.copy-video) { root.open-popup = root.open-popup == 0 ? -1 : 0; } } }
+                                TouchArea { clicked => { if (!root.copy-video && !root.metadata-only) { root.open-popup = root.open-popup == 0 ? -1 : 0; } } }
                                 VerticalLayout { padding: 4px; spacing: 2px;
-                                    Text { text: root.copy-video ? "Container (matches input)" : "Container"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                    Text { text: (root.copy-video || root.metadata-only) ? "Container (not used in this mode)" : "Container"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
                                     Text { text: root.container; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
                                 }
                             }
@@ -522,13 +544,13 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                         // Video codec
                         VerticalLayout { spacing: 0px;
                             Rectangle {
-                                opacity: root.copy-video ? 0.4 : 1.0;
+                                opacity: (root.copy-video || root.metadata-only) ? 0.4 : 1.0;
                                 border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                                 background: AppColors.deep-bg; min-height: 28px;
-                                TouchArea { clicked => { if (!root.copy-video) { root.open-popup = root.open-popup == 1 ? -1 : 1; } } }
+                                TouchArea { clicked => { if (!root.copy-video && !root.metadata-only) { root.open-popup = root.open-popup == 1 ? -1 : 1; } } }
                                 VerticalLayout { padding: 4px; spacing: 2px;
-                                    Text { text: root.copy-video ? "Video codec (stream copied)" : "Video codec"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
-                                    Text { text: root.copy-video ? "copy (untouched)" : root.video-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                                    Text { text: (root.copy-video || root.metadata-only) ? "Video codec (not used)" : "Video codec"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                    Text { text: (root.copy-video || root.metadata-only) ? "bypassed" : root.video-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
                                 }
                             }
                             if (root.open-popup == 1) : VerticalLayout { spacing: 1px; padding-top: 2px;
@@ -573,12 +595,13 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                         // Audio encoder
                         VerticalLayout { spacing: 0px;
                             Rectangle {
+                                opacity: root.metadata-only ? 0.4 : 1.0;
                                 border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                                 background: AppColors.deep-bg; min-height: 28px;
-                                TouchArea { clicked => { root.open-popup = root.open-popup == 2 ? -1 : 2; } }
+                                TouchArea { clicked => { if (!root.metadata-only) { root.open-popup = root.open-popup == 2 ? -1 : 2; } } }
                                 VerticalLayout { padding: 4px; spacing: 2px;
-                                    Text { text: "Audio encoder"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
-                                    Text { text: root.audio-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
+                                    Text { text: root.metadata-only ? "Audio encoder (not used)" : "Audio encoder"; color: AppColors.text-muted; font-size: 8px; font-weight: 600; }
+                                    Text { text: root.metadata-only ? "PCM 24-bit (fixed)" : root.audio-encoder; color: AppColors.text-title; font-size: 10px; font-family: "monospace"; font-weight: 700; }
                                 }
                             }
                             if (root.open-popup == 2) : VerticalLayout { spacing: 1px; padding-top: 2px;
@@ -777,13 +800,15 @@ Rectangle {
                         enabled: root.has-ffmpeg && root.selected-group-idx >= 0 && root.output-folder != "" && root.filename-prefix != "" && root.sanity-msg == "";
                         clicked => { root.start-convert(); }
                     }
-                    Text {
-                        text: root.is-video-recording
-                            ? "CONVERT VIDEO CLIPS"
-                            : (root.generate-synthetic-video ? "CONVERT WITH SYNTHETIC VIDEO" : "CONVERT AUDIO FILES");
-                        color: black; font-size: 13px; font-weight: 700;
-                        horizontal-alignment: center; vertical-alignment: center;
-                    }
+Text {
+                            text: root.metadata-only
+                                ? "TAG + EXTRACT (METADATA ONLY)"
+                                : (root.is-video-recording
+                                    ? "CONVERT VIDEO CLIPS"
+                                    : (root.generate-synthetic-video ? "CONVERT WITH SYNTHETIC VIDEO" : "CONVERT AUDIO FILES"));
+                            color: black; font-size: 13px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
                 }
 
                 // ── Progress / Log ──
