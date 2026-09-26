@@ -57,7 +57,19 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── timecode.rs           # FPS_OPTIONS (24/25/29.97 ND/29.97 DF/30), timecode formatting helpers
 │   │   ├── log_buffer.rs         # LogBuffer ring buffer + init_logger (canonical logger)
 │   │   ├── theme.rs              # Shared dark/light ThemeColors palettes used by both Rust GUIs
-│   │   ├── converter.rs          # ffmpeg conversion pipelines (see Converter section)
+│   │   ├── converter/            # Converter directory module (see Converter section)
+│   │   │   ├── mod.rs            # Facade: re-exports public API from submodules
+│   │   │   ├── progress.rs       # ConversionState, ConversionStatus, SharedConversionState, CancelFlag
+│   │   │   ├── channel_map.rs    # ChannelMap (input→output permutation)
+│   │   │   ├── timecode.rs       # TimecodeMetadata, format_ffmpeg_timecode, shift_timecode_back, TC math
+│   │   │   ├── capabilities.rs   # FfmpegCapabilities, HwDeviceCapabilities, query_ffmpeg_capabilities
+│   │   │   ├── formats.rs       # Codec/container compatibility: supported_*, available_*, select_best_combination
+│   │   │   ├── settings.rs       # ConversionPipeline, RecordingType, ConverterSettings + output-path naming
+│   │   │   ├── planning.rs       # AudioKeep, VideoOutputStep, plan_*, preview_output_files
+│   │   │   ├── checks.rs         # conversion_sanity_check*, ConvertBlocker, evaluate_readiness
+│   │   │   ├── args.rs           # ffmpeg argument builders (build_*_args, push_* helpers)
+│   │   │   ├── process.rs        # run_ffmpeg_process, parse_out_time, classify_step_failure, StepFailure
+│   │   │   └── runner.rs         # EncoderFallback, spawn_conversion, run_* pipeline orchestration
 │   │   ├── tagger.rs            # In-place timecode tagging (native MOV/MP4 + WAV bext + ffmpeg fallback)
 │   │   ├── file_pattern.rs      # Camera/recorder filename patterns + file grouping
 │   │   ├── ffprobe.rs            # ffprobe video/audio probing + ffmpeg channel extraction
@@ -164,8 +176,24 @@ The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 
 The converter turns raw recordings into deliverables: trim each file to its first LTC frame, embed start timecode as ffmpeg `-timecode` metadata, drop or split the LTC track, and remux/encode into the chosen container. Implemented in `gui_engine` and exposed in all three GUI frontends (ltc-gui **Convert** tab, ltc-slint converter section, web `ConverterTab`).
 
-### Components
-- **`converter.rs`** — core pipeline:
+### Components (`converter/` directory module)
+
+The monolithic `converter.rs` was split into a directory module with submodules, each owning one responsibility. All public types and functions are re-exported through `converter/mod.rs`, so `gui_engine::converter::X` paths are unchanged.
+
+- **`mod.rs`** — facade re-exporting the public API from all submodules.
+- **`progress.rs`** — `ConversionState`, `ConversionStatus`, `SharedConversionState`, `CancelFlag`.
+- **`channel_map.rs`** — `ChannelMap` (input→output permutation).
+- **`timecode.rs`** — `TimecodeMetadata`, `format_ffmpeg_timecode`, `shift_timecode_back`, `start_timecode_from_ltc`, per-file TC builders.
+- **`capabilities.rs`** — `FfmpegCapabilities`, `HwDeviceCapabilities`, `query_ffmpeg_capabilities()` (ffmpeg binary probing).
+- **`formats.rs`** — codec/container compatibility tables: `supported_*`, `available_*`, `select_best_combination`, `apply_available_defaults`.
+- **`settings.rs`** — `ConversionPipeline`, `RecordingType`, `ConverterSettings` + output-path naming.
+- **`planning.rs`** — `AudioKeep`, `VideoOutputStep`, `plan_video_outputs*`, `plan_concat_outputs`, `preview_output_files`, `output_collision_warning`.
+- **`checks.rs`** — preflight validation: `conversion_sanity_check*`, `ConvertBlocker`, `evaluate_readiness`, `format_blockers`.
+- **`args.rs`** — ffmpeg argument construction (`build_*_args`, `push_*` helpers).
+- **`process.rs`** — `run_ffmpeg_process`, `parse_out_time`, `classify_step_failure`, `StepFailure`.
+- **`runner.rs`** — `EncoderFallback`, `run_video_step_with_fallback`, `prepare_copy_mode`, `spawn_conversion`, four pipeline runners (`run_audio_to_audio`, `run_audio_to_synthetic_video`, `run_video_to_video`, `run_metadata_only`).
+
+**`converter.rs`** (original monolith, now removed) — core pipeline:
   - `ConversionPipeline`: `AudioOnly { generate_synthetic_video }` (multi-track WAV → audio/video outputs), `VideoPassthrough` (camera clips → video outputs), and `MetadataOnly` (tag originals in place, rename, extract audio).
   - `ConverterSettings`: input files, `RecordingType` (MultiTrackAudio / VideoClipSequence), `ChannelMap` (input→output permutation), `split_tracks` / `drop_ltc_track` / `ltc_video_source`, container + video codec / audio encoder, output folder + naming templates (defaults `_audio_track{:01d}` / `_video_clip{:02d}`), `trim_to_first_ltc` + per-file trim offsets, per-file `TimecodeMetadata` (start TC, fps, drop-frame).
   - `conversion_sanity_check_metadata_only()` — lightweight preflight for `MetadataOnly` pipeline (only ffmpeg, file existence, template validation).

@@ -1,0 +1,384 @@
+use std::path::{Path, PathBuf};
+
+use crate::converter::capabilities::FfmpegCapabilities;
+use crate::converter::formats::{container_supports_audio_encoder, container_to_ffmpeg_format, encoder_available_in_ffmpeg, format_available_in_ffmpeg};
+use crate::naming;
+use crate::video_codecs;
+
+pub fn conversion_sanity_check(
+    container: &str,
+    video_codec: &str,
+    audio_encoder: &str,
+    input_files: &[PathBuf],
+    output_folder: &Path,
+    filename_prefix: &str,
+    caps: &FfmpegCapabilities,
+    audio_suffix: Option<&str>,
+    video_suffix: Option<&str>,
+    copy_video: bool,
+) -> Result<(), String> {
+    if !caps.has_ffmpeg {
+        return Err("ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH."
+            .to_string());
+    }
+
+    if input_files.is_empty() {
+        return Err("No input files selected.".to_string());
+    }
+
+    for f in input_files {
+        if !f.exists() {
+            return Err(format!("Input file does not exist: {}", f.display()));
+        }
+    }
+
+    if filename_prefix.is_empty() && audio_suffix.unwrap_or("").is_empty() && video_suffix.unwrap_or("").is_empty() {
+        return Err("No output filename prefix or suffix specified.".to_string());
+    }
+
+    if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
+        return Err(format!(
+            "Output directory does not exist: {}",
+            output_folder.display()
+        ));
+    }
+
+    if !format_available_in_ffmpeg(container, caps) {
+        return Err(format!(
+            "Container format '{}' is not supported by your ffmpeg installation. \
+             Run `ffmpeg -formats` to see available formats.",
+            container
+        ));
+    }
+
+    if let Some(t) = audio_suffix {
+        if !t.is_empty() {
+            naming::validate_template(t).map_err(|e| format!("Invalid audio suffix template: {}", e))?;
+        }
+    }
+    if let Some(t) = video_suffix {
+        if !t.is_empty() {
+            naming::validate_template(t).map_err(|e| format!("Invalid video suffix template: {}", e))?;
+        }
+    }
+    if !filename_prefix.is_empty() {
+        naming::validate_template(filename_prefix).map_err(|e| format!("Invalid filename prefix: {}", e))?;
+    }
+
+    if !copy_video {
+        let codec_id = video_codecs::normalize_video_codec(video_codec);
+        if video_codecs::find_codec(codec_id).is_none() {
+            let known: Vec<&str> = video_codecs::supported_video_codecs()
+                .iter()
+                .map(|(k, _)| *k)
+                .collect();
+            return Err(format!(
+                "Unknown video codec '{}'. Supported codecs: {}.",
+                video_codec,
+                known.join(", ")
+            ));
+        }
+
+        if video_codecs::resolve_encoder_chain(codec_id, caps).is_empty() {
+            return Err(format!(
+                "No {} encoder is available in your ffmpeg installation \
+                 (needs one of: {}). Run `ffmpeg -encoders` to see available encoders.",
+                codec_id,
+                video_codecs::static_encoder_chain(codec_id).join(", ")
+            ));
+        }
+    }
+
+    if !encoder_available_in_ffmpeg(audio_encoder, caps) {
+        return Err(format!(
+            "Audio encoder '{}' is not supported by your ffmpeg installation. \
+             Run `ffmpeg -encoders` to see available encoders. \
+             Common alternatives: pcm_s24le (PCM 24-bit), pcm_s16le (PCM 16-bit), aac, libopus.",
+            audio_encoder
+        ));
+    }
+
+    if !copy_video && !video_codecs::codec_supports_container(
+        video_codecs::normalize_video_codec(video_codec),
+        container,
+    ) {
+        let codec_id = video_codecs::normalize_video_codec(video_codec);
+        return Err(format!(
+            "Video codec '{}' is not compatible with container format '{}'. \
+             {}",
+            codec_id,
+            container,
+            match codec_id {
+                "prores" => "ProRes typically requires MOV or MKV containers.",
+                "av1" => "AV1 works in MKV, MP4, and MOV containers.",
+                "dnxhd" => "DNxHD requires MXF, MOV, or MKV containers.",
+                "h264" | "h265" => "H.264/HEVC work in all containers.",
+                _ => "",
+            }
+        ));
+    }
+
+    if !container_supports_audio_encoder(container, audio_encoder) {
+        return Err(format!(
+            "Audio encoder '{}' is not compatible with container format '{}'. \
+             {}",
+            audio_encoder,
+            container,
+            match audio_encoder {
+                "libopus" => "Opus is only supported in MKV and MOV containers.",
+                "pcm_s24le" | "pcm_s16le" => "Uncompressed PCM works in all containers.",
+                "aac" => "AAC works in all containers.",
+                _ => "",
+            }
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn conversion_sanity_check_metadata_only(
+    input_files: &[PathBuf],
+    output_folder: &Path,
+    filename_prefix: &str,
+    caps: &FfmpegCapabilities,
+    audio_suffix: Option<&str>,
+    video_suffix: Option<&str>,
+) -> Result<(), String> {
+    if !caps.has_ffmpeg {
+        return Err(
+            "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH."
+                .to_string(),
+        );
+    }
+
+    if input_files.is_empty() {
+        return Err("No input files selected.".to_string());
+    }
+
+    for f in input_files {
+        if !f.exists() {
+            return Err(format!("Input file does not exist: {}", f.display()));
+        }
+    }
+
+    if filename_prefix.is_empty()
+        && audio_suffix.unwrap_or("").is_empty()
+        && video_suffix.unwrap_or("").is_empty()
+    {
+        return Err("No output filename prefix or suffix specified.".to_string());
+    }
+
+    if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
+        return Err(format!(
+            "Output directory does not exist: {}",
+            output_folder.display()
+        ));
+    }
+
+    if let Some(t) = audio_suffix {
+        if !t.is_empty() {
+            naming::validate_template(t)
+                .map_err(|e| format!("Invalid audio suffix template: {}", e))?;
+        }
+    }
+    if let Some(t) = video_suffix {
+        if !t.is_empty() {
+            naming::validate_template(t)
+                .map_err(|e| format!("Invalid video suffix template: {}", e))?;
+        }
+    }
+    if !filename_prefix.is_empty() {
+        naming::validate_template(filename_prefix)
+            .map_err(|e| format!("Invalid filename prefix: {}", e))?;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConvertBlocker {
+    NoRecording,
+    NoPrefix,
+    NoOutputFolder,
+    FfmpegNotQueried,
+    FfmpegMissing(Option<String>),
+}
+
+#[derive(Clone, Debug)]
+pub struct ConvertReadiness {
+    pub can_convert: bool,
+    pub blockers: Vec<ConvertBlocker>,
+}
+
+pub fn evaluate_readiness(
+    has_group: bool,
+    prefix_empty: bool,
+    output_folder_empty: bool,
+    caps: Option<&FfmpegCapabilities>,
+) -> ConvertReadiness {
+    let mut blockers = Vec::new();
+    if !has_group {
+        blockers.push(ConvertBlocker::NoRecording);
+    }
+    if prefix_empty {
+        blockers.push(ConvertBlocker::NoPrefix);
+    }
+    if output_folder_empty {
+        blockers.push(ConvertBlocker::NoOutputFolder);
+    }
+    match caps {
+        None => blockers.push(ConvertBlocker::FfmpegNotQueried),
+        Some(c) if !c.has_ffmpeg => blockers.push(ConvertBlocker::FfmpegMissing(c.error_message.clone())),
+        Some(_) => {}
+    }
+    ConvertReadiness {
+        can_convert: blockers.is_empty(),
+        blockers,
+    }
+}
+
+pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
+    let imperatives: Vec<&str> = blockers.iter().filter_map(|b| match b {
+        ConvertBlocker::NoRecording => Some("select a recording"),
+        ConvertBlocker::NoPrefix => Some("set a filename prefix"),
+        ConvertBlocker::NoOutputFolder => Some("choose an output folder"),
+        _ => None,
+    }).collect();
+
+    let ffmpeg_messages: Vec<String> = blockers.iter().filter_map(|b| match b {
+        ConvertBlocker::FfmpegNotQueried => {
+            Some("ffmpeg availability is being checked…".to_string())
+        }
+        ConvertBlocker::FfmpegMissing(msg) => {
+            let base = "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.";
+            match msg {
+                Some(detail) if !detail.is_empty() => Some(format!("{} ({})", base, detail)),
+                _ => Some(base.to_string()),
+            }
+        }
+        _ => None,
+    }).collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    if !imperatives.is_empty() {
+        parts.push(format!("To convert, please {}.", imperatives.join(", ")));
+    }
+    parts.extend(ffmpeg_messages);
+    parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use crate::converter::test_fixtures::*;
+
+    #[test]
+    fn test_readiness_unqueried_caps_is_not_missing() {
+        let r = evaluate_readiness(true, false, false, None);
+        assert!(!r.can_convert);
+        assert!(r.blockers.contains(&ConvertBlocker::FfmpegNotQueried));
+        assert!(!r.blockers.contains(&ConvertBlocker::FfmpegMissing(None)));
+    }
+
+    #[test]
+    fn test_readiness_ready_when_all_met() {
+        let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
+        let r = evaluate_readiness(true, false, false, Some(&caps));
+        assert!(r.can_convert);
+        assert!(r.blockers.is_empty());
+    }
+
+    #[test]
+    fn test_readiness_missing_ffmpeg() {
+        let caps = make_caps(false, BTreeSet::new(), BTreeSet::new());
+        let r = evaluate_readiness(true, false, false, Some(&caps));
+        assert!(!r.can_convert);
+        assert!(r.blockers.contains(&ConvertBlocker::FfmpegMissing(None)));
+    }
+
+    #[test]
+    fn test_readiness_missing_ffmpeg_with_error() {
+        let mut caps = make_caps(false, BTreeSet::new(), BTreeSet::new());
+        caps.error_message = Some("permission denied".into());
+        let r = evaluate_readiness(true, false, false, Some(&caps));
+        assert!(!r.can_convert);
+        assert_eq!(
+            r.blockers,
+            vec![ConvertBlocker::FfmpegMissing(Some("permission denied".into()))]
+        );
+    }
+
+    #[test]
+    fn test_readiness_no_group() {
+        let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
+        let r = evaluate_readiness(false, false, false, Some(&caps));
+        assert!(!r.can_convert);
+        assert!(r.blockers.contains(&ConvertBlocker::NoRecording));
+    }
+
+    #[test]
+    fn test_readiness_no_prefix() {
+        let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
+        let r = evaluate_readiness(true, true, false, Some(&caps));
+        assert!(!r.can_convert);
+        assert!(r.blockers.contains(&ConvertBlocker::NoPrefix));
+    }
+
+    #[test]
+    fn test_readiness_no_output_folder() {
+        let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
+        let r = evaluate_readiness(true, false, true, Some(&caps));
+        assert!(!r.can_convert);
+        assert!(r.blockers.contains(&ConvertBlocker::NoOutputFolder));
+    }
+
+    #[test]
+    fn test_readiness_multiple_blockers() {
+        let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
+        let r = evaluate_readiness(false, true, true, Some(&caps));
+        assert!(!r.can_convert);
+        assert_eq!(r.blockers.len(), 3);
+    }
+
+    #[test]
+    fn test_format_blockers_imperative_only() {
+        let blockers = vec![
+            ConvertBlocker::NoRecording,
+            ConvertBlocker::NoPrefix,
+            ConvertBlocker::NoOutputFolder,
+        ];
+        let msg = format_blockers(&blockers);
+        assert!(msg.contains("select a recording"));
+        assert!(msg.contains("set a filename prefix"));
+        assert!(msg.contains("choose an output folder"));
+        assert!(!msg.contains("ffmpeg"));
+    }
+
+    #[test]
+    fn test_format_blockers_ffmpeg_not_queried() {
+        let blockers = vec![ConvertBlocker::FfmpegNotQueried];
+        let msg = format_blockers(&blockers);
+        assert!(msg.contains("ffmpeg availability is being checked"));
+    }
+
+    #[test]
+    fn test_format_blockers_ffmpeg_missing() {
+        let blockers = vec![ConvertBlocker::FfmpegMissing(None)];
+        let msg = format_blockers(&blockers);
+        assert!(msg.contains("ffmpeg is not available"));
+        assert!(msg.contains("install ffmpeg"));
+    }
+
+    #[test]
+    fn test_format_blockers_mixed() {
+        let blockers = vec![
+            ConvertBlocker::NoRecording,
+            ConvertBlocker::FfmpegMissing(Some("not found: No such file".into())),
+        ];
+        let msg = format_blockers(&blockers);
+        assert!(msg.contains("select a recording"));
+        assert!(msg.contains("ffmpeg is not available"));
+        assert!(msg.contains("not found"));
+    }
+}
