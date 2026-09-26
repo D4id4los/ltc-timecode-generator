@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,7 @@ pub fn setup_poll_timer(
     last_debug_log_count: Arc<Mutex<usize>>,
     pulse_phase: Arc<Mutex<f64>>,
     conv_state: Arc<Mutex<ConversionState>>,
+    conv_fresh_after_reset: Arc<AtomicBool>,
     conv_ffmpeg_caps: Arc<Mutex<Option<FfmpegCapabilities>>>,
     conv_ffmpeg_probing: Arc<Mutex<bool>>,
     conv_sanity_msg: Arc<Mutex<String>>,
@@ -179,6 +180,11 @@ pub fn setup_poll_timer(
                         r.processing_time_ms,
                         quality_str,
                     )));
+                    ui.set_ltc_error(SharedString::from(""));
+                } else {
+                    // No result, no error, not detecting — clear stale UI
+                    ui.set_ltc_status(SharedString::from(""));
+                    ui.set_ltc_result_text(SharedString::from(""));
                     ui.set_ltc_error(SharedString::from(""));
                 }
             }
@@ -445,15 +451,41 @@ pub fn setup_poll_timer(
             //  block was folded into the mirror logic above)
             {
                 let cs = conv_state.lock().unwrap();
-                let (status_str, progress) = match &cs.status {
-                    ConversionStatus::Idle => ("idle".to_string(), 0.0),
-                    ConversionStatus::Running { progress } => ("running".to_string(), *progress),
-                    ConversionStatus::Completed => ("completed".to_string(), 1.0),
-                    ConversionStatus::Failed { .. } => ("failed".to_string(), 0.0),
+                let mut status_str = match &cs.status {
+                    ConversionStatus::Idle => "idle".to_string(),
+                    ConversionStatus::Running { progress } => {
+                        // A new recording selection was followed by a real conversion start.
+                        // Clear the fresh-flag so subsequent "completed"/"failed" states are shown.
+                        if conv_fresh_after_reset.swap(false, Ordering::Relaxed) {
+                            log::info!("Conversion started after recording switch — re-enabling status display");
+                        }
+                        format!("running {:.0}%", progress * 100.0)
+                    }
+                    ConversionStatus::Completed => "completed".to_string(),
+                    ConversionStatus::Failed { .. } => "failed".to_string(),
                 };
+                let progress = match &cs.status {
+                    ConversionStatus::Running { progress } => *progress,
+                    _ => 0.0,
+                };
+                // Suppress stale "completed"/"failed" from a cancelled conversion
+                // after a recording switch until a new conversion actually starts running.
+                if conv_fresh_after_reset.load(Ordering::Relaxed)
+                    && matches!(cs.status, ConversionStatus::Completed | ConversionStatus::Failed { .. })
+                {
+                    status_str = "idle".to_string();
+                }
                 ui.set_conv_status(SharedString::from(status_str));
                 ui.set_conv_progress(progress);
                 ui.set_conv_log(SharedString::from(cs.ffmpeg_output.clone()));
+            }
+            // Poll the fresh-flag: if the conversion thread set it back to idle
+            // after being cancelled, the "running" will not appear and the flag
+            // would stay set forever.  Clear it after a short timeout to avoid
+            // permanently suppressing real status updates.
+            if conv_fresh_after_reset.load(Ordering::Relaxed) && tick > 0 && tick % 150 == 0 {
+                conv_fresh_after_reset.store(false, Ordering::Relaxed);
+                log::info!("Clearing conv_fresh_after_reset guard after timeout — conversion likely cancelled");
             }
             if tick % 10 == 0 {
                 let caps = conv_ffmpeg_caps.lock().unwrap().clone();

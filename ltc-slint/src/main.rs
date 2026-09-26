@@ -56,6 +56,15 @@ struct ConvSelectionCtx {
     video_suffix: Arc<Mutex<String>>,
     cmd_tx: mpsc::Sender<GuiCommand>,
     ui_weak: Option<slint::Weak<AppWindow>>,
+    conv_state: Arc<Mutex<ConversionState>>,
+    conv_cancel: Arc<AtomicBool>,
+    conv_set_start_from_ltc: Arc<Mutex<bool>>,
+    conv_ltc_offset_secs: Arc<Mutex<f64>>,
+    /// Guards the UI against stale "failed" / "completed" written by a
+    /// cancelled conversion thread after a recording switch.  Set `true` by
+    /// apply_inner; poll.rs clears it on the first "running" state or after a
+    /// short timeout.
+    conv_fresh_after_reset: Arc<AtomicBool>,
 }
 
 impl ConvSelectionCtx {
@@ -92,7 +101,15 @@ impl ConvSelectionCtx {
         *self.split.lock().unwrap() = false;
         *self.drop.lock().unwrap() = false;
         *self.concat.lock().unwrap() = false;
+        *self.conv_set_start_from_ltc.lock().unwrap() = false;
+        *self.conv_ltc_offset_secs.lock().unwrap() = 0.0;
         let folder = self.folder.lock().unwrap().clone();
+
+        // Cancel any in-flight conversion so the cancelled thread's late
+        // Failed{} write targets the old (now-dropped) state, not our fresh one.
+        self.conv_cancel.store(true, Ordering::Relaxed);
+        *self.conv_state.lock().unwrap() = ConversionState::idle();
+        self.conv_fresh_after_reset.store(true, Ordering::Relaxed);
 
         let ltc_file_names: Vec<SharedString> = files.iter().map(|f| {
             SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
@@ -118,9 +135,14 @@ impl ConvSelectionCtx {
             u.set_conv_video_suffix_template(SharedString::from(self.video_suffix.lock().unwrap().clone()));
             u.set_ltc_file_idx(0);
             u.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
+            u.set_set_start_from_ltc(false);
+            u.set_ltc_start_tc_text(SharedString::from(""));
+            u.set_conv_status(SharedString::from("idle"));
+            u.set_conv_progress(0.0);
+            u.set_conv_log(SharedString::from(""));
         }
 
-        let _ = self.cmd_tx.send(GuiCommand::ClearLtcGroupResults);
+        let _ = self.cmd_tx.send(GuiCommand::ClearRecordingDecodeState);
 
         if is_video && !files.is_empty() {
             let full_path = PathBuf::from(&folder).join(&files[0]);
@@ -215,6 +237,8 @@ fn _run_gui(
     let conv_folder_for_group = conv_selected_folder.clone();
     let conv_ffmpeg_caps_for_select = conv_ffmpeg_caps.clone();
 
+    let conv_fresh_after_reset: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     let conv_sel_ctx = ConvSelectionCtx {
         cmap: conv_channel_map.clone(),
         pat: conv_selected_pattern.clone(),
@@ -229,6 +253,11 @@ fn _run_gui(
         video_suffix: conv_video_suffix_template.clone(),
         cmd_tx: cmd_tx.clone(),
         ui_weak: Some(ui.as_weak()),
+        conv_state: conv_state.clone(),
+        conv_cancel: conv_cancel.clone(),
+        conv_set_start_from_ltc: conv_set_start_from_ltc.clone(),
+        conv_ltc_offset_secs: conv_ltc_offset_secs.clone(),
+        conv_fresh_after_reset: conv_fresh_after_reset.clone(),
     };
 
     // ── Restore last used converter folders from config ─────────────────────
@@ -1394,6 +1423,7 @@ u.set_conv_split_tracks(false);
         last_debug_log_count,
         pulse_phase,
         conv_state,
+        conv_fresh_after_reset,
         conv_ffmpeg_caps,
         conv_ffmpeg_probing,
         conv_sanity_msg,
@@ -1444,6 +1474,11 @@ mod tests {
             video_suffix: Arc::new(Mutex::new("_video_clip{:02d}".to_string())),
             cmd_tx: tx,
             ui_weak: None,
+            conv_state: Arc::new(Mutex::new(ConversionState::idle())),
+            conv_cancel: Arc::new(AtomicBool::new(false)),
+            conv_set_start_from_ltc: Arc::new(Mutex::new(false)),
+            conv_ltc_offset_secs: Arc::new(Mutex::new(0.0)),
+            conv_fresh_after_reset: Arc::new(AtomicBool::new(false)),
         };
         (ctx, rx)
     }
@@ -1486,9 +1521,9 @@ mod tests {
         assert!(!*ctx.concat.lock().unwrap());
         assert_eq!(*ctx.output.lock().unwrap(), "");
 
-        // Audio group: pat=0, so no ProbeVideo; ClearLtcGroupResults sent
+        // Audio group: pat=0, so no ProbeVideo; ClearRecordingDecodeState sent
         let cmd = rx.try_recv().unwrap();
-        assert!(matches!(cmd, GuiCommand::ClearLtcGroupResults));
+        assert!(matches!(cmd, GuiCommand::ClearRecordingDecodeState));
         assert!(rx.try_recv().is_err(), "no second command for audio");
     }
 
@@ -1504,7 +1539,7 @@ mod tests {
         assert_eq!(*ctx.prefix.lock().unwrap(), "CLIP");
 
         let cmd1 = rx.try_recv().unwrap();
-        assert!(matches!(cmd1, GuiCommand::ClearLtcGroupResults));
+        assert!(matches!(cmd1, GuiCommand::ClearRecordingDecodeState));
         let cmd2 = rx.try_recv().unwrap();
         match cmd2 {
             GuiCommand::ProbeVideo(ref p) => assert!(p.contains("GOPR0001.MP4")),

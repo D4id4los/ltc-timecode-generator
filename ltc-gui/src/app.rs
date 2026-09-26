@@ -1119,6 +1119,11 @@ mod tests {
         let folder = PathBuf::from("/some/folder");
         app.selected_folder = Some(folder.clone());
 
+        // Set fields to non-default values to verify they are reset
+        app.set_start_from_ltc = true;
+        app.ltc_offset_secs = 42.0;
+        app.concat_audio = true;
+
         let group = MatchedGroup {
             prefix: "TEST".to_string(),
             rel_dir: String::new(),
@@ -1141,10 +1146,14 @@ mod tests {
         assert_eq!(app.output_folder, folder);
         assert!(!app.split_tracks);
         assert!(!app.drop_ltc_track);
+        assert!(!app.set_start_from_ltc, "set_start_from_ltc should be reset");
+        assert!((app.ltc_offset_secs - 0.0).abs() < 1e-9, "ltc_offset_secs should be reset");
+        assert!(!app.concat_audio, "concat_audio should be reset");
         assert_eq!(app.per_file_trim_offsets, vec![0.0, 0.0]);
         assert_eq!(app.ltc_file_idx, 0);
-        assert_eq!(cmds.len(), 1, "audio group should return 1 command (SelectRecording)");
-        assert!(matches!(cmds[0], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
+        assert_eq!(cmds.len(), 2, "audio group should return 2 commands");
+        assert!(matches!(cmds[0], GuiCommand::ClearRecordingDecodeState));
+        assert!(matches!(cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
     }
 
     #[test]
@@ -1179,7 +1188,7 @@ mod tests {
         assert_eq!(app.ltc_file_idx, 0);
 
         assert_eq!(cmds.len(), 2, "video group should return 2 commands");
-        assert!(matches!(cmds[0], GuiCommand::ClearLtcGroupResults));
+        assert!(matches!(cmds[0], GuiCommand::ClearRecordingDecodeState));
         assert!(matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
     }
 

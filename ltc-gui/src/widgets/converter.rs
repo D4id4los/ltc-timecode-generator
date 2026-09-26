@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
@@ -104,9 +105,7 @@ pub(crate) fn apply_group_selection(
 
     state.selected_group_idx = Some(idx);
 
-    if group.recording_type == RecordingType::VideoClipSequence {
-        cmds.push(GuiCommand::ClearLtcGroupResults);
-    }
+    cmds.push(GuiCommand::ClearRecordingDecodeState);
 
     let num_ch = group.files.len();
     // For audio, files == channels; for video, matrix is sized from probe later
@@ -120,8 +119,21 @@ pub(crate) fn apply_group_selection(
     state.output_folder = state.selected_folder.clone().unwrap_or_default();
     state.split_tracks = false;
     state.drop_ltc_track = false;
+    state.set_start_from_ltc = false;
+    state.ltc_offset_secs = 0.0;
+    state.concat_audio = false;
+    state.last_logged_group_decode_gen = 0;
     state.per_file_trim_offsets = vec![0.0; num_ch];
     state.ltc_file_idx = 0;
+
+    // Cancel any in-flight conversion so its cancelled-thread `Failed{}` write
+    // targets the old (now dropped) state, not our fresh one.
+    state.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    state.conversion_state = Arc::new(std::sync::Mutex::new(
+        gui_engine::converter::ConversionState::idle(),
+    ));
+    state.cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.convert_handle = None;
 
     // Notify engine to manage per-recording state (probes, stale LTC state).
     // For video groups, the engine's converter clip probe populates ltc_probe

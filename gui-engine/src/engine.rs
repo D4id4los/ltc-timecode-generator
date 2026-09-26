@@ -156,17 +156,28 @@ pub fn engine_main_with_probe<F>(
                     current.ltc_decode_result = None;
                     current.ltc_decode_error = None;
                     current.ltc_is_detecting = false;
+                    current.ltc_decode_progress_pct = 0.0;
+                    current.ltc_decode_progress_str = String::new();
                     current.ltc_group_results.clear();
                     current.ltc_group_errors.clear();
                     current.ltc_group_paths.clear();
                     current.ltc_group_done = 0;
                     current.ltc_group_total = 0;
+                    // Cancel any running single-file decode
+                    if let Some(ref cancel) = decode_cancel {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    decode_cancel = None;
+                    // Bump decode generations so in-flight results from the old
+                    // recording are discarded by the generation check.
+                    current.ltc_decode_generation = current.ltc_decode_generation.wrapping_add(1);
                     // Cancel any running group decode and reset clip progress
                     if let Some(ref cancel) = group_cancel {
                         cancel.store(true, Ordering::Relaxed);
                     }
                     group_cancel = None;
                     group_clip_progress = None;
+                    current.ltc_group_decode_generation = current.ltc_group_decode_generation.wrapping_add(1);
                     current.status_message = "Recording selected — probing…".to_string();
 
                     // Spawn background probing of all files in the group
@@ -1045,7 +1056,21 @@ fn process_command(
                 .expect("failed to spawn LTC group decode thread");
         }
 
-        GuiCommand::ClearLtcGroupResults => {
+        GuiCommand::ClearRecordingDecodeState => {
+            // Single-file decode state
+            state.ltc_decode_result = None;
+            state.ltc_decode_error = None;
+            state.ltc_probe = None;
+            state.ltc_decode_is_video = false;
+            state.ltc_is_detecting = false;
+            state.ltc_decode_progress_pct = 0.0;
+            state.ltc_decode_progress_str = String::new();
+            if let Some(ref cancel) = *decode_cancel {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            *decode_cancel = None;
+            state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
+            // Group decode state
             state.ltc_group_paths = Vec::new();
             state.ltc_group_results = Vec::new();
             state.ltc_group_errors = Vec::new();
@@ -1057,6 +1082,7 @@ fn process_command(
             }
             group_cancel.take();
             *group_clip_progress = None;
+            state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
         }
 
         GuiCommand::ProbeVideo(path) => {
@@ -2428,5 +2454,152 @@ mod tests {
         cp.chunk_total.store(3, Ordering::Relaxed);
         cp.chunks_done.store(3, Ordering::Relaxed);
         assert_eq!(group_progress_str(4, &cp, 5), "Clip 5/5 — Chunk 3/3");
+    }
+
+    // ── ClearRecordingDecodeState ──────────────────────────────────────────
+
+    fn setup_decode_state() -> AppStateSnapshot {
+        use audio_core::LtcDetectionResult;
+        let mut s = AppStateSnapshot::initial();
+        s.ltc_decode_result = Some(LtcDetectionResult {
+            status: audio_core::LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            total_possible_frames: 100,
+            valid_frames: 100,
+            timecodes: vec![],
+            avg_confidence: 0.95,
+            details: vec![],
+            total_audio_duration_secs: 4.0,
+            sample_rate: 48000,
+            processing_time_ms: 10.0,
+            first_ltc_timecode_secs: 0.0,
+            quality: None,
+        });
+        s.ltc_decode_error = Some("old error".into());
+        s.ltc_probe = Some(crate::ffprobe::VideoAudioProbe {
+            total_audio_channels: 2,
+            streams: vec![],
+            is_video_file: true,
+        });
+        s.ltc_decode_is_video = true;
+        s.ltc_group_paths = vec![std::path::PathBuf::from("clip.mp4")];
+        s.ltc_group_results = vec![None];
+        s.ltc_group_errors = vec![None];
+        s.ltc_group_done = 5;
+        s.ltc_group_total = 10;
+        s.ltc_group_is_detecting = true;
+        s.ltc_decode_generation = 42;
+        s.ltc_group_decode_generation = 99;
+        s
+    }
+
+    #[test]
+    fn test_clear_recording_decode_state_clears_single_state() {
+        let mut state = setup_decode_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (group_tx, _group_rx) = std::sync::mpsc::channel::<GroupLtcResult>();
+        let mut decode_cancel: Option<Arc<AtomicBool>> = None;
+        let mut group_cancel: Option<Arc<AtomicBool>> = None;
+
+        process_command(
+            GuiCommand::ClearRecordingDecodeState, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut decode_cancel, &mut None, &group_tx, &mut group_cancel,
+            &mut None, &mut None,
+        );
+
+        assert!(state.ltc_decode_result.is_none(), "single result cleared");
+        assert!(state.ltc_decode_error.is_none(), "error cleared");
+        assert!(state.ltc_probe.is_none(), "probe cleared");
+        assert!(!state.ltc_decode_is_video, "is_video cleared");
+        assert!(!state.ltc_is_detecting, "is_detecting cleared");
+        assert!((state.ltc_decode_progress_pct - 0.0).abs() < 1e-6, "progress reset");
+        assert!(state.ltc_decode_progress_str.is_empty(), "progress str cleared");
+        assert_eq!(state.ltc_decode_generation, 43, "decode gen bumped from 42");
+    }
+
+    #[test]
+    fn test_clear_recording_decode_state_clears_group_state() {
+        let mut state = setup_decode_state();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (group_tx, _group_rx) = std::sync::mpsc::channel::<GroupLtcResult>();
+        let mut decode_cancel: Option<Arc<AtomicBool>> = None;
+        let mut group_cancel: Option<Arc<AtomicBool>> = None;
+
+        process_command(
+            GuiCommand::ClearRecordingDecodeState, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut decode_cancel, &mut None, &group_tx, &mut group_cancel,
+            &mut None, &mut None,
+        );
+
+        assert!(state.ltc_group_paths.is_empty(), "group paths cleared");
+        assert!(state.ltc_group_results.is_empty(), "group results cleared");
+        assert!(state.ltc_group_errors.is_empty(), "group errors cleared");
+        assert_eq!(state.ltc_group_done, 0, "group done reset");
+        assert_eq!(state.ltc_group_total, 0, "group total reset");
+        assert!(!state.ltc_group_is_detecting, "group is_detecting cleared");
+        assert_eq!(state.ltc_group_decode_generation, 100, "group decode gen bumped from 99");
+    }
+
+    #[test]
+    fn test_clear_recording_decode_state_cancels_decode_cancel() {
+        let mut state = AppStateSnapshot::initial();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (group_tx, _group_rx) = std::sync::mpsc::channel::<GroupLtcResult>();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let mut decode_cancel: Option<Arc<AtomicBool>> = Some(cancel_flag.clone());
+        let mut group_cancel: Option<Arc<AtomicBool>> = None;
+
+        process_command(
+            GuiCommand::ClearRecordingDecodeState, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut decode_cancel, &mut None, &group_tx, &mut group_cancel,
+            &mut None, &mut None,
+        );
+
+        assert!(cancel_flag.load(Ordering::Relaxed), "old decode cancel flag should be set");
+        assert!(decode_cancel.is_none(), "decode_cancel slot should be cleared");
+    }
+
+    #[test]
+    fn test_clear_recording_decode_state_generation_noop_when_empty() {
+        let mut state = AppStateSnapshot::initial();
+        let core = audio_core::AudioCore::new();
+        let mut recovery = 0;
+        let mut log_id = 0;
+        let mut last_dev = None;
+        let mut prev_dev = None;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (group_tx, _group_rx) = std::sync::mpsc::channel::<GroupLtcResult>();
+        let mut decode_cancel: Option<Arc<AtomicBool>> = None;
+        let mut group_cancel: Option<Arc<AtomicBool>> = None;
+
+        process_command(
+            GuiCommand::ClearRecordingDecodeState, &core, &mut state,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
+            &mut decode_cancel, &mut None, &group_tx, &mut group_cancel,
+            &mut None, &mut None,
+        );
+
+        // Should not panic on empty state, just bump generations
+        assert_eq!(state.ltc_decode_generation, 1, "decode gen bumped from 0");
+        assert_eq!(state.ltc_group_decode_generation, 1, "group decode gen bumped from 0");
     }
 }
