@@ -80,6 +80,7 @@ impl Default for DecodeConfig {
 }
 
 /// Shared progress state for a chunked decode operation.
+#[derive(Clone)]
 pub struct DecodeProgress {
     pub chunks_total: usize,
     pub chunks_completed: Arc<AtomicUsize>,
@@ -146,6 +147,19 @@ pub fn count_chunks(
         pos = next;
     }
     count
+}
+
+/// Count chunks for a WAV file by opening it and calling [`count_chunks`].
+pub fn count_chunks_in_wav(path: &Path, config: &DecodeConfig) -> Result<usize, String> {
+    let (reader, _) = WavChunkReader::open(path)?;
+    let total_mono = reader.total_mono_samples();
+    Ok(count_chunks(
+        total_mono,
+        reader.sample_rate(),
+        reader.channels() as u16,
+        reader.spec().bits_per_sample,
+        config,
+    ))
 }
 
 /// Low-level WAV chunk reader that reads from a data section offset without
@@ -776,6 +790,56 @@ mod tests {
         let n = count_chunks(100, 48000, 1, 16, &config);
         assert_eq!(n, 1,
             "should handle zero chunk_size_bytes gracefully");
+    }
+
+    // ── count_chunks_in_wav wrappern ────────────────────────────────
+
+    #[test]
+    fn test_count_chunks_in_wav_missing_file() {
+        let config = DecodeConfig::default();
+        let result = count_chunks_in_wav(Path::new("/nonexistent/path.wav"), &config);
+        assert!(result.is_err(), "missing file should return Err");
+    }
+
+    #[test]
+    fn test_count_chunks_in_wav_empty_wav() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("empty.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let writer = hound::WavWriter::create(&path, spec).unwrap();
+        writer.finalize().unwrap();
+        let config = DecodeConfig::default();
+        let result = count_chunks_in_wav(&path, &config).unwrap();
+        assert_eq!(result, 0, "empty WAV -> 0 chunks");
+    }
+
+    #[test]
+    fn test_count_chunks_in_wav_matches_count_chunks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("wrapper_matches.wav");
+        generate_ltc_wav(
+            &path,
+            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
+            25.0, false, 48000, 200,
+        );
+        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let predicted = count_chunks_in_wav(&path, &config).unwrap();
+        let (reader, _) = WavChunkReader::open(&path).unwrap();
+        let expected = count_chunks(
+            reader.total_mono_samples(),
+            reader.sample_rate(),
+            reader.channels() as u16,
+            reader.spec().bits_per_sample,
+            &config,
+        );
+        assert_eq!(predicted, expected,
+            "count_chunks_in_wav({}) should equal count_chunks({})",
+            predicted, expected);
     }
 
     // ── WavChunkReader: open errors ───────────────────────────────────

@@ -82,7 +82,7 @@ pub fn engine_main_with_probe<F>(
 
     // Chunked decode progress / cancel tracking (WAV single-file path)
     let mut decode_cancel: Option<Arc<AtomicBool>> = None;
-    let mut decode_progress: Option<(usize, Arc<AtomicUsize>)> = None;
+    let mut decode_progress: Option<DecodeProgress> = None;
 
     // Single-video decode progress (works with ClipProgress atomics)
     let mut video_progress: Option<ClipProgress> = None;
@@ -449,12 +449,11 @@ pub fn engine_main_with_probe<F>(
                 // Single-video path: report from ClipProgress (extraction + chunked decode)
                 current.ltc_decode_progress_pct = vp.frac();
                 current.ltc_decode_progress_str = vp.progress_str();
-            } else if let Some((total, ref completed)) = decode_progress {
-                // WAV single-file path (existing)
-                let done = completed.load(Ordering::Relaxed);
-                let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                current.ltc_decode_progress_pct = pct;
-                current.ltc_decode_progress_str = format!("Chunk {}/{}", done.min(total), total);
+            } else if let Some(ref dp) = decode_progress {
+                // WAV single-file path
+                let done = dp.chunks_completed.load(Ordering::Relaxed);
+                current.ltc_decode_progress_pct = dp.percent();
+                current.ltc_decode_progress_str = format!("Chunk {}/{}", done.min(dp.chunks_total), dp.chunks_total);
             }
         } else if current.ltc_group_is_detecting && current.ltc_group_total > 0 {
             if let Some(ref cp) = group_clip_progress {
@@ -754,7 +753,6 @@ fn decode_one_video_clip(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn process_command(
     cmd: GuiCommand,
     core: &AudioCore,
@@ -765,7 +763,7 @@ fn process_command(
     previous_device: &mut Option<usize>,
     decode_result_tx: &Sender<LtcDecodeResult>,
     decode_cancel: &mut Option<Arc<AtomicBool>>,
-    decode_progress: &mut Option<(usize, Arc<AtomicUsize>)>,
+    decode_progress: &mut Option<DecodeProgress>,
     group_result_tx: &Sender<GroupLtcResult>,
     group_cancel: &mut Option<Arc<AtomicBool>>,
     video_progress: &mut Option<ClipProgress>,
@@ -1195,34 +1193,9 @@ fn process_command(
             info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps);
 
             // Quick open to calculate chunk count
-            let (chunk_count, _sr, _ch, _spec) = match WavChunkReader::open(Path::new(&path)) {
-                Ok((reader, _start)) => {
-                    let total_mono = reader.total_mono_samples();
-                    let sr = reader.sample_rate();
-                    let ch = reader.channels();
-                    let spec = *reader.spec();
-                    let bytes_per_mono = (ch as u64) * (spec.bits_per_sample as u64 / 8);
-                    let config = DecodeConfig::default();
-                    let chunk_mono = (config.chunk_size_bytes / bytes_per_mono.max(1)) as usize;
-                    let overlap_samples = (config.overlap_seconds * sr as f64) as usize;
-                    let chunk_mono = chunk_mono.max(overlap_samples * 2);
-
-                    if total_mono <= chunk_mono + overlap_samples {
-                        (1usize, sr, ch, spec)
-                    } else {
-                        let mut count = 0usize;
-                        let mut pos = 0usize;
-                        while pos < total_mono {
-                            count += 1;
-                            let end = (pos + chunk_mono).min(total_mono);
-                            if end >= total_mono { break; }
-                            let next = end.saturating_sub(overlap_samples);
-                            if next <= pos || next >= total_mono { break; }
-                            pos = next;
-                        }
-                        (count, sr, ch, spec)
-                    }
-                }
+            let config = DecodeConfig::default();
+            let chunk_count = match audio_core::count_chunks_in_wav(Path::new(&path), &config) {
+                Ok(c) => c,
                 Err(e) => {
                     error!("Failed to open WAV for chunked decode: {}", e);
                     state.ltc_is_detecting = false;
@@ -1243,7 +1216,7 @@ fn process_command(
 
             let progress = DecodeProgress::new(chunk_count);
             *decode_cancel = Some(progress.cancel_flag.clone());
-            *decode_progress = Some((chunk_count, progress.chunks_completed.clone()));
+            *decode_progress = Some(progress.clone());
 
             let capture_gen = state.ltc_decode_generation;
             let tx = decode_result_tx.clone();

@@ -540,34 +540,7 @@ fn run_decode_on_wav(
         audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame)
     } else {
         let config = audio_core::DecodeConfig::default();
-        let chunk_count = match audio_core::WavChunkReader::open(path) {
-            Ok((reader, _)) => {
-                let total_mono = reader.total_mono_samples();
-                let sr = reader.sample_rate();
-                let ch = reader.channels();
-                let spec = reader.spec();
-                let bytes_per_mono = (ch as u64) * (spec.bits_per_sample as u64 / 8);
-                let chunk_mono = (config.chunk_size_bytes / bytes_per_mono.max(1)) as usize;
-                let overlap_samples = (config.overlap_seconds * sr as f64) as usize;
-                let chunk_mono = chunk_mono.max(overlap_samples * 2);
-                if total_mono <= chunk_mono + overlap_samples {
-                    1
-                } else {
-                    let mut count = 0usize;
-                    let mut pos = 0usize;
-                    while pos < total_mono {
-                        count += 1;
-                        let end = (pos + chunk_mono).min(total_mono);
-                        if end >= total_mono { break; }
-                        let next = end.saturating_sub(overlap_samples);
-                        if next <= pos || next >= total_mono { break; }
-                        pos = next;
-                    }
-                    count
-                }
-            }
-            Err(_) => 1,
-        };
+        let chunk_count = audio_core::count_chunks_in_wav(path, &config).unwrap_or(1);
 
         if chunk_count <= 1 {
             audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame)
