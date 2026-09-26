@@ -80,12 +80,16 @@ pub fn engine_main_with_probe<F>(
         })
         .expect("failed to spawn ffmpeg-probe thread");
 
-    // Chunked decode progress / cancel tracking
+    // Chunked decode progress / cancel tracking (WAV single-file path)
     let mut decode_cancel: Option<Arc<AtomicBool>> = None;
     let mut decode_progress: Option<(usize, Arc<AtomicUsize>)> = None;
 
-    // Group (batch) decode cancel tracking
+    // Single-video decode progress (works with ClipProgress atomics)
+    let mut video_progress: Option<ClipProgress> = None;
+
+    // Group (batch) decode progress tracking
     let mut group_cancel: Option<Arc<AtomicBool>> = None;
+    let mut group_clip_progress: Option<ClipProgress> = None;
 
     // Duration probe tracking
     let mut dur_total: usize = 0;
@@ -157,6 +161,12 @@ pub fn engine_main_with_probe<F>(
                     current.ltc_group_paths.clear();
                     current.ltc_group_done = 0;
                     current.ltc_group_total = 0;
+                    // Cancel any running group decode and reset clip progress
+                    if let Some(ref cancel) = group_cancel {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    group_cancel = None;
+                    group_clip_progress = None;
                     current.status_message = "Recording selected — probing…".to_string();
 
                     // Spawn background probing of all files in the group
@@ -200,6 +210,8 @@ pub fn engine_main_with_probe<F>(
                         &mut decode_progress,
                         &group_result_tx,
                         &mut group_cancel,
+                        &mut video_progress,
+                        &mut group_clip_progress,
                     );
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -222,6 +234,7 @@ pub fn engine_main_with_probe<F>(
                         current.ltc_is_detecting = false;
                         decode_cancel = None;
                         decode_progress = None;
+                        video_progress = None;
                         current.ltc_decode_progress_pct = 1.0;
                         current.ltc_decode_progress_str = String::new();
                         match result {
@@ -314,6 +327,7 @@ pub fn engine_main_with_probe<F>(
                         if current.ltc_group_done >= current.ltc_group_total {
                             current.ltc_group_is_detecting = false;
                             group_cancel = None;
+                            group_clip_progress = None;
                             let successes = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
                             let failures = current.ltc_group_results.iter().filter(|r| r.is_none()).count();
                             let tc_info = if successes > 0 {
@@ -420,20 +434,33 @@ pub fn engine_main_with_probe<F>(
 
         // 1.10 Poll chunked / group decode progress
         if current.ltc_is_detecting {
-            if let Some((total, ref completed)) = decode_progress {
+            if let Some(ref vp) = video_progress {
+                // Single-video path: report from ClipProgress (extraction + chunked decode)
+                current.ltc_decode_progress_pct = vp.frac();
+                current.ltc_decode_progress_str = vp.progress_str();
+            } else if let Some((total, ref completed)) = decode_progress {
+                // WAV single-file path (existing)
                 let done = completed.load(Ordering::Relaxed);
                 let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
                 current.ltc_decode_progress_pct = pct;
                 current.ltc_decode_progress_str = format!("Chunk {}/{}", done.min(total), total);
             }
         } else if current.ltc_group_is_detecting && current.ltc_group_total > 0 {
-            let pct = current.ltc_group_done as f32 / current.ltc_group_total as f32;
-            current.ltc_decode_progress_pct = pct;
-            current.ltc_decode_progress_str = format!(
-                "Clip {}/{}",
-                (current.ltc_group_done + 1).min(current.ltc_group_total),
-                current.ltc_group_total,
-            );
+            if let Some(ref cp) = group_clip_progress {
+                current.ltc_decode_progress_pct =
+                    group_decode_progress(current.ltc_group_done, cp, current.ltc_group_total);
+                current.ltc_decode_progress_str =
+                    group_progress_str(current.ltc_group_done, cp, current.ltc_group_total);
+            } else {
+                // Fallback: just per-clip (no within-clip progress available)
+                let pct = current.ltc_group_done as f32 / current.ltc_group_total as f32;
+                current.ltc_decode_progress_pct = pct;
+                current.ltc_decode_progress_str = format!(
+                    "Clip {}/{}",
+                    (current.ltc_group_done + 1).min(current.ltc_group_total),
+                    current.ltc_group_total,
+                );
+            }
         } else {
             decode_progress = None;
             current.ltc_decode_progress_pct = 0.0;
@@ -509,8 +536,98 @@ struct GroupLtcResult {
     result: Result<LtcDetectionResult, String>,
 }
 
+/// Shared progress state for a single video-clip decode (extraction + chunked decode).
+/// The engine holds a clone of the atomics and reads them each tick; the decode
+/// thread updates them as it progresses through phases.
+///
+/// Phase values:
+/// - `0` = extracting audio via ffmpeg
+/// - `1` = decoding LTC from extracted WAV
+#[derive(Clone)]
+struct ClipProgress {
+    phase: Arc<AtomicUsize>,
+    extract_frac: Arc<AtomicUsize>,
+    chunk_total: Arc<AtomicUsize>,
+    chunks_done: Arc<AtomicUsize>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl ClipProgress {
+    fn new() -> Self {
+        Self {
+            phase: Arc::new(AtomicUsize::new(0)),
+            extract_frac: Arc::new(AtomicUsize::new(0)),
+            chunk_total: Arc::new(AtomicUsize::new(0)),
+            chunks_done: Arc::new(AtomicUsize::new(0)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Reset for a new clip (all phases back to start).
+    #[allow(dead_code)]
+    fn reset(&self) {
+        self.phase.store(0, Ordering::Relaxed);
+        self.extract_frac.store(0, Ordering::Relaxed);
+        self.chunk_total.store(0, Ordering::Relaxed);
+        self.chunks_done.store(0, Ordering::Relaxed);
+    }
+
+    /// Combined clip progress fraction (0.0..1.0) with a fixed 50/50 split
+    /// between extraction and decode phases.
+    fn frac(&self) -> f32 {
+        let extract_pct = self.extract_frac.load(Ordering::Relaxed) as f32 / 1000.0;
+        let decode_pct = if self.phase.load(Ordering::Relaxed) >= 1 {
+            let total = self.chunk_total.load(Ordering::Relaxed);
+            let done = self.chunks_done.load(Ordering::Relaxed);
+            if total > 0 { done.min(total) as f32 / total as f32 } else { 0.0 }
+        } else {
+            0.0
+        };
+        0.5 * extract_pct + 0.5 * decode_pct
+    }
+
+    /// Formatted progress string for display, e.g.:
+    /// - `"extracting audio…"` during extraction phase
+    /// - `"Chunk 3/9"` during decode phase
+    fn progress_str(&self) -> String {
+        if self.phase.load(Ordering::Relaxed) == 0 {
+            "extracting audio…".to_string()
+        } else {
+            let total = self.chunk_total.load(Ordering::Relaxed);
+            let done = self.chunks_done.load(Ordering::Relaxed);
+            format!("Chunk {}/{}", done.min(total), total)
+        }
+    }
+}
+
+/// Compute overall group-decode progress fraction from completed clips and the
+/// in-flight clip's progress.
+fn group_decode_progress(done: usize, clip: &ClipProgress, total: usize) -> f32 {
+    if total == 0 {
+        return 1.0;
+    }
+    (done as f32 + clip.frac()) / total as f32
+}
+
+/// Format the group-decode progress string, e.g.:
+/// `"Clip 2/5 — extracting audio…"` or `"Clip 2/5 — Chunk 3/9"`
+fn group_progress_str(done: usize, clip: &ClipProgress, total: usize) -> String {
+    let clip_str = clip.progress_str();
+    format!(
+        "Clip {}/{} — {}",
+        (done + 1).min(total),
+        total,
+        clip_str,
+    )
+}
+
 /// Extract a single audio channel from a video file and decode LTC from it.
 /// Returns the LTC detection result or an error string.
+///
+/// When `progress` is `Some`, its `chunks_done` and `cancel_flag` atomics
+/// are shared with the internal `DecodeProgress` so the engine can observe
+/// per-chunk progression in real time. The temp WAV name includes a unique
+/// counter to avoid collisions between concurrent decodes.
 fn decode_one_video_clip(
     path: &str,
     stream_index: usize,
@@ -519,44 +636,102 @@ fn decode_one_video_clip(
     decode_fps: f64,
     decode_drop_frame: bool,
     capture_gen: u64,
+    progress: Option<&ClipProgress>,
 ) -> Result<LtcDetectionResult, String> {
+    static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
     let tmp_dir = std::env::temp_dir();
     let tmp_wav = tmp_dir.join(format!(
-        "ltc_extract_{}_{}_{}_{}.wav",
+        "ltc_extract_{}_{}_{}_{}_{}.wav",
         std::process::id(),
         capture_gen,
         stream_index,
         channel_index,
+        counter,
     ));
 
-    ffprobe::extract_audio_channel(
+    // Phase 1: audio extraction via ffmpeg
+    if let Some(p) = progress {
+        p.phase.store(0, Ordering::Relaxed);
+        p.extract_frac.store(0, Ordering::Relaxed);
+    }
+
+    let duration = ffprobe::probe_stream_duration_secs(Path::new(&path), stream_index);
+
+    let on_frac = |frac: f32| {
+        if let Some(p) = progress {
+            p.extract_frac.store((frac * 1000.0) as usize, Ordering::Relaxed);
+        }
+    };
+
+    let cancel_for_extract: Option<&AtomicBool> = progress.map(|p| &*p.cancel_flag);
+
+    ffprobe::extract_audio_channel_with_progress(
         Path::new(&path),
         stream_index,
         channel_index,
         &tmp_wav,
+        duration,
+        cancel_for_extract,
+        &on_frac,
     ).map_err(|e| format!("Audio extraction failed: {}", e))?;
+
+    // Extraction complete
+    if let Some(p) = progress {
+        p.extract_frac.store(1000, Ordering::Relaxed);
+    }
+
+    // Check cancel after extraction, before decode
+    if let Some(p) = progress {
+        if p.cancel_flag.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&tmp_wav);
+            return Err("Decode canceled by user".to_string());
+        }
+    }
 
     let wav_path = tmp_wav.clone();
 
+    // Phase 2: chunked LTC decode from extracted WAV
     let result = match WavChunkReader::open(&wav_path) {
         Ok((reader, _start)) => {
             let total_mono = reader.total_mono_samples();
+            let sr = reader.sample_rate();
+            let ch = reader.channels() as u16;
+            let bps = reader.spec().bits_per_sample;
             drop(reader);
-            let config = DecodeConfig::default();
-            let chunk_mono =
-                (config.chunk_size_bytes / 3) as usize;
-            let overlap_samples =
-                (config.overlap_seconds * 48000.0) as usize;
-            let chunk_mono = chunk_mono.max(overlap_samples * 2);
 
-            if total_mono <= chunk_mono + overlap_samples {
-                audio_core::decode_ltc_with_decoder(
+            let config = DecodeConfig::default();
+            let chunk_count = audio_core::count_chunks(total_mono, sr, ch, bps, &config);
+
+            if let Some(p) = progress {
+                p.phase.store(1, Ordering::Relaxed);
+                p.chunk_total.store(chunk_count, Ordering::Relaxed);
+            }
+
+            if chunk_count <= 1 || total_mono == 0 {
+                let result = audio_core::decode_ltc_with_decoder(
                     &wav_path, use_libltc, decode_fps, decode_drop_frame,
-                )
+                );
+                if let Some(p) = progress {
+                    p.chunks_done.store(1, Ordering::Relaxed);
+                }
+                result
             } else {
+                // Share the ClipProgress chunks_done and cancel_flag atomics with DecodeProgress
+                let (shared_chunks, shared_cancel) = if let Some(p) = progress {
+                    (p.chunks_done.clone(), p.cancel_flag.clone())
+                } else {
+                    (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)))
+                };
+                let decode_progress = DecodeProgress {
+                    chunks_total: chunk_count,
+                    chunks_completed: shared_chunks,
+                    cancel_flag: shared_cancel,
+                };
                 audio_core::decode_ltc_chunked(
                     &wav_path, use_libltc, decode_fps, decode_drop_frame,
-                    config, &DecodeProgress::new(1),
+                    config, &decode_progress,
                 )
             }
         }
@@ -567,6 +742,7 @@ fn decode_one_video_clip(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn process_command(
     cmd: GuiCommand,
@@ -581,6 +757,8 @@ fn process_command(
     decode_progress: &mut Option<(usize, Arc<AtomicUsize>)>,
     group_result_tx: &Sender<GroupLtcResult>,
     group_cancel: &mut Option<Arc<AtomicBool>>,
+    video_progress: &mut Option<ClipProgress>,
+    group_clip_progress: &mut Option<ClipProgress>,
 ) {
     match cmd {
         GuiCommand::StartLtc => {
@@ -771,14 +949,21 @@ fn process_command(
         }
 
         GuiCommand::CancelDecode => {
-            if let Some(ref cancel) = decode_cancel {
+            if let Some(ref cancel) = *decode_cancel {
                 info!("CancelDecode: signaling cancel flag");
                 cancel.store(true, Ordering::Relaxed);
             }
-            if let Some(ref cancel) = group_cancel {
+            if let Some(ref cancel) = *group_cancel {
                 info!("CancelDecode: signaling group decode cancel flag");
                 cancel.store(true, Ordering::Relaxed);
             }
+            // Clear engine-local progress tracking so stale ClipProgress values
+            // don't leak into subsequent decode operations.
+            *decode_cancel = None;
+            *decode_progress = None;
+            *video_progress = None;
+            *group_cancel = None;
+            *group_clip_progress = None;
             // Mark single + group decode as finished so the UI doesn't stay
             // stuck in "detecting" state when the canceled thread returns
             // early without sending a result.
@@ -815,8 +1000,9 @@ fn process_command(
             state.ltc_group_total = total;
             state.status_message = format!("Decoding LTC group: 0/{} clips", total);
 
-            let cancel_flag = Arc::new(AtomicBool::new(false));
-            *group_cancel = Some(cancel_flag.clone());
+            let clip = ClipProgress::new();
+            *group_cancel = Some(clip.cancel_flag.clone());
+            *group_clip_progress = Some(clip.clone());
 
             let capture_gen = state.ltc_group_decode_generation;
             let tx = group_result_tx.clone();
@@ -828,7 +1014,7 @@ fn process_command(
                 .name("ltc-group-decode".into())
                 .spawn(move || {
                     for (idx, path) in paths.iter().enumerate() {
-                        if cancel_flag.load(Ordering::Relaxed) {
+                        if clip.cancel_flag.load(Ordering::Relaxed) {
                             info!("LTC group decode canceled at clip {}/{}", idx, total);
                             return;
                         }
@@ -836,14 +1022,14 @@ fn process_command(
                         info!("LTC group decode clip {}/{} started: {}", idx + 1, total, path);
                         let result = decode_one_video_clip(
                             path, stream_index, channel_index,
-                            use_libltc, decode_fps, decode_drop_frame, capture_gen,
+                            use_libltc, decode_fps, decode_drop_frame, capture_gen, Some(&clip),
                         );
                         info!("LTC group decode clip {}/{} finished: {} — {}",
                             idx + 1, total, path,
                             if result.is_ok() { "OK" } else { "FAILED" },
                         );
 
-                        if cancel_flag.load(Ordering::Relaxed) {
+                        if clip.cancel_flag.load(Ordering::Relaxed) {
                             return;
                         }
 
@@ -866,10 +1052,11 @@ fn process_command(
             state.ltc_group_done = 0;
             state.ltc_group_total = 0;
             state.ltc_group_is_detecting = false;
-            if let Some(ref cancel) = group_cancel {
+            if let Some(ref cancel) = *group_cancel {
                 cancel.store(true, Ordering::Relaxed);
             }
             group_cancel.take();
+            *group_clip_progress = None;
         }
 
         GuiCommand::ProbeVideo(path) => {
@@ -950,9 +1137,16 @@ fn process_command(
 
             let tx = decode_result_tx.clone();
 
+            // Wire ClipProgress so the engine can track extraction + chunked decode progress
+            let clip = ClipProgress::new();
+            *decode_cancel = Some(clip.cancel_flag.clone());
+            *video_progress = Some(clip.clone()); // engine reads from clone
+
             std::thread::spawn(move || {
                 let result = decode_one_video_clip(
-                    &path, stream_index, channel_index, use_libltc, decode_fps, decode_drop_frame, capture_gen,
+                    &path, stream_index, channel_index,
+                    use_libltc, decode_fps, decode_drop_frame, capture_gen,
+                    Some(&clip),
                 );
                 let _ = tx.send(LtcDecodeResult {
                     path,
@@ -1604,7 +1798,7 @@ mod tests {
         process_command(
             GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
             &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel,
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None,
         );
         assert!(state.is_locked);
     }
@@ -1623,10 +1817,10 @@ mod tests {
 
         process_command(GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
             &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         process_command(GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
             &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!(!state.is_locked);
     }
 
@@ -1644,7 +1838,7 @@ mod tests {
 
         process_command(GuiCommand::SetFpsIndex(4), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.fps_index, 4);
         assert_eq!(state.fps, 30.0);
         assert!(!state.drop_frame);
@@ -1664,7 +1858,7 @@ mod tests {
 
         process_command(GuiCommand::SetFpsIndex(3), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.fps_index, 3);
         assert!((state.fps - 29.97).abs() < 0.01);
         assert!(state.drop_frame);
@@ -1684,7 +1878,7 @@ mod tests {
 
         process_command(GuiCommand::SetFpsIndex(99), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.fps_index, 1);
         assert_eq!(state.fps, 25.0);
     }
@@ -1703,12 +1897,12 @@ mod tests {
 
         process_command(GuiCommand::SetTheme(true), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!(state.is_dark_theme);
 
         process_command(GuiCommand::SetTheme(false), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!(!state.is_dark_theme);
     }
 
@@ -1726,12 +1920,12 @@ mod tests {
 
         process_command(GuiCommand::ToggleTheme, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!(state.is_dark_theme, "toggle from initial false → true");
 
         process_command(GuiCommand::ToggleTheme, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!(!state.is_dark_theme, "toggle again true → false");
     }
 
@@ -1757,7 +1951,7 @@ mod tests {
 
         process_command(GuiCommand::ClearLogs, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!(state.logs.is_empty());
     }
 
@@ -1775,7 +1969,7 @@ mod tests {
 
         process_command(GuiCommand::SetLtcChannel("both".into()), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.ltc_channel, "both");
     }
 
@@ -1793,7 +1987,7 @@ mod tests {
 
         process_command(GuiCommand::SetBeepVolume(0.75), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!((state.beep_volume - 0.75).abs() < 1e-6);
     }
 
@@ -1812,7 +2006,7 @@ mod tests {
 
         process_command(GuiCommand::SetStartTimecode(tc), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.start_timecode, tc);
     }
 
@@ -1830,17 +2024,17 @@ mod tests {
 
         process_command(GuiCommand::SetScene(42), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.scene, 42);
 
         process_command(GuiCommand::SetTake(7), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.take, 7);
 
         process_command(GuiCommand::SetRoll("B002".into()), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.roll, "B002");
     }
 
@@ -1859,12 +2053,12 @@ mod tests {
         state.scene = 5;
         process_command(GuiCommand::SceneUp, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.scene, 6);
 
         process_command(GuiCommand::SceneDown, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.scene, 5);
     }
 
@@ -1883,12 +2077,12 @@ mod tests {
         state.take = 3;
         process_command(GuiCommand::TakeUp, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.take, 4);
 
         process_command(GuiCommand::TakeDown, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.take, 3);
     }
 
@@ -1907,7 +2101,7 @@ mod tests {
         state.scene = 0;
         process_command(GuiCommand::SceneDown, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.scene, 0, "scene should not go below 0");
     }
 
@@ -1926,7 +2120,7 @@ mod tests {
         state.take = 0;
         process_command(GuiCommand::TakeDown, &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.take, 0, "take should not go below 0");
     }
 
@@ -1944,7 +2138,7 @@ mod tests {
 
         process_command(GuiCommand::SetSampleRate(48000), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.sample_rate, 48000);
     }
 
@@ -1962,12 +2156,12 @@ mod tests {
 
         process_command(GuiCommand::SetAutoIncrement(false), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!(!state.auto_increment_take);
 
         process_command(GuiCommand::SetAutoIncrement(true), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!(state.auto_increment_take);
     }
 
@@ -1985,7 +2179,7 @@ mod tests {
 
         process_command(GuiCommand::SetDecodeFpsIndex(4), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert_eq!(state.decode_fps_index, 4);
         assert_eq!(state.decode_fps, 30.0);
         assert!(!state.decode_drop_frame);
@@ -2005,7 +2199,7 @@ mod tests {
 
         process_command(GuiCommand::SetDecodeFpsIndex(3), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         assert!((state.decode_fps - 29.97).abs() < 0.01);
         assert!(state.decode_drop_frame);
     }
@@ -2024,7 +2218,7 @@ mod tests {
 
         process_command(GuiCommand::SetDecodeFpsIndex(99), &core, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &tx,
-            &mut None, &mut None, &group_tx, &mut group_cancel);
+            &mut None, &mut None, &group_tx, &mut group_cancel, &mut None, &mut None);
         // Should not change since index is out of range
         assert_eq!(state.decode_fps_index, 1);
     }
@@ -2080,5 +2274,159 @@ mod tests {
 
         assert!(!unexpected);
         assert!(state.ffmpeg_caps.is_none());
+    }
+
+    // ── ClipProgress ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_clip_progress_initial_state() {
+        let cp = ClipProgress::new();
+        assert!((cp.frac()).abs() < 1e-6, "initial frac should be 0");
+        assert_eq!(cp.progress_str(), "extracting audio…");
+    }
+
+    #[test]
+    fn test_clip_progress_extraction_partial() {
+        let cp = ClipProgress::new();
+        // 50% extraction, phase still extracting → frac = 0.5 * 0.5 = 0.25
+        cp.extract_frac.store(500, Ordering::Relaxed);
+        assert!((cp.frac() - 0.25).abs() < 1e-6,
+            "extraction at 50% should give 0.25, got {}", cp.frac());
+        assert_eq!(cp.progress_str(), "extracting audio…");
+    }
+
+    #[test]
+    fn test_clip_progress_decode_phase_no_chunks_completed() {
+        let cp = ClipProgress::new();
+        cp.phase.store(1, Ordering::Relaxed);
+        cp.chunk_total.store(10, Ordering::Relaxed);
+        cp.extract_frac.store(1000, Ordering::Relaxed); // extraction 100%
+        // frac = 0.5 * 1.0 + 0.5 * 0.0 = 0.5
+        assert!((cp.frac() - 0.5).abs() < 1e-6,
+            "extraction done, decode not started: expected 0.5, got {}", cp.frac());
+        assert_eq!(cp.progress_str(), "Chunk 0/10");
+    }
+
+    #[test]
+    fn test_clip_progress_decode_partial() {
+        let cp = ClipProgress::new();
+        cp.phase.store(1, Ordering::Relaxed);
+        cp.extract_frac.store(1000, Ordering::Relaxed);
+        cp.chunk_total.store(10, Ordering::Relaxed);
+        cp.chunks_done.store(3, Ordering::Relaxed);
+        // frac = 0.5 * 1.0 + 0.5 * 0.3 = 0.65
+        assert!((cp.frac() - 0.65).abs() < 1e-6, "expected 0.65, got {}", cp.frac());
+        assert_eq!(cp.progress_str(), "Chunk 3/10");
+    }
+
+    #[test]
+    fn test_clip_progress_decode_complete() {
+        let cp = ClipProgress::new();
+        cp.phase.store(1, Ordering::Relaxed);
+        cp.extract_frac.store(1000, Ordering::Relaxed);
+        cp.chunk_total.store(10, Ordering::Relaxed);
+        cp.chunks_done.store(10, Ordering::Relaxed);
+        assert!((cp.frac() - 1.0).abs() < 1e-6, "expected 1.0, got {}", cp.frac());
+        assert_eq!(cp.progress_str(), "Chunk 10/10");
+    }
+
+    #[test]
+    fn test_clip_progress_reset() {
+        let cp = ClipProgress::new();
+        cp.phase.store(1, Ordering::Relaxed);
+        cp.extract_frac.store(1000, Ordering::Relaxed);
+        cp.chunk_total.store(10, Ordering::Relaxed);
+        cp.chunks_done.store(5, Ordering::Relaxed);
+        cp.reset();
+        assert!((cp.frac()).abs() < 1e-6, "after reset frac should be 0");
+        assert_eq!(cp.progress_str(), "extracting audio…");
+    }
+
+    #[test]
+    fn test_clip_progress_zero_chunk_total() {
+        let cp = ClipProgress::new();
+        cp.phase.store(1, Ordering::Relaxed);
+        cp.extract_frac.store(1000, Ordering::Relaxed);
+        cp.chunk_total.store(0, Ordering::Relaxed);
+        // decode_frac = 0/0 -> 0, frac = 0.5 * 1.0 + 0.5 * 0.0 = 0.5
+        assert!((cp.frac() - 0.5).abs() < 1e-6, "expected 0.5, got {}", cp.frac());
+        assert_eq!(cp.progress_str(), "Chunk 0/0");
+    }
+
+    // ── group_decode_progress ──────────────────────────────────────────────
+
+    #[test]
+    fn test_group_decode_progress_first_clip_starting() {
+        let cp = ClipProgress::new();
+        // clip_frac = 0 (just starting), done=0, total=3
+        let pct = group_decode_progress(0, &cp, 3);
+        assert!((pct).abs() < 1e-6, "expected 0, got {}", pct);
+    }
+
+    #[test]
+    fn test_group_decode_progress_first_clip_partial() {
+        let cp = ClipProgress::new();
+        cp.extract_frac.store(500, Ordering::Relaxed); // frac=0.25
+        let pct = group_decode_progress(0, &cp, 4);
+        assert!((pct - 0.0625).abs() < 1e-6, "expected 0.0625, got {}", pct);
+    }
+
+    #[test]
+    fn test_group_decode_progress_two_clips_done() {
+        let cp = ClipProgress::new(); // not started
+        let pct = group_decode_progress(2, &cp, 4);
+        assert!((pct - 0.5).abs() < 1e-6, "expected 0.5, got {}", pct);
+    }
+
+    #[test]
+    fn test_group_decode_progress_last_clip_complete() {
+        let cp = ClipProgress::new();
+        cp.phase.store(1, Ordering::Relaxed);
+        cp.extract_frac.store(1000, Ordering::Relaxed);
+        cp.chunk_total.store(5, Ordering::Relaxed);
+        cp.chunks_done.store(5, Ordering::Relaxed);
+        let pct = group_decode_progress(2, &cp, 3);
+        assert!((pct - 1.0).abs() < 1e-6, "expected 1.0, got {}", pct);
+    }
+
+    #[test]
+    fn test_group_decode_progress_zero_total() {
+        let cp = ClipProgress::new();
+        let pct = group_decode_progress(0, &cp, 0);
+        assert!((pct - 1.0).abs() < 1e-6, "expected 1.0 for 0 total");
+    }
+
+    // ── group_progress_str ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_group_progress_str_first_clip() {
+        let cp = ClipProgress::new();
+        assert_eq!(group_progress_str(0, &cp, 3), "Clip 1/3 — extracting audio…");
+    }
+
+    #[test]
+    fn test_group_progress_str_mid_extraction() {
+        let cp = ClipProgress::new();
+        cp.extract_frac.store(750, Ordering::Relaxed);
+        // string doesn't include extract_frac, just phase label
+        assert_eq!(group_progress_str(1, &cp, 4), "Clip 2/4 — extracting audio…");
+    }
+
+    #[test]
+    fn test_group_progress_str_decode_phase() {
+        let cp = ClipProgress::new();
+        cp.phase.store(1, Ordering::Relaxed);
+        cp.chunk_total.store(12, Ordering::Relaxed);
+        cp.chunks_done.store(5, Ordering::Relaxed);
+        assert_eq!(group_progress_str(2, &cp, 5), "Clip 3/5 — Chunk 5/12");
+    }
+
+    #[test]
+    fn test_group_progress_str_last_clip_complete() {
+        let cp = ClipProgress::new();
+        cp.phase.store(1, Ordering::Relaxed);
+        cp.chunk_total.store(3, Ordering::Relaxed);
+        cp.chunks_done.store(3, Ordering::Relaxed);
+        assert_eq!(group_progress_str(4, &cp, 5), "Clip 5/5 — Chunk 3/3");
     }
 }

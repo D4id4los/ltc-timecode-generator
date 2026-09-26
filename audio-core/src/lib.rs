@@ -107,6 +107,47 @@ impl DecodeProgress {
     }
 }
 
+/// Count how many chunks `decode_ltc_chunked` would split a WAV into,
+/// given its parameters and the [`DecodeConfig`]. Returns 1 for files
+/// small enough to fit in a single chunk.
+///
+/// The logic exactly mirrors the chunk-boundary computation in
+/// [`decode_ltc_chunked`].
+pub fn count_chunks(
+    total_mono_samples: usize,
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+    config: &DecodeConfig,
+) -> usize {
+    if total_mono_samples == 0 {
+        return 0;
+    }
+    let bytes_per_mono = (channels as u64) * (bits_per_sample as u64 / 8);
+    let chunk_mono =
+        (config.chunk_size_bytes / bytes_per_mono.max(1)) as usize;
+    let overlap_samples = (config.overlap_seconds * sample_rate as f64) as usize;
+    let chunk_mono = chunk_mono.max(overlap_samples * 2);
+    if total_mono_samples <= chunk_mono + overlap_samples {
+        return 1;
+    }
+    let mut count = 0usize;
+    let mut pos = 0usize;
+    while pos < total_mono_samples {
+        count += 1;
+        let end = (pos + chunk_mono).min(total_mono_samples);
+        if end >= total_mono_samples {
+            break;
+        }
+        let next = end.saturating_sub(overlap_samples);
+        if next <= pos || next >= total_mono_samples {
+            break;
+        }
+        pos = next;
+    }
+    count
+}
+
 /// Low-level WAV chunk reader that reads from a data section offset without
 /// loading the entire file into memory.
 pub struct WavChunkReader {
@@ -680,6 +721,63 @@ mod tests {
         assert!(p.cancel_flag.load(Ordering::Relaxed));
     }
 
+    // ── count_chunks ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_count_chunks_single_chunk_for_small_file() {
+        let config = DecodeConfig::default();
+        let n = count_chunks(100_000, 48000, 2, 16, &config);
+        assert_eq!(n, 1, "small file should be 1 chunk");
+    }
+
+    #[test]
+    fn test_count_chunks_multiple_chunks_for_large_file() {
+        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let total_mono = 500_000; // mono samples
+        let n = count_chunks(total_mono, 48000, 2, 16, &config);
+        assert!(n >= 2, "large file should produce >= 2 chunks, got {}", n);
+    }
+
+    #[test]
+    fn test_count_chunks_zero_samples() {
+        let config = DecodeConfig { chunk_size_bytes: 1_000, overlap_seconds: 0.1 };
+        let n = count_chunks(0, 48000, 1, 16, &config);
+        assert_eq!(n, 0, "zero samples -> zero chunks");
+    }
+
+    #[test]
+    fn test_count_chunks_matches_decode_ltc_chunked_output_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("count_matches.wav");
+        generate_ltc_wav(
+            &path,
+            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
+            25.0, false, 48000, 200,
+        );
+
+        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let (reader, _) = WavChunkReader::open(&path).unwrap();
+        let total_mono = reader.total_mono_samples();
+        let predicted = count_chunks(total_mono, reader.sample_rate(), reader.channels() as u16,
+            reader.spec().bits_per_sample, &config);
+
+        let progress = DecodeProgress::new(1);
+        let result = decode_ltc_chunked(&path, false, 25.0, false, config, &progress).unwrap();
+        let actual_chunks: usize = result.details.iter()
+            .filter(|d| d.starts_with("Chunk ") && d.contains("valid"))
+            .count();
+        assert_eq!(predicted, actual_chunks,
+            "count_chunks predicted {} actual decode produced {}", predicted, actual_chunks);
+    }
+
+    #[test]
+    fn test_count_chunks_zero_chunk_size_uses_fallback() {
+        let config = DecodeConfig { chunk_size_bytes: 0, overlap_seconds: 0.1 };
+        let n = count_chunks(100, 48000, 1, 16, &config);
+        assert_eq!(n, 1,
+            "should handle zero chunk_size_bytes gracefully");
+    }
+
     // ── WavChunkReader: open errors ───────────────────────────────────
 
     #[test]
@@ -991,24 +1089,7 @@ mod tests {
         bits_per_sample: u16,
         config: &DecodeConfig,
     ) -> usize {
-        let bytes_per_mono = (channels as u64) * (bits_per_sample as u64 / 8);
-        let chunk_mono = (config.chunk_size_bytes / bytes_per_mono.max(1)) as usize;
-        let overlap_samples = (config.overlap_seconds * sample_rate as f64) as usize;
-        let chunk_mono = chunk_mono.max(overlap_samples * 2);
-        if total_mono <= chunk_mono + overlap_samples {
-            return 1;
-        }
-        let mut count = 0usize;
-        let mut pos = 0usize;
-        while pos < total_mono {
-            count += 1;
-            let end = (pos + chunk_mono).min(total_mono);
-            if end >= total_mono { break; }
-            let next = end.saturating_sub(overlap_samples);
-            if next <= pos || next >= total_mono { break; }
-            pos = next;
-        }
-        count
+        count_chunks(total_mono, sample_rate, channels, bits_per_sample, config)
     }
 
     #[test]

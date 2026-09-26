@@ -1,5 +1,7 @@
+use std::io::BufRead;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::subprocess::no_window_command;
 
@@ -196,6 +198,162 @@ fn stderr_tail(s: &str, max_chars: usize) -> String {
     }
     let tail: String = s.chars().skip(len - max_chars).collect();
     format!("…{}", tail)
+}
+
+/// Parse an `out_time_us=<int>` progress line from ffmpeg's `-progress pipe:2` output.
+/// Returns `Some(duration_seconds)` on a valid match, `None` for other lines
+/// (including `N/A`, `out_time=`, `out_time_ms=`).
+pub fn parse_out_time_us(line: &str) -> Option<f64> {
+    let line = line.trim();
+    let prefix = "out_time_us=";
+    if let Some(val_str) = line.strip_prefix(prefix) {
+        let usecs: f64 = val_str.parse().ok()?;
+        Some(usecs / 1_000_000.0)
+    } else {
+        None
+    }
+}
+
+/// Quickly probe the duration (in seconds) of a single stream inside a
+/// container file by calling ffprobe with `-show_entries stream=duration`.
+/// Falls back to the container-level `format.duration` when per-stream
+/// duration is unavailable. Returns `None` on failure.
+pub fn probe_stream_duration_secs(path: &Path, absolute_stream_index: usize) -> Option<f64> {
+    let output = no_window_command("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_entries", &format!("stream=duration:format=duration"),
+            "-select_streams", &format!("{}", absolute_stream_index),
+            &path.to_string_lossy(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+
+    // Try per-stream duration first
+    if let Some(streams) = parsed.get("streams").and_then(|v| v.as_array()) {
+        for s in streams {
+            if let Some(d) = s.get("duration").and_then(|v| v.as_str()) {
+                if let Ok(secs) = d.parse::<f64>() {
+                    if secs > 0.0 {
+                        return Some(secs);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to format-level duration
+    if let Some(d) = parsed.get("format").and_then(|f| f.get("duration")).and_then(|v| v.as_str()) {
+        if let Ok(secs) = d.parse::<f64>() {
+            if secs > 0.0 {
+                return Some(secs);
+            }
+        }
+    }
+
+    None
+}
+
+/// Like [`extract_audio_channel`] but uses `-progress pipe:2` to report
+/// extraction progress via `on_frac` (called with values 0.0..1.0) and
+/// respects the `cancel` flag to kill ffmpeg mid-extraction.
+///
+/// `total_duration_secs` is used to convert ffmpeg's `out_time_us` into a
+/// fraction. When `None`, the function still spawns and parses progress lines
+/// but `on_frac` is only called with 0.0 and 1.0 (at start and end).
+///
+/// On cancel, ffmpeg is killed and `Err("Audio extraction canceled")` is
+/// returned.
+pub fn extract_audio_channel_with_progress(
+    path: &Path,
+    absolute_stream_index: usize,
+    channel_index: usize,
+    output_wav: &Path,
+    total_duration_secs: Option<f64>,
+    cancel: Option<&AtomicBool>,
+    on_frac: &impl Fn(f32),
+) -> Result<(), String> {
+    let mut args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
+    args.push("-progress".to_string());
+    args.push("pipe:2".to_string());
+
+    let mut child = no_window_command("ffmpeg")
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
+
+    let stderr = child.stderr.take().ok_or("Failed to capture ffmpeg stderr")?;
+    let reader = std::io::BufReader::new(stderr);
+
+    // Read stderr lines in a loop, checking cancel and reporting progress.
+    // We need to collect stderr for error reporting; use a buffer.
+    let mut stderr_lines: Vec<String> = Vec::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        stderr_lines.push(line.clone());
+
+        // Check cancel flag
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(output_wav);
+                return Err("Audio extraction canceled".to_string());
+            }
+        }
+
+        // Parse progress
+        if let Some(secs) = parse_out_time_us(&line) {
+            if let Some(duration) = total_duration_secs {
+                if duration > 0.0 {
+                    let frac = (secs / duration).min(1.0) as f32;
+                    on_frac(frac);
+                }
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("Failed to wait for ffmpeg: {}", e))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(output_wav);
+        let stderr = stderr_lines.join("\n");
+        let tail = stderr_tail(&stderr, 400);
+        error!(
+            "ffmpeg audio extraction failed for '{}' (stream {} channel {}): {}",
+            path.display(),
+            absolute_stream_index,
+            channel_index,
+            tail
+        );
+        return Err(format!(
+            "ffmpeg audio extraction failed: stream {} channel {} in '{}': {}",
+            absolute_stream_index,
+            channel_index,
+            path.display(),
+            tail
+        ));
+    }
+
+    info!("Audio extraction (with progress) successful: {}", output_wav.display());
+    Ok(())
 }
 
 // ── Keyframe lookup (stream-copy trim snapping) ──────────────────────────
@@ -442,5 +600,51 @@ mod tests {
             { "pts_time": "1.5", "flags": "K_" }
         ]}"#;
         assert_eq!(parse_last_keyframe(json, 5.0), Some(1.5));
+    }
+
+    // ── parse_out_time_us ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_out_time_us_valid() {
+        assert!((parse_out_time_us("out_time_us=1234567").unwrap() - 1.234567).abs() < 1e-9);
+        assert!((parse_out_time_us("out_time_us=0").unwrap()).abs() < 1e-9);
+        assert!((parse_out_time_us("out_time_us=1000000").unwrap() - 1.0).abs() < 1e-9);
+        assert!((parse_out_time_us("out_time_us=999999999").unwrap() - 999.999999).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_out_time_us_negative_larger() {
+        // Negative microsecond values (ffmpeg shouldn't produce them, but robust)
+        let result = parse_out_time_us("out_time_us=-1000000");
+        assert!(result.is_some());
+        assert!((result.unwrap() + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_out_time_us_ignores_out_time() {
+        assert_eq!(parse_out_time_us("out_time=01:02:03.456789"), None);
+    }
+
+    #[test]
+    fn test_parse_out_time_us_ignores_out_time_ms() {
+        assert_eq!(parse_out_time_us("out_time_ms=1234567"), None);
+    }
+
+    #[test]
+    fn test_parse_out_time_us_n_a() {
+        assert_eq!(parse_out_time_us("out_time_us=N/A"), None);
+    }
+
+    #[test]
+    fn test_parse_out_time_us_garbage() {
+        assert_eq!(parse_out_time_us("not a progress line"), None);
+        assert_eq!(parse_out_time_us(""), None);
+        assert_eq!(parse_out_time_us("out_time_us="), None);
+    }
+
+    #[test]
+    fn test_parse_out_time_us_trailing_text() {
+        // ffmpeg can emit extra whitespace; trim handles it
+        assert!((parse_out_time_us("  out_time_us=5000000  ").unwrap() - 5.0).abs() < 1e-9);
     }
 }

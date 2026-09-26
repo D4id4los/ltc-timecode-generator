@@ -98,7 +98,7 @@ pub fn setup_poll_timer(
             {
                 let mut last_auto = last_auto_applied_gen.lock().unwrap();
 
-                if s.ltc_is_detecting {
+                if s.ltc_is_detecting || s.ltc_group_is_detecting {
                     ui.set_ltc_status(SharedString::from("detecting"));
                     ui.set_ltc_result_text(SharedString::from(""));
                     ui.set_ltc_error(SharedString::from(""));
@@ -198,8 +198,8 @@ pub fn setup_poll_timer(
                 ui.set_ltc_channel_names(ModelRc::new(VecModel::from(channel_names)));
             }
 
-            // Sync decode progress every tick during active detection
-            if s.ltc_is_detecting {
+            // Sync decode progress every tick during active detection (single or group)
+            if s.ltc_is_detecting || s.ltc_group_is_detecting {
                 ui.set_ltc_decode_progress(s.ltc_decode_progress_pct);
             }
 

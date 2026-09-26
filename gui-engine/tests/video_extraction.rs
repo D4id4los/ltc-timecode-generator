@@ -145,6 +145,277 @@ fn run_engine_with_commands(commands: Vec<GuiCommand>) -> AppStateSnapshot {
     snapshot
 }
 
+// ── Progress tracking during multi-clip video decode ─────────────────────
+
+#[test]
+fn test_single_clip_decode_via_group_command() {
+    if !ffmpeg_tooling_available() {
+        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ltc_wav = generate_ltc_wav(dir.path(), "ltc.wav", 25.0, 2.0, "both");
+
+    let mp4 = dir.path().join("C0001.MP4");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-v", "error"]);
+    cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+    cmd.arg("-i").arg(&ltc_wav);
+    cmd.args(["-map", "0:v", "-map", "1:a"]);
+    cmd.args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"]);
+    cmd.args(["-c:a", "aac", "-b:a", "192k", "-t", "2"]);
+    cmd.arg(mp4.to_string_lossy().to_string());
+    let status = cmd.status().expect("failed to spawn ffmpeg for clip");
+    assert!(status.success(), "ffmpeg clip creation failed");
+
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-vtest".into())
+        .spawn(move || {
+            gui_engine::engine::engine_main(rx, state_clone, false);
+        })
+        .expect("failed to spawn engine thread");
+
+    tx.send(GuiCommand::DecodeLtcVideoGroup {
+        paths: vec![mp4.to_string_lossy().to_string()],
+        stream_index: 1,
+        channel_index: 0,
+    }).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let snapshot = state.load().as_ref().clone();
+        if !snapshot.ltc_group_is_detecting && snapshot.ltc_group_done >= 1 {
+            eprintln!("Group done! results={:?} errors={:?} pct={}",
+                snapshot.ltc_group_results.len(),
+                snapshot.ltc_group_errors.iter().filter(|e| e.is_some()).count(),
+                snapshot.ltc_decode_progress_pct);
+            break;
+        }
+        if Instant::now() > deadline {
+            eprintln!("TIMEOUT! group_is_detecting={} group_done={} total={} pct={}",
+                snapshot.ltc_group_is_detecting,
+                snapshot.ltc_group_done,
+                snapshot.ltc_group_total,
+                snapshot.ltc_decode_progress_pct);
+            panic!("test timed out waiting for group decode");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let snapshot = state.load().as_ref().clone();
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+
+    assert_eq!(snapshot.ltc_group_done, 1, "should have processed 1 clip");
+    assert!(!snapshot.ltc_group_is_detecting);
+}
+
+#[test]
+fn test_extract_audio_channel_with_progress_reports_fraction() {
+    if !ffmpeg_tooling_available() {
+        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    use std::sync::atomic::AtomicBool;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ltc_wav = generate_ltc_wav(dir.path(), "ltc.wav", 25.0, 2.0, "both");
+
+    let mp4 = dir.path().join("video.mp4");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-v", "error"]);
+    cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+    cmd.arg("-i").arg(&ltc_wav);
+    cmd.args(["-map", "0:v", "-map", "1:a"]);
+    cmd.args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"]);
+    cmd.args(["-c:a", "aac", "-b:a", "192k", "-t", "2"]);
+    cmd.arg(mp4.to_string_lossy().to_string());
+    let status = cmd.status().expect("failed to spawn ffmpeg");
+    assert!(status.success(), "ffmpeg video creation failed");
+
+    // Probe duration for progress fraction computation
+    let duration = gui_engine::probe_stream_duration_secs(&mp4, 1)
+        .expect("stream duration should be available");
+    assert!(duration > 0.0, "duration should be positive, got {}", duration);
+
+    let out = dir.path().join("extract.wav");
+    let cancel = AtomicBool::new(false);
+    let progress = std::sync::Mutex::new(Vec::new());
+
+    let result = gui_engine::extract_audio_channel_with_progress(
+        &mp4, 1, 0, &out, Some(duration), Some(&cancel), &|frac| {
+            let mut p = progress.lock().unwrap();
+            p.push(frac);
+        },
+    );
+
+    assert!(result.is_ok(), "extraction should succeed: {:?}", result);
+    assert!(out.exists(), "output file should exist");
+
+    let p = progress.lock().unwrap();
+    assert!(!p.is_empty(), "should have progress updates");
+    let last = *p.last().unwrap();
+    // Last progress fraction should be near 1.0 (allow for minor timing inaccuracies)
+    assert!(last > 0.8, "final progress should be near 1.0, got {}", last);
+}
+
+/// Helper: spawn engine, send commands, monitor state.
+fn run_engine_with_commands_monitor<F>(
+    commands: Vec<GuiCommand>,
+    mut monitor: F,
+    timeout_secs: u64,
+) -> AppStateSnapshot
+where
+    F: FnMut(&AppStateSnapshot, &Instant) -> bool,
+{
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-vtest".into())
+        .spawn(move || {
+            gui_engine::engine::engine_main(rx, state_clone, false);
+        })
+        .expect("failed to spawn engine thread");
+
+    for cmd in commands {
+        tx.send(cmd).unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let snapshot = state.load().as_ref().clone();
+        if monitor(&snapshot, &deadline) {
+            let final_snapshot = state.load().as_ref().clone();
+            drop(tx);
+            handle.join().expect("engine thread panicked");
+            return final_snapshot;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn test_group_decode_progress_reaches_100_percent() {
+    if !ffmpeg_tooling_available() {
+        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ltc_wav = generate_ltc_wav(dir.path(), "ltc.wav", 25.0, 2.0, "both");
+
+    // Create two video clips with LTC audio
+    let clip1 = dir.path().join("C0001.MP4");
+    let clip2 = dir.path().join("C0002.MP4");
+    for (i, clip) in [&clip1, &clip2].iter().enumerate() {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-y", "-v", "error"]);
+        cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+        cmd.arg("-i").arg(&ltc_wav);
+        cmd.args(["-map", "0:v", "-map", "1:a"]);
+        cmd.args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"]);
+        cmd.args(["-c:a", "aac", "-b:a", "192k", "-t", "2"]);
+        cmd.arg(clip.to_string_lossy().to_string());
+        let status = cmd.status().expect("failed to spawn ffmpeg for clip");
+        assert!(status.success(), "ffmpeg clip creation failed for C000{}.MP4", i + 1);
+    }
+
+    let paths: Vec<String> = vec![
+        clip1.to_string_lossy().to_string(),
+        clip2.to_string_lossy().to_string(),
+    ];
+
+    let mut max_pct = 0.0f32;
+
+    let snapshot = run_engine_with_commands_monitor(
+        vec![GuiCommand::DecodeLtcVideoGroup {
+            paths,
+            stream_index: 1,
+            channel_index: 0,
+        }],
+        |s, deadline| {
+            if s.ltc_decode_progress_pct > max_pct {
+                max_pct = s.ltc_decode_progress_pct;
+            }
+            if s.ltc_group_total > 0 && s.ltc_group_done >= s.ltc_group_total && !s.ltc_group_is_detecting {
+                return true;
+            }
+            Instant::now() > *deadline
+        },
+        30,
+    );
+
+    assert!(max_pct > 0.0,
+        "decode progress never exceeded 0 (max_pct={})", max_pct);
+    assert!(!snapshot.ltc_group_is_detecting, "group decode should not be detecting after completion");
+    assert_eq!(snapshot.ltc_group_results.len(), 2, "two clip results expected");
+    assert_eq!(snapshot.ltc_group_results.iter().filter(|r| r.is_some()).count(), 2,
+        "both clips should have decode results");
+}
+
+#[test]
+fn test_single_video_decode_progress() {
+    if !ffmpeg_tooling_available() {
+        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let ltc_wav = generate_ltc_wav(dir.path(), "ltc.wav", 25.0, 2.0, "both");
+
+    let mp4 = dir.path().join("video.mp4");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-v", "error"]);
+    cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+    cmd.arg("-i").arg(&ltc_wav);
+    cmd.args(["-map", "0:v", "-map", "1:a"]);
+    cmd.args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"]);
+    cmd.args(["-c:a", "aac", "-b:a", "192k", "-t", "2"]);
+    cmd.arg(mp4.to_string_lossy().to_string());
+    let status = cmd.status().expect("failed to spawn ffmpeg");
+    assert!(status.success(), "ffmpeg video creation failed");
+
+    let mp4_str = mp4.to_string_lossy().to_string();
+
+    let mut progress_gt_zero = false;
+
+    let snapshot = run_engine_with_commands_monitor(
+        vec![
+            GuiCommand::ProbeVideo(mp4_str.clone()),
+            GuiCommand::ParseLtcVideo(mp4_str.clone(), 1, 0),
+        ],
+        |s, deadline| {
+            if s.ltc_decode_progress_pct > 0.0 {
+                progress_gt_zero = true;
+            }
+            if !s.ltc_is_detecting && s.ltc_decode_generation > 0 {
+                return true;
+            }
+            Instant::now() > *deadline
+        },
+        120,
+    );
+
+    assert!(
+        progress_gt_zero,
+        "single video decode progress never exceeded 0"
+    );
+    assert!(!snapshot.ltc_is_detecting, "should not still be detecting");
+    assert!(
+        snapshot.ltc_decode_error.is_none() || snapshot.ltc_decode_result.is_some(),
+        "should have either result or error, got error={:?}, result={:?}",
+        snapshot.ltc_decode_error, snapshot.ltc_decode_result
+    );
+}
+
 fn assert_decodes_ltc(wav: &Path, min_valid_frames: u32) {
     let result = decode_ltc_from_wav(wav, 25.0, false)
         .expect("LTC decode of extracted wav failed");

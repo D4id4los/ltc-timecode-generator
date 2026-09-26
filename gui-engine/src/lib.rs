@@ -50,7 +50,7 @@ pub use video_codecs::{
 };
 
 // Re-export ffprobe types
-pub use ffprobe::{extract_audio_channel, path_is_video, probe_video_audio, AudioStreamInfo, VideoAudioProbe};
+pub use ffprobe::{extract_audio_channel, extract_audio_channel_with_progress, parse_out_time_us, path_is_video, probe_stream_duration_secs, probe_video_audio, AudioStreamInfo, VideoAudioProbe};
 
 // Re-export duration helpers
 pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs};
