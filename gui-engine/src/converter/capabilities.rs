@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::process::Stdio;
 
-use log::info;
 use serde;
 
 use crate::subprocess::no_window_command;

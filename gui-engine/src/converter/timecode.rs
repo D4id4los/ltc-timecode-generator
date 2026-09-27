@@ -112,7 +112,7 @@ pub fn build_per_file_start_timecodes(
     results: &[Option<&audio_core::LtcDetectionResult>],
 ) -> Vec<Option<TimecodeMetadata>> {
     results.iter().map(|r| {
-        r.and_then(|r| start_timecode_from_ltc(r))
+        r.and_then(start_timecode_from_ltc)
     }).collect()
 }
 
@@ -171,28 +171,28 @@ pub fn time_reference_samples(tc: &TimecodeMetadata, sample_rate: u32) -> u64 {
     (total_secs * sample_rate as f64).round() as u64
 }
 
-fn make_test_result(timecodes: Vec<FrameTimecode>, fps: f32, first_secs: f64, status: audio_core::LtcDecodeStatus) -> audio_core::LtcDetectionResult {
-    audio_core::LtcDetectionResult {
-        status,
-        detected_fps: fps,
-        drop_frame: false,
-        total_possible_frames: timecodes.len() as u32,
-        valid_frames: timecodes.len() as u32,
-        timecodes,
-        avg_confidence: 1.0,
-        details: vec![],
-        total_audio_duration_secs: 10.0,
-        sample_rate: 48000,
-        processing_time_ms: 0.0,
-        first_ltc_timecode_secs: first_secs,
-        quality: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use audio_core::{FrameTimecode, LtcDecodeStatus, Timecode};
     use super::*;
+
+    fn make_test_result(timecodes: Vec<FrameTimecode>, fps: f32, first_secs: f64, status: audio_core::LtcDecodeStatus) -> audio_core::LtcDetectionResult {
+        audio_core::LtcDetectionResult {
+            status,
+            detected_fps: fps,
+            drop_frame: false,
+            total_possible_frames: timecodes.len() as u32,
+            valid_frames: timecodes.len() as u32,
+            timecodes,
+            avg_confidence: 1.0,
+            details: vec![],
+            total_audio_duration_secs: 10.0,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            first_ltc_timecode_secs: first_secs,
+            quality: None,
+        }
+    }
 
     #[test]
     fn test_format_ffmpeg_timecode_non_drop() {

@@ -223,7 +223,7 @@ pub fn probe_stream_duration_secs(path: &Path, absolute_stream_index: usize) -> 
         .args([
             "-v", "quiet",
             "-print_format", "json",
-            "-show_entries", &format!("stream=duration:format=duration"),
+            "-show_entries", "stream=duration:format=duration",
             "-select_streams", &format!("{}", absolute_stream_index),
             &path.to_string_lossy(),
         ])

@@ -535,7 +535,6 @@ pub fn output_collision_warning(settings: &ConverterSettings) -> Option<String> 
 mod tests {
     use std::path::PathBuf;
     use crate::converter::test_fixtures::*;
-    use crate::converter::settings::RecordingType;
     use super::*;
 
     fn make_drop_settings(channels: usize, drop_ltc: bool, ltc_source: Option<(usize, usize)>, split: bool) -> ConverterSettings {

@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 use log::{info, warn};
 
-use crate::converter::progress::{CancelFlag, ConversionState, ConversionStatus, SharedConversionState};
+use crate::converter::progress::{CancelFlag, ConversionStatus, SharedConversionState};
 use crate::subprocess::no_window_command;
 use std::io::BufRead;
 
@@ -260,7 +260,7 @@ mod tests {
     fn test_classify_step_failure_no_output_zero_byte() {
         let dir = std::env::temp_dir();
         let p = dir.join("test_classify_zero.wav");
-        let _ = std::fs::write(&p, &[]);
+        let _ = std::fs::write(&p, []);
         let sf = classify_step_failure(false, &p, "1");
         assert!(matches!(sf, StepFailure::EncoderInit(_)));
         let _ = std::fs::remove_file(&p);

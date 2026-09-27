@@ -1,6 +1,4 @@
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
@@ -8,21 +6,19 @@ use gui_engine::command::{GuiCommand, ConverterCommand};
 use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, build_per_file_start_timecodes,
+    available_containers,
     conversion_sanity_check, conversion_sanity_check_metadata_only,
     conversion_sanity_check_pure, conversion_sanity_check_metadata_only_pure,
-    validate_conversion_paths,
-    evaluate_readiness, output_collision_warning,
+    evaluate_readiness,
     format_blockers,
-    preview_output_files, spawn_conversion, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
-    ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
-    ConverterSettings, FfmpegCapabilities, OutputKind, RecordingType, TimecodeMetadata,
+    preview_output_files, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
+    ChannelMap, ConversionPipeline, ConversionStatus,
+    ConverterSettings, FfmpegCapabilities, OutputKind, RecordingType,
 };
 use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::file_pattern::{group_display_key, MatchedGroup};
 use gui_engine::timecode::{self, FPS_OPTIONS};
-use gui_engine::LtcDecodeStatus;
 
 use crate::app::AppState;
 use crate::theme::ACCENT;
@@ -1612,12 +1608,12 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
             let tc_text = if is_video_group {
                 state.latest.ltc_group_results.first()
                     .and_then(|r| r.as_ref())
-                    .and_then(|r| start_timecode_from_ltc(r))
+                    .and_then(start_timecode_from_ltc)
                     .map(|m| gui_engine::converter::format_ffmpeg_timecode(&m.start, m.drop_frame))
                     .unwrap_or_default()
             } else {
                 state.latest.ltc_decode_result.as_ref()
-                    .and_then(|r| start_timecode_from_ltc(r))
+                    .and_then(start_timecode_from_ltc)
                     .map(|m| gui_engine::converter::format_ffmpeg_timecode(&m.start, m.drop_frame))
                     .unwrap_or_default()
             };

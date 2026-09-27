@@ -358,7 +358,7 @@ fn build_tmcd_trak(
     }
 
     // Timescale for tmcd = fps (so 1 unit = 1 frame)
-    let tmcd_timescale = fps_floor as u32;
+    let tmcd_timescale = fps_floor;
 
     // Duration in tmcd timescale = movie_duration frames
     let tmcd_duration = if movie_timescale > 0 {
@@ -653,7 +653,7 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, Stri
             // time_reference is at offset: 256+32+32+10+8 = 338 from chunk payload start
             let time_ref_offset = offset + 8 + 338;
             let sample_rate = read_wav_sample_rate_internal(&mut file)?;
-            let time_reference = crate::converter::time_reference_samples(meta, sample_rate as u32);
+            let time_reference = crate::converter::time_reference_samples(meta, sample_rate);
             let time_ref_bytes = time_reference.to_le_bytes(); // BWF is little-endian
             file.seek(SeekFrom::Start(time_ref_offset))
                 .map_err(|e| format!("seek to time_reference: {}", e))?;
@@ -682,7 +682,7 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, Stri
 
 fn read_wav_sample_rate_internal(file: &mut std::fs::File) -> Result<u32, String> {
     let mut fmt_data = [0u8; 6];
-    file.seek(SeekFrom::Current(0))
+    file.stream_position()
         .map_err(|e| format!("seek current: {}", e))?;
     // We need to find fmt chunk.  Simpler: read at offset 24 (WAV format's
     // fmt follows RIFF+WAVE header at fixed offset for standard RIFF layout).
@@ -1236,7 +1236,7 @@ mod tests {
 
         // Create a short test video with ffmpeg
         let status = no_window_command("ffmpeg")
-            .args(&[
+            .args([
                 "-f", "lavfi", "-i", "color=c=blue:s=128x72:r=25:d=1",
                 "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
                 "-c:v", "libx264", "-c:a", "aac",
@@ -1265,9 +1265,9 @@ mod tests {
 
         // Verify it's still playable
         let verify = no_window_command("ffmpeg")
-            .args(&["-v", "error", "-i"])
+            .args(["-v", "error", "-i"])
             .arg(&video)
-            .args(&["-f", "null", "-"])
+            .args(["-f", "null", "-"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -1295,7 +1295,7 @@ mod tests {
 
         // Create a WAV with ffmpeg
         let status = no_window_command("ffmpeg")
-            .args(&[
+            .args([
                 "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
                 "-c:a", "pcm_s16le",
                 "-y",
@@ -1340,8 +1340,7 @@ mod tests {
         // ffmpeg may fail but the file should be handled without panic
         let result = tag_file(&p, &test_meta());
         // Either an error (ffmpeg not available or fails) or success
-        if result.is_err() {
-            let err_msg = result.unwrap_err();
+        if let Err(err_msg) = result {
             assert!(
                 err_msg.contains("ffmpeg") || err_msg.contains("output too small") || err_msg.contains("cannot open"),
                 "unexpected error: {}",

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde;
 
@@ -8,7 +8,6 @@ use crate::naming::{self, NameTemplate};
 use crate::video_codecs;
 
 use super::capabilities::ResolvedHwDevice;
-use super::formats::extension_for_container;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ConversionPipeline {

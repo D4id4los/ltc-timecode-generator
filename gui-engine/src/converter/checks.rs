@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::converter::capabilities::FfmpegCapabilities;
-use crate::converter::formats::{container_supports_audio_encoder, container_to_ffmpeg_format, encoder_available_in_ffmpeg, format_available_in_ffmpeg};
+use crate::converter::formats::{container_supports_audio_encoder, encoder_available_in_ffmpeg, format_available_in_ffmpeg};
 use crate::naming;
 use crate::video_codecs;
 
@@ -14,7 +14,7 @@ pub fn conversion_sanity_check_pure(
     video_codec: &str,
     audio_encoder: &str,
     input_files: &[PathBuf],
-    output_folder: &Path,
+    _output_folder: &Path,
     filename_prefix: &str,
     caps: &FfmpegCapabilities,
     audio_suffix: Option<&str>,
@@ -170,7 +170,7 @@ pub fn conversion_sanity_check(
 /// Pure validation for metadata-only mode — no filesystem access.
 pub fn conversion_sanity_check_metadata_only_pure(
     input_files: &[PathBuf],
-    output_folder: &Path,
+    _output_folder: &Path,
     filename_prefix: &str,
     caps: &FfmpegCapabilities,
     audio_suffix: Option<&str>,

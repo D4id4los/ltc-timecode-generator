@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 
 use log::{info, warn};
@@ -8,8 +8,7 @@ use log::{info, warn};
 use crate::converter::args::{
     build_audio_to_audio_args, build_audio_to_synthetic_video_args,
     build_concat_audio_args, build_split_track_args, build_video_track_extract_args,
-    build_video_to_video_args, push_input_with_trim, push_output_trailer,
-    push_audio_timecode_args,
+    build_video_to_video_args,
 };
 use crate::converter::capabilities::{HwDeviceContext, ResolvedHwDevice};
 use crate::converter::formats::{
@@ -23,24 +22,20 @@ use crate::converter::process::{
 };
 use crate::converter::progress::{CancelFlag, ConversionStatus, SharedConversionState};
 use crate::converter::settings::{ConversionPipeline, ConverterSettings, RecordingType};
-use crate::converter::timecode::{read_wav_sample_rate, shift_timecode_back, TimecodeMetadata};
 use crate::ffprobe::VideoAudioProbe;
 use crate::naming;
 use crate::video_codecs;
 
-pub enum EncoderFallback {
-    Active {
-        chain: Vec<String>,
-        failed: BTreeSet<String>,
-        resolved: Option<String>,
-        hw_ctx: HwDeviceContext,
-    },
-    Inactive,
+pub struct EncoderFallback {
+    chain: Vec<String>,
+    failed: BTreeSet<String>,
+    resolved: Option<String>,
+    hw_ctx: HwDeviceContext,
 }
 
 impl EncoderFallback {
     pub fn new_with_hw(chain: Vec<String>, hw_ctx: HwDeviceContext) -> Self {
-        EncoderFallback::Active {
+        EncoderFallback {
             chain,
             failed: BTreeSet::new(),
             resolved: None,
@@ -49,38 +44,26 @@ impl EncoderFallback {
     }
 
     fn remaining(&self) -> Vec<String> {
-        match self {
-            EncoderFallback::Active { chain, failed, resolved, .. } => {
-                if let Some(resolved) = resolved {
-                    return vec![resolved.clone()];
-                }
-                chain
-                    .iter()
-                    .filter(|e| !failed.contains(*e))
-                    .cloned()
-                    .collect()
-            }
-            EncoderFallback::Inactive => Vec::new(),
+        if let Some(ref resolved) = self.resolved {
+            return vec![resolved.clone()];
         }
+        self.chain
+            .iter()
+            .filter(|e| !self.failed.contains(*e))
+            .cloned()
+            .collect()
     }
 
     fn note_success(&mut self, encoder: &str) {
-        if let EncoderFallback::Active { resolved, .. } = self {
-            *resolved = Some(encoder.to_string());
-        }
+        self.resolved = Some(encoder.to_string());
     }
 
     fn note_failure(&mut self, encoder: &str) {
-        if let EncoderFallback::Active { failed, .. } = self {
-            failed.insert(encoder.to_string());
-        }
+        self.failed.insert(encoder.to_string());
     }
 
     pub fn resolved(&self) -> Option<&str> {
-        match self {
-            EncoderFallback::Active { resolved, .. } => resolved.as_deref(),
-            EncoderFallback::Inactive => None,
-        }
+        self.resolved.as_deref()
     }
 }
 
@@ -126,10 +109,7 @@ fn run_video_step_with_fallback(
         }
         settings.resolved_video_encoder = encoder.clone();
 
-        let hw_ctx = match fallback {
-            EncoderFallback::Active { hw_ctx, .. } => hw_ctx,
-            EncoderFallback::Inactive => return false,
-        };
+        let hw_ctx = &fallback.hw_ctx;
         settings.resolved_hw_device = resolve_device_for_candidate(&encoder, hw_ctx);
 
         if video_codecs::hw_frames_for(&encoder).is_some() && settings.resolved_hw_device.is_none() {
@@ -182,11 +162,7 @@ fn run_video_step_with_fallback(
     let msg = format!(
         "all encoder candidates for codec '{}' failed to initialize ({})",
         video_codecs::normalize_video_codec(&settings.video_encoder),
-        match fallback {
-            EncoderFallback::Active { failed, .. } =>
-                failed.iter().cloned().collect::<Vec<_>>().join(", "),
-            EncoderFallback::Inactive => String::new(),
-        }
+        fallback.failed.iter().cloned().collect::<Vec<_>>().join(", ")
     );
     warn!("{}", msg);
     overall_log.push_str(&format!("\n\n--- {} ---", msg));
@@ -235,61 +211,6 @@ fn prepare_copy_mode(settings: &mut ConverterSettings) {
                 &meta.start, delta, meta.fps, meta.drop_frame,
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-    use crate::converter::test_fixtures::*;
-    use super::*;
-
-    #[test]
-    fn test_encoder_fallback_remaining_skips_failed() {
-        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
-        let mut fb = EncoderFallback::new_with_hw(
-            vec!["enc_a".into(), "enc_b".into(), "enc_c".into()],
-            hw,
-        );
-        fb.note_failure("enc_a");
-        let remaining = fb.remaining();
-        assert_eq!(remaining, vec!["enc_b".to_string(), "enc_c".to_string()]);
-    }
-
-    #[test]
-    fn test_encoder_fallback_pins_resolved_encoder() {
-        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
-        let mut fb = EncoderFallback::new_with_hw(
-            vec!["enc_a".into(), "enc_b".into()],
-            hw,
-        );
-        fb.note_success("enc_a");
-        assert_eq!(fb.resolved(), Some("enc_a"));
-        assert_eq!(fb.remaining(), vec!["enc_a".to_string()]);
-    }
-
-    #[test]
-    fn test_encoder_fallback_exhausted_chain() {
-        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
-        let mut fb = EncoderFallback::new_with_hw(
-            vec!["enc_a".into()],
-            hw,
-        );
-        fb.note_failure("enc_a");
-        assert!(fb.remaining().is_empty());
-    }
-
-    #[test]
-    fn test_resolve_device_for_candidate_software_encoder() {
-        let ctx = HwDeviceContext { vaapi_device: None, vulkan_available: false };
-        assert!(resolve_device_for_candidate("libx264", &ctx).is_none());
-        assert!(resolve_device_for_candidate("pcm_s24le", &ctx).is_none());
-    }
-
-    #[test]
-    fn test_effective_video_encoder_prefers_resolved() {
-        let s = make_video_settings();
-        assert!(!s.effective_video_encoder().is_empty());
     }
 }
 
@@ -924,5 +845,59 @@ fn run_metadata_only(
                 input_path.display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::converter::test_fixtures::*;
+    use super::*;
+
+    #[test]
+    fn test_encoder_fallback_remaining_skips_failed() {
+        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
+        let mut fb = EncoderFallback::new_with_hw(
+            vec!["enc_a".into(), "enc_b".into(), "enc_c".into()],
+            hw,
+        );
+        fb.note_failure("enc_a");
+        let remaining = fb.remaining();
+        assert_eq!(remaining, vec!["enc_b".to_string(), "enc_c".to_string()]);
+    }
+
+    #[test]
+    fn test_encoder_fallback_pins_resolved_encoder() {
+        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
+        let mut fb = EncoderFallback::new_with_hw(
+            vec!["enc_a".into(), "enc_b".into()],
+            hw,
+        );
+        fb.note_success("enc_a");
+        assert_eq!(fb.resolved(), Some("enc_a"));
+        assert_eq!(fb.remaining(), vec!["enc_a".to_string()]);
+    }
+
+    #[test]
+    fn test_encoder_fallback_exhausted_chain() {
+        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
+        let mut fb = EncoderFallback::new_with_hw(
+            vec!["enc_a".into()],
+            hw,
+        );
+        fb.note_failure("enc_a");
+        assert!(fb.remaining().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_device_for_candidate_software_encoder() {
+        let ctx = HwDeviceContext { vaapi_device: None, vulkan_available: false };
+        assert!(resolve_device_for_candidate("libx264", &ctx).is_none());
+        assert!(resolve_device_for_candidate("pcm_s24le", &ctx).is_none());
+    }
+
+    #[test]
+    fn test_effective_video_encoder_prefers_resolved() {
+        let s = make_video_settings();
+        assert!(!s.effective_video_encoder().is_empty());
     }
 }

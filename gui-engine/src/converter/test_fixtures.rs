@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::converter::{
     ChannelMap, ConversionPipeline, ConverterSettings, HwDeviceCapabilities,
@@ -128,35 +128,8 @@ pub fn make_mono_probe() -> VideoAudioProbe {
     }
 }
 
-pub fn make_multi_stream_probe() -> VideoAudioProbe {
-    VideoAudioProbe {
-        streams: vec![
-            AudioStreamInfo {
-                stream_index: 1,
-                channels: 2,
-                codec_name: "aac".to_string(),
-                sample_rate: 48000,
-            },
-            AudioStreamInfo {
-                stream_index: 2,
-                channels: 1,
-                codec_name: "pcm_s16le".to_string(),
-                sample_rate: 48000,
-            },
-        ],
-        total_audio_channels: 3,
-        is_video_file: true,
-    }
-}
-
 pub fn make_copy_settings() -> ConverterSettings {
     let mut s = make_video_settings();
     s.copy_video = true;
     s
-}
-
-pub fn codec_after_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
 }

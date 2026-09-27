@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use crate::converter::capabilities::ResolvedHwDevice;
-use crate::converter::formats::{audio_encoder_to_output_format, container_to_ffmpeg_format};
+use crate::converter::formats::{container_to_ffmpeg_format};
 use crate::converter::planning::{AudioKeep, VideoOutputStep};
 use crate::converter::settings::ConverterSettings;
 use crate::converter::timecode::{format_ffmpeg_timecode, time_reference_samples, TimecodeMetadata};

@@ -133,8 +133,6 @@ pub fn engine_main_with_probe<F>(
     // Conversion lifecycle state (engine-owned, shared with conversion thread)
     let mut conv_state_shared: SharedConversionState = Arc::new(Mutex::new(ConversionState::idle()));
     let mut conv_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let mut conv_handle: Option<std::thread::JoinHandle<()>> = None;
-
     loop {
         let now = Instant::now();
         let dt = (now - last_tick).as_secs_f32();
@@ -414,7 +412,7 @@ pub fn engine_main_with_probe<F>(
                         // Create fresh shared state and cancel flag for this conversion
                         let fresh_state: SharedConversionState = Arc::new(Mutex::new(ConversionState::idle()));
                         let fresh_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-                        let handle = spawn_conversion(
+                        let _ = spawn_conversion(
                             settings,
                             fresh_state.clone(),
                             fresh_cancel.clone(),
@@ -422,7 +420,6 @@ pub fn engine_main_with_probe<F>(
                         );
                         conv_state_shared = fresh_state;
                         conv_cancel = fresh_cancel;
-                        conv_handle = Some(handle);
                         // Immediately reflect running state in snapshot
                         current.converter.conversion_state = ConversionState {
                             status: ConversionStatus::Running { progress: 0.0 },
@@ -734,9 +731,7 @@ pub fn engine_main_with_probe<F>(
                             }
                         }
                         // New offload output → set last_offload_parent for converter auto-switch.
-                        let target = parent.and_then(|p| {
-                            Some(p.join(&current.offload.parent_name))
-                        });
+                        let target = parent.map(|p| p.join(&current.offload.parent_name));
                         current.offload.last_offload_parent = target;
                         current.offload.last_offload_version =
                             current.offload.last_offload_version.wrapping_add(1);
@@ -2119,7 +2114,7 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
         } else if !state.ltc_group_results.is_empty() {
             // Group decode — one per clip
             state.ltc_group_results.iter()
-                .map(|r| r.as_ref().and_then(|res| crate::converter::start_timecode_from_ltc(res)))
+                .map(|r| r.as_ref().and_then(crate::converter::start_timecode_from_ltc))
                 .collect()
         } else {
             vec![None; group.files.len()]
@@ -2237,6 +2232,32 @@ mod tests {
         assert_eq!(state.start_timecode.minutes, 30);
         assert_eq!(state.start_timecode.seconds, 15);
         assert_eq!(state.start_timecode.frames, 10);
+    }
+
+    // ── auto_apply_ltc_to_settings ───────────────────────────────────────
+
+    #[test]
+    fn auto_apply_ltc_sets_converter_flags() {
+        let mut state = setup_state();
+        state.converter.settings.split_tracks = false;
+        state.converter.settings.drop_ltc_track = false;
+        state.converter.settings.set_start_from_ltc = false;
+        auto_apply_ltc_to_settings(&mut state);
+        assert!(state.converter.settings.split_tracks);
+        assert!(state.converter.settings.drop_ltc_track);
+        assert!(state.converter.settings.set_start_from_ltc);
+    }
+
+    #[test]
+    fn auto_apply_group_ltc_sets_converter_flags() {
+        let mut state = setup_state();
+        state.converter.settings.split_tracks = false;
+        state.converter.settings.drop_ltc_track = false;
+        state.converter.settings.set_start_from_ltc = false;
+        auto_apply_group_ltc_to_settings(&mut state);
+        assert!(state.converter.settings.split_tracks);
+        assert!(state.converter.settings.drop_ltc_track);
+        assert!(state.converter.settings.set_start_from_ltc);
     }
 
     // ── stepper_minute ────────────────────────────────────────────────────

@@ -312,12 +312,12 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
         let in_media = mp.starts_with("/media")
             || mp.starts_with("/run/media")
             || mp.starts_with("/mnt");
-        if !in_media && !mp.starts_with(&format!("/media/{}", user)) {
+        if !in_media && !mp.starts_with(format!("/media/{}", user)) {
             continue;
         }
         // Check removable flag via /sys.
         let is_removable = is_block_removable(device, sys_root);
-        if !is_removable && !mp.starts_with(&format!("/run/media/{}", user)) {
+        if !is_removable && !mp.starts_with(format!("/run/media/{}", user)) {
             // /run/media/$USER mounts are usually removable.
             continue;
         }
@@ -421,7 +421,7 @@ fn collect_media_files_shallow(root: &Path) -> (Vec<PathBuf>, u64) {
             if ft.is_dir() && depth < CARD_SCAN_DEPTH {
                 stack.push(entry.path());
             } else if ft.is_file() && is_media_file(&entry.path()) {
-                if let Ok(meta) = fs::metadata(&entry.path()) {
+                if let Ok(meta) = fs::metadata(entry.path()) {
                     total_bytes += meta.len();
                 }
                 files.push(entry.path());
@@ -1045,8 +1045,8 @@ mod tests {
         let plans = plan_copies_for_card(card.path(), "A6700", dest.path());
 
         assert_eq!(plans.len(), 2);
-        assert!(plans[0].dst.starts_with(&dest.path().join("A6700")));
-        assert!(plans[1].dst.starts_with(&dest.path().join("A6700")));
+        assert!(plans[0].dst.starts_with(dest.path().join("A6700")));
+        assert!(plans[1].dst.starts_with(dest.path().join("A6700")));
         assert_eq!(
             plans[0].dst.file_name().unwrap(),
             "C0001.MP4"
@@ -1238,7 +1238,7 @@ mod tests {
 
         let plans = plan_copies_for_card(card.path(), "A6100", dest.path());
         let device_names = vec!["A6100".to_string()];
-        let ctx = OffloadContext::new(&device_names, &[plans.clone()]);
+        let ctx = OffloadContext::new(&device_names, std::slice::from_ref(&plans));
 
         let completed = run_offload(&[plans], &device_names, &ctx);
 
@@ -1261,7 +1261,7 @@ mod tests {
 
         let plans = plan_copies_for_card(card.path(), "A6100", dest.path());
         let device_names = vec!["A6100".to_string()];
-        let ctx = OffloadContext::new(&device_names, &[plans.clone()]);
+        let ctx = OffloadContext::new(&device_names, std::slice::from_ref(&plans));
 
         let completed = run_offload(&[plans], &device_names, &ctx);
         assert_eq!(completed.len(), 1, "should succeed even with pre-existing file");
@@ -1279,7 +1279,7 @@ mod tests {
 
         let plans = plan_copies_for_card(card.path(), "Cam", dest.path());
         let device_names = vec!["Cam".to_string()];
-        let ctx = OffloadContext::new(&device_names, &[plans.clone()]);
+        let ctx = OffloadContext::new(&device_names, std::slice::from_ref(&plans));
         ctx.cancel.store(true, Ordering::Relaxed); // cancel immediately
 
         let completed = run_offload(&[plans], &device_names, &ctx);

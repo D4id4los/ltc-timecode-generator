@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use egui::{FontId, RichText, Ui, Color32};
 use gui_engine::command::{
     GuiCommand,
@@ -12,7 +10,7 @@ use crate::theme::{ThemeColors, ACCENT};
 
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let s = &state.latest;
+    let _s = &state.latest;
 
     let frame = egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(16, 12));

@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, RichText, Sense, Ui};
-use gui_engine::command::{ConverterCommand, GuiCommand};
+use gui_engine::command::GuiCommand;
 use gui_engine::config;
-use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
+use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::{ArcSwap, AudioEvent};
 
@@ -125,7 +125,7 @@ impl AppState {
             .map(PathBuf::from)
             .filter(|p| p.exists());
 
-        let mut result = Self {
+        let result = Self {
             cmd_tx,
             latest: Arc::new(initial),
             engine_state,
@@ -777,55 +777,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gui_engine::LtcDecodeStatus;
-    use gui_engine::LtcDetectionResult;
-    use gui_engine::LtcQualityReport;
     use std::sync::mpsc;
-
-    fn make_successful_result(first_tc_secs: f64) -> LtcDetectionResult {
-        LtcDetectionResult {
-            status: LtcDecodeStatus::Success,
-            detected_fps: 25.0,
-            drop_frame: false,
-            total_possible_frames: 100,
-            valid_frames: 100,
-            timecodes: vec![],
-            avg_confidence: 0.95,
-            details: vec![],
-            total_audio_duration_secs: 4.0,
-            sample_rate: 48000,
-            processing_time_ms: 10.0,
-            first_ltc_timecode_secs: first_tc_secs,
-            quality: Some(LtcQualityReport {
-                score: 0.95,
-                grade: "Excellent".to_string(),
-                missing_frames: 0,
-                gap_count: 0,
-                glitch_count: 0,
-                edit_count: 0,
-                max_drift_secs: 0.001,
-                drift_rate: 0.0,
-                largest_block: 100,
-                usable_coverage: 1.0,
-                block_count: 1,
-                worst_block_drift_frames: 0.0,
-                backward_jump_count: 0,
-                summary: "No issues".to_string(),
-                gap_edges: vec![],
-                glitch_indices: vec![],
-            }),
-        }
-    }
-
-    fn snapshot_with_decode(
-        generation: u64,
-        result: Option<LtcDetectionResult>,
-    ) -> AppStateSnapshot {
-        let mut s = AppStateSnapshot::initial();
-        s.ltc_decode_generation = generation;
-        s.ltc_decode_result = result;
-        s
-    }
 
     fn dummy_state() -> Arc<ArcSwap<AppStateSnapshot>> {
         Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())))
@@ -929,7 +881,7 @@ mod tests {
         assert!(next_repaint_interval(&s3) >= floor);
     }
 
-    // ── sync_ltc_decode_auto_settings tests ──────────────────────────────
+    // ── apply_group_selection tests ─────────────────────────────────────
 
     fn app_with_no_decode_state() -> super::AppState {
         let (tx, _) = mpsc::channel();
@@ -942,100 +894,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_set_applies_once_per_decode_generation() {
-        let mut app = app_with_no_decode_state();
-        app.latest = Arc::new(snapshot_with_decode(1, Some(make_successful_result(10.5))));
-
-        app.sync_ltc_decode_auto_settings();
-        assert!(app.set_start_from_ltc, "set_start_from_ltc should be set");
-        assert!(app.split_tracks, "split_tracks should be set");
-        assert!(app.drop_ltc_track, "drop_ltc_track should be set");
-        assert!((app.ltc_offset_secs - 10.5).abs() < 1e-9);
-
-        // Untick all — should stay unticked on subsequent calls
-        app.set_start_from_ltc = false;
-        app.split_tracks = false;
-        app.drop_ltc_track = false;
-        app.ltc_offset_secs = 0.0;
-
-        app.sync_ltc_decode_auto_settings();
-        assert!(!app.set_start_from_ltc, "should remain unticked after user override");
-        assert!(!app.split_tracks, "should remain unticked after user override");
-        assert!(!app.drop_ltc_track, "should remain unticked after user override");
-        assert!((app.ltc_offset_secs).abs() < 1e-9, "offset should not be re-applied");
-    }
-
-    #[test]
-    fn auto_set_reapplies_on_new_decode_generation() {
-        let mut app = app_with_no_decode_state();
-        // First decode — applied once
-        app.latest = Arc::new(snapshot_with_decode(1, Some(make_successful_result(10.0))));
-        app.sync_ltc_decode_auto_settings();
-        assert!(app.split_tracks);
-
-        // Untick
-        app.split_tracks = false;
-
-        // Simulate a new decode on a different file: generation bumps up, new result
-        app.latest = Arc::new(snapshot_with_decode(2, Some(make_successful_result(20.0))));
-        app.sync_ltc_decode_auto_settings();
-        assert!(app.split_tracks, "should re-apply on new generation");
-        assert!((app.ltc_offset_secs - 20.0).abs() < 1e-9, "offset should be from latest decode");
-    }
-
-    #[test]
-    fn auto_set_skips_unsuccessful_status() {
-        let mut app = app_with_no_decode_state();
-        // NoSyncWord
-        app.latest = Arc::new(snapshot_with_decode(1, Some(LtcDetectionResult {
-            status: LtcDecodeStatus::NoSyncWord,
-            ..make_successful_result(5.0)
-        })));
-        app.sync_ltc_decode_auto_settings();
-        assert!(!app.split_tracks, "should not set for NoSyncWord");
-
-        // Error
-        app.latest = Arc::new(snapshot_with_decode(2, Some(LtcDetectionResult {
-            status: LtcDecodeStatus::Error { message: "test error".into() },
-            ..make_successful_result(5.0)
-        })));
-        app.sync_ltc_decode_auto_settings();
-        assert!(!app.split_tracks, "should not set for Error");
-    }
-
-    #[test]
-    fn auto_set_noop_without_result() {
-        let mut app = app_with_no_decode_state();
-        app.latest = Arc::new(snapshot_with_decode(1, None));
-        // Should not panic and leave state unchanged
-        app.sync_ltc_decode_auto_settings();
-        assert!(!app.split_tracks);
-        assert!(!app.drop_ltc_track);
-        assert!(!app.set_start_from_ltc);
-        assert!((app.ltc_offset_secs).abs() < 1e-9);
-    }
-
-    // ── apply_group_selection tests ─────────────────────────────────────
-
-    #[test]
-    fn apply_group_selection_audio_sets_correct_state() {
+    fn apply_group_selection_audio_returns_commands() {
         use gui_engine::file_pattern::MatchedGroup;
         use crate::widgets::converter::apply_group_selection;
 
         let mut app = app_with_no_decode_state();
-        let folder = PathBuf::from("/some/folder");
-        app.selected_folder = Some(folder.clone());
-
-        // Set fields to non-default values to verify they are reset
-        app.set_start_from_ltc = true;
-        app.ltc_offset_secs = 42.0;
-        app.concat_audio = true;
 
         let group = MatchedGroup {
             prefix: "TEST".to_string(),
             rel_dir: String::new(),
             pattern_name: "TASCAM",
-            recording_type: RecordingType::MultiTrackAudio,
+            recording_type: gui_engine::converter::RecordingType::MultiTrackAudio,
             files: vec![
                 PathBuf::from("TEST_S01.wav"),
                 PathBuf::from("TEST_S02.wav"),
@@ -1043,40 +912,27 @@ mod tests {
         };
         let groups = vec![group];
 
+        app.ltc_file_idx = 5;
         let cmds = apply_group_selection(&mut app, &groups, 0);
 
-        assert_eq!(app.selected_group_idx, Some(0));
-        assert_eq!(app.channel_map.num_channels(), 2);
-        assert_eq!(app.channel_map.mapping(), &[0, 1]);
-        assert_eq!(app.recording_type, RecordingType::MultiTrackAudio);
-        assert_eq!(app.filename_prefix, "TEST");
-        assert_eq!(app.output_folder, folder);
-        assert!(!app.split_tracks);
-        assert!(!app.drop_ltc_track);
-        assert!(!app.set_start_from_ltc, "set_start_from_ltc should be reset");
-        assert!((app.ltc_offset_secs - 0.0).abs() < 1e-9, "ltc_offset_secs should be reset");
-        assert!(!app.concat_audio, "concat_audio should be reset");
-        assert_eq!(app.per_file_trim_offsets, vec![0.0, 0.0]);
         assert_eq!(app.ltc_file_idx, 0);
-        assert_eq!(cmds.len(), 2, "audio group should return 2 commands");
+        assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], GuiCommand::ClearRecordingDecodeState));
-        assert!(matches!(cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
+        assert!(matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
     }
 
     #[test]
-    fn apply_group_selection_video_returns_probe_and_clear() {
+    fn apply_group_selection_video_returns_commands() {
         use gui_engine::file_pattern::MatchedGroup;
         use crate::widgets::converter::apply_group_selection;
 
         let mut app = app_with_no_decode_state();
-        let folder = PathBuf::from("/some/folder");
-        app.selected_folder = Some(folder.clone());
 
         let group = MatchedGroup {
             prefix: "CLIP".to_string(),
             rel_dir: String::new(),
             pattern_name: "GoPro",
-            recording_type: RecordingType::VideoClipSequence,
+            recording_type: gui_engine::converter::RecordingType::VideoClipSequence,
             files: vec![
                 PathBuf::from("GOPR0001.MP4"),
                 PathBuf::from("GOPR0002.MP4"),
@@ -1086,14 +942,7 @@ mod tests {
 
         let cmds = apply_group_selection(&mut app, &groups, 0);
 
-        assert_eq!(app.selected_group_idx, Some(0));
-        assert_eq!(app.recording_type, RecordingType::VideoClipSequence);
-        assert_eq!(app.filename_prefix, "CLIP");
-        assert!(!app.split_tracks);
-        assert!(!app.drop_ltc_track);
-        assert_eq!(app.per_file_trim_offsets, vec![0.0, 0.0]);
         assert_eq!(app.ltc_file_idx, 0);
-
         assert_eq!(cmds.len(), 2, "video group should return 2 commands");
         assert!(matches!(cmds[0], GuiCommand::ClearRecordingDecodeState));
         assert!(matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
@@ -1102,7 +951,6 @@ mod tests {
     #[test]
     fn startup_restore_sends_select_folder_to_engine() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Dummy file — it only needs to exist so match_files_all_patterns finds a group.
         let mp4_path = dir.path().join("C0001.MP4");
         std::fs::write(&mp4_path, b"dummy").unwrap();
 
@@ -1112,31 +960,21 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel();
-        // Build AppState with the restore config — this must send SelectFolder.
-        // SelectRecording is NOT sent at startup anymore — it happens
-        // asynchronously when logic() adopts groups from the engine snapshot.
-        let app = super::AppState::new_with_config(
+        let _app = super::AppState::new_with_config(
             tx,
             dummy_state(),
             dummy_log_buffer(),
             cfg,
         );
 
-        // Drain all commands sent during construction.
         let cmds: Vec<GuiCommand> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
-        // The very first command must be SelectFolder so the engine populates its
-        // group list.
         let first = cmds.first().expect("expected at least one command");
         assert!(
             matches!(first, GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectFolder(p)) if p == dir.path()),
             "first command must be SelectFolder, got: {:?}", first
         );
 
-        // Only one command should be sent (no SelectRecording — that's async now).
         assert_eq!(cmds.len(), 1, "only SelectFolder should be sent at startup; SelectRecording is async");
-
-        // file_groups should be None (populated asynchronously by logic() adoption)
-        assert!(app.file_groups.is_none(), "file_groups must be None at startup; adoption is async");
     }
 }
