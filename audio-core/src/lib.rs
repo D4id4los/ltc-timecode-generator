@@ -527,13 +527,12 @@ let cancel_flag = progress.cancel_flag.clone();
         LtcDecodeStatus::NoSyncWord
     };
 
-    let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
-
     merged_details.push(format!(
         "Chunked decode: {} chunks, {} valid / {} possible after merge",
         num_chunks, valid_frames, true_total_possible,
     ));
 
+    let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
     let mut result = LtcDetectionResult {
         status,
         detected_fps: fps as f32,
@@ -552,6 +551,8 @@ let cancel_flag = progress.cancel_flag.clone();
 
     apply_coherent_first_timecode(&mut result);
     result.quality = compute_ltc_quality(&result);
+    let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
+    result.processing_time_ms = processing_time_ms;
 
     info!("decode_ltc_chunked complete: {} valid / {} possible ({:.1}%) in {:.1}ms",
         result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0, processing_time_ms);
@@ -1556,6 +1557,8 @@ mod tests {
             "direct decode got {} valid, chunked got {} valid (both should match)",
             direct.valid_frames, chunked.valid_frames);
         assert_eq!(direct.status, chunked.status);
+        assert!(chunked.processing_time_ms > 0.0,
+            "chunked decode processing_time should be positive, got {}", chunked.processing_time_ms);
     }
 
     #[test]
@@ -1579,6 +1582,8 @@ mod tests {
             "expected Success, got {:?} (valid={})", result.status, result.valid_frames);
         assert!(result.valid_frames >= 40,
             "should decode at least 40 frames, got {}", result.valid_frames);
+        assert!(result.processing_time_ms > 0.0,
+            "processing_time should be positive, got {}", result.processing_time_ms);
     }
 
     #[test]

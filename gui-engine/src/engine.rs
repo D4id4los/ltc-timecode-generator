@@ -752,6 +752,7 @@ fn decode_one_video_clip(
 ) -> Result<LtcDetectionResult, String> {
     static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pipeline_start = Instant::now();
 
     let tmp_dir = std::env::temp_dir();
     let tmp_wav = tmp_dir.join(format!(
@@ -850,6 +851,12 @@ fn decode_one_video_clip(
         }
         Err(e) => Err(format!("Failed to open extracted WAV: {}", e)),
     };
+
+    // Stamp total pipeline time (extraction + decode) onto the result
+    let result = result.map(|mut r| {
+        r.processing_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
+        r
+    });
 
     let _ = std::fs::remove_file(&tmp_wav);
     result

@@ -716,6 +716,8 @@ pub enum CliOutcome {
 }
 
 fn run_decode_video(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let pipeline_start = Instant::now();
+
     let path = cli.decode.as_ref().ok_or("--decode path required")?;
     let path = Path::new(path);
 
@@ -788,9 +790,10 @@ fn run_decode_video(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Audio extraction failed: {}", e))?;
     eprintln!(" done.");
 
-    let result = run_decode_on_wav(
+    let mut result = run_decode_on_wav(
         &tmp_wav, use_libltc, cli.single_pass, cli.decode_fps, cli.decode_drop_frame,
     )?;
+    result.processing_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
     print_decode_results(
         path, &result, use_libltc, cli.verbose, cli.context_frames, cli.list_timecodes,
     );
