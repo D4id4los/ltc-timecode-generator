@@ -1,19 +1,91 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::converter::{ConversionState, FfmpegCapabilities, RecordingType};
+use crate::converter::{
+    ConversionState, FfmpegCapabilities, RecordingType, ChannelMap, ConvertBlocker, PreviewOutput,
+};
 use crate::ffprobe::VideoAudioProbe;
 use crate::file_pattern::MatchedGroup;
+use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX};
 use crate::offload::OffloadSnapshot;
 use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
 
+// ── Converter user settings (single source of truth) ─────────────────
+
+/// All user-configurable converter options — engine-owned single source
+/// of truth.  GUIs mutate by sending `ConverterCommand` variants; the
+/// engine applies side-effects (defaults repair, readiness recompute,
+/// config persistence) in the command handler.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConverterUserSettings {
+    /// Pattern filter for folder scanning: `None` = auto (all patterns,
+    /// used by egui), `Some(0)` = TASCAM, `Some(1)` = any/video (Slint).
+    pub naming_pattern: Option<usize>,
+    /// "Metadata only — tag + rename, extract audio" mode.
+    pub metadata_only: bool,
+    /// Audio-only pipeline: generate a synthetic black+silence video.
+    pub generate_synthetic_video: bool,
+    /// "Leave video encoding untouched" (stream copy).
+    pub copy_video: bool,
+    /// Split tracks into separate files.
+    pub split_tracks: bool,
+    /// Drop the LTC track from output.
+    pub drop_ltc_track: bool,
+    /// Concatenate audio tracks across clips (video groups only).
+    pub concat_audio: bool,
+    /// Embed start timecode metadata from LTC decode results.
+    pub set_start_from_ltc: bool,
+    /// Trim each file to its first LTC frame.
+    pub trim_enabled: bool,
+    /// Index of the file/channel carrying LTC (audio groups).
+    pub ltc_file_idx: usize,
+    /// Input→output channel permutation matrix.
+    pub channel_map: ChannelMap,
+    /// Output container id, e.g. `"mov"`, `"mkv"`, `"mp4"`.
+    pub container: String,
+    /// Video codec id, e.g. `"h265"`, `"av1"`, `"h264"`.
+    pub video_encoder: String,
+    /// Audio encoder id, e.g. `"pcm_s24le"`, `"aac"`.
+    pub audio_encoder: String,
+    /// Output folder for converted files.
+    pub output_folder: PathBuf,
+    /// Filename prefix for output files.
+    pub filename_prefix: String,
+    /// Naming template for audio output files (e.g. `_audio_track{track:01d}`).
+    pub audio_suffix_template: String,
+    /// Naming template for video output files (e.g. `_video_clip{clip:01d}`).
+    pub video_suffix_template: String,
+}
+
+impl ConverterUserSettings {
+    pub fn initial() -> Self {
+        Self {
+            naming_pattern: None,
+            metadata_only: false,
+            generate_synthetic_video: false,
+            copy_video: false,
+            split_tracks: false,
+            drop_ltc_track: false,
+            concat_audio: false,
+            set_start_from_ltc: false,
+            trim_enabled: true,
+            ltc_file_idx: 0,
+            channel_map: ChannelMap::identity(0),
+            container: "mov".to_string(),
+            video_encoder: "h265".to_string(),
+            audio_encoder: "pcm_s24le".to_string(),
+            output_folder: PathBuf::new(),
+            filename_prefix: String::new(),
+            audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
+            video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
+        }
+    }
+}
+
 // ── Converter snapshot (engine-owned) ─────────────────────────────────
 
-/// Engine-managed converter state: group list, per-clip probes, and
-/// conversion status.  The individual settings fields (prefix, suffixes,
-/// container, codecs, …) remain GUI-local because they are light strings
-/// with no stale-state risk — only probes, conversion, and groups need
-/// engine ownership.
+/// Engine-managed converter state: groups, probes, conversion status,
+/// user settings (single source of truth), and derived UI data.
 #[derive(Clone, Debug)]
 pub struct ConverterSnapshot {
     /// File groups discovered in the current converter folder.
@@ -35,12 +107,22 @@ pub struct ConverterSnapshot {
     /// True while a folder scan is in progress (background thread walking
     /// the filesystem to discover file groups).
     pub groups_loading: bool,
-    /// The folder being (or last) scanned.  GUIs compare against their
-    /// own `selected_folder` to know when a scan result is for them.
+    /// The folder being (or last) scanned.
     pub groups_folder: Option<PathBuf>,
     /// Generation counter — incremented on each `SelectFolder` so stale
     /// scan results from rapid re-clicks are discarded.
     pub groups_generation: u64,
+    /// Engine-owned user settings — sole source of truth.
+    pub settings: ConverterUserSettings,
+    /// Readiness blockers — recomputed by the engine on settings/groups/
+    /// caps changes.  Empty list means conversion is ready.
+    pub readiness: Vec<ConvertBlocker>,
+    /// Warning when an output file collides with an input file.
+    pub collision_warning: Option<String>,
+    /// Preview of output files — recomputed by the engine on changes.
+    pub output_preview: Vec<PreviewOutput>,
+    /// Human-readable description of the resolved encoder chain.
+    pub encoder_chain_desc: String,
 }
 
 impl ConverterSnapshot {
@@ -267,6 +349,11 @@ impl AppStateSnapshot {
                 groups_loading: false,
                 groups_folder: None,
                 groups_generation: 0,
+                settings: ConverterUserSettings::initial(),
+                readiness: Vec::new(),
+                collision_warning: None,
+                output_preview: Vec::new(),
+                encoder_chain_desc: String::new(),
             },
             offload: OffloadSnapshot::initial(),
         }

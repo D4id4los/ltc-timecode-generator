@@ -1,16 +1,12 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, RichText, Sense, Ui};
-use gui_engine::command::GuiCommand;
+use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::config;
-use gui_engine::converter::{ChannelMap, ConversionState, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX};
-use gui_engine::file_pattern::MatchedGroup;
-use gui_engine::state::AppStateSnapshot;
+use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::{ArcSwap, AudioEvent};
 
@@ -84,38 +80,18 @@ pub struct AppState {
     // ── LTC detection state (GUI-local) ──────────────────────────────
     pub ltc_file_idx: usize,
 
-    // ── Converter state (GUI-local) ──────────────────────────────────
-    pub _selected_pattern: usize,
+    // ── Converter folder (GUI-local display) ──────────────────────────
+    /// Last known converter selected folder — used to detect engine scan
+    /// result arrival and for offload auto-switch.
     pub selected_folder: Option<PathBuf>,
-    pub selected_files: Option<Vec<PathBuf>>,
-    pub file_groups: Option<Vec<MatchedGroup>>,
-    pub selected_group_idx: Option<usize>,
-    pub channel_map: ChannelMap,
-    pub recording_type: RecordingType,
-    pub generate_synthetic_video: bool,
-    pub split_tracks: bool,
-    pub drop_ltc_track: bool,
-    pub concat_audio: bool,
-    pub container: String,
-    pub metadata_only: bool,
-    pub leave_video_untouched: bool,
-    pub video_encoder: String,
-    pub audio_encoder: String,
-    pub output_folder: PathBuf,
-    pub filename_prefix: String,
-    pub audio_suffix_template: String,
-    pub video_suffix_template: String,
-    pub conversion_state: SharedConversionState,
-    pub cancel_flag: CancelFlag,
-    pub convert_handle: Option<JoinHandle<()>>,
-    pub set_start_from_ltc: bool,
-    pub ltc_offset_secs: f64,
-    pub per_file_trim_offsets: Vec<f64>,
 
-    // Latch: generation for which auto-settings (trim/split/drop) have been applied
-    ltc_auto_applied_gen: u64,
-    // Latch: group generation for which auto-settings have been applied
-    ltc_group_auto_applied_gen: u64,
+    /// Local cache of converter settings, synced from the engine snapshot
+    /// every frame.  egui's immediate-mode render functions need `&mut`
+    /// access for checkboxes and TextEdits; this cache provides that while
+    /// keeping the engine as the true source of truth.  All mutations send
+    /// a `GuiCommand` to the engine; the cache is refreshed on the next
+    /// `logic()` tick.
+    pub local_settings: gui_engine::state::ConverterUserSettings,
 
     // Diagnostic: last group decode generation that was logged to avoid spam
     pub last_logged_group_decode_gen: u64,
@@ -125,8 +101,6 @@ pub struct AppState {
     /// auto‑switch the converter folder.
     pub offload_last_version: u64,
 }
-
-type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>);
 
 impl AppState {
     pub fn new(
@@ -147,9 +121,9 @@ impl AppState {
         let initial = AppStateSnapshot::initial();
         let is_dark = initial.is_dark_theme;
 
-        // Restore last used converter folders from config
-        let (selected_folder, file_groups) = Self::restore_input_folder(&cfg);
-        let output_folder = cfg.last_output_folder.map(PathBuf::from).unwrap_or_default();
+        let selected_folder = cfg.last_input_folder.as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.exists());
 
         let mut result = Self {
             cmd_tx,
@@ -166,41 +140,13 @@ impl AppState {
             app_menu_pos: None,
             log_buffer,
             ltc_file_idx: 0,
-            _selected_pattern: 0,
             selected_folder: selected_folder.clone(),
-            selected_files: None,
-            file_groups: file_groups.clone(),
-            selected_group_idx: None,
-            channel_map: ChannelMap::identity(0),
-            recording_type: RecordingType::MultiTrackAudio,
-            generate_synthetic_video: false,
-            split_tracks: false,
-            drop_ltc_track: false,
-            concat_audio: false,
+            local_settings: gui_engine::state::ConverterUserSettings::initial(),
             last_logged_group_decode_gen: 0,
-            container: "mov".to_string(),
-            metadata_only: false,
-            leave_video_untouched: false,
-            video_encoder: "h265".to_string(),
-            audio_encoder: "pcm_s24le".to_string(),
-            output_folder,
-            filename_prefix: String::new(),
-            audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
-            video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
-            conversion_state: Arc::new(Mutex::new(ConversionState::idle())),
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-            convert_handle: None,
-            set_start_from_ltc: false,
-            ltc_offset_secs: 0.0,
-            per_file_trim_offsets: Vec::new(),
-            ltc_auto_applied_gen: 0,
-            ltc_group_auto_applied_gen: 0,
             offload_last_version: 0,
         };
 
-        // Sync the engine's group list with the restored folder so the
-        // engine starts scanning. Groups will be adopted from the snapshot
-        // once the folder-scan thread completes.
+        // Tell the engine to scan the restored input folder
         if let Some(ref folder) = selected_folder {
             let _ = result.cmd_tx.send(GuiCommand::Converter(
                 gui_engine::command::ConverterCommand::SelectFolder(folder.clone()),
@@ -211,68 +157,7 @@ impl AppState {
             );
         }
 
-        // Send duration probe for restored groups
-        if let Some(ref groups) = result.file_groups {
-            let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
-                let paths: Vec<std::path::PathBuf> = if g.recording_type == RecordingType::MultiTrackAudio {
-                    g.files.first().cloned().into_iter().collect()
-                } else {
-                    g.files.clone()
-                };
-                paths
-            }).collect();
-            if !probe_paths.is_empty() {
-                let _ = result.cmd_tx.send(GuiCommand::ProbeFileDurations(probe_paths));
-            }
-        }
-
         result
-    }
-
-    fn restore_input_folder(cfg: &config::ConverterConfig) -> RestoredFolder {
-        let folder = match cfg.last_input_folder {
-            Some(ref p) => PathBuf::from(p),
-            None => return (None, None),
-        };
-        if !folder.exists() {
-            return (None, None);
-        }
-        // Groups are discovered asynchronously by the engine — return no
-        // groups here; they will be adopted from the snapshot once the
-        // engine's folder-scan thread completes.
-        (Some(folder), None)
-    }
-
-    /// Applies auto-settings (trim/split/drop) from a successful decode result,
-    /// but only once per generation so user unticks survive.
-    fn sync_ltc_decode_auto_settings(&mut self) {
-        // Single-file decode (audio groups or single video)
-        if let Some(ref result) = self.latest.ltc_decode_result {
-            if matches!(result.status, gui_engine::LtcDecodeStatus::Success | gui_engine::LtcDecodeStatus::LowConfidence)
-                && self.ltc_auto_applied_gen != self.latest.ltc_decode_generation
-            {
-                self.ltc_offset_secs = result.first_ltc_timecode_secs;
-                self.set_start_from_ltc = true;
-                self.split_tracks = true;
-                self.drop_ltc_track = true;
-                self.ltc_auto_applied_gen = self.latest.ltc_decode_generation;
-            }
-        }
-
-        // Group decode (video clip groups)
-        if !self.latest.ltc_group_is_detecting
-            && self.latest.ltc_group_done > 0
-            && self.latest.ltc_group_done >= self.latest.ltc_group_total
-            && self.ltc_group_auto_applied_gen != self.latest.ltc_group_decode_generation
-        {
-            let has_success = self.latest.ltc_group_results.iter().any(|r| r.is_some());
-            if has_success {
-                self.set_start_from_ltc = true;
-                self.split_tracks = true;
-                self.drop_ltc_track = true;
-                self.ltc_group_auto_applied_gen = self.latest.ltc_group_decode_generation;
-            }
-        }
     }
 
     pub fn send(&self, cmd: GuiCommand) {
@@ -313,8 +198,8 @@ impl eframe::App for AppState {
         let snapshot = self.engine_state.load();
         self.latest = Arc::clone(&snapshot);
 
-        // 2. Derive trim offset from LTC result, auto-check split/drop (once per generation)
-        self.sync_ltc_decode_auto_settings();
+        // 2. Sync local converter settings cache from engine snapshot
+        self.local_settings = self.latest.converter.settings.clone();
 
         // 3. Maximize once
         if !self.has_requested_maximize {
@@ -408,52 +293,10 @@ impl eframe::App for AppState {
                 let path = path.clone();
                 log::info!("Offload completed — auto-switching converter folder to {:?}", path);
                 self.selected_folder = Some(path.clone());
-                self.file_groups = None;
-                self.selected_group_idx = None;
                 self.ltc_file_idx = 1;
-                config::save_input_folder(&path);
                 let _ = self.cmd_tx.send(GuiCommand::Converter(
                     gui_engine::command::ConverterCommand::SelectFolder(path.clone()),
                 ));
-            }
-        }
-
-        // 10. Adopt converter groups from the engine snapshot once the
-        //     folder-scan completes (so ltc-gui never walks the directory
-        //     on the GUI thread).
-        if self.file_groups.is_none() {
-            if let Some(ref folder) = self.selected_folder.clone() {
-                let snap = &self.latest.converter;
-                if !snap.groups_loading
-                    && snap.groups_folder.as_ref() == Some(folder)
-                {
-                    let groups = snap.groups.clone();
-                    log::info!(
-                        "Adopting converter groups from engine snapshot: {} group(s)",
-                        groups.len(),
-                    );
-                    self.file_groups = Some(groups.clone());
-                    if !groups.is_empty() {
-                        let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
-                            let paths: Vec<std::path::PathBuf> = if g.recording_type == gui_engine::converter::RecordingType::MultiTrackAudio {
-                                g.files.first().cloned().into_iter().collect()
-                            } else {
-                                g.files.clone()
-                            };
-                            paths
-                        }).collect();
-                        if !probe_paths.is_empty() {
-                            let _ = self.cmd_tx.send(GuiCommand::ProbeFileDurations(probe_paths));
-                        }
-                        let cmds = crate::widgets::converter::apply_group_selection(self, &groups, 0);
-                        for cmd in cmds {
-                            let _ = self.cmd_tx.send(cmd);
-                        }
-                    } else {
-                        self.selected_group_idx = None;
-                        self.ltc_file_idx = 1;
-                    }
-                }
             }
         }
     }

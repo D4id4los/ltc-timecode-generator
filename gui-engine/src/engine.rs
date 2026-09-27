@@ -1,16 +1,24 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetectionResult, WavChunkReader};
 use log::{debug, error, info, warn};
 
-use crate::command::GuiCommand;
-use crate::converter::{query_ffmpeg_capabilities, ConversionState, FfmpegCapabilities};
+use crate::command::{ConverterCommand, GuiCommand};
+use crate::config;
+use crate::video_codecs::describe_chain;
+use crate::converter::{
+    query_ffmpeg_capabilities, ConversionState, ConversionStatus, SharedConversionState,
+    CancelFlag, FfmpegCapabilities, ChannelMap, ConverterSettings, RecordingType,
+    evaluate_readiness, output_collision_warning, preview_output_files,
+    apply_available_defaults, spawn_conversion,
+};
 use crate::ffprobe::{self, VideoAudioProbe};
+use crate::naming::DEFAULT_PREFIX;
 use crate::offload::{self, DeviceNameSource, OffloadContext};
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
@@ -44,6 +52,14 @@ pub fn engine_main_with_probe<F>(
     let mut current = AppStateSnapshot::initial();
     current.use_libltc = use_libltc;
     current.ffmpeg_probe_running = true;
+
+    // Seed converter output folder from persisted config (input folder is
+    // restored by the GUI sending SelectFolder during startup).
+    let saved_cfg = config::load();
+    if let Some(ref folder) = saved_cfg.last_output_folder {
+        current.converter.settings.output_folder = Path::new(folder).to_path_buf();
+    }
+
     let core = AudioCore::new();
     let mut last_tick = Instant::now();
 
@@ -51,6 +67,10 @@ pub fn engine_main_with_probe<F>(
     let mut log_id_counter: u64 = 0;
     let mut last_device_id: Option<String> = None;
     let mut previous_device: Option<usize> = None;
+
+    // Engine-internal auto-apply latches — user un-ticks survive decode re-runs
+    let mut last_auto_applied_ltc_gen: u64 = 0;
+    let mut last_auto_applied_group_ltc_gen: u64 = 0;
 
     // Internal result channel for async decode operations
     let (decode_result_tx, decode_result_rx) =
@@ -111,6 +131,11 @@ pub fn engine_main_with_probe<F>(
     let mut offload_plans: Vec<Vec<crate::offload::CopyPlanItem>> = Vec::new();
     let mut offload_completed_before: Vec<String> = Vec::new();
 
+    // Conversion lifecycle state (engine-owned, shared with conversion thread)
+    let mut conv_state_shared: SharedConversionState = Arc::new(Mutex::new(ConversionState::idle()));
+    let mut conv_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let mut conv_handle: Option<std::thread::JoinHandle<()>> = None;
+
     loop {
         let now = Instant::now();
         let dt = (now - last_tick).as_secs_f32();
@@ -166,7 +191,7 @@ pub fn engine_main_with_probe<F>(
                         })
                         .expect("failed to spawn duration-probe thread");
                 }
-                Ok(GuiCommand::Converter(crate::command::ConverterCommand::SelectFolder(path))) => {
+                Ok(GuiCommand::Converter(ConverterCommand::SelectFolder(path))) => {
                     current.converter.groups.clear();
                     current.converter.groups_loading = true;
                     current.converter.groups_folder = Some(path.clone());
@@ -177,6 +202,8 @@ pub fn engine_main_with_probe<F>(
                     current.converter.probes_loading = false;
                     current.converter.probes_generation = 0;
                     current.converter.conversion_state = ConversionState::idle();
+                    // Persist input folder
+                    config::save_input_folder(&path);
                     let tx = scan_tx.clone();
                     std::thread::Builder::new()
                         .name("folder-scan".into())
@@ -190,8 +217,9 @@ pub fn engine_main_with_probe<F>(
                             let _ = tx.send(FolderScanResult { path, groups, generation: gen });
                         })
                         .expect("failed to spawn folder-scan thread");
+                    recompute_converter_derived(&mut current);
                 }
-                Ok(GuiCommand::Converter(crate::command::ConverterCommand::SelectRecording(idx))) => {
+                Ok(GuiCommand::Converter(ConverterCommand::SelectRecording(idx))) => {
                     let group_count = current.converter.groups.len();
                     // Reset per-recording state
                     current.converter.selected_group_idx = Some(idx);
@@ -199,6 +227,29 @@ pub fn engine_main_with_probe<F>(
                     current.converter.probes_loading = true;
                     current.converter.probes_generation += 1;
                     current.converter.conversion_state = ConversionState::idle();
+                    // Reset per-recording settings flags
+                    let s = &mut current.converter.settings;
+                    s.set_start_from_ltc = false;
+                    s.split_tracks = false;
+                    s.drop_ltc_track = false;
+                    s.concat_audio = false;
+                    s.ltc_file_idx = 0;
+                    s.channel_map = ChannelMap::identity(0);
+                    // Prefill filename prefix from group
+                    if let Some(group) = current.converter.groups.get(idx) {
+                        let prefix = &group.prefix;
+                        if !prefix.is_empty() {
+                            s.filename_prefix = prefix.clone();
+                        } else {
+                            s.filename_prefix = DEFAULT_PREFIX.to_string();
+                        }
+                        // Default output folder = input folder if empty
+                        if s.output_folder.as_os_str().is_empty() {
+                            if let Some(ref gf) = current.converter.groups_folder {
+                                s.output_folder = gf.clone();
+                            }
+                        }
+                    }
                     // Clear stale LTC decode state
                     current.ltc_probe = None;
                     current.ltc_selected_stream = 0;
@@ -229,6 +280,9 @@ pub fn engine_main_with_probe<F>(
                     group_cancel = None;
                     group_clip_progress = None;
                     current.ltc_group_decode_generation = current.ltc_group_decode_generation.wrapping_add(1);
+                    // Reset auto-apply latches so next decode re-applies defaults
+                    last_auto_applied_ltc_gen = 0;
+                    last_auto_applied_group_ltc_gen = 0;
                     current.status_message = "Recording selected — probing…".to_string();
 
                     // Spawn background probing of all files in the group
@@ -257,6 +311,7 @@ pub fn engine_main_with_probe<F>(
                         );
                         current.converter.probes_loading = false;
                     }
+                    recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Offload(cmd)) => {
                     handle_offload_command(
@@ -269,6 +324,124 @@ pub fn engine_main_with_probe<F>(
                         &mut offload_completed_before,
                         &offload_event_tx,
                     );
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetNamingPattern(val))) => {
+                    current.converter.settings.naming_pattern = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetMetadataOnly(val)))=> {
+                    current.converter.settings.metadata_only = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(val)))=> {
+                    current.converter.settings.generate_synthetic_video = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetCopyVideo(val)))=> {
+                    current.converter.settings.copy_video = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetSplitTracks(val)))=> {
+                    current.converter.settings.split_tracks = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(val)))=> {
+                    current.converter.settings.drop_ltc_track = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetConcatAudio(val)))=> {
+                    current.converter.settings.concat_audio = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetStartFromLtc(val)))=> {
+                    current.converter.settings.set_start_from_ltc = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetTrimEnabled(val)))=> {
+                    current.converter.settings.trim_enabled = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(val)))=> {
+                    current.converter.settings.ltc_file_idx = val;
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SwapChannelMapCells(row, col)))=> {
+                    current.converter.settings.channel_map.swap(row, col);
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetContainer(container))) => {
+                    current.converter.settings.container = container.clone();
+                    // Re-select best defaults for the new container
+                    if let Some(ref caps) = current.ffmpeg_caps {
+                        apply_available_defaults(
+                            &mut current.converter.settings.container,
+                            &mut current.converter.settings.video_encoder,
+                            &mut current.converter.settings.audio_encoder,
+                            caps,
+                        );
+                    }
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetVideoCodec(codec))) => {
+                    current.converter.settings.video_encoder = codec.clone();
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetAudioEncoder(encoder))) => {
+                    current.converter.settings.audio_encoder = encoder.clone();
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetOutputFolder(folder))) => {
+                    current.converter.settings.output_folder = folder.clone();
+                    config::save_output_folder(&folder);
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(prefix))) => {
+                    current.converter.settings.filename_prefix = prefix.clone();
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(tmpl))) => {
+                    current.converter.settings.audio_suffix_template = tmpl.clone();
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(tmpl))) => {
+                    current.converter.settings.video_suffix_template = tmpl.clone();
+                    recompute_converter_derived(&mut current);
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::StartConversion)) => {
+                    if matches!(current.converter.conversion_state.status, ConversionStatus::Running { .. }) {
+                        warn!("Conversion already in progress — ignoring duplicate StartConversion");
+                    } else if let Some(settings) = assemble_converter_settings(&current) {
+                        let caps = current.ffmpeg_caps.clone();
+                        // Create fresh shared state and cancel flag for this conversion
+                        let fresh_state: SharedConversionState = Arc::new(Mutex::new(ConversionState::idle()));
+                        let fresh_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+                        let handle = spawn_conversion(
+                            settings,
+                            fresh_state.clone(),
+                            fresh_cancel.clone(),
+                            caps.as_ref(),
+                        );
+                        conv_state_shared = fresh_state;
+                        conv_cancel = fresh_cancel;
+                        conv_handle = Some(handle);
+                        // Immediately reflect running state in snapshot
+                        current.converter.conversion_state = ConversionState {
+                            status: ConversionStatus::Running { progress: 0.0 },
+                            ffmpeg_output: String::new(),
+                            current_line: String::new(),
+                        };
+                        current.status_message = "Conversion started…".to_string();
+                        info!("Conversion started via engine StartConversion command");
+                    } else {
+                        let msg = "Cannot start conversion — no recording group selected or settings incomplete".to_string();
+                        current.status_message = msg.clone();
+                        warn!("{}", msg);
+                    }
+                }
+                Ok(GuiCommand::Converter(ConverterCommand::CancelConversion)) => {
+                    conv_cancel.store(true, Ordering::Relaxed);
+                    current.status_message = "Conversion canceled".to_string();
+                    info!("Conversion cancel signaled via engine CancelConversion command");
                 }
                 Ok(cmd) => {
                     process_command(
@@ -335,6 +508,12 @@ pub fn engine_main_with_probe<F>(
                                 );
                                 current.status_message = summary;
                                 info!("LTC decode completed: {}", path);
+                                // Auto-apply decoder result to converter settings
+                                if generation > last_auto_applied_ltc_gen {
+                                    auto_apply_ltc_to_settings(&mut current);
+                                    last_auto_applied_ltc_gen = generation;
+                                    recompute_converter_derived(&mut current);
+                                }
                             }
                             Err(e) => {
                                 let is_cancel = e == "Decode canceled by user";
@@ -422,6 +601,12 @@ pub fn engine_main_with_probe<F>(
                             current.ltc_decode_progress_pct = 1.0;
                             current.ltc_decode_progress_str = String::new();
                             info!("LTC group decode complete: {}/{} ok, {}/{} failed", successes, current.ltc_group_total, failures, current.ltc_group_total);
+                            // Auto-apply group decoder result to converter settings
+                            if generation > last_auto_applied_group_ltc_gen {
+                                auto_apply_group_ltc_to_settings(&mut current);
+                                last_auto_applied_group_ltc_gen = generation;
+                                recompute_converter_derived(&mut current);
+                            }
                         }
                     } else {
                         warn!("Discarding stale group result: generation={}, expected={}, clip_index={}, path={}",
@@ -499,6 +684,18 @@ pub fn engine_main_with_probe<F>(
                         current.converter.probes = probes.iter().map(|r| r.as_ref().ok().cloned()).collect();
                         current.converter.probes_loading = false;
                         info!("Converter clip probe complete: {} files", current.converter.probes.len());
+                        // Resize channel map to match the first successful probe's channel count
+                        let probe_channels = current.converter.probes.first()
+                            .and_then(|p| p.as_ref())
+                            .map(|p| p.total_audio_channels);
+                        let map_channels = current.converter.settings.channel_map.num_channels();
+                        if let Some(ch) = probe_channels {
+                            if ch > 0 && ch != map_channels {
+                                current.converter.settings.channel_map = ChannelMap::identity(ch);
+                                info!("Channel map resized to {} channels from probe", ch);
+                            }
+                        }
+                        recompute_converter_derived(&mut current);
                     } else {
                         warn!(
                             "Discarding stale converter clip probe result (gen {} != current {})",
@@ -618,12 +815,41 @@ pub fn engine_main_with_probe<F>(
             current.offload.device_progress.clear();
         }
 
+        // 1.13 Poll conversion progress from engine-owned shared state
+        if let Ok(mut locked) = conv_state_shared.lock() {
+            match &locked.status {
+                ConversionStatus::Running { progress } => {
+                    current.converter.conversion_state = locked.clone();
+                    current.status_message =
+                        format!("Conversion in progress: {:.0}%", progress * 100.0);
+                }
+                ConversionStatus::Completed => {
+                    current.converter.conversion_state = locked.clone();
+                    *locked = ConversionState::idle();
+                    recompute_converter_derived(&mut current);
+                    current.status_message = "Conversion completed".to_string();
+                    info!("Engine-owned conversion completed successfully");
+                }
+                ConversionStatus::Failed { error_log } => {
+                    current.converter.conversion_state = locked.clone();
+                    let err = error_log.clone();
+                    *locked = ConversionState::idle();
+                    recompute_converter_derived(&mut current);
+                    current.status_message = format!("Conversion failed: {}", err);
+                    warn!("Engine-owned conversion failed: {}", err);
+                }
+                _ => {} // Idle — nothing to do
+            }
+        }
+
         // 2. Poll current timecode if playing
         if current.is_playing {
             current.current_timecode = core.current_timecode();
         }
 
         // 3. Drain events from AudioCore
+        // Clear previous-tick events first so the GUIs only see each event once.
+        current.events.clear();
         for event in core.drain_events() {
             handle_event(event, &core, &mut current, &mut recovery_attempts, &mut last_device_id);
         }
@@ -1439,21 +1665,9 @@ fn process_command(
             // Handled in the command drain loop (engine_main) before reaching process_command
         }
 
-        GuiCommand::Converter(ref cmd) => match cmd {
-            crate::command::ConverterCommand::SelectFolder(_)
-            | crate::command::ConverterCommand::SelectRecording(_) => {
-                // Handled in the command drain loop before reaching process_command
-            }
-            crate::command::ConverterCommand::SetTrimEnabled(_) => {
-                // Trim is GUI-local; engine just acknowledges
-            }
-            crate::command::ConverterCommand::StartConversion => {
-                // Conversion is spawned by the GUI (settings are GUI-local);
-                // this can be extended when settings move to the engine.
-            }
-            crate::command::ConverterCommand::CancelConversion => {
-                // Cancel is handled via CancelFlag owned by the GUI.
-            }
+        GuiCommand::Converter(_) => {
+            // All ConverterCommand variants are handled in the main engine
+            // command drain loop (before process_command).
         },
 
         GuiCommand::Offload(_) => {
@@ -1696,12 +1910,21 @@ fn drain_ffmpeg_probe_result(
                 caps.hw.vaapi_device.is_some(),
                 caps.hw.vulkan_available,
             );
+            // Repair user settings defaults now that caps are available
+            apply_available_defaults(
+                &mut current.converter.settings.container,
+                &mut current.converter.settings.video_encoder,
+                &mut current.converter.settings.audio_encoder,
+                &caps,
+            );
+            recompute_converter_derived(current);
             false
         }
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             // Probe thread exited without sending — treat as no ffmpeg
             warn!("ffmpeg capability probe thread disconnected unexpectedly");
             current.ffmpeg_probe_running = false;
+            recompute_converter_derived(current);
             true
         }
         Err(std::sync::mpsc::TryRecvError::Empty) => false,
@@ -1831,6 +2054,125 @@ fn handle_offload_command(
             state.offload.error = Some("Canceled by user".to_string());
         }
     }
+}
+
+// ── Converter helper functions ─────────────────────────────────────────
+
+/// Recompute derived converter UI data (readiness, collision warning,
+/// output preview, encoder chain description) from current state.
+/// Called by the engine after any settings/groups/caps change.
+fn recompute_converter_derived(state: &mut AppStateSnapshot) {
+    let has_group = state.converter.selected_group_idx.is_some();
+    let prefix_empty = state.converter.settings.filename_prefix.is_empty();
+    let output_empty = state.converter.settings.output_folder.as_os_str().is_empty();
+    let caps = state.ffmpeg_caps.clone();
+
+    // Readiness — no mutable borrow of converter yet
+    let blockers = evaluate_readiness(has_group, prefix_empty, output_empty, caps.as_ref()).blockers;
+
+    // Compute preview / collision / encoder desc via a temporary settings assembly
+    let settings = assemble_converter_settings(state);
+    let (collision_warning, output_preview, encoder_chain_desc) = if let Some(ref s) = settings {
+        let probe = state.converter.probes.first().and_then(|p| p.as_ref());
+        let collision = output_collision_warning(s);
+        let preview = preview_output_files(s, probe);
+        let chain = caps.as_ref()
+            .map(|c| describe_chain(&s.video_encoder, c))
+            .unwrap_or_default();
+        (collision, preview, chain)
+    } else {
+        (None, Vec::new(), String::new())
+    };
+
+    // Now borrow converter mutably to publish all derived fields at once
+    let c = &mut state.converter;
+    c.readiness = blockers;
+    c.collision_warning = collision_warning;
+    c.output_preview = output_preview;
+    c.encoder_chain_desc = encoder_chain_desc;
+}
+
+/// Assemble a `ConverterSettings` from the engine's current state snapshot.
+/// Returns `None` when no recording group is selected.
+fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSettings> {
+    let idx = state.converter.selected_group_idx?;
+    let group = state.converter.groups.get(idx)?;
+
+    let s = &state.converter.settings;
+
+    let pipeline = if s.metadata_only {
+        crate::converter::ConversionPipeline::MetadataOnly
+    } else if group.recording_type == RecordingType::MultiTrackAudio {
+        crate::converter::ConversionPipeline::AudioOnly {
+            generate_synthetic_video: s.generate_synthetic_video,
+        }
+    } else {
+        crate::converter::ConversionPipeline::VideoPassthrough
+    };
+
+    // Derive timecode metadata from LTC decode results
+    let timecode_meta_per_file = if s.set_start_from_ltc {
+        if let Some(ref result) = state.ltc_decode_result {
+            // Single-file decode
+            let meta = crate::converter::start_timecode_from_ltc(result);
+            (0..group.files.len()).map(|_| meta.clone()).collect()
+        } else if !state.ltc_group_results.is_empty() {
+            // Group decode — one per clip
+            state.ltc_group_results.iter()
+                .map(|r| r.as_ref().and_then(|res| crate::converter::start_timecode_from_ltc(res)))
+                .collect()
+        } else {
+            vec![None; group.files.len()]
+        }
+    } else {
+        vec![None; group.files.len()]
+    };
+
+    let ltc_video_source = if group.recording_type == RecordingType::VideoClipSequence {
+        Some((state.ltc_selected_stream, state.ltc_selected_channel))
+    } else {
+        None
+    };
+
+    Some(ConverterSettings {
+        pipeline,
+        input_files: group.files.clone(),
+        recording_type: group.recording_type.clone(),
+        ltc_track_channel_index: s.ltc_file_idx,
+        channel_map: s.channel_map.clone(),
+        split_tracks: s.split_tracks,
+        drop_ltc_track: s.drop_ltc_track,
+        ltc_video_source,
+        container: s.container.clone(),
+        copy_video: s.copy_video,
+        video_encoder: s.video_encoder.clone(),
+        audio_encoder: s.audio_encoder.clone(),
+        resolved_video_encoder: String::new(),
+        resolved_hw_device: None,
+        output_folder: s.output_folder.clone(),
+        filename_prefix: s.filename_prefix.clone(),
+        audio_suffix_template: s.audio_suffix_template.clone(),
+        video_suffix_template: s.video_suffix_template.clone(),
+        set_start_from_ltc: s.set_start_from_ltc,
+        trim_offsets_secs: vec![0.0; group.files.len()],
+        timecode_meta_per_file,
+        concat_audio: s.concat_audio,
+    })
+}
+
+/// Auto-apply LTC decode results to converter settings (split tracks,
+/// drop LTC track, set start-from-LTC) once per decode generation.
+/// User manual un-ticks survive until the next decode re-run.
+fn auto_apply_ltc_to_settings(state: &mut AppStateSnapshot) {
+    state.converter.settings.split_tracks = true;
+    state.converter.settings.drop_ltc_track = true;
+    state.converter.settings.set_start_from_ltc = true;
+}
+
+fn auto_apply_group_ltc_to_settings(state: &mut AppStateSnapshot) {
+    state.converter.settings.split_tracks = true;
+    state.converter.settings.drop_ltc_track = true;
+    state.converter.settings.set_start_from_ltc = true;
 }
 
 #[cfg(test)]

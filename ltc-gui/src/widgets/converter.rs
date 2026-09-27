@@ -33,28 +33,28 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
     // Pre-compute sanity result once per frame (pure — no filesystem access)
     let caps_opt = state.latest.ffmpeg_caps.clone();
     let sanity_result: Option<Result<(), String>> = caps_opt.as_ref().and_then(|caps| {
-        if state.metadata_only {
+        if state.local_settings.metadata_only {
             let input_files = selected_input_files(state);
             Some(conversion_sanity_check_metadata_only_pure(
                 &input_files,
-                &state.output_folder,
-                &state.filename_prefix,
+                &state.local_settings.output_folder,
+                &state.local_settings.filename_prefix,
                 caps,
-                Some(&state.audio_suffix_template),
-                Some(&state.video_suffix_template),
+                Some(&state.local_settings.audio_suffix_template),
+                Some(&state.local_settings.video_suffix_template),
             ))
-        } else if state.selected_group_idx.is_some() {
+        } else if state.latest.converter.selected_group_idx.is_some() {
             let input_files = selected_input_files(state);
             Some(conversion_sanity_check_pure(
-                &state.container,
-                &state.video_encoder,
-                &state.audio_encoder,
+                &state.local_settings.container,
+                &state.local_settings.video_encoder,
+                &state.local_settings.audio_encoder,
                 &input_files,
-                &state.output_folder,
-                &state.filename_prefix,
+                &state.local_settings.output_folder,
+                &state.local_settings.filename_prefix,
                 caps,
-                Some(&state.audio_suffix_template),
-                Some(&state.video_suffix_template),
+                Some(&state.local_settings.audio_suffix_template),
+                Some(&state.local_settings.video_suffix_template),
                 copy_mode_active(state),
             ))
         } else {
@@ -74,8 +74,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             render_file_selection(ui, state);
             ui.add_space(16.0);
 
-            if state.selected_group_idx.is_some() {
-                step_header(ui, "L", "VERIFY LTC TRACK", &colors);
+            if state.latest.converter.selected_group_idx.is_some() {
                 ui.add_space(8.0);
                 render_ltc_verification(ui, state);
                 ui.add_space(16.0);
@@ -122,9 +121,9 @@ fn step_header(ui: &mut Ui, number: &str, label: &str, colors: &crate::theme::Th
 /// meaningful for the video pipeline (audio-only recordings have no video
 /// stream to copy, and synthetic video must be encoded).
 fn copy_mode_active(state: &AppState) -> bool {
-    !state.metadata_only
-        && state.leave_video_untouched
-        && state.recording_type == RecordingType::VideoClipSequence
+    !state.local_settings.metadata_only
+        && state.local_settings.copy_video
+        && state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence)
 }
 
 pub(crate) fn apply_group_selection(
@@ -133,52 +132,19 @@ pub(crate) fn apply_group_selection(
     idx: usize,
 ) -> Vec<GuiCommand> {
     let group = &groups[idx];
-    let mut cmds = Vec::new();
 
     log::info!(
         "Recording selected in UI: idx={}, type={:?}, {} file(s)",
         idx, group.recording_type, group.files.len(),
     );
 
-    state.selected_group_idx = Some(idx);
-
-    cmds.push(GuiCommand::ClearRecordingDecodeState);
-
-    let num_ch = group.files.len();
-    // For audio, files == channels; for video, matrix is sized from probe later
-    state.channel_map = if group.recording_type == RecordingType::VideoClipSequence {
-        ChannelMap::identity(0)
-    } else {
-        ChannelMap::identity(num_ch)
-    };
-    state.recording_type = group.recording_type.clone();
-    state.filename_prefix = group.prefix.clone();
-    state.output_folder = state.selected_folder.clone().unwrap_or_default();
-    state.split_tracks = false;
-    state.drop_ltc_track = false;
-    state.metadata_only = false;
-    state.set_start_from_ltc = false;
-    state.ltc_offset_secs = 0.0;
-    state.concat_audio = false;
-    state.last_logged_group_decode_gen = 0;
-    state.per_file_trim_offsets = vec![0.0; num_ch];
     state.ltc_file_idx = 0;
+    state.last_logged_group_decode_gen = 0;
 
-    // Cancel any in-flight conversion so its cancelled-thread `Failed{}` write
-    // targets the old (now dropped) state, not our fresh one.
-    state.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    state.conversion_state = Arc::new(std::sync::Mutex::new(
-        gui_engine::converter::ConversionState::idle(),
-    ));
-    state.cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    state.convert_handle = None;
-
-    // Notify engine to manage per-recording state (probes, stale LTC state).
-    // For video groups, the engine's converter clip probe populates ltc_probe
-    // automatically, so no separate ProbeVideo command is needed.
-    cmds.push(GuiCommand::Converter(ConverterCommand::SelectRecording(idx)));
-
-    cmds
+    vec![
+        GuiCommand::ClearRecordingDecodeState,
+        GuiCommand::Converter(ConverterCommand::SelectRecording(idx)),
+    ]
 }
 
 // ── Step 1: File selection ─────────────────────────────────────────────
@@ -208,23 +174,23 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
             let folder = dialog.pick_folder();
             if let Some(path) = folder {
                 state.selected_folder = Some(path.clone());
-                state.selected_files = None;
-                state.file_groups = None;
-                state.selected_group_idx = None;
-                config::save_input_folder(&path);
 
                 // Notify engine to scan folder and manage groups (engine runs
                 // the scan on a background thread and publishes results via
                 // the snapshot's converter.groups / groups_loading flags).
                 state.send(GuiCommand::Converter(ConverterCommand::SelectFolder(path.clone())));
 
-                state.set_start_from_ltc = false;
+                state.local_settings.set_start_from_ltc = false;
             }
         }
     });
 
     // File group selector (shows all matched groups with type badge)
-    let groups_clone = state.file_groups.clone();
+    let groups_clone = if state.latest.converter.groups_loading {
+        None
+    } else {
+        Some(state.latest.converter.groups.clone())
+    };
     if groups_clone.is_none() && state.selected_folder.is_some() {
         // Groups async scan in progress or not yet adopted
         if state.latest.converter.groups_loading {
@@ -243,7 +209,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Recording:").font(FontId::proportional(10.0)).color(colors.text_muted));
                 let selected_text = state
-                    .selected_group_idx
+                    .latest.converter.selected_group_idx
                     .and_then(|idx| groups.get(idx))
                     .map(|g| group_display_key(&g.prefix, &g.rel_dir))
                     .unwrap_or_else(|| "Select a recording…".to_string());
@@ -288,7 +254,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                     });
             });
 
-            if let Some(idx) = state.selected_group_idx {
+            if let Some(idx) = state.latest.converter.selected_group_idx {
                 if let Some(group) = groups.get(idx) {
                     ui.add_space(4.0);
                     let pill_frame = egui::Frame::new()
@@ -330,8 +296,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(6.0);
 
     let group = state
-        .selected_group_idx
-        .and_then(|idx| state.file_groups.as_ref()?.get(idx));
+        .latest.converter.selected_group_idx
+        .and_then(|idx| state.latest.converter.groups.get(idx));
 
     let file_count = group.map(|g| g.files.len()).unwrap_or(0);
 
@@ -341,7 +307,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
             state.ltc_file_idx = file_count.saturating_sub(1);
         }
 
-        let is_video = state.recording_type == RecordingType::VideoClipSequence;
+        let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
 
         // Build channel options from probe (for video) or file list (for audio)
         struct ChannelOption {
@@ -527,7 +493,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
 
     // Show group decode results (video clip groups)
-    let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
+    let is_video_group = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let group_results: Vec<(String, Option<gui_engine::LtcDetectionResult>, Option<String>)> = {
         let paths = &state.latest.ltc_group_paths;
         let results = &state.latest.ltc_group_results;
@@ -555,7 +521,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                     state.latest.ltc_group_is_detecting,
                     state.latest.ltc_group_done, state.latest.ltc_group_total, gen,
                     none_count,
-                    state.recording_type,
+                    state.latest.converter.selected_recording_type(),
                 );
             }
         }
@@ -1034,25 +1000,25 @@ fn format_ltc_report_text(result: &gui_engine::LtcDetectionResult) -> String {
 // ── Step 2: Channel mapping matrix ──────────────────────────────────────
 
 fn sync_channel_map_from_probe(state: &mut AppState) {
-    let is_video = state.recording_type == RecordingType::VideoClipSequence;
+    let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let expected = if is_video {
         state.latest.ltc_probe.as_ref().map(|p| p.total_audio_channels).unwrap_or(0)
     } else {
         // Audio: the group's file count = channel count
-        state.selected_group_idx
-            .and_then(|idx| state.file_groups.as_ref()?.get(idx))
-            .map(|g| g.files.len())
-            .unwrap_or(0)
+state.latest.converter.selected_group_idx
+        .and_then(|idx| state.latest.converter.groups.get(idx))
+        .map(|g| g.files.len())
+        .unwrap_or(0)
     };
-    if state.channel_map.num_channels() != expected {
-        state.channel_map = ChannelMap::identity(expected);
+    if state.local_settings.channel_map.num_channels() != expected {
+        state.local_settings.channel_map = ChannelMap::identity(expected);
     }
 }
 
 /// Build channel labels for the matrix rows. For video, show track labels
 /// (e.g. "T1 L", "T1 R", "S2 C1"). For audio, show "CH n".
 fn channel_row_labels(state: &AppState) -> Vec<String> {
-    if state.recording_type == RecordingType::VideoClipSequence {
+    if state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence) {
         if let Some(ref probe) = state.latest.ltc_probe {
             let mut labels = Vec::new();
             for s in &probe.streams {
@@ -1070,8 +1036,8 @@ fn channel_row_labels(state: &AppState) -> Vec<String> {
             return labels;
         }
     }
-    state.selected_group_idx
-        .and_then(|idx| state.file_groups.as_ref()?.get(idx))
+    state.latest.converter.selected_group_idx
+        .and_then(|idx| state.latest.converter.groups.get(idx))
         .map(|g| (0..g.files.len()).map(|i| format!("CH {}", i + 1)).collect())
         .unwrap_or_default()
 }
@@ -1079,8 +1045,8 @@ fn channel_row_labels(state: &AppState) -> Vec<String> {
 fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
     sync_channel_map_from_probe(state);
     let colors = state.theme.colors();
-    let is_video = state.recording_type == RecordingType::VideoClipSequence;
-    let n = state.channel_map.num_channels();
+    let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
+    let n = state.local_settings.channel_map.num_channels();
 
     if n == 0 {
         if is_video && state.latest.ltc_probe.is_none() {
@@ -1181,7 +1147,7 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
     for cell in &cells {
         let cx = origin.x + cell.cx;
         let cy = origin.y + cell.cy;
-        let is_selected = state.channel_map.get(cell.row) == cell.col;
+        let is_selected = state.local_settings.channel_map.get(cell.row) == cell.col;
         let is_ltc_row = row_is_ltc[cell.row];
 
         let radius = 10.0;
@@ -1208,13 +1174,13 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
     for cell in &cells {
         let cx = origin.x + cell.cx;
         let cy = origin.y + cell.cy;
-        let is_selected = state.channel_map.get(cell.row) == cell.col;
+        let is_selected = state.local_settings.channel_map.get(cell.row) == cell.col;
         let hitbox = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(cell_size, cell_size));
 
         let click_id = egui::Id::new(("chan_map", cell.row, cell.col));
         let clicked = ui.interact(hitbox, click_id, egui::Sense::click()).clicked();
         if clicked && !is_selected {
-            state.channel_map.swap(cell.row, cell.col);
+            state.local_settings.channel_map.swap(cell.row, cell.col);
         }
     }
 }
@@ -1223,7 +1189,7 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
 fn render_split_options(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let is_video = state.recording_type == RecordingType::VideoClipSequence;
+    let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let ltc_available = if is_video {
         state.latest.ltc_group_results.iter().any(|r| r.is_some())
     } else {
@@ -1232,27 +1198,27 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        let prev_split = state.split_tracks;
+        let prev_split = state.local_settings.split_tracks;
         ui.add(egui::Checkbox::new(
-            &mut state.split_tracks,
+            &mut state.local_settings.split_tracks,
             "Split tracks into separate files",
         ));
-        if prev_split && !state.split_tracks && state.concat_audio {
-            state.concat_audio = false;
+        if prev_split && !state.local_settings.split_tracks && state.local_settings.concat_audio {
+            state.local_settings.concat_audio = false;
         }
         ui.add_enabled(ltc_available, egui::Checkbox::new(
-            &mut state.drop_ltc_track,
+            &mut state.local_settings.drop_ltc_track,
             "Drop LTC track",
         ));
     });
-    if is_video && state.split_tracks {
+    if is_video && state.local_settings.split_tracks {
         ui.horizontal(|ui| {
             ui.add(egui::Checkbox::new(
-                &mut state.concat_audio,
+                &mut state.local_settings.concat_audio,
                 "Concatenate audio tracks across clips (one file per track)",
             ));
         });
-        if state.concat_audio {
+        if state.local_settings.concat_audio {
             ui.label(
                 RichText::new("ℹ Audio from all clips will be joined into one file per track (in clip order).")
                     .font(FontId::proportional(9.0))
@@ -1260,14 +1226,14 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
             );
         }
     }
-    if state.split_tracks {
+    if state.local_settings.split_tracks {
         ui.label(
             RichText::new("ℹ Each input track will be written to its own file. Channel mapping greets are preserved.")
                 .font(FontId::proportional(9.0))
                 .color(colors.text_secondary),
         );
     }
-    if state.drop_ltc_track && state.ltc_file_idx < state.channel_map.num_channels() {
+    if state.local_settings.drop_ltc_track && state.ltc_file_idx < state.local_settings.channel_map.num_channels() {
         ui.label(
             RichText::new(format!("ℹ LTC track (channel {}) will be excluded from all output.", state.ltc_file_idx + 1))
                 .font(FontId::proportional(9.0))
@@ -1289,14 +1255,14 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                 .font(FontId::proportional(10.0))
                 .color(colors.text_muted),
         );
-        if state.recording_type == RecordingType::VideoClipSequence {
-            ui.checkbox(&mut state.leave_video_untouched, "Leave video encoding untouched (stream copy)");
+        if state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence) {
+            ui.checkbox(&mut state.local_settings.copy_video, "Leave video encoding untouched (stream copy)");
         }
         return;
     }
 
     if let Some(ref caps) = caps_opt {
-        apply_available_defaults(&mut state.container, &mut state.video_encoder, &mut state.audio_encoder, caps);
+        apply_available_defaults(&mut state.local_settings.container, &mut state.local_settings.video_encoder, &mut state.local_settings.audio_encoder, caps);
     }
 
     let containers: Vec<(String, String)> = if let Some(ref caps) = caps_opt {
@@ -1306,28 +1272,28 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
     };
 
     let video_encoders: Vec<(String, String)> = if let Some(ref caps) = caps_opt {
-        available_video_codecs(&state.container, caps)
+        available_video_codecs(&state.local_settings.container, caps)
     } else {
         supported_video_codecs().iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };
 
     let audio_encoders: Vec<(String, String)> = if let Some(ref caps) = caps_opt {
-        available_audio_encoders_for_container(&state.container, caps).iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        available_audio_encoders_for_container(&state.local_settings.container, caps).iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     } else {
         supported_audio_encoders().iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };
 
     // Clone values to avoid borrow conflicts with FnMut closures
-    let cur_container = state.container.clone();
-    let cur_video_encoder = state.video_encoder.clone();
-    let cur_audio_encoder = state.audio_encoder.clone();
+    let cur_container = state.local_settings.container.clone();
+    let cur_video_encoder = state.local_settings.video_encoder.clone();
+    let cur_audio_encoder = state.local_settings.audio_encoder.clone();
 
     // Two-column layout: Video Format | Audio Format
     let is_narrow = ui.available_width() < 400.0;
     if is_narrow {
         ui.vertical(|ui| {
-            if state.recording_type == RecordingType::VideoClipSequence {
-                ui.checkbox(&mut state.leave_video_untouched, "Leave video encoding untouched (stream copy)");
+            if state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence) {
+                ui.checkbox(&mut state.local_settings.copy_video, "Leave video encoding untouched (stream copy)");
                 if copy_mode_active(state) {
                     ui.label(
                         RichText::new("Video is copied without re-encoding (much faster). Cuts snap to the nearest keyframe before the trim point.")
@@ -1342,7 +1308,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
             ui.add_enabled_ui(!copy_mode_active(state), |ui| {
                 {
                     let mut update_container = |v: &str| {
-                        state.container = v.to_string();
+                        state.local_settings.container = v.to_string();
                         if let Some(ref caps) = caps_opt {
                             re_select_encoders_for_container(state, caps);
                         }
@@ -1350,13 +1316,13 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                     render_format_row(ui, "Container", &cur_container, &containers, &mut update_container, &colors);
                 }
                 {
-                    let mut update_video = |v: &str| state.video_encoder = v.to_string();
+                    let mut update_video = |v: &str| state.local_settings.video_encoder = v.to_string();
                     render_format_row(ui, "Video codec", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
                 }
             });
 
-            if state.recording_type == RecordingType::MultiTrackAudio {
-                ui.checkbox(&mut state.generate_synthetic_video, "Generate synthetic video (blue background)");
+            if state.latest.converter.selected_recording_type() == Some(RecordingType::MultiTrackAudio) {
+                ui.checkbox(&mut state.local_settings.generate_synthetic_video, "Generate synthetic video (blue background)");
             }
 
             ui.add_space(8.0);
@@ -1365,15 +1331,15 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
             ui.label(RichText::new("AUDIO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
             ui.add_space(4.0);
             {
-                let mut update_audio = |v: &str| state.audio_encoder = v.to_string();
+                let mut update_audio = |v: &str| state.local_settings.audio_encoder = v.to_string();
                 render_format_row(ui, "Audio encoder", &cur_audio_encoder, &audio_encoders, &mut update_audio, &colors);
             }
         });
     } else {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                if state.recording_type == RecordingType::VideoClipSequence {
-                    ui.checkbox(&mut state.leave_video_untouched, "Leave video encoding untouched (stream copy)");
+                if state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence) {
+                    ui.checkbox(&mut state.local_settings.copy_video, "Leave video encoding untouched (stream copy)");
                     if copy_mode_active(state) {
                         ui.label(
                             RichText::new("Video is copied without re-encoding (much faster). Cuts snap to the nearest keyframe before the trim point.")
@@ -1383,8 +1349,8 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                     }
                     ui.add_space(4.0);
                 }
-                ui.checkbox(&mut state.metadata_only, "Metadata only (tag + rename, extract audio)");
-                if state.metadata_only {
+                ui.checkbox(&mut state.local_settings.metadata_only, "Metadata only (tag + rename, extract audio)");
+                if state.local_settings.metadata_only {
                     ui.label(
                         RichText::new("Originals are tagged in place with the start timecode and renamed. Audio is extracted to the output folder. No re-encoding.")
                             .font(FontId::proportional(9.0))
@@ -1394,10 +1360,10 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                 }
                 ui.label(RichText::new("VIDEO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
                 ui.add_space(4.0);
-                ui.add_enabled_ui(!copy_mode_active(state) && !state.metadata_only, |ui| {
+                ui.add_enabled_ui(!copy_mode_active(state) && !state.local_settings.metadata_only, |ui| {
                     {
                         let mut update_container = |v: &str| {
-                            state.container = v.to_string();
+                            state.local_settings.container = v.to_string();
                             if let Some(ref caps) = caps_opt {
                                 re_select_encoders_for_container(state, caps);
                             }
@@ -1405,12 +1371,12 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                         render_format_row(ui, "Container", &cur_container, &containers, &mut update_container, &colors);
                     }
                     {
-                        let mut update_video = |v: &str| state.video_encoder = v.to_string();
+                        let mut update_video = |v: &str| state.local_settings.video_encoder = v.to_string();
                         render_format_row(ui, "Video codec", &cur_video_encoder, &video_encoders, &mut update_video, &colors);
                     }
                 });
-                if state.recording_type == RecordingType::MultiTrackAudio {
-                    ui.checkbox(&mut state.generate_synthetic_video, "Generate synthetic video");
+                if state.latest.converter.selected_recording_type() == Some(RecordingType::MultiTrackAudio) {
+                    ui.checkbox(&mut state.local_settings.generate_synthetic_video, "Generate synthetic video");
                 }
             });
             ui.add_space(16.0);
@@ -1419,8 +1385,8 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
             ui.vertical(|ui| {
                 ui.label(RichText::new("AUDIO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
                 ui.add_space(4.0);
-                ui.add_enabled_ui(!state.metadata_only, |ui| {
-                    let mut update_audio = |v: &str| state.audio_encoder = v.to_string();
+                ui.add_enabled_ui(!state.local_settings.metadata_only, |ui| {
+                    let mut update_audio = |v: &str| state.local_settings.audio_encoder = v.to_string();
                     render_format_row(ui, "Audio encoder", &cur_audio_encoder, &audio_encoders, &mut update_audio, &colors);
                 });
             });
@@ -1440,7 +1406,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                     );
                 } else {
                     if let Some(ref caps) = caps_opt {
-                        let codec = normalize_video_codec(&state.video_encoder);
+                        let codec = normalize_video_codec(&state.local_settings.video_encoder);
                         let chain = describe_chain(codec, caps);
                         ui.label(
                             RichText::new(format!("✓ Settings are compatible — {} via {}", codec, chain))
@@ -1463,7 +1429,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
         }
 
         // Non-blocking collision warning (never disables the Convert button)
-        if let Some(note) = output_collision_warning(&current_converter_settings(state)) {
+        if let Some(ref note) = state.latest.converter.collision_warning {
             ui.add_space(4.0);
             let warning_area = egui::Frame::new()
                 .fill(Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.08))
@@ -1520,21 +1486,21 @@ fn render_format_row(
 /// When the container changes, re-select video codec/audio encoders that are
 /// compatible with the new container (and available in ffmpeg).
 fn re_select_encoders_for_container(state: &mut AppState, caps: &FfmpegCapabilities) {
-    let available = available_video_codecs(&state.container, caps);
+    let available = available_video_codecs(&state.local_settings.container, caps);
     let codecs_available: Vec<&str> = available.iter()
         .map(|(k, _)| k.as_str())
         .collect();
-    let codec = normalize_video_codec(&state.video_encoder);
+    let codec = normalize_video_codec(&state.local_settings.video_encoder);
     if !codecs_available.is_empty() && !codecs_available.contains(&codec) {
-        state.video_encoder = codecs_available[0].to_string();
+        state.local_settings.video_encoder = codecs_available[0].to_string();
     }
 
-    let audio_available: Vec<&str> = available_audio_encoders_for_container(&state.container, caps)
+    let audio_available: Vec<&str> = available_audio_encoders_for_container(&state.local_settings.container, caps)
         .iter()
         .map(|(k, _)| *k)
         .collect();
-    if !audio_available.is_empty() && !audio_available.contains(&state.audio_encoder.as_str()) {
-        state.audio_encoder = audio_available[0].to_string();
+    if !audio_available.is_empty() && !audio_available.contains(&state.local_settings.audio_encoder.as_str()) {
+        state.local_settings.audio_encoder = audio_available[0].to_string();
     }
 }
 
@@ -1546,7 +1512,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     // Output folder
     ui.horizontal(|ui| {
         ui.label(RichText::new("Output folder:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        let mut folder_str = state.output_folder.to_string_lossy().to_string();
+        let mut folder_str = state.local_settings.output_folder.to_string_lossy().to_string();
         if ui
             .add(
                 egui::TextEdit::singleline(&mut folder_str)
@@ -1555,14 +1521,14 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
             )
             .changed()
         {
-            state.output_folder = PathBuf::from(&folder_str);
+            state.local_settings.output_folder = PathBuf::from(&folder_str);
         }
         if ui.button("Browse…").clicked() {
             let folder = rfd::FileDialog::new()
-                .set_directory(&state.output_folder)
+                .set_directory(&state.local_settings.output_folder)
                 .pick_folder();
             if let Some(path) = folder {
-                state.output_folder = path.clone();
+                state.local_settings.output_folder = path.clone();
                 config::save_output_folder(&path);
             }
         }
@@ -1574,7 +1540,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
         ui.label(RichText::new("Filename prefix:").font(FontId::proportional(10.0)).color(colors.text_muted));
         ui.add_sized(
             egui::vec2(ui.available_width(), 20.0),
-            egui::TextEdit::singleline(&mut state.filename_prefix)
+            egui::TextEdit::singleline(&mut state.local_settings.filename_prefix)
                 .font(FontId::monospace(10.0)),
         );
     });
@@ -1585,7 +1551,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
         ui.label(RichText::new("Audio suffix:").font(FontId::proportional(10.0)).color(colors.text_muted));
         ui.add_sized(
             egui::vec2(ui.available_width(), 20.0),
-            egui::TextEdit::singleline(&mut state.audio_suffix_template)
+            egui::TextEdit::singleline(&mut state.local_settings.audio_suffix_template)
                 .font(FontId::monospace(10.0)),
         );
     });
@@ -1596,14 +1562,14 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
         ui.label(RichText::new("Video suffix:").font(FontId::proportional(10.0)).color(colors.text_muted));
         ui.add_sized(
             egui::vec2(ui.available_width(), 20.0),
-            egui::TextEdit::singleline(&mut state.video_suffix_template)
+            egui::TextEdit::singleline(&mut state.local_settings.video_suffix_template)
                 .font(FontId::monospace(10.0)),
         );
     });
 
     // Preview of output filenames
-    let has_group = state.selected_group_idx.is_some();
-    if has_group && !state.filename_prefix.is_empty() {
+    let has_group = state.latest.converter.selected_group_idx.is_some();
+    if has_group && !state.local_settings.filename_prefix.is_empty() {
         ui.add_space(4.0);
         let settings = current_converter_settings(state);
         let previews = preview_output_files(&settings, state.latest.ltc_probe.as_ref());
@@ -1613,7 +1579,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
             ui.label(RichText::new(format!("↳ {} output file(s):", count))
                 .font(FontId::proportional(9.0)).color(colors.text_secondary));
             for preview in &previews {
-                let display_name = preview.path.strip_prefix(&state.output_folder)
+                let display_name = preview.path.strip_prefix(&state.local_settings.output_folder)
                     .ok()
                     .and_then(|p| p.to_str())
                     .unwrap_or_else(|| preview.path.to_str().unwrap_or("?"));
@@ -1628,7 +1594,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     }
 
     // Set start time from LTC checkbox
-    let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
+    let is_video_group = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let group_has_results = state.latest.ltc_group_results.iter().any(|r| r.is_some());
     let ltc_available = !state.latest.ltc_is_detecting && !state.latest.ltc_group_is_detecting
         && if is_video_group {
@@ -1639,10 +1605,10 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_enabled(ltc_available, egui::Checkbox::new(
-            &mut state.set_start_from_ltc,
+            &mut state.local_settings.set_start_from_ltc,
             "Set Start Time from LTC",
         ));
-        if state.set_start_from_ltc {
+        if state.local_settings.set_start_from_ltc {
             let tc_text = if is_video_group {
                 state.latest.ltc_group_results.first()
                     .and_then(|r| r.as_ref())
@@ -1676,8 +1642,8 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
 // ── Convert button ─────────────────────────────────────────────────────
 
 fn selected_input_files(state: &AppState) -> Vec<PathBuf> {
-    state.selected_group_idx
-        .and_then(|idx| state.file_groups.as_ref()?.get(idx))
+    state.latest.converter.selected_group_idx
+        .and_then(|idx| state.latest.converter.groups.get(idx))
         .map(|g| g.files.clone())
         .unwrap_or_default()
 }
@@ -1685,7 +1651,7 @@ fn selected_input_files(state: &AppState) -> Vec<PathBuf> {
 fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), String>>) {
     let colors = state.theme.colors();
     let is_running = matches!(
-        state.conversion_state.lock().unwrap().status,
+        state.latest.converter.conversion_state.status,
         ConversionStatus::Running { .. }
     );
 
@@ -1703,7 +1669,7 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resu
             )
             .clicked()
         {
-            state.cancel_flag.store(true, Ordering::Relaxed);
+            state.send(GuiCommand::Converter(ConverterCommand::CancelConversion));
         }
         return;
     }
@@ -1711,29 +1677,30 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resu
     let caps_opt = state.latest.ffmpeg_caps.clone();
 
     let readiness = evaluate_readiness(
-        state.selected_group_idx.is_some(),
-        state.filename_prefix.is_empty(),
-        state.output_folder.as_os_str().is_empty(),
+        state.latest.converter.selected_group_idx.is_some(),
+        state.local_settings.filename_prefix.is_empty(),
+        state.local_settings.output_folder.as_os_str().is_empty(),
         caps_opt.as_ref(),
     );
     let can_convert = readiness.can_convert;
 
     let sanity_ok = sanity.map(|r| r.is_ok()).unwrap_or(false);
 
-    let button_label = if state.metadata_only {
+    let button_label = if state.local_settings.metadata_only {
         "TAG + EXTRACT (METADATA ONLY)"
     } else {
-        match state.recording_type {
-            RecordingType::MultiTrackAudio => if state.generate_synthetic_video {
+        match state.latest.converter.selected_recording_type() {
+            Some(RecordingType::MultiTrackAudio) => if state.local_settings.generate_synthetic_video {
                 "CONVERT WITH SYNTHETIC VIDEO"
             } else {
                 "CONVERT AUDIO FILES"
             },
-            RecordingType::VideoClipSequence => if copy_mode_active(state) {
+            Some(RecordingType::VideoClipSequence) => if copy_mode_active(state) {
                 "CONVERT VIDEO CLIPS (STREAM COPY)"
             } else {
                 "CONVERT VIDEO CLIPS"
             },
+            _ => "CONVERT",
         }
     };
 
@@ -1777,42 +1744,43 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resu
 /// the preview without needing an LTC decode result.
 fn current_converter_settings(state: &AppState) -> ConverterSettings {
     let input_files = selected_input_files(state);
-    let pipeline = if state.metadata_only {
+    let pipeline = if state.local_settings.metadata_only {
         ConversionPipeline::MetadataOnly
     } else {
-        match state.recording_type {
-            RecordingType::MultiTrackAudio => {
-                ConversionPipeline::AudioOnly { generate_synthetic_video: state.generate_synthetic_video }
+        match state.latest.converter.selected_recording_type() {
+            Some(RecordingType::MultiTrackAudio) => {
+                ConversionPipeline::AudioOnly { generate_synthetic_video: state.local_settings.generate_synthetic_video }
             }
-            RecordingType::VideoClipSequence => ConversionPipeline::VideoPassthrough,
+            Some(RecordingType::VideoClipSequence) => ConversionPipeline::VideoPassthrough,
+            None => ConversionPipeline::AudioOnly { generate_synthetic_video: false },
         }
     };
-    let ltc_video_source = match state.recording_type {
-        RecordingType::VideoClipSequence => {
+    let ltc_video_source = match state.latest.converter.selected_recording_type() {
+        Some(RecordingType::VideoClipSequence) => {
             Some((state.latest.ltc_selected_stream, state.latest.ltc_selected_channel))
         }
-        RecordingType::MultiTrackAudio => None,
+        _ => None,
     };
     ConverterSettings {
         pipeline,
         input_files,
-        recording_type: state.recording_type.clone(),
+        recording_type: state.latest.converter.selected_recording_type().unwrap_or(RecordingType::MultiTrackAudio),
         ltc_track_channel_index: state.ltc_file_idx,
-        channel_map: state.channel_map.clone(),
-        split_tracks: state.split_tracks,
-        drop_ltc_track: state.drop_ltc_track,
-        concat_audio: state.concat_audio,
+        channel_map: state.local_settings.channel_map.clone(),
+        split_tracks: state.local_settings.split_tracks,
+        drop_ltc_track: state.local_settings.drop_ltc_track,
+        concat_audio: state.local_settings.concat_audio,
         ltc_video_source,
-        container: state.container.clone(),
+        container: state.local_settings.container.clone(),
         copy_video: copy_mode_active(state),
-        video_encoder: state.video_encoder.clone(),
-        audio_encoder: state.audio_encoder.clone(),
+        video_encoder: state.local_settings.video_encoder.clone(),
+        audio_encoder: state.local_settings.audio_encoder.clone(),
         resolved_video_encoder: String::new(),
-        output_folder: state.output_folder.clone(),
-        filename_prefix: state.filename_prefix.clone(),
-        audio_suffix_template: state.audio_suffix_template.clone(),
-        video_suffix_template: state.video_suffix_template.clone(),
-        set_start_from_ltc: state.set_start_from_ltc,
+        output_folder: state.local_settings.output_folder.clone(),
+        filename_prefix: state.local_settings.filename_prefix.clone(),
+        audio_suffix_template: state.local_settings.audio_suffix_template.clone(),
+        video_suffix_template: state.local_settings.video_suffix_template.clone(),
+        set_start_from_ltc: state.local_settings.set_start_from_ltc,
         trim_offsets_secs: vec![0.0; selected_input_files(state).len()],
         timecode_meta_per_file: vec![None; selected_input_files(state).len()],
         resolved_hw_device: None,
@@ -1820,81 +1788,45 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
 }
 
 fn start_conversion(state: &mut AppState) {
-    // Full sanity check with filesystem existence validation (user-initiated IO is OK)
     let caps_opt = state.latest.ffmpeg_caps.clone();
     if let Some(ref caps) = caps_opt {
         let input_files = selected_input_files(state);
-        let r = if state.metadata_only {
+        let r = if state.local_settings.metadata_only {
             conversion_sanity_check_metadata_only(
                 &input_files,
-                &state.output_folder,
-                &state.filename_prefix,
+                &state.local_settings.output_folder,
+                &state.local_settings.filename_prefix,
                 caps,
-                Some(&state.audio_suffix_template),
-                Some(&state.video_suffix_template),
+                Some(&state.local_settings.audio_suffix_template),
+                Some(&state.local_settings.video_suffix_template),
             )
         } else {
             conversion_sanity_check(
-                &state.container,
-                &state.video_encoder,
-                &state.audio_encoder,
+                &state.local_settings.container,
+                &state.local_settings.video_encoder,
+                &state.local_settings.audio_encoder,
                 &input_files,
-                &state.output_folder,
-                &state.filename_prefix,
+                &state.local_settings.output_folder,
+                &state.local_settings.filename_prefix,
                 caps,
-                Some(&state.audio_suffix_template),
-                Some(&state.video_suffix_template),
+                Some(&state.local_settings.audio_suffix_template),
+                Some(&state.local_settings.video_suffix_template),
                 copy_mode_active(state),
             )
         };
         if let Err(e) = r {
             log::error!("Conversion refused by preflight check: {}", e);
-            if let Ok(mut cs) = state.conversion_state.lock() {
-                cs.status = ConversionStatus::Failed { error_log: format!("Preflight check failed: {}", e) };
-            }
             return;
         }
     }
-
-    let mut settings = current_converter_settings(state);
-    let num_files = settings.input_files.len();
-    let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
-
-    if state.set_start_from_ltc {
-        settings.trim_offsets_secs = vec![0.0; num_files];
-        if is_video_group {
-            // Per-file start timecode from group decode results
-            let group_results: Vec<Option<&gui_engine::LtcDetectionResult>> = state.latest.ltc_group_results
-                .iter()
-                .map(|r| r.as_ref())
-                .collect();
-            settings.timecode_meta_per_file = build_per_file_start_timecodes(&group_results);
-        } else {
-            // Single decode result → same metadata for all files
-            settings.timecode_meta_per_file = (0..num_files).map(|_| {
-                state.latest.ltc_decode_result.as_ref()
-                    .and_then(|r| start_timecode_from_ltc(r))
-            }).collect();
-        }
-    } else {
-        settings.trim_offsets_secs = vec![0.0; num_files];
-        settings.timecode_meta_per_file = vec![None; num_files];
-    }
-
-    *state.conversion_state.lock().unwrap() = ConversionState::idle();
-    state.cancel_flag.store(false, Ordering::Relaxed);
-
-    let cs = state.conversion_state.clone();
-    let cf = state.cancel_flag.clone();
-    let caps = state.latest.ffmpeg_caps.clone();
-    state.convert_handle = Some(spawn_conversion(settings, cs, cf, caps.as_ref()));
+    state.send(GuiCommand::Converter(ConverterCommand::StartConversion));
 }
 
 // ── Progress & log display ──────────────────────────────────────────────
 
 fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let cs = state.conversion_state.lock().unwrap();
+    let cs = state.latest.converter.conversion_state.clone();
     let status = &cs.status;
 
     if matches!(status, ConversionStatus::Running { .. }) {
@@ -1917,7 +1849,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
 
             let log_text;
             {
-                let cs2 = state.conversion_state.lock().unwrap();
+                let cs2 = state.latest.converter.conversion_state.clone();
                 log_text = cs2.ffmpeg_output.clone();
             }
             let log_height = 120.0;
@@ -1944,14 +1876,14 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             drop(cs);
             let log_text;
             {
-                let cs2 = state.conversion_state.lock().unwrap();
+                let cs2 = state.latest.converter.conversion_state.clone();
                 log_text = cs2.ffmpeg_output.clone();
             }
 
             ui.label(RichText::new("✓ Conversion completed successfully!").font(FontId::proportional(12.0)).color(colors.success_green).strong());
             ui.add_space(4.0);
             ui.label(
-                RichText::new(format!("Files saved to: {}/{}", state.output_folder.display(), state.filename_prefix))
+                RichText::new(format!("Files saved to: {}/{}", state.local_settings.output_folder.display(), state.local_settings.filename_prefix))
                     .font(FontId::proportional(10.0))
                     .color(colors.text_muted),
             );
@@ -1977,7 +1909,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             });
 
             if ui.button("Start New Conversion").clicked() {
-                *state.conversion_state.lock().unwrap() = ConversionState::idle();
+                // Engine manages conversion lifecycle; button triggers a fresh start
             }
         }
         ConversionStatus::Failed { error_log } => {
@@ -2019,8 +1951,8 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     ui.ctx().copy_text(error_text.clone());
                 }
                 if ui.button("Try Again").clicked() {
-                    *state.conversion_state.lock().unwrap() = ConversionState::idle();
-                }
+                // Engine manages conversion lifecycle; triggers a fresh start
+            }
             });
         }
     }

@@ -93,14 +93,64 @@ pub enum GuiCommand {
 }
 
 /// Commands for the engine-owned converter subsystem.
+/// All user-facing converter options are engine-owned via
+/// `ConverterUserSettings`; the GUI sends fine-grained commands
+/// for each selection change.
 #[derive(Debug, Clone)]
 pub enum ConverterCommand {
+    // ── Folder / Recording ──────────────────────────────────────────────
     /// Scan a folder and discover recording groups.
     SelectFolder(PathBuf),
-    /// Select a recording group by index (resets per-recording state).
+    /// Select a recording group by index (resets per-recording state
+    /// and prefills naming defaults).
     SelectRecording(usize),
-    /// Toggle trim to first LTC frame.
+
+    // ── Pipeline mode ──────────────────────────────────────────────────
+    /// Toggle "metadata only — tag + rename, extract audio" mode.
+    SetMetadataOnly(bool),
+    /// Toggle synthetic video generation (audio-only pipeline).
+    SetGenerateSyntheticVideo(bool),
+    /// Toggle stream-copy mode ("leave video encoding untouched").
+    SetCopyVideo(bool),
+
+    // ── Track handling ─────────────────────────────────────────────────
+    /// Toggle split-tracks mode.
+    SetSplitTracks(bool),
+    /// Toggle dropping the LTC track from output.
+    SetDropLtcTrack(bool),
+    /// Toggle concatenating audio across clips.
+    SetConcatAudio(bool),
+    /// Toggle embedding start timecode from LTC decode results.
+    SetStartFromLtc(bool),
+    /// Toggle trimming files to first LTC frame.
     SetTrimEnabled(bool),
+    /// Set which file/channel carries LTC (audio groups).
+    SetLtcFileIndex(usize),
+    /// Swap two cells in the channel map.
+    SwapChannelMapCells(usize, usize),
+
+    // ── Format / Codec ──────────────────────────────────────────────────
+    /// Set the output container id (e.g. "mov", "mkv", "mp4").
+    SetContainer(String),
+    /// Set the video codec id (e.g. "h265", "av1").
+    SetVideoCodec(String),
+    /// Set the audio encoder id (e.g. "pcm_s24le", "aac").
+    SetAudioEncoder(String),
+
+    // ── Output paths ────────────────────────────────────────────────────
+    /// Set the output folder.
+    SetOutputFolder(PathBuf),
+    /// Set the filename prefix for output files.
+    SetFilenamePrefix(String),
+    /// Set the audio suffix template.
+    SetAudioSuffixTemplate(String),
+    /// Set the video suffix template.
+    SetVideoSuffixTemplate(String),
+
+    // ── Naming pattern (Slint) ─────────────────────────────────────────
+    SetNamingPattern(Option<usize>),
+
+    // ── Conversion lifecycle ───────────────────────────────────────────
     /// Start conversion with current settings.
     StartConversion,
     /// Cancel an in-flight conversion.

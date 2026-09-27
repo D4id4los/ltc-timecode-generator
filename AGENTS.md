@@ -128,6 +128,16 @@ User action → GUI event handler → mpsc::Sender<GuiCommand>
                     GUI reads state.load() each frame
 ```
 
+### Sole Source of Truth — State Ownership
+
+The engine is the **sole source of truth** for all application state. GUIs hold only framework-level state (tab index, popup visibility, toast notifications, text-edit-in-progress buffers, scroll offsets). All user-configurable options — including every converter setting (container, codecs, split/drop/trim toggles, channel map, output paths, naming templates) — are engine-owned via `ConverterUserSettings` in `AppStateSnapshot.converter.settings`.
+
+**Data flow for all mutations:**
+1. User interacts with GUI widget → GUI sends a `GuiCommand` (fine-grained, one per field)
+2. Engine receives the command, mutates its owned state, applies side-effects (defaults repair, readiness recompute, config persist, channel-map resize, auto-apply from LTC decode, encoder re-selection on container change, prefix prefill on recording select)
+3. Next tick: engine publishes updated `AppStateSnapshot` via `ArcSwap`
+4. GUI reads the latest snapshot and re-renders
+
 ### GuiCommand
 Commands are sent from the GUI thread to the engine via `mpsc::Sender<GuiCommand>` (see `command.rs` for the full enum). Categories:
 - **Transport** — start/stop LTC, reset, lock, clap
@@ -137,6 +147,8 @@ Commands are sent from the GUI thread to the engine via `mpsc::Sender<GuiCommand
 - **Theme** — set/toggle dark-light
 - **Logs** — clear clap log
 - **LTC decode** — parse WAV file, probe video, parse video (stream/channel selection), cancel decode
+- **Converter** — fine-grained setters for every converter option: pipeline mode (`SetMetadataOnly`, `SetGenerateSyntheticVideo`, `SetCopyVideo`), track handling (`SetSplitTracks`, `SetDropLtcTrack`, `SetConcatAudio`, `SetStartFromLtc`, `SetTrimEnabled`, `SetLtcFileIndex`, `SwapChannelMapCells`), format/codec (`SetContainer`, `SetVideoCodec`, `SetAudioEncoder`), output paths (`SetOutputFolder`, `SetFilenamePrefix`, `SetAudioSuffixTemplate`, `SetVideoSuffixTemplate`), naming pattern (`SetNamingPattern`), folder/recording selection (`SelectFolder`, `SelectRecording`), and conversion lifecycle (`StartConversion`, `CancelConversion`).
+- **Offload** — scan cards, set parent folder/name, device naming, start/cancel offload
 - **Shutdown** — graceful engine stop
 - **Steppers** — up/down nudges for scene, take, and timecode segments
 
@@ -148,16 +160,21 @@ Field groups (see `state.rs` for the full struct): generation counter; transport
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 0. **Spawn ffmpeg capability probe** — before the loop starts, a background thread runs `query_ffmpeg_capabilities()` (hw-validated) and sends the result via an internal mpsc channel.
-1. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop
-1.5 **Drain ffmpeg probe result** — the first result sets `current.ffmpeg_caps` and clears `ffmpeg_probe_running`.
-2. **Drain async decode results** — generation-stamped, so stale results from rapid re-clicks are discarded
-3. **Poll chunked decode progress** — updates progress pct + "Chunk N/M" string
-4. **Poll timecode** — `core.current_timecode()` when playing
-5. **Drain events** — `core.drain_events()`, dispatches to recovery or forwards to `state.events`
-6. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s)
-7. **Update system time**
-8. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
-9. **Sleep** until next tick
+1. **Drain folder scan results** — async scan result from background thread
+2. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop. Converter commands are handled inline (selectors, setters, side-effects, config persistence) or dispatched to `process_command`.
+3. **Drain async decode results** — generation-stamped, so stale results from rapid re-clicks are discarded. On completion, auto-applies LTC settings to converter (split/drop/start-from-LTC) once per generation.
+4. **Drain async group decode results** — same generation gating; on full group completion, same auto-apply.
+5. **Drain ffmpeg probe result** — sets `current.ffmpeg_caps`; calls `apply_available_defaults` to repair stale converter settings and `recompute_converter_derived`.
+6. **Drain converter clip probe results** — populates `ltc_probe` for video groups; resizes `channel_map` to identity if probe channel count changed.
+7. **Poll chunked/group decode progress** — updates progress pct from atomics
+8. **Poll conversion progress** — reads engine-owned `SharedConversionState` and writes into snapshot's `converter.conversion_state`; resets shared state on completion/failure.
+9. **Poll timecode** — `core.current_timecode()` when playing
+10. **Drain events** — clears `state.events` first, then drains `core.drain_events()`, dispatches to recovery or forwards to `state.events`
+11. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s)
+12. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
+13. **Update system time**
+14. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
+15. **Sleep** until next tick
 
 ### Audio Lifecycle
 - **Init**: 3 retries with exponential backoff (50ms → 100ms → 200ms). Distinguishes permanent errors (permission denied — no retry) from transient (device busy — retry).
@@ -174,26 +191,15 @@ The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 
 ## Converter / Export Subsystem
 
-The converter turns raw recordings into deliverables: trim each file to its first LTC frame, embed start timecode as ffmpeg `-timecode` metadata, drop or split the LTC track, and remux/encode into the chosen container. Implemented in `gui_engine` and exposed in all three GUI frontends (ltc-gui **Convert** tab, ltc-slint converter section, web `ConverterTab`).
+The converter turns raw recordings into deliverables: trim each file to its first LTC frame, embed start timecode as ffmpeg `-timecode` metadata, drop or split the LTC track, and remux/encode into the chosen container. Implemented in `gui_engine` and exposed in both Rust GUIs (ltc-gui **Convert** tab, ltc-slint converter section).
+
+### Engine Ownership
+
+All converter user settings live in `ConverterUserSettings` (`state.rs`), owned by the engine. GUIs send `ConverterCommand` variants for every mutation. The engine applies side-effects (defaults repair, prefix prefill, channel-map resize, LTC auto-apply, config persistence, encoder re-selection on container change) and publishes the updated snapshot. Derived UI data (readiness blockers, collision warning, output preview, encoder chain description) is recomputed by `recompute_converter_derived()` in the engine and published for GUIs to render.
+
+Conversion execution runs in the engine thread via `StartConversion` which calls `assemble_converter_settings()` then `spawn_conversion()` with engine-owned `SharedConversionState` and `CancelFlag`. Progress is polled each tick and published into `ConverterSnapshot.conversion_state`.
 
 ### Components (`converter/` directory module)
-
-The monolithic `converter.rs` was split into a directory module with submodules, each owning one responsibility. All public types and functions are re-exported through `converter/mod.rs`, so `gui_engine::converter::X` paths are unchanged.
-
-- **`mod.rs`** — facade re-exporting the public API from all submodules.
-- **`progress.rs`** — `ConversionState`, `ConversionStatus`, `SharedConversionState`, `CancelFlag`.
-- **`channel_map.rs`** — `ChannelMap` (input→output permutation).
-- **`timecode.rs`** — `TimecodeMetadata`, `format_ffmpeg_timecode`, `shift_timecode_back`, `start_timecode_from_ltc`, per-file TC builders.
-- **`capabilities.rs`** — `FfmpegCapabilities`, `HwDeviceCapabilities`, `query_ffmpeg_capabilities()` (ffmpeg binary probing).
-- **`formats.rs`** — codec/container compatibility tables: `supported_*`, `available_*`, `select_best_combination`, `apply_available_defaults`.
-- **`settings.rs`** — `ConversionPipeline`, `RecordingType`, `ConverterSettings` + output-path naming.
-- **`planning.rs`** — `AudioKeep`, `VideoOutputStep`, `plan_video_outputs*`, `plan_concat_outputs`, `preview_output_files`, `output_collision_warning`.
-- **`checks.rs`** — preflight validation: `conversion_sanity_check*`, `ConvertBlocker`, `evaluate_readiness`, `format_blockers`.
-- **`args.rs`** — ffmpeg argument construction (`build_*_args`, `push_*` helpers).
-- **`process.rs`** — `run_ffmpeg_process`, `parse_out_time`, `classify_step_failure`, `StepFailure`.
-- **`runner.rs`** — `EncoderFallback`, `run_video_step_with_fallback`, `prepare_copy_mode`, `spawn_conversion`, four pipeline runners (`run_audio_to_audio`, `run_audio_to_synthetic_video`, `run_video_to_video`, `run_metadata_only`).
-
-**`converter.rs`** (original monolith, now removed) — core pipeline:
   - `ConversionPipeline`: `AudioOnly { generate_synthetic_video }` (multi-track WAV → audio/video outputs), `VideoPassthrough` (camera clips → video outputs), and `MetadataOnly` (tag originals in place, rename, extract audio).
   - `ConverterSettings`: input files, `RecordingType` (MultiTrackAudio / VideoClipSequence), `ChannelMap` (input→output permutation), `split_tracks` / `drop_ltc_track` / `ltc_video_source`, container + video codec / audio encoder, output folder + naming templates (defaults `_audio_track{:01d}` / `_video_clip{:02d}`), `trim_to_first_ltc` + per-file trim offsets, per-file `TimecodeMetadata` (start TC, fps, drop-frame).
   - `conversion_sanity_check_metadata_only()` — lightweight preflight for `MetadataOnly` pipeline (only ffmpeg, file existence, template validation).

@@ -1,5 +1,5 @@
 /// Maps input audio channels to output positions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChannelMap {
     num_channels: usize,
     mapping: Vec<usize>,
