@@ -1,3 +1,4 @@
+pub mod camera_meta;
 pub mod cli;
 pub mod command;
 pub mod config;
@@ -19,6 +20,9 @@ pub mod timecode;
 
 // Re-export commonly-used types so GUI crates don't need direct deps
 pub use arc_swap::ArcSwap;
+// Re-export camera_meta types
+pub use camera_meta::{probe_camera_info, CameraInfo, CameraMetaSource};
+
 pub use audio_core::{
     compute_ltc_quality, decode_ltc_chunked, decode_ltc_from_wav, decode_ltc_from_wav_libltc,
     decode_ltc_samples, decode_ltc_samples_libltc, decode_ltc_with_decoder, quick_check_ltc,

@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use chrono::Local;
 
+use crate::camera_meta;
 use crate::file_pattern::{CAMERA_PATTERNS, BUILTIN_PATTERNS};
 
 /// Video file extensions recognised as media (same list as `ffprobe::VIDEO_EXTENSIONS`).
@@ -29,7 +30,8 @@ const MAX_CARD_FILES: usize = 10_000;
 /// How a device name was determined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceNameSource {
-    /// Parsed from embedded XAVC metadata (e.g. `ILCE-6700` → `A6700`).
+    /// Parsed from embedded camera metadata — XAVC XML sniff, exiftool
+    /// (AVCHD SEI, MP4/MOV tags), or ffprobe format tags.
     Metadata,
     /// Derived from the filename pattern (e.g. `Sony FS100` → `FS100`).
     Pattern,
@@ -444,7 +446,8 @@ fn volume_label_for(mount: &Path) -> String {
 // ── Device name resolution ──────────────────────────────────────────────
 
 /// Resolve device name from media files on a card.
-/// Priority: 1) XAVC metadata, 2) filename pattern, 3) volume label, 4) "Card N".
+/// Priority: 1) XAVC metadata, 2) camera_meta (exiftool/ffprobe),
+///            3) filename pattern, 4) volume label, 5) "Card N".
 fn guess_device_name_for_card(
     files: &[PathBuf],
     volume_label: &str,
@@ -454,7 +457,12 @@ fn guess_device_name_for_card(
         return (name, source, None);
     }
 
-    // 2) Filename pattern matching.
+    // 2) Camera metadata via exiftool (AVCHD SEI) or ffprobe tags.
+    if let Some((name, source)) = try_camera_meta_name(files) {
+        return (name, source, None);
+    }
+
+    // 3) Filename pattern matching.
     let pattern_names = match_files_to_pattern_names(files);
     if !pattern_names.is_empty() {
         let best = &pattern_names[0];
@@ -462,14 +470,30 @@ fn guess_device_name_for_card(
         return (device, DeviceNameSource::Pattern, Some(best.clone()));
     }
 
-    // 3) Volume label.
+    // 4) Volume label.
     let label = volume_label.trim();
     if !label.is_empty() && !label.eq_ignore_ascii_case("usb") && !label.eq_ignore_ascii_case("usb drive") {
         return (label.to_string(), DeviceNameSource::VolumeLabel, None);
     }
 
-    // 4) Fallback.
+    // 5) Fallback.
     ("Card".to_string(), DeviceNameSource::Unknown, None)
+}
+
+/// Try to extract a model name from a video file's camera metadata
+/// via exiftool or ffprobe (handles AVCHD SEI, MP4/MOV tags).
+fn try_camera_meta_name(files: &[PathBuf]) -> Option<(String, DeviceNameSource)> {
+    for f in files {
+        if !is_video_file(f) {
+            continue;
+        }
+        if let Some(info) = camera_meta::probe_camera_info(f) {
+            if let Some(model) = info.model {
+                return Some((model, DeviceNameSource::Metadata));
+            }
+        }
+    }
+    None
 }
 
 /// Try to extract a model name from a video file's XAVC metadata.

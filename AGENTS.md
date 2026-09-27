@@ -53,6 +53,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── command.rs            # GuiCommand enum (source of truth for all commands)
 │   │   ├── state.rs              # AppStateSnapshot + ClapLogItem (source of truth for published state)
 │   │   ├── engine.rs             # Threaded engine loop, AudioCore lifecycle, retry/recovery, decode handling
+│   │   ├── camera_meta.rs        # Camera model detection from clips (exiftool/ffprobe probe)
 │   │   ├── cli.rs                # Cli struct, parse_args(), process_cli(); headless/WAV/list-devices/decode modes
 │   │   ├── timecode.rs           # FPS_OPTIONS (24/25/29.97 ND/29.97 DF/30), timecode formatting helpers
 │   │   ├── log_buffer.rs         # LogBuffer ring buffer + init_logger (canonical logger)
@@ -336,6 +337,13 @@ Integration suites in `gui-engine/tests/`: `integration.rs` (engine), `converter
 sudo apt install libltc-dev
 export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
 ```
+
+**Optional:** `exiftool` is auto-detected at runtime for camera metadata extraction during card scans (AVCHD SEI, MP4/MOV tags). Install it for more accurate device auto-naming:
+```bash
+sudo apt install exiftool
+# Or from source: https://exiftool.org
+```
+The probe gracefully falls back to ffprobe tags or filename patterns when exiftool is absent.
 
 ```bash
 npm run dev                          # Vite dev server on port 3000
