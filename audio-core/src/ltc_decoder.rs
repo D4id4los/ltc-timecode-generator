@@ -54,7 +54,8 @@ pub struct LtcQualityReport {
     pub score: f64,
     /// Human-readable grade: Excellent / Good / Fair / Poor / Bad
     pub grade: String,
-    /// Number of undetected frames (total_possible - valid)
+    /// Number of undetected frames within the span between the first and last
+    /// decoded frame (silent lead-in/out and pre-LTC silence are not counted)
     pub missing_frames: u32,
     /// Number of gaps between contiguous frame blocks
     pub gap_count: u32,
@@ -68,6 +69,19 @@ pub struct LtcQualityReport {
     pub drift_rate: f64,
     /// Largest contiguous block of consecutive frames
     pub largest_block: u32,
+    /// Fraction of decoded frames that lie in usable blocks (0.0–1.0).
+    /// A block is usable when it is long enough to sync against (>= 2s,
+    /// or >= 90% of the recording for very short recordings) and its
+    /// internal clock drift accumulates at most 1 frame over its length.
+    pub usable_coverage: f64,
+    /// Number of contiguous blocks (segments) the decode is split into
+    pub block_count: u32,
+    /// Worst drift accumulation within a single block, in frames
+    pub worst_block_drift_frames: f64,
+    /// Number of block boundaries where the timecode jumps backwards
+    /// (timecode reset — the same TC values can recur, which makes
+    /// syncing by TC value ambiguous in editors)
+    pub backward_jump_count: u32,
     /// Human-readable summary of issues found
     pub summary: String,
     /// Indices of gap boundaries: (prev_segment_last_idx, next_segment_first_idx)
@@ -705,6 +719,47 @@ pub fn apply_coherent_first_timecode(result: &mut LtcDetectionResult) {
     }
 }
 
+/// Least-squares fit of the drift series against audio position over a
+/// contiguous frame range.
+///
+/// Returns `(slope, max_abs_residual)` where `slope` is seconds of drift
+/// per second of audio within the range, and `max_abs_residual` is the
+/// largest deviation of any sample from the fitted line (jitter).
+/// Ranges with fewer than 2 points or zero time span yield `(0.0, 0.0)`.
+fn fit_segment_drift(
+    audio_secs: &[f64],
+    drift: &[f64],
+    range: std::ops::Range<usize>,
+) -> (f64, f64) {
+    let len = range.end.saturating_sub(range.start);
+    if len < 2 {
+        return (0.0, 0.0);
+    }
+    let xs = &audio_secs[range.start..range.end];
+    let ys = &drift[range.start..range.end];
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let mut sxx = 0.0f64;
+    let mut sxy = 0.0f64;
+    for (&x, &y) in xs.iter().zip(ys) {
+        let dx = x - mx;
+        sxx += dx * dx;
+        sxy += dx * (y - my);
+    }
+    if sxx <= 1e-12 {
+        return (0.0, 0.0);
+    }
+    let slope = sxy / sxx;
+    let intercept = my - slope * mx;
+    let max_residual = xs
+        .iter()
+        .zip(ys)
+        .map(|(&x, &y)| (y - (slope * x + intercept)).abs())
+        .fold(0.0f64, f64::max);
+    (slope, max_residual)
+}
+
 /// Compute a quality report for a decoded LTC sequence.
 ///
 /// Returns `None` when there are no decoded timecodes to analyze.
@@ -712,7 +767,6 @@ pub fn apply_coherent_first_timecode(result: &mut LtcDetectionResult) {
 /// gaps, glitches, edit points, and clock drift.
 pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityReport> {
     let timecodes = &result.timecodes;
-    let valid = result.valid_frames;
     if timecodes.is_empty() || result.detected_fps <= 0.0 {
         return None;
     }
@@ -739,13 +793,6 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         .map(|i| (audio_secs[i] - first_audio) - (ltc_secs[i] - first_ltc))
         .collect();
 
-    let total_possible = result.total_possible_frames.max(valid) as f64;
-    let missing_frames = if total_possible > 0.0 {
-        (total_possible - valid as f64).max(0.0) as u32
-    } else {
-        0
-    };
-
     // Find contiguous segments by comparing LTC timecode values,
     // NOT frame_index (which gets re-indexed by chunked merge).
     let frame_duration = 1.0 / fps;
@@ -765,15 +812,67 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
     // Largest contiguous block
     let largest_block = segments.iter().map(|s| (s.end - s.start) as u32).max().unwrap_or(0);
 
+    // ── Per-block clock drift (least-squares fit) ─────────────────────────
+    // Drift is fitted per block so that TC jumps between blocks cannot
+    // contaminate the measurement: each block gets its own linear model
+    // and only its own clock error counts against it.
+    struct BlockDrift {
+        slope: f64,
+        accum_frames: f64,
+        frames: usize,
+        duration: f64,
+    }
+    let blocks: Vec<BlockDrift> = segments
+        .iter()
+        .map(|seg| {
+            let (slope, _residual) = fit_segment_drift(&audio_secs, &drift, seg.start..seg.end);
+            let duration = audio_secs[seg.end - 1] - audio_secs[seg.start];
+            let accum_frames = (slope * duration).abs() * fps;
+            BlockDrift { slope, accum_frames, frames: seg.end - seg.start, duration }
+        })
+        .collect();
+
+    // ── Block usability ───────────────────────────────────────────────────
+    // A block is usable for syncing when it is long enough to align against
+    // (>= 2s; for very short recordings 90% of the span so a short clean
+    // clip still counts) and its drift accumulates at most 1 frame over its
+    // length. Everything else in the score is anchored on this.
+    let total_span = audio_secs[n - 1] - audio_secs[0];
+    let min_block_duration = if total_span < 2.2 { (total_span * 0.9).min(2.0) } else { 2.0 };
+    let mut usable_frames = 0usize;
+    let mut worst_block_drift_frames = 0.0f64;
+    let mut worst_slope = 0.0f64;
+    let mut drift_penalty = 0.0f64;
+    for b in &blocks {
+        if b.slope.abs() > worst_slope.abs() {
+            worst_slope = b.slope;
+        }
+        if b.accum_frames > worst_block_drift_frames {
+            worst_block_drift_frames = b.accum_frames;
+        }
+        let usable = b.duration >= min_block_duration && b.accum_frames <= 1.0;
+        if usable {
+            usable_frames += b.frames;
+            if b.accum_frames > 0.5 {
+                // Usable but degraded: the sync error creeps towards a frame
+                let severity = ((b.accum_frames - 0.5) / 0.5).min(1.0);
+                drift_penalty += 0.10 * severity * (b.frames as f64 / n as f64);
+            }
+        }
+    }
+    let usable_coverage = usable_frames as f64 / n as f64;
+
     // Analyze gaps between segments and detect edits
     // An edit is: a large LTC jump (>=10 frames) where audio elapsed doesn't match ltc elapsed
     let mut gap_count: u32 = 0;
     let mut edit_count: u32 = 0;
+    let mut backward_jump_count: u32 = 0;
+    let mut first_backward_block: Option<usize> = None;
     let mut gap_edges: Vec<(usize, usize)> = Vec::new();
     let edit_threshold = 0.1;  // seconds — audio-vs-LTC mismatch must exceed this
     let edit_ltc_jump_threshold = 10.0 / fps;  // LTC must jump by at least 10 frames
 
-    for w in segments.windows(2) {
+    for (block_idx, w) in segments.windows(2).enumerate() {
         let prev = &w[0];
         let cur = &w[1];
         let i_prev = prev.end - 1;
@@ -789,12 +888,31 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         if ltc_elapsed.abs() > edit_ltc_jump_threshold && diff > edit_threshold {
             edit_count += 1;
         }
+
+        // Backward jump: the TC value goes back (timecode reset). The TC
+        // values after the jump can recur from earlier in the recording,
+        // which makes syncing by TC value ambiguous in editors.
+        if ltc_elapsed < -0.5 * frame_duration {
+            backward_jump_count += 1;
+            if first_backward_block.is_none() {
+                first_backward_block = Some(block_idx + 1);
+            }
+        }
     }
 
-    // Detect glitch frames within contiguous segments
+    // Frames from the first backward jump onward are ambiguous
+    let backward_affected_frames: usize = match first_backward_block {
+        Some(k) => segments[k..].iter().map(|s| s.end - s.start).sum(),
+        None => 0,
+    };
+
+    // Detect glitch frames within contiguous segments.
+    // Threshold 1.5 frames: a single frame deviating by 2 frames stays
+    // inside its segment (segment splits need > 2 frames deviation) but is
+    // caught here; deviations >= 3 frames split segments and count as gaps.
     let mut glitch_count: u32 = 0;
     let mut glitch_indices: Vec<usize> = Vec::new();
-    let glitch_threshold = 2.0 / fps;
+    let glitch_threshold = 1.5 / fps;
 
     for seg in &segments {
         let seg_len = seg.end - seg.start;
@@ -810,53 +928,41 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         }
     }
 
-    // Compute robust max drift (99th percentile of |drift|)
-    let mut sorted_drift_abs: Vec<f64> = drift.iter().map(|d| d.abs()).collect();
-    sorted_drift_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let max_drift_secs = if sorted_drift_abs.len() > 5 {
-        let p99_idx = ((sorted_drift_abs.len() - 1) as f64 * 0.99).round() as usize;
-        sorted_drift_abs[p99_idx.min(sorted_drift_abs.len() - 1)]
-    } else {
-        sorted_drift_abs.last().copied().unwrap_or(0.0)
-    };
-
-    let drift_rate = if n >= 2 && (audio_secs[n - 1] - audio_secs[0]).abs() > 1e-6 {
-        (drift[n - 1] - drift[0]) / (audio_secs[n - 1] - audio_secs[0])
+    // ── Missing frames within the decoded LTC span ────────────────────────
+    // Only frames between the first and last decoded frame can be missing.
+    // Silent lead-in/out and pre-LTC silence at the edges of the recording
+    // are normal, not defects.
+    let expected_in_span = ((audio_secs[n - 1] - audio_secs[0]) * fps).round() as i64 + 1;
+    let missing_frames = (expected_in_span - n as i64).max(0) as u32;
+    let missing_ratio = if expected_in_span > 0 {
+        missing_frames as f64 / expected_in_span as f64
     } else {
         0.0
     };
 
-    // Calculate score (0.0 - 1.0)
-    let missing_ratio = if total_possible > 0.0 {
-        missing_frames as f64 / total_possible
-    } else {
-        0.0
-    };
+    // ── Score (0.0 – 1.0), anchored on usable coverage ────────────────────
+    let mut score = usable_coverage;
 
-    let mut score = 1.0;
+    // Forward TC jumps are normal in the field (generator restarts, re-jams)
+    // and do not invalidate the frames around them: small fixed penalty.
+    score -= 0.02 * (edit_count.min(10)) as f64;
 
+    // Backward jumps (TC reset) make TC values recur: penalize by the
+    // fraction of the recording that becomes ambiguous.
+    score -= 0.30 * (backward_affected_frames as f64 / n as f64);
+
+    // Glitches only matter once they exceed 0.1% of frames, then scale up.
+    let glitch_ratio = glitch_count as f64 / n as f64;
+    if glitch_ratio > 0.001 {
+        score -= 0.15 * ((glitch_ratio - 0.001) / 0.009).min(1.0);
+    }
+
+    // Usable blocks whose drift creeps towards a frame
+    score -= drift_penalty;
+
+    // Missing frames inside the LTC span (interior holes)
     if missing_ratio > 0.05 {
         score -= 0.15 * (missing_ratio / 0.5).min(1.0);
-    }
-
-    score -= 0.03 * (gap_count as f64).min(5.0);
-    score -= 0.03 * (glitch_count as f64).min(5.0);
-
-    if edit_count > 0 {
-        score -= 0.30;
-        if edit_count > 1 {
-            score -= 0.10 * (edit_count - 1) as f64;
-        }
-    }
-
-    let drift_rate_fps = drift_rate.abs() * fps;
-    if drift_rate_fps > 0.5 {
-        score -= 0.05 * (drift_rate_fps / 5.0).min(1.0);
-    }
-
-    let max_drift_frames = max_drift_secs * fps;
-    if max_drift_frames > 3.0 {
-        score -= 0.10 * (max_drift_frames / 10.0).min(1.0);
     }
 
     score = score.clamp(0.0, 1.0);
@@ -876,29 +982,31 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
 
     // Build summary
     let mut parts: Vec<String> = Vec::new();
-    if missing_frames > 0 {
-        parts.push(format!("{} missing frame(s)", missing_frames));
-    }
-    if gap_count > 0 {
-        parts.push(format!("{} gap(s)", gap_count));
+    if edit_count > 0 || backward_jump_count > 0 {
+        parts.push(format!("{} TC jump(s) ({} backward)", edit_count, backward_jump_count));
     }
     if glitch_count > 0 {
         parts.push(format!("{} glitch(es)", glitch_count));
     }
-    if edit_count > 0 {
-        parts.push(format!("{} edit point(s)", edit_count));
+    if missing_frames > 0 {
+        parts.push(format!("{} missing frame(s)", missing_frames));
     }
-    if drift_rate_fps > 0.5 {
-        parts.push(format!("drift {:.3} s/s", drift_rate));
+    if worst_block_drift_frames > 0.5 {
+        parts.push(format!("max drift {:.2} frame(s)", worst_block_drift_frames));
     }
-    if max_drift_frames > 1.0 {
-        parts.push(format!("max drift {:.2}s", max_drift_secs));
+    if worst_slope.abs() * fps > 0.5 {
+        parts.push(format!("drift rate {:.3} s/s", worst_slope));
     }
 
+    let coverage_part = format!(
+        "{:.1}% usable ({} block(s))",
+        usable_coverage * 100.0,
+        blocks.len()
+    );
     let summary = if parts.is_empty() {
-        "No issues detected — all frames contiguous and in sync".to_string()
+        format!("{} — all frames contiguous and in sync", coverage_part)
     } else {
-        parts.join(", ")
+        format!("{}; {}", coverage_part, parts.join(", "))
     };
 
     Some(LtcQualityReport {
@@ -908,9 +1016,13 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         gap_count,
         glitch_count,
         edit_count,
-        max_drift_secs,
-        drift_rate,
+        max_drift_secs: worst_block_drift_frames / fps,
+        drift_rate: worst_slope,
         largest_block,
+        usable_coverage,
+        block_count: blocks.len() as u32,
+        worst_block_drift_frames,
+        backward_jump_count,
         summary,
         gap_edges,
         glitch_indices,
@@ -3880,5 +3992,222 @@ mod tests {
         let signal = base_signal();
         let result = base_decode(&signal);
         assert_ltc_ok(&result, 45);
+    }
+
+    // ── compute_ltc_quality: real-world usability model ──────────────────
+    //
+    // The score must reflect what matters when syncing takes in an editor:
+    // how much of the recording is covered by long, internally linear
+    // blocks — not the raw count of discontinuities between them.
+
+    const QFPS: f64 = 25.0;
+
+    fn qtc_from_secs(secs: f64, fps: f64) -> Timecode {
+        let fps_i = fps as i64;
+        let total = (secs * fps).round() as i64;
+        let total_secs = total.div_euclid(fps_i);
+        Timecode {
+            hours: (total_secs.div_euclid(3600).rem_euclid(24)) as u32,
+            minutes: (total_secs.div_euclid(60).rem_euclid(60)) as u32,
+            seconds: (total_secs.rem_euclid(60)) as u32,
+            frames: (total.rem_euclid(fps_i)) as u32,
+        }
+    }
+
+    /// One contiguous block of decoded frames.
+    struct QBlock {
+        frames: usize,
+        /// TC value jump applied at this block's boundary (blocks > 0)
+        tc_jump_secs: f64,
+        /// Silence in the audio before this block starts (blocks > 0)
+        #[allow(dead_code)]
+        audio_gap_secs: f64,
+        /// Audio advances at (1 + drift_rate) × the TC rate in this block
+        drift_rate: f64,
+    }
+
+    fn build_quality_result(
+        blocks: &[QBlock],
+        glitch_indices: &[usize],
+        lead_in_secs: f64,
+        total_possible: u32,
+        audio_duration: f64,
+    ) -> LtcDetectionResult {
+        let fd = 1.0 / QFPS;
+        let mut tcs: Vec<f64> = Vec::new();
+        let mut auds: Vec<f64> = Vec::new();
+        let mut audio = lead_in_secs;
+        let mut tc = 3600.0; // 01:00:00:00
+        for (bi, b) in blocks.iter().enumerate() {
+            if bi > 0 {
+                audio += b.audio_gap_secs;
+                tc += b.tc_jump_secs;
+            }
+            for _ in 0..b.frames {
+                tcs.push(tc);
+                auds.push(audio);
+                audio += fd * (1.0 + b.drift_rate);
+                tc += fd;
+            }
+        }
+        // Glitch = single frame whose TC is 2 frames ahead of its neighbours
+        // (stays within the segment but trips the glitch detector)
+        for &g in glitch_indices {
+            tcs[g] += 2.0 * fd;
+        }
+        let timecodes: Vec<FrameTimecode> = tcs
+            .iter()
+            .zip(&auds)
+            .map(|(&t, &a)| FrameTimecode {
+                frame_index: 0,
+                timecode: qtc_from_secs(t, QFPS),
+                timecode_secs: a,
+            })
+            .collect();
+        LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: QFPS as f32,
+            drop_frame: false,
+            total_possible_frames: total_possible,
+            valid_frames: timecodes.len() as u32,
+            avg_confidence: 1.0,
+            timecodes,
+            details: vec![],
+            total_audio_duration_secs: audio_duration,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            first_ltc_timecode_secs: 0.0,
+            quality: None,
+        }
+    }
+
+    #[test]
+    fn test_quality_fit_segment_drift_linear() {
+        let audio: Vec<f64> = (0..100).map(|i| i as f64 * 0.04).collect();
+        let drift: Vec<f64> = audio.iter().map(|&a| 0.002 * a).collect();
+        let (slope, residual) = fit_segment_drift(&audio, &drift, 0..100);
+        assert!((slope - 0.002).abs() < 1e-9, "slope {}", slope);
+        assert!(residual < 1e-9, "residual {}", residual);
+    }
+
+    #[test]
+    fn test_quality_fit_segment_drift_flat() {
+        let audio: Vec<f64> = (0..50).map(|i| i as f64 * 0.04).collect();
+        let drift = vec![0.5f64; 50];
+        let (slope, residual) = fit_segment_drift(&audio, &drift, 0..50);
+        assert!(slope.abs() < 1e-12);
+        assert!(residual < 1e-12);
+    }
+
+    #[test]
+    fn test_quality_fit_segment_drift_tiny_range() {
+        let audio = vec![1.0f64];
+        let drift = vec![0.5f64];
+        let (slope, residual) = fit_segment_drift(&audio, &drift, 0..1);
+        assert_eq!(slope, 0.0);
+        assert_eq!(residual, 0.0);
+    }
+
+    /// The user-reported scenario: ~24000 frames, 11 forward TC jumps
+    /// (generator restarts), sub-frame drift. Must stay highly usable —
+    /// the old unbounded edit penalty drove this to 0% "Bad".
+    #[test]
+    fn test_quality_many_forward_edits_stay_usable() {
+        let blocks: Vec<QBlock> = (0..12)
+            .map(|_| QBlock { frames: 2000, tc_jump_secs: 5.0, audio_gap_secs: 0.0, drift_rate: 0.0 })
+            .collect();
+        let result = build_quality_result(&blocks, &[], 0.0, 24000, 960.0);
+        let q = compute_ltc_quality(&result).unwrap();
+
+        assert_eq!(q.block_count, 12, "12 blocks expected: {}", q.summary);
+        assert_eq!(q.backward_jump_count, 0, "all jumps forward: {}", q.summary);
+        assert!((q.usable_coverage - 1.0).abs() < 1e-9, "all blocks usable: {}", q.summary);
+        assert!(q.score >= 0.75, "11 benign edits must not destroy the score, got {:.2} ({})",
+            q.score, q.grade);
+    }
+
+    /// A backward TC jump (timecode reset) must cost more than a forward
+    /// jump of the same size: the reset TC values can recur, making
+    /// sync-by-TC ambiguous in editors.
+    #[test]
+    fn test_quality_backward_jump_penalized_harder_than_forward() {
+        let mk = |jump: f64| {
+            let blocks = vec![
+                QBlock { frames: 1500, tc_jump_secs: 0.0, audio_gap_secs: 0.0, drift_rate: 0.0 },
+                QBlock { frames: 1500, tc_jump_secs: jump, audio_gap_secs: 0.0, drift_rate: 0.0 },
+                QBlock { frames: 1500, tc_jump_secs: 0.0, audio_gap_secs: 0.0, drift_rate: 0.0 },
+            ];
+            build_quality_result(&blocks, &[], 0.0, 4500, 180.0)
+        };
+        let fwd = compute_ltc_quality(&mk(60.0)).unwrap();
+        let bwd = compute_ltc_quality(&mk(-60.0)).unwrap();
+
+        assert_eq!(bwd.backward_jump_count, 1);
+        assert!(bwd.score < fwd.score - 0.05,
+            "backward jump ({:.2}) must score below forward jump ({:.2})",
+            bwd.score, fwd.score);
+        assert!(fwd.score >= 0.90, "single forward jump: {:.2} ({})", fwd.score, fwd.grade);
+    }
+
+    /// A block whose clock drifts (2 frames accumulated over a minute) is
+    /// not frame-accurate and must reduce coverage; the damage must be
+    /// proportional to the affected frame fraction.
+    #[test]
+    fn test_quality_drifting_block_reduces_score_proportionally() {
+        // 1 of 3 blocks drifts
+        let blocks3 = vec![
+            QBlock { frames: 1500, tc_jump_secs: 0.0, audio_gap_secs: 0.0, drift_rate: 0.0 },
+            QBlock { frames: 1500, tc_jump_secs: 5.0, audio_gap_secs: 0.0, drift_rate: 1.33e-3 },
+            QBlock { frames: 1500, tc_jump_secs: 5.0, audio_gap_secs: 0.0, drift_rate: 0.0 },
+        ];
+        let r3 = build_quality_result(&blocks3, &[], 0.0, 4500, 180.0);
+        let q3 = compute_ltc_quality(&r3).unwrap();
+
+        // 1 of 10 blocks drifts (same drifting block size)
+        let mut blocks10 = vec![
+            QBlock { frames: 1500, tc_jump_secs: 0.0, audio_gap_secs: 0.0, drift_rate: 0.0 },
+            QBlock { frames: 1500, tc_jump_secs: 5.0, audio_gap_secs: 0.0, drift_rate: 1.33e-3 },
+        ];
+        for _ in 0..8 {
+            blocks10.push(QBlock { frames: 1500, tc_jump_secs: 5.0, audio_gap_secs: 0.0, drift_rate: 0.0 });
+        }
+        let r10 = build_quality_result(&blocks10, &[], 0.0, 15000, 600.0);
+        let q10 = compute_ltc_quality(&r10).unwrap();
+
+        assert!(q3.worst_block_drift_frames > 1.5 && q3.worst_block_drift_frames < 2.5,
+            "worst block drift should be ~2 frames, got {:.2}", q3.worst_block_drift_frames);
+        assert!(q3.score < 0.80, "drifting block must degrade the score, got {:.2}", q3.score);
+        assert!(q10.score > q3.score,
+            "same drift affecting 1/10 of frames ({:.2}) must score above 1/3 ({:.2})",
+            q10.score, q3.score);
+    }
+
+    /// A few glitches in a long recording are statistically irrelevant and
+    /// must not drag the score down (old code: fixed -0.03 per glitch).
+    #[test]
+    fn test_quality_few_glitches_in_long_recording_minor() {
+        let blocks = vec![QBlock { frames: 20000, tc_jump_secs: 0.0, audio_gap_secs: 0.0, drift_rate: 0.0 }];
+        let result = build_quality_result(&blocks, &[100, 200, 300, 400, 500, 600, 700, 800, 900, 1000,
+                                                    1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000,
+                                                    2100, 2200, 2300, 2400, 2500, 2600, 2700, 2800, 2900, 3000],
+                                          0.0, 20000, 800.0);
+        let q = compute_ltc_quality(&result).unwrap();
+        assert!(q.glitch_count >= 25, "glitches must be detected, got {}", q.glitch_count);
+        assert!(q.score >= 0.95, "30 glitches in 20000 frames are minor, got {:.2} ({})",
+            q.score, q.grade);
+    }
+
+    /// Silent lead-in before the LTC starts must not count as missing
+    /// frames (real camera recordings routinely start recording before
+    /// LTC is fed).
+    #[test]
+    fn test_quality_silent_prefix_not_missing_frames() {
+        let blocks = vec![QBlock { frames: 1500, tc_jump_secs: 0.0, audio_gap_secs: 0.0, drift_rate: 0.0 }];
+        let result = build_quality_result(&blocks, &[], 30.0, 2250, 90.0);
+        let q = compute_ltc_quality(&result).unwrap();
+
+        assert_eq!(q.missing_frames, 0, "30s silent lead-in is not missing LTC: {}", q.summary);
+        assert!(q.score >= 0.99, "perfect LTC after a lead-in must score ~1.0, got {:.2} ({})",
+            q.score, q.grade);
     }
 }

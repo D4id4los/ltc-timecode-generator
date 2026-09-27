@@ -834,11 +834,11 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                         } else {
                             "perfect".to_string()
                         };
-                        ui.label(RichText::new(issues)
+                        ui.label(RichText::new(format!("{:.1}% usable, {}", q.usable_coverage * 100.0, issues))
                             .font(FontId::monospace(8.0))
                             .color(colors.text_muted));
                         if q.max_drift_secs > 0.01 {
-                            ui.label(RichText::new(format!("drift {:.3}s", q.max_drift_secs))
+                            ui.label(RichText::new(format!("drift {:.2} frames", q.worst_block_drift_frames))
                                 .font(FontId::monospace(8.0))
                                 .color(colors.text_muted));
                         }
@@ -972,11 +972,18 @@ fn format_ltc_report_text(result: &gui_engine::LtcDetectionResult) -> String {
             q.score, q.grade
         ));
         report.push_str(&format!(
+            "  Usable:        {:.1}% ({} block(s), {} backward jump(s))\n",
+            q.usable_coverage * 100.0, q.block_count, q.backward_jump_count
+        ));
+        report.push_str(&format!(
             "  Missing:       {} frames, {} gap(s), {} glitch(es), {} edit point(s)\n",
             q.missing_frames, q.gap_count, q.glitch_count, q.edit_count
         ));
         if q.max_drift_secs > 0.01 {
-            report.push_str(&format!("  Max drift:    {:.3}s\n", q.max_drift_secs));
+            report.push_str(&format!(
+                "  Max drift:    {:.3}s ({:.2} frames)\n",
+                q.max_drift_secs, q.worst_block_drift_frames
+            ));
         }
     }
 

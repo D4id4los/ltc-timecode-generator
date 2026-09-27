@@ -169,7 +169,8 @@ pub fn setup_poll_timer(
                         } else {
                             "perfect".to_string()
                         };
-                        format!(" | Quality: {:.0}% ({}) {}", q.score * 100.0, q.grade, issues)
+                        format!(" | Quality: {:.0}% ({}) {:.1}% usable, {}",
+                            q.score * 100.0, q.grade, q.usable_coverage * 100.0, issues)
                     }).unwrap_or_default();
                     ui.set_ltc_result_text(SharedString::from(format!(
                         "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms{}",

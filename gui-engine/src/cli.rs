@@ -609,9 +609,12 @@ fn print_decode_results(
         println!();
         println!("=== LTC Quality ===");
         println!("  Score:        {:.2} / 1.00 ({})", q.score, q.grade);
+        println!("  Usable:       {:.1}% ({} block(s), {} backward jump(s))",
+            q.usable_coverage * 100.0, q.block_count, q.backward_jump_count);
         println!("  Frames:       {} missing, {} largest block", q.missing_frames, q.largest_block);
         println!("  Contiguity:   {} gap(s), {} glitch(es), {} edit point(s)", q.gap_count, q.glitch_count, q.edit_count);
-        println!("  Sync drift:   max {:.3}s, rate {:.4} s/s", q.max_drift_secs, q.drift_rate);
+        println!("  Sync drift:   max {:.3}s ({:.2} frames), rate {:.4} s/s",
+            q.max_drift_secs, q.worst_block_drift_frames, q.drift_rate);
         println!("  Summary:      {}", q.summary);
     }
 

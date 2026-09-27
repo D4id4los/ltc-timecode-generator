@@ -1387,11 +1387,18 @@ u.set_conv_split_tracks(false);
                         q.score, q.grade
                     ));
                     report.push_str(&format!(
+                        "  Usable:        {:.1}% ({} block(s), {} backward jump(s))\n",
+                        q.usable_coverage * 100.0, q.block_count, q.backward_jump_count
+                    ));
+                    report.push_str(&format!(
                         "  Missing:       {} frames, {} gap(s), {} glitch(es), {} edit point(s)\n",
                         q.missing_frames, q.gap_count, q.glitch_count, q.edit_count
                     ));
                     if q.max_drift_secs > 0.01 {
-                        report.push_str(&format!("  Max drift:    {:.3}s\n", q.max_drift_secs));
+                        report.push_str(&format!(
+                            "  Max drift:    {:.3}s ({:.2} frames)\n",
+                            q.max_drift_secs, q.worst_block_drift_frames
+                        ));
                     }
                 }
 
