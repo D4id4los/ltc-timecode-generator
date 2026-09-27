@@ -1,0 +1,160 @@
+import { AppColors } from "./theme.slint";
+import { OffloadCardInfo, OffloadDeviceStatus } from "./types.slint";
+
+export component OffloadSection {
+    in-out property <string> parent-folder: "";
+    in-out property <string> parent-name: "2026-09-26";
+    in-out property <[OffloadCardInfo]> cards: [];
+    in-out property <bool> scanning: false;
+    in-out property <bool> running: false;
+    in-out property <float> overall-progress: 0.0;
+    in-out property <[OffloadDeviceStatus]> device-progress: [];
+    in-out property <[string]> completed-devices: [];
+    in-out property <string> error: "";
+
+    callback select-parent-folder;
+    callback parent-name-changed(string);
+    callback card-name-changed(int, string);
+    callback rescan;
+    callback start-offload;
+    callback cancel-offload;
+
+    // Step labels
+    property <length> step-gap: 12px;
+    property <length> section-gap: 8px;
+
+    Rectangle {
+        border-radius: 12px;
+        background: AppColors.card-bg;
+        clip: true;
+
+        VerticalLayout {
+                padding: 16px;
+                spacing: section-gap;
+
+                // ── Step 1: Parent folder ──
+                Text { text: "1  SELECT PARENT FOLDER"; font-size: 14px; font-weight: 600; color: AppColors.text-title; }
+
+                HorizontalLayout { spacing: 6px;
+                    Rectangle {
+                        min-width: 120px;
+                        border-radius: 8px;
+                        background: AppColors.deep-bg;
+                        TouchArea {
+                            clicked => { root.select-parent-folder(); }
+                        }
+                        VerticalLayout { alignment: center;
+                            Text { text: "Browse…"; font-size: 11px; color: AppColors.text-title; }
+                        }
+                    }
+                    Text {
+                        text: root.parent-folder == "" ? "Select Folder…" : root.parent-folder;
+                        font-size: 11px; color: AppColors.text-muted; vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout { spacing: 6px;
+                    Text { text: "Subfolder:"; font-size: 11px; color: AppColors.text-muted; vertical-alignment: center; }
+                    // Use a TextInput for editable subfolder name — with property binding from Rust
+                    Text {
+                        text: root.parent-name;
+                        font-size: 13px; color: AppColors.text-title; vertical-alignment: center;
+                    }
+                    Text { text: "(date subfolder)"; font-size: 10px; color: AppColors.text-muted; vertical-alignment: center; }
+                }
+
+                // ── Step 2: Detected cards ──
+                Text { text: "2  DETECTED MEDIA CARDS"; font-size: 14px; font-weight: 600; color: AppColors.text-title; }
+
+                HorizontalLayout { spacing: 8px;
+                    Rectangle {
+                        min-width: 80px; min-height: 28px; border-radius: 8px;
+                        background: AppColors.deep-bg;
+                        TouchArea { clicked => { root.rescan(); } }
+                        VerticalLayout { alignment: center;
+                            Text { text: "Rescan"; font-size: 11px; color: AppColors.text-title; }
+                        }
+                    }
+                    if (root.scanning) : Text { text: "Scanning…"; font-size: 11px; color: AppColors.text-muted; vertical-alignment: center; }
+                }
+
+                if (root.cards.length == 0 && !root.scanning) : Text {
+                    text: "No removable media detected. Insert an SD card and click Rescan.";
+                    font-size: 11px; color: AppColors.text-muted;
+                }
+
+                for card[idx] in root.cards : Rectangle {
+                    border-radius: 8px; background: AppColors.nested-bg;
+                    VerticalLayout { padding: 8px; spacing: 4px;
+                        Text {
+                            text: card.mount;
+                            font-size: 11px; color: AppColors.text-muted;
+                        }
+                        Text {
+                            text: "Device folder: " + card.device-name;
+                            font-size: 13px; color: AppColors.text-title;
+                        }
+                        Text {
+                            text: card.media-file-count + " file(s), " + card.total-bytes;
+                            font-size: 11px; color: AppColors.text-muted;
+                        }
+                    }
+                }
+
+                // ── Step 3: Copy files ──
+                Text { text: "3  COPY FILES"; font-size: 14px; font-weight: 600; color: AppColors.text-title; }
+
+                if (root.running) : Rectangle {
+                    min-width: 100px; min-height: 32px; border-radius: 8px;
+                    background: AppColors.red;
+                    TouchArea { clicked => { root.cancel-offload(); } }
+                    VerticalLayout { alignment: center;
+                        Text { text: "■ Cancel"; font-size: 12px; color: AppColors.text-title; font-weight: 600; }
+                    }
+                }
+                if (!root.running) : Rectangle {
+                    min-width: 120px; min-height: 32px; border-radius: 8px;
+                    background: AppColors.accent;
+                    TouchArea { clicked => { root.start-offload(); } }
+                    VerticalLayout { alignment: center;
+                        Text { text: "Start Offload"; font-size: 12px; color: AppColors.text-title; font-weight: 600; }
+                    }
+                }
+
+                // Overall progress bar
+                if (root.running || root.overall-progress > 0.0) : Rectangle {
+                    height: 8px; border-radius: 4px; background: AppColors.deep-bg;
+                    Rectangle {
+                        height: 8px; border-radius: 4px; background: AppColors.accent;
+                        width: parent.width * root.overall-progress;
+                    }
+                }
+
+                // Per-device progress
+                for dev[idx] in root.device-progress : VerticalLayout { spacing: 4px;
+                    HorizontalLayout { spacing: 6px;
+                        Text { text: dev.state-text + " " + dev.device-name; font-size: 11px; color: AppColors.text-title; }
+                        HorizontalLayout { horizontal-stretch: 1; }
+                        Text { text: dev.files-done + "/" + dev.files-total + " files"; font-size: 10px; color: AppColors.text-muted; }
+                    }
+                    Rectangle {
+                        height: 6px; border-radius: 3px; background: AppColors.deep-bg;
+                        Rectangle {
+                            height: 6px; border-radius: 3px; background: AppColors.accent;
+                            width: parent.width * dev.progress;
+                        }
+                    }
+                    if (dev.error != "") : Text { text: dev.error; font-size: 10px; color: AppColors.red; }
+                }
+
+                // Completed devices
+                if (root.completed-devices.length > 0) : VerticalLayout { spacing: 4px;
+                    Text { text: "Completed:"; font-size: 12px; font-weight: 600; color: AppColors.green; }
+                    for name in root.completed-devices : Text { text: "✅ " + name; font-size: 11px; color: AppColors.green; }
+                }
+
+                // Error
+                if (root.error != "") : Text { text: root.error; font-size: 11px; color: AppColors.red; }
+            }
+    }
+}

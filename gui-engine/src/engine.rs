@@ -11,6 +11,7 @@ use log::{debug, error, info, warn};
 use crate::command::GuiCommand;
 use crate::converter::{query_ffmpeg_capabilities, ConversionState, FfmpegCapabilities};
 use crate::ffprobe::{self, VideoAudioProbe};
+use crate::offload::{self, DeviceNameSource, OffloadContext};
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
 
@@ -71,6 +72,10 @@ pub fn engine_main_with_probe<F>(
     let (conv_probe_tx, conv_probe_rx) =
         std::sync::mpsc::channel::<ConverterProbeResult>();
 
+    // Internal result channel for offload card scan and copy completion
+    let (offload_event_tx, offload_event_rx) =
+        std::sync::mpsc::channel::<OffloadEvent>();
+
     // Spawn the ffmpeg capability probe on a background thread
     std::thread::Builder::new()
         .name("ffmpeg-probe".into())
@@ -94,6 +99,13 @@ pub fn engine_main_with_probe<F>(
     // Duration probe tracking
     let mut dur_total: usize = 0;
     let mut dur_done: usize = 0;
+
+    // Offload state (scan + copy)
+    let mut offload_scan_generation: u64 = 0;
+    let mut offload_context: Option<Arc<OffloadContext>> = None;
+    let mut offload_device_names: Vec<String> = Vec::new();
+    let mut offload_plans: Vec<Vec<crate::offload::CopyPlanItem>> = Vec::new();
+    let mut offload_completed_before: Vec<String> = Vec::new();
 
     loop {
         let now = Instant::now();
@@ -206,6 +218,18 @@ pub fn engine_main_with_probe<F>(
                         );
                         current.converter.probes_loading = false;
                     }
+                }
+                Ok(GuiCommand::Offload(cmd)) => {
+                    handle_offload_command(
+                        cmd,
+                        &mut current,
+                        &mut offload_scan_generation,
+                        &mut offload_context,
+                        &mut offload_device_names,
+                        &mut offload_plans,
+                        &mut offload_completed_before,
+                        &offload_event_tx,
+                    );
                 }
                 Ok(cmd) => {
                     process_command(
@@ -451,7 +475,54 @@ pub fn engine_main_with_probe<F>(
             }
         }
 
-        // 1.10 Poll chunked / group decode progress
+        // 1.10 Drain offload events (card scans + copy completion)
+        loop {
+            match offload_event_rx.try_recv() {
+                Ok(OffloadEvent::CardsScanned { cards, generation }) => {
+                    if generation == offload_scan_generation {
+                        current.offload.cards = cards;
+                        current.offload.scanning = false;
+                        info!("Offload card scan complete: {} card(s)", current.offload.cards.len());
+                    } else {
+                        warn!("Discarding stale offload scan result: gen={}", generation);
+                    }
+                }
+                Ok(OffloadEvent::OffloadDone { completed, generation }) => {
+                    if generation == offload_scan_generation {
+                        info!("Offload copy complete: {} device(s) offloaded", completed.len());
+                        let parent = current.offload.parent_folder.clone();
+                        current.offload.running = false;
+                        current.offload.overall_progress = 1.0;
+                        for name in &completed {
+                            if !current.offload.completed_devices.contains(name) {
+                                current.offload.completed_devices.push(name.clone());
+                            }
+                        }
+                        // New offload output → set last_offload_parent for converter auto-switch.
+                        let target = parent.and_then(|p| {
+                            Some(p.join(&current.offload.parent_name))
+                        });
+                        current.offload.last_offload_parent = target;
+                        current.offload.last_offload_version =
+                            current.offload.last_offload_version.wrapping_add(1);
+                        current.status_message = format!(
+                            "Offload complete: {} device(s) copied",
+                            completed.len(),
+                        );
+                        offload_context = None;
+                    } else {
+                        warn!("Discarding stale offload copy result: gen={}", generation);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("Offload event channel disconnected");
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // 1.11 Poll chunked / group decode progress
         if current.ltc_is_detecting {
             if let Some(ref vp) = video_progress {
                 // Single-video path: report from ClipProgress (extraction + chunked decode)
@@ -483,6 +554,29 @@ pub fn engine_main_with_probe<F>(
             decode_progress = None;
             current.ltc_decode_progress_pct = 0.0;
             current.ltc_decode_progress_str = String::new();
+        }
+
+        // 1.12 Poll offload copy progress from shared atomics
+        if current.offload.running {
+            if let Some(ref ctx) = offload_context {
+                let snapshot = offload::snapshot_from_context(
+                    ctx,
+                    &offload_device_names,
+                    &current.offload.completed_devices,
+                    current.offload.parent_folder.clone(),
+                    &current.offload.parent_name,
+                    None,
+                    current.offload.last_offload_version,
+                );
+                current.offload.overall_progress = snapshot.overall_progress;
+                current.offload.device_progress = snapshot.device_progress;
+                current.status_message = format!(
+                    "Offloading… {:.0}%",
+                    snapshot.overall_progress * 100.0,
+                );
+            }
+        } else {
+            current.offload.device_progress.clear();
         }
 
         // 2. Poll current timecode if playing
@@ -1307,6 +1401,11 @@ fn process_command(
             }
         },
 
+        GuiCommand::Offload(_) => {
+            // All Offload commands are handled in the drain loop before
+            // reaching process_command.
+        }
+
         GuiCommand::Shutdown => {
             // Handled in the command drain loop before reaching process_command
         }
@@ -1551,6 +1650,131 @@ fn drain_ffmpeg_probe_result(
             true
         }
         Err(std::sync::mpsc::TryRecvError::Empty) => false,
+    }
+}
+
+// ── Offload event channel ─────────────────────────────────────────────
+
+/// Internal event sent from offload background threads.
+enum OffloadEvent {
+    CardsScanned {
+        cards: Vec<crate::offload::SdCardInfo>,
+        generation: u64,
+    },
+    OffloadDone {
+        completed: Vec<String>,
+        generation: u64,
+    },
+}
+
+/// Handle an offload command from within the engine command drain loop.
+#[allow(clippy::too_many_arguments)]
+fn handle_offload_command(
+    cmd: crate::command::OffloadCommand,
+    state: &mut AppStateSnapshot,
+    scan_generation: &mut u64,
+    context: &mut Option<Arc<OffloadContext>>,
+    device_names: &mut Vec<String>,
+    plans: &mut Vec<Vec<crate::offload::CopyPlanItem>>,
+    completed_before: &mut Vec<String>,
+    event_tx: &std::sync::mpsc::Sender<OffloadEvent>,
+) {
+    match cmd {
+        crate::command::OffloadCommand::ScanCards => {
+            if state.offload.scanning {
+                info!("Offload scan already in progress — ignoring duplicate ScanCards");
+                return;
+            }
+            state.offload.scanning = true;
+            state.offload.error = None;
+            *scan_generation = scan_generation.wrapping_add(1);
+            let gen = *scan_generation;
+            let tx = event_tx.clone();
+            std::thread::Builder::new()
+                .name("offload-scan".into())
+                .spawn(move || {
+                    info!("Offload card scan started (gen={})", gen);
+                    let cards = crate::offload::detect_cards();
+                    let _ = tx.send(OffloadEvent::CardsScanned { cards, generation: gen });
+                })
+                .expect("failed to spawn offload scan thread");
+        }
+
+        crate::command::OffloadCommand::SetParentFolder(path) => {
+            state.offload.parent_folder = Some(path);
+            state.offload.error = None;
+        }
+
+        crate::command::OffloadCommand::SetParentName(name) => {
+            state.offload.parent_name = name;
+        }
+
+        crate::command::OffloadCommand::SetDeviceName(idx, name) => {
+            if let Some(card) = state.offload.cards.get_mut(idx) {
+                card.device_name = name;
+                card.name_source = DeviceNameSource::Manual;
+            }
+        }
+
+        crate::command::OffloadCommand::StartOffload => {
+            if state.offload.running {
+                info!("Offload already running — ignoring duplicate StartOffload");
+                return;
+            }
+            if state.offload.cards.is_empty() {
+                state.offload.error = Some("No media cards detected.".to_string());
+                return;
+            }
+            let parent_folder = match state.offload.parent_folder.clone() {
+                Some(p) => p,
+                None => {
+                    state.offload.error = Some("No parent folder selected.".to_string());
+                    return;
+                }
+            };
+            let dest_parent = parent_folder.join(&state.offload.parent_name);
+
+            // Build plans per device.
+            let cards = state.offload.cards.clone();
+            let names: Vec<String> = cards.iter().map(|c| c.device_name.clone()).collect();
+            let device_plans: Vec<Vec<crate::offload::CopyPlanItem>> = cards
+                .iter()
+                .map(|card| crate::offload::plan_copies_for_card(&card.mount, &card.device_name, &dest_parent))
+                .collect();
+
+            let ctx = Arc::new(OffloadContext::new(&names, &device_plans));
+
+            *device_names = names.clone();
+            *plans = device_plans.clone();
+            *context = Some(ctx.clone());
+            *completed_before = state.offload.completed_devices.clone();
+            state.offload.running = true;
+            state.offload.error = None;
+            state.offload.overall_progress = 0.0;
+            state.offload.device_progress.clear();
+            info!("Offload started: {} device(s) → {:?}", names.len(), dest_parent);
+
+            *scan_generation = scan_generation.wrapping_add(1);
+            let gen = *scan_generation;
+            let tx = event_tx.clone();
+
+            std::thread::Builder::new()
+                .name("offload-copy".into())
+                .spawn(move || {
+                    info!("Offload copy thread started (gen={})", gen);
+                    let completed = crate::offload::run_offload(&device_plans, &names, &ctx);
+                    let _ = tx.send(OffloadEvent::OffloadDone { completed, generation: gen });
+                })
+                .expect("failed to spawn offload copy thread");
+        }
+
+        crate::command::OffloadCommand::CancelOffload => {
+            if let Some(ref ctx) = context {
+                ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                info!("Offload cancel signaled");
+            }
+            state.offload.error = Some("Canceled by user".to_string());
+        }
     }
 }
 

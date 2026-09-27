@@ -26,6 +26,7 @@ pub enum Tab {
     Clapper,
     Settings,
     Converter,
+    Offload,
 }
 
 impl Tab {
@@ -34,6 +35,7 @@ impl Tab {
             Tab::Clapper => "Clapper Slate & Logs",
             Tab::Settings => "Signal & Audio Settings",
             Tab::Converter => "File Converter & Export",
+            Tab::Offload => "Offload & Ingest",
         }
     }
 }
@@ -117,6 +119,11 @@ pub struct AppState {
 
     // Diagnostic: last group decode generation that was logged to avoid spam
     pub last_logged_group_decode_gen: u64,
+
+    // Offload GUI-local state
+    /// Last seen offload version — detects when a copy finishes so we can
+    /// auto‑switch the converter folder.
+    pub offload_last_version: u64,
 }
 
 type RestoredFolder = (Option<PathBuf>, Option<Vec<MatchedGroup>>);
@@ -188,6 +195,7 @@ impl AppState {
             per_file_trim_offsets: Vec::new(),
             ltc_auto_applied_gen: 0,
             ltc_group_auto_applied_gen: 0,
+            offload_last_version: 0,
         };
 
         // Sync the engine's group list with the restored folder before sending
@@ -399,6 +407,40 @@ impl eframe::App for AppState {
         }
         if toggle_debug {
             self.show_debug_log = !self.show_debug_log;
+        }
+
+        // 9. Auto-switch converter folder when an offload completes
+        let off_version = self.latest.offload.last_offload_version;
+        if off_version != self.offload_last_version {
+            self.offload_last_version = off_version;
+            if let Some(ref path) = self.latest.offload.last_offload_parent {
+                let path = path.clone();
+                log::info!("Offload completed — auto-switching converter folder to {:?}", path);
+                self.selected_folder = Some(path.clone());
+                config::save_input_folder(&path);
+                let _ = self.cmd_tx.send(GuiCommand::Converter(
+                    gui_engine::command::ConverterCommand::SelectFolder(path.clone()),
+                ));
+                let groups = match_files_all_patterns(&path);
+                let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
+                    let paths: Vec<std::path::PathBuf> = if g.recording_type == RecordingType::MultiTrackAudio {
+                        g.files.first().cloned().into_iter().collect()
+                    } else {
+                        g.files.clone()
+                    };
+                    paths
+                }).collect();
+                if !probe_paths.is_empty() {
+                    let _ = self.cmd_tx.send(GuiCommand::ProbeFileDurations(probe_paths));
+                }
+                self.file_groups = Some(groups.clone());
+                if !groups.is_empty() {
+                    let cmds = crate::widgets::converter::apply_group_selection(self, &groups, 0);
+                    for cmd in cmds {
+                        let _ = self.cmd_tx.send(cmd);
+                    }
+                }
+            }
         }
     }
 
@@ -699,7 +741,7 @@ impl AppState {
         let colors = self.theme.colors();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::Vec2::new(0.0, 0.0);
-            for tab in &[Tab::Clapper, Tab::Settings, Tab::Converter] {
+            for tab in &[Tab::Clapper, Tab::Settings, Tab::Converter, Tab::Offload] {
                 let is_active = *tab == self.active_tab;
                 let is_wide = ui.available_width() > 500.0;
                 let label = if is_wide {
@@ -709,6 +751,7 @@ impl AppState {
                         Tab::Clapper => "Clapper".to_string(),
                         Tab::Settings => "Settings".to_string(),
                         Tab::Converter => "Convert".to_string(),
+                        Tab::Offload => "Offload".to_string(),
                     }
                 };
                 let btn = egui::Button::new(
@@ -735,6 +778,7 @@ impl AppState {
             Tab::Clapper => widgets::clapper::render(ui, self),
             Tab::Settings => widgets::settings::render(ui, self),
             Tab::Converter => widgets::converter::render(ui, self),
+            Tab::Offload => widgets::offload::render(ui, self),
         }
     }
 

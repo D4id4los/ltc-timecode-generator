@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::converter::{ConversionState, FfmpegCapabilities, RecordingType};
 use crate::ffprobe::VideoAudioProbe;
 use crate::file_pattern::MatchedGroup;
+use crate::offload::OffloadSnapshot;
 use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
 
 // ── Converter snapshot (engine-owned) ─────────────────────────────────
@@ -165,6 +166,9 @@ pub struct AppStateSnapshot {
 
     // Engine-owned converter state
     pub converter: ConverterSnapshot,
+
+    // Engine-owned offload / file-ingestion state
+    pub offload: OffloadSnapshot,
 }
 
 impl AppStateSnapshot {
@@ -252,6 +256,7 @@ impl AppStateSnapshot {
                 probes_generation: 0,
                 conversion_state: ConversionState::idle(),
             },
+            offload: OffloadSnapshot::initial(),
         }
     }
 }

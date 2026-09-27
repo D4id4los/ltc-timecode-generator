@@ -1,11 +1,12 @@
 import { AppColors } from "./theme.slint";
 export { AppColors } from "./theme.slint";
-import { LogEntry, FrameRateOption, ToastData, FileGroupInfo } from "./types.slint";
+import { LogEntry, FrameRateOption, ToastData, FileGroupInfo, OffloadCardInfo, OffloadDeviceStatus } from "./types.slint";
 import { ClockSection } from "./clock.slint";
 import { ClapperSection } from "./clapper.slint";
 import { SettingsSection } from "./settings.slint";
 import { StatusBar } from "./status.slint";
 import { ConverterSection } from "./converter.slint";
+import { OffloadSection } from "./offload.slint";
 import { ScrollView } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
@@ -116,6 +117,17 @@ export component AppWindow inherits Window {
     in-out property <float> ltc-offset-secs: 0.0;
     in-out property <string> ltc-start-tc-text: "";
 
+    // ── Offload properties ──
+    in-out property <string> off-parent-folder: "";
+    in-out property <string> off-parent-name: "2026-09-26";
+    in-out property <[OffloadCardInfo]> off-cards: [];
+    in-out property <bool> off-scanning: false;
+    in-out property <bool> off-running: false;
+    in-out property <float> off-overall-progress: 0.0;
+    in-out property <[OffloadDeviceStatus]> off-device-progress: [];
+    in-out property <[string]> off-completed-devices: [];
+    in-out property <string> off-error: "";
+
     // ── LTC detection properties ──
     in-out property <int> ltc-file-idx: 0;
     in-out property <[string]> ltc-file-names: [];
@@ -207,6 +219,14 @@ export component AppWindow inherits Window {
     callback toggle-metadata-only;
     callback conv-select-pattern(int);
     callback toggle-set-start-ltc;
+
+    // ── Offload callbacks ──
+    callback off-select-parent-folder;
+    callback off-parent-name-changed(string);
+    callback off-card-name-changed(int, string);
+    callback off-rescan;
+    callback off-start;
+    callback off-cancel;
 
     // ── Tab navigation ──
     callback tab-clicked(int);
@@ -535,7 +555,7 @@ export component AppWindow inherits Window {
                     padding-right: 8px;
                     spacing: 0px;
                     Rectangle {
-                        width: 33%;
+                        width: 25%;
                         TouchArea {
                             clicked => { root.tab-clicked(0); }
                         }
@@ -556,7 +576,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        width: 33%;
+                        width: 25%;
                         TouchArea {
                             clicked => { root.tab-clicked(1); }
                         }
@@ -577,7 +597,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        width: 34%;
+                        width: 25%;
                         TouchArea {
                             clicked => { root.tab-clicked(2); }
                         }
@@ -592,6 +612,27 @@ export component AppWindow inherits Window {
                                 horizontal-alignment: center;
                             }
                             if (root.active-tab == 2) : Rectangle {
+                                height: 2px;
+                                background: AppColors.accent;
+                            }
+                        }
+                    }
+                    Rectangle {
+                        width: 25%;
+                        TouchArea {
+                            clicked => { root.tab-clicked(3); }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 4px;
+                            Text {
+                                text: "Offload";
+                                color: root.active-tab == 3 ? AppColors.text-title : AppColors.text-muted;
+                                font-size: 11px;
+                                font-weight: root.active-tab == 3 ? 700 : 400;
+                                horizontal-alignment: center;
+                            }
+                            if (root.active-tab == 3) : Rectangle {
                                 height: 2px;
                                 background: AppColors.accent;
                             }
@@ -733,6 +774,23 @@ export component AppWindow inherits Window {
                     toggle-copy-video => { root.toggle-copy-video(); }
                     toggle-metadata-only => { root.toggle-metadata-only(); }
                     select-pattern(idx) => { root.conv-select-pattern(idx); }
+                }
+                if (root.active-tab == 3) : OffloadSection {
+                    parent-folder: root.off-parent-folder;
+                    parent-name: root.off-parent-name;
+                    cards: root.off-cards;
+                    scanning: root.off-scanning;
+                    running: root.off-running;
+                    overall-progress: root.off-overall-progress;
+                    device-progress: root.off-device-progress;
+                    completed-devices: root.off-completed-devices;
+                    error: root.off-error;
+                    select-parent-folder => { root.off-select-parent-folder(); }
+                    parent-name-changed(val) => { root.off-parent-name-changed(val); }
+                    card-name-changed(idx, val) => { root.off-card-name-changed(idx, val); }
+                    rescan => { root.off-rescan(); }
+                    start-offload => { root.off-start(); }
+                    cancel-offload => { root.off-cancel(); }
                 }
                     }
                 }

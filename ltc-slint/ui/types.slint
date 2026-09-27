@@ -25,3 +25,21 @@ export struct FileGroupInfo {
     channel-count: int,
     duration-text: string,
 }
+
+export struct OffloadCardInfo {
+    mount: string,
+    volume-label: string,
+    device-name: string,
+    name-source: string,
+    media-file-count: int,
+    total-bytes: string,
+}
+
+export struct OffloadDeviceStatus {
+    device-name: string,
+    state-text: string,
+    files-total: int,
+    files-done: int,
+    progress: float,
+    error: string,
+}

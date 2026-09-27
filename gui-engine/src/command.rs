@@ -69,6 +69,10 @@ pub enum GuiCommand {
     /// Manage converter state in the engine.
     Converter(ConverterCommand),
 
+    // ── Offload / file ingestion (engine-owned) ────────────────────────
+    /// Manage offload state in the engine.
+    Offload(OffloadCommand),
+
     // ── Shutdown ────────────────────────────────────────────────────────
     CancelDecode,
     Shutdown,
@@ -101,4 +105,21 @@ pub enum ConverterCommand {
     StartConversion,
     /// Cancel an in-flight conversion.
     CancelConversion,
+}
+
+/// Commands for the engine-owned offload / file-ingestion subsystem.
+#[derive(Debug, Clone)]
+pub enum OffloadCommand {
+    /// Rescan all mounted media cards and update the card list.
+    ScanCards,
+    /// Set the parent folder (base directory) for this offload session.
+    SetParentFolder(PathBuf),
+    /// Set the parent folder name (e.g. the ISO date subfolder).
+    SetParentName(String),
+    /// Override the device folder name for a detected card by index.
+    SetDeviceName(usize, String),
+    /// Start copying files from all pending cards.
+    StartOffload,
+    /// Cancel an in-flight copy operation.
+    CancelOffload,
 }

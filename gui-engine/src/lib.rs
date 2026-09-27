@@ -9,6 +9,7 @@ pub mod file_pattern;
 pub mod naming;
 pub mod hw_device;
 pub mod log_buffer;
+pub mod offload;
 pub mod state;
 pub mod subprocess;
 pub mod tagger;
@@ -56,3 +57,10 @@ pub use ffprobe::{extract_audio_channel, extract_audio_channel_with_progress, pa
 
 // Re-export duration helpers
 pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs};
+
+// Re-export offload types
+pub use offload::{
+    default_parent_name, detect_cards, is_media_file, plan_copies_for_card, run_offload,
+    verify_copy, DeviceNameSource, OffloadContext, OffloadDeviceState, OffloadDeviceStatus,
+    OffloadSnapshot, SdCardInfo, VerifyMode,
+};

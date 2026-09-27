@@ -9,6 +9,7 @@ const CONFIG_FILE: &str = "converter_config.json";
 pub struct ConverterConfig {
     pub last_input_folder: Option<String>,
     pub last_output_folder: Option<String>,
+    pub last_offload_parent: Option<String>,
 }
 
 fn config_path() -> Option<PathBuf> {

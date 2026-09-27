@@ -46,6 +46,12 @@ pub fn debug_log_scroll() -> &'static str {
     "debug_log_scroll"
 }
 
+/// Salt for the Offload tab's scrollable area.
+#[allow(dead_code)]
+pub fn offload_scroll() -> &'static str {
+    "offload_scroll"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +111,12 @@ mod tests {
     fn debug_log_salt_is_unique() {
         assert_ne!(debug_log_scroll(), root_scroll());
         assert_ne!(debug_log_scroll(), clap_log_scroll());
+    }
+
+    #[test]
+    fn offload_salt_is_unique() {
+        assert_ne!(offload_scroll(), root_scroll());
+        assert_ne!(offload_scroll(), clap_log_scroll());
+        assert_ne!(offload_scroll(), debug_log_scroll());
     }
 }
