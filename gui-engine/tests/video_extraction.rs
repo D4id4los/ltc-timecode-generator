@@ -417,7 +417,7 @@ fn test_single_video_decode_progress() {
 }
 
 fn assert_decodes_ltc(wav: &Path, min_valid_frames: u32) {
-    let result = decode_ltc_from_wav(wav, 25.0, false)
+    let result = decode_ltc_from_wav(wav, 25.0, false, None)
         .expect("LTC decode of extracted wav failed");
     assert!(
         matches!(result.status, LtcDecodeStatus::Success),
@@ -530,7 +530,7 @@ fn test_extract_second_audio_stream_selects_ltc_stream() {
     let silent_out = dir.path().join("extract_s1_c0.wav");
     extract_audio_channel(&mp4, 1, 0, &silent_out)
         .expect("extraction of the silent stream must succeed");
-    match decode_ltc_from_wav(&silent_out, 25.0, false) {
+    match decode_ltc_from_wav(&silent_out, 25.0, false, None) {
         Err(_) => {} // no LTC found — acceptable
         Ok(r) => assert_eq!(
             r.valid_frames, 0,

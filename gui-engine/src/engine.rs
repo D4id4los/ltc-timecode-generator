@@ -822,8 +822,9 @@ fn decode_one_video_clip(
             }
 
             if chunk_count <= 1 || total_mono == 0 {
+                let cancel_ref = progress.map(|p| &*p.cancel_flag);
                 let result = audio_core::decode_ltc_with_decoder(
-                    &wav_path, use_libltc, decode_fps, decode_drop_frame,
+                    &wav_path, use_libltc, decode_fps, decode_drop_frame, cancel_ref,
                 );
                 if let Some(p) = progress {
                     p.chunks_done.store(1, Ordering::Relaxed);
@@ -1337,6 +1338,7 @@ fn process_command(
                     // Small file: use single-threaded decode
                     let result = audio_core::decode_ltc_with_decoder(
                         Path::new(&path), use_libltc, decode_fps, decode_drop_frame,
+                        Some(&progress.cancel_flag),
                     );
                     progress.chunks_completed.store(1, Ordering::Relaxed);
                     let _ = tx.send(LtcDecodeResult {

@@ -1502,7 +1502,7 @@ mod tests {
         assert_eq!(tc, mk_tc(10, 0, 42, 0), "generation must end at expected TC");
 
         let result = crate::ltc_decoder::decode_ltc_samples(
-            &audio, sample_rate, 1, fps, false, std::time::Instant::now(),
+            &audio, sample_rate, 1, fps, false, std::time::Instant::now(), None,
         )
         .expect("decode of generated audio must succeed");
         assert!(matches!(result.status, crate::ltc_decoder::LtcDecodeStatus::Success),

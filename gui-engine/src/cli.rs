@@ -537,13 +537,13 @@ fn run_decode_on_wav(
     drop_frame: bool,
 ) -> Result<audio_core::LtcDetectionResult, String> {
     if single_pass {
-        audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame)
+        audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame, None)
     } else {
         let config = audio_core::DecodeConfig::default();
         let chunk_count = audio_core::count_chunks_in_wav(path, &config).unwrap_or(1);
 
         if chunk_count <= 1 {
-            audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame)
+            audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame, None)
         } else {
             let progress = audio_core::DecodeProgress::new(chunk_count);
             let completed_ref = progress.chunks_completed.clone();

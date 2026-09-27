@@ -92,7 +92,7 @@ fn test_wav_roundtrip_25fps() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("test_25fps.wav");
     generate_wav(&path, 25.0, false, 2.0, 48000);
-    let result = decode_ltc_from_wav(&path, 25.0, false).expect("LTC decode failed");
+    let result = decode_ltc_from_wav(&path, 25.0, false, None).expect("LTC decode failed");
     assert!(matches!(result.status, LtcDecodeStatus::Success),
         "expected Success, got {:?} (valid={})", result.status, result.valid_frames);
     assert!(result.valid_frames >= 48, "expected ~50 frames, got {}", result.valid_frames);
@@ -103,7 +103,7 @@ fn test_wav_roundtrip_24fps() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("test_24fps.wav");
     generate_wav(&path, 24.0, false, 2.0, 48000);
-    let result = decode_ltc_from_wav(&path, 24.0, false).expect("LTC decode failed");
+    let result = decode_ltc_from_wav(&path, 24.0, false, None).expect("LTC decode failed");
     assert!(matches!(result.status, LtcDecodeStatus::Success),
         "expected Success, got {:?} (valid={})", result.status, result.valid_frames);
     assert!(result.valid_frames >= 46, "expected ~48 frames, got {}", result.valid_frames);
@@ -114,7 +114,7 @@ fn test_wav_roundtrip_30fps() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("test_30fps.wav");
     generate_wav(&path, 30.0, false, 2.0, 48000);
-    let result = decode_ltc_from_wav(&path, 30.0, false).expect("LTC decode failed");
+    let result = decode_ltc_from_wav(&path, 30.0, false, None).expect("LTC decode failed");
     assert!(matches!(result.status, LtcDecodeStatus::Success),
         "expected Success, got {:?} (valid={})", result.status, result.valid_frames);
     assert!(result.valid_frames >= 58, "expected ~60 frames, got {}", result.valid_frames);
@@ -125,7 +125,7 @@ fn test_wav_roundtrip_2997_nd() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("test_2997nd.wav");
     generate_wav(&path, 29.97, false, 3.0, 48000);
-    let result = decode_ltc_from_wav(&path, 29.97, false).expect("LTC decode failed");
+    let result = decode_ltc_from_wav(&path, 29.97, false, None).expect("LTC decode failed");
     assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
         "expected no Error, got {:?} (valid={})", result.status, result.valid_frames);
 }
@@ -135,7 +135,7 @@ fn test_wav_roundtrip_2997_df() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("test_2997df.wav");
     generate_wav(&path, 29.97, true, 3.0, 48000);
-    let result = decode_ltc_from_wav(&path, 29.97, true).expect("LTC decode failed");
+    let result = decode_ltc_from_wav(&path, 29.97, true, None).expect("LTC decode failed");
     assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
         "expected no Error, got {:?} (valid={})", result.status, result.valid_frames);
 }
@@ -145,7 +145,7 @@ fn test_wav_roundtrip_44khz() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("test_44khz.wav");
     generate_wav(&path, 25.0, false, 2.0, 44100);
-    let result = decode_ltc_from_wav(&path, 25.0, false).expect("LTC decode failed");
+    let result = decode_ltc_from_wav(&path, 25.0, false, None).expect("LTC decode failed");
     assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
         "expected no Error at 44kHz, got {:?}", result.status);
 }

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub mod ltc_decoder;
@@ -379,79 +379,75 @@ pub fn decode_ltc_chunked(
         return Ok(LtcDetectionResult::error("No audio data to decode"));
     }
 
-    struct ChunkResult {
-        chunk_idx: usize,
-        result: Result<LtcDetectionResult, String>,
-    }
-
-    let mut chunk_results: Vec<ChunkResult> = Vec::with_capacity(num_chunks);
-
+let cancel_flag = progress.cancel_flag.clone();
     let progress_completed = progress.chunks_completed.clone();
-    let cancel_flag = progress.cancel_flag.clone();
+    let chunks = Arc::new(chunks);
 
-    std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(num_chunks);
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(num_chunks);
+
+    let mut chunk_results: Vec<ChunkResult> = if num_workers <= 1 {
+        let mut results = Vec::with_capacity(num_chunks);
         for (chunk_idx, &(start_sample, end_sample)) in chunks.iter().enumerate() {
             if cancel_flag.load(Ordering::Relaxed) {
-                info!("decode_ltc_chunked: cancel requested, stopping dispatch at chunk {}", chunk_idx);
+                info!("decode_ltc_chunked: cancel requested, stopping at chunk {}", chunk_idx);
                 break;
             }
-
-            let num_samples = end_sample - start_sample;
-            let cancel_flag = cancel_flag.clone();
-            let progress_completed = progress_completed.clone();
-
-            let handle = s.spawn(move || {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return ChunkResult {
-                        chunk_idx,
-                        result: Err("Canceled".to_string()),
-                    };
-                }
-
-                let mut local_reader = match WavChunkReader::open(path) {
-                    Ok((r, _)) => r,
-                    Err(e) => return ChunkResult {
-                        chunk_idx,
-                        result: Err(format!("Failed to open file for chunk {}: {}", chunk_idx, e)),
-                    },
-                };
-
-                let chunk_start = Instant::now();
-
-                let result = if use_libltc {
-                    match local_reader.read_mono_samples_i16(start_sample, num_samples) {
-                        Ok(samples) => crate::ltc_decoder_libltc::decode_ltc_samples_libltc(
-                            &samples, 1, sample_rate, fps, drop_frame, chunk_start,
-                        ),
-                        Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
-                    }
-                } else {
-                    match local_reader.read_mono_samples_f32(start_sample, num_samples) {
-                        Ok(samples) => crate::ltc_decoder::decode_ltc_samples(
-                            &samples, sample_rate, 1, fps, drop_frame, chunk_start,
-                        ),
-                        Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
-                    }
-                };
-                let elapsed = chunk_start.elapsed();
-                let decoder_name = if use_libltc { "libltc" } else { "builtin" };
-                debug!("Chunk {}/{} decoded ({}): {:.1}ms", chunk_idx + 1, num_chunks, decoder_name, elapsed.as_secs_f64() * 1000.0);
-                progress_completed.fetch_add(1, Ordering::Relaxed);
-                ChunkResult { chunk_idx, result }
-            });
-
-            handles.push(handle);
+            let r = decode_one_chunk(path, chunk_idx, start_sample, end_sample, sample_rate, fps, drop_frame, use_libltc, &cancel_flag);
+            progress_completed.fetch_add(1, Ordering::Relaxed);
+            results.push(r);
         }
-
-        for handle in handles {
-            chunk_results.push(handle.join().expect("chunk decode thread panicked"));
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err("Decode canceled by user".to_string());
         }
-    });
+        results
+    } else {
+        let results: Arc<[Mutex<Option<ChunkResult>>]> = (0..num_chunks)
+            .map(|_| Mutex::new(None))
+            .collect::<Vec<_>>()
+            .into();
+        let next_chunk = Arc::new(AtomicUsize::new(0));
 
-    if cancel_flag.load(Ordering::Relaxed) {
-        return Err("Decode canceled by user".to_string());
-    }
+        std::thread::scope(|s| {
+            for _ in 0..num_workers {
+                let results = Arc::clone(&results);
+                let next_chunk = Arc::clone(&next_chunk);
+                let chunks = Arc::clone(&chunks);
+                let cancel_flag = cancel_flag.clone();
+                let progress_completed = progress_completed.clone();
+                s.spawn(move || loop {
+                    let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_chunks { break; }
+                    if cancel_flag.load(Ordering::Relaxed) { break; }
+                    let (start_sample, end_sample) = chunks[idx];
+                    let result = decode_one_chunk(
+                        path, idx, start_sample, end_sample,
+                        sample_rate, fps, drop_frame, use_libltc, &cancel_flag,
+                    );
+                    if cancel_flag.load(Ordering::Relaxed) { break; }
+                    progress_completed.fetch_add(1, Ordering::Relaxed);
+                    *results[idx].lock().unwrap() = Some(result);
+                });
+            }
+        });
+
+        let mut collected: Vec<ChunkResult> = Vec::with_capacity(num_chunks);
+        for (idx, mutex) in results.iter().enumerate() {
+            match mutex.lock().unwrap().take() {
+                Some(r) => collected.push(r),
+                None => collected.push(ChunkResult {
+                    chunk_idx: idx,
+                    result: Err("Canceled".to_string()),
+                }),
+            }
+        }
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err("Decode canceled by user".to_string());
+        }
+        collected
+    };
 
     chunk_results.sort_by_key(|cr| cr.chunk_idx);
 
@@ -563,6 +559,62 @@ pub fn decode_ltc_chunked(
     Ok(result)
 }
 
+
+/// Result produced by decoding one chunk.
+struct ChunkResult {
+    chunk_idx: usize,
+    result: Result<LtcDetectionResult, String>,
+}
+
+/// Decode a single chunk of a WAV file in a worker thread.
+fn decode_one_chunk(
+    path: &Path,
+    chunk_idx: usize,
+    start_sample: usize,
+    end_sample: usize,
+    sample_rate: u32,
+    fps: f64,
+    drop_frame: bool,
+    use_libltc: bool,
+    cancel_flag: &AtomicBool,
+) -> ChunkResult {
+    let num_samples = end_sample - start_sample;
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        return ChunkResult { chunk_idx, result: Err("Canceled".to_string()) };
+    }
+
+    let mut local_reader = match WavChunkReader::open(path) {
+        Ok((r, _)) => r,
+        Err(e) => return ChunkResult {
+            chunk_idx,
+            result: Err(format!("Failed to open file for chunk {}: {}", chunk_idx, e)),
+        },
+    };
+
+    let chunk_start = Instant::now();
+
+    let result = if use_libltc {
+        match local_reader.read_mono_samples_i16(start_sample, num_samples) {
+            Ok(samples) => crate::ltc_decoder_libltc::decode_ltc_samples_libltc(
+                &samples, 1, sample_rate, fps, drop_frame, chunk_start, Some(cancel_flag),
+            ),
+            Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
+        }
+    } else {
+        match local_reader.read_mono_samples_f32(start_sample, num_samples) {
+            Ok(samples) => crate::ltc_decoder::decode_ltc_samples(
+                &samples, sample_rate, 1, fps, drop_frame, chunk_start, Some(cancel_flag),
+            ),
+            Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
+        }
+    };
+    let elapsed = chunk_start.elapsed();
+    let decoder_name = if use_libltc { "libltc" } else { "builtin" };
+    debug!("Chunk {} decoded ({}): {:.1}ms", chunk_idx + 1, decoder_name, elapsed.as_secs_f64() * 1000.0);
+    ChunkResult { chunk_idx, result }
+}
+
 // Re-export LTC decoder types for convenience
 pub use ltc_decoder::{
     apply_coherent_first_timecode, compute_ltc_quality, decode_ltc_from_wav, decode_ltc_samples,
@@ -577,11 +629,12 @@ pub fn decode_ltc_with_decoder(
     use_libltc: bool,
     fps: f64,
     drop_frame: bool,
+    cancel: Option<&AtomicBool>,
 ) -> Result<LtcDetectionResult, String> {
     if use_libltc {
-        decode_ltc_from_wav_libltc(path, fps, drop_frame)
+        decode_ltc_from_wav_libltc(path, fps, drop_frame, cancel)
     } else {
-        decode_ltc_from_wav(path, fps, drop_frame)
+        decode_ltc_from_wav(path, fps, drop_frame, cancel)
     }
 }
 
@@ -1182,7 +1235,7 @@ mod tests {
 
         let progress = DecodeProgress::new(nchunks);
         let chunked = decode_ltc_chunked(&path, false, fps, false, config, &progress).unwrap();
-        let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, fps, false).unwrap();
+        let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, fps, false, None).unwrap();
 
         assert_eq!(chunked.valid_frames, direct.valid_frames,
             "chunked merge lost frames: chunked={} vs direct={}",
@@ -1247,7 +1300,7 @@ mod tests {
 
         let progress = DecodeProgress::new(1);
         let chunked = decode_ltc_chunked(&path, false, fps, false, config, &progress).unwrap();
-        let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, fps, false).unwrap();
+        let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, fps, false, None).unwrap();
 
         let diff = chunked.valid_frames.abs_diff(direct.valid_frames);
         assert!(diff <= 2,
@@ -1330,7 +1383,7 @@ mod tests {
 
         let progress = DecodeProgress::new(nchunks);
         let chunked = decode_ltc_chunked(&path, true, fps, false, config, &progress).unwrap();
-        let direct = crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(&path, fps, false).unwrap();
+        let direct = crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(&path, fps, false, None).unwrap();
 
         let diff = chunked.valid_frames.abs_diff(direct.valid_frames);
         assert!(diff <= 2,
@@ -1490,7 +1543,7 @@ mod tests {
             25.0, false, 48000, 50,
         );
 
-        let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, 25.0, false).unwrap();
+        let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
 
         let config = DecodeConfig {
             chunk_size_bytes: 10_000_000,

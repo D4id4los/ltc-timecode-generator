@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use libltc_rs::prelude::*;
@@ -7,7 +8,7 @@ use log::{debug, info, warn};
 use crate::ltc_decoder::{apply_coherent_first_timecode, compute_ltc_quality, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
 use crate::Timecode;
 
-pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool) -> Result<LtcDetectionResult, String> {
+pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, String> {
     let start = Instant::now();
 
     let mut reader = hound::WavReader::open(path)
@@ -30,6 +31,12 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool) -> Re
         ));
     }
 
+    if let Some(c) = cancel {
+        if c.load(Ordering::Relaxed) {
+            return Err("Decode canceled by user".to_string());
+        }
+    }
+
     let sample_data: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
     let total_samples = sample_data.len() / channels;
 
@@ -38,7 +45,7 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool) -> Re
         return Ok(error_result("Audio file contains no samples"));
     }
 
-    decode_ltc_samples_libltc(&sample_data, channels, sample_rate, fps, drop_frame, start)
+    decode_ltc_samples_libltc(&sample_data, channels, sample_rate, fps, drop_frame, start, cancel)
 }
 
 pub fn decode_ltc_samples_libltc(
@@ -48,6 +55,7 @@ pub fn decode_ltc_samples_libltc(
     fps: f64,
     drop_frame: bool,
     start: Instant,
+    cancel: Option<&AtomicBool>,
 ) -> Result<LtcDetectionResult, String> {
     let total_samples = sample_data.len() / channels;
     if total_samples == 0 {
@@ -70,6 +78,11 @@ pub fn decode_ltc_samples_libltc(
 
     if channels == 1 {
         for chunk in sample_data.chunks(chunk_size) {
+            if let Some(c) = cancel {
+                if c.load(Ordering::Relaxed) {
+                    return Err("Decode canceled by user".to_string());
+                }
+            }
             decoder.write_i16(chunk, sample_pos);
             sample_pos += chunk.len() as i64;
             while let Some(frame_ext) = decoder.read() {
@@ -90,6 +103,11 @@ pub fn decode_ltc_samples_libltc(
         }
     } else {
         for chunk_start in (0..sample_data.len()).step_by(chunk_size * channels) {
+            if let Some(c) = cancel {
+                if c.load(Ordering::Relaxed) {
+                    return Err("Decode canceled by user".to_string());
+                }
+            }
             let chunk_end = (chunk_start + chunk_size * channels).min(sample_data.len());
             let raw_chunk = &sample_data[chunk_start..chunk_end];
             let left: Vec<i16> = raw_chunk.chunks(channels).map(|ch| ch[0]).collect();
@@ -300,7 +318,7 @@ mod tests {
     #[test]
     fn test_decode_ltc_samples_libltc_empty_buffer() {
         let samples = vec![];
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now()).unwrap();
+        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Error { .. }));
     }
 
@@ -310,7 +328,7 @@ mod tests {
             hours: 0, minutes: 0, seconds: 0, frames: i as u32,
         }).collect();
         let samples = synthesize_ltc_samples_i16(&tcs, 25.0, false, 48000, 0.5);
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now()).unwrap();
+        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success for 25fps mono, got {:?} (valid={})", result.status, result.valid_frames);
         assert!(result.valid_frames >= 20,
@@ -330,7 +348,7 @@ mod tests {
             stereo.push(s);
             stereo.push(0i16); // right channel silence
         }
-        let result = decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now()).unwrap();
+        let result = decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success for stereo LTC, got {:?}", result.status);
         assert!(result.valid_frames >= 20,
@@ -341,7 +359,7 @@ mod tests {
     fn test_decode_ltc_samples_libltc_too_short() {
         // Only 100 samples — not enough to form a full frame
         let samples: Vec<i16> = vec![1000, -1000, 500, -500, 200, -200];
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now()).unwrap();
+        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::NoSyncWord),
             "expected NoSyncWord for too-short buffer, got {:?}", result.status);
         assert_eq!(result.valid_frames, 0);
@@ -353,7 +371,7 @@ mod tests {
             hours: 0, minutes: 0, seconds: 0, frames: i as u32,
         }).collect();
         let samples = synthesize_ltc_samples_i16(&tcs, 24.0, false, 48000, 0.5);
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 24.0, false, Instant::now()).unwrap();
+        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 24.0, false, Instant::now(), None).unwrap();
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
             "expected no Error for 24fps, got {:?}", result.status);
     }
@@ -364,7 +382,7 @@ mod tests {
             hours: 0, minutes: 0, seconds: 0, frames: i as u32,
         }).collect();
         let samples = synthesize_ltc_samples_i16(&tcs, 25.0, false, 44100, 0.5);
-        let result = decode_ltc_samples_libltc(&samples, 1, 44100, 25.0, false, Instant::now()).unwrap();
+        let result = decode_ltc_samples_libltc(&samples, 1, 44100, 25.0, false, Instant::now(), None).unwrap();
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
             "expected no Error at 44.1kHz, got {:?}", result.status);
     }
@@ -376,7 +394,7 @@ mod tests {
         // Repeat the same timecode a few times
         let tcs_rep: Vec<Timecode> = std::iter::repeat(tcs[0]).take(10).collect();
         let samples = synthesize_ltc_samples_i16(&tcs_rep, 25.0, false, 48000, 0.5);
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now()).unwrap();
+        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
     }
@@ -395,7 +413,7 @@ mod tests {
         writer.write_sample(0i32).unwrap();
         writer.finalize().unwrap();
 
-        let result = decode_ltc_from_wav_libltc(&path, 25.0, false);
+        let result = decode_ltc_from_wav_libltc(&path, 25.0, false, None);
         assert!(result.is_err(), "expected error for non-16-bit WAV");
         let err = result.unwrap_err();
         assert!(err.contains("32 bit"), "error should mention bit depth: {}", err);
