@@ -57,6 +57,8 @@ pub fn available_containers<'a>(caps: &FfmpegCapabilities) -> Vec<(&'a str, &'a 
 
 pub fn select_best_combination(caps: &FfmpegCapabilities) -> (String, String, String) {
     let preferences: &[(&str, &str, &str)] = &[
+        ("mov", "h265", "pcm_s24le"),
+        ("mp4", "h265", "aac"),
         ("mov", "prores", "pcm_s24le"),
         ("mxf", "dnxhd", "pcm_s24le"),
         ("mov", "h264", "pcm_s24le"),
@@ -244,6 +246,45 @@ mod tests {
         assert_eq!(container, "mov");
         assert_eq!(codec, "prores");
         assert_eq!(audio, "pcm_s24le");
+    }
+
+    #[test]
+    fn test_select_best_combination_prefers_h265() {
+        let mut caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
+        caps.available_encoders =
+            ["pcm_s24le", "prores_ks", "libx264", "libx265"].into_iter().map(String::from).collect();
+        caps.available_formats = ["mov", "matroska", "mp4"].into_iter().map(String::from).collect();
+        let (container, codec, audio) = select_best_combination(&caps);
+        assert_eq!(container, "mov");
+        assert_eq!(codec, "h265");
+        assert_eq!(audio, "pcm_s24le");
+    }
+
+    #[test]
+    fn test_select_best_combination_h265_mp4_fallback() {
+        let mut caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
+        caps.available_encoders = ["aac", "libx265"].into_iter().map(String::from).collect();
+        caps.available_formats = ["mp4"].into_iter().map(String::from).collect();
+        let (container, codec, audio) = select_best_combination(&caps);
+        assert_eq!(container, "mp4");
+        assert_eq!(codec, "h265");
+        assert_eq!(audio, "aac");
+    }
+
+    #[test]
+    fn test_apply_defaults_selects_h265_when_available() {
+        let caps = make_caps(
+            true,
+            BTreeSet::from(["prores_ks", "libx264", "libx265", "pcm_s24le"]),
+            BTreeSet::from(["mov", "matroska", "mp4"]),
+        );
+        let mut c = "mkv".to_string();
+        let mut v = "av1".to_string();
+        let mut a = "pcm_s24le".to_string();
+        apply_available_defaults(&mut c, &mut v, &mut a, &caps);
+        assert_eq!(c, "mov");
+        assert_eq!(v, "h265");
+        assert_eq!(a, "pcm_s24le");
     }
 
     #[test]

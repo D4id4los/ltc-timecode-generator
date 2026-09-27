@@ -214,8 +214,8 @@ fn _run_gui(
         Arc::new(Mutex::new(BTreeMap::new()));
     let conv_selected_group_idx: Arc<Mutex<isize>> = Arc::new(Mutex::new(-1));
     let conv_channel_map: Arc<Mutex<ChannelMap>> = Arc::new(Mutex::new(ChannelMap::identity(0)));
-    let conv_container: Arc<Mutex<String>> = Arc::new(Mutex::new("mkv".to_string()));
-    let conv_video_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("av1".to_string()));
+    let conv_container: Arc<Mutex<String>> = Arc::new(Mutex::new("mov".to_string()));
+    let conv_video_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("h265".to_string()));
     let conv_audio_encoder: Arc<Mutex<String>> = Arc::new(Mutex::new("pcm_s24le".to_string()));
     let conv_output_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let conv_filename_prefix: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
