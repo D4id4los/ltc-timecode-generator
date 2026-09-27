@@ -391,6 +391,12 @@ pub fn setup_poll_timer(
                     format_blockers(&s.converter.readiness)
                 };
                 ui.set_conv_sanity_msg(SharedString::from(msg));
+                ui.set_conv_collision_warning(SharedString::from(
+                    s.converter.collision_warning.as_deref().unwrap_or(""),
+                ));
+                ui.set_conv_duplicate_output_warning(SharedString::from(
+                    s.converter.duplicate_output_warning.as_deref().unwrap_or(""),
+                ));
             }
 
             // 27. Log entries (only rebuild if log count changed)

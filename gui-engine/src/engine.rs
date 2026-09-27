@@ -14,8 +14,8 @@ use crate::video_codecs::describe_chain;
 use crate::converter::{
     query_ffmpeg_capabilities, ConversionState, ConversionStatus, SharedConversionState,
     CancelFlag, FfmpegCapabilities, ChannelMap, ConverterSettings, RecordingType,
-    evaluate_readiness, output_collision_warning, preview_output_files,
-    apply_available_defaults, spawn_conversion,
+    duplicate_output_names, duplicate_output_warning, evaluate_readiness,
+    output_collision_warning, preview_output_files, apply_available_defaults, spawn_conversion,
 };
 use crate::ffprobe::{self, VideoAudioProbe};
 use crate::naming::DEFAULT_PREFIX;
@@ -2067,22 +2067,26 @@ fn recompute_converter_derived(state: &mut AppStateSnapshot) {
 
     // Compute preview / collision / encoder desc via a temporary settings assembly
     let settings = assemble_converter_settings(state);
-    let (collision_warning, output_preview, encoder_chain_desc) = if let Some(ref s) = settings {
+    let (collision_warning, output_preview, encoder_chain_desc, duplicate_warning) = if let Some(ref s) = settings {
         let probe = state.converter.probes.first().and_then(|p| p.as_ref());
         let collision = output_collision_warning(s);
         let preview = preview_output_files(s, probe);
         let chain = caps.as_ref()
             .map(|c| describe_chain(&s.video_encoder, c))
             .unwrap_or_default();
-        (collision, preview, chain)
+        let dupe_paths: Vec<std::path::PathBuf> = preview.iter().map(|p| p.path.clone()).collect();
+        let dupe_names = duplicate_output_names(&dupe_paths);
+        let dupe_warning = duplicate_output_warning(&dupe_names);
+        (collision, preview, chain, dupe_warning)
     } else {
-        (None, Vec::new(), String::new())
+        (None, Vec::new(), String::new(), None)
     };
 
     // Now borrow converter mutably to publish all derived fields at once
     let c = &mut state.converter;
     c.readiness = blockers;
     c.collision_warning = collision_warning;
+    c.duplicate_output_warning = duplicate_warning;
     c.output_preview = output_preview;
     c.encoder_chain_desc = encoder_chain_desc;
 }

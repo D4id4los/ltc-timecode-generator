@@ -30,8 +30,9 @@ pub use settings::{ConversionPipeline, ConverterSettings, RecordingType};
 
 pub(crate) mod planning;
 pub use planning::{
-    output_collision_warning, preview_output_files, plan_concat_outputs,
-    plan_video_outputs, AudioKeep, OutputKind, PreviewOutput, VideoOutputStep,
+    duplicate_output_names, duplicate_output_warning, output_collision_warning,
+    preview_output_files, plan_concat_outputs, plan_video_outputs, AudioKeep,
+    OutputKind, PreviewOutput, VideoOutputStep,
 };
 
 pub(crate) mod checks;

@@ -531,6 +531,42 @@ pub fn output_collision_warning(settings: &ConverterSettings) -> Option<String> 
     }
 }
 
+/// Returns the set of filenames (as `file_name` strings) that appear more than once
+/// in the given planned output paths.
+pub fn duplicate_output_names(paths: &[PathBuf]) -> Vec<String> {
+    let mut seen = std::collections::HashMap::new();
+    for p in paths {
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        *seen.entry(name).or_insert(0u32) += 1;
+    }
+    let mut dups: Vec<String> = seen
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, _)| name)
+        .collect();
+    dups.sort();
+    dups
+}
+
+/// Build a human-readable warning from a list of duplicate filenames.
+/// Returns `None` when the list is empty.
+pub fn duplicate_output_warning(duplicate_names: &[String]) -> Option<String> {
+    if duplicate_names.is_empty() {
+        return None;
+    }
+    let list = duplicate_names.join("\", \"");
+    Some(format!(
+        "Two or more output files would have the same name: \"{}\". \
+         Later files will overwrite earlier ones. \
+         Add {{clip}}, {{track}}, or {{filename}} to the naming templates to disambiguate.",
+        list
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -690,5 +726,122 @@ mod tests {
             ..make_settings_audio_only()
         };
         assert!(output_collision_warning(&s).is_none());
+    }
+
+    #[test]
+    fn test_duplicate_output_names_empty() {
+        assert!(duplicate_output_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_output_names_single_file() {
+        let s = make_video_settings();
+        let probe = make_stereo_probe();
+        let preview = preview_output_files(&s, Some(&probe));
+        let paths: Vec<PathBuf> = preview.iter().map(|p| p.path.clone()).collect();
+        assert!(duplicate_output_names(&paths).is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_output_names_video_two_files_no_placeholder() {
+        let mut s = make_video_settings();
+        s.input_files = vec![
+            PathBuf::from("/tmp/clip1.mp4"),
+            PathBuf::from("/tmp/clip2.mp4"),
+        ];
+        s.video_suffix_template = "_video".to_string();
+        let probe = make_stereo_probe();
+        let preview = preview_output_files(&s, Some(&probe));
+        let paths: Vec<PathBuf> = preview.iter().map(|p| p.path.clone()).collect();
+        let dups = duplicate_output_names(&paths);
+        assert!(dups.contains(&"output_video.mkv".to_string()),
+            "should detect duplicate video output without {{clip}}");
+    }
+
+    #[test]
+    fn test_duplicate_output_names_video_two_files_with_placeholder() {
+        let mut s = make_video_settings();
+        s.input_files = vec![
+            PathBuf::from("/tmp/clip1.mp4"),
+            PathBuf::from("/tmp/clip2.mp4"),
+        ];
+        s.video_suffix_template = "_video{clip:02d}".to_string();
+        let probe = make_stereo_probe();
+        let preview = preview_output_files(&s, Some(&probe));
+        let paths: Vec<PathBuf> = preview.iter().map(|p| p.path.clone()).collect();
+        assert!(duplicate_output_names(&paths).is_empty(),
+            "no dupes when {{clip}} is in the video suffix");
+    }
+
+    #[test]
+    fn test_duplicate_output_names_audio_split_no_track() {
+        let mut s = make_video_settings();
+        s.input_files = vec![
+            PathBuf::from("/tmp/clip1.mp4"),
+            PathBuf::from("/tmp/clip2.mp4"),
+        ];
+        s.split_tracks = true;
+        s.audio_suffix_template = "_audio".to_string();
+        s.channel_map = crate::converter::ChannelMap::identity(2);
+        let probe = make_stereo_probe();
+        let preview = preview_output_files(&s, Some(&probe));
+        let paths: Vec<PathBuf> = preview.iter().map(|p| p.path.clone()).collect();
+        let dups = duplicate_output_names(&paths);
+        assert!(!dups.is_empty(),
+            "should detect duplicate audio without {{track}}");
+        assert!(dups.contains(&"output_audio.wav".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_output_names_audio_split_with_track_only_still_dupes_across_files() {
+        let mut s = make_video_settings();
+        s.input_files = vec![
+            PathBuf::from("/tmp/clip1.mp4"),
+            PathBuf::from("/tmp/clip2.mp4"),
+        ];
+        s.split_tracks = true;
+        s.audio_suffix_template = "_audio{track:02d}".to_string();
+        s.channel_map = crate::converter::ChannelMap::identity(2);
+        let probe = make_stereo_probe();
+        let preview = preview_output_files(&s, Some(&probe));
+        let paths: Vec<PathBuf> = preview.iter().map(|p| p.path.clone()).collect();
+        let dups = duplicate_output_names(&paths);
+        assert!(!dups.is_empty(),
+            "{{track}} alone is not enough across files — expect duplicates");
+    }
+
+    #[test]
+    fn test_duplicate_output_names_audio_split_with_track_and_clip() {
+        let mut s = make_video_settings();
+        s.input_files = vec![
+            PathBuf::from("/tmp/clip1.mp4"),
+            PathBuf::from("/tmp/clip2.mp4"),
+        ];
+        s.split_tracks = true;
+        s.audio_suffix_template = "_audio{clip:02d}_track{track:02d}".to_string();
+        s.channel_map = crate::converter::ChannelMap::identity(2);
+        let probe = make_stereo_probe();
+        let preview = preview_output_files(&s, Some(&probe));
+        let paths: Vec<PathBuf> = preview.iter().map(|p| p.path.clone()).collect();
+        assert!(duplicate_output_names(&paths).is_empty(),
+            "no dupes when both {{clip}} and {{track}} are in the audio suffix");
+    }
+
+    #[test]
+    fn test_duplicate_output_warning_none() {
+        assert!(duplicate_output_warning(&[]).is_none());
+    }
+
+    #[test]
+    fn test_duplicate_output_warning_some() {
+        let dups = vec!["output.mkv".to_string(), "audio.wav".to_string()];
+        let warn = duplicate_output_warning(&dups);
+        assert!(warn.is_some());
+        let msg = warn.unwrap();
+        assert!(msg.contains("output.mkv"));
+        assert!(msg.contains("audio.wav"));
+        assert!(msg.contains("{clip}"));
+        assert!(msg.contains("{track}"));
+        assert!(msg.contains("{filename}"));
     }
 }

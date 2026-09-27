@@ -109,6 +109,8 @@ export component AppWindow inherits Window {
     in-out property <float> conv-progress: 0.0;
     in-out property <string> conv-log: "";
     in-out property <string> conv-sanity-msg: "";
+    in-out property <string> conv-collision-warning: "";
+    in-out property <string> conv-duplicate-output-warning: "";
     in-out property <int> conv-selected-pattern: 0;
     in-out property <[string]> conv-container-options: [];
     in-out property <[string]> conv-video-encoder-options: [];
@@ -744,6 +746,8 @@ export component AppWindow inherits Window {
                     conv-progress: root.conv-progress;
                     conv-log: root.conv-log;
                     sanity-msg: root.conv-sanity-msg;
+                    collision-warning: root.conv-collision-warning;
+                    duplicate-output-warning: root.conv-duplicate-output-warning;
                     container-options: root.conv-container-options;
                     video-encoder-options: root.conv-video-encoder-options;
                     audio-encoder-options: root.conv-audio-encoder-options;

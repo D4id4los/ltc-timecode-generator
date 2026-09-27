@@ -119,6 +119,8 @@ pub struct ConverterSnapshot {
     pub readiness: Vec<ConvertBlocker>,
     /// Warning when an output file collides with an input file.
     pub collision_warning: Option<String>,
+    /// Warning when two or more planned output files share the same name.
+    pub duplicate_output_warning: Option<String>,
     /// Preview of output files — recomputed by the engine on changes.
     pub output_preview: Vec<PreviewOutput>,
     /// Human-readable description of the resolved encoder chain.
@@ -352,6 +354,7 @@ impl AppStateSnapshot {
                 settings: ConverterUserSettings::initial(),
                 readiness: Vec::new(),
                 collision_warning: None,
+                duplicate_output_warning: None,
                 output_preview: Vec::new(),
                 encoder_chain_desc: String::new(),
             },

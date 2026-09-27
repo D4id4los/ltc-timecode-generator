@@ -1436,6 +1436,18 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                 ui.label(RichText::new(format!("ℹ {}", note)).font(FontId::proportional(10.0)).color(colors.warning_amber));
             });
         }
+        // Non-blocking duplicate output warning (never disables the Convert button)
+        if let Some(ref note) = state.latest.converter.duplicate_output_warning {
+            ui.add_space(4.0);
+            let warning_area = egui::Frame::new()
+                .fill(Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.08))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.2)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 6));
+            warning_area.show(ui, |ui| {
+                ui.label(RichText::new(format!("⚠ {}", note)).font(FontId::proportional(10.0)).color(colors.warning_amber));
+            });
+        }
     }
 
     if let Some(ref caps) = caps_opt {
