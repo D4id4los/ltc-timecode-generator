@@ -882,8 +882,16 @@ fn _run_gui(
     // ── Offload callbacks ───────────────────────────────────────────────────
     {
         let cmd = cmd_tx.clone();
+        let ui_weak = ui.as_weak();
         ui.on_off_select_parent_folder(move || {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(u) = ui_weak.upgrade() {
+                let current = u.get_off_parent_folder();
+                if !current.is_empty() {
+                    dialog = dialog.set_directory(current.as_str());
+                }
+            }
+            if let Some(path) = dialog.pick_folder() {
                 let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetParentFolder(path)));
                 // Poll will sync the parent folder from engine state
             }

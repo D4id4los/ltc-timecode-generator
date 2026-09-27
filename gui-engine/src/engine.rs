@@ -53,12 +53,11 @@ pub fn engine_main_with_probe<F>(
     current.use_libltc = use_libltc;
     current.ffmpeg_probe_running = true;
 
-    // Seed converter output folder from persisted config (input folder is
-    // restored by the GUI sending SelectFolder during startup).
+    // Seed persisted paths into the engine snapshot (output folder,
+    // offload parent dir). Input folder is restored by the GUI sending
+    // SelectFolder during startup.
     let saved_cfg = config::load();
-    if let Some(ref folder) = saved_cfg.last_output_folder {
-        current.converter.settings.output_folder = Path::new(folder).to_path_buf();
-    }
+    config::seed_snapshot_from_config(&mut current, &saved_cfg);
 
     let core = AudioCore::new();
     let mut last_tick = Instant::now();
@@ -1979,8 +1978,9 @@ fn handle_offload_command(
         }
 
         crate::command::OffloadCommand::SetParentFolder(path) => {
-            state.offload.parent_folder = Some(path);
+            state.offload.parent_folder = Some(path.clone());
             state.offload.error = None;
+            config::save_offload_parent(&path);
         }
 
         crate::command::OffloadCommand::SetParentName(name) => {

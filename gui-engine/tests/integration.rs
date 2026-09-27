@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use std::path::Path;
 
 use arc_swap::ArcSwap;
-use gui_engine::command::GuiCommand;
+use gui_engine::command::{GuiCommand, OffloadCommand};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::{decode_ltc_from_wav, LtcDecodeStatus};
 
@@ -613,4 +613,14 @@ fn cancel_decode_also_clears_group_detecting() {
     assert!(!snapshot.ltc_is_detecting,
         "CancelDecode should clear ltc_is_detecting");
     assert_eq!(snapshot.status_message, "Decode canceled by user");
+}
+
+#[test]
+fn set_parent_folder_persists_in_snapshot() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let snapshot = run_engine_with_commands(vec![
+        GuiCommand::Offload(OffloadCommand::SetParentFolder(dir.path().to_path_buf())),
+    ], false);
+    assert_eq!(snapshot.offload.parent_folder, Some(dir.path().to_path_buf()),
+        "SetParentFolder should update the snapshot parent_folder");
 }
