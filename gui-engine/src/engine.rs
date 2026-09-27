@@ -76,6 +76,10 @@ pub fn engine_main_with_probe<F>(
     let (offload_event_tx, offload_event_rx) =
         std::sync::mpsc::channel::<OffloadEvent>();
 
+    // Internal result channel for folder scan (file group discovery)
+    let (scan_tx, scan_rx) =
+        std::sync::mpsc::channel::<FolderScanResult>();
+
     // Spawn the ffmpeg capability probe on a background thread
     std::thread::Builder::new()
         .name("ffmpeg-probe".into())
@@ -112,6 +116,30 @@ pub fn engine_main_with_probe<F>(
         let dt = (now - last_tick).as_secs_f32();
         last_tick = now;
 
+        // 0. Drain folder scan results FIRST — before commands — so that a
+        //     SelectRecording processed in step 1 always finds the latest
+        //     scanned groups.
+        loop {
+            match scan_rx.try_recv() {
+                Ok(FolderScanResult { path, groups, generation }) => {
+                    if generation == current.converter.groups_generation
+                        && Some(&path) == current.converter.groups_folder.as_ref()
+                    {
+                        current.converter.groups = groups;
+                        current.converter.groups_loading = false;
+                        info!("Folder scan complete: {} group(s)", current.converter.groups.len());
+                    } else {
+                        warn!("Discarding stale folder scan result (gen {} != {} or path mismatch)", generation, current.converter.groups_generation);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("Folder scan channel disconnected");
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
         // 1. Drain all pending commands
         loop {
             match cmd_rx.try_recv() {
@@ -139,18 +167,29 @@ pub fn engine_main_with_probe<F>(
                         .expect("failed to spawn duration-probe thread");
                 }
                 Ok(GuiCommand::Converter(crate::command::ConverterCommand::SelectFolder(path))) => {
-                    let groups = crate::file_pattern::match_files_all_patterns(&path);
-                    info!(
-                        "Converter folder selected: {} — {} group(s) matched",
-                        path.display(),
-                        groups.len(),
-                    );
-                    current.converter.groups = groups;
+                    current.converter.groups.clear();
+                    current.converter.groups_loading = true;
+                    current.converter.groups_folder = Some(path.clone());
+                    current.converter.groups_generation = current.converter.groups_generation.wrapping_add(1);
+                    let gen = current.converter.groups_generation;
                     current.converter.selected_group_idx = None;
                     current.converter.probes.clear();
                     current.converter.probes_loading = false;
                     current.converter.probes_generation = 0;
                     current.converter.conversion_state = ConversionState::idle();
+                    let tx = scan_tx.clone();
+                    std::thread::Builder::new()
+                        .name("folder-scan".into())
+                        .spawn(move || {
+                            let groups = crate::file_pattern::match_files_all_patterns(&path);
+                            info!(
+                                "Folder scan complete: {} — {} group(s) matched",
+                                path.display(),
+                                groups.len(),
+                            );
+                            let _ = tx.send(FolderScanResult { path, groups, generation: gen });
+                        })
+                        .expect("failed to spawn folder-scan thread");
                 }
                 Ok(GuiCommand::Converter(crate::command::ConverterCommand::SelectRecording(idx))) => {
                     let group_count = current.converter.groups.len();
@@ -522,7 +561,7 @@ pub fn engine_main_with_probe<F>(
             }
         }
 
-        // 1.11 Poll chunked / group decode progress
+        // 1.12 Poll chunked / group decode progress
         if current.ltc_is_detecting {
             if let Some(ref vp) = video_progress {
                 // Single-video path: report from ClipProgress (extraction + chunked decode)
@@ -636,6 +675,13 @@ struct DurationResult {
 /// Internal message sent from the converter-probe thread back to the engine loop.
 struct ConverterProbeResult {
     probes: Vec<Result<VideoAudioProbe, String>>,
+    generation: u64,
+}
+
+/// Internal message sent from the folder-scan thread back to the engine loop.
+struct FolderScanResult {
+    path: std::path::PathBuf,
+    groups: Vec<crate::file_pattern::MatchedGroup>,
     generation: u64,
 }
 

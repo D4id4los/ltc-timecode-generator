@@ -32,6 +32,15 @@ pub struct ConverterSnapshot {
     /// Conversion state (idle/running/completed/failed).
     /// Owned by the engine; GUIs only read it.
     pub conversion_state: ConversionState,
+    /// True while a folder scan is in progress (background thread walking
+    /// the filesystem to discover file groups).
+    pub groups_loading: bool,
+    /// The folder being (or last) scanned.  GUIs compare against their
+    /// own `selected_folder` to know when a scan result is for them.
+    pub groups_folder: Option<PathBuf>,
+    /// Generation counter — incremented on each `SelectFolder` so stale
+    /// scan results from rapid re-clicks are discarded.
+    pub groups_generation: u64,
 }
 
 impl ConverterSnapshot {
@@ -255,6 +264,9 @@ impl AppStateSnapshot {
                 probes_loading: false,
                 probes_generation: 0,
                 conversion_state: ConversionState::idle(),
+                groups_loading: false,
+                groups_folder: None,
+                groups_generation: 0,
             },
             offload: OffloadSnapshot::initial(),
         }

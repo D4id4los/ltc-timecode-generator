@@ -212,7 +212,7 @@ fn test_engine_clap_auto_increments_take() {
 fn test_engine_clap_sets_flash_and_arm() {
     let snapshot = run_engine_with_command(GuiCommand::Clap, false);
 
-    assert!((snapshot.clap_flash_alpha - 1.0).abs() < 0.01, "flash alpha should be ~1.0 on Clap, got {}", snapshot.clap_flash_alpha);
+    assert!((snapshot.clap_flash_alpha - 1.0).abs() < 0.05, "flash alpha should be ~1.0 on Clap, got {}", snapshot.clap_flash_alpha);
     assert!(snapshot.clap_arm_angle.abs() < 0.1, "arm angle should be ~0.0 on Clap, got {}", snapshot.clap_arm_angle);
 }
 

@@ -9,7 +9,7 @@ use egui::{Color32, FontId, RichText, Sense, Ui};
 use gui_engine::command::GuiCommand;
 use gui_engine::config;
 use gui_engine::converter::{ChannelMap, ConversionState, RecordingType, SharedConversionState, CancelFlag, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX};
-use gui_engine::file_pattern::{match_files_all_patterns, MatchedGroup};
+use gui_engine::file_pattern::MatchedGroup;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::{ArcSwap, AudioEvent};
@@ -198,28 +198,17 @@ impl AppState {
             offload_last_version: 0,
         };
 
-        // Sync the engine's group list with the restored folder before sending
-        // any SelectRecording — otherwise the engine's group list is empty and
-        // SelectRecording silently skips the clip probe, leaving ltc_probe unset.
+        // Sync the engine's group list with the restored folder so the
+        // engine starts scanning. Groups will be adopted from the snapshot
+        // once the folder-scan thread completes.
         if let Some(ref folder) = selected_folder {
             let _ = result.cmd_tx.send(GuiCommand::Converter(
                 gui_engine::command::ConverterCommand::SelectFolder(folder.clone()),
             ));
             log::info!(
-                "Restored converter folder from config: {} ({} group(s))",
+                "Sent SelectFolder to engine on startup: {}",
                 folder.display(),
-                file_groups.as_ref().map_or(0, |g| g.len()),
             );
-        }
-
-        // Auto-select first group (clone groups to avoid borrow conflict with mutation)
-        if let Some(ref groups) = result.file_groups.clone() {
-            if !groups.is_empty() {
-                let cmds = crate::widgets::converter::apply_group_selection(&mut result, groups, 0);
-                for cmd in cmds {
-                    let _ = result.cmd_tx.send(cmd);
-                }
-            }
         }
 
         // Send duration probe for restored groups
@@ -248,8 +237,10 @@ impl AppState {
         if !folder.exists() {
             return (None, None);
         }
-        let groups = match_files_all_patterns(&folder);
-        (Some(folder), Some(groups))
+        // Groups are discovered asynchronously by the engine — return no
+        // groups here; they will be adopted from the snapshot once the
+        // engine's folder-scan thread completes.
+        (Some(folder), None)
     }
 
     /// Applies auto-settings (trim/split/drop) from a successful decode result,
@@ -417,27 +408,50 @@ impl eframe::App for AppState {
                 let path = path.clone();
                 log::info!("Offload completed — auto-switching converter folder to {:?}", path);
                 self.selected_folder = Some(path.clone());
+                self.file_groups = None;
+                self.selected_group_idx = None;
+                self.ltc_file_idx = 1;
                 config::save_input_folder(&path);
                 let _ = self.cmd_tx.send(GuiCommand::Converter(
                     gui_engine::command::ConverterCommand::SelectFolder(path.clone()),
                 ));
-                let groups = match_files_all_patterns(&path);
-                let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
-                    let paths: Vec<std::path::PathBuf> = if g.recording_type == RecordingType::MultiTrackAudio {
-                        g.files.first().cloned().into_iter().collect()
+            }
+        }
+
+        // 10. Adopt converter groups from the engine snapshot once the
+        //     folder-scan completes (so ltc-gui never walks the directory
+        //     on the GUI thread).
+        if self.file_groups.is_none() {
+            if let Some(ref folder) = self.selected_folder.clone() {
+                let snap = &self.latest.converter;
+                if !snap.groups_loading
+                    && snap.groups_folder.as_ref() == Some(folder)
+                {
+                    let groups = snap.groups.clone();
+                    log::info!(
+                        "Adopting converter groups from engine snapshot: {} group(s)",
+                        groups.len(),
+                    );
+                    self.file_groups = Some(groups.clone());
+                    if !groups.is_empty() {
+                        let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
+                            let paths: Vec<std::path::PathBuf> = if g.recording_type == gui_engine::converter::RecordingType::MultiTrackAudio {
+                                g.files.first().cloned().into_iter().collect()
+                            } else {
+                                g.files.clone()
+                            };
+                            paths
+                        }).collect();
+                        if !probe_paths.is_empty() {
+                            let _ = self.cmd_tx.send(GuiCommand::ProbeFileDurations(probe_paths));
+                        }
+                        let cmds = crate::widgets::converter::apply_group_selection(self, &groups, 0);
+                        for cmd in cmds {
+                            let _ = self.cmd_tx.send(cmd);
+                        }
                     } else {
-                        g.files.clone()
-                    };
-                    paths
-                }).collect();
-                if !probe_paths.is_empty() {
-                    let _ = self.cmd_tx.send(GuiCommand::ProbeFileDurations(probe_paths));
-                }
-                self.file_groups = Some(groups.clone());
-                if !groups.is_empty() {
-                    let cmds = crate::widgets::converter::apply_group_selection(self, &groups, 0);
-                    for cmd in cmds {
-                        let _ = self.cmd_tx.send(cmd);
+                        self.selected_group_idx = None;
+                        self.ltc_file_idx = 1;
                     }
                 }
             }
@@ -1255,8 +1269,10 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel();
-        // Build AppState with the restore config — this must send SelectFolder + SelectRecording.
-        let _app = super::AppState::new_with_config(
+        // Build AppState with the restore config — this must send SelectFolder.
+        // SelectRecording is NOT sent at startup anymore — it happens
+        // asynchronously when logic() adopts groups from the engine snapshot.
+        let app = super::AppState::new_with_config(
             tx,
             dummy_state(),
             dummy_log_buffer(),
@@ -1267,18 +1283,17 @@ mod tests {
         let cmds: Vec<GuiCommand> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
         // The very first command must be SelectFolder so the engine populates its
-        // group list before SelectRecording arrives.
+        // group list.
         let first = cmds.first().expect("expected at least one command");
         assert!(
             matches!(first, GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectFolder(p)) if p == dir.path()),
             "first command must be SelectFolder, got: {:?}", first
         );
 
-        // Somewhere in the list there must be a SelectRecording(0) for the
-        // auto-selected first group.
-        let has_select_recording = cmds.iter().any(|cmd| {
-            matches!(cmd, GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0)))
-        });
-        assert!(has_select_recording, "expected a SelectRecording(0) command");
+        // Only one command should be sent (no SelectRecording — that's async now).
+        assert_eq!(cmds.len(), 1, "only SelectFolder should be sent at startup; SelectRecording is async");
+
+        // file_groups should be None (populated asynchronously by logic() adoption)
+        assert!(app.file_groups.is_none(), "file_groups must be None at startup; adoption is async");
     }
 }

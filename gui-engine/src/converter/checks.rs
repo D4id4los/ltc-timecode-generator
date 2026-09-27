@@ -5,7 +5,11 @@ use crate::converter::formats::{container_supports_audio_encoder, container_to_f
 use crate::naming;
 use crate::video_codecs;
 
-pub fn conversion_sanity_check(
+/// Pure validation: checks templates, caps, codec/container compatibility.
+/// Does **not** access the filesystem (no `exists()` on files or folders).
+/// Use for per-frame UI display; use `conversion_sanity_check` (which
+/// additionally calls `validate_conversion_paths`) before spawning work.
+pub fn conversion_sanity_check_pure(
     container: &str,
     video_codec: &str,
     audio_encoder: &str,
@@ -26,21 +30,8 @@ pub fn conversion_sanity_check(
         return Err("No input files selected.".to_string());
     }
 
-    for f in input_files {
-        if !f.exists() {
-            return Err(format!("Input file does not exist: {}", f.display()));
-        }
-    }
-
     if filename_prefix.is_empty() && audio_suffix.unwrap_or("").is_empty() && video_suffix.unwrap_or("").is_empty() {
         return Err("No output filename prefix or suffix specified.".to_string());
-    }
-
-    if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
-        return Err(format!(
-            "Output directory does not exist: {}",
-            output_folder.display()
-        ));
     }
 
     if !format_available_in_ffmpeg(container, caps) {
@@ -136,7 +127,48 @@ pub fn conversion_sanity_check(
     Ok(())
 }
 
-pub fn conversion_sanity_check_metadata_only(
+/// Validate that all input files and the output folder exist on disk.
+pub fn validate_conversion_paths(
+    input_files: &[PathBuf],
+    output_folder: &Path,
+) -> Result<(), String> {
+    for f in input_files {
+        if !f.exists() {
+            return Err(format!("Input file does not exist: {}", f.display()));
+        }
+    }
+    if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
+        return Err(format!(
+            "Output directory does not exist: {}",
+            output_folder.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Full sanity check: pure validation + filesystem existence checks.
+/// Use this before actually starting a conversion.
+pub fn conversion_sanity_check(
+    container: &str,
+    video_codec: &str,
+    audio_encoder: &str,
+    input_files: &[PathBuf],
+    output_folder: &Path,
+    filename_prefix: &str,
+    caps: &FfmpegCapabilities,
+    audio_suffix: Option<&str>,
+    video_suffix: Option<&str>,
+    copy_video: bool,
+) -> Result<(), String> {
+    conversion_sanity_check_pure(
+        container, video_codec, audio_encoder, input_files, output_folder,
+        filename_prefix, caps, audio_suffix, video_suffix, copy_video,
+    )?;
+    validate_conversion_paths(input_files, output_folder)
+}
+
+/// Pure validation for metadata-only mode — no filesystem access.
+pub fn conversion_sanity_check_metadata_only_pure(
     input_files: &[PathBuf],
     output_folder: &Path,
     filename_prefix: &str,
@@ -155,24 +187,11 @@ pub fn conversion_sanity_check_metadata_only(
         return Err("No input files selected.".to_string());
     }
 
-    for f in input_files {
-        if !f.exists() {
-            return Err(format!("Input file does not exist: {}", f.display()));
-        }
-    }
-
     if filename_prefix.is_empty()
         && audio_suffix.unwrap_or("").is_empty()
         && video_suffix.unwrap_or("").is_empty()
     {
         return Err("No output filename prefix or suffix specified.".to_string());
-    }
-
-    if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
-        return Err(format!(
-            "Output directory does not exist: {}",
-            output_folder.display()
-        ));
     }
 
     if let Some(t) = audio_suffix {
@@ -193,6 +212,21 @@ pub fn conversion_sanity_check_metadata_only(
     }
 
     Ok(())
+}
+
+/// Full sanity check for metadata-only mode: pure + filesystem existence checks.
+pub fn conversion_sanity_check_metadata_only(
+    input_files: &[PathBuf],
+    output_folder: &Path,
+    filename_prefix: &str,
+    caps: &FfmpegCapabilities,
+    audio_suffix: Option<&str>,
+    video_suffix: Option<&str>,
+) -> Result<(), String> {
+    conversion_sanity_check_metadata_only_pure(
+        input_files, output_folder, filename_prefix, caps, audio_suffix, video_suffix,
+    )?;
+    validate_conversion_paths(input_files, output_folder)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -272,6 +306,86 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use crate::converter::test_fixtures::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_pure_ok_with_nonexistent_paths() {
+        let mut fmts = BTreeSet::new();
+        fmts.insert("mov");
+        let mut encs = BTreeSet::new();
+        encs.insert("pcm_s24le");
+        let caps = make_caps(true, encs, fmts);
+        let files = vec![PathBuf::from("/nonexistent/file.wav")];
+        let result = conversion_sanity_check_pure(
+            "mov", "h264", "pcm_s24le",
+            &files, Path::new("/nonexistent/out"),
+            "test", &caps, Some("_audio"), Some("_video"), true,
+        );
+        assert!(result.is_ok(), "pure check should not fail on nonexistent paths: {:?}", result);
+    }
+
+    #[test]
+    fn test_full_fails_on_nonexistent_paths() {
+        let mut fmts = BTreeSet::new();
+        fmts.insert("mov");
+        let mut encs = BTreeSet::new();
+        encs.insert("pcm_s24le");
+        let caps = make_caps(true, encs, fmts);
+        let files = vec![PathBuf::from("/nonexistent/file.wav")];
+        let result = conversion_sanity_check(
+            "mov", "h264", "pcm_s24le",
+            &files, Path::new("/nonexistent/out"),
+            "test", &caps, Some("_audio"), Some("_video"), true,
+        );
+        assert!(result.is_err(), "full check should fail on nonexistent paths");
+        assert!(result.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_pure_fails_on_empty_input() {
+        let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
+        let result = conversion_sanity_check_pure(
+            "mov", "h265", "pcm_s24le",
+            &[], Path::new("/tmp"),
+            "test", &caps, Some("_audio"), Some("_video"), false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No input files"));
+    }
+
+    #[test]
+    fn test_validate_paths_ok_when_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"dummy").unwrap();
+        let result = validate_conversion_paths(
+            &[file_path],
+            dir.path(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_paths_fails_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.txt");
+        let result = validate_conversion_paths(&[missing], dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_validate_paths_fails_on_missing_output_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"dummy").unwrap();
+        let result = validate_conversion_paths(
+            &[file_path],
+            Path::new("/nonexistent/output_dir"),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
+    }
 
     #[test]
     fn test_readiness_unqueried_caps_is_not_missing() {

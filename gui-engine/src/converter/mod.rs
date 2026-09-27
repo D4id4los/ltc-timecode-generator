@@ -37,6 +37,8 @@ pub use planning::{
 pub(crate) mod checks;
 pub use checks::{
     conversion_sanity_check, conversion_sanity_check_metadata_only,
+    conversion_sanity_check_pure, conversion_sanity_check_metadata_only_pure,
+    validate_conversion_paths,
     ConvertBlocker, ConvertReadiness, evaluate_readiness, format_blockers,
 };
 

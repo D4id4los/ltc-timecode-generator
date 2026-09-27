@@ -41,6 +41,26 @@ fn ffmpeg_tooling_available() -> bool {
     run("ffmpeg") && run("ffprobe")
 }
 
+/// After sending SelectFolder the engine spawns a background scanner thread.
+/// Wait until the scan completes (groups_folder is set, loading is done)
+/// before proceeding with SelectRecording.
+fn wait_for_folder_scan(state: &Arc<ArcSwap<AppStateSnapshot>>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = state.load().as_ref().clone();
+        let done = snapshot.converter.groups_folder.is_some()
+            && !snapshot.converter.groups_loading;
+        if done {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("folder scan did not complete within 30s (groups_folder={:?}, loading={})",
+                snapshot.converter.groups_folder, snapshot.converter.groups_loading);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Generate a stereo/mono LTC wav (01:00:00:00 start) via the engine's own
 /// WAV generator.
 fn generate_ltc_wav(dir: &Path, name: &str, fps: f64, duration: f64, channels: &str) -> PathBuf {
@@ -659,12 +679,20 @@ fn test_select_recording_probe_failure_publishes_error() {
         .expect("failed to spawn engine thread");
 
     tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    wait_for_folder_scan(&state);
+    let initial_probe_gen = state.load().as_ref().converter.probes_generation;
     tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
 
+    // Wait until the converter clip probe completes.  We probe-based wait:
+    // generation stuck at 0 means the engine hasn't done a tick yet (ignore);
+    // probes_loading must transition to true (probe started) then false (done).
+    // Use probes_generation as a sentinel — it's bumped by SelectRecording.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let snapshot = state.load().as_ref().clone();
-        if snapshot.generation > 0 && !snapshot.converter.probes_loading {
+        if snapshot.converter.probes_generation > initial_probe_gen
+            && !snapshot.converter.probes_loading
+        {
             break;
         }
         if Instant::now() > deadline {
@@ -716,12 +744,16 @@ fn test_select_recording_probe_falls_back_to_successful_clip() {
         .expect("failed to spawn engine thread");
 
     tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    wait_for_folder_scan(&state);
+    let initial_probe_gen = state.load().as_ref().converter.probes_generation;
     tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = state.load().as_ref().clone();
-        if snapshot.generation > 0 && !snapshot.converter.probes_loading {
+        if snapshot.converter.probes_generation > initial_probe_gen
+            && !snapshot.converter.probes_loading
+        {
             break;
         }
         if Instant::now() > deadline {
@@ -772,14 +804,18 @@ fn test_select_recording_preserves_ltc_probe() {
     // Reproduce the GUI's command order: SelectFolder → ProbeVideo → SelectRecording.
     // SelectRecording wipes ltc_probe, but the conv-probe drain must restore it.
     tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    wait_for_folder_scan(&state);
     tx.send(GuiCommand::ProbeVideo(mp4_str)).unwrap();
+    let initial_probe_gen = state.load().as_ref().converter.probes_generation;
     tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
 
     // Wait until the converter clip probe completes.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = state.load().as_ref().clone();
-        if snapshot.generation > 0 && !snapshot.converter.probes_loading {
+        if snapshot.converter.probes_generation > initial_probe_gen
+            && !snapshot.converter.probes_loading
+        {
             break;
         }
         if Instant::now() > deadline {
@@ -820,6 +856,7 @@ fn test_select_recording_without_folder_does_not_probe() {
         .expect("failed to spawn engine thread");
 
     // Send SelectRecording without SelectFolder — engine groups are empty.
+    let initial_probe_gen = state.load().as_ref().converter.probes_generation;
     tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
 
     // Wait for one tick to process the command
@@ -828,7 +865,9 @@ fn test_select_recording_without_folder_does_not_probe() {
         let snapshot = state.load().as_ref().clone();
         // probes_loading is set to true on entry; the else branch sets it
         // to false so this is the signal the command was processed.
-        if snapshot.generation > 0 && !snapshot.converter.probes_loading {
+        if snapshot.converter.probes_generation > initial_probe_gen
+            && !snapshot.converter.probes_loading
+        {
             break;
         }
         if Instant::now() > deadline {

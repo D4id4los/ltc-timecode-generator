@@ -8,8 +8,11 @@ use gui_engine::command::{GuiCommand, ConverterCommand};
 use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
-    available_containers, build_per_file_start_timecodes, conversion_sanity_check,
-    conversion_sanity_check_metadata_only, evaluate_readiness, output_collision_warning,
+    available_containers, build_per_file_start_timecodes,
+    conversion_sanity_check, conversion_sanity_check_metadata_only,
+    conversion_sanity_check_pure, conversion_sanity_check_metadata_only_pure,
+    validate_conversion_paths,
+    evaluate_readiness, output_collision_warning,
     format_blockers,
     preview_output_files, spawn_conversion, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
     ChannelMap, ConversionPipeline, ConversionState, ConversionStatus,
@@ -17,7 +20,7 @@ use gui_engine::converter::{
 };
 use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
-use gui_engine::file_pattern::{group_display_key, match_files_all_patterns, MatchedGroup};
+use gui_engine::file_pattern::{group_display_key, MatchedGroup};
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::LtcDecodeStatus;
 
@@ -26,6 +29,38 @@ use crate::theme::ACCENT;
 
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
+
+    // Pre-compute sanity result once per frame (pure — no filesystem access)
+    let caps_opt = state.latest.ffmpeg_caps.clone();
+    let sanity_result: Option<Result<(), String>> = caps_opt.as_ref().and_then(|caps| {
+        if state.metadata_only {
+            let input_files = selected_input_files(state);
+            Some(conversion_sanity_check_metadata_only_pure(
+                &input_files,
+                &state.output_folder,
+                &state.filename_prefix,
+                caps,
+                Some(&state.audio_suffix_template),
+                Some(&state.video_suffix_template),
+            ))
+        } else if state.selected_group_idx.is_some() {
+            let input_files = selected_input_files(state);
+            Some(conversion_sanity_check_pure(
+                &state.container,
+                &state.video_encoder,
+                &state.audio_encoder,
+                &input_files,
+                &state.output_folder,
+                &state.filename_prefix,
+                caps,
+                Some(&state.audio_suffix_template),
+                Some(&state.video_suffix_template),
+                copy_mode_active(state),
+            ))
+        } else {
+            None
+        }
+    });
 
     let frame = egui::Frame::group(ui.style())
         .fill(colors.card_bg)
@@ -54,7 +89,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 
             step_header(ui, "3", "OUTPUT FORMAT", &colors);
             ui.add_space(8.0);
-            render_output_format(ui, state);
+            render_output_format(ui, state, sanity_result.as_ref());
             ui.add_space(16.0);
 
             step_header(ui, "4", "OUTPUT FILE", &colors);
@@ -62,7 +97,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             render_output_path(ui, state);
             ui.add_space(16.0);
 
-            render_convert_button(ui, state);
+            render_convert_button(ui, state, sanity_result.as_ref());
             ui.add_space(12.0);
 
             render_conversion_progress(ui, state);
@@ -174,41 +209,33 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
             if let Some(path) = folder {
                 state.selected_folder = Some(path.clone());
                 state.selected_files = None;
+                state.file_groups = None;
+                state.selected_group_idx = None;
                 config::save_input_folder(&path);
 
-                // Notify engine to scan folder and manage groups
+                // Notify engine to scan folder and manage groups (engine runs
+                // the scan on a background thread and publishes results via
+                // the snapshot's converter.groups / groups_loading flags).
                 state.send(GuiCommand::Converter(ConverterCommand::SelectFolder(path.clone())));
 
-                // Apply all patterns simultaneously (local for immediate UI)
-                let groups = match_files_all_patterns(&path);
-                let probe_paths: Vec<std::path::PathBuf> = groups.iter().flat_map(|g| {
-                    let paths: Vec<std::path::PathBuf> = if g.recording_type == RecordingType::MultiTrackAudio {
-                        g.files.first().cloned().into_iter().collect()
-                    } else {
-                        g.files.clone()
-                    };
-                    paths
-                }).collect();
-                let group_count = groups.len();
-                state.file_groups = Some(groups.clone());
-                state.send(GuiCommand::ProbeFileDurations(probe_paths));
                 state.set_start_from_ltc = false;
-                if group_count > 0 {
-                    let cmds = apply_group_selection(state, &groups, 0);
-                    for cmd in cmds {
-                        state.send(cmd);
-                    }
-                } else {
-                    state.selected_group_idx = None;
-                    state.ltc_file_idx = 1;
-                }
             }
         }
     });
 
     // File group selector (shows all matched groups with type badge)
     let groups_clone = state.file_groups.clone();
-    if let Some(ref groups) = groups_clone {
+    if groups_clone.is_none() && state.selected_folder.is_some() {
+        // Groups async scan in progress or not yet adopted
+        if state.latest.converter.groups_loading {
+            ui.label(RichText::new("Scanning folder for recordings…")
+                .font(FontId::proportional(10.0)).color(colors.text_muted));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        } else {
+            ui.label(RichText::new("No files matching any known pattern were found in this folder.")
+                .font(FontId::proportional(10.0)).color(colors.error_red));
+        }
+    } else if let Some(ref groups) = groups_clone {
         if groups.is_empty() {
             ui.label(RichText::new("No files matching any known pattern were found in this folder.")
                 .font(FontId::proportional(10.0)).color(colors.error_red));
@@ -1251,7 +1278,7 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
 
 // ── Step 3: Output format (Video / Audio columns) ──────────────────────
 
-fn render_output_format(ui: &mut Ui, state: &mut AppState) {
+fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), String>>) {
     let colors = state.theme.colors();
     let caps_opt = state.latest.ffmpeg_caps.clone();
 
@@ -1400,27 +1427,10 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
         });
     }
 
-    // Sanity check
-    if let Some(ref caps) = caps_opt {
+    // Sanity check (pre-computed in render() — pure, no filesystem IO)
+    if let Some(s) = sanity {
         ui.add_space(4.0);
-        let input_files: Vec<PathBuf> = state
-            .selected_group_idx
-            .and_then(|idx| state.file_groups.as_ref()?.get(idx))
-            .map(|g| g.files.clone())
-            .unwrap_or_default();
-
-        match conversion_sanity_check(
-            &state.container,
-            &state.video_encoder,
-            &state.audio_encoder,
-            &input_files,
-            &state.output_folder,
-            &state.filename_prefix,
-            caps,
-            Some(&state.audio_suffix_template),
-            Some(&state.video_suffix_template),
-            copy_mode_active(state),
-        ) {
+        match s {
             Ok(()) => {
                 if copy_mode_active(state) {
                     ui.label(
@@ -1429,13 +1439,15 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState) {
                             .color(colors.success_green),
                     );
                 } else {
-                    let codec = normalize_video_codec(&state.video_encoder);
-                    let chain = describe_chain(codec, caps);
-                    ui.label(
-                        RichText::new(format!("✓ Settings are compatible — {} via {}", codec, chain))
-                            .font(FontId::proportional(10.0))
-                            .color(colors.success_green),
-                    );
+                    if let Some(ref caps) = caps_opt {
+                        let codec = normalize_video_codec(&state.video_encoder);
+                        let chain = describe_chain(codec, caps);
+                        ui.label(
+                            RichText::new(format!("✓ Settings are compatible — {} via {}", codec, chain))
+                                .font(FontId::proportional(10.0))
+                                .color(colors.success_green),
+                        );
+                    }
                 }
             }
             Err(msg) => {
@@ -1670,7 +1682,7 @@ fn selected_input_files(state: &AppState) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
+fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), String>>) {
     let colors = state.theme.colors();
     let is_running = matches!(
         state.conversion_state.lock().unwrap().status,
@@ -1706,37 +1718,7 @@ fn render_convert_button(ui: &mut Ui, state: &mut AppState) {
     );
     let can_convert = readiness.can_convert;
 
-    let sanity_ok = if can_convert {
-        let caps = caps_opt.as_ref().unwrap();
-        let input_files = selected_input_files(state);
-        if state.metadata_only {
-            conversion_sanity_check_metadata_only(
-                &input_files,
-                &state.output_folder,
-                &state.filename_prefix,
-                caps,
-                Some(&state.audio_suffix_template),
-                Some(&state.video_suffix_template),
-            )
-            .is_ok()
-        } else {
-            conversion_sanity_check(
-                &state.container,
-                &state.video_encoder,
-                &state.audio_encoder,
-                &input_files,
-                &state.output_folder,
-                &state.filename_prefix,
-                caps,
-                Some(&state.audio_suffix_template),
-                Some(&state.video_suffix_template),
-                copy_mode_active(state),
-            )
-            .is_ok()
-        }
-    } else {
-        false
-    };
+    let sanity_ok = sanity.map(|r| r.is_ok()).unwrap_or(false);
 
     let button_label = if state.metadata_only {
         "TAG + EXTRACT (METADATA ONLY)"
@@ -1838,6 +1820,42 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
 }
 
 fn start_conversion(state: &mut AppState) {
+    // Full sanity check with filesystem existence validation (user-initiated IO is OK)
+    let caps_opt = state.latest.ffmpeg_caps.clone();
+    if let Some(ref caps) = caps_opt {
+        let input_files = selected_input_files(state);
+        let r = if state.metadata_only {
+            conversion_sanity_check_metadata_only(
+                &input_files,
+                &state.output_folder,
+                &state.filename_prefix,
+                caps,
+                Some(&state.audio_suffix_template),
+                Some(&state.video_suffix_template),
+            )
+        } else {
+            conversion_sanity_check(
+                &state.container,
+                &state.video_encoder,
+                &state.audio_encoder,
+                &input_files,
+                &state.output_folder,
+                &state.filename_prefix,
+                caps,
+                Some(&state.audio_suffix_template),
+                Some(&state.video_suffix_template),
+                copy_mode_active(state),
+            )
+        };
+        if let Err(e) = r {
+            log::error!("Conversion refused by preflight check: {}", e);
+            if let Ok(mut cs) = state.conversion_state.lock() {
+                cs.status = ConversionStatus::Failed { error_log: format!("Preflight check failed: {}", e) };
+            }
+            return;
+        }
+    }
+
     let mut settings = current_converter_settings(state);
     let num_files = settings.input_files.len();
     let is_video_group = state.recording_type == RecordingType::VideoClipSequence;
