@@ -1,6 +1,45 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* v0.4.4
+
+Main features are UI freeze fixes, improved LTC quality scoring, H.265 default
+for the converter, and the first pass at an offloading tab for file import.
+
+List of Changes:
+- Decode:
+  - Reworked LTC quality score to reflect sync usability — anchored on usable
+    coverage (fraction of frames in blocks >=2s with <=1 frame drift), computed
+    per-segment drift via least-squares fit, capped jump penalties, and added
+    usable_coverage, block_count, worst_block_drift_frames, backward_jump_count
+    fields.
+  - Report end-to-end processing time for video decodes (previously only the
+    LTC decode step was timed, hiding ffprobe/ffmpeg extraction cost).
+  - Abort LTC decode promptly on cancellation — cancel flag now checked inside
+    the decoder (ZC scan, sliding-window search, chunk loops) and chunk
+    concurrency bounded to available_parallelism().
+  - Unified chunk-count logic and progress tracking — replaced 3 hand-rolled
+    chunk-count loops with audio_core::count_chunks_in_wav(), stored progress
+    as DecodeProgress struct instead of raw atomics.
+- Convert tab:
+  - Set H.265/HEVC in MOV with PCM 24-bit as the default codec/container when
+    an encoder is available, ahead of ProRes/DNxHD/H.264; MP4+AAC as second
+    H.265 row for builds without a MOV muxer.
+  - Show LTC probe failure instead of stuck "Probing…" — preserved per-file
+    ffprobe error strings, published ltc_decode_error on failure, fell back
+    to the first successful clip probe.
+  - Split the monolithic converter.rs into a directory module with focused
+    submodules (progress, channel_map, timecode, capabilities, formats,
+    settings, planning, checks, args, process, runner).
+- ltc-gui:
+  - Stop UI freezes when switching recordings — moved folder scanning off the
+    GUI thread to a background scanner thread; split conversion_sanity_check
+    into pure validation (no IO) for per-frame rendering and a full check with
+    existence validation for preflight/conversion start.
+- Offloading:
+  - First pass at an offloading tab for file import, with recording device
+    detection to auto-name destination folders.
+
 * v0.4.3
 
 Main features are a reworked set-start-time-from-LTC workflow that no longer
