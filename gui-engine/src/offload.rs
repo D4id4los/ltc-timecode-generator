@@ -645,7 +645,8 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
 
 /// Classify a mount point as a media card: shallow media scan + device name guess.
 fn classify_mount(mount: &Path, _label_source: &Path) -> Option<SdCardInfo> {
-    let infos = collect_media_files_shallow(mount);
+    let mut infos = collect_media_files_shallow(mount);
+    infos.sort_by(|a, b| b.modified.cmp(&a.modified));
     let media_files: Vec<PathBuf> = infos.iter().map(|f| f.path.clone()).collect();
     let total_bytes: u64 = infos.iter().map(|f| f.size_bytes).sum();
     let volume_label = volume_label_for(mount);
