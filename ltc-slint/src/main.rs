@@ -516,6 +516,14 @@ fn _run_gui(
     {
         let cmd = cmd_tx.clone();
         let cache = conv_settings_cache.clone();
+        ui.on_toggle_embed_camera_meta(move || {
+            let val = !cache.lock().unwrap().embed_camera_metadata;
+            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetEmbedCameraMetadata(val)));
+        });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        let cache = conv_settings_cache.clone();
         ui.on_toggle_set_start_ltc(move || {
             let val = !cache.lock().unwrap().set_start_from_ltc;
             let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetStartFromLtc(val)));

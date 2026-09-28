@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, RichText, Sense, Ui};
-use gui_engine::command::GuiCommand;
+use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::config;
-use gui_engine::state::AppStateSnapshot;
+use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::{ArcSwap, AudioEvent};
 
@@ -190,6 +190,96 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     (base + predicted_dt).max(floor)
 }
 
+/// Compare two `ConverterUserSettings` snapshots and emit the
+/// `ConverterCommand` variants needed to reconcile `new` into the engine.
+///
+/// This is the reverse-direction bridge: engine state flows into the GUI
+/// via `ArcSwap`, but when the user edits a field in the local copy, that
+/// change is detected here and forwarded as a command.
+///
+/// Channel-map differences use `SwapChannelMapCells` (the only channel-map
+/// mutation primitive) by computing a minimal swap sequence.
+fn diff_converter_commands(
+    old: &ConverterUserSettings,
+    new: &ConverterUserSettings,
+) -> Vec<ConverterCommand> {
+    let mut cmds = Vec::new();
+
+    if old.metadata_only != new.metadata_only {
+        cmds.push(ConverterCommand::SetMetadataOnly(new.metadata_only));
+    }
+    if old.generate_synthetic_video != new.generate_synthetic_video {
+        cmds.push(ConverterCommand::SetGenerateSyntheticVideo(new.generate_synthetic_video));
+    }
+    if old.copy_video != new.copy_video {
+        cmds.push(ConverterCommand::SetCopyVideo(new.copy_video));
+    }
+    if old.split_tracks != new.split_tracks {
+        cmds.push(ConverterCommand::SetSplitTracks(new.split_tracks));
+    }
+    if old.drop_ltc_track != new.drop_ltc_track {
+        cmds.push(ConverterCommand::SetDropLtcTrack(new.drop_ltc_track));
+    }
+    if old.concat_audio != new.concat_audio {
+        cmds.push(ConverterCommand::SetConcatAudio(new.concat_audio));
+    }
+    if old.set_start_from_ltc != new.set_start_from_ltc {
+        cmds.push(ConverterCommand::SetStartFromLtc(new.set_start_from_ltc));
+    }
+    if old.embed_camera_metadata != new.embed_camera_metadata {
+        cmds.push(ConverterCommand::SetEmbedCameraMetadata(new.embed_camera_metadata));
+    }
+    if old.trim_enabled != new.trim_enabled {
+        cmds.push(ConverterCommand::SetTrimEnabled(new.trim_enabled));
+    }
+    if old.ltc_file_idx != new.ltc_file_idx {
+        cmds.push(ConverterCommand::SetLtcFileIndex(new.ltc_file_idx));
+    }
+    if old.naming_pattern != new.naming_pattern {
+        cmds.push(ConverterCommand::SetNamingPattern(new.naming_pattern));
+    }
+    if old.container != new.container {
+        cmds.push(ConverterCommand::SetContainer(new.container.clone()));
+    }
+    if old.video_encoder != new.video_encoder {
+        cmds.push(ConverterCommand::SetVideoCodec(new.video_encoder.clone()));
+    }
+    if old.audio_encoder != new.audio_encoder {
+        cmds.push(ConverterCommand::SetAudioEncoder(new.audio_encoder.clone()));
+    }
+    if old.output_folder != new.output_folder {
+        cmds.push(ConverterCommand::SetOutputFolder(new.output_folder.clone()));
+    }
+    if old.filename_prefix != new.filename_prefix {
+        cmds.push(ConverterCommand::SetFilenamePrefix(new.filename_prefix.clone()));
+    }
+    if old.audio_suffix_template != new.audio_suffix_template {
+        cmds.push(ConverterCommand::SetAudioSuffixTemplate(new.audio_suffix_template.clone()));
+    }
+    if old.video_suffix_template != new.video_suffix_template {
+        cmds.push(ConverterCommand::SetVideoSuffixTemplate(new.video_suffix_template.clone()));
+    }
+
+    // Channel-map: emit SwapChannelMapCells for each position where the
+    // mapping changed.  Only meaningful when dimensions match (engine
+    // resizes via identity on probe).
+    if old.channel_map.num_channels() == new.channel_map.num_channels() {
+        let old_map = old.channel_map.mapping();
+        let new_map = new.channel_map.mapping();
+        let mut working = old_map.to_vec();
+        for i in 0..working.len() {
+            if working[i] != new_map[i] {
+                if let Some(j) = working.iter().position(|&v| v == new_map[i]) {
+                    cmds.push(ConverterCommand::SwapChannelMapCells(i, j));
+                    working.swap(i, j);
+                }
+            }
+        }
+    }
+
+    cmds
+}
+
 // ── egui App ────────────────────────────────────────────────────────────
 
 impl eframe::App for AppState {
@@ -198,8 +288,13 @@ impl eframe::App for AppState {
         let snapshot = self.engine_state.load();
         self.latest = Arc::clone(&snapshot);
 
-        // 2. Sync local converter settings cache from engine snapshot
+        // 2. Diff local converter settings against engine snapshot and send
+        //    commands for fields that changed on the GUI side (user edits).
+        let old = self.local_settings.clone();
         self.local_settings = self.latest.converter.settings.clone();
+        for cmd in diff_converter_commands(&old, &self.latest.converter.settings) {
+            let _ = self.cmd_tx.send(GuiCommand::Converter(cmd));
+        }
 
         // 3. Maximize once
         if !self.has_requested_maximize {

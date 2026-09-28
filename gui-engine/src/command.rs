@@ -122,6 +122,8 @@ pub enum ConverterCommand {
     SetConcatAudio(bool),
     /// Toggle embedding start timecode from LTC decode results.
     SetStartFromLtc(bool),
+    /// Toggle embedding camera metadata (make/model, bext originator) in outputs.
+    SetEmbedCameraMetadata(bool),
     /// Toggle trimming files to first LTC frame.
     SetTrimEnabled(bool),
     /// Set which file/channel carries LTC (audio groups).

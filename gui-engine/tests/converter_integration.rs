@@ -107,8 +107,10 @@ fn test_conversion_progress_tracking() {
         audio_suffix_template: "_audio_track{track:01d}".to_string(),
         video_suffix_template: "_video_clip{clip:02d}".to_string(),
         set_start_from_ltc: false,
+        embed_camera_metadata: true,
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
+        camera_meta_per_file: vec![None; 2],
 concat_audio: false,
             resolved_hw_device: None,
         };
@@ -217,8 +219,10 @@ fn make_test_settings(dir: &Path, input_files: Vec<std::path::PathBuf>) -> Conve
         audio_suffix_template: "_audio_track{track:01d}".to_string(),
         video_suffix_template: "_video_clip{clip:02d}".to_string(),
         set_start_from_ltc: false,
+        embed_camera_metadata: true,
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
+        camera_meta_per_file: vec![None; 2],
         concat_audio: false,
         resolved_hw_device: None,
     }
@@ -417,8 +421,10 @@ fn test_concat_audio_across_two_video_clips() {
         audio_suffix_template: "_audio_track{track:01d}".to_string(),
         video_suffix_template: "_video_clip{clip:02d}".to_string(),
         set_start_from_ltc: false,
+        embed_camera_metadata: true,
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
+        camera_meta_per_file: vec![None; 2],
         concat_audio: true,
         resolved_hw_device: None,
     };
@@ -565,12 +571,14 @@ fn test_copy_mode_streams_video_and_derives_container() {
 audio_suffix_template: "_audio_track{track:01d}".to_string(),
         video_suffix_template: "_video_clip{clip:02d}".to_string(),
     set_start_from_ltc: true,
+        embed_camera_metadata: true,
         trim_offsets_secs: vec![2.5],
         timecode_meta_per_file: vec![Some(gui_engine::converter::TimecodeMetadata {
             start: audio_core::Timecode { hours: 1, minutes: 0, seconds: 4, frames: 12 },
             fps: 25.0,
             drop_frame: false,
         })],
+        camera_meta_per_file: vec![None; 1],
     concat_audio: false,
         resolved_hw_device: None,
         };
@@ -662,8 +670,10 @@ fn test_progress_stays_below_100_until_all_steps_done() {
         audio_suffix_template: "_audio_track{track:01d}".to_string(),
         video_suffix_template: "_video_clip{clip:02d}".to_string(),
         set_start_from_ltc: false,
+        embed_camera_metadata: true,
         trim_offsets_secs: vec![0.0; 4],
         timecode_meta_per_file: vec![None; 4],
+        camera_meta_per_file: vec![None; 4],
         concat_audio: false,
         resolved_hw_device: None,
     };

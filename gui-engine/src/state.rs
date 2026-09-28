@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::camera_meta::CameraInfo;
 use crate::converter::{
     ConversionState, FfmpegCapabilities, RecordingType, ChannelMap, ConvertBlocker, PreviewOutput,
 };
@@ -35,6 +36,8 @@ pub struct ConverterUserSettings {
     pub concat_audio: bool,
     /// Embed start timecode metadata from LTC decode results.
     pub set_start_from_ltc: bool,
+    /// Embed camera metadata (make/model, bext originator) in output files.
+    pub embed_camera_metadata: bool,
     /// Trim each file to its first LTC frame.
     pub trim_enabled: bool,
     /// Index of the file/channel carrying LTC (audio groups).
@@ -68,6 +71,7 @@ impl ConverterUserSettings {
             drop_ltc_track: false,
             concat_audio: false,
             set_start_from_ltc: false,
+            embed_camera_metadata: true,
             trim_enabled: true,
             ltc_file_idx: 0,
             channel_map: ChannelMap::identity(0),
@@ -96,6 +100,9 @@ pub struct ConverterSnapshot {
     /// Per-file audio/video probes for the selected recording.
     /// Index-aligned with the group's files.
     pub probes: Vec<Option<VideoAudioProbe>>,
+    /// Per-file camera metadata for the selected recording.
+    /// Index-aligned with the group's files. Populated alongside probes.
+    pub camera_meta: Vec<Option<CameraInfo>>,
     /// True while probes are being loaded (background ffprobe).
     pub probes_loading: bool,
     /// Generation counter — incremented on each recording selection so
@@ -345,6 +352,7 @@ impl AppStateSnapshot {
                 groups: Vec::new(),
                 selected_group_idx: None,
                 probes: Vec::new(),
+                camera_meta: Vec::new(),
                 probes_loading: false,
                 probes_generation: 0,
                 conversion_state: ConversionState::idle(),

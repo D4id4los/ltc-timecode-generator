@@ -99,6 +99,7 @@ export component AppWindow inherits Window {
     in-out property <string> conv-container: "mkv";
     in-out property <bool> conv-copy-video: false;
     in-out property <bool> conv-metadata-only: false;
+    in-out property <bool> conv-embed-camera-meta: true;
     in-out property <string> conv-video-encoder: "libsvtav1";
     in-out property <string> conv-audio-encoder: "pcm_s24le";
     in-out property <string> conv-output-folder: "";
@@ -219,6 +220,7 @@ export component AppWindow inherits Window {
     callback toggle-synthetic-video;
     callback toggle-copy-video;
     callback toggle-metadata-only;
+    callback toggle-embed-camera-meta;
     callback conv-select-pattern(int);
     callback toggle-set-start-ltc;
 
@@ -736,6 +738,7 @@ export component AppWindow inherits Window {
                     container: root.conv-container;
                     copy-video: root.conv-copy-video;
                     metadata-only: root.conv-metadata-only;
+                    embed-camera-meta: root.conv-embed-camera-meta;
                     video-encoder: root.conv-video-encoder;
                     audio-encoder: root.conv-audio-encoder;
                     output-folder: root.conv-output-folder;
@@ -777,6 +780,7 @@ export component AppWindow inherits Window {
                     toggle-synthetic-video => { root.toggle-synthetic-video(); }
                     toggle-copy-video => { root.toggle-copy-video(); }
                     toggle-metadata-only => { root.toggle-metadata-only(); }
+                    toggle-embed-camera-meta => { root.toggle-embed-camera-meta(); }
                     select-pattern(idx) => { root.conv-select-pattern(idx); }
                 }
                 if (root.active-tab == 3) : OffloadSection {

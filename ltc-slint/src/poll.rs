@@ -266,6 +266,7 @@ pub fn setup_poll_timer(
                 ui.set_conv_generate_synthetic_video(s.converter.settings.generate_synthetic_video);
                 ui.set_conv_copy_video(s.converter.settings.copy_video);
                 ui.set_conv_metadata_only(s.converter.settings.metadata_only);
+                ui.set_conv_embed_camera_meta(s.converter.settings.embed_camera_metadata);
                 ui.set_set_start_from_ltc(s.converter.settings.set_start_from_ltc);
                 ui.set_conv_filename_prefix(SharedString::from(s.converter.settings.filename_prefix.clone()));
                 ui.set_conv_audio_suffix_template(SharedString::from(

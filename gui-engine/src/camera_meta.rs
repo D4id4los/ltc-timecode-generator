@@ -21,7 +21,7 @@ pub enum CameraMetaSource {
 }
 
 /// Detected camera make and model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraInfo {
     /// Manufacturer name (e.g. "Sony", "Canon").
     pub make: Option<String>,
@@ -29,6 +29,8 @@ pub struct CameraInfo {
     pub model: Option<String>,
     /// How the info was obtained.
     pub source: CameraMetaSource,
+    /// Creation date of the media, normalized as `YYYY-MM-DD`.
+    pub creation_date: Option<String>,
 }
 
 /// Convenience wrapper — probes `path` for camera info using real subprocesses.
@@ -61,6 +63,8 @@ pub fn probe_camera_info_with(
         "-json".into(),
         "-Make".into(),
         "-Model".into(),
+        "-CreateDate".into(),
+        "-DateTimeOriginal".into(),
         path.to_string_lossy().into(),
     ];
     if let Ok(output) = runner("exiftool", &exif_args) {
@@ -92,12 +96,13 @@ pub fn probe_camera_info_with(
     None
 }
 
-/// Parse exiftool `-json -Make -Model` output.
+/// Parse exiftool JSON output.
 ///
 /// Expected format:
 /// ```json
-/// [{"SourceFile":"/path","Make":"Sony","Model":"NEX-FS100EK"}]
+/// [{"SourceFile":"/path","Make":"Sony","Model":"NEX-FS100EK","CreateDate":"2024:01:01 12:00:00"}]
 /// ```
+/// `CreateDate` is preferred; `DateTimeOriginal` is fallback.
 fn parse_exiftool_json(stdout: &str) -> Option<CameraInfo> {
     let arr: Vec<serde_json::Value> = serde_json::from_str(stdout).ok()?;
     let entry = arr.first()?;
@@ -110,10 +115,16 @@ fn parse_exiftool_json(stdout: &str) -> Option<CameraInfo> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let raw_date = entry
+        .get("CreateDate")
+        .or_else(|| entry.get("DateTimeOriginal"))
+        .and_then(|v| v.as_str());
+    let creation_date = raw_date.and_then(normalize_date);
     Some(CameraInfo {
         make,
         model: Some(model),
         source: CameraMetaSource::ExifTool,
+        creation_date,
     })
 }
 
@@ -121,11 +132,12 @@ fn parse_exiftool_json(stdout: &str) -> Option<CameraInfo> {
 ///
 /// Expected structure (in `format.tags`):
 /// ```json
-/// {"format":{"tags":{"make":"Sony","model":"NEX-FS100EK"}}}
+/// {"format":{"tags":{"make":"Sony","model":"NEX-FS100EK","creation_time":"2024-01-01T12:00:00.000000Z"}}}
 /// ```
 /// Also handles Apple-style keys:
 /// `com.apple.quicktime.make` / `com.apple.quicktime.model`.
 /// The `encoder` tag is tried as a secondary make source.
+/// `creation_time` is read from format tags for date.
 fn parse_ffprobe_tags(stdout: &str) -> Option<CameraInfo> {
     let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
     let tags = value.get("format")?.get("tags")?;
@@ -145,11 +157,38 @@ fn parse_ffprobe_tags(stdout: &str) -> Option<CameraInfo> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())?;
 
+    let raw_date = tags
+        .get("creation_time")
+        .and_then(|v| v.as_str());
+    let creation_date = raw_date.and_then(normalize_date);
+
     Some(CameraInfo {
         make,
         model: Some(model),
         source: CameraMetaSource::FfprobeTags,
+        creation_date,
     })
+}
+
+/// Normalize a date string to `YYYY-MM-DD` format.
+///
+/// Handles exiftool format (`2024:01:01 12:00:00`) and ISO 8601
+/// (`2024-01-01T12:00:00.000000Z`). Returns `None` for unparseable input.
+fn normalize_date(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.len() < 10 {
+        return None;
+    }
+    // Exiftool uses colons:  2024:01:01 ...
+    // ISO 8601 uses hyphens: 2024-01-01T...
+    let sep = raw.as_bytes()[4];
+    if sep == b':' {
+        Some(format!("{}-{}-{}", &raw[0..4], &raw[5..7], &raw[8..10]))
+    } else if sep == b'-' {
+        Some(raw[0..10].to_string())
+    } else {
+        None
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -187,11 +226,12 @@ mod tests {
 
     #[test]
     fn test_exiftool_fs100() {
-        let json = r#"[{"SourceFile":"/test.MTS","Make":"Sony","Model":"NEX-FS100EK"}]"#;
+        let json = r#"[{"SourceFile":"/test.MTS","Make":"Sony","Model":"NEX-FS100EK","CreateDate":"2024:01:01 12:00:00"}]"#;
         let info = parse_exiftool_json(json).unwrap();
         assert_eq!(info.make, Some("Sony".to_string()));
         assert_eq!(info.model, Some("NEX-FS100EK".to_string()));
         assert_eq!(info.source, CameraMetaSource::ExifTool);
+        assert_eq!(info.creation_date, Some("2024-01-01".to_string()));
     }
 
     #[test]
@@ -200,6 +240,7 @@ mod tests {
         let info = parse_exiftool_json(json).unwrap();
         assert_eq!(info.make, None);
         assert_eq!(info.model, Some("EOS R5".to_string()));
+        assert_eq!(info.creation_date, None);
     }
 
     #[test]
@@ -220,15 +261,31 @@ mod tests {
         assert!(parse_exiftool_json("{}").is_none());
     }
 
+    #[test]
+    fn test_exiftool_datetime_original_fallback() {
+        let json = r#"[{"SourceFile":"/test.mp4","Make":"Canon","Model":"EOS R5","DateTimeOriginal":"2023:06:15 08:30:00"}]"#;
+        let info = parse_exiftool_json(json).unwrap();
+        assert_eq!(info.creation_date, Some("2023-06-15".to_string()));
+    }
+
+    #[test]
+    fn test_exiftool_create_date_wins_over_datetime_original() {
+        // CreateDate should take precedence over DateTimeOriginal
+        let json = r#"[{"SourceFile":"/test.mp4","Make":"Canon","Model":"EOS R5","CreateDate":"2024:01:01 12:00:00","DateTimeOriginal":"2023:06:15 08:30:00"}]"#;
+        let info = parse_exiftool_json(json).unwrap();
+        assert_eq!(info.creation_date, Some("2024-01-01".to_string()));
+    }
+
     // ── parse_ffprobe_tags ────────────────────────────────────────────
 
     #[test]
     fn test_ffprobe_tags_standard() {
-        let json = r#"{"format":{"tags":{"make":"Sony","model":"NEX-FS100EK"}}}"#;
+        let json = r#"{"format":{"tags":{"make":"Sony","model":"NEX-FS100EK","creation_time":"2024-01-01T12:00:00.000000Z"}}}"#;
         let info = parse_ffprobe_tags(json).unwrap();
         assert_eq!(info.make, Some("Sony".to_string()));
         assert_eq!(info.model, Some("NEX-FS100EK".to_string()));
         assert_eq!(info.source, CameraMetaSource::FfprobeTags);
+        assert_eq!(info.creation_date, Some("2024-01-01".to_string()));
     }
 
     #[test]
@@ -237,6 +294,7 @@ mod tests {
         let info = parse_ffprobe_tags(json).unwrap();
         assert_eq!(info.make, Some("GoPro".to_string()));
         assert_eq!(info.model, Some("HERO9 Black".to_string()));
+        assert_eq!(info.creation_date, None);
     }
 
     #[test]
@@ -273,12 +331,19 @@ mod tests {
         assert!(parse_ffprobe_tags("{}").is_none());
     }
 
+    #[test]
+    fn test_ffprobe_tags_with_creation_time() {
+        let json = r#"{"format":{"tags":{"model":"GH6","creation_time":"2023-12-25T10:00:00.000000Z"}}}"#;
+        let info = parse_ffprobe_tags(json).unwrap();
+        assert_eq!(info.creation_date, Some("2023-12-25".to_string()));
+    }
+
     // ── integration: probe_camera_info_with ───────────────────────────
 
     #[test]
     fn test_probe_with_exiftool_success() {
         let path = Path::new("/media/card/00001.MTS");
-        let json = r#"[{"SourceFile":"/media/card/00001.MTS","Make":"Sony","Model":"NEX-FS100EK"}]"#;
+        let json = r#"[{"SourceFile":"/media/card/00001.MTS","Make":"Sony","Model":"NEX-FS100EK","CreateDate":"2024:01:01 12:00:00"}]"#;
         let mut runner = |prog: &str, _args: &[String]| match prog {
             "exiftool" => Ok(ok_with(json.as_bytes())),
             _ => Ok(failure()),
@@ -287,12 +352,13 @@ mod tests {
         assert_eq!(info.make, Some("Sony".to_string()));
         assert_eq!(info.model, Some("NEX-FS100EK".to_string()));
         assert_eq!(info.source, CameraMetaSource::ExifTool);
+        assert_eq!(info.creation_date, Some("2024-01-01".to_string()));
     }
 
     #[test]
     fn test_probe_exiftool_fails_ffprobe_success() {
         let path = Path::new("/media/card/00001.MP4");
-        let json = r#"{"format":{"tags":{"make":"GoPro","model":"HERO9 Black"}}}"#;
+        let json = r#"{"format":{"tags":{"make":"GoPro","model":"HERO9 Black","creation_time":"2023-06-15T08:30:00.000000Z"}}}"#;
         let mut runner = |prog: &str, _args: &[String]| match prog {
             "exiftool" => Ok(failure()),
             "ffprobe" => Ok(ok_with(json.as_bytes())),
@@ -302,6 +368,7 @@ mod tests {
         assert_eq!(info.make, Some("GoPro".to_string()));
         assert_eq!(info.model, Some("HERO9 Black".to_string()));
         assert_eq!(info.source, CameraMetaSource::FfprobeTags);
+        assert_eq!(info.creation_date, Some("2023-06-15".to_string()));
     }
 
     #[test]
@@ -316,6 +383,7 @@ mod tests {
         let info = probe_camera_info_with(path, &mut runner).unwrap();
         assert_eq!(info.make, None);
         assert_eq!(info.model, Some("GH6".to_string()));
+        assert_eq!(info.creation_date, None);
     }
 
     #[test]
@@ -330,5 +398,42 @@ mod tests {
         let path = Path::new("/media/card/no_file.txt");
         let mut runner = |_: &str, _: &[String]| not_found();
         assert!(probe_camera_info_with(path, &mut runner).is_none());
+    }
+
+    // ── normalize_date ────────────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_date_exiftool_format() {
+        assert_eq!(normalize_date("2024:01:01 12:00:00"), Some("2024-01-01".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_date_iso_format() {
+        assert_eq!(normalize_date("2024-01-01T12:00:00.000000Z"), Some("2024-01-01".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_date_iso_no_trailing() {
+        assert_eq!(normalize_date("2024-01-01"), Some("2024-01-01".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_date_bad_separator() {
+        assert_eq!(normalize_date("2024/01/01 12:00:00"), None);
+    }
+
+    #[test]
+    fn test_normalize_date_too_short() {
+        assert_eq!(normalize_date("2024"), None);
+    }
+
+    #[test]
+    fn test_normalize_date_empty() {
+        assert_eq!(normalize_date(""), None);
+    }
+
+    #[test]
+    fn test_normalize_date_whitespace() {
+        assert_eq!(normalize_date("  "), None);
     }
 }

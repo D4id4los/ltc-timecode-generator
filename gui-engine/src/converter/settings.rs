@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde;
 
+use crate::camera_meta::CameraInfo;
 use crate::converter::channel_map::ChannelMap;
 use crate::converter::timecode::TimecodeMetadata;
 use crate::naming::{self, NameTemplate};
@@ -45,8 +46,10 @@ pub struct ConverterSettings {
     pub audio_suffix_template: String,
     pub video_suffix_template: String,
     pub set_start_from_ltc: bool,
+    pub embed_camera_metadata: bool,
     pub trim_offsets_secs: Vec<f64>,
     pub timecode_meta_per_file: Vec<Option<TimecodeMetadata>>,
+    pub camera_meta_per_file: Vec<Option<CameraInfo>>,
     pub concat_audio: bool,
 }
 

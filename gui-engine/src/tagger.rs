@@ -2,8 +2,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::camera_meta::CameraInfo;
 use crate::converter::{TimecodeMetadata, format_ffmpeg_timecode};
 use crate::subprocess::no_window_command;
+
+/// Originator string for WAV bext when no camera is detected.
+const BEXT_DEFAULT_ORIGINATOR: &str = "LTC Timecode Generator";
 
 /// Outcome of a tagging attempt.
 #[derive(Debug, Clone, PartialEq)]
@@ -13,22 +17,26 @@ pub enum TagOutcome {
     Skipped { reason: String },
 }
 
-/// Tag a file with start-timecode metadata using the fastest available method:
+/// Tag a file with start-timecode and (optionally) camera metadata using the
+/// fastest available method:
 ///
 /// 1. **MOV/MP4 with trailing `moov`** — native in-place tagger: replaces the
 ///    old `moov` with a `free` box and appends the rebuilt `moov` (original
 ///    boxes + a `tmcd` timecode track + a tiny `mdat` sample).  Never touches
-///    media data, so I/O is O(1).
-/// 2. **WAV with an existing `bext` chunk** — patches the 8-byte
-///    `time_reference` field in place.  No bext → ffmpeg fallback.
+///    media data, so I/O is O(1).  Camera metadata is NOT embedded by the
+///    O(1) in-place MP4 tagger; only the ffmpeg fallback and all converted
+///    outputs carry it.
+/// 2. **WAV with an existing `bext` chunk** — patches the originator (32 B),
+///    origination_date (10 B), and 8-byte `time_reference` fields in place.
+///    No bext → ffmpeg fallback.
 /// 3. **Everything else** — ffmpeg stream-copy remux (`-c copy
 ///    -timecode …`) to a temp file followed by an atomic rename over the
 ///    original.  This is I/O-bound (no decode) but requires a full file
-///    write.
+///    write.  Camera metadata is passed via `-metadata` / `-write_bext`.
 ///
 /// Containers that have no standard timecode metadata (e.g. MPEG-TS / MTS)
 /// are skipped with a `Skipped` outcome.
-pub fn tag_file(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, String> {
+pub fn tag_file(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo>) -> Result<TagOutcome, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -52,7 +60,7 @@ pub fn tag_file(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, Stri
             // MXF uses ffmpeg fallback (header-partition TC is structural)
         }
         "wav" => {
-            match tag_wav_bext(path, meta) {
+            match tag_wav_bext(path, meta, camera) {
                 Ok(outcome) => return Ok(outcome),
                 Err(e) => {
                     log::warn!(
@@ -80,7 +88,7 @@ pub fn tag_file(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, Stri
         }
     }
 
-    tag_via_ffmpeg(path, meta)
+    tag_via_ffmpeg(path, meta, camera)
 }
 
 // ── Native MOV/MP4 in-place tagger ─────────────────────────────────────
@@ -606,10 +614,34 @@ fn read_le_u32(data: &[u8]) -> u32 {
     u32::from_le_bytes(data[..4].try_into().unwrap())
 }
 
-/// Try to patch the `bext` chunk's `time_reference` field in a WAV file
-/// in place.  Returns `Err(…)` when no `bext` chunk is found (caller
-/// falls back to ffmpeg).
-fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, String> {
+fn bext_padded_string(s: &str, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let bytes = s.as_bytes();
+    let copy_len = bytes.len().min(len);
+    buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    buf
+}
+
+fn bext_originator(camera: Option<&CameraInfo>) -> String {
+    let c = match camera {
+        Some(c) => c,
+        None => return BEXT_DEFAULT_ORIGINATOR.to_string(),
+    };
+    let make = c.make.as_deref().unwrap_or("");
+    let model = c.model.as_deref().unwrap_or("");
+    match (make.is_empty(), model.is_empty()) {
+        (true, true) => BEXT_DEFAULT_ORIGINATOR.to_string(),
+        (true, false) => model.to_string(),
+        (false, true) => make.to_string(),
+        (false, false) => format!("{} {}", make, model),
+    }
+}
+
+/// Try to patch the `bext` chunk's originator, origination_date, and
+/// `time_reference` fields in a WAV file in place.
+/// Returns `Err(…)` when no `bext` chunk is found (caller falls back
+/// to ffmpeg).
+fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo>) -> Result<TagOutcome, String> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -646,16 +678,44 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, Stri
 
         if chunk_id == b"bext" {
             // Found bext chunk.
-            // BEW v2 format (fixed-size fields):
+            // BEW v2 format (fixed-size fields from payload start):
             //   description[256] | originator[32] | originator_ref[32] |
             //   origination_date[10] | origination_time[8] |
             //   time_reference_low(4) + time_reference_high(4) | ... |
-            // time_reference is at offset: 256+32+32+10+8 = 338 from chunk payload start
-            let time_ref_offset = offset + 8 + 338;
+            // Offsets from chunk payload: originator=256, origination_date=320,
+            // time_reference=338. Minimum valid chunk_size for these: 346.
+            let payload_off = offset + 8;
+            if chunk_size < 346 {
+                return Err(format!(
+                    "bext chunk too small ({} bytes, need >= 346)",
+                    chunk_size
+                ));
+            }
+
+            // Write originator (32 bytes, NUL-padded)
+            let originator = bext_originator(camera);
+            let originator_bytes = bext_padded_string(&originator, 32);
+            file.seek(SeekFrom::Start(payload_off + 256))
+                .map_err(|e| format!("seek to originator: {}", e))?;
+            file.write_all(&originator_bytes)
+                .map_err(|e| format!("write originator: {}", e))?;
+
+            // Write origination_date (10 bytes)
+            if let Some(camera) = camera {
+                if let Some(ref date) = camera.creation_date {
+                    let date_bytes = bext_padded_string(date, 10);
+                    file.seek(SeekFrom::Start(payload_off + 320))
+                        .map_err(|e| format!("seek to origination_date: {}", e))?;
+                    file.write_all(&date_bytes)
+                        .map_err(|e| format!("write origination_date: {}", e))?;
+                }
+            }
+
+            // Write time_reference (8 bytes)
             let sample_rate = read_wav_sample_rate_internal(&mut file)?;
             let time_reference = crate::converter::time_reference_samples(meta, sample_rate);
-            let time_ref_bytes = time_reference.to_le_bytes(); // BWF is little-endian
-            file.seek(SeekFrom::Start(time_ref_offset))
+            let time_ref_bytes = time_reference.to_le_bytes();
+            file.seek(SeekFrom::Start(payload_off + 338))
                 .map_err(|e| format!("seek to time_reference: {}", e))?;
             file.write_all(&time_ref_bytes[0..8])
                 .map_err(|e| format!("write time_reference: {}", e))?;
@@ -663,7 +723,8 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, Stri
                 .map_err(|e| format!("fsync: {}", e))?;
 
             log::info!(
-                "Patched bext time_reference={} in {}",
+                "Patched bext originator={}, time_reference={} in {}",
+                originator,
                 time_reference,
                 path.display()
             );
@@ -723,7 +784,7 @@ fn read_wav_sample_rate_internal(file: &mut std::fs::File) -> Result<u32, String
 
 /// Tag a file via ffmpeg stream-copy remux: write to a temp file in the
 /// same directory, then atomically rename over the original.
-fn tag_via_ffmpeg(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, String> {
+fn tag_via_ffmpeg(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo>) -> Result<TagOutcome, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -763,6 +824,41 @@ fn tag_via_ffmpeg(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, St
     if matches!(container, "mov" | "mp4" | "mxf") {
         args.push("-write_tmcd".to_string());
         args.push("1".to_string());
+    }
+
+    // Camera metadata
+    if let Some(c) = camera {
+        let is_wav = container == "wav";
+        let is_mov_like = matches!(container, "mov" | "mp4");
+        if is_wav {
+            args.push("-write_bext".to_string());
+            args.push("1".to_string());
+            args.push("-metadata".to_string());
+            args.push(format!("originator={}", bext_originator(Some(c))));
+            if let Some(ref date) = c.creation_date {
+                args.push("-metadata".to_string());
+                args.push(format!("origination_date={}", date));
+            }
+        } else {
+            if let Some(ref make_str) = c.make {
+                if is_mov_like {
+                    args.push("-metadata".to_string());
+                    args.push(format!("com.apple.quicktime.make={}", make_str));
+                } else {
+                    args.push("-metadata".to_string());
+                    args.push(format!("make={}", make_str));
+                }
+            }
+            if let Some(ref model_str) = c.model {
+                if is_mov_like {
+                    args.push("-metadata".to_string());
+                    args.push(format!("com.apple.quicktime.model={}", model_str));
+                } else {
+                    args.push("-metadata".to_string());
+                    args.push(format!("model={}", model_str));
+                }
+            }
+        }
     }
 
     args.push("-f".to_string());
@@ -812,6 +908,7 @@ fn tag_via_ffmpeg(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, St
 pub fn run_tagging(
     paths: &[PathBuf],
     timecodes: &[Option<TimecodeMetadata>],
+    cameras: &[Option<CameraInfo>],
     state: &crate::converter::SharedConversionState,
     cancel: &std::sync::Arc<AtomicBool>,
     file_weight: f32,
@@ -839,7 +936,8 @@ pub fn run_tagging(
             }
         };
 
-        match tag_file(path, tc) {
+        let camera = cameras.get(i).and_then(|c| c.as_ref());
+        match tag_file(path, tc, camera) {
             Ok(outcome) => {
                 let msg = match outcome {
                     TagOutcome::TaggedInPlace => {
@@ -1109,7 +1207,7 @@ mod tests {
         std::fs::write(&p, &wav).unwrap();
 
         // Should return Err("no bext chunk found")
-        let result = tag_wav_bext(&p, &test_meta());
+        let result = tag_wav_bext(&p, &test_meta(), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no bext chunk"));
     }
@@ -1189,7 +1287,7 @@ mod tests {
         std::fs::write(&p, &modified).unwrap();
 
         // Now tag it
-        let result = tag_wav_bext(&p, &test_meta());
+        let result = tag_wav_bext(&p, &test_meta(), None);
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
 
         // Verify the time_reference changed from the initial dummy value
@@ -1255,7 +1353,7 @@ mod tests {
             drop_frame: false,
         };
 
-        let result = tag_via_ffmpeg(&video, &meta);
+        let result = tag_via_ffmpeg(&video, &meta, None);
         assert!(result.is_ok(), "ffmpeg tagging failed: {:?}", result);
         assert_eq!(result.unwrap(), TagOutcome::TaggedViaFfmpeg);
 
@@ -1309,7 +1407,7 @@ mod tests {
 
         let meta = test_meta();
         // No bext → should fall through to ffmpeg
-        let result = tag_via_ffmpeg(&wav, &meta);
+        let result = tag_via_ffmpeg(&wav, &meta, None);
         assert!(result.is_ok(), "ffmpeg WAV tagging failed: {:?}", result);
     }
 
@@ -1321,7 +1419,7 @@ mod tests {
         let p = dir.path().join("clip.mts");
         std::fs::write(&p, b"dummy").unwrap();
 
-        let result = tag_file(&p, &test_meta());
+        let result = tag_file(&p, &test_meta(), None);
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
@@ -1338,7 +1436,7 @@ mod tests {
         std::fs::write(&p, b"dummy").unwrap();
 
         // ffmpeg may fail but the file should be handled without panic
-        let result = tag_file(&p, &test_meta());
+        let result = tag_file(&p, &test_meta(), None);
         // Either an error (ffmpeg not available or fails) or success
         if let Err(err_msg) = result {
             assert!(

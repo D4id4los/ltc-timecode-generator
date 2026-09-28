@@ -1354,6 +1354,25 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                     );
                     ui.add_space(4.0);
                 }
+                ui.checkbox(&mut state.local_settings.embed_camera_metadata, "Embed camera metadata (make/model, bext originator)");
+                {
+                    let camera = state.latest.converter.camera_meta.first().and_then(|c| c.as_ref());
+                    if let Some(c) = camera {
+                        let desc = match (&c.make, &c.model) {
+                            (Some(m), Some(n)) => format!("{} {}", m, n),
+                            (Some(m), None) => m.clone(),
+                            (None, Some(n)) => n.clone(),
+                            (None, None) => String::new(),
+                        };
+                        if !desc.is_empty() {
+                            ui.label(
+                                RichText::new(desc)
+                                    .font(FontId::proportional(9.0))
+                                    .color(colors.text_muted),
+                            );
+                        }
+                    }
+                }
                 ui.label(RichText::new("VIDEO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
                 ui.add_space(4.0);
                 ui.add_enabled_ui(!copy_mode_active(state) && !state.local_settings.metadata_only, |ui| {
@@ -1789,8 +1808,10 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
         audio_suffix_template: state.local_settings.audio_suffix_template.clone(),
         video_suffix_template: state.local_settings.video_suffix_template.clone(),
         set_start_from_ltc: state.local_settings.set_start_from_ltc,
+        embed_camera_metadata: state.local_settings.embed_camera_metadata,
         trim_offsets_secs: vec![0.0; selected_input_files(state).len()],
         timecode_meta_per_file: vec![None; selected_input_files(state).len()],
+        camera_meta_per_file: vec![None; selected_input_files(state).len()],
         resolved_hw_device: None,
     }
 }

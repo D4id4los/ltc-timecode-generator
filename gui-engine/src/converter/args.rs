@@ -7,6 +7,9 @@ use crate::converter::timecode::{format_ffmpeg_timecode, time_reference_samples,
 use crate::ffprobe::VideoAudioProbe;
 use crate::video_codecs;
 
+/// Originator string for WAV bext when no camera is detected.
+const BEXT_DEFAULT_ORIGINATOR: &str = "LTC Timecode Generator";
+
 pub fn build_audio_to_audio_args(
     settings: &ConverterSettings,
     format: &str,
@@ -28,6 +31,7 @@ pub fn build_audio_to_audio_args(
         push_audio_timecode_args(&mut args, tc, format, sample_rate);
     }
 
+    push_metadata_args(&mut args, settings, None, format);
     push_output_trailer(&mut args, format);
 
     args
@@ -89,7 +93,9 @@ pub fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<
     }
 
     args.push("-shortest".to_string());
-    push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
+    let format = container_to_ffmpeg_format(&settings.container);
+    push_metadata_args(&mut args, settings, None, &format);
+    push_output_trailer(&mut args, &format);
 
     args
 }
@@ -120,7 +126,9 @@ pub fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> V
         push_timecode_args(&mut args, tc, !settings.copy_video);
     }
 
-    push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
+    let format = container_to_ffmpeg_format(&settings.container);
+    push_metadata_args(&mut args, settings, Some(file_idx), &format);
+    push_output_trailer(&mut args, &format);
     args
 }
 
@@ -239,7 +247,9 @@ pub fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep:
         push_timecode_args(&mut args, tc, !settings.copy_video);
     }
 
-    push_output_trailer(&mut args, container_to_ffmpeg_format(&settings.container));
+    let format = container_to_ffmpeg_format(&settings.container);
+    push_metadata_args(&mut args, settings, Some(file_idx), &format);
+    push_output_trailer(&mut args, &format);
     args
 }
 
@@ -276,6 +286,7 @@ pub fn build_video_track_extract_args(
         push_audio_timecode_args(&mut args, tc, format, sample_rate);
     }
 
+    push_metadata_args(&mut args, settings, Some(file_idx), format);
     push_output_trailer(&mut args, format);
     args
 }
@@ -321,6 +332,7 @@ pub fn build_concat_audio_args(
         push_audio_timecode_args(&mut args, tc, format, sample_rate);
     }
 
+    push_metadata_args(&mut args, settings, None, format);
     push_output_trailer(&mut args, format);
     args
 }
@@ -355,6 +367,83 @@ pub fn push_input_with_trim(args: &mut Vec<String>, file: &Path, trim_secs: f64)
     }
     args.push("-i".to_string());
     args.push(file.to_string_lossy().to_string());
+}
+
+/// Push metadata (camera make/model, bext originator) arguments to the
+/// ffmpeg arg list, iff `settings.embed_camera_metadata` is enabled.
+///
+/// `file_idx` selects the per-file camera info; `format` is the ffmpeg output
+/// format (e.g. `"wav"`, `"mov"`, `"mp4"`, `"matroska"`).
+pub fn push_metadata_args(
+    args: &mut Vec<String>,
+    settings: &ConverterSettings,
+    file_idx: Option<usize>,
+    format: &str,
+) {
+    if !settings.embed_camera_metadata {
+        return;
+    }
+
+    let camera = file_idx
+        .and_then(|i| settings.camera_meta_per_file.get(i))
+        .or_else(|| settings.camera_meta_per_file.first())
+        .and_then(|c| c.as_ref());
+
+    let originator = camera
+        .map(|c| {
+            let make = c.make.as_deref().unwrap_or("");
+            let model = c.model.as_deref().unwrap_or("");
+            match (make.is_empty(), model.is_empty()) {
+                (true, true) => BEXT_DEFAULT_ORIGINATOR.to_string(),
+                (true, false) => model.to_string(),
+                (false, true) => make.to_string(),
+                (false, false) => format!("{} {}", make, model),
+            }
+        })
+        .unwrap_or_else(|| BEXT_DEFAULT_ORIGINATOR.to_string());
+
+    let origination_date = camera
+        .and_then(|c| c.creation_date.clone())
+        .or_else(|| {
+            let file_path = file_idx
+                .and_then(|i| settings.input_files.get(i))
+                .or_else(|| settings.input_files.first())?;
+            let meta = std::fs::metadata(file_path).ok()?;
+            let mtime = meta.modified().ok()?;
+            let dt: chrono::DateTime<chrono::Local> = mtime.into();
+            Some(dt.format("%Y-%m-%d").to_string())
+        });
+
+    if format == "wav" || format == "rf64" {
+        args.push("-write_bext".to_string());
+        args.push("1".to_string());
+        args.push("-metadata".to_string());
+        args.push(format!("originator={}", originator));
+        if let Some(ref date) = origination_date {
+            args.push("-metadata".to_string());
+            args.push(format!("origination_date={}", date));
+        }
+    } else {
+        let is_mov_like = matches!(format, "mov" | "mp4" | "m4v" | "ipod");
+        if let Some(ref make_str) = camera.and_then(|c| c.make.as_ref()) {
+            if is_mov_like {
+                args.push("-metadata".to_string());
+                args.push(format!("com.apple.quicktime.make={}", make_str));
+            } else {
+                args.push("-metadata".to_string());
+                args.push(format!("make={}", make_str));
+            }
+        }
+        if let Some(ref model_str) = camera.and_then(|c| c.model.as_ref()) {
+            if is_mov_like {
+                args.push("-metadata".to_string());
+                args.push(format!("com.apple.quicktime.model={}", model_str));
+            } else {
+                args.push("-metadata".to_string());
+                args.push(format!("model={}", model_str));
+            }
+        }
+    }
 }
 
 pub fn push_output_trailer(args: &mut Vec<String>, format: &str) {
@@ -443,6 +532,7 @@ pub fn build_split_track_args(
         push_audio_timecode_args(&mut args, tc, format, sample_rate);
     }
 
+    push_metadata_args(&mut args, settings, None, format);
     push_output_trailer(&mut args, format);
     args
 }
@@ -451,6 +541,7 @@ pub fn build_split_track_args(
 mod tests {
     use std::path::Path;
     use audio_core::Timecode;
+    use crate::camera_meta::{CameraInfo, CameraMetaSource};
     use crate::converter::test_fixtures::*;
     use crate::converter::planning::VideoOutputStep;
     use super::*;
@@ -591,5 +682,112 @@ mod tests {
         let probe = make_probe(1, 2, 48000);
         let args = build_video_to_video_args(&s, &step, &probe);
         assert!(args.contains(&"-an".to_string()));
+    }
+
+    // ── push_metadata_args ────────────────────────────────────────────
+
+    fn make_camera_settings() -> ConverterSettings {
+        let mut s = make_settings_audio_only();
+        s.embed_camera_metadata = true;
+        s.camera_meta_per_file = vec![
+            Some(CameraInfo {
+                make: Some("Sony".to_string()),
+                model: Some("NEX-FS100EK".to_string()),
+                source: CameraMetaSource::ExifTool,
+                creation_date: Some("2024-01-01".to_string()),
+            }),
+            None,
+        ];
+        s
+    }
+
+    #[test]
+    fn test_push_metadata_disabled() {
+        let mut s = make_camera_settings();
+        s.embed_camera_metadata = false;
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "wav");
+        assert!(args.is_empty(), "no args when disabled");
+    }
+
+    #[test]
+    fn test_push_metadata_wav_with_camera() {
+        let s = make_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "wav");
+        let joined = args.join(" ");
+        assert!(joined.contains("-write_bext 1"));
+        assert!(joined.contains("originator=Sony NEX-FS100EK"));
+        assert!(joined.contains("origination_date=2024-01-01"));
+    }
+
+    #[test]
+    fn test_push_metadata_wav_without_camera_default_originator() {
+        let s = make_settings_audio_only();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "wav");
+        let joined = args.join(" ");
+        assert!(joined.contains("-write_bext 1"));
+        assert!(joined.contains("originator=LTC Timecode Generator"));
+    }
+
+    #[test]
+    fn test_push_metadata_mov() {
+        let s = make_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "mov");
+        let joined = args.join(" ");
+        assert!(joined.contains("com.apple.quicktime.make=Sony"));
+        assert!(joined.contains("com.apple.quicktime.model=NEX-FS100EK"));
+    }
+
+    #[test]
+    fn test_push_metadata_mkv_make_model() {
+        let s = make_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "matroska");
+        let joined = args.join(" ");
+        assert!(joined.contains("make=Sony"));
+        assert!(joined.contains("model=NEX-FS100EK"));
+        assert!(!joined.contains("com.apple.quicktime"));
+    }
+
+    #[test]
+    fn test_push_metadata_model_only() {
+        let mut s = make_camera_settings();
+        s.camera_meta_per_file = vec![
+            Some(CameraInfo {
+                make: None,
+                model: Some("GH6".to_string()),
+                source: CameraMetaSource::FfprobeTags,
+                creation_date: None,
+            }),
+        ];
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "matroska");
+        let joined = args.join(" ");
+        assert!(!joined.contains("make="));
+        assert!(joined.contains("model=GH6"));
+    }
+
+    #[test]
+    fn test_push_metadata_with_out_of_bounds_idx_falls_back_to_first() {
+        let s = make_camera_settings();
+        // Index out of bounds (only 2 entries) → falls back to first entry
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(99), "wav");
+        let joined = args.join(" ");
+        assert!(joined.contains("originator=Sony NEX-FS100EK"));
+    }
+
+    #[test]
+    fn test_push_metadata_idx_returns_none_when_entry_is_none() {
+        let s = make_camera_settings();
+        // Index 1 has None camera → no camera metadata pushed
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(1), "wav");
+        let joined = args.join(" ");
+        assert!(joined.contains("-write_bext 1"));
+        assert!(joined.contains("originator=LTC Timecode Generator"));
     }
 }

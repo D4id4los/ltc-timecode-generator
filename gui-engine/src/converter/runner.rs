@@ -757,8 +757,9 @@ fn run_metadata_only(
             return;
         }
 
+        let camera = settings.camera_meta_per_file.get(file_idx).and_then(|c| c.as_ref());
         if let Some(tc_meta) = tc {
-            match crate::tagger::tag_file(input_path, tc_meta) {
+            match crate::tagger::tag_file(input_path, tc_meta, camera) {
                 Ok(outcome) => {
                     let msg = match outcome {
                         crate::tagger::TagOutcome::TaggedInPlace => {

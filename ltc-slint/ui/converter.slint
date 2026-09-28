@@ -18,6 +18,8 @@ export component ConverterSection {
     in-out property <bool> is-video-recording: false;
     in-out property <bool> copy-video: false;
     in-out property <bool> metadata-only: false;
+    in-out property <bool> embed-camera-meta: true;
+    callback toggle-embed-camera-meta;
     in-out property <string> container: "mkv";
     in-out property <string> video-encoder: "libsvtav1";
     in-out property <string> audio-encoder: "pcm_s24le";
@@ -800,6 +802,26 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                             horizontal-alignment: left; vertical-alignment: center;
                             edited => { root.video-suffix-changed(self.text); }
                         }
+                    }
+                }
+
+                // ── Embed camera metadata ──
+                HorizontalLayout { spacing: 4px; padding-top: 4px;
+                    Rectangle {
+                        width: 14px; height: 14px; border-radius: 3px;
+                        border-width: 1px;
+                        border-color: root.embed-camera-meta ? AppColors.accent : AppColors.border-main;
+                        background: root.embed-camera-meta ? AppColors.accent : transparent;
+                        TouchArea { clicked => { root.toggle-embed-camera-meta(); } }
+                        Text {
+                            visible: root.embed-camera-meta;
+                            text: "✓"; color: black; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: "Embed camera metadata (make/model, bext originator)";
+                        color: AppColors.text-title; font-size: 9px; vertical-alignment: center; wrap: word-wrap;
                     }
                 }
 

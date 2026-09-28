@@ -30,8 +30,10 @@ pub fn make_settings_audio_only() -> ConverterSettings {
         audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
         video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
         set_start_from_ltc: false,
+        embed_camera_metadata: true,
         trim_offsets_secs: vec![0.0; 2],
         timecode_meta_per_file: vec![None; 2],
+        camera_meta_per_file: vec![None; 2],
         concat_audio: false,
         resolved_hw_device: None,
     }
@@ -91,8 +93,10 @@ pub fn make_video_settings() -> ConverterSettings {
         audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
         video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
         set_start_from_ltc: false,
+        embed_camera_metadata: true,
         trim_offsets_secs: vec![0.0],
         timecode_meta_per_file: vec![None],
+        camera_meta_per_file: vec![None],
         concat_audio: false,
         resolved_hw_device: None,
     }
