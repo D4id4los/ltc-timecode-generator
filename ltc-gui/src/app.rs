@@ -85,13 +85,17 @@ pub struct AppState {
     /// result arrival and for offload auto-switch.
     pub selected_folder: Option<PathBuf>,
 
-    /// Local cache of converter settings, synced from the engine snapshot
-    /// every frame.  egui's immediate-mode render functions need `&mut`
-    /// access for checkboxes and TextEdits; this cache provides that while
-    /// keeping the engine as the true source of truth.  All mutations send
-    /// a `GuiCommand` to the engine; the cache is refreshed on the next
-    /// `logic()` tick.
+    /// Local cache of converter settings (GUI editing buffer).
+    /// egui's immediate-mode render functions need `&mut` access for
+    /// checkboxes and TextEdits; this cache provides that while keeping
+    /// the engine as the true source of truth.  The three-way merge in
+    /// `logic()` reconciles this with the engine snapshot each frame.
     pub local_settings: gui_engine::state::ConverterUserSettings,
+
+    /// Previous frame's engine snapshot — used as the merge base so
+    /// in-flight user edits are not visually reverted between command
+    /// send and engine publish.
+    pub prev_engine_settings: Option<gui_engine::state::ConverterUserSettings>,
 
     // Diagnostic: last group decode generation that was logged to avoid spam
     pub last_logged_group_decode_gen: u64,
@@ -142,6 +146,7 @@ impl AppState {
             ltc_file_idx: 0,
             selected_folder: selected_folder.clone(),
             local_settings: gui_engine::state::ConverterUserSettings::initial(),
+            prev_engine_settings: None,
             last_logged_group_decode_gen: 0,
             offload_last_version: 0,
         };
@@ -194,15 +199,61 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     (base + predicted_dt).max(floor)
 }
 
+/// Three-way merge of `ConverterUserSettings`: for each field, if the
+/// local (GUI-edited) value differs from the `base` (previous frame's
+/// engine snapshot), the user's edit is preserved; otherwise the engine's
+/// latest value is adopted.  This prevents in-flight edits from being
+/// visually reverted between command send and engine publish (~40 ms).
+///
+/// The channel map is a special case: when the engine changes its
+/// dimensions (resize on probe), engine's map wins unconditionally.
+fn merge_converter_settings(
+    base: &ConverterUserSettings,
+    local: &ConverterUserSettings,
+    engine: &ConverterUserSettings,
+) -> ConverterUserSettings {
+    let channel_map = if engine.channel_map.num_channels() != base.channel_map.num_channels() {
+        // Resize event (probe): engine's new dimensions are authoritative
+        engine.channel_map.clone()
+    } else {
+        // Normal merge: adopt engine if user hasn't touched
+        merge_field(&base.channel_map, &local.channel_map, &engine.channel_map)
+    };
+
+    ConverterUserSettings {
+        naming_pattern: merge_field(&base.naming_pattern, &local.naming_pattern, &engine.naming_pattern),
+        metadata_only: merge_field(&base.metadata_only, &local.metadata_only, &engine.metadata_only),
+        generate_synthetic_video: merge_field(&base.generate_synthetic_video, &local.generate_synthetic_video, &engine.generate_synthetic_video),
+        copy_video: merge_field(&base.copy_video, &local.copy_video, &engine.copy_video),
+        split_tracks: merge_field(&base.split_tracks, &local.split_tracks, &engine.split_tracks),
+        drop_ltc_track: merge_field(&base.drop_ltc_track, &local.drop_ltc_track, &engine.drop_ltc_track),
+        concat_audio: merge_field(&base.concat_audio, &local.concat_audio, &engine.concat_audio),
+        set_start_from_ltc: merge_field(&base.set_start_from_ltc, &local.set_start_from_ltc, &engine.set_start_from_ltc),
+        embed_camera_metadata: merge_field(&base.embed_camera_metadata, &local.embed_camera_metadata, &engine.embed_camera_metadata),
+        trim_enabled: merge_field(&base.trim_enabled, &local.trim_enabled, &engine.trim_enabled),
+        ltc_file_idx: merge_field(&base.ltc_file_idx, &local.ltc_file_idx, &engine.ltc_file_idx),
+        channel_map,
+        container: merge_field(&base.container, &local.container, &engine.container),
+        video_encoder: merge_field(&base.video_encoder, &local.video_encoder, &engine.video_encoder),
+        audio_encoder: merge_field(&base.audio_encoder, &local.audio_encoder, &engine.audio_encoder),
+        output_folder: merge_field(&base.output_folder, &local.output_folder, &engine.output_folder),
+        filename_prefix: merge_field(&base.filename_prefix, &local.filename_prefix, &engine.filename_prefix),
+        audio_suffix_template: merge_field(&base.audio_suffix_template, &local.audio_suffix_template, &engine.audio_suffix_template),
+        video_suffix_template: merge_field(&base.video_suffix_template, &local.video_suffix_template, &engine.video_suffix_template),
+    }
+}
+
+fn merge_field<T: PartialEq + Clone>(base: &T, local: &T, engine: &T) -> T {
+    if local == base { engine.clone() } else { local.clone() }
+}
+
 /// Compare two `ConverterUserSettings` snapshots and emit the
 /// `ConverterCommand` variants needed to reconcile `new` into the engine.
 ///
-/// This is the reverse-direction bridge: engine state flows into the GUI
-/// via `ArcSwap`, but when the user edits a field in the local copy, that
-/// change is detected here and forwarded as a command.
-///
 /// Channel-map differences use `SwapChannelMapCells` (the only channel-map
 /// mutation primitive) by computing a minimal swap sequence.
+///
+/// NOTE: arguments are `(old, new)` — commands carry `new.*` values.
 fn diff_converter_commands(
     old: &ConverterUserSettings,
     new: &ConverterUserSettings,
@@ -292,13 +343,18 @@ impl eframe::App for AppState {
         let snapshot = self.engine_state.load();
         self.latest = Arc::clone(&snapshot);
 
-        // 2. Diff local converter settings against engine snapshot and send
-        //    commands for fields that changed on the GUI side (user edits).
-        let old = self.local_settings.clone();
-        self.local_settings = self.latest.converter.settings.clone();
-        for cmd in diff_converter_commands(&old, &self.latest.converter.settings) {
+        // 2. Three-way merge of converter settings: fields the user edited
+        //    (local != base = previous engine snapshot) keep their value and
+        //    are forwarded as commands; untouched fields adopt the engine's
+        //    latest (prefills, flag resets, capability repairs).
+        let engine_settings = self.latest.converter.settings.clone();
+        let base = self.prev_engine_settings.clone().unwrap_or_else(|| self.local_settings.clone());
+        let merged = merge_converter_settings(&base, &self.local_settings, &engine_settings);
+        for cmd in diff_converter_commands(&base, &merged) {
             let _ = self.cmd_tx.send(GuiCommand::Converter(cmd));
         }
+        self.local_settings = merged;
+        self.prev_engine_settings = Some(engine_settings);
 
         // 3. Maximize once
         if !self.has_requested_maximize {
@@ -981,6 +1037,155 @@ mod tests {
         let mut s3 = make_snapshot();
         s3.clap_animating = true;
         assert!(next_repaint_interval(&s3) >= floor);
+    }
+
+    // ── merge_converter_settings tests ───────────────────────────────────
+
+    fn make_cus() -> ConverterUserSettings {
+        ConverterUserSettings::initial()
+    }
+
+    #[test]
+    fn merge_user_edit_preserved_vs_engine_change() {
+        let mut base = make_cus();
+        let mut local = make_cus();
+        let mut engine = make_cus();
+
+        // User edits filename_prefix → local differs from base
+        base.filename_prefix = "{device}".to_string();
+        local.filename_prefix = "my_project".to_string();
+        engine.filename_prefix = "{device}".to_string(); // engine hasn't applied yet
+
+        let merged = merge_converter_settings(&base, &local, &engine);
+        assert_eq!(merged.filename_prefix, "my_project", "user edit must survive");
+    }
+
+    #[test]
+    fn merge_engine_change_adopted_when_untouched() {
+        let mut base = make_cus();
+        let mut local = make_cus();
+        let mut engine = make_cus();
+
+        // Engine prefilled output_folder; user didn't touch it
+        base.output_folder = PathBuf::new();
+        local.output_folder = PathBuf::new();
+        engine.output_folder = PathBuf::from("/media/clips");
+
+        let merged = merge_converter_settings(&base, &local, &engine);
+        assert_eq!(merged.output_folder, PathBuf::from("/media/clips"),
+                   "engine prefill must be adopted when user hasn't edited the field");
+    }
+
+    #[test]
+    fn merge_engine_and_user_both_changed_user_wins() {
+        let mut base = make_cus();
+        let mut local = make_cus();
+        let mut engine = make_cus();
+
+        // Engine reset split_tracks to false; user had set it to true
+        base.split_tracks = false;
+        local.split_tracks = true;
+        engine.split_tracks = false;
+
+        let merged = merge_converter_settings(&base, &local, &engine);
+        assert!(merged.split_tracks, "user edit wins when both engine and user changed");
+    }
+
+    #[test]
+    fn merge_channel_map_dimension_change_adopts_engine() {
+        use gui_engine::converter::ChannelMap;
+
+        let mut base = make_cus();
+        let mut local = make_cus();
+        let mut engine = make_cus();
+
+        // Probe resized channel map from 0 to 4 channels
+        base.channel_map = ChannelMap::identity(0);
+        local.channel_map = ChannelMap::identity(0);
+        engine.channel_map = ChannelMap::identity(4);
+
+        let merged = merge_converter_settings(&base, &local, &engine);
+        assert_eq!(merged.channel_map.num_channels(), 4,
+                   "engine dimension change must win");
+    }
+
+    #[test]
+    fn merge_channel_map_cell_swap_preserved() {
+        use gui_engine::converter::ChannelMap;
+
+        let mut base = make_cus();
+        let mut local = make_cus();
+        let mut engine = make_cus();
+
+        // 2-channel map; user swapped cells [0,1] → [1,0]
+        base.channel_map = ChannelMap::identity(2);
+        local.channel_map = ChannelMap::from_mapping(vec![1, 0]);
+        engine.channel_map = ChannelMap::identity(2); // engine hasn't applied yet
+
+        let merged = merge_converter_settings(&base, &local, &engine);
+        assert_eq!(merged.channel_map.mapping(), &[1, 0],
+                   "user cell swap must survive");
+    }
+
+    #[test]
+    fn merge_diff_carries_user_values_for_text_fields() {
+        let base = make_cus();
+        let mut local = make_cus();
+
+        local.filename_prefix = "edited_prefix".to_string();
+        local.output_folder = PathBuf::from("/user/out");
+        local.audio_suffix_template = "_my_audio{:02d}".to_string();
+        local.video_suffix_template = "_my_video{:02d}".to_string();
+
+        // Engine has not changed these fields
+        let engine = base.clone();
+
+        let merged = merge_converter_settings(&base, &local, &engine);
+        let cmds = diff_converter_commands(&base, &merged);
+
+        let has_set = |variant: ConverterCommand| cmds.iter().any(|c| std::mem::discriminant(c) == std::mem::discriminant(&variant));
+        assert!(has_set(ConverterCommand::SetFilenamePrefix(String::new())),
+                "SetFilenamePrefix must be emitted");
+        assert!(has_set(ConverterCommand::SetOutputFolder(PathBuf::new())),
+                "SetOutputFolder must be emitted");
+        assert!(has_set(ConverterCommand::SetAudioSuffixTemplate(String::new())),
+                "SetAudioSuffixTemplate must be emitted");
+        assert!(has_set(ConverterCommand::SetVideoSuffixTemplate(String::new())),
+                "SetVideoSuffixTemplate must be emitted");
+
+        // Verify the emitted commands carry the USER's values
+        let find_cmd = |needle: &str| -> bool {
+            cmds.iter().any(|c| match c {
+                ConverterCommand::SetFilenamePrefix(v) => v == needle,
+                _ => false,
+            })
+        };
+        assert!(find_cmd("edited_prefix"),
+                "SetFilenamePrefix must carry user value 'edited_prefix'");
+
+        let find_cmd = |needle: &str| -> bool {
+            cmds.iter().any(|c| match c {
+                ConverterCommand::SetAudioSuffixTemplate(v) => v == needle,
+                _ => false,
+            })
+        };
+        assert!(find_cmd("_my_audio{:02d}"),
+                "SetAudioSuffixTemplate must carry user value");
+    }
+
+    #[test]
+    fn merge_first_frame_adopts_engine_values() {
+        // First frame: prev_engine_settings is None, so base = local.
+        // If engine has already processed a recording selection (output_folder filled),
+        // the merge should adopt engine values since local == base for all fields.
+        let local = make_cus(); // initial: empty output_folder
+        let base = local.clone(); // base = local (first frame)
+        let mut engine = make_cus();
+        engine.output_folder = PathBuf::from("/media/clips");
+
+        let merged = merge_converter_settings(&base, &local, &engine);
+        assert_eq!(merged.output_folder, PathBuf::from("/media/clips"),
+                   "first frame must adopt engine's output folder");
     }
 
     // ── apply_group_selection tests ─────────────────────────────────────

@@ -8,7 +8,6 @@ const CONFIG_FILE: &str = "converter_config.json";
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct ConverterConfig {
     pub last_input_folder: Option<String>,
-    pub last_output_folder: Option<String>,
     pub last_offload_parent: Option<String>,
 }
 
@@ -53,12 +52,6 @@ pub fn save_input_folder(path: &Path) {
     save(&cfg);
 }
 
-pub fn save_output_folder(path: &Path) {
-    let mut cfg = load();
-    cfg.last_output_folder = Some(path.to_string_lossy().to_string());
-    save(&cfg);
-}
-
 pub fn save_offload_parent(path: &Path) {
     let mut cfg = load();
     cfg.last_offload_parent = Some(path.to_string_lossy().to_string());
@@ -66,15 +59,10 @@ pub fn save_offload_parent(path: &Path) {
 }
 
 /// Seed engine snapshot fields from a loaded config.
-/// Returns `true` if any field was populated (for diagnostics).
 pub fn seed_snapshot_from_config(
     snapshot: &mut crate::state::AppStateSnapshot,
     cfg: &ConverterConfig,
 ) {
-    // Output folder (converter)
-    if let Some(ref folder) = cfg.last_output_folder {
-        snapshot.converter.settings.output_folder = Path::new(folder).to_path_buf();
-    }
     // Offload parent folder
     if let Some(ref folder) = cfg.last_offload_parent {
         let p = Path::new(folder);
@@ -95,7 +83,6 @@ mod tests {
 
         let original = ConverterConfig {
             last_input_folder: Some("/home/input".into()),
-            last_output_folder: Some("/home/output".into()),
             last_offload_parent: None,
         };
         save_to(&cfg_path, &original);
@@ -113,7 +100,6 @@ mod tests {
         assert_eq!(reloaded.last_offload_parent, Some("/media/cards".into()));
         // Unrelated fields preserved
         assert_eq!(reloaded.last_input_folder, Some("/home/input".into()));
-        assert_eq!(reloaded.last_output_folder, Some("/home/output".into()));
     }
 
     #[test]
@@ -123,7 +109,6 @@ mod tests {
 
         let cfg = ConverterConfig {
             last_input_folder: None,
-            last_output_folder: None,
             last_offload_parent: Some(dir.path().to_string_lossy().to_string()),
         };
 
@@ -141,7 +126,6 @@ mod tests {
     fn seed_snapshot_from_config_ignores_missing_offload_parent() {
         let cfg = ConverterConfig {
             last_input_folder: None,
-            last_output_folder: None,
             last_offload_parent: Some("/nonexistent/path/that/does/not/exist_42".into()),
         };
 
@@ -156,20 +140,20 @@ mod tests {
     }
 
     #[test]
-    fn seed_snapshot_from_config_restores_output_folder() {
-        let dir = tempfile::TempDir::new().unwrap();
+    fn seed_snapshot_from_config_does_not_seed_output_folder() {
         let cfg = ConverterConfig {
             last_input_folder: None,
-            last_output_folder: Some(dir.path().to_string_lossy().to_string()),
             last_offload_parent: None,
         };
 
         let mut snapshot = crate::state::AppStateSnapshot::initial();
+        // Seed from config (no output folder in config anymore)
         seed_snapshot_from_config(&mut snapshot, &cfg);
 
-        assert_eq!(
-            snapshot.converter.settings.output_folder,
-            dir.path(),
+        // Output folder should remain at its initial default (empty)
+        assert!(
+            snapshot.converter.settings.output_folder.as_os_str().is_empty(),
+            "output folder must not be seeded by config anymore; it defaults to source clip parent dir",
         );
     }
 }

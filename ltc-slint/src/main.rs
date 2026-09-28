@@ -2,7 +2,6 @@
 
 slint::include_modules!();
 
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -80,12 +79,6 @@ fn _run_gui(
                     ConverterCommand::SelectRecording(0),
                 ));
             }
-        }
-        if let Some(ref out_path) = cfg.last_output_folder {
-            ui.set_conv_output_folder(SharedString::from(out_path.as_str()));
-            let _ = cmd_tx.send(GuiCommand::Converter(ConverterCommand::SetOutputFolder(
-                PathBuf::from(out_path),
-            )));
         }
     }
 
@@ -575,7 +568,6 @@ fn _run_gui(
                 let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetOutputFolder(
                     path.clone(),
                 )));
-                config::save_output_folder(&path);
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_output_folder(SharedString::from(path.to_string_lossy().as_ref()));
                 }

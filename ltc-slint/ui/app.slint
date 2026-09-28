@@ -116,6 +116,7 @@ export component AppWindow inherits Window {
     in-out property <[string]> conv-container-options: [];
     in-out property <[string]> conv-video-encoder-options: [];
     in-out property <[string]> conv-audio-encoder-options: [];
+    in-out property <bool> conv-text-editing: false;
     in-out property <bool> set-start-from-ltc: false;
     in-out property <float> ltc-offset-secs: 0.0;
     in-out property <string> ltc-start-tc-text: "";
@@ -745,6 +746,7 @@ export component AppWindow inherits Window {
                     filename-prefix: root.conv-filename-prefix;
                     audio-suffix-template: root.conv-audio-suffix-template;
                     video-suffix-template: root.conv-video-suffix-template;
+                    text-editing: root.conv-text-editing;
                     conv-status: root.conv-status;
                     conv-progress: root.conv-progress;
                     conv-log: root.conv-log;

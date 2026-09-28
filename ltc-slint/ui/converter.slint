@@ -28,6 +28,10 @@ export component ConverterSection {
     in-out property <string> audio-suffix-template: "_audio_track{:01d}";
     in-out property <string> video-suffix-template: "_video_clip{:02d}";
     in-out property <string> conv-status: "idle";
+    /// True while the user is editing one of the text fields
+    /// (prefix, audio suffix, video suffix) — poll.rs skips
+    /// pushing engine values while true to prevent flicker.
+    in-out property <bool> text-editing;
     in-out property <float> conv-progress: 0.0;
     in-out property <string> conv-log: "";
     in-out property <string> sanity-msg: "";
@@ -761,7 +765,7 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                     Rectangle {
                         border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                         background: AppColors.deep-bg; min-height: 26px; horizontal-stretch: 1;
-                        TextInput {
+                        prefix-input := TextInput {
                             text: root.filename-prefix;
                             font-size: 10px; font-family: "monospace";
                             color: AppColors.text-title;
@@ -778,7 +782,7 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                     Rectangle {
                         border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                         background: AppColors.deep-bg; min-height: 26px; horizontal-stretch: 1;
-                        TextInput {
+                        audio-suffix-input := TextInput {
                             text: root.audio-suffix-template;
                             font-size: 10px; font-family: "monospace";
                             color: AppColors.text-title;
@@ -795,7 +799,7 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                     Rectangle {
                         border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                         background: AppColors.deep-bg; min-height: 26px; horizontal-stretch: 1;
-                        TextInput {
+                        video-suffix-input := TextInput {
                             text: root.video-suffix-template;
                             font-size: 10px; font-family: "monospace";
                             color: AppColors.text-title;
@@ -986,4 +990,9 @@ Text {
             }
         }
     }
+
+    // True while any of the editable text fields has focus —
+    // poll.rs uses this to avoid pushing engine values that
+    // would overwrite the user's in-progress keystrokes.
+    text-editing: prefix-input.has-focus || audio-suffix-input.has-focus || video-suffix-input.has-focus;
 }

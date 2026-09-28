@@ -268,13 +268,19 @@ pub fn setup_poll_timer(
                 ui.set_conv_metadata_only(s.converter.settings.metadata_only);
                 ui.set_conv_embed_camera_meta(s.converter.settings.embed_camera_metadata);
                 ui.set_set_start_from_ltc(s.converter.settings.set_start_from_ltc);
-                ui.set_conv_filename_prefix(SharedString::from(s.converter.settings.filename_prefix.clone()));
-                ui.set_conv_audio_suffix_template(SharedString::from(
-                    s.converter.settings.audio_suffix_template.clone(),
-                ));
-                ui.set_conv_video_suffix_template(SharedString::from(
-                    s.converter.settings.video_suffix_template.clone(),
-                ));
+                // Don't push text-field values while the user is actively
+                // editing them — focus-gated to prevent flicker/races
+                // between keystroke and engine publish (~40 ms).
+                let editing = ui.get_conv_text_editing();
+                if !editing {
+                    ui.set_conv_filename_prefix(SharedString::from(s.converter.settings.filename_prefix.clone()));
+                    ui.set_conv_audio_suffix_template(SharedString::from(
+                        s.converter.settings.audio_suffix_template.clone(),
+                    ));
+                    ui.set_conv_video_suffix_template(SharedString::from(
+                        s.converter.settings.video_suffix_template.clone(),
+                    ));
+                }
                 ui.set_conv_output_folder(SharedString::from(
                     s.converter.settings.output_folder.to_string_lossy().as_ref(),
                 ));
@@ -355,7 +361,9 @@ pub fn setup_poll_timer(
                         ui.set_conv_num_channels(if is_audio { files.len() as i32 } else { 0 });
                         ui.set_ltc_file_idx(s.converter.settings.ltc_file_idx as i32);
                         ui.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
-                        ui.set_conv_filename_prefix(SharedString::from(s.converter.settings.filename_prefix.clone()));
+                        if !ui.get_conv_text_editing() {
+                            ui.set_conv_filename_prefix(SharedString::from(s.converter.settings.filename_prefix.clone()));
+                        }
                     }
                 }
 

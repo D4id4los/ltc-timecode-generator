@@ -18,7 +18,6 @@ use crate::converter::{
     output_collision_warning, preview_output_files, apply_available_defaults, spawn_conversion,
 };
 use crate::ffprobe::{self, VideoAudioProbe};
-use crate::naming::DEFAULT_PREFIX;
 use crate::offload::{self, DeviceNameSource, OffloadContext};
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
@@ -343,7 +342,6 @@ pub fn engine_main_with_probe<F>(
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetOutputFolder(folder))) => {
                     current.converter.settings.output_folder = folder.clone();
-                    config::save_output_folder(&folder);
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(prefix))) => {
@@ -2308,19 +2306,10 @@ fn apply_recording_selection(
     s.concat_audio = false;
     s.ltc_file_idx = 0;
     s.channel_map = ChannelMap::identity(0);
-    // Prefill filename prefix from group
-    if let Some(group) = state.converter.groups.get(idx) {
-        let prefix = &group.prefix;
-        if !prefix.is_empty() {
-            s.filename_prefix = prefix.clone();
-        } else {
-            s.filename_prefix = DEFAULT_PREFIX.to_string();
-        }
-        // Default output folder = input folder if empty
-        if s.output_folder.as_os_str().is_empty() {
-            if let Some(ref gf) = state.converter.groups_folder {
-                s.output_folder = gf.clone();
-            }
+    // Default output folder = input folder (source clip parent dir) if unset
+    if s.output_folder.as_os_str().is_empty() {
+        if let Some(ref gf) = state.converter.groups_folder {
+            s.output_folder = gf.clone();
         }
     }
     // Clear stale LTC decode state

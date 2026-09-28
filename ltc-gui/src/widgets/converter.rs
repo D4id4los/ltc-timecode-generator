@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
 use gui_engine::command::{GuiCommand, ConverterCommand};
-use gui_engine::config;
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
     available_containers,
@@ -1559,7 +1558,6 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
                 .pick_folder();
             if let Some(path) = folder {
                 state.local_settings.output_folder = path.clone();
-                config::save_output_folder(&path);
             }
         }
     });
