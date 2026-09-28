@@ -137,6 +137,10 @@ pub fn engine_main_with_probe<F>(
     let mut offload_device_names: Vec<String> = Vec::new();
     let mut offload_plans: Vec<Vec<crate::offload::CopyPlanItem>> = Vec::new();
     let mut offload_completed_before: Vec<String> = Vec::new();
+    // Speed tracking (smoothed MB/s via byte deltas between ticks)
+    let mut offload_last_blocks_done: usize = 0;
+    let mut offload_last_time: Option<Instant> = None;
+    let mut offload_speed_smoothed: f64 = 0.0;
 
     // Conversion lifecycle state (engine-owned, shared with conversion thread)
     let mut conv_state_shared: SharedConversionState = Arc::new(Mutex::new(ConversionState::idle()));
@@ -793,38 +797,58 @@ pub fn engine_main_with_probe<F>(
                 }
                 Ok(OffloadEvent::OffloadDone { completed, generation }) => {
                     if generation == offload_scan_generation {
-                        // Log per-device failures before clearing the context.
-                        for dev in &current.offload.device_progress {
-                            if let offload::OffloadDeviceState::Failed(ref msg) = dev.state {
-                                warn!(
-                                    "Offload device '{}' FAILED: {}",
-                                    dev.device_name, msg
-                                );
+                        let was_cancelled = offload_context
+                            .as_ref()
+                            .map(|c| c.cancel.load(Ordering::Relaxed))
+                            .unwrap_or(false);
+
+                        if was_cancelled {
+                            info!(
+                                "Offload copy was cancelled by user (gen={}): {} device(s) completed",
+                                generation,
+                                completed.len(),
+                            );
+                            current.offload.running = false;
+                            current.offload.overall_progress = 0.0;
+                            current.offload.speed_bytes_per_sec = 0.0;
+                            current.offload.device_progress.clear();
+                            current.offload.error = Some("Canceled by user".to_string());
+                            current.status_message = "Offload canceled".to_string();
+                        } else {
+                            // Log per-device failures.
+                            for dev in &current.offload.device_progress {
+                                if let offload::OffloadDeviceState::Failed(ref msg) = dev.state {
+                                    warn!(
+                                        "Offload device '{}' FAILED: {}",
+                                        dev.device_name, msg
+                                    );
+                                }
                             }
-                        }
-                        info!(
-                            "Offload copy complete (gen={}): {} device(s) offloaded of {}",
-                            generation,
-                            completed.len(),
-                            current.offload.device_progress.len(),
-                        );
-                        let parent = current.offload.parent_folder.clone();
-                        current.offload.running = false;
-                        current.offload.overall_progress = 1.0;
-                        for name in &completed {
-                            if !current.offload.completed_devices.contains(name) {
-                                current.offload.completed_devices.push(name.clone());
+                            info!(
+                                "Offload copy complete (gen={}): {} device(s) offloaded of {}",
+                                generation,
+                                completed.len(),
+                                current.offload.device_progress.len(),
+                            );
+                            let parent = current.offload.parent_folder.clone();
+                            current.offload.running = false;
+                            current.offload.overall_progress = 1.0;
+                            current.offload.speed_bytes_per_sec = 0.0;
+                            for name in &completed {
+                                if !current.offload.completed_devices.contains(name) {
+                                    current.offload.completed_devices.push(name.clone());
+                                }
                             }
+                            // New offload output → set last_offload_parent for converter auto-switch.
+                            let target = parent.map(|p| p.join(&current.offload.parent_name));
+                            current.offload.last_offload_parent = target;
+                            current.offload.last_offload_version =
+                                current.offload.last_offload_version.wrapping_add(1);
+                            current.status_message = format!(
+                                "Offload complete: {} device(s) copied",
+                                completed.len(),
+                            );
                         }
-                        // New offload output → set last_offload_parent for converter auto-switch.
-                        let target = parent.map(|p| p.join(&current.offload.parent_name));
-                        current.offload.last_offload_parent = target;
-                        current.offload.last_offload_version =
-                            current.offload.last_offload_version.wrapping_add(1);
-                        current.status_message = format!(
-                            "Offload complete: {} device(s) copied",
-                            completed.len(),
-                        );
                         offload_context = None;
                     } else {
                         warn!("Discarding stale offload copy result: gen={}", generation);
@@ -893,13 +917,39 @@ pub fn engine_main_with_probe<F>(
                 );
                 current.offload.overall_progress = snapshot.overall_progress;
                 current.offload.device_progress = snapshot.device_progress;
+
+                // Compute smoothed copy speed from byte deltas.
+                let now = Instant::now();
+                let blocks_now = ctx.overall_blocks_done.load(Ordering::Relaxed);
+                if let Some(last_time) = offload_last_time {
+                    let delta_t = now.saturating_duration_since(last_time).as_secs_f64();
+                    if delta_t > 0.001 {
+                        let delta_blocks = blocks_now.saturating_sub(offload_last_blocks_done);
+                        let instant_speed = (delta_blocks as f64 * (1 << 20) as f64) / delta_t;
+                        // EMA smoothing (α=0.3)
+                        offload_speed_smoothed = 0.7 * offload_speed_smoothed + 0.3 * instant_speed;
+                    }
+                } else {
+                    offload_speed_smoothed = 0.0;
+                }
+                offload_last_blocks_done = blocks_now;
+                offload_last_time = Some(now);
+                current.offload.speed_bytes_per_sec = offload_speed_smoothed;
+
+                let speed_mb = offload_speed_smoothed / (1024.0 * 1024.0);
                 current.status_message = format!(
-                    "Offloading… {:.0}%",
+                    "Offloading… {:.0}% ({:.1} MB/s)",
                     snapshot.overall_progress * 100.0,
+                    speed_mb,
                 );
             }
         } else {
             current.offload.device_progress.clear();
+            // Reset speed tracking when idle.
+            offload_last_blocks_done = 0;
+            offload_last_time = None;
+            offload_speed_smoothed = 0.0;
+            current.offload.speed_bytes_per_sec = 0.0;
         }
 
         // 1.13 Poll conversion progress from engine-owned shared state
@@ -2182,6 +2232,7 @@ fn handle_offload_command(
             state.offload.running = true;
             state.offload.error = None;
             state.offload.overall_progress = 0.0;
+            state.offload.speed_bytes_per_sec = 0.0;
             state.offload.device_progress.clear();
             let total_files: usize = device_plans.iter().map(|p| p.len()).sum();
             let total_bytes: u64 = device_plans.iter().flat_map(|p| p.iter().map(|i| i.size)).sum();

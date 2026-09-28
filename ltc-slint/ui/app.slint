@@ -128,6 +128,7 @@ export component AppWindow inherits Window {
     in-out property <bool> off-scanning: false;
     in-out property <bool> off-running: false;
     in-out property <float> off-overall-progress: 0.0;
+    in-out property <string> off-speed-text: "";
     in-out property <[OffloadDeviceStatus]> off-device-progress: [];
     in-out property <[string]> off-completed-devices: [];
     in-out property <string> off-error: "";
@@ -797,6 +798,7 @@ export component AppWindow inherits Window {
                     scanning: root.off-scanning;
                     running: root.off-running;
                     overall-progress: root.off-overall-progress;
+                    speed-text: root.off-speed-text;
                     device-progress: root.off-device-progress;
                     completed-devices: root.off-completed-devices;
                     error: root.off-error;

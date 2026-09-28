@@ -498,6 +498,13 @@ pub fn setup_poll_timer(
                 ui.set_off_scanning(off.scanning);
                 ui.set_off_running(off.running);
                 ui.set_off_overall_progress(off.overall_progress);
+                ui.set_off_speed_text(SharedString::from(
+                    if off.speed_bytes_per_sec > 0.0 {
+                        format!("{} / s", format_bytes(off.speed_bytes_per_sec as u64))
+                    } else {
+                        String::new()
+                    },
+                ));
                 ui.set_off_error(SharedString::from(off.error.clone().unwrap_or_default()));
 
                 let card_infos: Vec<crate::OffloadCardInfo> = off.cards.iter().map(|card| {
@@ -552,12 +559,27 @@ pub fn setup_poll_timer(
                         gui_engine::offload::OffloadDeviceState::Failed(e) => e.clone(),
                         _ => String::new(),
                     };
+                    let (progress, bytes_text) = if dp.bytes_total > 0 {
+                        (
+                            (dp.bytes_done as f32) / (dp.bytes_total as f32),
+                            format!("{} / {}", format_bytes(dp.bytes_done), format_bytes(dp.bytes_total)),
+                        )
+                    } else if dp.files_total > 0 {
+                        (
+                            dp.files_done as f32 / dp.files_total as f32,
+                            String::new(),
+                        )
+                    } else {
+                        (0.0, String::new())
+                    };
                     crate::OffloadDeviceStatus {
                         device_name: SharedString::from(dp.device_name.clone()),
                         state_text: SharedString::from(state_text),
                         files_total: dp.files_total as i32,
                         files_done: dp.files_done as i32,
-                        progress: if dp.files_total > 0 { dp.files_done as f32 / dp.files_total as f32 } else { 0.0 },
+                        progress,
+                        bytes_text: SharedString::from(bytes_text),
+                        current_file: SharedString::from(dp.current_file.clone()),
                         error: SharedString::from(error_str),
                     }
                 }).collect();

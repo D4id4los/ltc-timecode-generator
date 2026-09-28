@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, Error, Read, Write};
+use std::io::{Error, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -63,6 +63,19 @@ const AUDIO_EXTS: &[&str] = &["wav"];
 
 /// Buffer size for file copy (1 MiB).
 const COPY_BUF_SIZE: usize = 1 << 20;
+
+/// Errors from [`copy_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyError {
+    Io(String),
+    Cancelled,
+}
+
+impl CopyError {
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, CopyError::Cancelled)
+    }
+}
 
 /// Maximum depth when scanning a card for media files.
 const CARD_SCAN_DEPTH: usize = 6;
@@ -149,6 +162,8 @@ pub struct OffloadSnapshot {
     pub running: bool,
     /// Overall progress fraction 0.0…1.0.
     pub overall_progress: f32,
+    /// Current copy speed in bytes per second (smoothed; 0.0 when idle).
+    pub speed_bytes_per_sec: f64,
     /// Per-device progress details.
     pub device_progress: Vec<OffloadDeviceStatus>,
     /// Device names that have been fully offloaded this session.
@@ -175,6 +190,7 @@ impl OffloadSnapshot {
             parent_name: default_parent_name(),
             running: false,
             overall_progress: 0.0,
+            speed_bytes_per_sec: 0.0,
             device_progress: Vec::new(),
             completed_devices: Vec::new(),
             last_offload_parent: None,
@@ -855,6 +871,10 @@ pub fn run_offload(
 
     for (dev_idx, plans) in plans_per_device.iter().enumerate() {
         if context.cancel.load(Ordering::Relaxed) {
+            // Mark all remaining (unstarted) devices as Skipped.
+            for remaining in dev_idx..plans_per_device.len() {
+                *context.per_device[remaining].state.lock().unwrap() = DeviceState::Skipped;
+            }
             break;
         }
 
@@ -902,14 +922,15 @@ pub fn run_offload(
             // Skip if destination exists with the same size (idempotent resume).
             if let Ok(existing_meta) = fs::metadata(&item.dst) {
                 if existing_meta.len() == item.size && existing_meta.is_file() {
-                    // Already copied — just update counters.
                     advance_counters(context, dev_idx, 1, item.size);
                     continue;
                 }
             }
 
-            // Copy the file with 1 MiB buffered IO.
-            match copy_file(&item.src, &item.dst) {
+            // Copy the file with 1 MiB chunked IO.
+            match copy_file(&item.src, &item.dst, &context.cancel, &mut |copied| {
+                report_chunk_progress(context, dev_idx, copied);
+            }) {
                 Ok(()) => {
                     // Verify after copy.
                     match verify_copy(&item.src, &item.dst, &VerifyMode::SizeOnly) {
@@ -928,7 +949,11 @@ pub fn run_offload(
                         }
                     }
                 }
-                Err(e) => {
+                Err(CopyError::Cancelled) => {
+                    dev_ok = false;
+                    break;
+                }
+                Err(CopyError::Io(e)) => {
                     let msg = format!("Copy failed for {:?}: {}", item.src, e);
                     {
                         let inner = &context.per_device[dev_idx];
@@ -948,7 +973,6 @@ pub fn run_offload(
         } else if context.cancel.load(Ordering::Relaxed) {
             DeviceState::Skipped
         } else {
-            // Already set to Failed above.
             DeviceState::Failed
         };
         *inner.state.lock().unwrap() = final_state;
@@ -962,7 +986,7 @@ pub fn run_offload(
     completed
 }
 
-/// Advance file/byte counters after a successful copy.
+/// Advance file/byte counters after a successful file copy.
 fn advance_counters(ctx: &OffloadContext, dev_idx: usize, files_inc: usize, bytes_inc: u64) {
     let blocks = ((bytes_inc.saturating_add((1 << 20) - 1)) >> 20) as usize;
     let inner = &ctx.per_device[dev_idx];
@@ -972,27 +996,72 @@ fn advance_counters(ctx: &OffloadContext, dev_idx: usize, files_inc: usize, byte
     ctx.overall_blocks_done.fetch_add(blocks, Ordering::Relaxed);
 }
 
-/// Copy a single file with 1 MiB buffered IO.
-fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
-    let src_file = fs::File::open(src).map_err(|e| format!("Cannot open {:?}: {}", src, e))?;
-    let reader = BufReader::with_capacity(COPY_BUF_SIZE, src_file);
+/// Progress callback invoked by [`copy_file`] after each chunk.
+/// Updates per-device and overall byte/block counters and tracks cumulative
+/// bytes copied for this file to compute the final exact total.
+fn report_chunk_progress(ctx: &OffloadContext, dev_idx: usize, cumulative_bytes: u64) {
+    // Per-device: store as raw bytes (wrapping on 32-bit for >4GiB is acceptable).
+    let prev = ctx.per_device[dev_idx]
+        .bytes_done
+        .fetch_add(0, Ordering::Relaxed) as u64;
+    let delta = cumulative_bytes.saturating_sub(prev);
+    if delta > 0 {
+        ctx.per_device[dev_idx]
+            .bytes_done
+            .fetch_add(delta as usize, Ordering::Relaxed);
+        let blocks_delta = ((delta.saturating_add((1 << 20) - 1)) >> 20) as usize;
+        ctx.overall_blocks_done
+            .fetch_add(blocks_delta, Ordering::Relaxed);
+    }
+}
 
-    // Write to a temp file next to dst, then atomically rename.
+/// Copy a single file with 1 MiB chunked IO.
+///
+/// Reads the source in `COPY_BUF_SIZE` chunks, writes each chunk to a
+/// `.offload_tmp` file beside the destination, then atomically renames.
+/// Checks `cancel` per chunk and calls `on_progress` with the cumulative
+/// bytes written so far.
+fn copy_file(
+    src: &Path,
+    dst: &Path,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(u64),
+) -> Result<(), CopyError> {
+    let src_file = fs::File::open(src).map_err(|e| CopyError::Io(format!("Cannot open {:?}: {}", src, e)))?;
+    let mut src_file = std::io::BufReader::with_capacity(COPY_BUF_SIZE, src_file);
+
     let tmp = dst.with_extension("offload_tmp");
     let mut dst_file =
-        fs::File::create(&tmp).map_err(|e| format!("Cannot create {:?}: {}", tmp, e))?;
+        fs::File::create(&tmp).map_err(|e| CopyError::Io(format!("Cannot create {:?}: {}", tmp, e)))?;
 
-    for chunk in reader.bytes() {
-        let byte = chunk.map_err(|e| format!("Read error on {:?}: {}", src, e))?;
+    let mut buf = vec![0u8; COPY_BUF_SIZE];
+    let mut total: u64 = 0;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            drop(dst_file);
+            let _ = fs::remove_file(&tmp);
+            return Err(CopyError::Cancelled);
+        }
+
+        let n = src_file
+            .read(&mut buf)
+            .map_err(|e| CopyError::Io(format!("Read error on {:?}: {}", src, e)))?;
+        if n == 0 {
+            break;
+        }
         dst_file
-            .write_all(&[byte])
-            .map_err(|e| format!("Write error on {:?}: {}", tmp, e))?;
+            .write_all(&buf[..n])
+            .map_err(|e| CopyError::Io(format!("Write error on {:?}: {}", tmp, e)))?;
+        total += n as u64;
+        on_progress(total);
     }
+
     dst_file
         .sync_all()
-        .map_err(|e| format!("Sync error on {:?}: {}", tmp, e))?;
+        .map_err(|e| CopyError::Io(format!("Sync error on {:?}: {}", tmp, e)))?;
     drop(dst_file);
-    fs::rename(&tmp, dst).map_err(|e| format!("Rename {:?} → {:?}: {}", tmp, dst, e))?;
+    fs::rename(&tmp, dst).map_err(|e| CopyError::Io(format!("Rename {:?} → {:?}: {}", tmp, dst, e)))?;
     Ok(())
 }
 
@@ -1078,6 +1147,7 @@ pub fn snapshot_from_context(
         parent_name: parent_name.to_string(),
         running: true,
         overall_progress: progress.min(1.0),
+        speed_bytes_per_sec: 0.0,
         device_progress,
         completed_devices: completed_devices.to_vec(),
         last_offload_parent: parent_folder,
@@ -1387,11 +1457,123 @@ mod tests {
         let plans = plan_copies_for_card(card.path(), "Cam", dest.path());
         let device_names = vec!["Cam".to_string()];
         let ctx = OffloadContext::new(&device_names, std::slice::from_ref(&plans));
-        ctx.cancel.store(true, Ordering::Relaxed); // cancel immediately
+        ctx.cancel.store(true, Ordering::Relaxed);
 
         let completed = run_offload(&[plans], &device_names, &ctx);
-        // Should have been cancelled before copying any files (or during).
-        assert!(completed.is_empty() || completed.len() < 10);
+        // Should have been cancelled with no files completed.
+        assert!(completed.is_empty());
+        // Device should be Skipped.
+        assert_eq!(
+            *ctx.per_device[0].state.lock().unwrap(),
+            DeviceState::Skipped,
+        );
+        // No .offload_tmp files left behind.
+        let tmp_left: Vec<_> = fs::read_dir(dest.path().join("Cam"))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "offload_tmp").unwrap_or(false))
+            .collect();
+        assert!(tmp_left.is_empty(), "no leftover temp files on cancel");
+    }
+
+    #[test]
+    fn test_copy_file_copies_content_correctly() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+
+        // 3 MiB file (spans multiple chunks).
+        let content = vec![0xABu8; 3 * 1024 * 1024];
+        fs::write(&src, &content).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut progress_events: Vec<u64> = Vec::new();
+        copy_file(&src, &dst, &cancel, &mut |c| progress_events.push(c)).unwrap();
+
+        // Content matches.
+        let dst_content = fs::read(&dst).unwrap();
+        assert_eq!(dst_content, content, "copied file content must match source");
+
+        // Progress callback called with increasing values ending at file size.
+        assert!(
+            !progress_events.is_empty(),
+            "progress callback must be called at least once"
+        );
+        assert_eq!(
+            *progress_events.last().unwrap(),
+            content.len() as u64,
+            "final progress must equal file size"
+        );
+        for w in progress_events.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "progress must be monotonic: {} > {}",
+                w[0],
+                w[1]
+            );
+        }
+        // For a 3 MiB file we expect at least 3 chunk updates (1 MiB each).
+        assert!(progress_events.len() >= 3, "expected >= 3 progress callbacks, got {}", progress_events.len());
+    }
+
+    #[test]
+    fn test_copy_file_cancel_mid_copy() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+
+        // 5 MiB file — will span at least 5 chunks.
+        let content = vec![0xCDu8; 5 * 1024 * 1024];
+        fs::write(&src, &content).unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let mut progress_events: Vec<u64> = Vec::new();
+        let result = copy_file(&src, &dst, &cancel, &mut |c| progress_events.push(c));
+
+        // Should fail with Cancelled.
+        assert!(result.is_err(), "copy should return error when cancelled");
+        assert!(
+            matches!(result, Err(CopyError::Cancelled)),
+            "error should be Cancelled, got {:?}",
+            result
+        );
+
+        // Destination should NOT exist (tmp was deleted on cancel).
+        assert!(!dst.exists(), "destination should not exist after cancelled copy");
+
+        // Temp file should be gone.
+        let tmp = dst.with_extension("offload_tmp");
+        assert!(!tmp.exists(), "temp file should be deleted on cancel");
+
+        // Progress may have been called 0 or 1 time (cancel checked before chunk).
+        // Either is fine.
+    }
+
+    #[test]
+    fn test_copy_file_respects_cancel_after_chunk() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+
+        // 3 MiB file.
+        let content = vec![0xEFu8; 3 * 1024 * 1024];
+        fs::write(&src, &content).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut count = 0;
+        let result = copy_file(&src, &dst, &cancel, &mut |_c| {
+            count += 1;
+            if count >= 2 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+
+        // Should have been cancelled mid-copy.
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CopyError::Cancelled)));
+        // Destination should not exist.
+        assert!(!dst.exists());
     }
 
     // ── snapshot_from_context ─────────────────────────────────────────
@@ -1442,6 +1624,7 @@ mod tests {
         assert_eq!(snapshot.device_progress[0].bytes_done, 1_000_000);
         assert_eq!(snapshot.last_offload_version, 1);
         assert_eq!(snapshot.parent_name, "2026-09-26");
+        assert_eq!(snapshot.speed_bytes_per_sec, 0.0);
     }
 
     // ── detect_cards_from_mounts ──────────────────────────────────────

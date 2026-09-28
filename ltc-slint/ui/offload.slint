@@ -8,6 +8,7 @@ export component OffloadSection {
     in-out property <bool> scanning: false;
     in-out property <bool> running: false;
     in-out property <float> overall-progress: 0.0;
+    in-out property <string> speed-text: "";
     in-out property <[OffloadDeviceStatus]> device-progress: [];
     in-out property <[string]> completed-devices: [];
     in-out property <string> error: "";
@@ -193,6 +194,10 @@ export component OffloadSection {
                         width: parent.width * root.overall-progress;
                     }
                 }
+                if (root.speed-text != "") : Text {
+                    text: root.speed-text;
+                    font-size: 10px; color: AppColors.accent;
+                }
 
                 // Per-device progress
                 for dev[idx] in root.device-progress : VerticalLayout { spacing: 4px;
@@ -201,12 +206,20 @@ export component OffloadSection {
                         HorizontalLayout { horizontal-stretch: 1; }
                         Text { text: dev.files-done + "/" + dev.files-total + " files"; font-size: 10px; color: AppColors.text-muted; }
                     }
+                    if (dev.bytes-text != "") : Text {
+                        text: dev.bytes-text;
+                        font-size: 10px; color: AppColors.text-muted;
+                    }
                     Rectangle {
                         height: 6px; border-radius: 3px; background: AppColors.deep-bg;
                         Rectangle {
                             height: 6px; border-radius: 3px; background: AppColors.accent;
                             width: parent.width * dev.progress;
                         }
+                    }
+                    if (dev.current-file != "") : Text {
+                        text: "  " + dev.current-file;
+                        font-size: 9px; color: AppColors.text-muted;
                     }
                     if (dev.error != "") : Text { text: dev.error; font-size: 10px; color: AppColors.red; }
                 }
