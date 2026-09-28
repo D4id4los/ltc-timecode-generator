@@ -34,6 +34,7 @@ pub fn make_settings_audio_only() -> ConverterSettings {
         trim_offsets_secs: vec![0.0; 2],
         timecode_meta_per_file: vec![None; 2],
         camera_meta_per_file: vec![None; 2],
+        device_name: None,
         concat_audio: false,
         resolved_hw_device: None,
     }
@@ -97,6 +98,7 @@ pub fn make_video_settings() -> ConverterSettings {
         trim_offsets_secs: vec![0.0],
         timecode_meta_per_file: vec![None],
         camera_meta_per_file: vec![None],
+        device_name: None,
         concat_audio: false,
         resolved_hw_device: None,
     }

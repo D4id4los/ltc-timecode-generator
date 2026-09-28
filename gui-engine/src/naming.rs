@@ -1,7 +1,7 @@
 // ── Named-placeholder template for output filenames ─────────────────────
 //
-// Supports `{filename}`, `{clip}`, `{track}` and zero-padded variants
-// `{clip:0Nd}` and `{track:0Nd}` where N = 1..=9 digits.
+// Supports `{filename}`, `{device}`, `{clip}`, `{track}` and zero-padded
+// variants `{clip:0Nd}` and `{track:0Nd}` where N = 1..=9 digits.
 
 use std::fmt;
 
@@ -10,6 +10,7 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Placeholder {
     Filename,
+    Device,
     Clip,
     Track,
 }
@@ -19,6 +20,8 @@ pub enum Placeholder {
 pub struct NamingContext {
     /// Source-file stem (without directory or extension).
     pub filename: String,
+    /// Device name (human-readable, from camera metadata / filename pattern).
+    pub device: String,
     /// Clip number (1-based; 1 for single-clip recordings).
     pub clip: usize,
     /// Track number (1-based output index; surviving order after LTC drop).
@@ -37,7 +40,7 @@ impl fmt::Display for TemplateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TemplateError::UnknownPlaceholder(p) => {
-                write!(f, "Unknown placeholder '{}'. Allowed: {{filename}}, {{clip:0Nd}}, {{track:0Nd}}.", p)
+                write!(f, "Unknown placeholder '{}'. Allowed: {{filename}}, {{device}}, {{clip:0Nd}}, {{track:0Nd}}.", p)
             }
             TemplateError::InvalidWidth => {
                 write!(f, "Placeholder width must be :0Nd where N is 1..9.")
@@ -65,7 +68,7 @@ enum Segment {
 /// use gui_engine::naming::{NameTemplate, NamingContext};
 ///
 /// let tmpl = NameTemplate::parse("{filename}_track{track:02d}").unwrap();
-/// let ctx = NamingContext { filename: "session1".into(), clip: 1, track: 3 };
+/// let ctx = NamingContext { filename: "session1".into(), device: "A6700".into(), clip: 1, track: 3 };
 /// assert_eq!(tmpl.expand(&ctx), "session1_track03");
 /// ```
 #[derive(Clone, Debug)]
@@ -112,6 +115,7 @@ impl NameTemplate {
                 Segment::Literal(s) => out.push_str(s),
                 Segment::Placeholder { name, width } => match name {
                     Placeholder::Filename => out.push_str(&ctx.filename),
+                    Placeholder::Device => out.push_str(&ctx.device),
                     Placeholder::Clip => {
                         push_padded(&mut out, ctx.clip, *width);
                     }
@@ -137,6 +141,14 @@ fn parse_placeholder(inner: &str) -> Result<(Placeholder, Option<usize>), Templa
     // {filename} — no width suffix
     if inner == "filename" {
         return Ok((Placeholder::Filename, None));
+    }
+
+    // {device} — no width suffix; reject any width specifier.
+    if let Some(rest) = inner.strip_prefix("device") {
+        if rest.is_empty() {
+            return Ok((Placeholder::Device, None));
+        }
+        return Err(TemplateError::InvalidWidth);
     }
 
     // {clip} or {clip:0Nd}
@@ -244,6 +256,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_device() {
+        let t = NameTemplate::parse("{device}").unwrap();
+        assert_eq!(t.segments.len(), 1);
+        match &t.segments[0] {
+            Segment::Placeholder { name: Placeholder::Device, width: None } => {}
+            _ => panic!("expected Device placeholder"),
+        }
+    }
+
+    #[test]
+    fn test_parse_device_width_rejected() {
+        let err = NameTemplate::parse("{device:01d}").unwrap_err();
+        assert_eq!(err, TemplateError::InvalidWidth);
+    }
+
+    #[test]
     fn test_parse_multiple_placeholders() {
         let t = NameTemplate::parse("{filename}_clip{clip:01d}_tr{track:02d}").unwrap();
         assert_eq!(t.segments.len(), 5);
@@ -308,6 +336,7 @@ mod tests {
     fn ctx() -> NamingContext {
         NamingContext {
             filename: "recording".into(),
+            device: "A6700".into(),
             clip: 5,
             track: 3,
         }
@@ -350,6 +379,25 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_device() {
+        let t = NameTemplate::parse("{device}").unwrap();
+        assert_eq!(t.expand(&ctx()), "A6700");
+    }
+
+    #[test]
+    fn test_expand_device_empty() {
+        let t = NameTemplate::parse("{device}").unwrap();
+        let c = NamingContext { filename: "x".into(), device: "".into(), clip: 1, track: 1 };
+        assert_eq!(t.expand(&c), "");
+    }
+
+    #[test]
+    fn test_expand_device_in_path() {
+        let t = NameTemplate::parse("{device}_{filename}").unwrap();
+        assert_eq!(t.expand(&ctx()), "A6700_recording");
+    }
+
+    #[test]
     fn test_expand_full_path() {
         let t = NameTemplate::parse("{filename}_clip{clip:01d}_tr{track:02d}").unwrap();
         assert_eq!(t.expand(&ctx()), "recording_clip5_tr03");
@@ -372,14 +420,14 @@ mod tests {
     #[test]
     fn test_expand_track_at_1() {
         let t = NameTemplate::parse("{track:03d}").unwrap();
-        let c = NamingContext { filename: "x".into(), clip: 1, track: 1 };
+        let c = NamingContext { filename: "x".into(), device: "A6700".into(), clip: 1, track: 1 };
         assert_eq!(t.expand(&c), "001");
     }
 
     #[test]
     fn test_expand_large_clip() {
         let t = NameTemplate::parse("{clip:02d}").unwrap();
-        let c = NamingContext { filename: "x".into(), clip: 42, track: 1 };
+        let c = NamingContext { filename: "x".into(), device: "A6700".into(), clip: 42, track: 1 };
         // width=2 but value needs 2 chars — fits
         assert_eq!(t.expand(&c), "42");
     }
@@ -387,7 +435,7 @@ mod tests {
     #[test]
     fn test_expand_clip_wider_than_width() {
         let t = NameTemplate::parse("{clip:02d}").unwrap();
-        let c = NamingContext { filename: "x".into(), clip: 142, track: 1 };
+        let c = NamingContext { filename: "x".into(), device: "A6700".into(), clip: 142, track: 1 };
         // width=2 but value needs 3 — still produces "142" (no truncation)
         assert_eq!(t.expand(&c), "142");
     }
@@ -395,7 +443,7 @@ mod tests {
     #[test]
     fn test_expand_filename_with_extension() {
         let t = NameTemplate::parse("{filename}").unwrap();
-        let c = NamingContext { filename: "C0001.MP4".into(), clip: 1, track: 1 };
+        let c = NamingContext { filename: "C0001.MP4".into(), device: "A6700".into(), clip: 1, track: 1 };
         // filename includes "extension" since it's just the stem
         assert_eq!(t.expand(&c), "C0001.MP4");
     }
@@ -405,7 +453,7 @@ mod tests {
     #[test]
     fn test_consecutive_placeholders() {
         let t = NameTemplate::parse("{clip}{track}").unwrap();
-        let c = NamingContext { filename: "x".into(), clip: 1, track: 2 };
+        let c = NamingContext { filename: "x".into(), device: "A6700".into(), clip: 1, track: 2 };
         assert_eq!(t.expand(&c), "12");
     }
 

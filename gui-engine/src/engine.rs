@@ -654,7 +654,7 @@ pub fn engine_main_with_probe<F>(
         // 1.9 Drain converter clip probe results
         loop {
             match conv_probe_rx.try_recv() {
-                Ok(ConverterProbeResult { probes, cameras, generation }) => {
+                Ok(ConverterProbeResult { probes, cameras, device_name, generation }) => {
                     if generation == current.converter.probes_generation {
                         // Populate ltc_probe for video groups so the LTC source
                         // dropdown works even when the GUI sends SelectRecording
@@ -689,6 +689,7 @@ pub fn engine_main_with_probe<F>(
                         }
                         current.converter.probes = probes.iter().map(|r| r.as_ref().ok().cloned()).collect();
                         current.converter.camera_meta = cameras;
+                        current.converter.device_name = Some(device_name);
                         current.converter.probes_loading = false;
                         info!("Converter clip probe complete: {} files", current.converter.probes.len());
                         // Resize channel map to match the first successful probe's channel count
@@ -914,6 +915,7 @@ struct VideoProbeResult {
 struct ConverterProbeResult {
     probes: Vec<Result<VideoAudioProbe, String>>,
     cameras: Vec<Option<crate::CameraInfo>>,
+    device_name: String,
     generation: u64,
 }
 
@@ -2158,6 +2160,7 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
         trim_offsets_secs: vec![0.0; group.files.len()],
         timecode_meta_per_file,
         camera_meta_per_file: state.converter.camera_meta.clone(),
+        device_name: state.converter.device_name.clone(),
         concat_audio: s.concat_audio,
     })
 }
@@ -2188,6 +2191,7 @@ fn apply_recording_selection(
     state.converter.selected_group_idx = Some(idx);
     state.converter.probes.clear();
     state.converter.camera_meta.clear();
+    state.converter.device_name = None;
     state.converter.probes_loading = true;
     state.converter.probes_generation += 1;
     state.converter.conversion_state = ConversionState::idle();
@@ -2269,7 +2273,8 @@ fn apply_recording_selection(
                 let cameras: Vec<Option<crate::CameraInfo>> = files.iter()
                     .map(|f| crate::camera_meta::probe_camera_info(f))
                     .collect();
-                let _ = conv_probe_tx.send(ConverterProbeResult { probes, cameras, generation: gen });
+                let (device_name, _, _) = crate::device_name::resolve_device_name(&files, "", Some(&cameras));
+                let _ = conv_probe_tx.send(ConverterProbeResult { probes, cameras, device_name, generation: gen });
             })
             .expect("failed to spawn converter probe thread");
     } else {

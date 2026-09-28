@@ -50,6 +50,7 @@ pub struct ConverterSettings {
     pub trim_offsets_secs: Vec<f64>,
     pub timecode_meta_per_file: Vec<Option<TimecodeMetadata>>,
     pub camera_meta_per_file: Vec<Option<CameraInfo>>,
+    pub device_name: Option<String>,
     pub concat_audio: bool,
 }
 
@@ -80,6 +81,7 @@ impl ConverterSettings {
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string(),
+            device: self.device_name.clone().unwrap_or_else(|| "unknown".into()),
             clip: file_idx + 1,
             track: index.max(1),
         };

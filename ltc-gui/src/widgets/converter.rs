@@ -1815,6 +1815,7 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
         trim_offsets_secs: vec![0.0; selected_input_files(state).len()],
         timecode_meta_per_file: vec![None; selected_input_files(state).len()],
         camera_meta_per_file: vec![None; selected_input_files(state).len()],
+        device_name: state.latest.converter.device_name.clone(),
         resolved_hw_device: None,
     }
 }

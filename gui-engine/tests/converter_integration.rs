@@ -110,14 +110,14 @@ fn test_conversion_progress_tracking() {
         embed_camera_metadata: true,
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
-        camera_meta_per_file: vec![None; 2],
+camera_meta_per_file: vec![None; 2],
+        device_name: None,
 concat_audio: false,
             resolved_hw_device: None,
         };
 
     let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
     let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-
     let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
 
     let (final_status, _max_progress, log) =
@@ -223,6 +223,7 @@ fn make_test_settings(dir: &Path, input_files: Vec<std::path::PathBuf>) -> Conve
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
         camera_meta_per_file: vec![None; 2],
+        device_name: None,
         concat_audio: false,
         resolved_hw_device: None,
     }
@@ -425,6 +426,7 @@ fn test_concat_audio_across_two_video_clips() {
         trim_offsets_secs: vec![0.0, 0.0],
         timecode_meta_per_file: vec![None, None],
         camera_meta_per_file: vec![None; 2],
+        device_name: None,
         concat_audio: true,
         resolved_hw_device: None,
     };
@@ -579,6 +581,7 @@ audio_suffix_template: "_audio_track{track:01d}".to_string(),
             drop_frame: false,
         })],
         camera_meta_per_file: vec![None; 1],
+        device_name: None,
     concat_audio: false,
         resolved_hw_device: None,
         };
@@ -674,6 +677,7 @@ fn test_progress_stays_below_100_until_all_steps_done() {
         trim_offsets_secs: vec![0.0; 4],
         timecode_meta_per_file: vec![None; 4],
         camera_meta_per_file: vec![None; 4],
+        device_name: None,
         concat_audio: false,
         resolved_hw_device: None,
     };

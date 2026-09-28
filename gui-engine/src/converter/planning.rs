@@ -562,7 +562,7 @@ pub fn duplicate_output_warning(duplicate_names: &[String]) -> Option<String> {
     Some(format!(
         "Two or more output files would have the same name: \"{}\". \
          Later files will overwrite earlier ones. \
-         Add {{clip}}, {{track}}, or {{filename}} to the naming templates to disambiguate.",
+         Add {{device}}, {{clip}}, {{track}}, or {{filename}} to the naming templates to disambiguate.",
         list
     ))
 }

@@ -591,6 +591,7 @@ fn rename_target_in_source_dir(settings: &ConverterSettings, file_idx: usize, ex
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string(),
+        device: settings.device_name.clone().unwrap_or_else(|| "unknown".into()),
         clip: file_idx + 1,
         track: (file_idx + 1).max(1),
     };

@@ -3,6 +3,7 @@ pub mod cli;
 pub mod command;
 pub mod config;
 pub mod converter;
+pub mod device_name;
 pub mod duration;
 pub mod engine;
 pub mod ffprobe;

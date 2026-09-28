@@ -103,6 +103,10 @@ pub struct ConverterSnapshot {
     /// Per-file camera metadata for the selected recording.
     /// Index-aligned with the group's files. Populated alongside probes.
     pub camera_meta: Vec<Option<CameraInfo>>,
+    /// Detected device name for the selected recording (from XAVC sniff,
+    /// exiftool/ffprobe, filename pattern, or `"unknown"`).  `None` while
+    /// probes are loading or when no recording is selected.
+    pub device_name: Option<String>,
     /// True while probes are being loaded (background ffprobe).
     pub probes_loading: bool,
     /// Generation counter — incremented on each recording selection so
@@ -358,6 +362,7 @@ impl AppStateSnapshot {
                 selected_group_idx: None,
                 probes: Vec::new(),
                 camera_meta: Vec::new(),
+                device_name: None,
                 probes_loading: false,
                 probes_generation: 0,
                 conversion_state: ConversionState::idle(),
