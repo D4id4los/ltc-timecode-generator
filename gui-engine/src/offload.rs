@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Error, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -272,11 +272,167 @@ pub fn is_media_file(path: &Path) -> bool {
 
 // ── Card detection ──────────────────────────────────────────────────────
 
-/// Detect mounted media cards by parsing `/proc/mounts` and probing `/sys`.
+/// Detect media cards: parse `/proc/mounts` for mounted cards, then scan
+/// `/sys/class/block` for unmounted removable partitions and auto-mount them
+/// via `udisksctl` (so they become available for offload).
 #[cfg(target_os = "linux")]
 pub fn detect_cards() -> Vec<SdCardInfo> {
     let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
-    detect_cards_from_mounts(&mounts, Path::new("/sys"))
+    let sys_root = Path::new("/sys");
+
+    // 1. Detect already-mounted cards.
+    let mut cards = detect_cards_from_mounts(&mounts, sys_root);
+
+    // 2. Find unmounted card-like partitions and try to auto-mount.
+    let unmounted = find_unmounted_card_partitions(&mounts, sys_root);
+    for dev_name in &unmounted {
+        let dev_path = format!("/dev/{}", dev_name);
+        match udisks_mount(&dev_path) {
+            Ok(Some(mount_point)) => {
+                info!(
+                    "Auto-mounted {} at {:?} via udisksctl",
+                    dev_path, mount_point
+                );
+                // Re-read mounts to get the mount line, then run it through
+                // the same detect_cards_from_mounts pipeline.
+                let updated_mounts =
+                    fs::read_to_string("/proc/mounts").unwrap_or_else(|_| mounts.clone());
+                let new_cards = detect_cards_from_mounts(&updated_mounts, sys_root);
+                // Append newly discovered cards (avoid duplicates by mount).
+                let existing: std::collections::HashSet<PathBuf> =
+                    cards.iter().map(|c| c.mount.clone()).collect();
+                for c in new_cards {
+                    if !existing.contains(&c.mount) {
+                        cards.push(c);
+                    }
+                }
+            }
+            Ok(None) => {
+                info!(
+                    "Found unmounted removable /dev/{} — udisksctl auto-mount \
+                     returned no mount point; consider mounting manually",
+                    dev_name
+                );
+            }
+            Err(e) => {
+                info!(
+                    "Found unmounted removable /dev/{} but could not auto-mount: \
+                     {} (is udisks2 installed? Try: udisksctl mount -b /dev/{})",
+                    dev_name, e, dev_name
+                );
+            }
+        }
+    }
+
+    cards
+}
+
+/// Collect the set of mounted `/dev/…` paths from `/proc/mounts` content.
+fn collect_mounted_devices(mounts_content: &str) -> std::collections::HashSet<String> {
+    let mut mounted = std::collections::HashSet::new();
+    for line in mounts_content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let device = parts[0];
+        if device.starts_with("/dev/") {
+            mounted.insert(device.to_string());
+        }
+    }
+    mounted
+}
+
+/// Walk `/sys/class/block` for card-like device partitions that are not
+/// listed in the given mounts content. Returns a list of partition device
+/// names (e.g. `sdb1`, `mmcblk0p1`).
+fn find_unmounted_card_partitions(
+    mounts_content: &str,
+    sys_root: &Path,
+) -> Vec<String> {
+    let mounted = collect_mounted_devices(mounts_content);
+    let mut result = Vec::new();
+
+    let block_dir = sys_root.join("class").join("block");
+    let entries = match fs::read_dir(&block_dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // Skip loop, dm-, md, zram, nbd — never physical cards.
+        if name_str.starts_with("loop")
+            || name_str.starts_with("dm-")
+            || name_str.starts_with("md")
+            || name_str.starts_with("zram")
+            || name_str.starts_with("nbd")
+        {
+            continue;
+        }
+
+        let full_dev = format!("/dev/{}", name_str);
+        if mounted.contains(&full_dev) {
+            continue;
+        }
+
+        // Only consider partitions (have `partition` sysfs attribute).
+        let part_path = block_dir.join(&name_str).join("partition");
+        if !part_path.exists() {
+            continue;
+        }
+
+        // Size check: must be > 0 (ignore empty card slots).
+        let size_path = block_dir.join(&name_str).join("size");
+        let size_ok = fs::read_to_string(&size_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|sz| sz > 0)
+            .unwrap_or(false);
+        if !size_ok {
+            continue;
+        }
+
+        // Card-like check.
+        if !is_card_like_device(&full_dev, sys_root) {
+            continue;
+        }
+
+        result.push(name_str);
+    }
+
+    result
+}
+
+/// Try to mount a block device via `udisksctl mount`.
+/// Returns the mount point on success, `Ok(None)` if the device was already
+/// mounted (so we shouldn't retry), or `Err` on failure.
+fn udisks_mount(dev_path: &str) -> std::io::Result<Option<PathBuf>> {
+    let output = std::process::Command::new("udisksctl")
+        .arg("mount")
+        .arg("-b")
+        .arg(dev_path)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::other(stderr.trim().to_string()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // udisksctl prints: "Mounted /dev/sdb1 at /run/media/viktoria/disk"
+    if let Some(pos) = stdout.find(" at ") {
+        let path_str = stdout[pos + 4..].trim();
+        let mp = PathBuf::from(path_str);
+        if mp.is_dir() {
+            return Ok(Some(mp));
+        }
+    }
+    Ok(None)
 }
 
 /// Fallback for non-Linux: enumerate common mount roots.
@@ -371,29 +527,38 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
             continue;
         }
         let mp = Path::new(mount_point);
-        // Skip common non-removable system paths.
+        // Skip non-removable system paths; whitelist /run/media (udisks2).
         if mp == Path::new("/")
             || mp.starts_with("/boot")
             || mp.starts_with("/proc")
             || mp.starts_with("/sys")
             || mp.starts_with("/dev")
-            || mp.starts_with("/run")
         {
             skipped += 1;
             continue;
         }
-        // Prefer mounts under standard media directories.
-        let in_media = mp.starts_with("/media")
-            || mp.starts_with("/run/media")
-            || mp.starts_with("/mnt");
-        if !in_media && !mp.starts_with(format!("/media/{}", user)) {
+        // Whitelist /run/media before checking the generic /run skip.
+        let in_user_run_media = mp.starts_with(format!("/run/media/{}", user));
+        if !in_user_run_media && mp.starts_with("/run") {
             skipped += 1;
             continue;
         }
-        // Check removable flag via /sys.
-        let is_removable = is_block_removable(device, sys_root);
-        if !is_removable && !mp.starts_with(format!("/run/media/{}", user)) {
-            // /run/media/$USER mounts are usually removable.
+
+        // Must be under a recognised media mount root.
+        let in_media = mp.starts_with("/media")
+            || mp.starts_with("/run/media")
+            || mp.starts_with("/mnt");
+        let in_user_media = mp.starts_with(format!("/media/{}", user))
+            || in_user_run_media;
+        if !in_media && !in_user_media {
+            skipped += 1;
+            continue;
+        }
+
+        // Card-like check: removable flag / USB-MMC bus.
+        // Mounts under /run/media/$USER are also checked — the bus heuristic
+        // correctly excludes internal disks (nvme, SATA) even if mounted there.
+        if !is_card_like_device(device, sys_root) {
             skipped += 1;
             continue;
         }
@@ -410,7 +575,6 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
     let mut cards = Vec::new();
     let mut rejected = 0u32;
     for mp in &candidates {
-        // Deduplicate (same mount point via multiple /proc/mounts lines).
         if !seen.insert(mp.clone()) {
             continue;
         }
@@ -423,7 +587,7 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
             cards.push(info);
         } else {
             rejected += 1;
-            debug!("Mount {:?}: rejected by classify_mount", mp);
+            info!("Mount {:?}: rejected — no recognized media files", mp);
         }
     }
 
@@ -433,34 +597,6 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
         rejected
     );
     cards
-}
-
-/// Try to read `/sys/class/block/<devname>/removable`.
-fn is_block_removable(device_path: &str, sys_root: &Path) -> bool {
-    let dev_part = device_path.trim_start_matches("/dev/");
-    // Try the partition-level removable file first; fall back to stripping trailing digits.
-    let candidates = [
-        format!("class/block/{}", dev_part),
-        format!("block/{}", dev_part),
-    ];
-    for sys_path in &candidates {
-        let removable_path = sys_root.join(sys_path).join("removable");
-        if let Ok(val) = fs::read_to_string(&removable_path) {
-            return val.trim() == "1";
-        }
-    }
-    // Try base device (strip trailing digits).
-    let base = dev_part.trim_end_matches(|c: char| c.is_ascii_digit());
-    if !base.is_empty() && base != dev_part {
-        for sys_path in &candidates {
-            let base_sys = sys_path.replace(dev_part, base);
-            let removable_path = sys_root.join(&base_sys).join("removable");
-            if let Ok(val) = fs::read_to_string(&removable_path) {
-                return val.trim() == "1";
-            }
-        }
-    }
-    false
 }
 
 /// Classify a mount point as a media card: shallow media scan + device name guess.
@@ -861,6 +997,71 @@ pub fn snapshot_from_context(
         last_offload_version: last_version,
         error,
     }
+}
+
+/// Resolve the base (whole-disk) device name from a partition or device name.
+/// Uses the sysfs `partition` attribute to detect partitions:
+/// returns the input unchanged if it's already a whole-disk device.
+///
+/// Examples with mock sysfs:
+///   sda1 → sda, nvme0n1p3 → nvme0n1, mmcblk0p1 → mmcblk0,
+///   sda → sda, nvme0n1 → nvme0n1, mmcblk0 → mmcblk0
+fn base_device_name<'a>(dev_part: &'a str, sys_root: &'a Path) -> &'a str {
+    // Not a partition → return as-is.
+    let is_partition = sys_root
+        .join("class")
+        .join("block")
+        .join(dev_part)
+        .join("partition")
+        .exists();
+    if !is_partition {
+        return dev_part;
+    }
+    // Strip trailing digits, then a trailing 'p' if the remainder ends in a digit.
+    let trimmed = dev_part.trim_end_matches(|c: char| c.is_ascii_digit());
+    if let Some(stripped) = trimmed.strip_suffix('p') {
+        if !stripped.is_empty()
+            && stripped.ends_with(|c: char| c.is_ascii_digit())
+        {
+            return stripped;
+        }
+    }
+    trimmed
+}
+
+/// Check whether a block device is card-like: either the kernel's removable
+/// flag is set, or the device is on a USB or MMC bus (the two common card-reader
+/// transports).
+fn is_card_like_device(device_path: &str, sys_root: &Path) -> bool {
+    let dev_part = device_path.trim_start_matches("/dev/");
+    let base = base_device_name(dev_part, sys_root);
+    if is_dev_removable(base, sys_root) {
+        return true;
+    }
+    // Bus heuristic: check the resolved device path for /usb or /mmc.
+    let dev_path = sys_root.join("class").join("block").join(base);
+    if let Ok(real) = dev_path.canonicalize() {
+        let s = real.to_string_lossy();
+        if s.contains("/usb") || s.contains("/mmc") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Helper: check `/sys/class/block/<base>/removable`.
+fn is_dev_removable(base_dev: &str, sys_root: &Path) -> bool {
+    let sys_paths = [
+        format!("class/block/{}", base_dev),
+        format!("block/{}", base_dev),
+    ];
+    for sys_path in &sys_paths {
+        let removable_path = sys_root.join(sys_path).join("removable");
+        if let Ok(val) = fs::read_to_string(&removable_path) {
+            return val.trim() == "1";
+        }
+    }
+    false
 }
 
 // ── Helper to get current username (used in mount detection) ────────────
@@ -1271,6 +1472,286 @@ proc /proc proc rw 0 0
         assert!(letters.contains(&'C'));
         assert!(letters.contains(&'Z'));
         assert!(!letters.contains(&'B'));
+    }
+
+    // ── base_device_name ──────────────────────────────────────────────────
+
+    /// Quick mock sysfs: create a `class/block/<name>/partition` file for
+    /// partition devices (names ending with a digit or p + digits).
+    fn mock_base_dev_sys(partition_devs: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for dev in partition_devs {
+            let p = dir.path().join("class").join("block").join(dev);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(p.join("partition"), "1").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn test_base_device_name_sda() {
+        let sys = mock_base_dev_sys(&["sda1", "sdb1", "sdc123"]);
+        // sda — no partition file → returned unchanged.
+        assert_eq!(base_device_name("sda", sys.path()), "sda");
+        assert_eq!(base_device_name("sda1", sys.path()), "sda");
+        assert_eq!(base_device_name("sdb1", sys.path()), "sdb");
+        assert_eq!(base_device_name("sdc123", sys.path()), "sdc");
+    }
+
+    #[test]
+    fn test_base_device_name_nvme() {
+        let sys = mock_base_dev_sys(&["nvme0n1p1", "nvme0n1p3", "nvme1n1p10"]);
+        assert_eq!(base_device_name("nvme0n1", sys.path()), "nvme0n1");
+        assert_eq!(base_device_name("nvme0n1p1", sys.path()), "nvme0n1");
+        assert_eq!(base_device_name("nvme0n1p3", sys.path()), "nvme0n1");
+        assert_eq!(base_device_name("nvme1n1p10", sys.path()), "nvme1n1");
+    }
+
+    #[test]
+    fn test_base_device_name_mmc() {
+        let sys = mock_base_dev_sys(&["mmcblk0p1", "mmcblk0p12"]);
+        assert_eq!(base_device_name("mmcblk0", sys.path()), "mmcblk0");
+        assert_eq!(base_device_name("mmcblk0p1", sys.path()), "mmcblk0");
+        assert_eq!(base_device_name("mmcblk0p12", sys.path()), "mmcblk0");
+    }
+
+    #[test]
+    fn test_base_device_name_no_partition_file() {
+        let sys = mock_base_dev_sys(&[]);
+        assert_eq!(base_device_name("sda", sys.path()), "sda");
+        assert_eq!(base_device_name("nvme0n1", sys.path()), "nvme0n1");
+        assert_eq!(base_device_name("mmcblk0", sys.path()), "mmcblk0");
+        assert_eq!(base_device_name("loop0", sys.path()), "loop0");
+    }
+
+    // ── is_dev_removable / is_card_like_device (with mock sysfs) ──────────
+
+    /// Create a mock sysfs tree for testing removable / bus checks.
+    /// - `removable_devs`: devices with `removable` flag set to 1
+    /// - `usb_devs`: devices on a USB bus (removable=0, path contains /usb)
+    /// - `mmc_devs`: devices on an MMC bus (removable=0, path contains /mmc)
+    /// - `partition_devs`: partition names relative to the above groups;
+    ///   each gets a `partition` file and no `removable` file.
+    fn make_mock_sys(
+        removable_devs: &[&str],
+        usb_devs: &[&str],
+        mmc_devs: &[&str],
+        partition_devs: &[&str],
+    ) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        for dev in removable_devs {
+            let p = root.join("class").join("block").join(dev);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(p.join("removable"), "1").unwrap();
+        }
+
+        for dev in usb_devs {
+            let symlink_target = root.join("devices").join("pci0000:00").join("0000:00:14.0")
+                .join("usb1").join("1-1").join("1-1:1.0").join("host0")
+                .join("target0:0:0").join("0:0:0:0").join("block").join(dev);
+            fs::create_dir_all(&symlink_target).unwrap();
+            fs::write(symlink_target.join("removable"), "0").unwrap();
+            let link_path = root.join("class").join("block").join(dev);
+            fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+            let _ = std::fs::remove_dir(&link_path);
+            let _ = std::os::unix::fs::symlink(&symlink_target, &link_path);
+        }
+
+        for dev in mmc_devs {
+            let symlink_target = root.join("devices").join("pci0000:00").join("0000:00:1a.0")
+                .join("mmc_host").join("mmc0").join("mmc0:0001").join("block").join(dev);
+            fs::create_dir_all(&symlink_target).unwrap();
+            fs::write(symlink_target.join("removable"), "0").unwrap();
+            let link_path = root.join("class").join("block").join(dev);
+            fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+            let _ = std::fs::remove_dir(&link_path);
+            let _ = std::os::unix::fs::symlink(&symlink_target, &link_path);
+        }
+
+        // Nvme — should NOT be card-like (removable=0, pci bus, not usb/mmc).
+        let nvme_tgt = root.join("devices").join("pci0000:00").join("0000:00:1c.0")
+            .join("nvme").join("nvme0").join("nvme0n1").join("block").join("nvme0n1");
+        fs::create_dir_all(&nvme_tgt).unwrap();
+        fs::write(nvme_tgt.join("removable"), "0").unwrap();
+        let nvme_link = root.join("class").join("block").join("nvme0n1");
+        fs::create_dir_all(nvme_link.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_dir(&nvme_link);
+        let _ = std::os::unix::fs::symlink(&nvme_tgt, &nvme_link);
+
+        // Partition devices: create `partition` and `size` files.
+        for dev in partition_devs {
+            let p = root.join("class").join("block").join(dev);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(p.join("partition"), "1").unwrap();
+            fs::write(p.join("size"), "244306944").unwrap(); // ~120 MB
+        }
+
+        dir
+    }
+
+    #[test]
+    fn test_is_dev_removable_found() {
+        let sys = make_mock_sys(&["sdb"], &[], &[], &[]);
+        assert!(is_dev_removable("sdb", sys.path()));
+    }
+
+    #[test]
+    fn test_is_dev_removable_not_found() {
+        let sys = make_mock_sys(&[], &[], &[], &[]);
+        assert!(!is_dev_removable("nvme0n1", sys.path()));
+    }
+
+    #[test]
+    fn test_is_card_like_device_removable_flag() {
+        let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
+        assert!(is_card_like_device("/dev/sdb1", sys.path()));
+    }
+
+    #[test]
+    fn test_is_card_like_device_usb_bus() {
+        let sys = make_mock_sys(&[], &["sdc"], &[], &[]);
+        assert!(is_card_like_device("/dev/sdc", sys.path()));
+    }
+
+    #[test]
+    fn test_is_card_like_device_mmc_bus() {
+        let sys = make_mock_sys(&[], &[], &["mmcblk0"], &[]);
+        assert!(is_card_like_device("/dev/mmcblk0", sys.path()));
+    }
+
+    #[test]
+    fn test_is_card_like_device_nvme_excluded() {
+        let sys = make_mock_sys(&[], &[], &[], &[]);
+        assert!(!is_card_like_device("/dev/nvme0n1", sys.path()));
+    }
+
+    // ── detect_cards_from_mounts (Linux mount-parsing) ──────────────────
+
+    /// Create a tempdir with media files under a subpath.
+    fn make_mount_with_media(label: &str, media_names: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join(label);
+        fs::create_dir_all(&root).unwrap();
+        for name in media_names {
+            fs::write(root.join(name), b"video_data").unwrap();
+        }
+        (dir, root)
+    }
+
+    #[test]
+    fn test_detect_cards_udisks2_path_passes_filtering() {
+        let mounts = "\
+/dev/sdb1 /run/media/viktoria/disk vfat rw 0 0
+";
+        let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
+        let cards = detect_cards_from_mounts(mounts, sys.path());
+        // /run/media/viktoria/disk doesn't exist on this machine, so
+        // classify_mount rejects it (0 files). But the filter should
+        // accept it (sdb is removable, sdb1 is its partition).
+        assert!(cards.is_empty());
+    }
+
+    #[test]
+    fn test_detect_cards_skips_gvfs_snap() {
+        let mounts = "\
+/dev/nvme0n1p2 / ext4 rw 0 0
+gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
+systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
+/dev/loop0 /snap/emacs/4391 squashfs ro 0 0
+";
+        let sys = make_mock_sys(&[], &[], &[], &[]);
+        let cards = detect_cards_from_mounts(mounts, sys.path());
+        assert!(cards.is_empty());
+    }
+
+    #[test]
+    fn test_detect_cards_media_dir_paths_pass_filtering() {
+        let mounts = "\
+/dev/sdc1 /media/viktoria/EOS_DIGITAL vfat rw 0 0
+/dev/sdd1 /mnt/card vfat rw 0 0
+";
+        let sys = make_mock_sys(&["sdc", "sdd"], &[], &[], &["sdc1", "sdd1"]);
+        let cards = detect_cards_from_mounts(mounts, sys.path());
+        assert!(cards.is_empty());
+    }
+
+    #[test]
+    fn test_detect_cards_nvme_under_run_media_excluded() {
+        let mounts = "\
+/dev/nvme0n1p3 /run/media/viktoria/1440965240963B06 ntfs3 rw 0 0
+";
+        let sys = make_mock_sys(&[], &[], &[], &[]);
+        let cards = detect_cards_from_mounts(mounts, sys.path());
+        assert!(cards.is_empty(), "nvme under /run/media should be excluded by bus heuristic");
+    }
+
+    #[test]
+    fn test_classify_mount_real_dir_with_media_accepted() {
+        let (_tmp, mp) = make_mount_with_media("EOS_DIGITAL", &["C0001.MP4"]);
+        let info = classify_mount(&mp, &mp);
+        assert!(info.is_some());
+        assert_eq!(info.unwrap().media_file_count, 1);
+    }
+
+    // ── collect_mounted_devices ──────────────────────────────────────────
+
+    #[test]
+    fn test_collect_mounted_devices() {
+        let mounts = "\
+/dev/nvme0n1p2 / ext4 rw 0 0
+/dev/sdb1 /run/media/viktoria/disk vfat rw 0 0
+proc /proc proc rw 0 0
+gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
+";
+        let mounted = collect_mounted_devices(mounts);
+        assert!(mounted.contains("/dev/nvme0n1p2"));
+        assert!(mounted.contains("/dev/sdb1"));
+        assert!(!mounted.contains("/proc"));
+        assert_eq!(mounted.len(), 2);
+    }
+
+    // ── find_unmounted_card_partitions ───────────────────────────────────
+
+    #[test]
+    fn test_find_unmounted_card_partitions_none_mounted() {
+        let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
+        let mounts = ""; // nothing mounted
+        let unmounted = find_unmounted_card_partitions(mounts, sys.path());
+        // sdb1 is card-like (removable parent) and has no mount → should be found
+        assert!(
+            unmounted.iter().any(|d| d == "sdb1"),
+            "sdb1 should be found as unmounted candidate"
+        );
+    }
+
+    #[test]
+    fn test_find_unmounted_card_partitions_already_mounted() {
+        let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
+        let mounts = "/dev/sdb1 /run/media/viktoria/disk vfat rw 0 0\n";
+        let unmounted = find_unmounted_card_partitions(mounts, sys.path());
+        assert!(
+            !unmounted.iter().any(|d| d == "sdb1"),
+            "sdb1 mounted → should not be in unmounted list"
+        );
+    }
+
+    #[test]
+    fn test_find_unmounted_card_partitions_nvme_excluded() {
+        let sys = make_mock_sys(&[], &[], &[], &["nvme0n1p3"]);
+        let mounts = "";
+        let unmounted = find_unmounted_card_partitions(mounts, sys.path());
+        assert!(
+            !unmounted.iter().any(|d| d == "nvme0n1p3"),
+            "nvme partition should be excluded by bus heuristic"
+        );
+    }
+
+    #[test]
+    fn test_collect_mounted_devices_empty() {
+        let mounted = collect_mounted_devices("");
+        assert!(mounted.is_empty());
     }
 
     // ── MAX_CARD_FILES limit in collect_media_files_shallow ──────────────

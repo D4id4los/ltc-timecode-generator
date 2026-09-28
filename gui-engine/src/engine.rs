@@ -745,7 +745,8 @@ pub fn engine_main_with_probe<F>(
                         if current.offload.cards.is_empty() {
                             info!(
                                 "Offload card scan complete: 0 cards — if your card reader \
-                                 is connected, check the drive letters / reader type"
+                                 is connected, check that the card is mounted and has \
+                                 video/audio files"
                             );
                         } else {
                             info!(
