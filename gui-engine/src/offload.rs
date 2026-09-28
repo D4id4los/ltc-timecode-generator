@@ -6,9 +6,57 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use chrono::Local;
+use log::{debug, info};
 
 use crate::device_name;
 pub use crate::device_name::DeviceNameSource;
+
+// ── Windows drive enumeration helper ─────────────────────────────────
+
+#[cfg(target_os = "windows")]
+mod win_driver {
+    use std::path::PathBuf;
+    use windows_sys::Win32::Storage::FileSystem;
+
+    pub struct DriveCandidate {
+        pub letter: char,
+        pub kind: u32,
+        pub root: PathBuf,
+    }
+
+    pub fn enumerate() -> Vec<DriveCandidate> {
+        let mut candidates = Vec::new();
+        let mask = unsafe { FileSystem::GetLogicalDrives() };
+        if mask == 0 {
+            return candidates;
+        }
+        for i in 0..26u32 {
+            if (mask >> i) & 1 == 1 {
+                let letter = char::from_u32(b'A' as u32 + i).unwrap_or('?');
+                let root = format!("{}:\\", letter);
+                let root_wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+                let kind = unsafe { FileSystem::GetDriveTypeW(root_wide.as_ptr()) };
+                candidates.push(DriveCandidate { letter, kind, root: PathBuf::from(root) });
+            }
+        }
+        candidates
+    }
+
+    pub const DRIVE_REMOVABLE: u32 = FileSystem::DRIVE_REMOVABLE;
+
+    pub fn drive_type_name(kind: u32) -> &'static str {
+        match kind {
+            FileSystem::DRIVE_UNKNOWN => "unknown",
+            FileSystem::DRIVE_NO_ROOT_DIR => "no_root_dir",
+            FileSystem::DRIVE_REMOVABLE => "removable",
+            FileSystem::DRIVE_FIXED => "fixed",
+            FileSystem::DRIVE_REMOTE => "remote",
+            FileSystem::DRIVE_CDROM => "cdrom",
+            FileSystem::DRIVE_RAMDISK => "ramdisk",
+            _ => "invalid",
+        }
+    }
+}
 
 /// Audio file extensions recognised as media.
 const AUDIO_EXTS: &[&str] = &["wav"];
@@ -235,30 +283,70 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
 #[cfg(not(target_os = "linux"))]
 pub fn detect_cards() -> Vec<SdCardInfo> {
     let mut cards = Vec::new();
+    let start = std::time::Instant::now();
+
     #[cfg(target_os = "windows")]
     {
-        for letter in 'A'..='Z' {
-            let root = PathBuf::from(format!("{}:\\", letter));
-            if root.exists() {
-                if let Some(info) = classify_mount(&root, &root) {
-                    cards.push(info);
-                }
+        let candidates = win_driver::enumerate();
+        info!(
+            "Windows card scan: {} drive(s) detected via GetLogicalDrives",
+            candidates.len()
+        );
+        for cand in &candidates {
+            let tname = win_driver::drive_type_name(cand.kind);
+            if cand.kind != win_driver::DRIVE_REMOVABLE {
+                debug!("Skipping drive {}: type={}", cand.letter, tname);
+                continue;
+            }
+            debug!("Probing removable drive {}: {:?}", cand.letter, cand.root);
+            if let Some(info) = classify_mount(&cand.root, &cand.root) {
+                info!(
+                    "Drive {} → card: {} files, {} bytes, name='{}'",
+                    cand.letter, info.media_file_count, info.total_bytes, info.device_name
+                );
+                cards.push(info);
+            } else {
+                debug!("Drive {}: no media files found", cand.letter);
             }
         }
     }
+
     #[cfg(target_os = "macos")]
     {
-        if let Ok(entries) = fs::read_dir("/Volumes") {
-            for entry in entries.flatten() {
-                let mp = entry.path();
-                if mp.is_dir() {
+        match fs::read_dir("/Volumes") {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let mp = entry.path();
+                    if !mp.is_dir() {
+                        continue;
+                    }
+                    debug!("Probing macOS volume: {:?}", mp);
                     if let Some(info) = classify_mount(&mp, &mp) {
+                        info!(
+                            "macOS volume {:?} → card: {} files, {} bytes, name='{}'",
+                            mp, info.media_file_count, info.total_bytes, info.device_name
+                        );
                         cards.push(info);
+                    } else {
+                        debug!("macOS volume {:?}: no media files found", mp);
                     }
                 }
+                info!(
+                    "macOS /Volumes scan: {} volume(s) processed",
+                    cards.len()
+                );
+            }
+            Err(e) => {
+                log::warn!("Cannot read /Volumes: {} — only real volumes skipped", e);
             }
         }
     }
+
+    info!(
+        "Card scan finished in {:.2?}: {} card(s)",
+        start.elapsed(),
+        cards.len()
+    );
     cards
 }
 
@@ -267,6 +355,7 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
 fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCardInfo> {
     let user = whoami_fallback();
     let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut skipped = 0u32;
 
     for line in mounts_content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -278,6 +367,7 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
 
         // Skip non-real devices.
         if !device.starts_with("/dev/") || device.contains("/loop") || device == "systemd-1" {
+            skipped += 1;
             continue;
         }
         let mp = Path::new(mount_point);
@@ -289,6 +379,7 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
             || mp.starts_with("/dev")
             || mp.starts_with("/run")
         {
+            skipped += 1;
             continue;
         }
         // Prefer mounts under standard media directories.
@@ -296,28 +387,51 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
             || mp.starts_with("/run/media")
             || mp.starts_with("/mnt");
         if !in_media && !mp.starts_with(format!("/media/{}", user)) {
+            skipped += 1;
             continue;
         }
         // Check removable flag via /sys.
         let is_removable = is_block_removable(device, sys_root);
         if !is_removable && !mp.starts_with(format!("/run/media/{}", user)) {
             // /run/media/$USER mounts are usually removable.
+            skipped += 1;
             continue;
         }
         candidates.push(mp.to_path_buf());
     }
 
+    info!(
+        "Linux mount scan: {} candidate(s), {} skipped",
+        candidates.len(),
+        skipped
+    );
+
     let mut seen = std::collections::HashSet::new();
     let mut cards = Vec::new();
+    let mut rejected = 0u32;
     for mp in &candidates {
         // Deduplicate (same mount point via multiple /proc/mounts lines).
         if !seen.insert(mp.clone()) {
             continue;
         }
+        debug!("Probing mount candidate: {:?}", mp);
         if let Some(info) = classify_mount(mp, mp) {
+            info!(
+                "Mount {:?} → card: {} files, {} bytes, name='{}'",
+                mp, info.media_file_count, info.total_bytes, info.device_name
+            );
             cards.push(info);
+        } else {
+            rejected += 1;
+            debug!("Mount {:?}: rejected by classify_mount", mp);
         }
     }
+
+    info!(
+        "Mount scan complete: {} card(s), {} rejected",
+        cards.len(),
+        rejected
+    );
     cards
 }
 
@@ -355,11 +469,23 @@ fn classify_mount(mount: &Path, _label_source: &Path) -> Option<SdCardInfo> {
     let volume_label = volume_label_for(mount);
 
     if media_files.is_empty() {
-        // No media files — not a media card.
+        debug!("Mount {:?} rejected: no media files found (label='{}')", mount, volume_label);
         return None;
     }
 
-    let (device_name, name_source, pattern_name) = device_name::resolve_device_name(&media_files, &volume_label, None);
+    let (device_name, name_source, pattern_name) =
+        device_name::resolve_device_name(&media_files, &volume_label, None);
+
+    debug!(
+        "Mount {:?} accepted: {} files, {} bytes, label='{}', device='{}', source={:?}, pattern={:?}",
+        mount,
+        media_files.len(),
+        total_bytes,
+        volume_label,
+        device_name,
+        name_source,
+        pattern_name,
+    );
 
     Some(SdCardInfo {
         mount: mount.to_path_buf(),
@@ -373,15 +499,19 @@ fn classify_mount(mount: &Path, _label_source: &Path) -> Option<SdCardInfo> {
 }
 
 /// Shallow recursive scan for media files (up to CARD_SCAN_DEPTH).
+/// Returns (media_files, total_bytes).
 fn collect_media_files_shallow(root: &Path) -> (Vec<PathBuf>, u64) {
     let mut files = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     let mut total_bytes = 0u64;
+    let mut visited_dirs: u32 = 0;
+    let mut skipped_symlinks: u32 = 0;
 
     while let Some(dir) = stack.pop() {
         if files.len() >= MAX_CARD_FILES {
             break;
         }
+        visited_dirs += 1;
         let read_dir = match dir.read_dir() {
             Ok(d) => d,
             Err(_) => continue,
@@ -401,6 +531,11 @@ fn collect_media_files_shallow(root: &Path) -> (Vec<PathBuf>, u64) {
                 Ok(t) => t,
                 Err(_) => continue,
             };
+            // Skip symlinks/junctions to avoid cycles (e.g. Windows junction cycles).
+            if ft.is_symlink() {
+                skipped_symlinks += 1;
+                continue;
+            }
             if ft.is_dir() && depth < CARD_SCAN_DEPTH {
                 stack.push(entry.path());
             } else if ft.is_file() && is_media_file(&entry.path()) {
@@ -411,6 +546,11 @@ fn collect_media_files_shallow(root: &Path) -> (Vec<PathBuf>, u64) {
             }
         }
     }
+
+    debug!(
+        "Scanned {:?}: {} dirs visited, {} symlinks skipped, {} media files ({} bytes)",
+        root, visited_dirs, skipped_symlinks, files.len(), total_bytes
+    );
     (files, total_bytes)
 }
 
@@ -1051,5 +1191,101 @@ proc /proc proc rw 0 0
         let info = result.unwrap();
         assert_eq!(info.media_file_count, 1);
         assert!(info.total_bytes > 0);
+    }
+
+    // ── Symlink skip in collect_media_files_shallow ─────────────────────
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_collect_media_skips_symlink_dirs() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("clip.mp4"), b"data").unwrap();
+        fs::write(dir.path().join("root_clip.mp4"), b"root").unwrap();
+
+        // Symlink pointing back to the root cycle.
+        let cycle = dir.path().join("cycle_back");
+        let _ = unix_fs::symlink(dir.path(), &cycle);
+
+        // Symlink pointing to a file (would be skipped).
+        let file_link = dir.path().join("linked.mp4");
+        let _ = unix_fs::symlink(sub.join("clip.mp4"), &file_link);
+
+        let (files, _) = collect_media_files_shallow(dir.path());
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f.file_name())
+            .filter_map(|n| n.to_str())
+            .collect();
+
+        assert!(names.contains(&"root_clip.mp4"), "real file should be found");
+        assert!(!names.contains(&"cycle_back"), "symlink dir should be skipped");
+        assert!(!names.contains(&"linked.mp4"), "symlink file should be skipped");
+    }
+
+    // ── Depth limit in collect_media_files_shallow ───────────────────────
+
+    #[test]
+    fn test_collect_media_depth_limit() {
+        let dir = TempDir::new().unwrap();
+        // Create a deep chain of directories beyond CARD_SCAN_DEPTH.
+        let deep = dir.path().join("a/b/c/d/e/f/g/h/i/j");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.mp4"), b"data").unwrap();
+
+        // Also a shallow file.
+        fs::write(dir.path().join("shallow.mp4"), b"data").unwrap();
+
+        let (files, _) = collect_media_files_shallow(dir.path());
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|f| f.file_name())
+            .filter_map(|n| n.to_str())
+            .collect();
+
+        // The shallow file should be found, the deep one (depth > 6) should not.
+        assert!(names.contains(&"shallow.mp4"), "shallow file should be found");
+        assert!(!names.contains(&"deep.mp4"), "deep file beyond depth limit should not be found");
+    }
+
+    // ── Windows drive bitmask parsing (pure logic, no API calls) ────────
+
+    #[test]
+    fn test_drive_bitmask_parsing_logic() {
+        // Simulate what win_driver::enumerate would parse from GetLogicalDrives.
+        // Bit 0 = A:, bit 2 = C:, bit 25 = Z:
+        let mask: u32 = (1u32 << 0) | (1u32 << 2) | (1u32 << 25);
+
+        let mut letters: Vec<char> = Vec::new();
+        for i in 0..26u32 {
+            if (mask >> i) & 1 == 1 {
+                letters.push(char::from_u32(b'A' as u32 + i).unwrap());
+            }
+        }
+
+        assert_eq!(letters.len(), 3);
+        assert!(letters.contains(&'A'));
+        assert!(letters.contains(&'C'));
+        assert!(letters.contains(&'Z'));
+        assert!(!letters.contains(&'B'));
+    }
+
+    // ── MAX_CARD_FILES limit in collect_media_files_shallow ──────────────
+
+    #[test]
+    fn test_collect_media_files_cap_at_max() {
+        let dir = TempDir::new().unwrap();
+        // Create more media files than MAX_CARD_FILES.
+        let sub = dir.path().join("DCIM");
+        fs::create_dir_all(&sub).unwrap();
+        for i in 0..MAX_CARD_FILES + 100 {
+            fs::write(sub.join(format!("C{:04}.MP4", i)), b"x").unwrap();
+        }
+
+        let (files, _) = collect_media_files_shallow(dir.path());
+        assert_eq!(files.len(), MAX_CARD_FILES);
     }
 }

@@ -726,14 +726,38 @@ pub fn engine_main_with_probe<F>(
                     if generation == offload_scan_generation {
                         current.offload.cards = cards;
                         current.offload.scanning = false;
-                        info!("Offload card scan complete: {} card(s)", current.offload.cards.len());
+                        if current.offload.cards.is_empty() {
+                            info!(
+                                "Offload card scan complete: 0 cards — if your card reader \
+                                 is connected, check the drive letters / reader type"
+                            );
+                        } else {
+                            info!(
+                                "Offload card scan complete: {} card(s)",
+                                current.offload.cards.len()
+                            );
+                        }
                     } else {
                         warn!("Discarding stale offload scan result: gen={}", generation);
                     }
                 }
                 Ok(OffloadEvent::OffloadDone { completed, generation }) => {
                     if generation == offload_scan_generation {
-                        info!("Offload copy complete: {} device(s) offloaded", completed.len());
+                        // Log per-device failures before clearing the context.
+                        for dev in &current.offload.device_progress {
+                            if let offload::OffloadDeviceState::Failed(ref msg) = dev.state {
+                                warn!(
+                                    "Offload device '{}' FAILED: {}",
+                                    dev.device_name, msg
+                                );
+                            }
+                        }
+                        info!(
+                            "Offload copy complete (gen={}): {} device(s) offloaded of {}",
+                            generation,
+                            completed.len(),
+                            current.offload.device_progress.len(),
+                        );
                         let parent = current.offload.parent_folder.clone();
                         current.offload.running = false;
                         current.offload.overall_progress = 1.0;
@@ -1968,9 +1992,37 @@ fn handle_offload_command(
             std::thread::Builder::new()
                 .name("offload-scan".into())
                 .spawn(move || {
+                    let scan_start = Instant::now();
                     info!("Offload card scan started (gen={})", gen);
-                    let cards = crate::offload::detect_cards();
-                    let _ = tx.send(OffloadEvent::CardsScanned { cards, generation: gen });
+                    let result = std::panic::catch_unwind(|| {
+                        crate::offload::detect_cards()
+                    });
+                    match result {
+                        Ok(cards) => {
+                            let elapsed = scan_start.elapsed();
+                            info!(
+                                "Offload card scan finished in {:.2?} (gen={}): {} card(s)",
+                                elapsed,
+                                gen,
+                                cards.len(),
+                            );
+                            let _ = tx.send(OffloadEvent::CardsScanned { cards, generation: gen });
+                        }
+                        Err(panic) => {
+                            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            error!("Offload card scan panicked (gen={}): {}", gen, msg);
+                            let _ = tx.send(OffloadEvent::CardsScanned {
+                                cards: Vec::new(),
+                                generation: gen,
+                            });
+                        }
+                    }
                 })
                 .expect("failed to spawn offload scan thread");
         }
@@ -2028,7 +2080,15 @@ fn handle_offload_command(
             state.offload.error = None;
             state.offload.overall_progress = 0.0;
             state.offload.device_progress.clear();
-            info!("Offload started: {} device(s) → {:?}", names.len(), dest_parent);
+            let total_files: usize = device_plans.iter().map(|p| p.len()).sum();
+            let total_bytes: u64 = device_plans.iter().flat_map(|p| p.iter().map(|i| i.size)).sum();
+            info!(
+                "Offload started: {} device(s), {} file(s), {} MB → {:?}",
+                names.len(),
+                total_files,
+                total_bytes / (1024 * 1024),
+                dest_parent,
+            );
 
             *scan_generation = scan_generation.wrapping_add(1);
             let gen = *scan_generation;
