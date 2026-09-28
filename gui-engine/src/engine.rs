@@ -224,6 +224,10 @@ pub fn engine_main_with_probe<F>(
                     current.converter.probes_loading = false;
                     current.converter.probes_generation = 0;
                     current.converter.conversion_state = ConversionState::idle();
+                    // Fresh scan — reset user-set flag so the next recording
+                    // selection re-defaults output_folder to the record's
+                    // parent dir.
+                    current.converter.settings.output_folder_user_set = false;
                     // Persist input folder
                     config::save_input_folder(&path);
                     let tx = scan_tx.clone();
@@ -342,6 +346,7 @@ pub fn engine_main_with_probe<F>(
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetOutputFolder(folder))) => {
                     current.converter.settings.output_folder = folder.clone();
+                    current.converter.settings.output_folder_user_set = true;
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(prefix))) => {
@@ -2439,10 +2444,17 @@ fn apply_recording_selection(
     s.concat_audio = false;
     s.ltc_file_idx = 0;
     s.channel_map = ChannelMap::identity(channel_count);
-    // Default output folder = input folder (source clip parent dir) if unset
-    if s.output_folder.as_os_str().is_empty() {
-        if let Some(ref gf) = state.converter.groups_folder {
-            s.output_folder = gf.clone();
+    // Default output folder = the selected recording's parent dir
+    // (scan root or one of its subdirectories).  Re-defaults on every
+    // recording selection unless the user has manually set it.
+    if !s.output_folder_user_set {
+        let record_dir = state.converter.groups.get(idx)
+            .and_then(|g| g.files.first())
+            .and_then(|f| f.parent())
+            .map(|p| p.to_path_buf())
+            .or_else(|| state.converter.groups_folder.clone());
+        if let Some(dir) = record_dir {
+            s.output_folder = dir;
         }
     }
     // Clear stale LTC decode state
@@ -3655,5 +3667,119 @@ mod tests {
             "video group channel map must NOT be repaired, should stay at probe size (2)"
         );
         assert!(matches!(settings.pipeline, crate::converter::ConversionPipeline::VideoPassthrough));
+    }
+
+    // ── output_folder defaulting ─────────────────────────────────────────
+
+    /// Helper: call `apply_recording_selection` with minimal argument
+    /// plumbing.
+    fn apply_sel(state: &mut AppStateSnapshot, idx: usize) {
+        let (_tx, _rx) = std::sync::mpsc::channel();
+        let mut decode_cancel: Option<Arc<AtomicBool>> = None;
+        let mut group_cancel: Option<Arc<AtomicBool>> = None;
+        let mut group_progress: Option<ClipProgress> = None;
+        apply_recording_selection(
+            state, idx,
+            &mut decode_cancel, &mut group_cancel, &mut group_progress,
+            &mut 0, &mut 0, &_tx,
+        );
+    }
+
+    /// Helper: a video group in a subdirectory (one that would be found by
+    /// recursive scan).  All files are rooted under `parent`.
+    fn make_video_group(parent: &Path) -> MatchedGroup {
+        MatchedGroup {
+            prefix: "C0001".to_string(),
+            rel_dir: parent.file_name().unwrap().to_string_lossy().to_string(),
+            files: vec![parent.join("C0001.MP4")],
+            pattern_name: "Sony Handycam",
+            recording_type: crate::converter::RecordingType::VideoClipSequence,
+        }
+    }
+
+    #[test]
+    fn defaults_to_record_parent_dir_subdir() {
+        let root = Path::new("/root");
+        let first_dir = root.join("day1");
+        let second_dir = root.join("day2");
+        let mut state = setup_state();
+        state.converter.groups_folder = Some(root.to_path_buf());
+        state.converter.groups = vec![
+            make_video_group(&first_dir),
+            make_video_group(&second_dir),
+        ];
+        state.converter.settings.output_folder = PathBuf::new();
+
+        apply_sel(&mut state, 0);
+
+        assert_eq!(state.converter.settings.output_folder, first_dir,
+            "default output for a subdir recording should be the recording's parent dir");
+    }
+
+    #[test]
+    fn defaults_to_scan_root_for_root_files() {
+        let root = Path::new("/root");
+        let mut state = setup_state();
+        state.converter.groups_folder = Some(root.to_path_buf());
+        state.converter.groups = vec![MatchedGroup {
+            prefix: "C0001".to_string(),
+            rel_dir: String::new(),
+            files: vec![root.join("C0001.MP4")],
+            pattern_name: "Sony Handycam",
+            recording_type: crate::converter::RecordingType::VideoClipSequence,
+        }];
+        state.converter.settings.output_folder = PathBuf::new();
+
+        apply_sel(&mut state, 0);
+
+        assert_eq!(state.converter.settings.output_folder, root,
+            "default output for a root-level recording should be the scan root");
+    }
+
+    #[test]
+    fn output_default_follows_recording_switch() {
+        let root = Path::new("/root");
+        let first_dir = root.join("day1");
+        let second_dir = root.join("day2");
+        let mut state = setup_state();
+        state.converter.groups_folder = Some(root.to_path_buf());
+        state.converter.groups = vec![
+            make_video_group(&first_dir),
+            make_video_group(&second_dir),
+        ];
+        state.converter.settings.output_folder = PathBuf::new();
+
+        apply_sel(&mut state, 0);
+        assert_eq!(state.converter.settings.output_folder, first_dir,
+            "first selection defaults to first dir");
+
+        apply_sel(&mut state, 1);
+        assert_eq!(state.converter.settings.output_folder, second_dir,
+            "second selection defaults to second dir when not user-set");
+    }
+
+    #[test]
+    fn manual_output_override_survives_recording_switch() {
+        let root = Path::new("/root");
+        let first_dir = root.join("day1");
+        let second_dir = root.join("day2");
+        let custom = Path::new("/custom/output");
+        let mut state = setup_state();
+        state.converter.groups_folder = Some(root.to_path_buf());
+        state.converter.groups = vec![
+            make_video_group(&first_dir),
+            make_video_group(&second_dir),
+        ];
+
+        state.converter.settings.output_folder = custom.to_path_buf();
+        state.converter.settings.output_folder_user_set = true;
+
+        apply_sel(&mut state, 0);
+        assert_eq!(state.converter.settings.output_folder, custom,
+            "user-set output must survive recording selection");
+
+        apply_sel(&mut state, 1);
+        assert_eq!(state.converter.settings.output_folder, custom,
+            "user-set output must survive selection switch");
     }
 }

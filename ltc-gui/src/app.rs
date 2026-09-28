@@ -329,6 +329,7 @@ fn merge_converter_settings(
         video_encoder: merge_field(&base.video_encoder, &local.video_encoder, &engine.video_encoder),
         audio_encoder: merge_field(&base.audio_encoder, &local.audio_encoder, &engine.audio_encoder),
         output_folder: merge_field(&base.output_folder, &local.output_folder, &engine.output_folder),
+        output_folder_user_set: engine.output_folder_user_set,
         filename_prefix: merge_field(&base.filename_prefix, &local.filename_prefix, &engine.filename_prefix),
         audio_suffix_template: merge_field(&base.audio_suffix_template, &local.audio_suffix_template, &engine.audio_suffix_template),
         video_suffix_template: merge_field(&base.video_suffix_template, &local.video_suffix_template, &engine.video_suffix_template),

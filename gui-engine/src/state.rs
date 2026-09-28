@@ -52,6 +52,10 @@ pub struct ConverterUserSettings {
     pub audio_encoder: String,
     /// Output folder for converted files.
     pub output_folder: PathBuf,
+    /// Whether the user has manually set `output_folder` (via `SetOutputFolder`).
+    /// When false, the engine re-defaults `output_folder` to the selected
+    /// recording's parent dir on each recording selection.
+    pub output_folder_user_set: bool,
     /// Filename prefix for output files.
     pub filename_prefix: String,
     /// Naming template for audio output files (e.g. `_audio_track{track:01d}`).
@@ -79,6 +83,7 @@ impl ConverterUserSettings {
             video_encoder: "h265".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
             output_folder: PathBuf::new(),
+            output_folder_user_set: false,
             filename_prefix: DEFAULT_PREFIX.to_string(),
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
