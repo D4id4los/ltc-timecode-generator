@@ -135,7 +135,6 @@ fn render_clapper_board_drawing(ui: &mut Ui, state: &mut AppState) {
 
 fn render_roll_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let s = &state.latest;
     let card = egui::Frame::new()
         .fill(colors.nested_bg)
         .corner_radius(8.0)
@@ -146,10 +145,14 @@ fn render_roll_card(ui: &mut Ui, state: &mut AppState) {
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("ROLL").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
             ui.add_space(4.0);
-            let mut roll = s.roll.clone();
-            if ui.add(egui::TextEdit::singleline(&mut roll).font(FontId::monospace(14.0)).text_color(colors.text_title).margin(egui::Margin::symmetric(4, 4))).lost_focus() {
-                state.send(GuiCommand::SetRoll(roll));
+            let resp = ui.add(egui::TextEdit::singleline(state.roll_edit.buffer_mut()).font(FontId::monospace(14.0)).text_color(colors.text_title).margin(egui::Margin::symmetric(4, 4)));
+            let focused = resp.has_focus();
+            if resp.changed() {
+                let value = state.roll_edit.buffer().to_string();
+                state.roll_edit.mark_edited(std::time::Instant::now());
+                state.send(GuiCommand::SetRoll(value));
             }
+            state.roll_edit.set_focused(focused);
         });
     });
 }

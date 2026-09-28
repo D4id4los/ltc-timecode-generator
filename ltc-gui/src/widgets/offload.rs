@@ -77,8 +77,12 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_space(4.0);
 
-    // Editable parent name (ISO date)
-    let mut name = s.offload.parent_name.clone();
+    // Editable parent name (ISO date) — persistent buffer via parent_name_edit.
+    // Use a local copy inside the horizontal closure to avoid borrow conflicts;
+    // write back through state.parent_name_edit after the closure exits.
+    let mut name = state.parent_name_edit.buffer().to_string();
+    let mut changed = false;
+    let mut focused = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Subfolder: ").font(FontId::monospace(12.0)).color(colors.text_muted));
         let resp = ui.add(
@@ -86,11 +90,21 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
                 .font(FontId::monospace(14.0))
                 .desired_width(160.0)
         );
-        if resp.changed() && !name.is_empty() {
-            state.send(GuiCommand::Offload(OffloadCommand::SetParentName(name)));
-        }
+        focused = resp.has_focus();
+        changed = resp.changed() && !name.is_empty();
         ui.label(RichText::new("(date subfolder)").font(FontId::monospace(10.0)).color(colors.text_muted));
     });
+    // Write back the local copy to the persistent buffer BEFORE mark_edited,
+    // so that mark_edited captures the latest value as the pending confirmation.
+    let parent_value = name.clone();
+    *state.parent_name_edit.buffer_mut() = name;
+    if changed {
+        state.parent_name_edit.mark_edited(std::time::Instant::now());
+    }
+    state.parent_name_edit.set_focused(focused);
+    if changed {
+        state.send(GuiCommand::Offload(OffloadCommand::SetParentName(parent_value)));
+    }
 }
 
 fn render_cards(ui: &mut Ui, state: &mut AppState) {
@@ -137,8 +151,15 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
 
                 ui.add_space(2.0);
 
-                // Editable device name.
-                let mut dev_name = card.device_name.clone();
+                // Editable device name — persistent buffers in device_name_edits keyed by mount
+                // Use a local copy to avoid borrow conflicts in the closure.
+                let mount = card.mount.clone();
+                let copy = state.device_name_edits.get(&mount)
+                    .map(|e| e.buffer().to_string())
+                    .unwrap_or_else(|| card.device_name.clone());
+                let mut dev_name = copy;
+                let mut dev_changed = false;
+                let mut dev_focused = false;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Device folder: ")
                         .font(FontId::monospace(11.0))
@@ -148,10 +169,20 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
                             .font(FontId::monospace(14.0))
                             .desired_width(140.0)
                     );
-                    if resp.changed() {
-                        state.send(GuiCommand::Offload(OffloadCommand::SetDeviceName(idx, dev_name)));
-                    }
+                    dev_focused = resp.has_focus();
+                    dev_changed = resp.changed();
                 });
+                let dev_value = dev_name.clone();
+                if let Some(edit) = state.device_name_edits.get_mut(&mount) {
+                    *edit.buffer_mut() = dev_name;
+                    if dev_changed {
+                        edit.mark_edited(std::time::Instant::now());
+                    }
+                    edit.set_focused(dev_focused);
+                }
+                if dev_changed {
+                    state.send(GuiCommand::Offload(OffloadCommand::SetDeviceName(idx, dev_value)));
+                }
 
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{} file(s), {}", card.media_file_count, format_bytes(card.total_bytes)))

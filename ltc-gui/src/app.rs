@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,86 @@ use crate::theme::{Theme, ACCENT};
 use crate::widgets;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const TEXT_FIELD_EDIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// GUI-side state for a single text entry field bound to an engine value.
+///
+/// egui `TextEdit` buffers must be stable across frames: re-seeding from the
+/// (stale) engine snapshot every frame makes egui clamp the stored cursor to
+/// the reverted text, jumping the caret behind the last typed character.
+/// This struct instead keeps a persistent buffer that only adopts the engine
+/// value when the field is not focused and any in-flight edit has been
+/// confirmed by the engine (value echoed back verbatim), with a timeout
+/// fallback for engine-side overrides (e.g., rescan replacing device names).
+pub struct TextFieldEdit {
+    buffer: String,
+    pending: Option<String>,
+    pending_since: Option<Instant>,
+    was_focused: bool,
+}
+
+impl TextFieldEdit {
+    pub fn new(initial: impl Into<String>) -> Self {
+        Self {
+            buffer: initial.into(),
+            pending: None,
+            pending_since: None,
+            was_focused: false,
+        }
+    }
+
+    pub fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    pub fn buffer_mut(&mut self) -> &mut String {
+        &mut self.buffer
+    }
+
+    /// Call once per frame before any widget rendering, using the fresh
+    /// engine snapshot value.  Adopts the engine value only when:
+    /// - No unconfirmed pending edit, AND
+    /// - The widget was not focused last frame, AND
+    /// - The values actually differ.
+    pub fn sync(&mut self, engine: &str, now: Instant) {
+        // Check if engine has confirmed our pending edit
+        if let Some(sent) = &self.pending {
+            if sent == engine {
+                // Engine echoed back our value — confirmed.
+                self.pending = None;
+                self.pending_since = None;
+            } else if self.pending_since
+                .is_some_and(|t| now.duration_since(t) > TEXT_FIELD_EDIT_TIMEOUT)
+            {
+                // Pending timed out (engine overrode our value, e.g. rescan).
+                // Drop the pending and adopt the current engine value.
+                self.pending = None;
+                self.pending_since = None;
+            } else {
+                // Still waiting for confirmation — keep the user's text.
+                return;
+            }
+        }
+
+        if !self.was_focused && self.buffer != engine {
+            self.buffer = engine.to_string();
+        }
+    }
+
+    /// Must be called each frame after the widget is shown, to track focus
+    /// state for the next frame's `sync` decision.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.was_focused = focused;
+    }
+
+    /// Marks the current buffer as having been sent to the engine, so
+    /// `sync` will not overwrite it until the engine echoes the value back.
+    pub fn mark_edited(&mut self, now: Instant) {
+        self.pending = Some(self.buffer.clone());
+        self.pending_since = Some(now);
+    }
+}
 
 // ── GUI-only types ──────────────────────────────────────────────────────
 
@@ -104,6 +185,14 @@ pub struct AppState {
     /// Last seen offload version — detects when a copy finishes so we can
     /// auto‑switch the converter folder.
     pub offload_last_version: u64,
+
+    // ── GUI-local text edit buffers ────────────────────────────────────
+    /// Persistent buffer for the clapper ROLL field.
+    pub roll_edit: TextFieldEdit,
+    /// Persistent buffer for the offload subfolder name field.
+    pub parent_name_edit: TextFieldEdit,
+    /// Persistent buffers for offload device folder names, keyed by mount.
+    pub device_name_edits: HashMap<PathBuf, TextFieldEdit>,
 }
 
 impl AppState {
@@ -131,7 +220,7 @@ impl AppState {
 
         let result = Self {
             cmd_tx,
-            latest: Arc::new(initial),
+            latest: Arc::new(initial.clone()),
             engine_state,
             theme: if is_dark { Theme::Dark } else { Theme::Light },
             active_tab: Tab::Clapper,
@@ -149,6 +238,9 @@ impl AppState {
             prev_engine_settings: None,
             last_logged_group_decode_gen: 0,
             offload_last_version: 0,
+            roll_edit: TextFieldEdit::new(&initial.roll),
+            parent_name_edit: TextFieldEdit::new(&initial.offload.parent_name),
+            device_name_edits: HashMap::new(),
         };
 
         // Tell the engine to scan the restored input folder and auto-select
@@ -355,6 +447,26 @@ impl eframe::App for AppState {
         }
         self.local_settings = merged;
         self.prev_engine_settings = Some(engine_settings);
+
+        // 2.5 Reconcile GUI-local text edit buffers with the engine snapshot.
+        //      Buffers persist across frames (unlike cloning from the snapshot
+        //      each time) so that egui's stored cursor stays valid while the
+        //      user types.  Engine values are adopted only when the field is
+        //      not focused and no in-flight edit awaits confirmation.
+        let now = Instant::now();
+        self.roll_edit.sync(&self.latest.roll, now);
+        self.parent_name_edit.sync(&self.latest.offload.parent_name, now);
+
+        // Device-name buffers keyed by mount point: prune vanished mounts,
+        // seed new ones, sync each with the engine's current name.
+        let mounts: Vec<PathBuf> = self.latest.offload.cards.iter().map(|c| c.mount.clone()).collect();
+        self.device_name_edits.retain(|mount, _| mounts.contains(mount));
+        for card in &self.latest.offload.cards {
+            let edit = self.device_name_edits
+                .entry(card.mount.clone())
+                .or_insert_with(|| TextFieldEdit::new(&card.device_name));
+            edit.sync(&card.device_name, now);
+        }
 
         // 3. Maximize once
         if !self.has_requested_maximize {
@@ -1287,5 +1399,109 @@ mod tests {
             matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))),
             "second command must be SelectRecording(0), got: {:?}", cmds[1]
         );
+    }
+
+    // ── TextFieldEdit tests ─────────────────────────────────────────────
+
+    /// Helper: sync at instant 0 (no pending timeout) and at instant 1
+    /// (after a 1 ns pause — well within the 2 s timeout).
+    fn sync_now(edit: &mut TextFieldEdit, engine: &str) {
+        edit.sync(engine, Instant::now());
+    }
+
+    #[test]
+    fn textfield_sync_adopts_engine_when_idle_and_different() {
+        let mut edit = TextFieldEdit::new("old");
+        sync_now(&mut edit, "new");
+        assert_eq!(edit.buffer(), "new", "idle field must adopt engine value");
+    }
+
+    #[test]
+    fn textfield_sync_noop_when_equal() {
+        let mut edit = TextFieldEdit::new("same");
+        sync_now(&mut edit, "same");
+        assert_eq!(edit.buffer(), "same", "equal values must not change buffer");
+    }
+
+    #[test]
+    fn textfield_sync_keeps_buffer_while_focused() {
+        let mut edit = TextFieldEdit::new("old");
+        edit.set_focused(true); // widget was focused last frame
+        sync_now(&mut edit, "engine_changed");
+        assert_eq!(edit.buffer(), "old",
+                   "focused field must NOT adopt engine value (would move cursor)");
+    }
+
+    #[test]
+    fn textfield_sync_keeps_buffer_while_pending_unconfirmed() {
+        let mut edit = TextFieldEdit::new("user_text");
+        edit.set_focused(false);
+        edit.mark_edited(Instant::now());
+        // Engine has not echoed our value yet
+        sync_now(&mut edit, "old_engine_value");
+        assert_eq!(edit.buffer(), "user_text",
+                   "pending-unconfirmed field must keep user text");
+    }
+
+    #[test]
+    fn textfield_sync_adopts_after_confirmation() {
+        let mut edit = TextFieldEdit::new("user_text");
+        edit.mark_edited(Instant::now());
+        // Engine echoes back our value — confirmation
+        sync_now(&mut edit, "user_text");
+        assert_eq!(edit.buffer(), "user_text", "confirmed: buffer unchanged");
+
+        // Now a NEW engine change arrives; field is idle → must adopt
+        edit.set_focused(false);
+        sync_now(&mut edit, "new_engine_value");
+        assert_eq!(edit.buffer(), "new_engine_value",
+                   "after confirm, idle field must adopt new engine value");
+    }
+
+    #[test]
+    fn textfield_sync_drops_stale_pending_after_timeout() {
+        let mut edit = TextFieldEdit::new("user_text");
+        edit.mark_edited(Instant::now());
+        // Engine never applied our edit; advance well beyond the 2 s timeout
+        let far_future = Instant::now() + Duration::from_secs(3);
+        edit.sync("engine_override", far_future);
+        assert_eq!(edit.buffer(), "engine_override",
+                   "stale pending must be dropped after timeout");
+    }
+
+    #[test]
+    fn textfield_sync_keeps_pending_if_before_timeout() {
+        let mut edit = TextFieldEdit::new("user_text");
+        edit.mark_edited(Instant::now());
+        // Just 1 second later — inside the 2 s window
+        let soon = Instant::now() + Duration::from_secs(1);
+        edit.sync("engine_override", soon);
+        assert_eq!(edit.buffer(), "user_text",
+                   "pending must be kept while within the timeout window");
+    }
+
+    #[test]
+    fn textfield_mark_edited_protects_buffer_from_sync() {
+        let mut edit = TextFieldEdit::new("my_value");
+        edit.mark_edited(Instant::now());
+        // Engine differs but we marked edited → sync must keep user text
+        sync_now(&mut edit, "engine_value");
+        assert_eq!(edit.buffer(), "my_value",
+                   "mark_edited must keep buffer safe from engine overwrite");
+    }
+
+    #[test]
+    fn textfield_adopts_engine_after_unfocus() {
+        let mut edit = TextFieldEdit::new("user_type");
+        edit.set_focused(true);
+        sync_now(&mut edit, "engine_value");
+        assert_eq!(edit.buffer(), "user_type",
+                   "focused: no adoption");
+
+        // Next frame: focus lost
+        edit.set_focused(false);
+        sync_now(&mut edit, "engine_value");
+        assert_eq!(edit.buffer(), "engine_value",
+                   "after unfocus, idle field adopts engine value");
     }
 }
