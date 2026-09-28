@@ -1,6 +1,65 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* v0.4.5
+
+Main features are embedded camera metadata in converter outputs, a {device}
+name template for output naming, moving all converter/offload state
+ownership into the gui-engine, and subprocess robustness — timeouts and
+stall watchdogs for all ffmpeg/ffprobe/exiftool probes.
+
+List of Changes:
+- Convert tab:
+  - Embed camera metadata in converted outputs: make/model (com.apple.quicktime.*
+    for MOV), lens, serial, gamma, creation date on video outputs; bext
+    originator/origination_date/description on WAVs. New "Embed camera metadata"
+    toggle (default on) + detected-camera readout in both GUIs.
+  - Fall back to the camera-native start timecode (XAVC LtcChangeTable /
+    AVCHD H264:TimeCode) when LTC decoding finds no timecode for a file;
+    warn when both exist and differ.
+  - New {device} naming placeholder for the detected recording device
+    (XAVC binary sniff -> camera metadata probe -> filename pattern ->
+    "unknown"); it is the new default filename prefix and works in suffix
+    templates. The duplicate-output warning now suggests {device}.
+  - Warn (never block) when two output files resolve to the same name —
+    templates without {clip}/{track}/{filename} previously let ffmpeg
+    silently overwrite earlier outputs.
+  - Honour "concatenate audio" in the Metadata Only pipeline: multi-clip
+    video sequences now emit one concatenated audio file per track instead
+    of per-clip files; preview and collision warning reflect this.
+  - Fix auto-select race: SelectRecording(0) sent right after SelectFolder
+    raced the async folder scan, so the first recording was never probed;
+    the engine now defers it until the scan arrives (removed the ltc-slint
+    100ms timer hack).
+- Engine robustness:
+  - All ffprobe/exiftool probes run with a 10s timeout; ProbeVideo moved to
+    a generation-stamped background thread — corrupt inputs can no longer
+    hang the whole engine (frozen clock, stalled commands).
+  - 30s no-output stall watchdog for streaming ffmpeg calls (audio
+    extraction, conversion steps) and bounded timeouts for CLI extraction
+    and tagger remux, so cancellation works even when ffmpeg is silent.
+- Refactoring (state ownership):
+  - Move all converter state into gui-engine as the sole source of truth:
+    engine-owned ConverterUserSettings, fine-grained ConverterCommand
+    variants, config persistence/restore, defaults repair on ffmpeg-capability
+    arrival, prefix prefill, channel-map resize, readiness/output-preview
+    recompute, engine-driven StartConversion/CancelConversion.
+  - Migrate ltc-slint converter & offload handling fully onto the engine
+    (deleted local Arc<Mutex> state, ~700 lines).
+  - Fix ltc-gui settings-sync regression: toggles are diffed against the
+    snapshot and sent as commands instead of reverting every frame.
+- Offloading:
+  - Auto-detect camera model from clip metadata (exiftool, ffprobe-tag
+    fallback) when scanning cards — e.g. Sony FS100 auto-names as
+    NEX-FS100EK instead of pattern-derived "FS100".
+  - Remember the last used offload parent directory across sessions.
+- Misc:
+  - Fix compiler/clippy warnings and repair the ltc-gui test build; port
+    auto-apply-LTC tests into gui-engine.
+  - Deterministic engine tests (predicate waits, fake ffmpeg probe,
+    temp-dir config) + flaky-test detection via cargo-nextest
+    (npm run test:flaky); methodology documented in AGENTS.md.
+
 * v0.4.4
 
 Main features are UI freeze fixes, improved LTC quality scoring, H.265 default
