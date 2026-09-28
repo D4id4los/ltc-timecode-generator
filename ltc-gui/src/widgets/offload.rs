@@ -1,8 +1,9 @@
-use egui::{FontId, RichText, Ui, Color32};
+use egui::{FontId, RichText, Ui, Color32, Vec2};
 use gui_engine::command::{
     GuiCommand,
     OffloadCommand,
 };
+use gui_engine::duration::format_duration_secs;
 use gui_engine::offload::OffloadDeviceState;
 
 use crate::app::AppState;
@@ -113,6 +114,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
     let off = &s.offload;
     let cards = off.cards.clone();
     let scanning = off.scanning;
+    let file_durations = off.file_durations.clone();
 
     ui.horizontal(|ui| {
         if ui.button("Rescan").clicked() {
@@ -152,7 +154,6 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
                 ui.add_space(2.0);
 
                 // Editable device name — persistent buffers in device_name_edits keyed by mount
-                // Use a local copy to avoid borrow conflicts in the closure.
                 let mount = card.mount.clone();
                 let copy = state.device_name_edits.get(&mount)
                     .map(|e| e.buffer().to_string())
@@ -184,11 +185,109 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
                     state.send(GuiCommand::Offload(OffloadCommand::SetDeviceName(idx, dev_value)));
                 }
 
+                // File count summary (now with selection info).
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} file(s), {}", card.media_file_count, format_bytes(card.total_bytes)))
+                    let summary = format!(
+                        "{}/{} file(s) selected · {}",
+                        card.selected_count,
+                        card.media_file_count,
+                        format_bytes(card.selected_bytes),
+                    );
+                    ui.label(RichText::new(summary)
                         .font(FontId::monospace(11.0))
                         .color(device_color));
                 });
+
+                // ── File selection list ──
+                if !card.files.is_empty() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let btn_size = Vec2::new(40.0, 18.0);
+                        if ui.add_sized(btn_size, egui::Button::new("All")).clicked() {
+                            state.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(idx, true)));
+                        }
+                        if ui.add_sized(btn_size, egui::Button::new("None")).clicked() {
+                            state.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(idx, false)));
+                        }
+                        if ui.add_sized(egui::vec2(60.0, 18.0), egui::Button::new("Latest day")).clicked() {
+                            state.send(GuiCommand::Offload(OffloadCommand::SelectLatestDay(idx)));
+                        }
+                    });
+
+                    // Column headers
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(
+                            RichText::new("File").font(FontId::monospace(10.0)).color(colors.text_muted),
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(
+                                RichText::new("Size").font(FontId::monospace(10.0)).color(colors.text_muted),
+                            ));
+                            ui.add(egui::Label::new(
+                                RichText::new("Length  ").font(FontId::monospace(10.0)).color(colors.text_muted),
+                            ));
+                            ui.add(egui::Label::new(
+                                RichText::new("Date           ").font(FontId::monospace(10.0)).color(colors.text_muted),
+                            ));
+                        });
+                    });
+
+                    let row_height = 20.0;
+                    let total = card.files.len();
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .auto_shrink([false; 2])
+                        .show_rows(ui, row_height, total, |ui, range| {
+                            for i in range {
+                                let file = &card.files[i];
+                                let selected = card.selected.get(i).copied().unwrap_or(false);
+                                let mut checked = selected;
+                                ui.horizontal(|ui| {
+                                    ui.set_min_height(row_height);
+                                    ui.set_height(row_height);
+                                    let resp = ui.checkbox(&mut checked, "");
+                                    if resp.changed() {
+                                        state.send(GuiCommand::Offload(
+                                            OffloadCommand::SetFileSelected(idx, i, checked),
+                                        ));
+                                    }
+
+                                    // Filename
+                                    ui.label(RichText::new(&file.name)
+                                        .font(FontId::monospace(11.0))
+                                        .color(colors.text_main));
+
+                                    // Date, duration, size — right-aligned
+                                    let date_str = file.modified
+                                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                        .unwrap_or_default();
+                                    let dur_str = file_durations.get(&file.path)
+                                        .and_then(|opt| *opt)
+                                        .map(format_duration_secs)
+                                        .unwrap_or_else(|| {
+                                            if file_durations.contains_key(&file.path) {
+                                                "—".to_string()
+                                            } else {
+                                                "…".to_string()
+                                            }
+                                        });
+                                    let size_str = format_bytes(file.size_bytes);
+
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(RichText::new(size_str)
+                                            .font(FontId::monospace(10.0))
+                                            .color(colors.text_muted));
+                                        ui.label(RichText::new(format!("  {}", dur_str))
+                                            .font(FontId::monospace(10.0))
+                                            .color(colors.text_muted));
+                                        ui.label(RichText::new(format!("  {}", date_str))
+                                            .font(FontId::monospace(10.0))
+                                            .color(colors.text_muted));
+                                    });
+                                });
+                            }
+                        });
+                }
             });
         ui.add_space(4.0);
     }

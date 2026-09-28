@@ -231,6 +231,9 @@ export component AppWindow inherits Window {
     callback off-parent-name-changed(string);
     callback off-card-name-changed(int, string);
     callback off-rescan;
+    callback off-file-toggled(int, int, bool);
+    callback off-select-all-files(int, bool);
+    callback off-select-latest-day(int);
     callback off-start;
     callback off-cancel;
 
@@ -801,6 +804,9 @@ export component AppWindow inherits Window {
                     parent-name-changed(val) => { root.off-parent-name-changed(val); }
                     card-name-changed(idx, val) => { root.off-card-name-changed(idx, val); }
                     rescan => { root.off-rescan(); }
+                    file-toggled(card_idx, file_idx, sel) => { root.off-file-toggled(card_idx, file_idx, sel); }
+                    select-all-files(card_idx, sel) => { root.off-select-all-files(card_idx, sel); }
+                    select-latest-day(card_idx) => { root.off-select-latest-day(card_idx); }
                     start-offload => { root.off-start(); }
                     cancel-offload => { root.off-cancel(); }
                 }

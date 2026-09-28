@@ -501,6 +501,30 @@ pub fn setup_poll_timer(
                 ui.set_off_error(SharedString::from(off.error.clone().unwrap_or_default()));
 
                 let card_infos: Vec<crate::OffloadCardInfo> = off.cards.iter().map(|card| {
+                    let files: Vec<crate::OffloadFileInfo> = card.files.iter()
+                        .zip(card.selected.iter())
+                        .map(|(f, &sel)| {
+                            let date_text = f.modified
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_default();
+                            let dur_text = off.file_durations.get(&f.path)
+                                .and_then(|opt| *opt)
+                                .map(format_duration_secs)
+                                .unwrap_or_else(|| {
+                                    if off.file_durations.contains_key(&f.path) {
+                                        "—".to_string()
+                                    } else {
+                                        "…".to_string()
+                                    }
+                                });
+                            crate::OffloadFileInfo {
+                                name: SharedString::from(f.name.clone()),
+                                date_text: SharedString::from(date_text),
+                                duration_text: SharedString::from(dur_text),
+                                size_text: SharedString::from(format_bytes(f.size_bytes)),
+                                selected: sel,
+                            }
+                        }).collect();
                     crate::OffloadCardInfo {
                         mount: SharedString::from(card.mount.to_string_lossy().as_ref()),
                         volume_label: SharedString::from(card.volume_label.clone()),
@@ -508,6 +532,10 @@ pub fn setup_poll_timer(
                         name_source: SharedString::from(format!("{:?}", card.name_source)),
                         media_file_count: card.media_file_count as i32,
                         total_bytes: SharedString::from(format_bytes(card.total_bytes)),
+                        files: ModelRc::new(VecModel::<crate::OffloadFileInfo>::from(files)),
+                        selected_count: card.selected_count as i32,
+                        selected_bytes: SharedString::from(format_bytes(card.selected_bytes)),
+                        durations_version: off.durations_version as i32,
                     }
                 }).collect();
                 ui.set_off_cards(ModelRc::new(VecModel::<crate::OffloadCardInfo>::from(card_infos)));

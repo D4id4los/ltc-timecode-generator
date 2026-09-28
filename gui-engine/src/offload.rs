@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use chrono::Local;
+use chrono::{DateTime, Local, NaiveDate};
 use log::{debug, info};
 
 use crate::device_name;
@@ -72,6 +72,19 @@ const MAX_CARD_FILES: usize = 10_000;
 
 // ── Public types ────────────────────────────────────────────────────────
 
+/// Information about a single media file found on a card.
+#[derive(Debug, Clone)]
+pub struct OffloadFileInfo {
+    /// Full filesystem path.
+    pub path: PathBuf,
+    /// File name for display.
+    pub name: String,
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// File modification time (recording date/time) in local time, if available.
+    pub modified: Option<DateTime<Local>>,
+}
+
 /// Information about a detected media card.
 #[derive(Debug, Clone)]
 pub struct SdCardInfo {
@@ -89,6 +102,14 @@ pub struct SdCardInfo {
     pub total_bytes: u64,
     /// Pattern name from file_pattern matching, if any.
     pub pattern_name: Option<String>,
+    /// Per-file metadata collected during scan.
+    pub files: Vec<OffloadFileInfo>,
+    /// Per-file selection (aligned with `files`). Filled by engine on scan.
+    pub selected: Vec<bool>,
+    /// Number of selected files (engine-derived, updated on selection changes).
+    pub selected_count: usize,
+    /// Total bytes of selected files (engine-derived).
+    pub selected_bytes: u64,
 }
 
 /// Per-device copy status for the published snapshot.
@@ -138,6 +159,11 @@ pub struct OffloadSnapshot {
     pub last_offload_version: u64,
     /// Global error message (e.g. no parent folder set).
     pub error: Option<String>,
+    /// Per-file durations (seconds), probed asynchronously after scan.
+    /// Keyed by full file path; value is `None` when probing failed or is pending.
+    pub file_durations: HashMap<PathBuf, Option<f64>>,
+    /// Monotonically increasing version — incremented on each duration insertion.
+    pub durations_version: u64,
 }
 
 impl OffloadSnapshot {
@@ -154,6 +180,8 @@ impl OffloadSnapshot {
             last_offload_parent: None,
             last_offload_version: 0,
             error: None,
+            file_durations: HashMap::new(),
+            durations_version: 0,
         }
     }
 }
@@ -601,7 +629,9 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
 
 /// Classify a mount point as a media card: shallow media scan + device name guess.
 fn classify_mount(mount: &Path, _label_source: &Path) -> Option<SdCardInfo> {
-    let (media_files, total_bytes) = collect_media_files_shallow(mount);
+    let infos = collect_media_files_shallow(mount);
+    let media_files: Vec<PathBuf> = infos.iter().map(|f| f.path.clone()).collect();
+    let total_bytes: u64 = infos.iter().map(|f| f.size_bytes).sum();
     let volume_label = volume_label_for(mount);
 
     if media_files.is_empty() {
@@ -631,15 +661,17 @@ fn classify_mount(mount: &Path, _label_source: &Path) -> Option<SdCardInfo> {
         media_file_count: media_files.len(),
         total_bytes,
         pattern_name,
+        files: infos,
+        selected: Vec::new(),
+        selected_count: 0,
+        selected_bytes: 0,
     })
 }
 
 /// Shallow recursive scan for media files (up to CARD_SCAN_DEPTH).
-/// Returns (media_files, total_bytes).
-fn collect_media_files_shallow(root: &Path) -> (Vec<PathBuf>, u64) {
+fn collect_media_files_shallow(root: &Path) -> Vec<OffloadFileInfo> {
     let mut files = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    let mut total_bytes = 0u64;
     let mut visited_dirs: u32 = 0;
     let mut skipped_symlinks: u32 = 0;
 
@@ -675,19 +707,25 @@ fn collect_media_files_shallow(root: &Path) -> (Vec<PathBuf>, u64) {
             if ft.is_dir() && depth < CARD_SCAN_DEPTH {
                 stack.push(entry.path());
             } else if ft.is_file() && is_media_file(&entry.path()) {
-                if let Ok(meta) = fs::metadata(entry.path()) {
-                    total_bytes += meta.len();
-                }
-                files.push(entry.path());
+                let p = entry.path();
+                let modified = fs::metadata(&p).ok().and_then(|m| m.modified().ok().map(|sys| sys.into()));
+                let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                files.push(OffloadFileInfo {
+                    path: p,
+                    name: name_str.to_string(),
+                    size_bytes: size,
+                    modified,
+                });
             }
         }
     }
 
+    let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
     debug!(
         "Scanned {:?}: {} dirs visited, {} symlinks skipped, {} media files ({} bytes)",
         root, visited_dirs, skipped_symlinks, files.len(), total_bytes
     );
-    (files, total_bytes)
+    files
 }
 
 /// Best-effort volume label from the mount point's parent (Linux).
@@ -703,18 +741,31 @@ fn volume_label_for(mount: &Path) -> String {
 // ── Copy planning ───────────────────────────────────────────────────────
 
 /// Plan copies for a single card: flat layout, collision handling.
+/// Scans the mount point fresh; for selection-aware planning use
+/// [`plan_copies_for_files`] with pre-selected file paths.
 pub fn plan_copies_for_card(
     mount: &Path,
     device_name: &str,
     dest_parent: &Path,
 ) -> Vec<CopyPlanItem> {
-    let (files, _) = collect_media_files_shallow(mount);
+    let infos = collect_media_files_shallow(mount);
+    let files: Vec<PathBuf> = infos.iter().map(|f| f.path.clone()).collect();
+    plan_copies_for_files(&files, device_name, dest_parent)
+}
+
+/// Plan copies for a given set of file paths (no extra scan).
+/// Collision handling, flat device dir layout.
+pub fn plan_copies_for_files(
+    files: &[PathBuf],
+    device_name: &str,
+    dest_parent: &Path,
+) -> Vec<CopyPlanItem> {
     let dest_dir = dest_parent.join(device_name);
 
     let mut used_names: HashMap<String, u32> = HashMap::new();
     let mut plans = Vec::new();
 
-    for src in &files {
+    for src in files {
         let name = src
             .file_name()
             .and_then(|n| n.to_str())
@@ -733,6 +784,42 @@ pub fn plan_copies_for_card(
 
     plans.sort_by(|a, b| a.src.cmp(&b.src));
     plans
+}
+
+// ── Selection helpers ────────────────────────────────────────────────────
+
+/// Find the latest date (in local time) for which any file has a recording.
+/// Returns `None` if no files have a valid modification time.
+pub fn latest_recording_date(files: &[OffloadFileInfo]) -> Option<NaiveDate> {
+    files.iter()
+        .filter_map(|f| f.modified)
+        .map(|dt| dt.date_naive())
+        .max()
+}
+
+/// Build a default selection: select all files whose recording date (mtime in
+/// local time) matches the latest date present.
+pub fn default_selection(files: &[OffloadFileInfo]) -> Vec<bool> {
+    let latest = match latest_recording_date(files) {
+        Some(d) => d,
+        None => return vec![false; files.len()],
+    };
+    files.iter()
+        .map(|f| f.modified.map(|dt| dt.date_naive() == latest).unwrap_or(false))
+        .collect()
+}
+
+/// Apply a selection vector to a card: update `selected`, `selected_count`,
+/// and `selected_bytes`. Panics if the selection length doesn't match.
+pub fn apply_selection(card: &mut SdCardInfo, selection: Vec<bool>) {
+    assert_eq!(selection.len(), card.files.len(), "selection length mismatch");
+    card.selected = selection;
+    card.selected_count = card.selected.iter().filter(|&&s| s).count();
+    card.selected_bytes = card.files.iter()
+        .zip(card.selected.iter())
+        .filter(|(_, &sel)| sel)
+        .map(|(f, _)| f.size_bytes)
+        .sum();
 }
 
 /// If `name` has been seen before, append ` (N)` before the extension.
@@ -996,6 +1083,8 @@ pub fn snapshot_from_context(
         last_offload_parent: parent_folder,
         last_offload_version: last_version,
         error,
+        file_durations: HashMap::new(),
+        durations_version: 0,
     }
 }
 
@@ -1208,11 +1297,11 @@ mod tests {
         fs::create_dir(dir.path().join("DCIM")).unwrap();
         fs::write(dir.path().join("DCIM").join("C0001.MP4"), b"more").unwrap();
 
-        let (files, _) = collect_media_files_shallow(dir.path());
+        let files = collect_media_files_shallow(dir.path());
         // Only .mp4 and .wav should be collected.
         let names: Vec<&str> = files
             .iter()
-            .filter_map(|f| f.file_name())
+            .filter_map(|f| f.path.file_name())
             .filter_map(|n| n.to_str())
             .collect();
         assert!(names.contains(&"clip1.mp4"));
@@ -1415,10 +1504,10 @@ proc /proc proc rw 0 0
         let file_link = dir.path().join("linked.mp4");
         let _ = unix_fs::symlink(sub.join("clip.mp4"), &file_link);
 
-        let (files, _) = collect_media_files_shallow(dir.path());
+        let files = collect_media_files_shallow(dir.path());
         let names: Vec<&str> = files
             .iter()
-            .filter_map(|f| f.file_name())
+            .filter_map(|f| f.path.file_name())
             .filter_map(|n| n.to_str())
             .collect();
 
@@ -1440,10 +1529,10 @@ proc /proc proc rw 0 0
         // Also a shallow file.
         fs::write(dir.path().join("shallow.mp4"), b"data").unwrap();
 
-        let (files, _) = collect_media_files_shallow(dir.path());
+        let files = collect_media_files_shallow(dir.path());
         let names: Vec<&str> = files
             .iter()
-            .filter_map(|f| f.file_name())
+            .filter_map(|f| f.path.file_name())
             .filter_map(|n| n.to_str())
             .collect();
 
@@ -1643,13 +1732,13 @@ proc /proc proc rw 0 0
     #[test]
     fn test_detect_cards_udisks2_path_passes_filtering() {
         let mounts = "\
-/dev/sdb1 /run/media/viktoria/disk vfat rw 0 0
+/dev/sdb1 /run/media/viktoria/NONEXISTENT_UNIQUE_CARD_DIR_42 vfat rw 0 0
 ";
         let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
         let cards = detect_cards_from_mounts(mounts, sys.path());
-        // /run/media/viktoria/disk doesn't exist on this machine, so
-        // classify_mount rejects it (0 files). But the filter should
-        // accept it (sdb is removable, sdb1 is its partition).
+        // The mount directory doesn't exist, so classify_mount rejects it
+        // (0 files). But the filter should accept it (sdb is removable,
+        // sdb1 is its partition).
         assert!(cards.is_empty());
     }
 
@@ -1766,7 +1855,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
             fs::write(sub.join(format!("C{:04}.MP4", i)), b"x").unwrap();
         }
 
-        let (files, _) = collect_media_files_shallow(dir.path());
+        let files = collect_media_files_shallow(dir.path());
         assert_eq!(files.len(), MAX_CARD_FILES);
     }
 }

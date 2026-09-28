@@ -65,7 +65,8 @@ pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs
 
 // Re-export offload types
 pub use offload::{
-    default_parent_name, detect_cards, is_media_file, plan_copies_for_card, run_offload,
+    apply_selection, default_parent_name, default_selection, detect_cards, is_media_file,
+    latest_recording_date, plan_copies_for_card, plan_copies_for_files, run_offload,
     verify_copy, DeviceNameSource, OffloadContext, OffloadDeviceState, OffloadDeviceStatus,
-    OffloadSnapshot, SdCardInfo, VerifyMode,
+    OffloadFileInfo, OffloadSnapshot, SdCardInfo, VerifyMode,
 };

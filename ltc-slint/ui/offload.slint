@@ -16,10 +16,12 @@ export component OffloadSection {
     callback parent-name-changed(string);
     callback card-name-changed(int, string);
     callback rescan;
+    callback file-toggled(int, int, bool);
+    callback select-all-files(int, bool);
+    callback select-latest-day(int);
     callback start-offload;
     callback cancel-offload;
 
-    // Step labels
     property <length> step-gap: 12px;
     property <length> section-gap: 8px;
 
@@ -55,7 +57,6 @@ export component OffloadSection {
 
                 HorizontalLayout { spacing: 6px;
                     Text { text: "Subfolder:"; font-size: 11px; color: AppColors.text-muted; vertical-alignment: center; }
-                    // Use a TextInput for editable subfolder name — with property binding from Rust
                     Text {
                         text: root.parent-name;
                         font-size: 13px; color: AppColors.text-title; vertical-alignment: center;
@@ -95,8 +96,71 @@ export component OffloadSection {
                             font-size: 13px; color: AppColors.text-title;
                         }
                         Text {
-                            text: card.media-file-count + " file(s), " + card.total-bytes;
+                            text: card.selected-count + "/" + card.media-file-count + " file(s) selected, " + card.selected-bytes;
                             font-size: 11px; color: AppColors.text-muted;
+                        }
+
+                        // Quick selection buttons
+                        if (card.files.length > 0) : HorizontalLayout { spacing: 4px;
+                            Rectangle {
+                                min-width: 30px; min-height: 20px; border-radius: 4px;
+                                background: AppColors.deep-bg;
+                                TouchArea { clicked => { root.select-all-files(idx, true); } }
+                                VerticalLayout { alignment: center;
+                                    Text { text: "All"; font-size: 10px; color: AppColors.text-title; }
+                                }
+                            }
+                            Rectangle {
+                                min-width: 30px; min-height: 20px; border-radius: 4px;
+                                background: AppColors.deep-bg;
+                                TouchArea { clicked => { root.select-all-files(idx, false); } }
+                                VerticalLayout { alignment: center;
+                                    Text { text: "None"; font-size: 10px; color: AppColors.text-title; }
+                                }
+                            }
+                            Rectangle {
+                                min-width: 70px; min-height: 20px; border-radius: 4px;
+                                background: AppColors.deep-bg;
+                                TouchArea { clicked => { root.select-latest-day(idx); } }
+                                VerticalLayout { alignment: center;
+                                    Text { text: "Latest day"; font-size: 10px; color: AppColors.text-title; }
+                                }
+                            }
+                        }
+
+                        // File list (clipped at 240px height)
+                        if (card.files.length > 0) : Rectangle {
+                            clip: true;
+                            max-height: 240px;
+                            VerticalLayout { spacing: 2px;
+                                for file[fi] in card.files : HorizontalLayout { spacing: 4px;
+                                    Rectangle {
+                                        width: 14px; height: 14px; border-radius: 3px;
+                                        border-width: 1px; border-color: AppColors.text-muted;
+                                        background: file.selected ? AppColors.accent : transparent;
+                                        TouchArea {
+                                            clicked => { root.file-toggled(idx, fi, !file.selected); }
+                                        }
+                                    }
+                                    Text {
+                                        text: file.name;
+                                        font-size: 11px; color: AppColors.text-title;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Text {
+                                        text: file.date-text;
+                                        font-size: 10px; color: AppColors.text-muted;
+                                    }
+                                    Text {
+                                        text: file.duration-text;
+                                        font-size: 10px; color: AppColors.text-muted;
+                                    }
+                                    Text {
+                                        text: file.size-text;
+                                        font-size: 10px; color: AppColors.text-muted;
+                                    }
+                                }
+                            }
                         }
                     }
                 }

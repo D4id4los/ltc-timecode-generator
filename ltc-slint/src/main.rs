@@ -930,6 +930,30 @@ fn _run_gui(
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::CancelOffload));
         });
     }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_off_file_toggled(move |card_idx, file_idx, sel| {
+            let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetFileSelected(
+                card_idx as usize, file_idx as usize, sel,
+            )));
+        });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_off_select_all_files(move |card_idx, sel| {
+            let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(
+                card_idx as usize, sel,
+            )));
+        });
+    }
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_off_select_latest_day(move |card_idx| {
+            let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SelectLatestDay(
+                card_idx as usize,
+            )));
+        });
+    }
 
     // ── Poll timer — state sync ────────────────────────────────────────────
     setup_poll_timer(

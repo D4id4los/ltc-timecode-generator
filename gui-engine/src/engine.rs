@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -738,10 +738,24 @@ pub fn engine_main_with_probe<F>(
         // 1.10 Drain offload events (card scans + copy completion)
         loop {
             match offload_event_rx.try_recv() {
-                Ok(OffloadEvent::CardsScanned { cards, generation }) => {
+                Ok(OffloadEvent::CardsScanned { mut cards, generation }) => {
                     if generation == offload_scan_generation {
+                        // Collect file paths before consume for duration probing.
+                        let file_paths: Vec<PathBuf> = cards.iter()
+                            .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
+                            .collect();
+
+                        // Apply default selection (latest recording day) to each card.
+                        for card in &mut cards {
+                            let sel = crate::offload::default_selection(&card.files);
+                            crate::offload::apply_selection(card, sel);
+                        }
                         current.offload.cards = cards;
                         current.offload.scanning = false;
+                        current.offload.file_durations.clear();
+                        current.offload.durations_version =
+                            current.offload.durations_version.wrapping_add(1);
+
                         if current.offload.cards.is_empty() {
                             info!(
                                 "Offload card scan complete: 0 cards — if your card reader \
@@ -753,6 +767,20 @@ pub fn engine_main_with_probe<F>(
                                 "Offload card scan complete: {} card(s)",
                                 current.offload.cards.len()
                             );
+                            // Spawn async duration probe for all scanned files.
+                            let tx = offload_event_tx.clone();
+                            let gen = generation;
+                            std::thread::Builder::new()
+                                .name("offload-dur-probe".into())
+                                .spawn(move || {
+                                    for path in file_paths {
+                                        let secs = crate::duration::file_duration_secs(&path);
+                                        let _ = tx.send(OffloadEvent::OffloadDurationResult {
+                                            path, secs, generation: gen,
+                                        });
+                                    }
+                                })
+                                .expect("failed to spawn offload duration-probe thread");
                         }
                     } else {
                         warn!("Discarding stale offload scan result: gen={}", generation);
@@ -795,6 +823,13 @@ pub fn engine_main_with_probe<F>(
                         offload_context = None;
                     } else {
                         warn!("Discarding stale offload copy result: gen={}", generation);
+                    }
+                }
+                Ok(OffloadEvent::OffloadDurationResult { path, secs, generation }) => {
+                    if generation == offload_scan_generation {
+                        current.offload.file_durations.insert(path, secs);
+                        current.offload.durations_version =
+                            current.offload.durations_version.wrapping_add(1);
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1977,6 +2012,11 @@ enum OffloadEvent {
         cards: Vec<crate::offload::SdCardInfo>,
         generation: u64,
     },
+    OffloadDurationResult {
+        path: PathBuf,
+        secs: Option<f64>,
+        generation: u64,
+    },
     OffloadDone {
         completed: Vec<String>,
         generation: u64,
@@ -2061,6 +2101,34 @@ fn handle_offload_command(
             }
         }
 
+        crate::command::OffloadCommand::SetFileSelected(card_idx, file_idx, selected) => {
+            if let Some(card) = state.offload.cards.get_mut(card_idx) {
+                if file_idx < card.selected.len() {
+                    card.selected[file_idx] = selected;
+                    card.selected_count = card.selected.iter().filter(|&&s| s).count();
+                    card.selected_bytes = card.files.iter()
+                        .zip(card.selected.iter())
+                        .filter(|(_, &sel)| sel)
+                        .map(|(f, _)| f.size_bytes)
+                        .sum();
+                }
+            }
+        }
+
+        crate::command::OffloadCommand::SetAllFilesSelected(card_idx, selected) => {
+            if let Some(card) = state.offload.cards.get_mut(card_idx) {
+                let sel = vec![selected; card.files.len()];
+                crate::offload::apply_selection(card, sel);
+            }
+        }
+
+        crate::command::OffloadCommand::SelectLatestDay(card_idx) => {
+            if let Some(card) = state.offload.cards.get_mut(card_idx) {
+                let sel = crate::offload::default_selection(&card.files);
+                crate::offload::apply_selection(card, sel);
+            }
+        }
+
         crate::command::OffloadCommand::StartOffload => {
             if state.offload.running {
                 info!("Offload already running — ignoring duplicate StartOffload");
@@ -2079,13 +2147,26 @@ fn handle_offload_command(
             };
             let dest_parent = parent_folder.join(&state.offload.parent_name);
 
-            // Build plans per device.
+            // Build plans per device from selected files only.
             let cards = state.offload.cards.clone();
             let names: Vec<String> = cards.iter().map(|c| c.device_name.clone()).collect();
             let device_plans: Vec<Vec<crate::offload::CopyPlanItem>> = cards
                 .iter()
-                .map(|card| crate::offload::plan_copies_for_card(&card.mount, &card.device_name, &dest_parent))
+                .map(|card| {
+                    let selected: Vec<PathBuf> = card.files.iter()
+                        .zip(card.selected.iter())
+                        .filter(|(_, &sel)| sel)
+                        .map(|(f, _)| f.path.clone())
+                        .collect();
+                    crate::offload::plan_copies_for_files(&selected, &card.device_name, &dest_parent)
+                })
                 .collect();
+
+            let total_selected: usize = device_plans.iter().map(|p| p.len()).sum();
+            if total_selected == 0 {
+                state.offload.error = Some("No files selected.".to_string());
+                return;
+            }
 
             let ctx = Arc::new(OffloadContext::new(&names, &device_plans));
 

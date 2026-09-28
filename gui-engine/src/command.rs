@@ -170,6 +170,12 @@ pub enum OffloadCommand {
     SetParentName(String),
     /// Override the device folder name for a detected card by index.
     SetDeviceName(usize, String),
+    /// Toggle selection of a single file on a card.
+    SetFileSelected(usize, usize, bool),
+    /// Select or deselect all files on a card.
+    SetAllFilesSelected(usize, bool),
+    /// Select only files from the latest recording day on a card.
+    SelectLatestDay(usize),
     /// Start copying files from all pending cards.
     StartOffload,
     /// Cancel an in-flight copy operation.

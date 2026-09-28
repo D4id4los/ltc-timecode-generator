@@ -26,6 +26,14 @@ export struct FileGroupInfo {
     duration-text: string,
 }
 
+export struct OffloadFileInfo {
+    name: string,
+    date-text: string,
+    duration-text: string,
+    size-text: string,
+    selected: bool,
+}
+
 export struct OffloadCardInfo {
     mount: string,
     volume-label: string,
@@ -33,6 +41,10 @@ export struct OffloadCardInfo {
     name-source: string,
     media-file-count: int,
     total-bytes: string,
+    files: [OffloadFileInfo],
+    selected-count: int,
+    selected-bytes: string,
+    durations-version: int,
 }
 
 export struct OffloadDeviceStatus {
