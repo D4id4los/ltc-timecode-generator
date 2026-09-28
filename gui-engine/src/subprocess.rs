@@ -1,6 +1,8 @@
 use std::io;
+use std::io::BufRead;
 use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -13,6 +15,21 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Default timeout for ffprobe/exiftool probe subprocesses.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Stall (no-stderr-output) timeout for streaming ffmpeg subprocesses.
+/// If no stderr line arrives within this window the child is killed.
+pub const FFMPEG_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Outcome of [`watch_stderr_lines`] when the child had to be stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WatchdogStop {
+    /// Cancel flag was observed — child killed and reaped.
+    Cancelled,
+    /// No stderr output for the stall timeout — child killed and reaped.
+    Stalled,
+    /// wait()/try_wait() failed.
+    Wait(String),
+}
 
 /// Error type for subprocess operations.
 #[derive(Debug, Clone)]
@@ -115,6 +132,104 @@ pub fn run_with_timeout(child: &mut Child, timeout: Duration) -> Option<bool> {
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(_) => return None,
+        }
+    }
+}
+
+/// Stream `stderr` line-by-line through `on_line` while the child runs.
+///
+/// - Cancel is checked every ~100 ms (not only between lines) and kills the
+///   child immediately on detection.
+/// - If no line arrives for `stall`, the child is killed and
+///   `Err(WatchdogStop::Stalled)` returned.
+/// - On normal exit, all buffered lines are delivered via `on_line`, then the
+///   exit status is reaped and returned as `Ok(status)`.
+pub fn watch_stderr_lines(
+    child: &mut Child,
+    stderr: impl io::Read + Send + 'static,
+    stall: Duration,
+    cancel: Option<&AtomicBool>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<std::process::ExitStatus, WatchdogStop> {
+    let (tx, rx) = mpsc::channel::<String>();
+
+    // Spawn reader thread (detached — handle is dropped on return).
+    std::thread::Builder::new()
+        .name("stderr-watchdog-reader".into())
+        .spawn(move || {
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .expect("failed to spawn stderr reader thread");
+
+    let mut last_activity = Instant::now();
+
+    loop {
+        // Cancel is checked on every poll iteration, not just per-line.
+        if let Some(cancel) = cancel {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(WatchdogStop::Cancelled);
+            }
+        }
+
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                last_activity = Instant::now();
+                on_line(&line);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last_activity.elapsed() >= stall {
+                    match child.try_wait() {
+                        Ok(None) => {
+                            // Child is still running but silent → kill.
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(WatchdogStop::Stalled);
+                        }
+                        // Child already exited — keep draining below.
+                        Ok(Some(_)) => {}
+                        Err(e) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(WatchdogStop::Wait(format!("{}", e)));
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Reader thread finished. Normally the child has also
+                // exited (pipe close = child exit).  Safeguard: if the
+                // child closed stderr while still alive (rare edge case),
+                // bound the wait by the stall timeout.
+                let disconnect_start = Instant::now();
+                loop {
+                    if disconnect_start.elapsed() >= stall {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(WatchdogStop::Stalled);
+                    }
+                    match child.try_wait() {
+                        Ok(Some(status)) => return Ok(status),
+                        Ok(None) => {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(e) => {
+                            return Err(WatchdogStop::Wait(format!("{}", e)));
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -243,6 +358,123 @@ mod tests {
         cmd.stderr(Stdio::null());
         let result = run_output_with_timeout(&mut cmd, Duration::from_secs(1));
         assert!(matches!(result, Err(SubprocessFailure::Io(_))));
+    }
+
+    // ── watch_stderr_lines tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_watch_stderr_lines_delivers_lines_and_status() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = no_window_command("cmd");
+            c.args(["/C", "echo hello>&2 & echo world>&2"]);
+            c
+        } else {
+            let mut c = no_window_command("sh");
+            c.args(["-c", "echo hello >&2; echo world >&2"]);
+            c
+        };
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().expect("should spawn");
+        let stderr = child.stderr.take().unwrap();
+
+        let mut lines = Vec::new();
+        let status = watch_stderr_lines(
+            &mut child,
+            stderr,
+            Duration::from_secs(5),
+            None,
+            &mut |l| lines.push(l.to_string()),
+        )
+        .expect("should complete successfully");
+        assert!(status.success());
+        assert_eq!(lines.len(), 2, "should have 2 lines: {:?}", lines);
+    }
+
+    #[test]
+    fn test_watch_stderr_lines_cancel_while_silent() {
+        let mut cmd = no_window_command(sleep_prog());
+        cmd.args(sleep_args(30));
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+
+        let mut child = cmd.spawn().expect("should spawn");
+        // stderr was null → pass a dummy reader that reads nothing.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let stderr_reader = std::io::Cursor::new(Vec::<u8>::new());
+
+        let start = Instant::now();
+        let result = watch_stderr_lines(
+            &mut child,
+            stderr_reader,
+            Duration::from_secs(30),
+            Some(&cancel),
+            &mut |_| {},
+        );
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(WatchdogStop::Cancelled)));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel took {:?} — should return promptly",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_watch_stderr_lines_stall_kills_silent_child() {
+        let mut cmd = no_window_command(sleep_prog());
+        cmd.args(sleep_args(30));
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+
+        let mut child = cmd.spawn().expect("should spawn");
+        let stderr_reader = std::io::Cursor::new(Vec::<u8>::new());
+        let stall = Duration::from_millis(200);
+
+        let start = Instant::now();
+        let result = watch_stderr_lines(
+            &mut child,
+            stderr_reader,
+            stall,
+            None,
+            &mut |_| {},
+        );
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(WatchdogStop::Stalled)));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "stall timeout took {:?} — should kill promptly",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_watch_stderr_lines_nonzero_status() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = no_window_command("cmd");
+            c.args(["/C", "exit /b 3"]);
+            c
+        } else {
+            let mut c = no_window_command("sh");
+            c.args(["-c", "exit 3"]);
+            c
+        };
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().expect("should spawn");
+        let stderr = child.stderr.take().unwrap();
+
+        let status = watch_stderr_lines(
+            &mut child,
+            stderr,
+            Duration::from_secs(5),
+            None,
+            &mut |_| {},
+        )
+        .expect("should complete");
+        assert_eq!(status.code(), Some(3));
     }
 
     // ── platform helpers ─────────────────────────────────────────────────────

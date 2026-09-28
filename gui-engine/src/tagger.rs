@@ -1,13 +1,21 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use std::time::Duration;
 
 use crate::camera_meta::CameraInfo;
 use crate::converter::{TimecodeMetadata, format_ffmpeg_timecode};
-use crate::subprocess::no_window_command;
+use crate::subprocess::{no_window_command, run_output_with_timeout, SubprocessFailure};
 
 /// Originator string for WAV bext when no camera is detected.
 const BEXT_DEFAULT_ORIGINATOR: &str = "LTC Timecode Generator";
+
+/// Total timeout for the ffmpeg stream-copy tagging fallback.
+/// Stream copying a full-length recording (e.g. 100 GB on slow storage) can
+/// take many minutes, but should never hang indefinitely.
+const TAG_REMUX_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Outcome of a tagging attempt.
 #[derive(Debug, Clone, PartialEq)]
@@ -785,6 +793,31 @@ fn read_wav_sample_rate_internal(file: &mut std::fs::File) -> Result<u32, String
 /// Tag a file via ffmpeg stream-copy remux: write to a temp file in the
 /// same directory, then atomically rename over the original.
 fn tag_via_ffmpeg(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo>) -> Result<TagOutcome, String> {
+    tag_via_ffmpeg_with(path, meta, camera, &mut |args: &[String], tmp: &Path| {
+        run_output_with_timeout(
+            no_window_command("ffmpeg")
+                .args(args)
+                .arg(tmp)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped()),
+            TAG_REMUX_TIMEOUT,
+        )
+    })
+}
+
+/// Injectable-runner variant of [`tag_via_ffmpeg`] for testability.
+///
+/// `runner` receives the full argument list (INCLUDING the timecode metadata,
+/// camera metadata, and container flags) plus the temporary output path. It
+/// must return the subprocess [`Output`] (with timed-out/killed handled as
+/// `Err(SubprocessFailure::TimedOut)`).
+#[allow(clippy::type_complexity)]
+fn tag_via_ffmpeg_with(
+    path: &Path,
+    meta: &TimecodeMetadata,
+    camera: Option<&CameraInfo>,
+    runner: &mut dyn FnMut(&[String], &Path) -> Result<Output, SubprocessFailure>,
+) -> Result<TagOutcome, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -864,14 +897,18 @@ fn tag_via_ffmpeg(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraIn
     args.push("-f".to_string());
     args.push(container.to_string());
 
-    // Run ffmpeg
-    let output = no_window_command("ffmpeg")
-        .args(&args)
-        .arg(&tmp_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("failed to spawn ffmpeg: {}", e))?;
+    // Run ffmpeg via the injectable runner
+    let output = runner(&args, &tmp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        match e {
+            SubprocessFailure::Io(msg) => format!("failed to spawn ffmpeg: {}", msg),
+            SubprocessFailure::TimedOut => format!(
+                "ffmpeg timed out after {}s while tagging {} — file may be corrupt",
+                TAG_REMUX_TIMEOUT.as_secs(),
+                path.display(),
+            ),
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1445,5 +1482,38 @@ mod tests {
                 err_msg
             );
         }
+    }
+
+    // ── tag_via_ffmpeg_with runner tests ──────────────────────────────────
+
+    #[test]
+    fn test_tag_via_ffmpeg_with_timeout() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("clip.mov");
+        std::fs::write(&p, b"dummy content").unwrap();
+        let meta = test_meta();
+
+        let mut timeout_runner = |_: &[String], _: &Path| Err(SubprocessFailure::TimedOut);
+        let result = tag_via_ffmpeg_with(&p, &meta, None, &mut timeout_runner);
+        assert!(result.is_err(), "expected timeout error, got {:?}", result);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("timed out"), "msg should mention timeout: {}", msg);
+        assert!(msg.contains("1800"), "msg should mention 1800s: {}", msg);
+    }
+
+    #[test]
+    fn test_tag_via_ffmpeg_with_io_error() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("clip.mp4");
+        std::fs::write(&p, b"dummy content").unwrap();
+        let meta = test_meta();
+
+        let mut io_runner = |_: &[String], _: &Path| {
+            Err(SubprocessFailure::Io("binary not found".into()))
+        };
+        let result = tag_via_ffmpeg_with(&p, &meta, None, &mut io_runner);
+        assert!(result.is_err(), "expected Io error, got {:?}", result);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("failed to spawn ffmpeg"), "msg: {}", msg);
     }
 }

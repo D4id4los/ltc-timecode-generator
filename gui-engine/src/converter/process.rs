@@ -1,12 +1,11 @@
 use std::path::Path;
-use std::process::Stdio;
-use std::sync::atomic::Ordering;
+use std::process::{Child, Stdio};
+use std::time::Duration;
 
 use log::{info, warn};
 
 use crate::converter::progress::{CancelFlag, ConversionStatus, SharedConversionState};
-use crate::subprocess::no_window_command;
-use std::io::BufRead;
+use crate::subprocess::{no_window_command, watch_stderr_lines, WatchdogStop, FFMPEG_STALL_TIMEOUT};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StepFailure {
@@ -94,6 +93,49 @@ pub fn run_ffmpeg_process(
     info!("{} Spawning ffmpeg with {} args → {}", step_label, args.len(), output.display());
 
     let full_args: Vec<String> = args.iter().cloned().chain(std::iter::once(output.to_string_lossy().to_string())).collect();
+
+    run_ffmpeg_process_with(
+        &full_args,
+        output,
+        state,
+        cancel,
+        step_progress_weight,
+        overall_progress,
+        overall_log,
+        total_steps,
+        current_step,
+        &mut |full_args: &[String]| {
+            no_window_command("ffmpeg")
+                .args(full_args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+        },
+        FFMPEG_STALL_TIMEOUT,
+    )
+}
+
+/// Injectable-spawner variant of [`run_ffmpeg_process`] for testability.
+///
+/// `full_args` must include the output path as the last argument (already
+/// appended by the caller). `spawner` returns the spawned child (with stderr
+/// piped). `stall` is the no-output timeout; the public variant uses
+/// [`FFMPEG_STALL_TIMEOUT`] (30 s).
+pub fn run_ffmpeg_process_with(
+    full_args: &[String],
+    output: &Path,
+    state: &SharedConversionState,
+    cancel: &CancelFlag,
+    step_progress_weight: f32,
+    overall_progress: &mut f32,
+    overall_log: &mut String,
+    total_steps: usize,
+    current_step: usize,
+    spawner: &mut dyn FnMut(&[String]) -> std::io::Result<Child>,
+    stall: Duration,
+) -> Result<(), StepFailure> {
+    let step_label = format!("[{}/{}]", current_step, total_steps);
+
     let args_str = format!("{} ffmpeg \\\n  {}", step_label, full_args.join(" \\\n  "));
     {
         let mut s = state.lock().unwrap();
@@ -101,12 +143,7 @@ pub fn run_ffmpeg_process(
         s.current_line = args_str;
     }
 
-    let mut child = match no_window_command("ffmpeg")
-        .args(&full_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    let mut child = match spawner(full_args) {
         Ok(c) => c,
         Err(e) => {
             let err_msg = format!("{} Failed to spawn ffmpeg: {}", step_label, e);
@@ -116,73 +153,76 @@ pub fn run_ffmpeg_process(
         }
     };
 
-    let stderr = child.stderr.take().unwrap();
-    let reader = std::io::BufReader::new(stderr);
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            let err_msg = format!("{} Failed to capture ffmpeg stderr", step_label);
+            warn!("{}", err_msg);
+            overall_log.push_str(&format!("\n\n--- {} ---", err_msg));
+            return Err(StepFailure::Fatal(err_msg));
+        }
+    };
+
     let mut local_log = String::new();
     let mut step_progress: f32 = 0.0;
     let mut produced_output = false;
     let duration_re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
     let mut total_duration_secs: Option<f64> = None;
 
-    for line in reader.lines() {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            overall_log.push_str(&format!("{} --- CANCELLED ---\n", step_label));
-            overall_log.push_str("\n\n--- CANCELLED BY USER ---");
-            return Err(StepFailure::Fatal("cancelled by user".to_string()));
-        }
+    let cancel_ref: Option<&std::sync::atomic::AtomicBool> = Some(cancel.as_ref());
 
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    let watchdog_result = watch_stderr_lines(
+        &mut child,
+        stderr,
+        stall,
+        cancel_ref,
+        &mut |line: &str| {
+            local_log.push_str(line);
+            local_log.push('\n');
 
-        local_log.push_str(&line);
-        local_log.push('\n');
-
-        if total_duration_secs.is_none() {
-            if let Some(caps) = duration_re.captures(&line) {
-                let h: f64 = caps[1].parse().unwrap_or(0.0);
-                let m: f64 = caps[2].parse().unwrap_or(0.0);
-                let s: f64 = caps[3].parse().unwrap_or(0.0);
-                let frac: f64 = caps[4].parse().unwrap_or(0.0) / 100.0;
-                if h > 0.0 || m > 0.0 || s > 0.0 || frac > 0.0 {
-                    total_duration_secs = Some(h * 3600.0 + m * 60.0 + s + frac);
+            if total_duration_secs.is_none() {
+                if let Some(caps) = duration_re.captures(line) {
+                    let h: f64 = caps[1].parse().unwrap_or(0.0);
+                    let m: f64 = caps[2].parse().unwrap_or(0.0);
+                    let s: f64 = caps[3].parse().unwrap_or(0.0);
+                    let frac: f64 = caps[4].parse().unwrap_or(0.0) / 100.0;
+                    if h > 0.0 || m > 0.0 || s > 0.0 || frac > 0.0 {
+                        total_duration_secs = Some(h * 3600.0 + m * 60.0 + s + frac);
+                    }
                 }
             }
-        }
 
-        if let Some(current_secs) = parse_out_time(&line) {
-            if current_secs > 0.0 {
-                produced_output = true;
-            }
-
-            if let Some(total) = total_duration_secs {
-                if total > 0.0 {
-                    step_progress = (current_secs / total).min(1.0) as f32;
+            if let Some(current_secs) = parse_out_time(line) {
+                if current_secs > 0.0 {
+                    produced_output = true;
                 }
-            } else if current_secs > 0.0 {
-                let heuristic = current_secs * 100.0;
-                step_progress = (current_secs / heuristic).min(1.0) as f32;
+
+                if let Some(total) = total_duration_secs {
+                    if total > 0.0 {
+                        step_progress = (current_secs / total).min(1.0) as f32;
+                    }
+                } else if current_secs > 0.0 {
+                    let heuristic = current_secs * 100.0;
+                    step_progress = (current_secs / heuristic).min(1.0) as f32;
+                }
             }
-        }
 
-        if line.trim() == "progress=end" {
-            step_progress = 1.0;
-        }
+            if line.trim() == "progress=end" {
+                step_progress = 1.0;
+            }
 
-        let combined = *overall_progress + step_progress * step_progress_weight;
-        {
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Running { progress: combined.min(1.0) };
-            s.current_line = line.clone();
-        }
-    }
+            let combined = *overall_progress + step_progress * step_progress_weight;
+            {
+                let mut s = state.lock().unwrap();
+                s.status = ConversionStatus::Running { progress: combined.min(1.0) };
+                s.current_line = line.to_string();
+            }
+        },
+    );
 
-    let exit_status = child.wait();
     overall_log.push_str(&local_log);
 
-    match exit_status {
+    match watchdog_result {
         Ok(status) if status.success() => {
             *overall_progress += step_progress_weight;
             info!("{} Step completed: {}", step_label, output.display());
@@ -198,10 +238,25 @@ pub fn run_ffmpeg_process(
             }
             Err(classification)
         }
-        Err(e) => {
-            warn!("{} ffmpeg error: {}", step_label, e);
-            overall_log.push_str(&format!("\n\n--- FFMPEG ERROR: {} ---", e));
-            Err(StepFailure::Fatal(e.to_string()))
+        Err(WatchdogStop::Cancelled) => {
+            overall_log.push_str(&format!("{} --- CANCELLED ---\n", step_label));
+            overall_log.push_str("\n\n--- CANCELLED BY USER ---");
+            Err(StepFailure::Fatal("cancelled by user".to_string()))
+        }
+        Err(WatchdogStop::Stalled) => {
+            let msg = format!(
+                "ffmpeg stalled — no stderr output for {}s",
+                stall.as_secs()
+            );
+            warn!("{} {}", step_label, msg);
+            overall_log.push_str(&format!("\n\n--- {} ---", msg));
+            Err(StepFailure::Fatal(msg))
+        }
+        Err(WatchdogStop::Wait(e)) => {
+            let msg = format!("ffmpeg process wait error: {}", e);
+            warn!("{} {}", step_label, msg);
+            overall_log.push_str(&format!("\n\n--- {} ---", msg));
+            Err(StepFailure::Fatal(msg))
         }
     }
 }
@@ -292,5 +347,144 @@ mod tests {
         let p = Path::new("/nonexistent/output.wav");
         let sf = classify_step_failure(true, p, "1");
         assert!(matches!(sf, StepFailure::Fatal(_)));
+    }
+
+    // ── run_ffmpeg_process_with tests ────────────────────────────────────
+
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::AtomicBool;
+    use crate::converter::progress::ConversionState;
+
+    fn fresh_state() -> SharedConversionState {
+        Arc::new(Mutex::new(ConversionState::idle()))
+    }
+
+    /// Spawner that runs `sleep 30` (silent child). Ignores its args.
+    fn silent_spawner(_full_args: &[String]) -> std::io::Result<Child> {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "ping", "-n", "30", "127.0.0.1", ">nul"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.spawn()
+    }
+
+    #[test]
+    fn test_run_ffmpeg_cancel_while_silent() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let state = fresh_state();
+        let mut progress = 0.0f32;
+        let mut log = String::new();
+        let out = Path::new("/tmp/_test_ffmpeg_cancel.mp4");
+        let start = std::time::Instant::now();
+
+        let result = run_ffmpeg_process_with(
+            &[], out, &state, &cancel, 0.5, &mut progress, &mut log, 2, 1,
+            &mut silent_spawner,
+            Duration::from_secs(10),
+        );
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(StepFailure::Fatal(ref m)) if m == "cancelled by user"),
+            "expected cancel, got {:?}", result);
+        assert!(elapsed < Duration::from_secs(5), "cancel took {:?}", elapsed);
+        assert!(log.contains("CANCELLED"), "log should mention cancel: {}", log);
+    }
+
+    #[test]
+    fn test_run_ffmpeg_stall_timeout() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = fresh_state();
+        let mut progress = 0.0f32;
+        let mut log = String::new();
+        let out = Path::new("/tmp/_test_ffmpeg_stall.mp4");
+        let start = std::time::Instant::now();
+
+        let result = run_ffmpeg_process_with(
+            &[], out, &state, &cancel, 0.5, &mut progress, &mut log, 2, 1,
+            &mut silent_spawner,
+            Duration::from_millis(200),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "expected stall error, got {:?}", result);
+        assert!(log.contains("stalled") || log.contains("stall"), "log: {}", log);
+        assert!(elapsed < Duration::from_secs(5), "stall took {:?}", elapsed);
+    }
+
+    #[test]
+    fn test_run_ffmpeg_parses_lines_and_reports_progress() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = fresh_state();
+        let mut progress = 0.0f32;
+        let mut log = String::new();
+        let out = Path::new("/tmp/_test_ffmpeg_lines.mp4");
+
+        let mut spawner = |_args: &[String]| {
+            let mut cmd = if cfg!(windows) {
+                let mut c = std::process::Command::new("cmd");
+                c.args(["/C",
+                    "echo Duration: 00:00:10.00>&2 & echo out_time=00:00:05.000000>&2 & echo progress=end>&2"]);
+                c
+            } else {
+                let mut c = std::process::Command::new("sh");
+                c.args(["-c",
+                    "echo 'Duration: 00:00:10.00' >&2; echo 'out_time=00:00:05.000000' >&2; echo 'progress=end' >&2"]);
+                c
+            };
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.spawn()
+        };
+
+        let result = run_ffmpeg_process_with(
+            &["-i".to_string(), "dummy".to_string()], out, &state, &cancel, 0.5, &mut progress, &mut log, 2, 1,
+            &mut spawner,
+            Duration::from_secs(5),
+        );
+        // Child exits 0 → success
+        assert!(result.is_ok(), "expected ok, got {:?}", result);
+        // Progress should have advanced (step weight was 0.5)
+        assert!(progress > 0.0, "progress should have advanced: {}", progress);
+        assert!(progress <= 1.0, "progress should be <= 1.0: {}", progress);
+    }
+
+    #[test]
+    fn test_run_ffmpeg_exit_nonzero_no_output_encoder_init() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = fresh_state();
+        let mut progress = 0.0f32;
+        let mut log = String::new();
+        let out = Path::new("/tmp/_test_ffmpeg_fail.mp4");
+
+        let mut spawner = |_args: &[String]| {
+            let mut cmd = if cfg!(windows) {
+                let mut c = std::process::Command::new("cmd");
+                c.args(["/C", "exit /b 1"]);
+                c
+            } else {
+                let mut c = std::process::Command::new("sh");
+                c.args(["-c", "exit 1"]);
+                c
+            };
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.spawn()
+        };
+
+        let result = run_ffmpeg_process_with(
+            &["-i".to_string(), "nonexistent".to_string()], out, &state, &cancel, 0.5, &mut progress, &mut log, 1, 1,
+            &mut spawner,
+            Duration::from_secs(5),
+        );
+        // No output produced and file does not exist → EncoderInit
+        match result {
+            Err(StepFailure::EncoderInit(_)) => {} // expected
+            other => panic!("expected EncoderInit, got {:?}", other),
+        }
     }
 }

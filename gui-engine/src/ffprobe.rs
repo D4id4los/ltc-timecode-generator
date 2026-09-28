@@ -1,9 +1,12 @@
-use std::io::BufRead;
 use std::path::Path;
-use std::process::{Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, Output, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
-use crate::subprocess::{no_window_command, run_output_with_timeout, SubprocessFailure, PROBE_TIMEOUT};
+use crate::subprocess::{
+    no_window_command, run_output_with_timeout, SubprocessFailure, WatchdogStop, PROBE_TIMEOUT,
+};
+use crate::subprocess::{watch_stderr_lines, FFMPEG_STALL_TIMEOUT};
 
 use log::{error, info, warn};
 
@@ -165,6 +168,11 @@ fn build_extract_args(
     ]
 }
 
+/// Total timeout for audio extraction ffmpeg calls (CLI decode and similar).
+/// Corrupt files can hang indefinitely, so a generous total-timeout bounds the
+/// wait and produces a clear error instead of blocking the CLI forever.
+pub const EXTRACT_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Extract a single channel of one audio stream from a container file into a
 /// mono 24-bit PCM WAV.
 ///
@@ -176,6 +184,35 @@ pub fn extract_audio_channel(
     channel_index: usize,
     output_wav: &Path,
 ) -> Result<(), String> {
+    extract_audio_channel_with(
+        path,
+        absolute_stream_index,
+        channel_index,
+        output_wav,
+        &mut |args: &[String]| {
+            run_output_with_timeout(
+                no_window_command("ffmpeg")
+                    .args(args)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped()),
+                EXTRACT_TIMEOUT,
+            )
+        },
+    )
+}
+
+/// Injectable-runner variant of [`extract_audio_channel`] for testability.
+///
+/// `runner` receives the full argument list (including the input path and
+/// output WAV path) and must return the subprocess [`Output`] (with
+/// timed-out/killed handled as `Err(SubprocessFailure::TimedOut)`).
+pub fn extract_audio_channel_with(
+    path: &Path,
+    absolute_stream_index: usize,
+    channel_index: usize,
+    output_wav: &Path,
+    runner: &mut dyn FnMut(&[String]) -> Result<Output, SubprocessFailure>,
+) -> Result<(), String> {
     info!(
         "Extracting audio: stream={}, channel={} from '{}' → '{}'",
         absolute_stream_index,
@@ -186,12 +223,16 @@ pub fn extract_audio_channel(
 
     let args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
 
-    let output = no_window_command("ffmpeg")
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    let output = runner(&args).map_err(|e| {
+        let _ = std::fs::remove_file(output_wav);
+        match e {
+            SubprocessFailure::Io(msg) => format!("Failed to run ffmpeg: {}", msg),
+            SubprocessFailure::TimedOut => format!(
+                "ffmpeg audio extraction timed out after {}s — file may be corrupt",
+                EXTRACT_TIMEOUT.as_secs()
+            ),
+        }
+    })?;
 
     if !output.status.success() {
         let _ = std::fs::remove_file(output_wav);
@@ -328,7 +369,8 @@ pub fn probe_stream_duration_secs_with(
 /// but `on_frac` is only called with 0.0 and 1.0 (at start and end).
 ///
 /// On cancel, ffmpeg is killed and `Err("Audio extraction canceled")` is
-/// returned.
+/// returned.  If ffmpeg hangs silently for 30 s, it is killed with a stall
+/// error.
 pub fn extract_audio_channel_with_progress(
     path: &Path,
     absolute_stream_index: usize,
@@ -338,77 +380,110 @@ pub fn extract_audio_channel_with_progress(
     cancel: Option<&AtomicBool>,
     on_frac: &impl Fn(f32),
 ) -> Result<(), String> {
+    extract_audio_channel_with_progress_with(
+        path,
+        absolute_stream_index,
+        channel_index,
+        output_wav,
+        total_duration_secs,
+        cancel,
+        on_frac,
+        &mut |args: &[String]| {
+            no_window_command("ffmpeg")
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+        },
+        FFMPEG_STALL_TIMEOUT,
+    )
+}
+
+/// Injectable-spawner variant of [`extract_audio_channel_with_progress`] for
+/// testability.
+///
+/// `spawner` receives the full argument list (including the input path and
+/// output WAV path, plus `-progress` / `pipe:2` flags) and must return the
+/// spawned child with stderr piped. `stall` is the no-output timeout; the
+/// public variant uses [`FFMPEG_STALL_TIMEOUT`] (30 s).
+pub fn extract_audio_channel_with_progress_with(
+    path: &Path,
+    absolute_stream_index: usize,
+    channel_index: usize,
+    output_wav: &Path,
+    total_duration_secs: Option<f64>,
+    cancel: Option<&AtomicBool>,
+    on_frac: &impl Fn(f32),
+    spawner: &mut dyn FnMut(&[String]) -> std::io::Result<Child>,
+    stall: Duration,
+) -> Result<(), String> {
     let mut args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
     args.push("-progress".to_string());
     args.push("pipe:2".to_string());
 
-    let mut child = no_window_command("ffmpeg")
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
+    let mut child = spawner(&args).map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
 
     let stderr = child.stderr.take().ok_or("Failed to capture ffmpeg stderr")?;
-    let reader = std::io::BufReader::new(stderr);
-
-    // Read stderr lines in a loop, checking cancel and reporting progress.
-    // We need to collect stderr for error reporting; use a buffer.
     let mut stderr_lines: Vec<String> = Vec::new();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-
-        stderr_lines.push(line.clone());
-
-        // Check cancel flag
-        if let Some(c) = cancel {
-            if c.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_file(output_wav);
-                return Err("Audio extraction canceled".to_string());
-            }
-        }
-
-        // Parse progress
-        if let Some(secs) = parse_out_time_us(&line) {
-            if let Some(duration) = total_duration_secs {
-                if duration > 0.0 {
-                    let frac = (secs / duration).min(1.0) as f32;
-                    on_frac(frac);
+    let result = watch_stderr_lines(
+        &mut child,
+        stderr,
+        stall,
+        cancel,
+        &mut |line| {
+            stderr_lines.push(line.to_string());
+            if let Some(secs) = parse_out_time_us(line) {
+                if let Some(duration) = total_duration_secs {
+                    if duration > 0.0 {
+                        let frac = (secs / duration).min(1.0) as f32;
+                        on_frac(frac);
+                    }
                 }
             }
+        },
+    );
+
+    match result {
+        Ok(status) if status.success() => {
+            info!("Audio extraction (with progress) successful: {}", output_wav.display());
+            Ok(())
+        }
+        Ok(_status) => {
+            let _ = std::fs::remove_file(output_wav);
+            let stderr = stderr_lines.join("\n");
+            let tail = stderr_tail(&stderr, 400);
+            error!(
+                "ffmpeg audio extraction failed for '{}' (stream {} channel {}): {}",
+                path.display(),
+                absolute_stream_index,
+                channel_index,
+                tail
+            );
+            Err(format!(
+                "ffmpeg audio extraction failed: stream {} channel {} in '{}': {}",
+                absolute_stream_index,
+                channel_index,
+                path.display(),
+                tail
+            ))
+        }
+        Err(WatchdogStop::Cancelled) => {
+            let _ = std::fs::remove_file(output_wav);
+            Err("Audio extraction canceled".to_string())
+        }
+        Err(WatchdogStop::Stalled) => {
+            let _ = std::fs::remove_file(output_wav);
+            Err(format!(
+                "Audio extraction stalled: ffmpeg produced no output for {}s — input may be corrupt",
+                stall.as_secs()
+            ))
+        }
+        Err(WatchdogStop::Wait(e)) => {
+            let _ = std::fs::remove_file(output_wav);
+            Err(format!("Audio extraction wait error: {}", e))
         }
     }
-
-    let status = child.wait().map_err(|e| format!("Failed to wait for ffmpeg: {}", e))?;
-
-    if !status.success() {
-        let _ = std::fs::remove_file(output_wav);
-        let stderr = stderr_lines.join("\n");
-        let tail = stderr_tail(&stderr, 400);
-        error!(
-            "ffmpeg audio extraction failed for '{}' (stream {} channel {}): {}",
-            path.display(),
-            absolute_stream_index,
-            channel_index,
-            tail
-        );
-        return Err(format!(
-            "ffmpeg audio extraction failed: stream {} channel {} in '{}': {}",
-            absolute_stream_index,
-            channel_index,
-            path.display(),
-            tail
-        ));
-    }
-
-    info!("Audio extraction (with progress) successful: {}", output_wav.display());
-    Ok(())
 }
 
 // ── Keyframe lookup (stream-copy trim snapping) ──────────────────────────
@@ -859,5 +934,157 @@ mod tests {
         let path = Path::new("clip.mp4");
         let result = probe_stream_duration_secs_with(path, 0, &mut runner);
         assert!((result.unwrap() - 42.0).abs() < 0.001);
+    }
+
+    // ── extract_audio_channel_with (runner-based) ─────────────────────────
+
+    fn extract_success_runner(_args: &[String]) -> Result<Output, SubprocessFailure> {
+        Ok(Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn test_extract_audio_channel_with_success() {
+        let path = Path::new("test.mp4");
+        let out = Path::new("/tmp/_unused_test_extract.wav");
+        let result = extract_audio_channel_with(path, 1, 0, out, &mut extract_success_runner);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_extract_audio_channel_with_timeout() {
+        let mut runner = |_: &[String]| Err(SubprocessFailure::TimedOut);
+        let path = Path::new("corrupt.mp4");
+        let out = Path::new("/tmp/_test_extract_timeout.wav");
+        let result = extract_audio_channel_with(path, 1, 0, out, &mut runner);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("timed out"), "msg should mention timeout: {}", msg);
+    }
+
+    #[test]
+    fn test_extract_audio_channel_with_io_error() {
+        let mut runner = |_: &[String]| Err(SubprocessFailure::Io("binary not found".into()));
+        let path = Path::new("missing.mp4");
+        let out = Path::new("/tmp/_test_extract_io.wav");
+        let result = extract_audio_channel_with(path, 1, 0, out, &mut runner);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("Failed to run ffmpeg"), "msg: {}", msg);
+    }
+
+    // ── extract_audio_channel_with_progress_with (spawner-based) ────────
+
+    fn spawn_silent_child(_args: &[String]) -> std::io::Result<std::process::Child> {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "ping", "-n", "30", "127.0.0.1", ">nul"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.spawn()
+    }
+
+    #[test]
+    fn test_extract_with_progress_cancel_while_silent() {
+        let cancel = std::sync::Arc::new(AtomicBool::new(true));
+        let out = Path::new("/tmp/_test_extract_cancel.wav");
+        let fracs = std::sync::Mutex::new(Vec::new());
+        let start = std::time::Instant::now();
+
+        let result = extract_audio_channel_with_progress_with(
+            Path::new("dummy.mp4"),
+            1,
+            0,
+            out,
+            None,
+            Some(&cancel),
+            &|f| {
+                let mut p = fracs.lock().unwrap();
+                p.push(f);
+            },
+            &mut spawn_silent_child,
+            Duration::from_secs(30),
+        );
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(ref e) if e == "Audio extraction canceled"),
+            "expected cancel error, got {:?}", result);
+        assert!(elapsed < Duration::from_secs(5),
+            "cancel took {:?}", elapsed);
+    }
+
+    #[test]
+    fn test_extract_with_progress_stall_timeout() {
+        let out = Path::new("/tmp/_test_extract_stall.wav");
+        let start = std::time::Instant::now();
+
+        let result = extract_audio_channel_with_progress_with(
+            Path::new("dummy.mp4"),
+            1,
+            0,
+            out,
+            None,
+            None,
+            &|_| {},
+            &mut spawn_silent_child,
+            Duration::from_millis(200),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "expected stall error, got {:?}", result);
+        let msg = result.unwrap_err();
+        assert!(msg.contains("stalled") || msg.contains("stall"), "msg: {}", msg);
+        assert!(elapsed < Duration::from_secs(5),
+            "stall detection took {:?}", elapsed);
+    }
+
+    #[test]
+    fn test_extract_with_progress_parses_lines() {
+        let fracs = std::sync::Mutex::new(Vec::new());
+
+        let mut spawner = |_args: &[String]| {
+            let mut cmd = if cfg!(windows) {
+                let mut c = std::process::Command::new("cmd");
+                c.args(["/C", "echo out_time_us=5000000>&2 & echo out_time_us=10000000>&2"]);
+                c
+            } else {
+                let mut c = std::process::Command::new("sh");
+                c.args(["-c", "echo out_time_us=5000000 >&2; echo out_time_us=10000000 >&2"]);
+                c
+            };
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.spawn()
+        };
+
+        let out = Path::new("/tmp/_test_extract_lines.wav");
+
+        let result = extract_audio_channel_with_progress_with(
+            Path::new("dummy.mp4"),
+            1,
+            0,
+            out,
+            Some(10.0),
+            None,
+            &|f| {
+                let mut p = fracs.lock().unwrap();
+                p.push(f);
+            },
+            &mut spawner,
+            Duration::from_secs(5),
+        );
+
+        // Child exits 0 → success
+        assert!(result.is_ok(), "expected ok, got {:?}", result);
+        let p = fracs.lock().unwrap();
+        // Should have called on_frac with at least one value
+        assert!(!p.is_empty(), "at least one progress callback should fire, got {:?}", p);
     }
 }
