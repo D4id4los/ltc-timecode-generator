@@ -13,8 +13,8 @@ use crate::config;
 use crate::video_codecs::describe_chain;
 use crate::converter::{
     query_ffmpeg_capabilities, ConversionState, ConversionStatus, SharedConversionState,
-    CancelFlag, FfmpegCapabilities, ChannelMap, ConverterSettings, RecordingType,
-    duplicate_output_names, duplicate_output_warning, evaluate_readiness,
+    CancelFlag, FfmpegCapabilities, ChannelMap, ConversionPipeline, ConverterSettings,
+    RecordingType, duplicate_output_names, duplicate_output_warning, evaluate_readiness,
     output_collision_warning, preview_output_files, apply_available_defaults, spawn_conversion,
 };
 use crate::ffprobe::{self, VideoAudioProbe};
@@ -690,16 +690,34 @@ pub fn engine_main_with_probe<F>(
                         current.converter.device_name = Some(device_name);
                         current.converter.probes_loading = false;
                         info!("Converter clip probe complete: {} files", current.converter.probes.len());
-                        // Resize channel map to match the first successful probe's channel count
-                        let probe_channels = current.converter.probes.first()
-                            .and_then(|p| p.as_ref())
-                            .map(|p| p.total_audio_channels);
-                        let map_channels = current.converter.settings.channel_map.num_channels();
-                        if let Some(ch) = probe_channels {
-                            if ch > 0 && ch != map_channels {
-                                current.converter.settings.channel_map = ChannelMap::identity(ch);
-                                info!("Channel map resized to {} channels from probe", ch);
+                        // Resize channel map to match the first successful probe's channel count.
+                        // Only applies to VideoClipSequence groups — MultiTrackAudio groups
+                        // already have their map set to the file count in apply_recording_selection.
+                        let is_video_group = current.converter.selected_group_idx
+                            .and_then(|i| current.converter.groups.get(i))
+                            .map(|g| g.recording_type == RecordingType::VideoClipSequence)
+                            .unwrap_or(false);
+                        if is_video_group {
+                            let probe_channels = current.converter.probes.first()
+                                .and_then(|p| p.as_ref())
+                                .map(|p| p.total_audio_channels);
+                            let map_channels = current.converter.settings.channel_map.num_channels();
+                            if let Some(ch) = probe_channels {
+                                if ch > 0 && ch != map_channels {
+                                    current.converter.settings.channel_map = ChannelMap::identity(ch);
+                                    info!("Channel map resized to {} channels from probe (video group)", ch);
+                                }
                             }
+                        } else {
+                            let map_channels = current.converter.settings.channel_map.num_channels();
+                            info!(
+                                "Channel map not resized (audio group): map has {} channel(s), file count = {}",
+                                map_channels,
+                                current.converter.selected_group_idx
+                                    .and_then(|i| current.converter.groups.get(i))
+                                    .map(|g| g.files.len())
+                                    .unwrap_or(0),
+                            );
                         }
                         recompute_converter_derived(&mut current);
                     } else {
@@ -2239,12 +2257,32 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
         None
     };
 
+    // Defensive repair: for MultiTrackAudio groups the channel map dimension
+    // must equal the number of input files (each file = one track). If the
+    // stored map has a different size (e.g. from stale probe-based resize or
+    // identity(0) after selection), rebuild the correct identity permutation.
+    let channel_map = if matches!(pipeline, ConversionPipeline::AudioOnly { .. }) {
+        let correct_n = group.files.len();
+        if s.channel_map.num_channels() != correct_n {
+            log::info!(
+                "Repaired stale channel map: identity({}) → identity({}) \
+                 for MultiTrackAudio group '{}' ({} files)",
+                s.channel_map.num_channels(), correct_n, group.prefix, correct_n,
+            );
+            ChannelMap::identity(correct_n)
+        } else {
+            s.channel_map.clone()
+        }
+    } else {
+        s.channel_map.clone()
+    };
+
     Some(ConverterSettings {
         pipeline,
         input_files: group.files.clone(),
         recording_type: group.recording_type.clone(),
         ltc_track_channel_index: s.ltc_file_idx,
-        channel_map: s.channel_map.clone(),
+        channel_map,
         split_tracks: s.split_tracks,
         drop_ltc_track: s.drop_ltc_track,
         ltc_video_source,
@@ -2299,13 +2337,26 @@ fn apply_recording_selection(
     state.converter.probes_generation += 1;
     state.converter.conversion_state = ConversionState::idle();
     // Reset per-recording settings flags
+    let channel_count = state.converter.groups.get(idx)
+        .map(|g| {
+            if g.recording_type == RecordingType::MultiTrackAudio {
+                log::info!(
+                    "Setting channel map to identity({}) for MultiTrackAudio group '{}'",
+                    g.files.len(), g.prefix,
+                );
+                g.files.len()
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
     let s = &mut state.converter.settings;
     s.set_start_from_ltc = false;
     s.split_tracks = false;
     s.drop_ltc_track = false;
     s.concat_audio = false;
     s.ltc_file_idx = 0;
-    s.channel_map = ChannelMap::identity(0);
+    s.channel_map = ChannelMap::identity(channel_count);
     // Default output folder = input folder (source clip parent dir) if unset
     if s.output_folder.as_os_str().is_empty() {
         if let Some(ref gf) = state.converter.groups_folder {
@@ -2395,8 +2446,10 @@ fn auto_apply_group_ltc_to_settings(state: &mut AppStateSnapshot) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use super::*;
     use crate::converter::HwDeviceCapabilities;
+    use crate::file_pattern::MatchedGroup;
     use crate::state::AppStateSnapshot;
     use audio_core::Timecode;
     use std::collections::BTreeSet;
@@ -3447,5 +3500,78 @@ mod tests {
         // Should not panic on empty state, just bump generations
         assert_eq!(state.ltc_decode_generation, 1, "decode gen bumped from 0");
         assert_eq!(state.ltc_group_decode_generation, 1, "group decode gen bumped from 0");
+    }
+
+    // ── assemble_converter_settings ─────────────────────────────────────
+
+    fn make_audio_group(files: Vec<PathBuf>) -> MatchedGroup {
+        MatchedGroup {
+            prefix: "TASCAM_0097".to_string(),
+            rel_dir: String::new(),
+            files,
+            pattern_name: "TASCAM Portacapture X8",
+            recording_type: crate::converter::RecordingType::MultiTrackAudio,
+        }
+    }
+
+    #[test]
+    fn test_assemble_converter_settings_repairs_stale_map_for_audio() {
+        let mut state = setup_state();
+        let files: Vec<PathBuf> = (0..4).map(|i| {
+            PathBuf::from(format!("/tmp/TASCAM_0097S{}.wav", i + 1))
+        }).collect();
+        state.converter.groups = vec![make_audio_group(files)];
+        state.converter.selected_group_idx = Some(0);
+        state.converter.settings.channel_map = ChannelMap::identity(1);
+        state.converter.settings.ltc_file_idx = 0;
+        state.converter.settings.filename_prefix = "test".to_string();
+        state.converter.settings.output_folder = PathBuf::from("/tmp");
+        state.converter.settings.split_tracks = true;
+        state.converter.settings.drop_ltc_track = true;
+
+        let settings = assemble_converter_settings(&state)
+            .expect("assemble_converter_settings should return Some for valid state");
+
+        assert_eq!(
+            settings.channel_map.num_channels(),
+            4,
+            "audio group channel map should be repaired to file count (4), got {}",
+            settings.channel_map.num_channels()
+        );
+        assert_eq!(
+            settings.recording_type,
+            crate::converter::RecordingType::MultiTrackAudio,
+        );
+        assert_eq!(
+            settings.ltc_track_channel_index,
+            0,
+        );
+        assert!(matches!(settings.pipeline, crate::converter::ConversionPipeline::AudioOnly { .. }));
+    }
+
+    #[test]
+    fn test_assemble_converter_settings_does_not_repair_video_map() {
+        let mut state = setup_state();
+        state.converter.groups = vec![MatchedGroup {
+            prefix: "C0001".to_string(),
+            rel_dir: String::new(),
+            files: vec![PathBuf::from("/tmp/clip1.mp4")],
+            pattern_name: "Sony Handycam",
+            recording_type: crate::converter::RecordingType::VideoClipSequence,
+        }];
+        state.converter.selected_group_idx = Some(0);
+        state.converter.settings.channel_map = ChannelMap::identity(2);
+        state.converter.settings.filename_prefix = "test".to_string();
+        state.converter.settings.output_folder = PathBuf::from("/tmp");
+
+        let settings = assemble_converter_settings(&state)
+            .expect("assemble_converter_settings should return Some");
+
+        assert_eq!(
+            settings.channel_map.num_channels(),
+            2,
+            "video group channel map must NOT be repaired, should stay at probe size (2)"
+        );
+        assert!(matches!(settings.pipeline, crate::converter::ConversionPipeline::VideoPassthrough));
     }
 }

@@ -195,6 +195,7 @@ export component AppWindow inherits Window {
 
     // ── LTC detection callbacks ──
     callback ltc-detect;
+    callback ltc-file-selected(int);
     callback channel-selected(int);
     callback decode-fps-selected(int);
     callback cancel-decode;
@@ -720,6 +721,7 @@ export component AppWindow inherits Window {
                     ltc-probe-failed: root.conv-ltc-probe-failed;
                     ltc-probe-loading: root.conv-ltc-probe-loading;
                     detect-ltc => { root.ltc-detect(); }
+                    ltc-file-selected(val) => { root.ltc-file-selected(val); }
                     channel-selected(val) => { root.channel-selected(val); }
                     decode-fps-selected(val) => { root.decode-fps-selected(val); }
                     cancel-decode => { root.cancel-decode(); }

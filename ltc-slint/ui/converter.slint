@@ -71,6 +71,7 @@ export component ConverterSection {
     in-out property <bool> ltc-probe-failed: false;
     in-out property <bool> ltc-probe-loading: false;
     callback channel-selected(int);
+    callback ltc-file-selected(int);
 
     callback detect-ltc;
     callback decode-fps-selected(int);
@@ -228,6 +229,7 @@ export component ConverterSection {
                                     } else {
                                         root.ltc-file-idx = 0;
                                     }
+                                    root.ltc-file-selected(root.ltc-file-idx);
                                 }
                             }
                             Text {

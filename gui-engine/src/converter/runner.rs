@@ -382,6 +382,7 @@ fn run_audio_to_audio(
         .unwrap_or(48000);
 
     if settings.split_tracks {
+        let mut emitted = 0usize;
         for track_idx in 0..settings.channel_map.num_channels() {
             if settings.drop_ltc_track && track_idx == settings.ltc_track_channel_index {
                 continue;
@@ -401,6 +402,22 @@ fn run_audio_to_audio(
                 mark_conversion_failed(state, overall_log);
                 return;
             }
+            emitted += 1;
+        }
+        if emitted == 0 {
+            let msg = format!(
+                "No output tracks produced: all {} track(s) were dropped \
+                 (split_tracks={}, drop_ltc_track={}, ltc_track_channel_index={}, \
+                  channel_map channels={}). Check LTC track selection.",
+                settings.channel_map.num_channels(),
+                settings.split_tracks,
+                settings.drop_ltc_track,
+                settings.ltc_track_channel_index,
+                settings.channel_map.num_channels(),
+            );
+            log::warn!("{}", msg);
+            overall_log.push_str(&format!("\n\n--- {} ---", msg));
+            mark_conversion_failed(state, overall_log);
         }
     } else {
         let tc = settings
@@ -996,8 +1013,101 @@ fn run_metadata_only(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::converter::test_fixtures::*;
+    use crate::{ChannelMap, CancelFlag, ConversionState, ConversionStatus, SharedConversionState};
     use super::*;
+
+    fn fresh_state() -> SharedConversionState {
+        Arc::new(Mutex::new(ConversionState::idle()))
+    }
+
+    fn fresh_cancel() -> CancelFlag {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    /// Create a short PCM 16-bit mono WAV file in the given directory.
+    fn create_test_wav(dir: &std::path::Path, name: &str, sample_rate: u32, duration_secs: f64) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let num_samples = (sample_rate as f64 * duration_secs) as u32;
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..num_samples {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_run_audio_to_audio_split_all_dropped_fails() {
+        let mut settings = make_settings_audio_only();
+        settings.split_tracks = true;
+        settings.drop_ltc_track = true;
+        settings.channel_map = ChannelMap::identity(1);
+        settings.ltc_track_channel_index = 0;
+
+        let state = fresh_state();
+        let cancel = fresh_cancel();
+        let mut progress = 0.0f32;
+        let mut log = String::new();
+        let total_steps = 1;
+
+        run_audio_to_audio(
+            &settings, "wav", "wav", &state, &cancel,
+            total_steps, &mut progress, &mut log,
+        );
+
+        let s = state.lock().unwrap();
+        assert!(
+            matches!(&s.status, ConversionStatus::Failed { .. }),
+            "expected Failed when all tracks are dropped, got {:?}",
+            s.status
+        );
+        assert!(
+            progress == 0.0,
+            "progress must remain 0 when no ffmpeg ran, got {}",
+            progress
+        );
+    }
+
+    #[test]
+    fn test_run_audio_to_audio_split_one_survives_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav1 = create_test_wav(dir.path(), "ch1.wav", 48000, 0.25);
+        let wav2 = create_test_wav(dir.path(), "ch2.wav", 48000, 0.25);
+
+        let mut settings = make_settings_audio_only();
+        settings.input_files = vec![wav1, wav2];
+        settings.split_tracks = true;
+        settings.drop_ltc_track = true;
+        settings.channel_map = ChannelMap::identity(2);
+        settings.ltc_track_channel_index = 1;
+
+        let state = fresh_state();
+        let cancel = fresh_cancel();
+        let mut progress = 0.0f32;
+        let mut log = String::new();
+        let total_steps = 2;
+
+        run_audio_to_audio(
+            &settings, "wav", "wav", &state, &cancel,
+            total_steps, &mut progress, &mut log,
+        );
+
+        let s = state.lock().unwrap();
+        assert!(
+            matches!(&s.status, ConversionStatus::Running { .. } | ConversionStatus::Completed),
+            "expected Running or Completed when one track survives, got {:?}",
+            s.status
+        );
+    }
 
     #[test]
     fn test_encoder_fallback_remaining_skips_failed() {

@@ -667,6 +667,14 @@ fn _run_gui(
         });
     }
 
+    // ── LTC file index changed callback ────────────────────────────────────
+    {
+        let cmd = cmd_tx.clone();
+        ui.on_ltc_file_selected(move |idx| {
+            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(idx as usize)));
+        });
+    }
+
     // ── LTC detection callback ─────────────────────────────────────────────
     {
         let ui_weak = ui.as_weak();
@@ -685,8 +693,11 @@ fn _run_gui(
                 .unwrap_or_default();
             let files = &group.files;
             if files.is_empty() { return; }
-            let ltc_idx = 0;
-            if ltc_idx >= files.len() { return; }
+            // Use the UI-selected LTC file index (for audio groups)
+            let ltc_idx = ui_weak.upgrade()
+                .map(|u| u.get_ltc_file_idx() as usize)
+                .unwrap_or(0)
+                .min(files.len().saturating_sub(1));
             let file_name = files[ltc_idx].file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
