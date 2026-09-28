@@ -390,8 +390,18 @@ pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAu
             let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
             let mut previews = Vec::new();
             if settings.recording_type == super::settings::RecordingType::VideoClipSequence {
-                let num_channels = settings.channel_map.num_channels();
-                if settings.split_tracks {
+                let use_concat = settings.concat_audio && settings.split_tracks;
+                if use_concat {
+                    let probes: Vec<Option<VideoAudioProbe>> =
+                        (0..settings.input_files.len()).map(|_| probe.cloned()).collect();
+                    let (concat_steps, _warning) = plan_concat_outputs(settings, &probes);
+                    for step in &concat_steps {
+                        if let VideoOutputStep::AudioChannelConcat { output, .. } = step {
+                            previews.push(PreviewOutput { kind: OutputKind::Audio, path: output.clone() });
+                        }
+                    }
+                } else if settings.split_tracks {
+                    let num_channels = settings.channel_map.num_channels();
                     for i in 0..num_channels {
                         if settings.drop_ltc_track && i == settings.ltc_track_channel_index {
                             continue;
@@ -571,6 +581,7 @@ pub fn duplicate_output_warning(duplicate_names: &[String]) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
     use crate::converter::test_fixtures::*;
+    use crate::converter::{ChannelMap, ConversionPipeline, RecordingType};
     use super::*;
 
     fn make_drop_settings(channels: usize, drop_ltc: bool, ltc_source: Option<(usize, usize)>, split: bool) -> ConverterSettings {
@@ -843,5 +854,25 @@ mod tests {
         assert!(msg.contains("{clip}"));
         assert!(msg.contains("{track}"));
         assert!(msg.contains("{filename}"));
+    }
+
+    #[test]
+    fn test_preview_metadata_only_concat() {
+        let mut s = make_video_settings();
+        s.pipeline = ConversionPipeline::MetadataOnly;
+        s.input_files = vec![
+            PathBuf::from("/tmp/clip1.mp4"),
+            PathBuf::from("/tmp/clip2.mp4"),
+        ];
+        s.channel_map = ChannelMap::identity(2);
+        s.split_tracks = true;
+        s.concat_audio = true;
+        s.recording_type = RecordingType::VideoClipSequence;
+        let preview = preview_output_files(&s, Some(&make_stereo_probe()));
+        let audio_count = preview
+            .iter()
+            .filter(|p| matches!(p.kind, OutputKind::Audio))
+            .count();
+        assert_eq!(audio_count, 2, "MetadataOnly+split+concat should show one audio per track");
     }
 }

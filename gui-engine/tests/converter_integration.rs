@@ -492,6 +492,104 @@ fn test_concat_audio_across_two_video_clips() {
     }
 }
 
+#[test]
+fn test_metadata_only_concat_audio_across_two_video_clips() {
+    let caps = query_ffmpeg_capabilities();
+    if !caps.has_ffmpeg {
+        eprintln!("--- SKIPPED: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let clip1 = dir.path().join("clip1.mp4");
+    let clip2 = dir.path().join("clip2.mp4");
+
+    create_test_video_with_tone(&clip1, 0.3, 440, 48000);
+    create_test_video_with_tone(&clip2, 0.2, 880, 48000);
+
+    let settings = ConverterSettings {
+        pipeline: ConversionPipeline::MetadataOnly,
+        input_files: vec![clip1.clone(), clip2.clone()],
+        recording_type: RecordingType::VideoClipSequence,
+        ltc_track_channel_index: 0,
+        channel_map: ChannelMap::identity(1),
+        split_tracks: true,
+        drop_ltc_track: false,
+        ltc_video_source: None,
+        container: "mkv".to_string(),
+        copy_video: false,
+        video_encoder: "h264".to_string(),
+        audio_encoder: "pcm_s24le".to_string(),
+        resolved_video_encoder: String::new(),
+        output_folder: dir.path().to_path_buf(),
+        filename_prefix: "{filename}".to_string(),
+        audio_suffix_template: "_audio_track{track:01d}".to_string(),
+        video_suffix_template: "_video_clip{clip:02d}".to_string(),
+        set_start_from_ltc: false,
+        embed_camera_metadata: false,
+        trim_offsets_secs: vec![0.0, 0.0],
+        timecode_meta_per_file: vec![None, None],
+        camera_meta_per_file: vec![None; 2],
+        device_name: None,
+        concat_audio: true,
+        resolved_hw_device: None,
+    };
+
+    let state: Arc<Mutex<ConversionState>> = Arc::new(Mutex::new(ConversionState::idle()));
+    let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
+
+    let (final_status, _max_progress, log) =
+        poll_conversion(&state, &cancel, Duration::from_secs(30));
+
+    handle.join().expect("conversion thread panicked");
+
+    assert!(
+        matches!(final_status, ConversionStatus::Completed),
+        "Expected Completed, got {:?}. Log:\n{}",
+        final_status,
+        log,
+    );
+
+    // With concat + 1 channel: exactly 1 concatenated audio file
+    let audio_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|ext| ext == "wav").unwrap_or(false))
+        .collect();
+    assert_eq!(
+        audio_files.len(),
+        1,
+        "Expected exactly 1 concatenated audio file, got {} (files: {:?})",
+        audio_files.len(),
+        audio_files.iter().map(|e| e.path().display().to_string()).collect::<Vec<_>>(),
+    );
+
+    // Verify duration matches sum of both clips
+    let concat_path = audio_files[0].path();
+    let reader = hound::WavReader::open(&concat_path).expect("Could not open concatenated WAV");
+    let spec = reader.spec();
+    let num_samples = reader.duration() as u64;
+    let expected_samples = ((0.3 + 0.2) * spec.sample_rate as f64).round() as u64;
+    let tolerance = (spec.sample_rate as f64 * 0.05) as u64; // 50 ms tolerance
+    assert!(
+        num_samples.abs_diff(expected_samples) <= tolerance,
+        "Expected ~{} samples, got {} (tolerance: {})",
+        expected_samples, num_samples, tolerance,
+    );
+
+    // Verify the video files were renamed (MetadataOnly renames in place)
+    let renamed1 = dir.path().join("clip1_video_clip01.mp4");
+    let renamed2 = dir.path().join("clip2_video_clip02.mp4");
+    assert!(renamed1.exists(), "Renamed clip1 not found: {}", renamed1.display());
+    assert!(renamed2.exists(), "Renamed clip2 not found: {}", renamed2.display());
+
+    // Assert original input files no longer exist
+    assert!(!clip1.exists(), "Original clip1 should have been renamed");
+    assert!(!clip2.exists(), "Original clip2 should have been renamed");
+}
+
 // ── Stream-copy mode ("Leave Video Encoding Untouched") ─────────────────
 
 /// Create an MP4 with MPEG-4 Part 2 video (universally available encoder)

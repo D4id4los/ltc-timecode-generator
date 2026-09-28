@@ -629,8 +629,12 @@ fn run_metadata_only(
     let input_files = &settings.input_files;
     let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
     let is_video = settings.recording_type == RecordingType::VideoClipSequence;
+    let use_concat = is_video && settings.concat_audio && settings.split_tracks;
 
-    for file_idx in 0..input_files.len() {
+    // Phase A: probe all files upfront so plan_concat_outputs can see every clip
+    let mut probes: Vec<Option<crate::ffprobe::VideoAudioProbe>> =
+        Vec::with_capacity(input_files.len());
+    for input_path in input_files.iter() {
         if cancel.load(Ordering::Relaxed) {
             overall_log.push_str("\n--- CANCELLED ---\n");
             let mut s = state.lock().unwrap();
@@ -639,9 +643,6 @@ fn run_metadata_only(
             };
             return;
         }
-
-        let input_path = &input_files[file_idx];
-        let tc = settings.timecode_meta_per_file.get(file_idx).and_then(|m| m.as_ref());
 
         let probed: Option<crate::ffprobe::VideoAudioProbe> = if is_video {
             match crate::ffprobe::probe_video_audio(input_path) {
@@ -654,58 +655,208 @@ fn run_metadata_only(
                     );
                     log::warn!("{}", msg.trim());
                     overall_log.push_str(&msg);
-                    let sw = 1.0 / total_steps as f32;
-                    *overall_progress += sw;
                     None
                 }
             }
         } else {
             None
         };
+        probes.push(probed);
+    }
 
-        if let Some(ref probe) = probed {
-            let channels: Vec<(usize, usize)> = probe
-                .streams
-                .iter()
-                .flat_map(|s| (0..s.channels).map(move |ch| (s.stream_index, ch)))
-                .collect();
-            let map_n = settings.channel_map.num_channels();
-            let use_split = settings.split_tracks && map_n > 0;
-            let step_weight = 1.0 / total_steps as f32;
+    // Phase B: audio extraction
+    let total_actual;
+    if use_concat {
+        let (concat_steps, warning) = plan_concat_outputs(settings, &probes);
+        if !warning.is_empty() {
+            let w = warning.trim().to_string();
+            warn!("{}", w);
+            overall_log.push_str(&format!("\n--- {}\n", w));
+        }
+        let extraction_count = concat_steps.len();
+        total_actual = extraction_count + input_files.len();
+        let step_weight = if total_actual > 0 {
+            1.0 / total_actual as f32
+        } else {
+            0.0
+        };
 
-            if use_split {
-                let mut emitted = 0usize;
-                for output_k in 0..map_n {
-                    if cancel.load(Ordering::Relaxed) {
-                        break;
+        for (step_idx, step) in concat_steps.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                overall_log.push_str("\n--- CANCELLED ---\n");
+                let mut s = state.lock().unwrap();
+                s.status = ConversionStatus::Failed {
+                    error_log: "Cancelled by user".into(),
+                };
+                return;
+            }
+            match step {
+                VideoOutputStep::AudioChannelConcat {
+                    segments,
+                    output,
+                    format,
+                    sample_rate,
+                } => {
+                    if run_ffmpeg_process(
+                        &build_concat_audio_args(settings, segments, format, *sample_rate),
+                        output,
+                        state,
+                        cancel,
+                        step_weight,
+                        overall_progress,
+                        overall_log,
+                        total_actual,
+                        step_idx + 1,
+                    )
+                    .is_err()
+                    {
+                        let msg = format!(
+                            "✗ audio concatenation step {} failed\n",
+                            step_idx + 1
+                        );
+                        overall_log.push_str(&msg);
                     }
-                    let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
-                        continue;
-                    };
-                    if input_i >= channels.len() {
-                        continue;
+                }
+                VideoOutputStep::AudioChannel {
+                    file_idx,
+                    stream_idx,
+                    channel_idx,
+                    output,
+                    format,
+                } => {
+                    let sr = probes[*file_idx]
+                        .as_ref()
+                        .and_then(|p| {
+                            p.streams.iter().find(|s| s.stream_index == *stream_idx)
+                        })
+                        .map(|s| s.sample_rate)
+                        .unwrap_or(48000);
+                    if run_ffmpeg_process(
+                        &build_video_track_extract_args(
+                            settings, *file_idx, *stream_idx, *channel_idx, format, sr,
+                        ),
+                        output,
+                        state,
+                        cancel,
+                        step_weight,
+                        overall_progress,
+                        overall_log,
+                        total_actual,
+                        step_idx + 1,
+                    )
+                    .is_err()
+                    {
+                        let msg = format!(
+                            "✗ {} — audio extraction failed\n",
+                            input_files[*file_idx].display()
+                        );
+                        overall_log.push_str(&msg);
                     }
-                    let (stream_idx, ch_idx) = channels[input_i];
-                    let is_ltc = settings.ltc_video_source == Some((stream_idx, ch_idx));
-                    if settings.drop_ltc_track && is_ltc {
-                        continue;
+                }
+                _ => {}
+            }
+        }
+    } else {
+        total_actual = total_steps;
+        for (file_idx, probed) in probes.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                overall_log.push_str("\n--- CANCELLED ---\n");
+                let mut s = state.lock().unwrap();
+                s.status = ConversionStatus::Failed {
+                    error_log: "Cancelled by user".into(),
+                };
+                return;
+            }
+
+            let input_path = &input_files[file_idx];
+
+            if let Some(ref probe) = probed {
+                let channels: Vec<(usize, usize)> = probe
+                    .streams
+                    .iter()
+                    .flat_map(|s| (0..s.channels).map(move |ch| (s.stream_index, ch)))
+                    .collect();
+                let map_n = settings.channel_map.num_channels();
+                let use_split = settings.split_tracks && map_n > 0;
+                let step_weight = 1.0 / total_steps as f32;
+
+                if use_split {
+                    let mut emitted = 0usize;
+                    for output_k in 0..map_n {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let Some(input_i) =
+                            settings.channel_map.input_for_output(output_k)
+                        else {
+                            continue;
+                        };
+                        if input_i >= channels.len() {
+                            continue;
+                        }
+                        let (stream_idx, ch_idx) = channels[input_i];
+                        let is_ltc =
+                            settings.ltc_video_source == Some((stream_idx, ch_idx));
+                        if settings.drop_ltc_track && is_ltc {
+                            continue;
+                        }
+                        emitted += 1;
+                        let output_path =
+                            settings.output_path_for_file("audio", file_idx, emitted, aext);
+                        let sample_rate = probe
+                            .streams
+                            .iter()
+                            .find(|s| s.stream_index == stream_idx)
+                            .map(|s| s.sample_rate)
+                            .unwrap_or(48000);
+                        let args = build_video_track_extract_args(
+                            settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
+                        );
+                        if run_ffmpeg_process(
+                            &args,
+                            &output_path,
+                            state,
+                            cancel,
+                            step_weight,
+                            overall_progress,
+                            overall_log,
+                            total_steps,
+                            file_idx * 3 + 1,
+                        )
+                        .is_err()
+                        {
+                            let msg = format!(
+                                "✗ {} — audio extraction failed\n",
+                                input_path.display()
+                            );
+                            overall_log.push_str(&msg);
+                        }
                     }
-                    emitted += 1;
-                    let output_path =
-                        settings.output_path_for_file("audio", file_idx, emitted, aext);
+                    if emitted == 0 {
+                        *overall_progress += step_weight;
+                    }
+                } else {
+                    let output_path = settings.merged_audio_output_path(aext);
+                    let (stream_idx, ch_idx) =
+                        channels.first().copied().unwrap_or((0, 0));
                     let sample_rate = probe
                         .streams
-                        .iter()
-                        .find(|s| s.stream_index == stream_idx)
+                        .first()
                         .map(|s| s.sample_rate)
                         .unwrap_or(48000);
                     let args = build_video_track_extract_args(
                         settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
                     );
                     if run_ffmpeg_process(
-                        &args, &output_path, state, cancel,
-                        step_weight, overall_progress, overall_log,
-                        total_steps, file_idx * 3 + 1,
+                        &args,
+                        &output_path,
+                        state,
+                        cancel,
+                        step_weight,
+                        overall_progress,
+                        overall_log,
+                        total_steps,
+                        file_idx * 3 + 1,
                     )
                     .is_err()
                     {
@@ -716,39 +867,15 @@ fn run_metadata_only(
                         overall_log.push_str(&msg);
                     }
                 }
-                if emitted == 0 {
-                    *overall_progress += step_weight;
-                }
-            } else {
-                let output_path = settings.merged_audio_output_path(aext);
-                let (stream_idx, ch_idx) = channels.first().copied().unwrap_or((0, 0));
-                let sample_rate = probe
-                    .streams
-                    .first()
-                    .map(|s| s.sample_rate)
-                    .unwrap_or(48000);
-                let args = build_video_track_extract_args(
-                    settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
-                );
-                if run_ffmpeg_process(
-                    &args, &output_path, state, cancel,
-                    step_weight, overall_progress, overall_log,
-                    total_steps, file_idx * 3 + 1,
-                )
-                .is_err()
-                {
-                    let msg = format!(
-                        "✗ {} — audio extraction failed\n",
-                        input_path.display()
-                    );
-                    overall_log.push_str(&msg);
-                }
+            } else if !is_video {
+                let sw = 1.0 / total_steps as f32;
+                *overall_progress += sw;
             }
-        } else if !is_video {
-            let sw = 1.0 / total_steps as f32;
-            *overall_progress += sw;
         }
+    }
 
+    // Phase C: per-file tagging + rename
+    for (file_idx, _probed) in probes.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             overall_log.push_str("\n--- CANCELLED ---\n");
             let mut s = state.lock().unwrap();
@@ -758,7 +885,16 @@ fn run_metadata_only(
             return;
         }
 
-        let camera = settings.camera_meta_per_file.get(file_idx).and_then(|c| c.as_ref());
+        let input_path = &input_files[file_idx];
+        let tc = settings
+            .timecode_meta_per_file
+            .get(file_idx)
+            .and_then(|m| m.as_ref());
+
+        let camera = settings
+            .camera_meta_per_file
+            .get(file_idx)
+            .and_then(|c| c.as_ref());
         if let Some(tc_meta) = tc {
             match crate::tagger::tag_file(input_path, tc_meta, camera) {
                 Ok(outcome) => {
@@ -770,7 +906,11 @@ fn run_metadata_only(
                             format!("✓ {} — tagged via ffmpeg\n", input_path.display())
                         }
                         crate::tagger::TagOutcome::Skipped { reason } => {
-                            format!("⚠ {} — skipped tagging: {}\n", input_path.display(), reason)
+                            format!(
+                                "⚠ {} — skipped tagging: {}\n",
+                                input_path.display(),
+                                reason
+                            )
                         }
                     };
                     overall_log.push_str(&msg);
@@ -833,7 +973,11 @@ fn run_metadata_only(
             }
         }
 
-        let step_weight = 1.0 / total_steps as f32;
+        let step_weight = if total_actual > 0 {
+            1.0 / total_actual as f32
+        } else {
+            0.0
+        };
         *overall_progress += step_weight;
         {
             let mut s = state.lock().unwrap();
