@@ -131,7 +131,7 @@ impl NameTemplate {
 
 // ── Default templates ───────────────────────────────────────────────────
 
-pub const DEFAULT_PREFIX: &str = "{filename}";
+pub const DEFAULT_PREFIX: &str = "{device}";
 pub const DEFAULT_AUDIO_SUFFIX: &str = "_clip{clip:01d}_tr{track:01d}";
 pub const DEFAULT_VIDEO_SUFFIX: &str = "_clip{clip:01d}";
 

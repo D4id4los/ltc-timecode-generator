@@ -7,7 +7,7 @@ use crate::converter::{
 };
 use crate::ffprobe::VideoAudioProbe;
 use crate::file_pattern::MatchedGroup;
-use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX};
+use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, DEFAULT_PREFIX};
 use crate::offload::OffloadSnapshot;
 use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
 
@@ -79,7 +79,7 @@ impl ConverterUserSettings {
             video_encoder: "h265".to_string(),
             audio_encoder: "pcm_s24le".to_string(),
             output_folder: PathBuf::new(),
-            filename_prefix: String::new(),
+            filename_prefix: DEFAULT_PREFIX.to_string(),
             audio_suffix_template: DEFAULT_AUDIO_SUFFIX.to_string(),
             video_suffix_template: DEFAULT_VIDEO_SUFFIX.to_string(),
         }
