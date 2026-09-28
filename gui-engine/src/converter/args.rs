@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::camera_meta::CameraInfo;
 use crate::converter::formats::{container_to_ffmpeg_format};
 use crate::converter::planning::{AudioKeep, VideoOutputStep};
 use crate::converter::settings::ConverterSettings;
@@ -423,26 +424,102 @@ pub fn push_metadata_args(
             args.push("-metadata".to_string());
             args.push(format!("origination_date={}", date));
         }
+        if let Some(c) = camera {
+            // Only write description when lens is present (model alone is
+            // already covered by the originator field).
+            if let Some(ref lens) = c.lens {
+                let model = c.model.as_deref().unwrap_or("");
+                if !model.is_empty() {
+                    args.push("-metadata".to_string());
+                    args.push(format!("description={} / {}", model, lens));
+                } else {
+                    args.push("-metadata".to_string());
+                    args.push(format!("description={}", lens));
+                }
+            }
+        }
     } else {
         let is_mov_like = matches!(format, "mov" | "mp4" | "m4v" | "ipod");
-        if let Some(ref make_str) = camera.and_then(|c| c.make.as_ref()) {
-            if is_mov_like {
-                args.push("-metadata".to_string());
-                args.push(format!("com.apple.quicktime.make={}", make_str));
-            } else {
-                args.push("-metadata".to_string());
-                args.push(format!("make={}", make_str));
-            }
+        push_camera_metadata(args, camera, is_mov_like, format);
+    }
+}
+
+/// Push camera metadata keys for non-WAV outputs.
+///
+/// This helper is public so `tagger.rs` (ffmpeg fallback) can reuse it.
+/// `is_mov_like` controls Apple-compatible key naming; `format` is used for
+/// `-movflags` (only for mov/mp4/m4v when extended keys are present).
+pub fn push_camera_metadata(
+    args: &mut Vec<String>,
+    camera: Option<&CameraInfo>,
+    is_mov_like: bool,
+    _format: &str,
+) {
+    let c = match camera {
+        Some(c) => c,
+        None => return,
+    };
+
+    // make / model
+    if let Some(ref make_str) = c.make {
+        if is_mov_like {
+            args.push("-metadata".to_string());
+            args.push(format!("com.apple.quicktime.make={}", make_str));
+        } else {
+            args.push("-metadata".to_string());
+            args.push(format!("make={}", make_str));
         }
-        if let Some(ref model_str) = camera.and_then(|c| c.model.as_ref()) {
-            if is_mov_like {
-                args.push("-metadata".to_string());
-                args.push(format!("com.apple.quicktime.model={}", model_str));
-            } else {
-                args.push("-metadata".to_string());
-                args.push(format!("model={}", model_str));
-            }
+    }
+    if let Some(ref model_str) = c.model {
+        if is_mov_like {
+            args.push("-metadata".to_string());
+            args.push(format!("com.apple.quicktime.model={}", model_str));
+        } else {
+            args.push("-metadata".to_string());
+            args.push(format!("model={}", model_str));
         }
+    }
+
+    // Extended keys — check if any are present before pushing metadata flags
+    let has_extended = c.lens.is_some()
+        || c.serial.is_some()
+        || c.gamma.is_some()
+        || c.exposure_summary.is_some()
+        || c.creation_time.is_some();
+
+    if !has_extended {
+        return;
+    }
+
+    // For mov/mp4/m4v, arbitrary keys need -movflags use_metadata_tags.
+    // Multiple occurrences are harmless (ffmpeg uses the last value).
+    if is_mov_like {
+        args.push("-movflags".to_string());
+        args.push("use_metadata_tags".to_string());
+    }
+
+    if let Some(ref lens) = c.lens {
+        args.push("-metadata".to_string());
+        args.push(format!("lens={}", lens));
+    }
+    if let Some(ref serial) = c.serial {
+        args.push("-metadata".to_string());
+        args.push(format!("serial={}", serial));
+    }
+    if let Some(ref gamma) = c.gamma {
+        args.push("-metadata".to_string());
+        args.push(format!("gamma={}", gamma));
+    }
+    if let Some(ref ct) = c.creation_time {
+        // creation_time is a whitelisted key → maps to ©day in MP4/MOV,
+        // DateUTC in Matroska.
+        args.push("-metadata".to_string());
+        args.push(format!("creation_time={}", ct));
+    }
+    if let Some(ref summary) = c.exposure_summary {
+        // comment maps to ©cmt in MP4/MOV, COMMENT in Matroska
+        args.push("-metadata".to_string());
+        args.push(format!("comment={}", summary));
     }
 }
 
@@ -695,6 +772,33 @@ mod tests {
                 model: Some("NEX-FS100EK".to_string()),
                 source: CameraMetaSource::ExifTool,
                 creation_date: Some("2024-01-01".to_string()),
+                lens: None,
+                serial: None,
+                creation_time: None,
+                gamma: None,
+                native_timecode: None,
+                exposure_summary: None,
+            }),
+            None,
+        ];
+        s
+    }
+
+    fn make_extended_camera_settings() -> ConverterSettings {
+        let mut s = make_settings_audio_only();
+        s.embed_camera_metadata = true;
+        s.camera_meta_per_file = vec![
+            Some(CameraInfo {
+                make: Some("Sony".to_string()),
+                model: Some("ILCE-6700".to_string()),
+                source: CameraMetaSource::ExifTool,
+                creation_date: Some("2026-09-25".to_string()),
+                lens: Some("E PZ 18-105mm F4 G OSS".to_string()),
+                serial: None,
+                creation_time: Some("2026-09-25T20:45:22+01:00".to_string()),
+                gamma: Some("ex-cine4".to_string()),
+                native_timecode: Some("08:09:59:15".to_string()),
+                exposure_summary: Some("Manual exp".to_string()),
             }),
             None,
         ];
@@ -761,6 +865,12 @@ mod tests {
                 model: Some("GH6".to_string()),
                 source: CameraMetaSource::FfprobeTags,
                 creation_date: None,
+                lens: None,
+                serial: None,
+                creation_time: None,
+                gamma: None,
+                native_timecode: None,
+                exposure_summary: None,
             }),
         ];
         let mut args = vec![];
@@ -783,11 +893,100 @@ mod tests {
     #[test]
     fn test_push_metadata_idx_returns_none_when_entry_is_none() {
         let s = make_camera_settings();
-        // Index 1 has None camera → no camera metadata pushed
         let mut args = vec![];
         push_metadata_args(&mut args, &s, Some(1), "wav");
         let joined = args.join(" ");
         assert!(joined.contains("-write_bext 1"));
         assert!(joined.contains("originator=LTC Timecode Generator"));
+    }
+
+    // ── Extended metadata tests ─────────────────────────────────────
+
+    fn has_movflags(joined: &str) -> bool {
+        joined.contains("-movflags use_metadata_tags")
+    }
+
+    #[test]
+    fn test_push_metadata_wav_extended_description() {
+        let s = make_extended_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "wav");
+        let joined = args.join(" ");
+        assert!(joined.contains("-write_bext 1"));
+        assert!(joined.contains("originator=Sony ILCE-6700"));
+        assert!(joined.contains("description=ILCE-6700 / E PZ 18-105mm F4 G OSS"));
+    }
+
+    #[test]
+    fn test_push_metadata_mov_extended_has_movflags_and_extended_keys() {
+        let s = make_extended_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "mov");
+        let joined = args.join(" ");
+        assert!(joined.contains("com.apple.quicktime.make=Sony"));
+        assert!(joined.contains("com.apple.quicktime.model=ILCE-6700"));
+        assert!(has_movflags(&joined),
+            "mov output with extended keys needs -movflags use_metadata_tags");
+        assert!(joined.contains("lens=E PZ 18-105mm F4 G OSS"));
+        assert!(joined.contains("creation_time=2026-09-25T20:45:22+01:00"));
+        assert!(joined.contains("gamma=ex-cine4"));
+        assert!(joined.contains("comment=Manual exp"));
+        assert!(!joined.contains("serial="));
+    }
+
+    #[test]
+    fn test_push_metadata_mkv_extended_keys() {
+        let s = make_extended_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "matroska");
+        let joined = args.join(" ");
+        assert!(joined.contains("make=Sony"));
+        assert!(joined.contains("model=ILCE-6700"));
+        assert!(!has_movflags(&joined));
+        assert!(joined.contains("lens=E PZ 18-105mm F4 G OSS"));
+        assert!(joined.contains("creation_time=2026-09-25T20:45:22+01:00"));
+        assert!(joined.contains("gamma=ex-cine4"));
+        assert!(joined.contains("comment=Manual exp"));
+    }
+
+    #[test]
+    fn test_push_metadata_mov_no_extended_keys_no_movflags() {
+        // CameraInfo with only make/model (no extended fields) → no -movflags
+        let s = make_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "mov");
+        let joined = args.join(" ");
+        assert!(joined.contains("com.apple.quicktime.make=Sony"));
+        assert!(joined.contains("com.apple.quicktime.model=NEX-FS100EK"));
+        assert!(!has_movflags(&joined),
+            "no -movflags when only make/model are present");
+    }
+
+    #[test]
+    fn test_push_metadata_mp4_extended_has_movflags() {
+        let s = make_extended_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "mp4");
+        let joined = args.join(" ");
+        assert!(joined.contains("com.apple.quicktime.make=Sony"));
+        assert!(has_movflags(&joined));
+    }
+
+    #[test]
+    fn test_push_metadata_push_camera_metadata_empty() {
+        let mut args = vec![];
+        push_camera_metadata(&mut args, None, true, "mov");
+        assert!(args.is_empty(), "no args when camera is None");
+    }
+
+    #[test]
+    fn test_push_metadata_wav_no_description_when_only_make_model() {
+        let s = make_camera_settings();
+        let mut args = vec![];
+        push_metadata_args(&mut args, &s, Some(0), "wav");
+        let joined = args.join(" ");
+        // No lens → no description tag expected
+        assert!(!joined.contains("description="),
+            "no description when camera has no lens/model info beyond originator");
     }
 }

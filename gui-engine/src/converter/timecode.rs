@@ -144,6 +144,23 @@ pub fn build_per_file_trim_and_timecode(
     (trims, metas)
 }
 
+/// Parse a native camera timecode string `HH:MM:SS:FF` into a `Timecode`.
+/// Returns `None` for unparseable strings.
+pub fn parse_native_timecode(s: &str) -> Option<Timecode> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let hours = parts[0].parse::<u8>().ok()?;
+    let minutes = parts[1].parse::<u8>().ok()?;
+    let seconds = parts[2].parse::<u8>().ok()?;
+    let frames = parts[3].parse::<u8>().ok()?;
+    if hours >= 24 || minutes >= 60 || seconds >= 60 || frames >= 60 {
+        return None;
+    }
+    Some(Timecode { hours: hours as u32, minutes: minutes as u32, seconds: seconds as u32, frames: frames as u32 })
+}
+
 pub fn find_timecode_at_offset(
     timecodes: &[FrameTimecode],
     offset_secs: f64,
@@ -391,5 +408,50 @@ mod tests {
         let results: [Option<&audio_core::LtcDetectionResult>; 0] = [];
         let metas = build_per_file_start_timecodes(&results);
         assert!(metas.is_empty());
+    }
+
+    // ── parse_native_timecode ─────────────────────────────────────────
+
+    #[test]
+    fn test_parse_native_timecode_valid() {
+        let tc = parse_native_timecode("08:09:59:15").unwrap();
+        assert_eq!(tc.hours, 8);
+        assert_eq!(tc.minutes, 9);
+        assert_eq!(tc.seconds, 59);
+        assert_eq!(tc.frames, 15);
+    }
+
+    #[test]
+    fn test_parse_native_timecode_midnight() {
+        let tc = parse_native_timecode("00:00:00:00").unwrap();
+        assert_eq!(tc.hours, 0);
+        assert_eq!(tc.minutes, 0);
+        assert_eq!(tc.seconds, 0);
+        assert_eq!(tc.frames, 0);
+    }
+
+    #[test]
+    fn test_parse_native_timecode_invalid_format() {
+        assert!(parse_native_timecode("").is_none());
+        assert!(parse_native_timecode("15:32").is_none());
+        assert!(parse_native_timecode("15:32:14").is_none());
+        assert!(parse_native_timecode("hello:world:foo:bar").is_none());
+    }
+
+    #[test]
+    fn test_parse_native_timecode_invalid_bounds() {
+        assert!(parse_native_timecode("24:00:00:00").is_none());
+        assert!(parse_native_timecode("00:60:00:00").is_none());
+        assert!(parse_native_timecode("00:00:61:00").is_none());
+        assert!(parse_native_timecode("00:00:00:60").is_none());
+    }
+
+    #[test]
+    fn test_parse_native_timecode_max_valid() {
+        let tc = parse_native_timecode("23:59:59:59").unwrap();
+        assert_eq!(tc.hours, 23);
+        assert_eq!(tc.minutes, 59);
+        assert_eq!(tc.seconds, 59);
+        assert_eq!(tc.frames, 59);
     }
 }

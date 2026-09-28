@@ -645,10 +645,74 @@ fn bext_originator(camera: Option<&CameraInfo>) -> String {
     }
 }
 
+/// Build the bext `description` field (model / lens) when lens is available.
+fn build_bext_description(camera: Option<&CameraInfo>) -> Option<String> {
+    let c = camera?;
+    let lens = c.lens.as_ref()?;
+    let model = c.model.as_deref().unwrap_or("");
+    if !model.is_empty() {
+        Some(format!("{} / {}", model, lens))
+    } else {
+        Some(lens.clone())
+    }
+}
+
+/// Build a 602-byte BWF `bext` chunk payload (BWF v1 fixed-size fields).
+///
+/// Layout (from payload start):
+///   description[256] | originator[32] | originator_ref[32] |
+///   origination_date[10] | origination_time[8] |
+///   time_reference[8] | version[2] | umid[64] | reserved[190]
+fn build_bext_payload(
+    camera: Option<&CameraInfo>,
+    meta: &TimecodeMetadata,
+    file: &mut std::fs::File,
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(602);
+
+    // description (256)
+    let desc = build_bext_description(camera).unwrap_or_default();
+    buf.extend_from_slice(&bext_padded_string(&desc, 256));
+
+    // originator (32)
+    let originator = bext_originator(camera);
+    buf.extend_from_slice(&bext_padded_string(&originator, 32));
+
+    // originator_ref (32) — empty
+    buf.extend_from_slice(&bext_padded_string("", 32));
+
+    // origination_date (10)
+    let date = camera
+        .and_then(|c| c.creation_date.as_deref())
+        .unwrap_or("");
+    buf.extend_from_slice(&bext_padded_string(date, 10));
+
+    // origination_time (8) — empty
+    buf.extend_from_slice(&bext_padded_string("", 8));
+
+    // time_reference (8 bytes)
+    let sample_rate = read_wav_sample_rate_internal(file)?;
+    let time_reference = crate::converter::time_reference_samples(meta, sample_rate);
+    buf.extend_from_slice(&time_reference.to_le_bytes());
+
+    // version (2 bytes) — BWF v1 = 1
+    buf.extend_from_slice(&1u16.to_le_bytes());
+
+    // umid (64 bytes) — empty
+    buf.extend_from_slice(&[0u8; 64]);
+
+    // reserved (190 bytes) — zero
+    buf.extend_from_slice(&[0u8; 190]);
+
+    debug_assert_eq!(buf.len(), 602);
+    Ok(buf)
+}
+
 /// Try to patch the `bext` chunk's originator, origination_date, and
 /// `time_reference` fields in a WAV file in place.
-/// Returns `Err(…)` when no `bext` chunk is found (caller falls back
-/// to ffmpeg).
+/// If no `bext` chunk exists, creates one by appending it at the end of
+/// the file (O(1) for any file size — most WAV parsers accept bext after
+/// the data chunk).
 fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo>) -> Result<TagOutcome, String> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -685,19 +749,22 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
         let chunk_id = &chunk_hdr[0..4];
 
         if chunk_id == b"bext" {
-            // Found bext chunk.
-            // BEW v2 format (fixed-size fields from payload start):
-            //   description[256] | originator[32] | originator_ref[32] |
-            //   origination_date[10] | origination_time[8] |
-            //   time_reference_low(4) + time_reference_high(4) | ... |
-            // Offsets from chunk payload: originator=256, origination_date=320,
-            // time_reference=338. Minimum valid chunk_size for these: 346.
+            // Found bext chunk — patch in place
             let payload_off = offset + 8;
             if chunk_size < 346 {
                 return Err(format!(
                     "bext chunk too small ({} bytes, need >= 346)",
                     chunk_size
                 ));
+            }
+
+            // Write description (256 bytes) if lens is available
+            if let Some(ref desc) = build_bext_description(camera) {
+                let desc_bytes = bext_padded_string(desc, 256);
+                file.seek(SeekFrom::Start(payload_off))
+                    .map_err(|e| format!("seek to description: {}", e))?;
+                file.write_all(&desc_bytes)
+                    .map_err(|e| format!("write description: {}", e))?;
             }
 
             // Write originator (32 bytes, NUL-padded)
@@ -746,7 +813,35 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
         }
     }
 
-    Err("no bext chunk found".to_string())
+    // No bext chunk found — create one by appending at end (O(1) for any file size)
+    let bext_payload = build_bext_payload(camera, meta, &mut file)?;
+    let bext_size = bext_payload.len() as u32;
+
+    file.seek(SeekFrom::End(0))
+        .map_err(|e| format!("seek end: {}", e))?;
+    file.write_all(b"bext")
+        .map_err(|e| format!("write bext id: {}", e))?;
+    file.write_all(&bext_size.to_le_bytes())
+        .map_err(|e| format!("write bext size: {}", e))?;
+    file.write_all(&bext_payload)
+        .map_err(|e| format!("write bext payload: {}", e))?;
+
+    // Update RIFF size at offset 4
+    let new_file_len = file_len + 8 + bext_size as u64;
+    file.seek(SeekFrom::Start(4))
+        .map_err(|e| format!("seek to RIFF size: {}", e))?;
+    file.write_all(&(new_file_len as u32 - 8).to_le_bytes())
+        .map_err(|e| format!("write RIFF size: {}", e))?;
+
+    file.sync_all().map_err(|e| format!("fsync: {}", e))?;
+
+    let originator = bext_originator(camera);
+    log::info!(
+        "Created bext originator={} in {}",
+        originator,
+        path.display()
+    );
+    Ok(TagOutcome::TaggedInPlace)
 }
 
 fn read_wav_sample_rate_internal(file: &mut std::fs::File) -> Result<u32, String> {
@@ -859,11 +954,9 @@ fn tag_via_ffmpeg_with(
         args.push("1".to_string());
     }
 
-    // Camera metadata
+    // Camera metadata (via shared helper from args.rs, plus WAV bext extras)
     if let Some(c) = camera {
-        let is_wav = container == "wav";
-        let is_mov_like = matches!(container, "mov" | "mp4");
-        if is_wav {
+        if container == "wav" {
             args.push("-write_bext".to_string());
             args.push("1".to_string());
             args.push("-metadata".to_string());
@@ -872,25 +965,19 @@ fn tag_via_ffmpeg_with(
                 args.push("-metadata".to_string());
                 args.push(format!("origination_date={}", date));
             }
+            if let Some(ref lens) = c.lens {
+                let model = c.model.as_deref().unwrap_or("");
+                if !model.is_empty() {
+                    args.push("-metadata".to_string());
+                    args.push(format!("description={} / {}", model, lens));
+                } else {
+                    args.push("-metadata".to_string());
+                    args.push(format!("description={}", lens));
+                }
+            }
         } else {
-            if let Some(ref make_str) = c.make {
-                if is_mov_like {
-                    args.push("-metadata".to_string());
-                    args.push(format!("com.apple.quicktime.make={}", make_str));
-                } else {
-                    args.push("-metadata".to_string());
-                    args.push(format!("make={}", make_str));
-                }
-            }
-            if let Some(ref model_str) = c.model {
-                if is_mov_like {
-                    args.push("-metadata".to_string());
-                    args.push(format!("com.apple.quicktime.model={}", model_str));
-                } else {
-                    args.push("-metadata".to_string());
-                    args.push(format!("model={}", model_str));
-                }
-            }
+            let is_mov_like = matches!(container, "mov" | "mp4");
+            crate::converter::args::push_camera_metadata(&mut args, Some(c), is_mov_like, container);
         }
     }
 
@@ -1243,10 +1330,16 @@ mod tests {
 
         std::fs::write(&p, &wav).unwrap();
 
-        // Should return Err("no bext chunk found")
+        // Should succeed (creates bext chunk in place)
         let result = tag_wav_bext(&p, &test_meta(), None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no bext chunk"));
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+
+        // Verify bext chunk now exists in the patched file
+        let patched = std::fs::read(&p).unwrap();
+        assert!(
+            patched.windows(4).any(|w| w == b"bext"),
+            "bext chunk should exist after tagging"
+        );
     }
 
     #[test]

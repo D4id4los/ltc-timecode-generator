@@ -438,6 +438,12 @@ mod tests {
             model: Some("ILCE-6700".to_string()),
             source: camera_meta::CameraMetaSource::ExifTool,
             creation_date: None,
+            lens: None,
+            serial: None,
+            creation_time: None,
+            gamma: None,
+            native_timecode: None,
+            exposure_summary: None,
         })];
 
         // With pre-computed cameras and no XAVC data in the wav file,

@@ -2113,7 +2113,7 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
     };
 
     // Derive timecode metadata from LTC decode results
-    let timecode_meta_per_file = if s.set_start_from_ltc {
+    let mut timecode_meta_per_file = if s.set_start_from_ltc {
         if let Some(ref result) = state.ltc_decode_result {
             // Single-file decode
             let meta = crate::converter::start_timecode_from_ltc(result);
@@ -2129,6 +2129,51 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
     } else {
         vec![None; group.files.len()]
     };
+
+    // Native camera TC fallback + cross-check.
+    // When LTC decode found nothing for a file, use the camera's own embedded
+    // start timecode (XAVC LtcChangeTableLtcChangeValue or AVCHD
+    // H264:TimeCode) for the timecode-embedding step.
+    // When both LTC and native TC exist, log a warning if they differ.
+    if s.set_start_from_ltc {
+        let native_fps = state.fps;
+        let native_df = state.drop_frame;
+        for (i, meta) in timecode_meta_per_file.iter_mut().enumerate() {
+            let camera_native = state.converter.camera_meta.get(i)
+                .and_then(|c| c.as_ref())
+                .and_then(|c| c.native_timecode.as_ref())
+                .and_then(|s| crate::converter::timecode::parse_native_timecode(s));
+            match (meta.as_ref(), camera_native) {
+                (Some(ltc_meta), Some(native_tc)) => {
+                    if ltc_meta.start != native_tc {
+                        let ltc_str = crate::converter::format_ffmpeg_timecode(
+                            &ltc_meta.start, ltc_meta.drop_frame);
+                        log::warn!(
+                            "Native camera TC differs from LTC decode for file {}: \
+                             native={:02}:{:02}:{:02}:{:02}, LTC={}",
+                            i,
+                            native_tc.hours, native_tc.minutes, native_tc.seconds,
+                            native_tc.frames, ltc_str,
+                        );
+                    }
+                }
+                (None, Some(native_tc)) => {
+                    let tc_str = format!("{:02}:{:02}:{:02}:{:02}",
+                        native_tc.hours, native_tc.minutes, native_tc.seconds, native_tc.frames);
+                    log::info!(
+                        "Using native camera timecode {} for file {} (LTC decode: none)",
+                        tc_str, i
+                    );
+                    *meta = Some(crate::converter::TimecodeMetadata {
+                        start: native_tc,
+                        fps: native_fps,
+                        drop_frame: native_df,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
 
     let ltc_video_source = if group.recording_type == RecordingType::VideoClipSequence {
         Some((state.ltc_selected_stream, state.ltc_selected_channel))

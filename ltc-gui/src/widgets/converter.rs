@@ -1357,7 +1357,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                     );
                     ui.add_space(4.0);
                 }
-                ui.checkbox(&mut state.local_settings.embed_camera_metadata, "Embed camera metadata (make/model, bext originator)");
+                ui.checkbox(&mut state.local_settings.embed_camera_metadata, "Embed camera metadata (make/model, lens, serial, timestamp, gamma, exposure)");
                 {
                     let camera = state.latest.converter.camera_meta.first().and_then(|c| c.as_ref());
                     if let Some(c) = camera {
