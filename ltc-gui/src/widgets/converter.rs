@@ -175,6 +175,9 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                 // the scan on a background thread and publishes results via
                 // the snapshot's converter.groups / groups_loading flags).
                 state.send(GuiCommand::Converter(ConverterCommand::SelectFolder(path.clone())));
+                // Auto-select first recording (deferred by engine until scan
+                // completes, then applied race-free).
+                state.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0)));
 
                 state.local_settings.set_start_from_ltc = false;
             }

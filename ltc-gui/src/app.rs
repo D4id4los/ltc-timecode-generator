@@ -146,13 +146,17 @@ impl AppState {
             offload_last_version: 0,
         };
 
-        // Tell the engine to scan the restored input folder
+        // Tell the engine to scan the restored input folder and auto-select
+        // the first recording (deferred by the engine until scan completes).
         if let Some(ref folder) = selected_folder {
             let _ = result.cmd_tx.send(GuiCommand::Converter(
                 gui_engine::command::ConverterCommand::SelectFolder(folder.clone()),
             ));
+            let _ = result.cmd_tx.send(GuiCommand::Converter(
+                gui_engine::command::ConverterCommand::SelectRecording(0),
+            ));
             log::info!(
-                "Sent SelectFolder to engine on startup: {}",
+                "Sent SelectFolder + SelectRecording(0) to engine on startup: {}",
                 folder.display(),
             );
         }
@@ -391,6 +395,9 @@ impl eframe::App for AppState {
                 self.ltc_file_idx = 1;
                 let _ = self.cmd_tx.send(GuiCommand::Converter(
                     gui_engine::command::ConverterCommand::SelectFolder(path.clone()),
+                ));
+                let _ = self.cmd_tx.send(GuiCommand::Converter(
+                    gui_engine::command::ConverterCommand::SelectRecording(0),
                 ));
             }
         }
@@ -1070,6 +1077,10 @@ mod tests {
             "first command must be SelectFolder, got: {:?}", first
         );
 
-        assert_eq!(cmds.len(), 1, "only SelectFolder should be sent at startup; SelectRecording is async");
+        assert_eq!(cmds.len(), 2, "startup must send SelectFolder + SelectRecording(0)");
+        assert!(
+            matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))),
+            "second command must be SelectRecording(0), got: {:?}", cmds[1]
+        );
     }
 }

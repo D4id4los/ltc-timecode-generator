@@ -165,6 +165,48 @@ fn run_engine_with_commands(commands: Vec<GuiCommand>) -> AppStateSnapshot {
     snapshot
 }
 
+#[test]
+fn test_select_recording_deferred_during_folder_scan() {
+    // Sending SelectRecording(0) immediately after SelectFolder must NOT
+    // skip probing — the engine must defer it until the folder scan
+    // completes, then apply the selection automatically.
+    let dir = tempfile::TempDir::new().unwrap();
+    let _wav = generate_ltc_wav(dir.path(), "myrec.wav", 25.0, 1.0, "both");
+
+    let snapshot = run_engine_with_commands_monitor(
+        vec![
+            GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf())),
+            GuiCommand::Converter(ConverterCommand::SelectRecording(0)),
+        ],
+        |s, deadline| {
+            if s.converter.groups_folder.is_some()
+                && !s.converter.groups_loading
+                && s.converter.selected_group_idx == Some(0)
+                && !s.converter.probes_loading
+            {
+                return true;
+            }
+            Instant::now() > *deadline
+        },
+        30,
+    );
+
+    assert_eq!(
+        snapshot.converter.selected_group_idx,
+        Some(0),
+        "SelectRecording(0) sent right after SelectFolder must be deferred and applied \
+         after the async folder scan completes",
+    );
+    assert!(
+        !snapshot.converter.probes_loading,
+        "probes must have completed (even if they failed due to missing ffmpeg)",
+    );
+    assert!(
+        snapshot.converter.groups_folder.is_some(),
+        "groups_folder must be set after folder scan",
+    );
+}
+
 // ── Progress tracking during multi-clip video decode ─────────────────────
 
 #[test]

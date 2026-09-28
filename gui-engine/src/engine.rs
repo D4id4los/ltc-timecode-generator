@@ -71,6 +71,11 @@ pub fn engine_main_with_probe<F>(
     let mut last_auto_applied_ltc_gen: u64 = 0;
     let mut last_auto_applied_group_ltc_gen: u64 = 0;
 
+    // Deferred SelectRecording while a folder scan is still in flight
+    // (set by SelectRecording, cleared by SelectFolder, applied in step 0
+    // when the scan result arrives).
+    let mut pending_recording: Option<usize> = None;
+
     // Internal result channel for async decode operations
     let (decode_result_tx, decode_result_rx) =
         std::sync::mpsc::channel::<LtcDecodeResult>();
@@ -150,6 +155,22 @@ pub fn engine_main_with_probe<F>(
                         current.converter.groups = groups;
                         current.converter.groups_loading = false;
                         info!("Folder scan complete: {} group(s)", current.converter.groups.len());
+                        // Apply a deferred SelectRecording, if any was queued
+                        // while the scan was in flight.
+                        if let Some(idx) = pending_recording.take() {
+                            info!(
+                                "Applying deferred SelectRecording({}) after folder scan",
+                                idx,
+                            );
+                            apply_recording_selection(
+                                &mut current, idx,
+                                &mut decode_cancel, &mut group_cancel,
+                                &mut group_clip_progress,
+                                &mut last_auto_applied_ltc_gen,
+                                &mut last_auto_applied_group_ltc_gen,
+                                &conv_probe_tx,
+                            );
+                        }
                     } else {
                         warn!("Discarding stale folder scan result (gen {} != {} or path mismatch)", generation, current.converter.groups_generation);
                     }
@@ -193,6 +214,7 @@ pub fn engine_main_with_probe<F>(
                     current.converter.groups_loading = true;
                     current.converter.groups_folder = Some(path.clone());
                     current.converter.groups_generation = current.converter.groups_generation.wrapping_add(1);
+                    pending_recording = None; // new scan invalidates any deferred selection
                     let gen = current.converter.groups_generation;
                     current.converter.selected_group_idx = None;
                     current.converter.probes.clear();
@@ -217,102 +239,22 @@ pub fn engine_main_with_probe<F>(
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SelectRecording(idx))) => {
-                    let group_count = current.converter.groups.len();
-                    // Reset per-recording state
-                    current.converter.selected_group_idx = Some(idx);
-                    current.converter.probes.clear();
-                    current.converter.camera_meta.clear();
-                    current.converter.probes_loading = true;
-                    current.converter.probes_generation += 1;
-                    current.converter.conversion_state = ConversionState::idle();
-                    // Reset per-recording settings flags
-                    let s = &mut current.converter.settings;
-                    s.set_start_from_ltc = false;
-                    s.split_tracks = false;
-                    s.drop_ltc_track = false;
-                    s.concat_audio = false;
-                    s.ltc_file_idx = 0;
-                    s.channel_map = ChannelMap::identity(0);
-                    // Prefill filename prefix from group
-                    if let Some(group) = current.converter.groups.get(idx) {
-                        let prefix = &group.prefix;
-                        if !prefix.is_empty() {
-                            s.filename_prefix = prefix.clone();
-                        } else {
-                            s.filename_prefix = DEFAULT_PREFIX.to_string();
-                        }
-                        // Default output folder = input folder if empty
-                        if s.output_folder.as_os_str().is_empty() {
-                            if let Some(ref gf) = current.converter.groups_folder {
-                                s.output_folder = gf.clone();
-                            }
-                        }
-                    }
-                    // Clear stale LTC decode state
-                    current.ltc_probe = None;
-                    current.ltc_selected_stream = 0;
-                    current.ltc_selected_channel = 0;
-                    current.ltc_decode_is_video = false;
-                    current.ltc_decode_result = None;
-                    current.ltc_decode_error = None;
-                    current.ltc_is_detecting = false;
-                    current.ltc_decode_progress_pct = 0.0;
-                    current.ltc_decode_progress_str = String::new();
-                    current.ltc_group_results.clear();
-                    current.ltc_group_errors.clear();
-                    current.ltc_group_paths.clear();
-                    current.ltc_group_done = 0;
-                    current.ltc_group_total = 0;
-                    // Cancel any running single-file decode
-                    if let Some(ref cancel) = decode_cancel {
-                        cancel.store(true, Ordering::Relaxed);
-                    }
-                    decode_cancel = None;
-                    // Bump decode generations so in-flight results from the old
-                    // recording are discarded by the generation check.
-                    current.ltc_decode_generation = current.ltc_decode_generation.wrapping_add(1);
-                    // Cancel any running group decode and reset clip progress
-                    if let Some(ref cancel) = group_cancel {
-                        cancel.store(true, Ordering::Relaxed);
-                    }
-                    group_cancel = None;
-                    group_clip_progress = None;
-                    current.ltc_group_decode_generation = current.ltc_group_decode_generation.wrapping_add(1);
-                    // Reset auto-apply latches so next decode re-applies defaults
-                    last_auto_applied_ltc_gen = 0;
-                    last_auto_applied_group_ltc_gen = 0;
-                    current.status_message = "Recording selected — probing…".to_string();
-
-                    // Spawn background probing of all files in the group
-                    if let Some(group) = current.converter.groups.get(idx) {
+                    if current.converter.groups_loading {
                         info!(
-                            "Recording selected: idx={} of {} engine group(s), type={:?}, {} file(s) — spawning clip probe",
-                            idx, group_count, group.recording_type, group.files.len(),
+                            "SelectRecording({}) deferred — folder scan still in progress",
+                            idx,
                         );
-                        let files = group.files.clone();
-                        let gen = current.converter.probes_generation;
-                        let conv_probe_tx = conv_probe_tx.clone();
-                        std::thread::Builder::new()
-                            .name("conv-probe".into())
-                            .spawn(move || {
-                                info!("Converter clip probe started: {} file(s)", files.len());
-                                let probes: Vec<Result<VideoAudioProbe, String>> = files.iter()
-                                    .map(|f| crate::ffprobe::probe_video_audio(f).map_err(|e| e.to_string()))
-                                    .collect();
-                                let cameras: Vec<Option<crate::CameraInfo>> = files.iter()
-                                    .map(|f| crate::camera_meta::probe_camera_info(f))
-                                    .collect();
-                                let _ = conv_probe_tx.send(ConverterProbeResult { probes, cameras, generation: gen });
-                            })
-                            .expect("failed to spawn converter probe thread");
+                        pending_recording = Some(idx);
                     } else {
-                        warn!(
-                            "Recording selected: idx={} but engine has {} group(s) — probe skipped (was the folder sent to the engine?)",
-                            idx, group_count,
+                        apply_recording_selection(
+                            &mut current, idx,
+                            &mut decode_cancel, &mut group_cancel,
+                            &mut group_clip_progress,
+                            &mut last_auto_applied_ltc_gen,
+                            &mut last_auto_applied_group_ltc_gen,
+                            &conv_probe_tx,
                         );
-                        current.converter.probes_loading = false;
                     }
-                    recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Offload(cmd)) => {
                     handle_offload_command(
@@ -2174,6 +2116,122 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
 /// Auto-apply LTC decode results to converter settings (split tracks,
 /// drop LTC track, set start-from-LTC) once per decode generation.
 /// User manual un-ticks survive until the next decode re-run.
+/// Apply `SelectRecording(idx)` to state: reset per-recording state, clear
+/// LTC decode state, cancel in-flight decodes, and spawn converter clip probe
+/// on a background thread.
+///
+/// Extracted so it can be called both from the command handler (directly when
+/// groups are ready) and from the folder-scan result drain (when a deferred
+/// `SelectRecording` was queued during `groups_loading`).
+#[allow(clippy::too_many_arguments)]
+fn apply_recording_selection(
+    state: &mut AppStateSnapshot,
+    idx: usize,
+    decode_cancel: &mut Option<Arc<AtomicBool>>,
+    group_cancel: &mut Option<Arc<AtomicBool>>,
+    group_clip_progress: &mut Option<ClipProgress>,
+    last_auto_applied_ltc_gen: &mut u64,
+    last_auto_applied_group_ltc_gen: &mut u64,
+    conv_probe_tx: &Sender<ConverterProbeResult>,
+) {
+    let group_count = state.converter.groups.len();
+    // Reset per-recording state
+    state.converter.selected_group_idx = Some(idx);
+    state.converter.probes.clear();
+    state.converter.camera_meta.clear();
+    state.converter.probes_loading = true;
+    state.converter.probes_generation += 1;
+    state.converter.conversion_state = ConversionState::idle();
+    // Reset per-recording settings flags
+    let s = &mut state.converter.settings;
+    s.set_start_from_ltc = false;
+    s.split_tracks = false;
+    s.drop_ltc_track = false;
+    s.concat_audio = false;
+    s.ltc_file_idx = 0;
+    s.channel_map = ChannelMap::identity(0);
+    // Prefill filename prefix from group
+    if let Some(group) = state.converter.groups.get(idx) {
+        let prefix = &group.prefix;
+        if !prefix.is_empty() {
+            s.filename_prefix = prefix.clone();
+        } else {
+            s.filename_prefix = DEFAULT_PREFIX.to_string();
+        }
+        // Default output folder = input folder if empty
+        if s.output_folder.as_os_str().is_empty() {
+            if let Some(ref gf) = state.converter.groups_folder {
+                s.output_folder = gf.clone();
+            }
+        }
+    }
+    // Clear stale LTC decode state
+    state.ltc_probe = None;
+    state.ltc_selected_stream = 0;
+    state.ltc_selected_channel = 0;
+    state.ltc_decode_is_video = false;
+    state.ltc_decode_result = None;
+    state.ltc_decode_error = None;
+    state.ltc_is_detecting = false;
+    state.ltc_decode_progress_pct = 0.0;
+    state.ltc_decode_progress_str = String::new();
+    state.ltc_group_results.clear();
+    state.ltc_group_errors.clear();
+    state.ltc_group_paths.clear();
+    state.ltc_group_done = 0;
+    state.ltc_group_total = 0;
+    // Cancel any running single-file decode
+    if let Some(ref cancel) = decode_cancel {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    *decode_cancel = None;
+    // Bump decode generations so in-flight results from the old
+    // recording are discarded by the generation check.
+    state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
+    // Cancel any running group decode and reset clip progress
+    if let Some(ref cancel) = group_cancel {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    *group_cancel = None;
+    *group_clip_progress = None;
+    state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
+    // Reset auto-apply latches so next decode re-applies defaults
+    *last_auto_applied_ltc_gen = 0;
+    *last_auto_applied_group_ltc_gen = 0;
+    state.status_message = "Recording selected — probing…".to_string();
+
+    // Spawn background probing of all files in the group
+    if let Some(group) = state.converter.groups.get(idx) {
+        info!(
+            "Recording selected: idx={} of {} engine group(s), type={:?}, {} file(s) — spawning clip probe",
+            idx, group_count, group.recording_type, group.files.len(),
+        );
+        let files = group.files.clone();
+        let gen = state.converter.probes_generation;
+        let conv_probe_tx = conv_probe_tx.clone();
+        std::thread::Builder::new()
+            .name("conv-probe".into())
+            .spawn(move || {
+                info!("Converter clip probe started: {} file(s)", files.len());
+                let probes: Vec<Result<VideoAudioProbe, String>> = files.iter()
+                    .map(|f| crate::ffprobe::probe_video_audio(f).map_err(|e| e.to_string()))
+                    .collect();
+                let cameras: Vec<Option<crate::CameraInfo>> = files.iter()
+                    .map(|f| crate::camera_meta::probe_camera_info(f))
+                    .collect();
+                let _ = conv_probe_tx.send(ConverterProbeResult { probes, cameras, generation: gen });
+            })
+            .expect("failed to spawn converter probe thread");
+    } else {
+        warn!(
+            "Recording selected: idx={} but engine has {} group(s) — probe skipped (was the folder sent to the engine?)",
+            idx, group_count,
+        );
+        state.converter.probes_loading = false;
+    }
+    recompute_converter_derived(state);
+}
+
 fn auto_apply_ltc_to_settings(state: &mut AppStateSnapshot) {
     state.converter.settings.split_tracks = true;
     state.converter.settings.drop_ltc_track = true;

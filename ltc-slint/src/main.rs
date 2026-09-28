@@ -74,23 +74,11 @@ fn _run_gui(
                 let _ = cmd_tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(
                     path.to_path_buf(),
                 )));
-                // Auto-select first group after engine publishes groups
-                let cmd = cmd_tx.clone();
-                let ui_weak = ui.as_weak();
-                let select_timer = slint::Timer::default();
-                select_timer.start(
-                    slint::TimerMode::SingleShot,
-                    Duration::from_millis(100),
-                    move || {
-                        let _ = cmd.send(GuiCommand::Converter(
-                            ConverterCommand::SelectRecording(0),
-                        ));
-                        if let Some(u) = ui_weak.upgrade() {
-                            u.set_conv_selected_group_idx(0);
-                        }
-                    },
-                );
-                Box::leak(Box::new(select_timer));
+                // Auto-select first recording — deferred by the engine until
+                // the async folder scan completes, then applied race-free.
+                let _ = cmd_tx.send(GuiCommand::Converter(
+                    ConverterCommand::SelectRecording(0),
+                ));
             }
         }
         if let Some(ref out_path) = cfg.last_output_folder {

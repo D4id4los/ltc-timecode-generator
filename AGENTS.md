@@ -161,8 +161,8 @@ Field groups (see `state.rs` for the full struct): generation counter; transport
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 0. **Spawn ffmpeg capability probe** — before the loop starts, a background thread runs `query_ffmpeg_capabilities()` (hw-validated) and sends the result via an internal mpsc channel.
-1. **Drain folder scan results** — async scan result from background thread
-2. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop. Converter commands are handled inline (selectors, setters, side-effects, config persistence) or dispatched to `process_command`.
+1. **Drain folder scan results** — async scan result from background thread; applies any deferred `SelectRecording` that arrived while the scan was in flight.
+2. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop. Converter commands are handled inline (selectors, setters, side-effects, config persistence, deferred `SelectRecording` while `groups_loading`) or dispatched to `process_command`.
 3. **Drain async decode results** — generation-stamped, so stale results from rapid re-clicks are discarded. On completion, auto-applies LTC settings to converter (split/drop/start-from-LTC) once per generation.
 4. **Drain async group decode results** — same generation gating; on full group completion, same auto-apply.
 5. **Drain ffmpeg probe result** — sets `current.ffmpeg_caps`; calls `apply_available_defaults` to repair stale converter settings and `recompute_converter_derived`.
