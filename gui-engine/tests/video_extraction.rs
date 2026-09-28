@@ -13,20 +13,44 @@
 //! absolute index 1, so the relative form extracts nothing and ffmpeg fails
 //! with "Stream map '0:a:1' matches no streams".
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use gui_engine::command::{ConverterCommand, GuiCommand};
+use gui_engine::engine::engine_main_with_probe;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::{
-    decode_ltc_from_wav, extract_audio_channel, path_is_video, probe_video_audio, LtcDecodeStatus,
+    decode_ltc_from_wav, extract_audio_channel, path_is_video, probe_video_audio,
+    FfmpegCapabilities, HwDeviceCapabilities, LtcDecodeStatus,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+fn fake_probe() -> FfmpegCapabilities {
+    FfmpegCapabilities {
+        has_ffmpeg: false,
+        available_encoders: BTreeSet::new(),
+        available_formats: BTreeSet::new(),
+        error_message: None,
+        hw: HwDeviceCapabilities::default(),
+    }
+}
+
+/// Ensure the test does not write to the real user config directory.
+fn init_test_config() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let dir = tempfile::TempDir::new().expect("tempdir for test config");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let _ = Box::leak(Box::new(dir));
+    });
+}
 
 fn ffmpeg_tooling_available() -> bool {
     let run = |bin: &str| {
@@ -127,6 +151,8 @@ fn mux_video_fixture(dir: &Path, name: &str, ltc_wav: &Path, leading_silent_stre
 
 /// Engine harness (same pattern as integration.rs).
 fn run_engine_with_commands(commands: Vec<GuiCommand>) -> AppStateSnapshot {
+    init_test_config();
+
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -134,7 +160,7 @@ fn run_engine_with_commands(commands: Vec<GuiCommand>) -> AppStateSnapshot {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -142,14 +168,13 @@ fn run_engine_with_commands(commands: Vec<GuiCommand>) -> AppStateSnapshot {
         tx.send(cmd).unwrap();
     }
 
-    // Wait until a decode request has been processed (generation > 0) and the
+    // Wait until a decode request has been processed and the
     // async result has been published (no longer detecting).
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = state.load().as_ref().clone();
-        if snapshot.generation > 0
+        if !snapshot.ltc_is_detecting
             && snapshot.ltc_decode_generation > 0
-            && !snapshot.ltc_is_detecting
         {
             break;
         }
@@ -212,7 +237,7 @@ fn test_select_recording_deferred_during_folder_scan() {
 #[test]
 fn test_single_clip_decode_via_group_command() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
 
@@ -231,6 +256,8 @@ fn test_single_clip_decode_via_group_command() {
     let status = cmd.status().expect("failed to spawn ffmpeg for clip");
     assert!(status.success(), "ffmpeg clip creation failed");
 
+    init_test_config();
+
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -238,7 +265,7 @@ fn test_single_clip_decode_via_group_command() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -280,7 +307,7 @@ fn test_single_clip_decode_via_group_command() {
 #[test]
 fn test_extract_audio_channel_with_progress_reports_fraction() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
 
@@ -336,6 +363,8 @@ fn run_engine_with_commands_monitor<F>(
 where
     F: FnMut(&AppStateSnapshot, &Instant) -> bool,
 {
+    init_test_config();
+
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -343,7 +372,7 @@ where
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -367,7 +396,7 @@ where
 #[test]
 fn test_group_decode_progress_reaches_100_percent() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
 
@@ -426,7 +455,7 @@ fn test_group_decode_progress_reaches_100_percent() {
 #[test]
 fn test_single_video_decode_progress() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
 
@@ -500,7 +529,7 @@ fn assert_decodes_ltc(wav: &Path, min_valid_frames: u32) {
 #[test]
 fn test_probe_reports_absolute_stream_indices() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -524,7 +553,7 @@ fn test_probe_reports_absolute_stream_indices() {
 #[test]
 fn test_extract_first_audio_stream_by_absolute_index() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -550,7 +579,7 @@ fn test_extract_first_audio_stream_by_absolute_index() {
 #[test]
 fn test_probe_then_extract_ltc_roundtrip() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -569,7 +598,7 @@ fn test_probe_then_extract_ltc_roundtrip() {
 #[test]
 fn test_extract_second_audio_stream_selects_ltc_stream() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -605,7 +634,7 @@ fn test_extract_second_audio_stream_selects_ltc_stream() {
 #[test]
 fn test_extract_stereo_channel_1() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -623,7 +652,7 @@ fn test_extract_stereo_channel_1() {
 #[test]
 fn test_extract_invalid_stream_error_includes_ffmpeg_stderr() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -646,7 +675,7 @@ fn test_extract_invalid_stream_error_includes_ffmpeg_stderr() {
 #[test]
 fn test_engine_mpsc_parse_ltc_video() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -680,7 +709,7 @@ fn test_engine_mpsc_parse_ltc_video() {
 #[test]
 fn test_engine_parse_ltc_video_rejects_out_of_range_stream() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -709,6 +738,8 @@ fn test_select_recording_probe_failure_publishes_error() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(dir.path().join("C0001.MP4"), b"not a video file").unwrap();
 
+    init_test_config();
+
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -716,7 +747,7 @@ fn test_select_recording_probe_failure_publishes_error() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -765,7 +796,7 @@ fn test_select_recording_probe_falls_back_to_successful_clip() {
     // The first clip is garbage (ffprobe fails), but the second is a valid
     // muxed video. The engine should fall back to the successful probe.
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
 
@@ -774,6 +805,8 @@ fn test_select_recording_probe_falls_back_to_successful_clip() {
     let ltc_wav = generate_ltc_wav(dir.path(), "ltc.wav", 25.0, 2.0, "both");
     let _mp4 = mux_video_fixture(dir.path(), "C0002.MP4", &ltc_wav, false);
 
+    init_test_config();
+
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -781,7 +814,7 @@ fn test_select_recording_probe_falls_back_to_successful_clip() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -822,7 +855,7 @@ fn test_select_recording_probe_falls_back_to_successful_clip() {
 #[test]
 fn test_select_recording_preserves_ltc_probe() {
     if !ffmpeg_tooling_available() {
-        eprintln!("Skipping: ffmpeg/ffprobe not available");
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
     }
 
@@ -832,6 +865,8 @@ fn test_select_recording_preserves_ltc_probe() {
     let mp4 = mux_video_fixture(dir.path(), "C0001.MP4", &ltc_wav, false);
     let mp4_str = mp4.to_string_lossy().to_string();
 
+    init_test_config();
+
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -839,7 +874,7 @@ fn test_select_recording_preserves_ltc_probe() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -886,6 +921,8 @@ fn test_select_recording_without_folder_does_not_probe() {
     // No ffmpeg needed — the engine has no files to probe when SelectFolder
     // was never sent, so the else branch fires.
 
+    init_test_config();
+
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -893,7 +930,7 @@ fn test_select_recording_without_folder_does_not_probe() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 

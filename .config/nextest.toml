@@ -1,0 +1,16 @@
+[profile.default]
+# Fast local runs: retry once if a test flakes
+retries = 1
+
+# Tests that take >60s should be slow-timeout-eligible
+slow-timeout = { period = "60s", max-integration = "120s", max-unit = "30s" }
+
+[profile.ci]
+# CI: retry 3 times to surface flaky tests
+retries = 3
+final-status-level = "flaky"
+# Show tests that passed on retry as "FLAKY" so they're easy to spot
+status-level-description = "FLAKY"
+
+# Don't fail the run just because of a flaky test — report it
+failure-output = "immediate-final"

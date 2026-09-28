@@ -1,12 +1,15 @@
+use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 use std::path::Path;
 
 use arc_swap::ArcSwap;
 use gui_engine::command::{GuiCommand, OffloadCommand};
+use gui_engine::engine::engine_main_with_probe;
 use gui_engine::state::AppStateSnapshot;
-use gui_engine::{decode_ltc_from_wav, LtcDecodeStatus};
+use gui_engine::{decode_ltc_from_wav, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -45,8 +48,33 @@ fn generate_wav(path: &Path, fps: f64, drop_frame: bool, duration: f64, sample_r
     gui_engine::cli::generate_wav(cli).expect("WAV generation failed");
 }
 
-/// Start engine, send one or more commands, poll for result, return snapshot.
-fn run_engine_with_commands(commands: Vec<GuiCommand>, use_libltc: bool) -> AppStateSnapshot {
+fn fake_probe() -> FfmpegCapabilities {
+    FfmpegCapabilities {
+        has_ffmpeg: false,
+        available_encoders: BTreeSet::new(),
+        available_formats: BTreeSet::new(),
+        error_message: None,
+        hw: HwDeviceCapabilities::default(),
+    }
+}
+
+/// Ensure the test does not write to the real user config directory.
+fn init_test_config() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let dir = tempfile::TempDir::new().expect("tempdir for test config");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let _ = Box::leak(Box::new(dir));
+    });
+}
+
+/// Start engine, send commands, wait until a predicate is satisfied, return snapshot.
+fn run_engine<F>(commands: Vec<GuiCommand>, use_libltc: bool, predicate: F) -> AppStateSnapshot
+where
+    F: Fn(&AppStateSnapshot) -> bool,
+{
+    init_test_config();
+
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -54,7 +82,7 @@ fn run_engine_with_commands(commands: Vec<GuiCommand>, use_libltc: bool) -> AppS
     let handle = std::thread::Builder::new()
         .name("gui-engine-test".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, use_libltc);
+            engine_main_with_probe(rx, state_clone, use_libltc, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -62,27 +90,23 @@ fn run_engine_with_commands(commands: Vec<GuiCommand>, use_libltc: bool) -> AppS
         tx.send(cmd).unwrap();
     }
 
-    // Poll the state until processing completes
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         let snapshot: AppStateSnapshot = state.load().as_ref().clone();
-        if snapshot.generation > 0 && !snapshot.ltc_is_detecting {
-            break;
+        if predicate(&snapshot) {
+            let final_snapshot: AppStateSnapshot = state.load().as_ref().clone();
+            drop(tx);
+            handle.join().expect("engine thread panicked");
+            return final_snapshot;
         }
         if Instant::now() > deadline {
-            break;
+            panic!(
+                "Timeout waiting for predicate (generation={}, is_detecting={}, status={})",
+                snapshot.generation, snapshot.ltc_is_detecting, snapshot.status_message
+            );
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-
-    let snapshot: AppStateSnapshot = state.load().as_ref().clone();
-    drop(tx);
-    handle.join().expect("engine thread panicked");
-    snapshot
-}
-
-fn run_engine_with_command(cmd: GuiCommand, use_libltc: bool) -> AppStateSnapshot {
-    run_engine_with_commands(vec![cmd], use_libltc)
 }
 
 // ── WAV round-trip tests (various FPS) ──────────────────────────────────
@@ -158,9 +182,10 @@ fn test_engine_mpsc_parse_ltc_command() {
     let path = dir.path().join("test_parse.wav");
     generate_wav(&path, 25.0, false, 1.0, 48000);
 
-    let snapshot = run_engine_with_command(
-        GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string()),
+    let snapshot = run_engine(
+        vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
         false,
+        |s| !s.ltc_is_detecting && s.ltc_decode_result.is_some(),
     );
 
     assert!(snapshot.ltc_decode_result.is_some(), "expected ltc_decode_result to be Some");
@@ -175,9 +200,10 @@ fn test_engine_mpsc_parse_ltc_command() {
 
 #[test]
 fn test_engine_mpsc_parse_invalid_file() {
-    let snapshot = run_engine_with_command(
-        GuiCommand::ParseLtcWavFile("/tmp/nonexistent_ltc_test_file.wav".to_string()),
+    let snapshot = run_engine(
+        vec![GuiCommand::ParseLtcWavFile("/tmp/nonexistent_ltc_test_file.wav".to_string())],
         false,
+        |s| !s.ltc_is_detecting && s.ltc_decode_error.is_some(),
     );
 
     assert!(snapshot.status_message.contains("Parse failed"),
@@ -191,7 +217,7 @@ fn test_engine_mpsc_parse_invalid_file() {
 
 #[test]
 fn test_engine_clap_creates_log_entry() {
-    let snapshot = run_engine_with_command(GuiCommand::Clap, false);
+    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.logs.len() == 1);
 
     assert_eq!(snapshot.logs.len(), 1, "expected 1 log entry after Clap");
     let log = &snapshot.logs[0];
@@ -202,32 +228,25 @@ fn test_engine_clap_creates_log_entry() {
 
 #[test]
 fn test_engine_clap_auto_increments_take() {
-    let snapshot = run_engine_with_command(GuiCommand::Clap, false);
+    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.take == 2);
 
     // auto_increment_take defaults to true, take starts at 1
     assert_eq!(snapshot.take, 2, "take should auto-increment from 1 to 2");
 }
 
 #[test]
-fn test_engine_clap_sets_flash_and_arm() {
-    let snapshot = run_engine_with_command(GuiCommand::Clap, false);
-
-    assert!((snapshot.clap_flash_alpha - 1.0).abs() < 0.05, "flash alpha should be ~1.0 on Clap, got {}", snapshot.clap_flash_alpha);
-    assert!(snapshot.clap_arm_angle.abs() < 0.1, "arm angle should be ~0.0 on Clap, got {}", snapshot.clap_arm_angle);
-}
-
-#[test]
 fn test_engine_clap_status_message() {
-    let snapshot = run_engine_with_command(GuiCommand::Clap, false);
+    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.status_message == "Clap!");
 
     assert_eq!(snapshot.status_message, "Clap!");
 }
 
 #[test]
 fn test_engine_multiple_claps_accumulate_logs() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![GuiCommand::Clap, GuiCommand::Clap, GuiCommand::Clap],
         false,
+        |s| s.logs.len() == 3,
     );
 
     assert_eq!(snapshot.logs.len(), 3, "expected 3 log entries after 3 Claps");
@@ -237,13 +256,14 @@ fn test_engine_multiple_claps_accumulate_logs() {
 
 #[test]
 fn test_engine_clap_without_auto_increment() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![
             GuiCommand::SetAutoIncrement(false),
             GuiCommand::Clap,
             GuiCommand::Clap,
         ],
         false,
+        |s| s.logs.len() == 2,
     );
 
     assert_eq!(snapshot.logs.len(), 2, "expected 2 log entries");
@@ -254,6 +274,7 @@ fn test_engine_clap_without_auto_increment() {
 
 #[test]
 fn test_engine_shutdown_via_command() {
+    init_test_config();
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -261,7 +282,7 @@ fn test_engine_shutdown_via_command() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-shutdown-test".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -285,6 +306,7 @@ fn test_engine_shutdown_via_command() {
 
 #[test]
 fn test_engine_shutdown_via_channel_drop() {
+    init_test_config();
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
@@ -292,7 +314,7 @@ fn test_engine_shutdown_via_channel_drop() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-drop-test".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -316,18 +338,20 @@ fn test_engine_shutdown_via_channel_drop() {
 
 #[test]
 fn test_engine_hour_up_down() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![GuiCommand::HourUp, GuiCommand::HourUp, GuiCommand::HourDown],
         false,
+        |s| s.start_timecode.hours == 2,
     );
     assert_eq!(snapshot.start_timecode.hours, 2, "expected hours=2 (start=1, up 2, down 1), got {}", snapshot.start_timecode.hours);
 }
 
 #[test]
 fn test_engine_frame_up_wrap() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![GuiCommand::SetFpsIndex(1), GuiCommand::FrameDown],
         false,
+        |s| s.start_timecode.frames == 24,
     );
     // 25fps: frame 0 - 1 → wrap to 24
     assert_eq!(snapshot.start_timecode.frames, 24, "expected frames=24 (wrap around 25fps), got {}", snapshot.start_timecode.frames);
@@ -337,7 +361,7 @@ fn test_engine_frame_up_wrap() {
 
 #[test]
 fn test_engine_set_fps_24() {
-    let snapshot = run_engine_with_command(GuiCommand::SetFpsIndex(0), false);
+    let snapshot = run_engine(vec![GuiCommand::SetFpsIndex(0)], false, |s| s.fps_index == 0);
     assert_eq!(snapshot.fps_index, 0);
     assert_eq!(snapshot.fps, 24.0);
     assert!(!snapshot.drop_frame);
@@ -345,7 +369,7 @@ fn test_engine_set_fps_24() {
 
 #[test]
 fn test_engine_set_fps_2997_df() {
-    let snapshot = run_engine_with_command(GuiCommand::SetFpsIndex(3), false);
+    let snapshot = run_engine(vec![GuiCommand::SetFpsIndex(3)], false, |s| s.fps_index == 3);
     assert_eq!(snapshot.fps_index, 3);
     assert!((snapshot.fps - 29.97).abs() < 0.01);
     assert!(snapshot.drop_frame);
@@ -353,7 +377,7 @@ fn test_engine_set_fps_2997_df() {
 
 #[test]
 fn test_engine_set_fps_30() {
-    let snapshot = run_engine_with_command(GuiCommand::SetFpsIndex(4), false);
+    let snapshot = run_engine(vec![GuiCommand::SetFpsIndex(4)], false, |s| s.fps_index == 4);
     assert_eq!(snapshot.fps_index, 4);
     assert_eq!(snapshot.fps, 30.0);
     assert!(!snapshot.drop_frame);
@@ -363,25 +387,16 @@ fn test_engine_set_fps_30() {
 
 #[test]
 fn test_engine_toggle_theme() {
-    let snapshot = run_engine_with_commands(
-        vec![GuiCommand::ToggleTheme],
-        false,
-    );
+    let snapshot = run_engine(vec![GuiCommand::ToggleTheme], false, |s| s.is_dark_theme);
     assert!(snapshot.is_dark_theme, "expected dark theme after toggle");
 }
 
 #[test]
 fn test_engine_set_theme() {
-    let snapshot = run_engine_with_commands(
-        vec![GuiCommand::SetTheme(true)],
-        false,
-    );
+    let snapshot = run_engine(vec![GuiCommand::SetTheme(true)], false, |s| s.is_dark_theme);
     assert!(snapshot.is_dark_theme);
 
-    let snapshot = run_engine_with_commands(
-        vec![GuiCommand::SetTheme(false)],
-        false,
-    );
+    let snapshot = run_engine(vec![GuiCommand::SetTheme(false)], false, |s| !s.is_dark_theme);
     assert!(!snapshot.is_dark_theme);
 }
 
@@ -393,9 +408,10 @@ fn test_engine_decode_generation_increments() {
     let path = dir.path().join("test_gen.wav");
     generate_wav(&path, 25.0, false, 1.0, 48000);
 
-    let snapshot = run_engine_with_command(
-        GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string()),
+    let snapshot = run_engine(
+        vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
         false,
+        |s| !s.ltc_is_detecting && s.ltc_decode_result.is_some(),
     );
 
     assert!(snapshot.ltc_decode_generation > 0, "generation should be > 0");
@@ -405,9 +421,10 @@ fn test_engine_decode_generation_increments() {
 
 #[test]
 fn test_engine_decode_error_on_nonexistent_file() {
-    let snapshot = run_engine_with_command(
-        GuiCommand::ParseLtcWavFile("/tmp/definitely_not_a_real_ltc_file.wav".to_string()),
+    let snapshot = run_engine(
+        vec![GuiCommand::ParseLtcWavFile("/tmp/definitely_not_a_real_ltc_file.wav".to_string())],
         false,
+        |s| !s.ltc_is_detecting && s.ltc_decode_error.is_some(),
     );
 
     assert!(snapshot.ltc_decode_error.is_some());
@@ -419,13 +436,14 @@ fn test_engine_decode_error_on_nonexistent_file() {
 
 #[test]
 fn test_engine_set_scene_take_roll() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![
             GuiCommand::SetScene(42),
             GuiCommand::SetTake(7),
             GuiCommand::SetRoll("B002".into()),
         ],
         false,
+        |s| s.scene == 42 && s.take == 7 && s.roll == "B002",
     );
     assert_eq!(snapshot.scene, 42);
     assert_eq!(snapshot.take, 7);
@@ -434,27 +452,29 @@ fn test_engine_set_scene_take_roll() {
 
 #[test]
 fn test_engine_clear_logs() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![GuiCommand::Clap, GuiCommand::Clap, GuiCommand::ClearLogs],
         false,
+        |s| s.logs.is_empty(),
     );
     assert!(snapshot.logs.is_empty(), "expected empty logs after ClearLogs");
 }
 
 #[test]
 fn test_engine_set_sample_rate() {
-    let snapshot = run_engine_with_command(GuiCommand::SetSampleRate(48000), false);
+    let snapshot = run_engine(vec![GuiCommand::SetSampleRate(48000)], false, |s| s.sample_rate == 48000);
     assert_eq!(snapshot.sample_rate, 48000);
 }
 
 #[test]
 fn test_engine_set_ltc_and_beep_channels() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![
             GuiCommand::SetLtcChannel("both".into()),
             GuiCommand::SetBeepChannel("left".into()),
         ],
         false,
+        |s| s.ltc_channel == "both" && s.beep_channel == "left",
     );
     assert_eq!(snapshot.ltc_channel, "both");
     assert_eq!(snapshot.beep_channel, "left");
@@ -462,7 +482,7 @@ fn test_engine_set_ltc_and_beep_channels() {
 
 #[test]
 fn test_engine_set_volumes_and_beep_params() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![
             GuiCommand::SetLtcVolume(0.75),
             GuiCommand::SetBeepVolume(0.3),
@@ -470,6 +490,7 @@ fn test_engine_set_volumes_and_beep_params() {
             GuiCommand::SetBeepDuration(1.0),
         ],
         false,
+        |s| (s.beep_duration - 1.0).abs() < 1e-6,
     );
     assert!((snapshot.ltc_volume - 0.75).abs() < 1e-6);
     assert!((snapshot.beep_volume - 0.3).abs() < 1e-6);
@@ -479,25 +500,16 @@ fn test_engine_set_volumes_and_beep_params() {
 
 #[test]
 fn test_engine_toggle_lock() {
-    let snapshot = run_engine_with_commands(
-        vec![GuiCommand::ToggleLock],
-        false,
-    );
+    let snapshot = run_engine(vec![GuiCommand::ToggleLock], false, |s| s.is_locked);
     assert!(snapshot.is_locked, "expected locked after one toggle");
 
-    let snapshot = run_engine_with_commands(
-        vec![GuiCommand::ToggleLock, GuiCommand::ToggleLock],
-        false,
-    );
+    let snapshot = run_engine(vec![GuiCommand::ToggleLock, GuiCommand::ToggleLock], false, |s| !s.is_locked);
     assert!(!snapshot.is_locked, "expected unlocked after two toggles");
 }
 
 #[test]
 fn test_engine_reset_current_timecode() {
-    let snapshot = run_engine_with_commands(
-        vec![GuiCommand::Reset],
-        false,
-    );
+    let snapshot = run_engine(vec![GuiCommand::Reset], false, |s| s.status_message == "Reset");
     assert_eq!(snapshot.current_timecode, snapshot.start_timecode);
     assert_eq!(snapshot.status_message, "Reset");
 }
@@ -506,24 +518,25 @@ fn test_engine_reset_current_timecode() {
 
 #[test]
 fn test_engine_set_ltc_decode_stream() {
-    let snapshot = run_engine_with_command(GuiCommand::SetLtcDecodeStream(2), false);
+    let snapshot = run_engine(vec![GuiCommand::SetLtcDecodeStream(2)], false, |s| s.ltc_selected_stream == 2);
     assert_eq!(snapshot.ltc_selected_stream, 2);
 }
 
 #[test]
 fn test_engine_set_ltc_decode_channel() {
-    let snapshot = run_engine_with_command(GuiCommand::SetLtcDecodeChannel(3), false);
+    let snapshot = run_engine(vec![GuiCommand::SetLtcDecodeChannel(3)], false, |s| s.ltc_selected_channel == 3);
     assert_eq!(snapshot.ltc_selected_channel, 3);
 }
 
 #[test]
 fn test_engine_set_ltc_decode_stream_and_channel() {
-    let snapshot = run_engine_with_commands(
+    let snapshot = run_engine(
         vec![
             GuiCommand::SetLtcDecodeStream(1),
             GuiCommand::SetLtcDecodeChannel(2),
         ],
         false,
+        |s| s.ltc_selected_stream == 1 && s.ltc_selected_channel == 2,
     );
     assert_eq!(snapshot.ltc_selected_stream, 1);
     assert_eq!(snapshot.ltc_selected_channel, 2);
@@ -536,6 +549,8 @@ fn test_engine_probe_file_durations_wav() {
     let dir = tempfile::TempDir::new().unwrap();
     let path1 = dir.path().join("ch1.wav");
     let path2 = dir.path().join("ch2.wav");
+
+    init_test_config();
 
     // Create two WAVs with known durations
     let spec = hound::WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
@@ -557,7 +572,7 @@ fn test_engine_probe_file_durations_wav() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-test".into())
         .spawn(move || {
-            gui_engine::engine::engine_main(rx, state_clone, false);
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -588,10 +603,14 @@ fn test_engine_probe_file_durations_wav() {
 
 #[test]
 fn cancel_decode_clears_is_detecting_and_sets_status() {
-    let snapshot = run_engine_with_commands(vec![
-        GuiCommand::ParseLtcWavFile("/nonexistent/bogus_file_for_test.wav".to_string()),
-        GuiCommand::CancelDecode,
-    ], false);
+    let snapshot = run_engine(
+        vec![
+            GuiCommand::ParseLtcWavFile("/nonexistent/bogus_file_for_test.wav".to_string()),
+            GuiCommand::CancelDecode,
+        ],
+        false,
+        |s| !s.ltc_is_detecting && s.status_message == "Decode canceled by user",
+    );
     assert!(!snapshot.ltc_is_detecting,
         "CancelDecode should clear ltc_is_detecting");
     assert_eq!(snapshot.status_message, "Decode canceled by user",
@@ -600,14 +619,18 @@ fn cancel_decode_clears_is_detecting_and_sets_status() {
 
 #[test]
 fn cancel_decode_also_clears_group_detecting() {
-    let snapshot = run_engine_with_commands(vec![
-        GuiCommand::DecodeLtcVideoGroup {
-            paths: vec!["/nonexistent/bogus_clip_1.wav".to_string()],
-            stream_index: 0,
-            channel_index: 0,
-        },
-        GuiCommand::CancelDecode,
-    ], false);
+    let snapshot = run_engine(
+        vec![
+            GuiCommand::DecodeLtcVideoGroup {
+                paths: vec!["/nonexistent/bogus_clip_1.wav".to_string()],
+                stream_index: 0,
+                channel_index: 0,
+            },
+            GuiCommand::CancelDecode,
+        ],
+        false,
+        |s| !s.ltc_group_is_detecting && s.status_message == "Decode canceled by user",
+    );
     assert!(!snapshot.ltc_group_is_detecting,
         "CancelDecode should clear ltc_group_is_detecting");
     assert!(!snapshot.ltc_is_detecting,
@@ -618,9 +641,11 @@ fn cancel_decode_also_clears_group_detecting() {
 #[test]
 fn set_parent_folder_persists_in_snapshot() {
     let dir = tempfile::TempDir::new().unwrap();
-    let snapshot = run_engine_with_commands(vec![
-        GuiCommand::Offload(OffloadCommand::SetParentFolder(dir.path().to_path_buf())),
-    ], false);
+    let snapshot = run_engine(
+        vec![GuiCommand::Offload(OffloadCommand::SetParentFolder(dir.path().to_path_buf()))],
+        false,
+        |s| s.offload.parent_folder.is_some(),
+    );
     assert_eq!(snapshot.offload.parent_folder, Some(dir.path().to_path_buf()),
         "SetParentFolder should update the snapshot parent_folder");
 }

@@ -332,7 +332,53 @@ npm run lint                         # TypeScript typecheck (tsc --noEmit)
 cargo clippy --all-targets           # Lint all workspace crates
 ```
 
-Integration suites in `gui-engine/tests/`: `integration.rs` (engine), `converter_integration.rs` (conversion pipelines), `video_extraction.rs` (ffprobe/ffmpeg extraction). Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
+### Flaky-Test Methodology
+
+Integration tests that drive the real engine thread or real ffmpeg subprocesses
+can be timing-sensitive. Follow these rules to keep them deterministic:
+
+1. **Predicate waits, not signals** — Never break a poll loop on `generation > 0`
+   or similar coarse signals. Always wait for the *specific postcondition* the
+   test asserts (e.g. `logs.len() == 3`, `status_message == "Clap!"`). See
+   `run_engine()` in `gui-engine/tests/integration.rs` for the canonical pattern.
+
+2. **Deadlines, not fixed sleeps** — Never use `thread::sleep(Duration::from_millis(N))`
+   to wait for an async operation. Poll with a deadline and a predicate; this
+   adapts to machine load. Fix examples in `test_conversion_cancellation`:
+   it polls until `Running` before cancelling, never sleeping a fixed 200ms.
+
+3. **Decay-tolerant tolerances** — Temporal assertions (e.g. flash-alpha after a
+   clap) must account for engine-tick decay. If testing through the state-snapshot
+   path, the observed snapshot may be 1-2 ticks old. Prefer synchronous unit tests
+   for fine-grained state checks; keep integration assertions coarse.
+
+4. **No real user config** — Engine tests set `XDG_CONFIG_HOME` to a tempdir via
+   `init_test_config()`, preventing writes to `~/.config/`. All test engine
+   spawns must call `init_test_config()` first.
+
+5. **No real ffmpeg probe** — Engine tests use `engine_main_with_probe()` with
+   `fake_probe()`, skipping the real ffmpeg-capability subprocess probe.
+   This removes N concurrent `ffmpeg -encoders` calls per test run and the
+   mid-test `apply_available_defaults` mutation. The real probe path is exercised
+   by converter integration tests that call `query_ffmpeg_capabilities()` directly.
+
+6. **Loud skips** — Tests that require ffmpeg/ffprobe use `eprintln!("--- SKIPPED: ...")`
+   so skips are visible in the output, never silent.
+
+7. **Tooling** — `cargo-nextest` is installed and configured (`.config/nextest.toml`).
+   Each test runs in its own process, eliminating shared-state races. Use
+   `npm run test:flaky` (alias for `cargo nextest run --profile ci`) for CI
+   repeat runs: `retries=3`, `final-status-level=flaky` highlights tests that
+   passed only on retry. Locally, `cargo nextest run --retries 10 -E 'test(...)'`
+   ruthlessly shakes out timing flakes in a target test.
+
+### Integration Suites
+
+- `gui-engine/tests/integration.rs` — engine-thread command processing
+- `gui-engine/tests/converter_integration.rs` — conversion pipelines (real ffmpeg)
+- `gui-engine/tests/video_extraction.rs` — ffprobe/ffmpeg extraction (real ffmpeg)
+
+Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 
 ## Build & Run
 

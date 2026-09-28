@@ -72,11 +72,11 @@ fn test_conversion_progress_tracking() {
     // Skip if ffmpeg is not available
     let caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
-        eprintln!("Skipping: ffmpeg not available");
+        eprintln!("--- SKIPPED: ffmpeg not available");
         return;
     }
     if resolve_encoder_chain("h264", &caps).is_empty() {
-        eprintln!("Skipping: no H.264 encoder available");
+        eprintln!("--- SKIPPED: no H.264 encoder available");
         return;
     }
 
@@ -151,11 +151,11 @@ concat_audio: false,
 fn test_conversion_cancellation() {
     let caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
-        eprintln!("Skipping: ffmpeg not available");
+        eprintln!("--- SKIPPED: ffmpeg not available (test_conversion_cancellation)");
         return;
     }
     if resolve_encoder_chain("h264", &caps).is_empty() {
-        eprintln!("Skipping: no H.264 encoder available");
+        eprintln!("--- SKIPPED: no H.264 encoder available (test_conversion_cancellation)");
         return;
     }
 
@@ -163,9 +163,9 @@ fn test_conversion_cancellation() {
     let wav1 = dir.path().join("ch1.wav");
     let wav2 = dir.path().join("ch2.wav");
 
-    // Use a longer duration so we have time to cancel
-    create_test_wav(&wav1, 48000, 5.0, 8000);
-    create_test_wav(&wav2, 48000, 5.0, -8000);
+    // Use long (60s) inputs so the encode CANNOT complete before we cancel.
+    create_test_wav(&wav1, 48000, 60.0, 8000);
+    create_test_wav(&wav2, 48000, 60.0, -8000);
 
     let settings = make_test_settings(dir.path(), vec![wav1, wav2]);
 
@@ -174,8 +174,26 @@ fn test_conversion_cancellation() {
 
     let handle = spawn_conversion(settings, Arc::clone(&state), Arc::clone(&cancel), Some(&caps));
 
-    // Let it run briefly, then cancel
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait until the conversion is actually Running (not Idle), then cancel immediately.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        {
+            let s = state.lock().unwrap();
+            match &s.status {
+                ConversionStatus::Running { .. } => break,
+                ConversionStatus::Completed | ConversionStatus::Failed { .. } => {
+                    panic!("Conversion completed or failed before we could cancel. Status: {:?}", s.status);
+                }
+                _ => {}
+            }
+        }
+        if Instant::now() > deadline {
+            cancel.store(true, Ordering::Relaxed);
+            panic!("Conversion did not enter Running state within 30s");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     cancel.store(true, Ordering::Relaxed);
 
     let (final_status, _max_progress, log) =
@@ -233,11 +251,11 @@ fn make_test_settings(dir: &Path, input_files: Vec<std::path::PathBuf>) -> Conve
 fn test_conversion_progress_reaches_100_percent() {
     let caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
-        eprintln!("Skipping: ffmpeg not available");
+        eprintln!("--- SKIPPED: ffmpeg not available");
         return;
     }
     if resolve_encoder_chain("h264", &caps).is_empty() {
-        eprintln!("Skipping: no H.264 encoder available");
+        eprintln!("--- SKIPPED: no H.264 encoder available");
         return;
     }
 
@@ -274,11 +292,11 @@ fn test_conversion_progress_reaches_100_percent() {
 fn test_conversion_resolves_and_reports_encoder() {
     let mut caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
-        eprintln!("Skipping: ffmpeg not available");
+        eprintln!("--- SKIPPED: ffmpeg not available");
         return;
     }
     if !caps.available_encoders.contains("libx264") {
-        eprintln!("Skipping: libx264 encoder not available");
+        eprintln!("--- SKIPPED: libx264 encoder not available");
         return;
     }
     caps.available_encoders = std::collections::BTreeSet::from([
@@ -323,7 +341,7 @@ fn test_conversion_resolves_and_reports_encoder() {
 fn test_conversion_fails_when_no_encoder_candidate_exists() {
     let caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
-        eprintln!("Skipping: ffmpeg not available");
+        eprintln!("--- SKIPPED: ffmpeg not available");
         return;
     }
 
@@ -387,11 +405,11 @@ fn create_test_video_with_tone(
 fn test_concat_audio_across_two_video_clips() {
     let caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
-        eprintln!("Skipping: ffmpeg not available");
+        eprintln!("--- SKIPPED: ffmpeg not available");
         return;
     }
     if resolve_encoder_chain("h264", &caps).is_empty() && !caps.available_encoders.contains("mpeg4") {
-        eprintln!("Skipping: no suitable video encoder");
+        eprintln!("--- SKIPPED: no suitable video encoder");
         return;
     }
 
@@ -536,7 +554,7 @@ fn probe_stream_codecs(path: &Path) -> Vec<String> {
 fn test_copy_mode_streams_video_and_derives_container() {
     let caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
-        eprintln!("Skipping: ffmpeg not available");
+        eprintln!("--- SKIPPED: ffmpeg not available");
         return;
     }
 
@@ -642,7 +660,7 @@ audio_suffix_template: "_audio_track{track:01d}".to_string(),
 fn test_progress_stays_below_100_until_all_steps_done() {
     let caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
-        eprintln!("Skipping: ffmpeg not available");
+        eprintln!("--- SKIPPED: ffmpeg not available");
         return;
     }
 
