@@ -229,6 +229,10 @@ pub struct AppStateSnapshot {
     pub ltc_selected_stream: usize,
     pub ltc_selected_channel: usize,
     pub ltc_decode_is_video: bool,
+    /// Monotonically increasing generation — only probe results matching the
+    /// current generation are accepted (discards stale results from rapid
+    /// re-clicks).
+    pub ltc_probe_generation: u64,
 
     // LTC group (batch) decode — decode every clip in a video recording group
     pub ltc_group_is_detecting: bool,
@@ -334,6 +338,7 @@ impl AppStateSnapshot {
             ltc_selected_stream: 0,
             ltc_selected_channel: 0,
             ltc_decode_is_video: false,
+            ltc_probe_generation: 0,
             ltc_decode_progress_pct: 0.0,
             ltc_decode_progress_str: String::new(),
             ltc_group_is_detecting: false,
@@ -531,6 +536,20 @@ mod tests {
         assert!(s.ltc_group_errors.is_empty());
         assert_eq!(s.ltc_group_done, 0);
         assert_eq!(s.ltc_group_total, 0);
+    }
+
+    // ── LTC probe generation ──────────────────────────────────────────────
+
+    #[test]
+    fn test_initial_probe_generation_zero() {
+        let s = initial_state();
+        assert_eq!(s.ltc_probe_generation, 0);
+    }
+
+    #[test]
+    fn test_initial_probe_is_none() {
+        let s = initial_state();
+        assert!(s.ltc_probe.is_none());
     }
 
     // ── Clone produces independent copy ───────────────────────────────────

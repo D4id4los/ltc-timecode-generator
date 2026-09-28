@@ -1,9 +1,9 @@
 use std::io::BufRead;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::subprocess::no_window_command;
+use crate::subprocess::{no_window_command, run_output_with_timeout, SubprocessFailure, PROBE_TIMEOUT};
 
 use log::{error, info, warn};
 
@@ -32,22 +32,51 @@ pub fn path_is_video(path: &Path) -> bool {
 }
 
 pub fn probe_video_audio(path: &Path) -> Result<VideoAudioProbe, String> {
-    let output = no_window_command("ffprobe")
-        .args([
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams",
-            "-select_streams", "a",
-            &path.to_string_lossy(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run ffprobe: {}", e))?;
+    probe_video_audio_with(path, &mut |args: &[String]| {
+        run_output_with_timeout(
+            no_window_command("ffprobe")
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            PROBE_TIMEOUT,
+        )
+    })
+}
+
+/// Injectable-runner variant of [`probe_video_audio`] for testability.
+///
+/// `runner` receives the full argument list (including the path) and must
+/// return the subprocess [`Output`] (with timed-out/killed handled as
+/// `Err(SubprocessFailure::TimedOut)`).
+pub fn probe_video_audio_with(
+    path: &Path,
+    runner: &mut dyn FnMut(&[String]) -> Result<Output, SubprocessFailure>,
+) -> Result<VideoAudioProbe, String> {
+    let args: Vec<String> = vec![
+        "-v".into(),
+        "quiet".into(),
+        "-print_format".into(),
+        "json".into(),
+        "-show_streams".into(),
+        "-select_streams".into(),
+        "a".into(),
+        path.to_string_lossy().into(),
+    ];
+
+    let output = runner(&args).map_err(|e| {
+        let msg = match e {
+            SubprocessFailure::Io(_) => format!("ffprobe probe failed: {}", e),
+            SubprocessFailure::TimedOut => {
+                format!("ffprobe timed out after {:.0}s — file may be corrupt", PROBE_TIMEOUT.as_secs_f64())
+            }
+        };
+        error!("{} for '{}'", msg, path.display());
+        msg
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffprobe failed: {}", stderr));
+        return Err(format!("ffprobe failed: {}", stderr.trim()));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -217,24 +246,50 @@ pub fn parse_out_time_us(line: &str) -> Option<f64> {
 /// Quickly probe the duration (in seconds) of a single stream inside a
 /// container file by calling ffprobe with `-show_entries stream=duration`.
 /// Falls back to the container-level `format.duration` when per-stream
-/// duration is unavailable. Returns `None` on failure.
+/// duration is unavailable. Returns `None` on failure or timeout.
 pub fn probe_stream_duration_secs(path: &Path, absolute_stream_index: usize) -> Option<f64> {
-    let output = no_window_command("ffprobe")
-        .args([
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_entries", "stream=duration:format=duration",
-            "-select_streams", &format!("{}", absolute_stream_index),
-            &path.to_string_lossy(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    probe_stream_duration_secs_with(path, absolute_stream_index, &mut |args: &[String]| {
+        run_output_with_timeout(
+            no_window_command("ffprobe")
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            PROBE_TIMEOUT,
+        )
+    })
+}
 
-    if !output.status.success() {
-        return None;
-    }
+/// Injectable-runner variant of [`probe_stream_duration_secs`].
+pub fn probe_stream_duration_secs_with(
+    path: &Path,
+    absolute_stream_index: usize,
+    runner: &mut dyn FnMut(&[String]) -> Result<Output, SubprocessFailure>,
+) -> Option<f64> {
+    let args: Vec<String> = vec![
+        "-v".into(),
+        "quiet".into(),
+        "-print_format".into(),
+        "json".into(),
+        "-show_entries".into(),
+        "stream=duration:format=duration".into(),
+        "-select_streams".into(),
+        format!("{}", absolute_stream_index),
+        path.to_string_lossy().into(),
+    ];
+
+    let output = match runner(&args) {
+        Ok(o) if o.status.success() => o,
+        Ok(_) => return None,
+        Err(SubprocessFailure::TimedOut) => {
+            warn!(
+                "ffprobe duration probe timed out after {:.0}s for '{}'",
+                PROBE_TIMEOUT.as_secs_f64(),
+                path.display()
+            );
+            return None;
+        }
+        Err(SubprocessFailure::Io(_)) => return None,
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).ok()?;
@@ -403,18 +458,27 @@ pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
     let window_start = (offset_secs - 15.0).max(0.0);
     let interval = format!("{:.3}%{:.3}", window_start, offset_secs + 0.05);
 
-    let output = match no_window_command("ffprobe")
-        .args([
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "packet=pts_time,flags",
-            "-read_intervals", &interval,
-            "-of", "json",
-            &path.to_string_lossy(),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let args: Vec<String> = vec![
+        "-v".into(),
+        "error".into(),
+        "-select_streams".into(),
+        "v:0".into(),
+        "-show_entries".into(),
+        "packet=pts_time,flags".into(),
+        "-read_intervals".into(),
+        interval,
+        "-of".into(),
+        "json".into(),
+        path.to_string_lossy().into(),
+    ];
+
+    let output = match run_output_with_timeout(
+        no_window_command("ffprobe")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        PROBE_TIMEOUT,
+    )
     {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
@@ -427,7 +491,16 @@ pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
             );
             return offset_secs;
         }
-        Err(e) => {
+        Err(SubprocessFailure::TimedOut) => {
+            warn!(
+                "Keyframe probe timed out after {:.0}s for '{}' (offset {:.3}s)",
+                PROBE_TIMEOUT.as_secs_f64(),
+                path.display(),
+                offset_secs,
+            );
+            return offset_secs;
+        }
+        Err(SubprocessFailure::Io(e)) => {
             warn!("Failed to run ffprobe for keyframe lookup: {}", e);
             return offset_secs;
         }
@@ -646,5 +719,145 @@ mod tests {
     fn test_parse_out_time_us_trailing_text() {
         // ffmpeg can emit extra whitespace; trim handles it
         assert!((parse_out_time_us("  out_time_us=5000000  ").unwrap() - 5.0).abs() < 1e-9);
+    }
+
+    // ── probe_video_audio_with timeout ──────────────────────────────────────
+
+    fn probe_success_runner(_args: &[String]) -> Result<Output, SubprocessFailure> {
+        let json = br#"{"streams":[{"index":1,"codec_name":"aac","channels":2,"sample_rate":"48000"}]}"#;
+        Ok(Output {
+            status: std::process::ExitStatus::default(),
+            stdout: json.to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    fn probe_timeout_runner(_args: &[String]) -> Result<Output, SubprocessFailure> {
+        Err(SubprocessFailure::TimedOut)
+    }
+
+    fn probe_io_error_runner(_args: &[String]) -> Result<Output, SubprocessFailure> {
+        Err(SubprocessFailure::Io("ffprobe not found".into()))
+    }
+
+    #[test]
+    fn test_probe_video_audio_with_success() {
+        let path = Path::new("test.mp4");
+        let result = probe_video_audio_with(path, &mut probe_success_runner);
+        assert!(result.is_ok());
+        let probe = result.unwrap();
+        assert_eq!(probe.total_audio_channels, 2);
+        assert!(probe.is_video_file);
+        assert_eq!(probe.streams.len(), 1);
+        assert_eq!(probe.streams[0].codec_name, "aac");
+    }
+
+    #[test]
+    fn test_probe_video_audio_with_timed_out_returns_error() {
+        let path = Path::new("corrupt.mp4");
+        let result = probe_video_audio_with(path, &mut probe_timeout_runner);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("timed out"), "error should mention timeout: {}", msg);
+        assert!(msg.contains("corrupt"), "error should mention file may be corrupt: {}", msg);
+    }
+
+    #[test]
+    fn test_probe_video_audio_with_io_error() {
+        let path = Path::new("unreadable.mp4");
+        let result = probe_video_audio_with(path, &mut probe_io_error_runner);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("ffprobe"), "error should mention ffprobe: {}", msg);
+    }
+
+    #[test]
+    fn test_probe_video_audio_with_empty_streams_returns_error() {
+        // ffprobe returned valid JSON but no streams → error path
+        let mut runner = |_: &[String]| {
+            let json = r#"{"streams":[]}"#;
+            Ok(Output {
+                status: std::process::ExitStatus::default(),
+                stdout: json.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        };
+        let path = Path::new("silent.mp4");
+        let result = probe_video_audio_with(path, &mut runner);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("No audio streams"), "error should mention no streams: {}", msg);
+    }
+
+    #[test]
+    fn test_probe_video_audio_with_invalid_json_returns_error() {
+        let mut runner = |_: &[String]| {
+            Ok(Output {
+                status: std::process::ExitStatus::default(),
+                stdout: b"not json".to_vec(),
+                stderr: Vec::new(),
+            })
+        };
+        let path = Path::new("garbage.mp4");
+        let result = probe_video_audio_with(path, &mut runner);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("Failed to parse"), "error should mention parse failure: {}", msg);
+    }
+
+    // ── probe_stream_duration_secs_with timeout ─────────────────────────────
+
+    fn duration_success_runner(_args: &[String]) -> Result<Output, SubprocessFailure> {
+        let json = r#"{"streams":[{"duration":"123.456"}]}"#;
+        Ok(Output {
+            status: std::process::ExitStatus::default(),
+            stdout: json.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn test_probe_stream_duration_secs_with_success() {
+        let path = Path::new("clip.mp4");
+        let result = probe_stream_duration_secs_with(path, 0, &mut duration_success_runner);
+        assert!((result.unwrap() - 123.456).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_probe_stream_duration_secs_with_timed_out_returns_none() {
+        let path = Path::new("corrupt.mp4");
+        let result = probe_stream_duration_secs_with(path, 0, &mut probe_timeout_runner);
+        assert!(result.is_none(), "timeout should return None, got {:?}", result);
+    }
+
+    #[test]
+    fn test_probe_stream_duration_secs_with_empty_json_returns_none() {
+        // ffprobe returned success but JSON has no stream or format duration
+        let mut runner = |_: &[String]| {
+            let json = r#"{"streams":[{"index":1}]}"#;
+            Ok(Output {
+                status: std::process::ExitStatus::default(),
+                stdout: json.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        };
+        let path = Path::new("bad.mp4");
+        let result = probe_stream_duration_secs_with(path, 0, &mut runner);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_probe_stream_duration_secs_with_format_fallback() {
+        let mut runner = |_: &[String]| {
+            let json = r#"{"format":{"duration":"42.0"}}"#;
+            Ok(Output {
+                status: std::process::ExitStatus::default(),
+                stdout: json.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        };
+        let path = Path::new("clip.mp4");
+        let result = probe_stream_duration_secs_with(path, 0, &mut runner);
+        assert!((result.unwrap() - 42.0).abs() < 0.001);
     }
 }

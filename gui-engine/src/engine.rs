@@ -96,6 +96,10 @@ pub fn engine_main_with_probe<F>(
     let (conv_probe_tx, conv_probe_rx) =
         std::sync::mpsc::channel::<ConverterProbeResult>();
 
+    // Internal result channel for video-file probe (async ProbeVideo)
+    let (probe_tx, probe_rx) =
+        std::sync::mpsc::channel::<VideoProbeResult>();
+
     // Internal result channel for offload card scan and copy completion
     let (offload_event_tx, offload_event_rx) =
         std::sync::mpsc::channel::<OffloadEvent>();
@@ -389,6 +393,23 @@ pub fn engine_main_with_probe<F>(
                     current.status_message = "Conversion canceled".to_string();
                     info!("Conversion cancel signaled via engine CancelConversion command");
                 }
+                Ok(GuiCommand::ProbeVideo(path)) => {
+                    info!("Probing video file for audio streams (async): {}", path);
+                    current.ltc_probe_generation += 1;
+                    let gen = current.ltc_probe_generation;
+                    current.ltc_probe = None;
+                    current.ltc_decode_error = None;
+                    current.ltc_decode_is_video = false;
+                    current.status_message = format!("Probing video: {}", path);
+                    let tx = probe_tx.clone();
+                    std::thread::Builder::new()
+                        .name("video-probe".into())
+                        .spawn(move || {
+                            let result = crate::ffprobe::probe_video_audio(Path::new(&path));
+                            let _ = tx.send(VideoProbeResult { path, generation: gen, result });
+                        })
+                        .expect("failed to spawn video-probe thread");
+                }
                 Ok(cmd) => {
                     process_command(
                         cmd,
@@ -412,6 +433,45 @@ pub fn engine_main_with_probe<F>(
                     let _ = core.stop_ltc();
                     let _ = core.stop_output();
                     return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // 1.4 Drain async video probe result
+        loop {
+            match probe_rx.try_recv() {
+                Ok(VideoProbeResult { path, generation, result }) => {
+                    if generation == current.ltc_probe_generation {
+                        match result {
+                            Ok(probe) => {
+                                current.ltc_probe = Some(probe.clone());
+                                current.ltc_selected_stream = 0;
+                                current.ltc_selected_channel = 0;
+                                current.ltc_decode_is_video = true;
+                                current.status_message = format!(
+                                    "Video probed: {} audio stream(s), {} total channel(s)",
+                                    probe.streams.len(),
+                                    probe.total_audio_channels,
+                                );
+                                info!("Probe succeeded: {} streams, {} channels — {}", probe.streams.len(), probe.total_audio_channels, path);
+                            }
+                            Err(e) => {
+                                current.ltc_probe = None;
+                                current.ltc_decode_error = Some(e.clone());
+                                current.ltc_decode_is_video = false;
+                                current.status_message = format!("Video probe failed: {}", e);
+                                error!("Video probe failed: {} — {}", path, e);
+                            }
+                        }
+                    } else {
+                        warn!("Discarding stale video probe result: generation={}, expected={}, path={}",
+                            generation, current.ltc_probe_generation, path);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("Video probe result channel disconnected");
+                    break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
             }
@@ -841,6 +901,13 @@ struct DurationResult {
     path: std::path::PathBuf,
     generation: u64,
     secs: Option<f64>,
+}
+
+/// Internal message sent from a spawned video-probe thread back to the engine loop.
+struct VideoProbeResult {
+    path: String,
+    generation: u64,
+    result: Result<VideoAudioProbe, String>,
 }
 
 /// Internal message sent from the converter-probe thread back to the engine loop.
@@ -1396,6 +1463,7 @@ fn process_command(
             }
             *decode_cancel = None;
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
+            state.ltc_probe_generation = state.ltc_probe_generation.wrapping_add(1);
             // Group decode state
             state.ltc_group_paths = Vec::new();
             state.ltc_group_results = Vec::new();
@@ -1411,29 +1479,10 @@ fn process_command(
             state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
         }
 
-        GuiCommand::ProbeVideo(path) => {
-            info!("Probing video file for audio streams: {}", path);
-            match ffprobe::probe_video_audio(Path::new(&path)) {
-                Ok(probe) => {
-                    state.ltc_probe = Some(probe.clone());
-                    state.ltc_selected_stream = 0;
-                    state.ltc_selected_channel = 0;
-                    state.ltc_decode_is_video = true;
-                    state.status_message = format!(
-                        "Video probed: {} audio stream(s), {} total channel(s)",
-                        probe.streams.len(),
-                        probe.total_audio_channels,
-                    );
-                    info!("Probe succeeded: {} streams, {} channels — {}", probe.streams.len(), probe.total_audio_channels, path);
-                }
-                Err(e) => {
-                    state.ltc_probe = None;
-                    state.ltc_decode_error = Some(e.clone());
-                    state.ltc_decode_is_video = false;
-                    state.status_message = format!("Video probe failed: {}", e);
-                    error!("Video probe failed: {} — {}", path, e);
-                }
-            }
+        GuiCommand::ProbeVideo(_path) => {
+            // Handled inline in engine_main's command drain — this arm is
+            // never reached in practice; kept for match exhaustiveness.
+            unreachable!("ProbeVideo is handled in the main loop, not here");
         }
 
         GuiCommand::ParseLtcVideo(path, stream_index, channel_index) => {
@@ -2188,6 +2237,7 @@ fn apply_recording_selection(
     // Bump decode generations so in-flight results from the old
     // recording are discarded by the generation check.
     state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
+    state.ltc_probe_generation = state.ltc_probe_generation.wrapping_add(1);
     // Cancel any running group decode and reset clip progress
     if let Some(ref cancel) = group_cancel {
         cancel.store(true, Ordering::Relaxed);

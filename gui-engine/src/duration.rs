@@ -1,7 +1,8 @@
 use std::path::Path;
+use std::process::Stdio;
 
 use crate::converter::RecordingType;
-use crate::subprocess::no_window_command;
+use crate::subprocess::{no_window_command, run_output_with_timeout, SubprocessFailure, PROBE_TIMEOUT};
 
 /// Read the duration (seconds) of an audio/video file.
 /// WAV files use a fast header-only parse via `hound`; other files use ffprobe.
@@ -60,19 +61,31 @@ fn wav_duration_secs(path: &Path) -> Option<f64> {
 // ── ffprobe duration ──────────────────────────────────────────────────────
 
 fn run_ffprobe_duration(path: &Path) -> Option<f64> {
-    let output = no_window_command("ffprobe")
-        .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path.as_os_str().to_str()?,
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
+    let args: [&str; 6] = [
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+    ];
+    let output = match run_output_with_timeout(
+        no_window_command("ffprobe")
+            .args(args)
+            .arg(path.as_os_str().to_str()?)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        PROBE_TIMEOUT,
+    ) {
+        Ok(o) if o.status.success() => o,
+        Ok(_) => return None,
+        Err(SubprocessFailure::TimedOut) => {
+            log::warn!(
+                "ffprobe duration probe timed out after {:.0}s for '{}'",
+                PROBE_TIMEOUT.as_secs_f64(),
+                path.display(),
+            );
+            return None;
+        }
+        Err(SubprocessFailure::Io(_)) => return None,
+    };
 
     let stdout = String::from_utf8(output.stdout).ok()?;
     let trimmed = stdout.trim();

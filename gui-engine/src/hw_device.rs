@@ -6,8 +6,8 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Duration;
 
 use crate::converter::HwDeviceCapabilities;
 use crate::subprocess::no_window_command;
@@ -181,27 +181,6 @@ pub fn build_test_encode_args(
     args
 }
 
-/// Run a child process and wait for it to finish within `timeout`, killing
-/// it on expiry. Returns `None` on timeout/spawn failure, `Some(exit_success)`
-/// otherwise.
-pub fn run_with_timeout(child: &mut Child, timeout: Duration) -> Option<bool> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status.success()),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => return None,
-        }
-    }
-}
-
 /// Test-encode a single hardware encoder: run a 1-frame null encode and
 /// return `true` if it succeeds within the timeout.
 pub fn test_encode(ffmpeg: &str, encoder: &str, hw_frames: Option<HwFramePath>, vaapi_device: Option<&str>) -> bool {
@@ -215,7 +194,7 @@ pub fn test_encode(ffmpeg: &str, encoder: &str, hw_frames: Option<HwFramePath>, 
         Ok(c) => c,
         Err(_) => return false,
     };
-    run_with_timeout(&mut child, TEST_ENCODE_TIMEOUT).unwrap_or(false)
+    crate::subprocess::run_with_timeout(&mut child, TEST_ENCODE_TIMEOUT).unwrap_or(false)
 }
 
 /// Injectable variant of [`test_encode`] for unit testing — accepts a

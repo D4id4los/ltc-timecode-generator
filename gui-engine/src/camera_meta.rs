@@ -33,14 +33,25 @@ pub struct CameraInfo {
     pub creation_date: Option<String>,
 }
 
-/// Convenience wrapper — probes `path` for camera info using real subprocesses.
+/// Convenience wrapper — probes `path` for camera info using real subprocesses
+/// with a 10-second timeout per subprocess.
 pub fn probe_camera_info(path: &Path) -> Option<CameraInfo> {
     probe_camera_info_with(path, &mut |prog, args| {
-        crate::subprocess::no_window_command(prog)
-            .args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
+        crate::subprocess::run_output_with_timeout(
+            crate::subprocess::no_window_command(prog)
+                .args(args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null()),
+            crate::subprocess::PROBE_TIMEOUT,
+        )
+        .map_err(|e| match e {
+            crate::subprocess::SubprocessFailure::Io(msg) => {
+                io::Error::other(msg)
+            }
+            crate::subprocess::SubprocessFailure::TimedOut => {
+                io::Error::new(io::ErrorKind::TimedOut, "probe timed out")
+            }
+        })
     })
 }
 
