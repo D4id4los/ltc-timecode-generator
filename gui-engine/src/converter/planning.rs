@@ -361,7 +361,7 @@ pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAu
 
             if settings.split_tracks {
                 for i in 0..settings.channel_map.num_channels() {
-                    if settings.drop_ltc_track && i == settings.ltc_track_channel_index {
+                    if settings.is_ltc_output_track(i) {
                         continue;
                     }
                     previews.push(PreviewOutput {
@@ -403,7 +403,7 @@ pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAu
                 } else if settings.split_tracks {
                     let num_channels = settings.channel_map.num_channels();
                     for i in 0..num_channels {
-                        if settings.drop_ltc_track && i == settings.ltc_track_channel_index {
+                        if settings.is_ltc_output_track(i) {
                             continue;
                         }
                         previews.push(PreviewOutput {
@@ -448,7 +448,7 @@ pub fn output_collision_warning(settings: &ConverterSettings) -> Option<String> 
             let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
             if settings.split_tracks {
                 for i in 0..settings.channel_map.num_channels() {
-                    if settings.drop_ltc_track && i == settings.ltc_track_channel_index {
+                    if settings.is_ltc_output_track(i) {
                         continue;
                     }
                     let (guarded, unguarded) = settings.output_path_for_file_checked("audio", 0, i + 1, aext);
@@ -484,7 +484,7 @@ pub fn output_collision_warning(settings: &ConverterSettings) -> Option<String> 
             if settings.recording_type == super::settings::RecordingType::VideoClipSequence {
                 if settings.split_tracks {
                     for i in 0..settings.channel_map.num_channels() {
-                        if settings.drop_ltc_track && i == settings.ltc_track_channel_index {
+                        if settings.is_ltc_output_track(i) {
                             continue;
                         }
                         let (guarded, unguarded) =

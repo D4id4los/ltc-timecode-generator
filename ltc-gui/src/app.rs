@@ -196,6 +196,14 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Set the LTC file/track index in *both* the GUI-local decode-section
+    /// field and the `local_settings` merge buffer, so the diff machinery
+    /// (`diff_converter_commands`) emits `SetLtcFileIndex` to the engine.
+    pub fn set_ltc_file_idx(&mut self, idx: usize) {
+        self.ltc_file_idx = idx;
+        self.local_settings.ltc_file_idx = idx;
+    }
+
     pub fn new(
         cmd_tx: Sender<GuiCommand>,
         engine_state: Arc<ArcSwap<AppStateSnapshot>>,
@@ -582,7 +590,7 @@ impl eframe::App for AppState {
                 let path = path.clone();
                 log::info!("Offload completed — auto-switching converter folder to {:?}", path);
                 self.selected_folder = Some(path.clone());
-                self.ltc_file_idx = 1;
+                self.set_ltc_file_idx(1);
                 let _ = self.cmd_tx.send(GuiCommand::Converter(
                     gui_engine::command::ConverterCommand::SelectFolder(path.clone()),
                 ));
@@ -1405,9 +1413,12 @@ mod tests {
         let groups = vec![group];
 
         app.ltc_file_idx = 5;
+        app.local_settings.ltc_file_idx = 5;
         let cmds = apply_group_selection(&mut app, &groups, 0);
 
         assert_eq!(app.ltc_file_idx, 0);
+        assert_eq!(app.local_settings.ltc_file_idx, 0,
+            "apply_group_selection must reset local_settings.ltc_file_idx too");
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], GuiCommand::ClearRecordingDecodeState));
         assert!(matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
@@ -1435,9 +1446,25 @@ mod tests {
         let cmds = apply_group_selection(&mut app, &groups, 0);
 
         assert_eq!(app.ltc_file_idx, 0);
+        assert_eq!(app.local_settings.ltc_file_idx, 0,
+            "apply_group_selection must reset local_settings.ltc_file_idx too");
         assert_eq!(cmds.len(), 2, "video group should return 2 commands");
         assert!(matches!(cmds[0], GuiCommand::ClearRecordingDecodeState));
         assert!(matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
+    }
+
+    #[test]
+    fn set_ltc_file_idx_writes_both_fields() {
+        let mut app = app_with_no_decode_state();
+        assert_eq!(app.ltc_file_idx, 0);
+        assert_eq!(app.local_settings.ltc_file_idx, 0);
+
+        app.set_ltc_file_idx(2);
+
+        assert_eq!(app.ltc_file_idx, 2,
+            "set_ltc_file_idx must write the GUI-local field");
+        assert_eq!(app.local_settings.ltc_file_idx, 2,
+            "set_ltc_file_idx must write the merge-buffer field");
     }
 
     #[test]

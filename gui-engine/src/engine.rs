@@ -521,7 +521,7 @@ pub fn engine_main_with_probe<F>(
                                 info!("LTC decode completed: {}", path);
                                 // Auto-apply decoder result to converter settings
                                 if generation > last_auto_applied_ltc_gen {
-                                    auto_apply_ltc_to_settings(&mut current);
+                                    auto_apply_ltc_to_settings(&mut current, &path);
                                     last_auto_applied_ltc_gen = generation;
                                     recompute_converter_derived(&mut current);
                                 }
@@ -2594,10 +2594,27 @@ fn apply_recording_selection(
     recompute_converter_derived(state);
 }
 
-fn auto_apply_ltc_to_settings(state: &mut AppStateSnapshot) {
+fn auto_apply_ltc_to_settings(state: &mut AppStateSnapshot, decoded_path: &str) {
     state.converter.settings.split_tracks = true;
     state.converter.settings.drop_ltc_track = true;
     state.converter.settings.set_start_from_ltc = true;
+
+    // Derive ltc_file_idx from the decoded file's position in the selected
+    // audio group (mirrors how video groups transfer decoded stream/channel
+    // into ltc_video_source at assemble time).
+    if let Some(idx) = state
+        .converter
+        .selected_group_idx
+        .and_then(|gi| state.converter.groups.get(gi))
+        .filter(|g| g.recording_type == RecordingType::MultiTrackAudio)
+        .and_then(|g| g.files.iter().position(|f| f.to_string_lossy() == decoded_path))
+    {
+        state.converter.settings.ltc_file_idx = idx;
+        info!(
+            "Auto-synced LTC track index to {} from decoded file (path contained in selected audio group)",
+            idx,
+        );
+    }
 }
 
 fn auto_apply_group_ltc_to_settings(state: &mut AppStateSnapshot) {
@@ -2680,7 +2697,7 @@ mod tests {
         state.converter.settings.split_tracks = false;
         state.converter.settings.drop_ltc_track = false;
         state.converter.settings.set_start_from_ltc = false;
-        auto_apply_ltc_to_settings(&mut state);
+        auto_apply_ltc_to_settings(&mut state, "any.wav");
         assert!(state.converter.settings.split_tracks);
         assert!(state.converter.settings.drop_ltc_track);
         assert!(state.converter.settings.set_start_from_ltc);
@@ -2696,6 +2713,80 @@ mod tests {
         assert!(state.converter.settings.split_tracks);
         assert!(state.converter.settings.drop_ltc_track);
         assert!(state.converter.settings.set_start_from_ltc);
+    }
+
+    #[test]
+    fn auto_apply_ltc_derives_idx_from_decoded_audio_path() {
+        let mut state = setup_state();
+        let files = vec![
+            PathBuf::from("TEST_S01.wav"),
+            PathBuf::from("TEST_S02.wav"),
+            PathBuf::from("TEST_S03.wav"),
+            PathBuf::from("TEST_S04.wav"),
+        ];
+        state.converter.groups = vec![MatchedGroup {
+            prefix: "TEST".into(),
+            rel_dir: String::new(),
+            pattern_name: "TASCAM",
+            recording_type: crate::converter::RecordingType::MultiTrackAudio,
+            files: files.clone(),
+        }];
+        state.converter.selected_group_idx = Some(0);
+        state.converter.settings.ltc_file_idx = 999;
+
+        auto_apply_ltc_to_settings(&mut state, "TEST_S02.wav");
+
+        assert_eq!(state.converter.settings.ltc_file_idx, 1,
+            "must derive index from decoded path position in audio group");
+        assert!(state.converter.settings.split_tracks);
+        assert!(state.converter.settings.drop_ltc_track);
+        assert!(state.converter.settings.set_start_from_ltc);
+    }
+
+    #[test]
+    fn auto_apply_ltc_skips_idx_for_path_not_in_group() {
+        let mut state = setup_state();
+        let files = vec![
+            PathBuf::from("TEST_S01.wav"),
+            PathBuf::from("TEST_S02.wav"),
+        ];
+        state.converter.groups = vec![MatchedGroup {
+            prefix: "TEST".into(),
+            rel_dir: String::new(),
+            pattern_name: "TASCAM",
+            recording_type: crate::converter::RecordingType::MultiTrackAudio,
+            files: files.clone(),
+        }];
+        state.converter.selected_group_idx = Some(0);
+        state.converter.settings.ltc_file_idx = 999;
+
+        auto_apply_ltc_to_settings(&mut state, "NONEXISTENT.wav");
+
+        assert_eq!(state.converter.settings.ltc_file_idx, 999,
+            "must not change idx when decoded path is not in group");
+        assert!(state.converter.settings.split_tracks);
+    }
+
+    #[test]
+    fn auto_apply_ltc_skips_idx_for_video_group() {
+        let mut state = setup_state();
+        state.converter.groups = vec![MatchedGroup {
+            prefix: "CLIP".into(),
+            rel_dir: String::new(),
+            pattern_name: "GoPro",
+            recording_type: crate::converter::RecordingType::VideoClipSequence,
+            files: vec![
+                PathBuf::from("GOPR0001.MP4"),
+                PathBuf::from("GOPR0002.MP4"),
+            ],
+        }];
+        state.converter.selected_group_idx = Some(0);
+        state.converter.settings.ltc_file_idx = 999;
+
+        auto_apply_ltc_to_settings(&mut state, "GOPR0001.MP4");
+
+        assert_eq!(state.converter.settings.ltc_file_idx, 999,
+            "must not change idx for VideoClipSequence groups (uses ltc_video_source)");
     }
 
     // ── stepper_minute ────────────────────────────────────────────────────

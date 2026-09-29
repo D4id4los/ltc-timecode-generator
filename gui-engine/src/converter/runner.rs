@@ -384,7 +384,7 @@ fn run_audio_to_audio(
     if settings.split_tracks {
         let mut emitted = 0usize;
         for track_idx in 0..settings.channel_map.num_channels() {
-            if settings.drop_ltc_track && track_idx == settings.ltc_track_channel_index {
+            if settings.is_ltc_output_track(track_idx) {
                 continue;
             }
             if cancel.load(Ordering::Relaxed) { break; }

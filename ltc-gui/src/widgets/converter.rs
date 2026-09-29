@@ -133,7 +133,7 @@ pub(crate) fn apply_group_selection(
         idx, group.recording_type, group.files.len(),
     );
 
-    state.ltc_file_idx = 0;
+    state.set_ltc_file_idx(0);
     state.last_logged_group_decode_gen = 0;
 
     vec![
@@ -300,9 +300,10 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     let file_count = group.map(|g| g.files.len()).unwrap_or(0);
 
     if file_count > 0 {
-        // Ensure ltc_file_idx is in range (0-based, default to track 2 = index 1)
-        if state.ltc_file_idx >= file_count {
+        // Clamp out-of-range track index to the last file.
+        if state.ltc_file_idx >= file_count && file_count > 0 {
             state.ltc_file_idx = file_count.saturating_sub(1);
+            state.local_settings.ltc_file_idx = state.ltc_file_idx;
         }
 
         let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
@@ -377,6 +378,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
         } else {
             if state.ltc_file_idx >= channel_options.len() && !channel_options.is_empty() {
                 state.ltc_file_idx = channel_options.len().saturating_sub(1);
+                state.local_settings.ltc_file_idx = state.ltc_file_idx;
             }
         }
 
@@ -422,6 +424,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                         for (i, opt) in channel_options.iter().enumerate() {
                             if ui.selectable_label(i == state.ltc_file_idx, &opt.label).clicked() {
                                 state.ltc_file_idx = i;
+                                state.local_settings.ltc_file_idx = i;
                             }
                         }
                     }
@@ -1231,9 +1234,9 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
                 .color(colors.text_secondary),
         );
     }
-    if state.local_settings.drop_ltc_track && state.ltc_file_idx < state.local_settings.channel_map.num_channels() {
+    if state.local_settings.drop_ltc_track && state.local_settings.ltc_file_idx < state.local_settings.channel_map.num_channels() {
         ui.label(
-            RichText::new(format!("ℹ LTC track (channel {}) will be excluded from all output.", state.ltc_file_idx + 1))
+            RichText::new(format!("ℹ LTC track (channel {}) will be excluded from all output.", state.local_settings.ltc_file_idx + 1))
                 .font(FontId::proportional(9.0))
                 .color(colors.text_secondary),
         );
@@ -1793,7 +1796,7 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
         pipeline,
         input_files,
         recording_type: state.latest.converter.selected_recording_type().unwrap_or(RecordingType::MultiTrackAudio),
-        ltc_track_channel_index: state.ltc_file_idx,
+        ltc_track_channel_index: state.local_settings.ltc_file_idx,
         channel_map: state.local_settings.channel_map.clone(),
         split_tracks: state.local_settings.split_tracks,
         drop_ltc_track: state.local_settings.drop_ltc_track,

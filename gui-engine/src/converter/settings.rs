@@ -120,12 +120,25 @@ impl ConverterSettings {
     pub fn merged_audio_output_path(&self, extension: &str) -> PathBuf {
         self.output_path_for_file("audio", 0, 0, extension)
     }
+
+    /// Whether the given *output* track position should be dropped because it
+    /// originates from the LTC input channel.
+    ///
+    /// With the default identity channel map this is equivalent to
+    /// `output_idx == ltc_track_channel_index`; with a permuted map the
+    /// check goes through `ChannelMap::input_for_output` so the correct
+    /// input file is dropped regardless of output reordering.
+    pub fn is_ltc_output_track(&self, output_idx: usize) -> bool {
+        self.drop_ltc_track
+            && self.channel_map.input_for_output(output_idx) == Some(self.ltc_track_channel_index)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use crate::converter::test_fixtures::*;
+    use crate::converter::ChannelMap;
     use crate::converter::DEFAULT_AUDIO_SUFFIX;
     use crate::converter::DEFAULT_VIDEO_SUFFIX;
     use super::*;
@@ -224,6 +237,44 @@ mod tests {
         };
         let path = s.output_path_for_file("audio", 0, 1, "wav");
         assert!(path.to_string_lossy().contains("my_prefix_track1.wav"));
+    }
+
+    #[test]
+    fn test_is_ltc_output_track_identity_map() {
+        let mut s = make_settings_audio_only();
+        s.drop_ltc_track = true;
+        s.ltc_track_channel_index = 1;
+        s.channel_map = ChannelMap::identity(4);
+        // With identity map: output_idx == ltc_track_channel_index → matches
+        assert!(!s.is_ltc_output_track(0), "output 0 is input 0, not LTC input 1");
+        assert!(s.is_ltc_output_track(1), "output 1 is input 1 = LTC input");
+        assert!(!s.is_ltc_output_track(2), "output 2 is input 2, not LTC input");
+        assert!(!s.is_ltc_output_track(3), "output 3 is input 3, not LTC input");
+    }
+
+    #[test]
+    fn test_is_ltc_output_track_permuted_map() {
+        let mut s = make_settings_audio_only();
+        s.drop_ltc_track = true;
+        s.ltc_track_channel_index = 1; // file idx 1 = input 1 is LTC
+        // mapping: [1, 0, 2, 3] → input 1 feeds output 0; input 0 feeds output 1
+        s.channel_map = ChannelMap::from_mapping(vec![1, 0, 2, 3]);
+        // output 0 originates from input 1 (LTC) → should be dropped
+        assert!(s.is_ltc_output_track(0),
+            "output 0 comes from input 1 (LTC) via permuted map");
+        assert!(!s.is_ltc_output_track(1),
+            "output 1 comes from input 0, not LTC");
+        assert!(!s.is_ltc_output_track(2),
+            "output 2 comes from input 2, not LTC");
+    }
+
+    #[test]
+    fn test_is_ltc_output_track_disabled_by_drop_flag() {
+        let mut s = make_settings_audio_only();
+        s.drop_ltc_track = false;
+        s.ltc_track_channel_index = 1;
+        s.channel_map = ChannelMap::identity(4);
+        assert!(!s.is_ltc_output_track(1), "drop_ltc_track is false, nothing is dropped");
     }
 
     #[test]
