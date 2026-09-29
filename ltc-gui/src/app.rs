@@ -428,6 +428,24 @@ fn diff_converter_commands(
     cmds
 }
 
+/// Reconcile the converter settings between user-local edits and the
+/// engine's latest snapshot.
+///
+/// Returns (merged user-visible settings, commands to forward to engine).
+/// Only fields the user actually changed (`local != base`) produce commands
+/// — engine-initiated changes (recording-selection re-defaults, flag resets)
+/// are adopted silently, never echoed back.
+fn reconcile_converter_settings(
+    prev_engine: Option<&ConverterUserSettings>,
+    local: &ConverterUserSettings,
+    engine: &ConverterUserSettings,
+) -> (ConverterUserSettings, Vec<ConverterCommand>) {
+    let base = prev_engine.cloned().unwrap_or_else(|| local.clone());
+    let merged = merge_converter_settings(&base, local, engine);
+    let cmds = diff_converter_commands(&base, local);
+    (merged, cmds)
+}
+
 // ── egui App ────────────────────────────────────────────────────────────
 
 impl eframe::App for AppState {
@@ -441,9 +459,12 @@ impl eframe::App for AppState {
         //    are forwarded as commands; untouched fields adopt the engine's
         //    latest (prefills, flag resets, capability repairs).
         let engine_settings = self.latest.converter.settings.clone();
-        let base = self.prev_engine_settings.clone().unwrap_or_else(|| self.local_settings.clone());
-        let merged = merge_converter_settings(&base, &self.local_settings, &engine_settings);
-        for cmd in diff_converter_commands(&base, &merged) {
+        let (merged, cmds) = reconcile_converter_settings(
+            self.prev_engine_settings.as_ref(),
+            &self.local_settings,
+            &engine_settings,
+        );
+        for cmd in cmds {
             let _ = self.cmd_tx.send(GuiCommand::Converter(cmd));
         }
         self.local_settings = merged;
@@ -1299,6 +1320,57 @@ mod tests {
         let merged = merge_converter_settings(&base, &local, &engine);
         assert_eq!(merged.output_folder, PathBuf::from("/media/clips"),
                    "first frame must adopt engine's output folder");
+    }
+
+    // ── reconcile_converter_settings tests ─────────────────────────────
+
+    #[test]
+    fn reconcile_does_not_echo_engine_output_folder_change() {
+        let mut base = make_cus();
+        let mut local = make_cus();
+        let mut engine = make_cus();
+
+        // User hasn't touched output_folder — it matches the previous engine snapshot
+        base.output_folder = PathBuf::from("/recording1");
+        local.output_folder = PathBuf::from("/recording1");
+        // Engine re-defaulted to recording 2's parent after recording switch
+        engine.output_folder = PathBuf::from("/recording2");
+
+        let (merged, cmds) = reconcile_converter_settings(
+            Some(&base), &local, &engine,
+        );
+
+        assert_eq!(merged.output_folder, PathBuf::from("/recording2"),
+            "merged must adopt engine's new folder");
+        let has_set_output = cmds.iter().any(|c| {
+            matches!(c, ConverterCommand::SetOutputFolder(_))
+        });
+        assert!(!has_set_output,
+            "engine-initiated folder change must NOT be echoed as SetOutputFolder");
+    }
+
+    #[test]
+    fn reconcile_forwards_user_output_folder_edit() {
+        let mut base = make_cus();
+        let mut local = make_cus();
+
+        base.output_folder = PathBuf::from("/recording1");
+        // User changed the folder via Browse or text field
+        local.output_folder = PathBuf::from("/custom/path");
+        // Engine hasn't changed it
+        let engine = base.clone();
+
+        let (merged, cmds) = reconcile_converter_settings(
+            Some(&base), &local, &engine,
+        );
+
+        assert_eq!(merged.output_folder, PathBuf::from("/custom/path"),
+            "merged must keep user's folder");
+        let has_set_output = cmds.iter().any(|c| {
+            matches!(c, ConverterCommand::SetOutputFolder(p) if p == "/custom/path")
+        });
+        assert!(has_set_output,
+            "user-initiated folder change must be forwarded as SetOutputFolder");
     }
 
     // ── apply_group_selection tests ─────────────────────────────────────

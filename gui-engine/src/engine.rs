@@ -349,9 +349,7 @@ pub fn engine_main_with_probe<F>(
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetOutputFolder(folder))) => {
-                    current.converter.settings.output_folder = folder.clone();
-                    current.converter.settings.output_folder_user_set = true;
-                    recompute_converter_derived(&mut current);
+                    apply_set_output_folder(&mut current, folder);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(prefix))) => {
                     current.converter.settings.filename_prefix = prefix.clone();
@@ -2444,6 +2442,18 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
     })
 }
 
+/// Apply `SetOutputFolder` to state: only marks the folder as user-set
+/// when the value actually changes, so echo-back paths can't freeze the
+/// output folder on subsequent recording switches.
+fn apply_set_output_folder(state: &mut AppStateSnapshot, folder: PathBuf) {
+    let changed = state.converter.settings.output_folder != folder;
+    state.converter.settings.output_folder = folder;
+    if changed {
+        state.converter.settings.output_folder_user_set = true;
+    }
+    recompute_converter_derived(state);
+}
+
 /// Auto-apply LTC decode results to converter settings (split tracks,
 /// drop LTC track, set start-from-LTC) once per decode generation.
 /// User manual un-ticks survive until the next decode re-run.
@@ -3839,5 +3849,49 @@ mod tests {
         apply_sel(&mut state, 1);
         assert_eq!(state.converter.settings.output_folder, custom,
             "user-set output must survive selection switch");
+    }
+
+    #[test]
+    fn set_output_folder_to_new_path_marks_user_set() {
+        let mut state = setup_state();
+        state.converter.settings.output_folder = PathBuf::from("/old");
+        state.converter.settings.output_folder_user_set = false;
+
+        apply_set_output_folder(&mut state, PathBuf::from("/new"));
+
+        assert_eq!(state.converter.settings.output_folder, PathBuf::from("/new"));
+        assert!(state.converter.settings.output_folder_user_set,
+            "setting a different folder must mark it as user-set");
+    }
+
+    #[test]
+    fn set_output_folder_echo_does_not_freeze_folder() {
+        let root = Path::new("/root");
+        let first_dir = root.join("day1");
+        let second_dir = root.join("day2");
+        let mut state = setup_state();
+        state.converter.groups_folder = Some(root.to_path_buf());
+        state.converter.groups = vec![
+            make_video_group(&first_dir),
+            make_video_group(&second_dir),
+        ];
+        state.converter.settings.output_folder = PathBuf::new();
+
+        apply_sel(&mut state, 0);
+        assert_eq!(state.converter.settings.output_folder, first_dir,
+            "first selection defaults to first dir");
+        assert!(!state.converter.settings.output_folder_user_set,
+            "flag must be false after first auto-default");
+
+        // Simulate the GUI echo-back: SetOutputFolder with the same value
+        apply_set_output_folder(&mut state, first_dir.clone());
+        assert_eq!(state.converter.settings.output_folder, first_dir,
+            "folder unchanged by no-op echo");
+        assert!(!state.converter.settings.output_folder_user_set,
+            "echo must NOT set the flag — regression: echo froze the folder");
+
+        apply_sel(&mut state, 1);
+        assert_eq!(state.converter.settings.output_folder, second_dir,
+            "second selection must still re-default after a no-op echo");
     }
 }
