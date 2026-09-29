@@ -1,6 +1,62 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* v0.4.6
+
+Main features are a faster, more reliable card-offload workflow —
+per-file selection with recording dates and durations, byte-accurate
+progress with copy-speed display, a responsive cancel, and fixed card
+detection on both Linux and Windows — plus converter fixes that stop
+settings fields reverting every frame, silent zero-step audio
+conversions, and a default output folder that follows the source
+clips.
+
+List of Changes:
+- Offloading:
+  - Per-file selection in the card list: each detected card shows its
+    files (name, recording date, duration, size) with per-file
+    checkboxes and All/None/Latest-day quick actions; selection
+    defaults to all files from the most recent recording day and only
+    selected files are copied. Files are listed newest-first.
+  - Copy performance & progress: chunked 1 MiB copy raises throughput
+    from ~0.3 MB/s to disk-bound; byte-based progress (with GB
+    totals) moves within large files instead of jumping per file;
+    both GUIs show the file being copied and an EMA-smoothed speed.
+  - Responsive cancel: checked per chunk (takes effect within ~1 MiB),
+    deletes the .offload_tmp partial, marks the device Skipped, and
+    the UI shows "Canceled by user" instead of "Offload complete".
+  - Linux card scan now finds udisks2 automounts (/run/media was
+    wrongly excluded), auto-mounts unmounted removable cards via
+    udisksctl, classifies card readers by sysfs removable flag or
+    usb/mmc bus (internal disks no longer offered as cards), and
+    fixes base-device derivation for nvme*/mmcblk* partitions.
+  - Windows card scan no longer hangs: drives enumerated via
+    GetLogicalDrivesW/GetDriveTypeW instead of per-letter exists()
+    probes (which blocked on network drives/empty slots), non-
+    removable drives and symlinks/junctions skipped, scan lifecycle
+    logged end-to-end, scan-thread panics caught so "Scanning" can't
+    latch.
+- Convert tab:
+  - Stop settings fields reverting every frame: ltc-gui syncs edits
+    via a three-way merge against the previous engine snapshot (edited
+    fields win, untouched adopt engine changes); ltc-slint pushes text
+    on focus loss. Filename prefix no longer prefilled from the
+    recording (starts at the {device} default); output folder defaults
+    to the selected recording's parent dir instead of the scan root
+    and is no longer persisted across sessions.
+  - Fix audio-only conversions silently running zero ffmpeg steps:
+    the MultiTrackAudio channel map is sized by the group's file count
+    (not the first clip's probe channel count), stale dimensions are
+    repaired at conversion time, and a zero-step plan now fails the
+    conversion instead of reporting success. ltc-slint decodes the
+    selected LTC source file instead of always the first.
+- ltc-gui:
+  - Fix text-field cursor jumping behind typed characters: typed
+    fields (clapper ROLL, offload folder/device names, converter
+    output folder/prefix/suffixes) use a GUI-owned persistent edit
+    buffer that adopts the engine value only when unfocused; ROLL now
+    commits per keystroke.
+
 * v0.4.5
 
 Main features are embedded camera metadata in converter outputs, a {device}
