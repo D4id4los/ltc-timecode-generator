@@ -137,6 +137,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
     for (idx, card) in cards.iter().enumerate() {
         let device_color = card_color(&card.name_source, &colors);
 
+        ui.push_id(&card.mount, |ui| {
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
@@ -235,6 +236,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
                     let row_height = 20.0;
                     let total = card.files.len();
                     egui::ScrollArea::vertical()
+                        .id_salt(crate::ids::offload_card_files_scroll(&card.mount))
                         .max_height(240.0)
                         .auto_shrink([false; 2])
                         .show_rows(ui, row_height, total, |ui, range| {
@@ -289,6 +291,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
                         });
                 }
             });
+        });
         ui.add_space(4.0);
     }
 }

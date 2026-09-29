@@ -46,10 +46,11 @@ pub fn debug_log_scroll() -> &'static str {
     "debug_log_scroll"
 }
 
-/// Salt for the Offload tab's scrollable area.
-#[allow(dead_code)]
-pub fn offload_scroll() -> &'static str {
-    "offload_scroll"
+/// Salt for the per-card file-list ScrollArea in the Offload tab.
+/// Keyed by the card mount path (same per-card key as `device_name_edits`)
+/// so scroll state follows the card across rescans.
+pub fn offload_card_files_scroll(mount: &std::path::Path) -> String {
+    format!("offload_card_files_scroll_{}", mount.display())
 }
 
 #[cfg(test)]
@@ -114,9 +115,17 @@ mod tests {
     }
 
     #[test]
-    fn offload_salt_is_unique() {
-        assert_ne!(offload_scroll(), root_scroll());
-        assert_ne!(offload_scroll(), clap_log_scroll());
-        assert_ne!(offload_scroll(), debug_log_scroll());
+    fn offload_card_salts_differ_across_cards() {
+        use std::path::Path;
+        let a = offload_card_files_scroll(Path::new("/media/sda1"));
+        let b = offload_card_files_scroll(Path::new("/media/sdb1"));
+        let c = offload_card_files_scroll(Path::new("/media/other/sda1"));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        assert_ne!(a, root_scroll());
+        assert_ne!(a, clap_log_scroll());
+        assert_ne!(a, debug_log_scroll());
+        assert_ne!(a, ltc_group_results_scroll());
     }
 }
