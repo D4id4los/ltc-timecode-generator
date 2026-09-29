@@ -42,7 +42,7 @@ fn _run_gui(
     engine_state: Arc<ArcSwap<AppStateSnapshot>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let log_buffer = gui_engine::log_buffer::init_logger(
-        "ltc_gui=trace,audio_core=trace,info",
+        gui_engine::log_buffer::DEFAULT_LOG_FILTER,
     )?;
 
     info!("LTC Slint GUI v{} starting...", APP_VERSION);

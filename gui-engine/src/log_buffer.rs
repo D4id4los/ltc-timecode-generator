@@ -6,6 +6,9 @@ use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
 
 const MAX_LOG_ENTRIES: usize = 1000;
 
+pub const DEFAULT_LOG_FILTER: &str =
+    "ltc_gui=debug,ltc_slint=debug,audio_core=debug,gui_engine=debug,info";
+
 pub struct LogBuffer {
     pub entries: VecDeque<String>,
     max_entries: usize,
@@ -84,6 +87,15 @@ pub fn init_logger(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_log_filter_contains_project_crates() {
+        assert!(DEFAULT_LOG_FILTER.contains("ltc_gui=debug"), "missing ltc_gui=debug");
+        assert!(DEFAULT_LOG_FILTER.contains("ltc_slint=debug"), "missing ltc_slint=debug");
+        assert!(DEFAULT_LOG_FILTER.contains("audio_core=debug"), "missing audio_core=debug");
+        assert!(DEFAULT_LOG_FILTER.contains("gui_engine=debug"), "missing gui_engine=debug");
+        assert!(DEFAULT_LOG_FILTER.ends_with(",info"), "should end with ,info fallback");
+    }
 
     #[test]
     fn test_log_buffer_new_creates_empty() {

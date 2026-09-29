@@ -12,7 +12,7 @@ fn main() {
         gui_engine::cli::CliOutcome::Done => {}
         gui_engine::cli::CliOutcome::RunGui { cmd_tx, state } => {
             let log_buffer = gui_engine::log_buffer::init_logger(
-                "ltc_gui=trace,audio_core=trace,info",
+                gui_engine::log_buffer::DEFAULT_LOG_FILTER,
             )
             .expect("Failed to initialize logger");
 

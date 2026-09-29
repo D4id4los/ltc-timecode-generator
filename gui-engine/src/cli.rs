@@ -20,7 +20,7 @@ use crate::state::AppStateSnapshot;
 fn init_logger() {
     let _ = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(
-            "ltc_gui=trace,audio_core=trace,info",
+            crate::log_buffer::DEFAULT_LOG_FILTER,
         ),
     )
     .try_init();
