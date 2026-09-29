@@ -4,9 +4,10 @@ use std::io::{Error, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveDate};
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::device_name;
 pub use crate::device_name::DeviceNameSource;
@@ -87,6 +88,10 @@ const CARD_SCAN_DEPTH: usize = 6;
 
 /// Maximum files to enumerate on a card.
 const MAX_CARD_FILES: usize = 10_000;
+
+/// Per-scan timeout — if a single card scan (including all mount probes) takes
+/// longer than this, remaining mounts are skipped.
+const CARD_SCAN_BUDGET: Duration = Duration::from_secs(120);
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -326,15 +331,23 @@ pub fn is_media_file(path: &Path) -> bool {
 /// via `udisksctl` (so they become available for offload).
 #[cfg(target_os = "linux")]
 pub fn detect_cards() -> Vec<SdCardInfo> {
+    let deadline = Instant::now() + CARD_SCAN_BUDGET;
     let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
     let sys_root = Path::new("/sys");
 
     // 1. Detect already-mounted cards.
-    let mut cards = detect_cards_from_mounts(&mounts, sys_root);
+    let mut cards = detect_cards_from_mounts(&mounts, sys_root, deadline);
 
     // 2. Find unmounted card-like partitions and try to auto-mount.
     let unmounted = find_unmounted_card_partitions(&mounts, sys_root);
     for dev_name in &unmounted {
+        if Instant::now() >= deadline {
+            warn!(
+                "detect_cards: budget exceeded — skipping auto-mount of /dev/{}",
+                dev_name
+            );
+            break;
+        }
         let dev_path = format!("/dev/{}", dev_name);
         match udisks_mount(&dev_path) {
             Ok(Some(mount_point)) => {
@@ -342,12 +355,9 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
                     "Auto-mounted {} at {:?} via udisksctl",
                     dev_path, mount_point
                 );
-                // Re-read mounts to get the mount line, then run it through
-                // the same detect_cards_from_mounts pipeline.
                 let updated_mounts =
                     fs::read_to_string("/proc/mounts").unwrap_or_else(|_| mounts.clone());
-                let new_cards = detect_cards_from_mounts(&updated_mounts, sys_root);
-                // Append newly discovered cards (avoid duplicates by mount).
+                let new_cards = detect_cards_from_mounts(&updated_mounts, sys_root, deadline);
                 let existing: std::collections::HashSet<PathBuf> =
                     cards.iter().map(|c| c.mount.clone()).collect();
                 for c in new_cards {
@@ -487,6 +497,7 @@ fn udisks_mount(dev_path: &str) -> std::io::Result<Option<PathBuf>> {
 /// Fallback for non-Linux: enumerate common mount roots.
 #[cfg(not(target_os = "linux"))]
 pub fn detect_cards() -> Vec<SdCardInfo> {
+    let deadline = Instant::now() + CARD_SCAN_BUDGET;
     let mut cards = Vec::new();
     let start = std::time::Instant::now();
 
@@ -503,8 +514,12 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
                 debug!("Skipping drive {}: type={}", cand.letter, tname);
                 continue;
             }
+            if Instant::now() >= deadline {
+                warn!("Windows card scan: budget exceeded — skipping drive {}", cand.letter);
+                break;
+            }
             debug!("Probing removable drive {}: {:?}", cand.letter, cand.root);
-            if let Some(info) = classify_mount(&cand.root, &cand.root) {
+            if let Some(info) = classify_mount(&cand.root, &cand.root, deadline) {
                 info!(
                     "Drive {} → card: {} files, {} bytes, name='{}'",
                     cand.letter, info.media_file_count, info.total_bytes, info.device_name
@@ -525,8 +540,12 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
                     if !mp.is_dir() {
                         continue;
                     }
+                    if Instant::now() >= deadline {
+                        warn!("macOS card scan: budget exceeded — skipping {:?}", mp);
+                        break;
+                    }
                     debug!("Probing macOS volume: {:?}", mp);
-                    if let Some(info) = classify_mount(&mp, &mp) {
+                    if let Some(info) = classify_mount(&mp, &mp, deadline) {
                         info!(
                             "macOS volume {:?} → card: {} files, {} bytes, name='{}'",
                             mp, info.media_file_count, info.total_bytes, info.device_name
@@ -556,8 +575,9 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
 }
 
 /// Parse `/proc/mounts` content and return detected cards.
-/// `sys_root` is typically `/sys` on Linux.
-fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCardInfo> {
+/// `sys_root` is typically `/sys` on Linux.  `deadline` caps the overall
+/// time budget for the mount probes.
+fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path, deadline: Instant) -> Vec<SdCardInfo> {
     let user = whoami_fallback();
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut skipped = 0u32;
@@ -623,12 +643,18 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
     let mut seen = std::collections::HashSet::new();
     let mut cards = Vec::new();
     let mut rejected = 0u32;
+    let mut budget_exhausted = 0u32;
     for mp in &candidates {
         if !seen.insert(mp.clone()) {
             continue;
         }
+        if Instant::now() >= deadline {
+            warn!("detect_cards_from_mounts: budget exceeded — skipping {:?}", mp);
+            budget_exhausted += 1;
+            continue;
+        }
         debug!("Probing mount candidate: {:?}", mp);
-        if let Some(info) = classify_mount(mp, mp) {
+        if let Some(info) = classify_mount(mp, mp, deadline) {
             info!(
                 "Mount {:?} → card: {} files, {} bytes, name='{}'",
                 mp, info.media_file_count, info.total_bytes, info.device_name
@@ -641,15 +667,21 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path) -> Vec<SdCard
     }
 
     info!(
-        "Mount scan complete: {} card(s), {} rejected",
+        "Mount scan complete: {} card(s), {} rejected{}",
         cards.len(),
-        rejected
+        rejected,
+        if budget_exhausted > 0 {
+            format!(", {} budget-exhausted", budget_exhausted)
+        } else {
+            String::new()
+        },
     );
     cards
 }
 
 /// Classify a mount point as a media card: shallow media scan + device name guess.
-fn classify_mount(mount: &Path, _label_source: &Path) -> Option<SdCardInfo> {
+/// `deadline` caps the overall time spent on I/O-heavy probe steps.
+fn classify_mount(mount: &Path, _label_source: &Path, deadline: Instant) -> Option<SdCardInfo> {
     let mut infos = collect_media_files_shallow(mount);
     infos.sort_by(|a, b| b.modified.cmp(&a.modified));
     let media_files: Vec<PathBuf> = infos.iter().map(|f| f.path.clone()).collect();
@@ -661,8 +693,10 @@ fn classify_mount(mount: &Path, _label_source: &Path) -> Option<SdCardInfo> {
         return None;
     }
 
+    debug!("Resolving device name from {} file(s) with budget until {:?}", media_files.len(), deadline);
+    let budget = deadline.saturating_duration_since(Instant::now());
     let (device_name, name_source, pattern_name) =
-        device_name::resolve_device_name(&media_files, &volume_label, None);
+        device_name::resolve_device_name_with_budget(&media_files, &volume_label, None, budget);
 
     debug!(
         "Mount {:?} accepted: {} files, {} bytes, label='{}', device='{}', source={:?}, pattern={:?}",
@@ -1635,9 +1669,13 @@ mod tests {
 
     // ── detect_cards_from_mounts ──────────────────────────────────────
 
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
     #[test]
     fn test_detect_cards_from_mounts_empty() {
-        let cards = detect_cards_from_mounts("", Path::new("/sys"));
+        let cards = detect_cards_from_mounts("", Path::new("/sys"), far_deadline());
         assert!(cards.is_empty());
     }
 
@@ -1648,7 +1686,7 @@ mod tests {
 /dev/nvme0n1p1 /boot/efi vfat rw 0 0
 proc /proc proc rw 0 0
 ";
-        let cards = detect_cards_from_mounts(mounts, Path::new("/sys"));
+        let cards = detect_cards_from_mounts(mounts, Path::new("/sys"), far_deadline());
         assert!(cards.is_empty());
     }
 
@@ -1657,7 +1695,7 @@ proc /proc proc rw 0 0
     #[test]
     fn test_classify_mount_with_no_media_no_card() {
         let dir = TempDir::new().unwrap();
-        let result = classify_mount(dir.path(), dir.path());
+        let result = classify_mount(dir.path(), dir.path(), far_deadline());
         assert!(result.is_none(), "no media files → no card");
     }
 
@@ -1665,7 +1703,7 @@ proc /proc proc rw 0 0
     fn test_classify_mount_with_media_returns_sd_card() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("C0001.MP4"), b"data").unwrap();
-        let result = classify_mount(dir.path(), dir.path());
+        let result = classify_mount(dir.path(), dir.path(), far_deadline());
         assert!(result.is_some());
         let info = result.unwrap();
         assert_eq!(info.media_file_count, 1);
@@ -1924,7 +1962,7 @@ proc /proc proc rw 0 0
 /dev/sdb1 /run/media/viktoria/NONEXISTENT_UNIQUE_CARD_DIR_42 vfat rw 0 0
 ";
         let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
-        let cards = detect_cards_from_mounts(mounts, sys.path());
+        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline());
         // The mount directory doesn't exist, so classify_mount rejects it
         // (0 files). But the filter should accept it (sdb is removable,
         // sdb1 is its partition).
@@ -1940,7 +1978,7 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
 /dev/loop0 /snap/emacs/4391 squashfs ro 0 0
 ";
         let sys = make_mock_sys(&[], &[], &[], &[]);
-        let cards = detect_cards_from_mounts(mounts, sys.path());
+        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline());
         assert!(cards.is_empty());
     }
 
@@ -1951,7 +1989,7 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
 /dev/sdd1 /mnt/card vfat rw 0 0
 ";
         let sys = make_mock_sys(&["sdc", "sdd"], &[], &[], &["sdc1", "sdd1"]);
-        let cards = detect_cards_from_mounts(mounts, sys.path());
+        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline());
         assert!(cards.is_empty());
     }
 
@@ -1961,14 +1999,14 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
 /dev/nvme0n1p3 /run/media/viktoria/1440965240963B06 ntfs3 rw 0 0
 ";
         let sys = make_mock_sys(&[], &[], &[], &[]);
-        let cards = detect_cards_from_mounts(mounts, sys.path());
+        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline());
         assert!(cards.is_empty(), "nvme under /run/media should be excluded by bus heuristic");
     }
 
     #[test]
     fn test_classify_mount_real_dir_with_media_accepted() {
         let (_tmp, mp) = make_mount_with_media("EOS_DIGITAL", &["C0001.MP4"]);
-        let info = classify_mount(&mp, &mp);
+        let info = classify_mount(&mp, &mp, far_deadline());
         assert!(info.is_some());
         assert_eq!(info.unwrap().media_file_count, 1);
     }

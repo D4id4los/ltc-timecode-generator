@@ -2561,7 +2561,14 @@ fn apply_recording_selection(
                     .map(|f| crate::ffprobe::probe_video_audio(f).map_err(|e| e.to_string()))
                     .collect();
                 let cameras: Vec<Option<crate::CameraInfo>> = files.iter()
-                    .map(|f| crate::camera_meta::probe_camera_info(f))
+                    .enumerate()
+                    .map(|(i, f)| {
+                        if i < crate::device_name::DEVICE_NAME_PROBE_SAMPLE {
+                            crate::camera_meta::probe_camera_info(f)
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 let (device_name, _, _) = crate::device_name::resolve_device_name(&files, "", Some(&cameras));
                 let _ = conv_probe_tx.send(ConverterProbeResult { probes, cameras, device_name, generation: gen });
