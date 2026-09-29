@@ -811,8 +811,28 @@ pub fn plan_copies_for_card(
 
 /// Plan copies for a given set of file paths (no extra scan).
 /// Collision handling, flat device dir layout.
+/// Uses `fs::metadata` per file to determine sizes.
 pub fn plan_copies_for_files(
     files: &[PathBuf],
+    device_name: &str,
+    dest_parent: &Path,
+) -> Vec<CopyPlanItem> {
+    let files_with_sizes: Vec<(PathBuf, u64)> = files
+        .iter()
+        .map(|p| {
+            let size = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            (p.clone(), size)
+        })
+        .collect();
+    plan_copies_for_files_with_sizes(&files_with_sizes, device_name, dest_parent)
+}
+
+/// Plan copies using pre-determined sizes (no filesystem I/O).
+/// Collision handling, flat device dir layout.
+/// Use this when sizes are already known (e.g. from a prior scan)
+/// to avoid the `fs::metadata` per file that `plan_copies_for_files` does.
+pub fn plan_copies_for_files_with_sizes(
+    files: &[(PathBuf, u64)],
     device_name: &str,
     dest_parent: &Path,
 ) -> Vec<CopyPlanItem> {
@@ -821,7 +841,7 @@ pub fn plan_copies_for_files(
     let mut used_names: HashMap<String, u32> = HashMap::new();
     let mut plans = Vec::new();
 
-    for src in files {
+    for (src, size) in files {
         let name = src
             .file_name()
             .and_then(|n| n.to_str())
@@ -830,11 +850,10 @@ pub fn plan_copies_for_files(
 
         let dst_name = resolve_collision(&name, &mut used_names);
         let dst = dest_dir.join(&dst_name);
-        let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
         plans.push(CopyPlanItem {
             src: src.clone(),
             dst,
-            size,
+            size: *size,
         });
     }
 
@@ -1393,6 +1412,47 @@ mod tests {
             .dst
             .to_string_lossy()
             .ends_with("C0001 (3).MP4"));
+    }
+
+    // ── plan_copies_for_files_with_sizes ─────────────────────────────
+
+    #[test]
+    fn test_plan_with_sizes_parity_with_stats() {
+        let card = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+
+        fs::write(card.path().join("C0001.MP4"), b"data_a").unwrap();
+        fs::write(card.path().join("C0002.MP4"), b"data_bb").unwrap();
+        fs::create_dir_all(card.path().join("DCIM").join("100MSDCF")).unwrap();
+        fs::write(
+            card.path().join("DCIM").join("100MSDCF").join("C0001.MP4"),
+            b"data_ccc",
+        )
+        .unwrap();
+
+        // Run the disk-I/O version.
+        let paths: Vec<std::path::PathBuf> = vec![
+            card.path().join("C0001.MP4"),
+            card.path().join("C0002.MP4"),
+            card.path().join("DCIM").join("100MSDCF").join("C0001.MP4"),
+        ];
+        let plans_disk = plan_copies_for_files(&paths, "A6100", dest.path());
+
+        // Run the size-based version with known sizes.
+        let sizes: Vec<(std::path::PathBuf, u64)> = vec![
+            (card.path().join("C0001.MP4"), 6),       // "data_a" = 6 bytes
+            (card.path().join("C0002.MP4"), 7),       // "data_bb" = 7 bytes
+            (card.path().join("DCIM").join("100MSDCF").join("C0001.MP4"), 8), // "data_ccc" = 8 bytes
+        ];
+        let plans_size = plan_copies_for_files_with_sizes(&sizes, "A6100", dest.path());
+
+        // Plans must be identical: same count, same src/dst/size per item.
+        assert_eq!(plans_disk.len(), plans_size.len());
+        for (disk, size) in plans_disk.iter().zip(plans_size.iter()) {
+            assert_eq!(disk.src, size.src);
+            assert_eq!(disk.dst, size.dst);
+            assert_eq!(disk.size, size.size);
+        }
     }
 
     // ── collect_media_files_shallow ───────────────────────────────────

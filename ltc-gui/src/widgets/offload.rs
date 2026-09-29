@@ -297,20 +297,21 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
 }
 
 fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
-    let s = &state.latest;
     let colors = state.theme.colors();
-    let off = &s.offload;
-    let has_cards = !off.cards.is_empty();
-    let has_parent = off.parent_folder.is_some();
-    let can_start = has_cards && has_parent && !off.running && !off.scanning;
+    let is_running = state.latest.offload.running;
+    let can_start = !state.latest.offload.cards.is_empty()
+        && state.latest.offload.parent_folder.is_some()
+        && !is_running
+        && !state.latest.offload.scanning;
 
     ui.horizontal(|ui| {
-        if off.running {
+        if is_running {
             if ui.button(RichText::new("■ Cancel").font(FontId::proportional(13.0)).color(colors.error_red)).clicked() {
                 state.send(GuiCommand::Offload(OffloadCommand::CancelOffload));
             }
         } else if can_start {
             if ui.button(RichText::new("Start Offload").font(FontId::proportional(13.0)).color(ACCENT)).clicked() {
+                state.mark_offload_start_pending();
                 state.send(GuiCommand::Offload(OffloadCommand::StartOffload));
             }
         } else {

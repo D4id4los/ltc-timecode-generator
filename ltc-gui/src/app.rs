@@ -17,6 +17,7 @@ use crate::widgets;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const TEXT_FIELD_EDIT_TIMEOUT: Duration = Duration::from_secs(2);
+const OFFLOAD_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// GUI-side state for a single text entry field bound to an engine value.
 ///
@@ -185,6 +186,10 @@ pub struct AppState {
     /// Last seen offload version — detects when a copy finishes so we can
     /// auto‑switch the converter folder.
     pub offload_last_version: u64,
+    /// When the user clicks Start Offload, set to `Instant::now()` so the
+    /// next frame forces a fast repaint until the engine publishes
+    /// `offload.running = true`. Resets once running is visible.
+    offload_start_pending: Option<Instant>,
 
     // ── GUI-local text edit buffers ────────────────────────────────────
     /// Persistent buffer for the clapper ROLL field.
@@ -202,6 +207,12 @@ impl AppState {
     pub fn set_ltc_file_idx(&mut self, idx: usize) {
         self.ltc_file_idx = idx;
         self.local_settings.ltc_file_idx = idx;
+    }
+
+    /// Mark the offload start as pending so the next frame forces a fast repaint
+    /// until the engine publishes `running = true`.
+    pub fn mark_offload_start_pending(&mut self) {
+        self.offload_start_pending = Some(Instant::now());
     }
 
     pub fn new(
@@ -246,6 +257,7 @@ impl AppState {
             prev_engine_settings: None,
             last_logged_group_decode_gen: 0,
             offload_last_version: 0,
+            offload_start_pending: None,
             roll_edit: TextFieldEdit::new(&initial.roll),
             parent_name_edit: TextFieldEdit::new(&initial.offload.parent_name),
             device_name_edits: HashMap::new(),
@@ -292,6 +304,8 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
         interval.min(Duration::from_millis(40))
     } else if s.clap_animating {
         Duration::from_secs_f64(1.0 / 60.0)
+    } else if s.offload.running {
+        Duration::from_millis(100)
     } else {
         Duration::from_secs(1)
     };
@@ -547,6 +561,17 @@ impl eframe::App for AppState {
 
         // 7. Repaint scheduling
         ctx.request_repaint_after(next_repaint_interval(&self.latest));
+
+        // 7a. Offload start-pending latch: force fast repaints until the engine
+        //     publishes running=true (or timeout) so the Start→Cancel button
+        //     switch appears on the very next frame after engine publish.
+        if let Some(pending_since) = self.offload_start_pending {
+            if self.latest.offload.running || now.duration_since(pending_since) >= OFFLOAD_PENDING_TIMEOUT {
+                self.offload_start_pending = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(40));
+            }
+        }
 
         // 8. Keyboard shortcuts
         let any_focused = ctx.memory(|m| m.focused().is_some());
@@ -1179,6 +1204,19 @@ mod tests {
         let mut s3 = make_snapshot();
         s3.clap_animating = true;
         assert!(next_repaint_interval(&s3) >= floor);
+        // offload running
+        let mut s4 = make_snapshot();
+        s4.offload.running = true;
+        assert!(next_repaint_interval(&s4) >= floor);
+    }
+
+    #[test]
+    fn repaint_interval_offload_running_returns_approx_100ms() {
+        let mut s = make_snapshot();
+        s.offload.running = true;
+        let dur = next_repaint_interval(&s);
+        // base = 100ms, plus predicted_dt 16.67ms = 116.67ms
+        assert!(dur > Duration::from_millis(110) && dur < Duration::from_millis(130));
     }
 
     // ── merge_converter_settings tests ───────────────────────────────────

@@ -135,7 +135,6 @@ pub fn engine_main_with_probe<F>(
     let mut offload_scan_generation: u64 = 0;
     let mut offload_context: Option<Arc<OffloadContext>> = None;
     let mut offload_device_names: Vec<String> = Vec::new();
-    let mut offload_plans: Vec<Vec<crate::offload::CopyPlanItem>> = Vec::new();
     let mut offload_completed_before: Vec<String> = Vec::new();
     // Speed tracking (smoothed MB/s via byte deltas between ticks)
     let mut offload_last_blocks_done: usize = 0;
@@ -274,7 +273,6 @@ pub fn engine_main_with_probe<F>(
                         &mut offload_scan_generation,
                         &mut offload_context,
                         &mut offload_device_names,
-                        &mut offload_plans,
                         &mut offload_completed_before,
                         &offload_event_tx,
                     );
@@ -2084,7 +2082,6 @@ fn handle_offload_command(
     scan_generation: &mut u64,
     context: &mut Option<Arc<OffloadContext>>,
     device_names: &mut Vec<String>,
-    plans: &mut Vec<Vec<crate::offload::CopyPlanItem>>,
     completed_before: &mut Vec<String>,
     event_tx: &std::sync::mpsc::Sender<OffloadEvent>,
 ) {
@@ -2200,18 +2197,23 @@ fn handle_offload_command(
             };
             let dest_parent = parent_folder.join(&state.offload.parent_name);
 
-            // Build plans per device from selected files only.
+            // Build plans per device from selected files only,
+            // using sizes already collected during the card scan (no I/O).
             let cards = state.offload.cards.clone();
             let names: Vec<String> = cards.iter().map(|c| c.device_name.clone()).collect();
             let device_plans: Vec<Vec<crate::offload::CopyPlanItem>> = cards
                 .iter()
                 .map(|card| {
-                    let selected: Vec<PathBuf> = card.files.iter()
+                    let selected_with_sizes: Vec<(PathBuf, u64)> = card.files.iter()
                         .zip(card.selected.iter())
                         .filter(|(_, &sel)| sel)
-                        .map(|(f, _)| f.path.clone())
+                        .map(|(f, _)| (f.path.clone(), f.size_bytes))
                         .collect();
-                    crate::offload::plan_copies_for_files(&selected, &card.device_name, &dest_parent)
+                    crate::offload::plan_copies_for_files_with_sizes(
+                        &selected_with_sizes,
+                        &card.device_name,
+                        &dest_parent,
+                    )
                 })
                 .collect();
 
@@ -2224,7 +2226,6 @@ fn handle_offload_command(
             let ctx = Arc::new(OffloadContext::new(&names, &device_plans));
 
             *device_names = names.clone();
-            *plans = device_plans.clone();
             *context = Some(ctx.clone());
             *completed_before = state.offload.completed_devices.clone();
             state.offload.running = true;
