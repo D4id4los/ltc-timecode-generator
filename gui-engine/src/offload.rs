@@ -17,6 +17,11 @@ pub use crate::device_name::DeviceNameSource;
 mod win_driver {
     use std::path::PathBuf;
     use windows_sys::Win32::Storage::FileSystem;
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_CDROM, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK,
+        DRIVE_REMOTE, DRIVE_UNKNOWN,
+        DRIVE_REMOVABLE as WIN32_DRIVE_REMOVABLE,
+    };
 
     pub struct DriveCandidate {
         pub letter: char,
@@ -42,17 +47,17 @@ mod win_driver {
         candidates
     }
 
-    pub const DRIVE_REMOVABLE: u32 = FileSystem::DRIVE_REMOVABLE;
+    pub const DRIVE_REMOVABLE: u32 = WIN32_DRIVE_REMOVABLE;
 
     pub fn drive_type_name(kind: u32) -> &'static str {
         match kind {
-            FileSystem::DRIVE_UNKNOWN => "unknown",
-            FileSystem::DRIVE_NO_ROOT_DIR => "no_root_dir",
-            FileSystem::DRIVE_REMOVABLE => "removable",
-            FileSystem::DRIVE_FIXED => "fixed",
-            FileSystem::DRIVE_REMOTE => "remote",
-            FileSystem::DRIVE_CDROM => "cdrom",
-            FileSystem::DRIVE_RAMDISK => "ramdisk",
+            DRIVE_UNKNOWN => "unknown",
+            DRIVE_NO_ROOT_DIR => "no_root_dir",
+            WIN32_DRIVE_REMOVABLE => "removable",
+            DRIVE_FIXED => "fixed",
+            DRIVE_REMOTE => "remote",
+            DRIVE_CDROM => "cdrom",
+            DRIVE_RAMDISK => "ramdisk",
             _ => "invalid",
         }
     }
