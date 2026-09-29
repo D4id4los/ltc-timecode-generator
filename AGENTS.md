@@ -1,7 +1,7 @@
 # LTC Timecode Generator — Project Guide
 
 ## Overview
-High-precision SMPTE Linear Timecode (LTC) audio signal generator + digital clapper-board for multi-camera video sync. Generates bi-phase mark modulated LTC audio and beep tones, routed to selectable stereo channels. It also **decodes** LTC from WAV/video files (quality reports, trim offsets) and **converts/exports** recordings (trim-to-first-LTC, timecode metadata embedding, channel splitting/dropping) via ffmpeg.
+High-precision SMPTE Linear Timecode (LTC) audio signal generator + digital clapper-board for multi-camera video sync. Generates bi-phase mark modulated LTC audio and beep tones, routed to selectable stereo channels. It also **decodes** LTC from WAV/video files (quality reports, trim offsets), **converts/exports** recordings (trim-to-first-LTC, timecode metadata embedding, channel splitting/dropping) via ffmpeg, and **ingests/offloads** card media (detect mounted cards, scan for recordings, copy to organised folders).
 
 Four frontends share a common `audio-core` Rust crate:
 1. **ltc-gui** (native Rust egui/eframe app — primary GUI target)
@@ -52,12 +52,19 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── lib.rs                # Module decls + re-exports (ArcSwap, decode types, converter/file_pattern/ffprobe API)
 │   │   ├── command.rs            # GuiCommand enum (source of truth for all commands)
 │   │   ├── state.rs              # AppStateSnapshot + ClapLogItem (source of truth for published state)
-│   │   ├── engine.rs             # Threaded engine loop, AudioCore lifecycle, retry/recovery, decode handling
+│   │   ├── engine.rs             # Threaded engine loop, AudioCore lifecycle, retry/recovery, decode handling, offload handling
 │   │   ├── camera_meta.rs        # Camera model detection from clips (exiftool/ffprobe probe)
 │   │   ├── cli.rs                # Cli struct, parse_args(), process_cli(); headless/WAV/list-devices/decode modes
 │   │   ├── timecode.rs           # FPS_OPTIONS (24/25/29.97 ND/29.97 DF/30), timecode formatting helpers
 │   │   ├── log_buffer.rs         # LogBuffer ring buffer + init_logger (canonical logger)
 │   │   ├── theme.rs              # Shared dark/light ThemeColors palettes used by both Rust GUIs
+│   │   ├── device_name.rs        # Device-name resolution chain (XAVC sniff → camera meta → filename → volume → "unknown")
+│   │   ├── duration.rs           # File-duration helpers (WAV header / ffprobe), group aggregation, H:MM:SS formatting
+│   │   ├── naming.rs             # Named-placeholder output-filename template engine ({filename}/{device}/{clip}/{track})
+│   │   ├── subprocess.rs         # Shared process runner: Windows console suppression, timeout-kill, stderr watchdog
+│   │   ├── offload.rs            # Card-offload subsystem: detect, scan, plan, copy with verify/resume/cancel
+│   │   ├── video_codecs.rs       # Codec-level video-encoder registry (single source of truth for encoding)
+│   │   ├── hw_device.rs          # VAAPI/Vulkan hw-device discovery, render-node enumeration, test-encode validation
 │   │   ├── converter/            # Converter directory module (see Converter section)
 │   │   │   ├── mod.rs            # Facade: re-exports public API from submodules
 │   │   │   ├── progress.rs       # ConversionState, ConversionStatus, SharedConversionState, CancelFlag
@@ -70,11 +77,12 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   │   ├── checks.rs         # conversion_sanity_check*, ConvertBlocker, evaluate_readiness
 │   │   │   ├── args.rs           # ffmpeg argument builders (build_*_args, push_* helpers)
 │   │   │   ├── process.rs        # run_ffmpeg_process, parse_out_time, classify_step_failure, StepFailure
-│   │   │   └── runner.rs         # EncoderFallback, spawn_conversion, run_* pipeline orchestration
+│   │   │   ├── runner.rs         # EncoderFallback, spawn_conversion, run_* pipeline orchestration
+│   │   │   └── test_fixtures.rs  # #[cfg(test)] fixtures for converter unit tests
 │   │   ├── tagger.rs            # In-place timecode tagging (native MOV/MP4 + WAV bext + ffmpeg fallback)
 │   │   ├── file_pattern.rs      # Camera/recorder filename patterns + file grouping
 │   │   ├── ffprobe.rs            # ffprobe video/audio probing + ffmpeg channel extraction
-│   │   └── config.rs             # Converter config persistence (last input/output folders)
+│   │   └── config.rs             # Converter/offload config persistence (last input/output/offload folders)
 │   └── tests/                    # integration.rs, converter_integration.rs, video_extraction.rs
 ├── ltc-gui/                      # Native Rust GUI (egui/eframe) — target for weak-GPU tablets
 │   ├── Cross.toml                # Cross-compilation config for i686 targets
@@ -82,14 +90,15 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │       ├── main.rs               # process_cli() → eframe::run_native()
 │       ├── app.rs                # AppState: tabs, keyboard shortcuts, toasts; reads engine state, sends commands
 │       ├── theme.rs              # Bridges engine theme palettes to egui styles
-│       └── widgets/              # clock.rs, clapper.rs, settings.rs, status.rs, converter.rs
+│       ├── ids.rs                # egui ScrollArea id-salt constructors (sibling-widget ID-clash prevention)
+│       └── widgets/              # clock.rs, clapper.rs, converter.rs, offload.rs, settings.rs, status.rs
 ├── ltc-slint/                    # Slint-based GUI (alternative frontend)
 │   ├── build.rs                  # slint-build compiler for ui/
 │   ├── src/
 │   │   ├── main.rs               # Registers Slint callbacks → send GuiCommands; converter option wiring
 │   │   ├── poll.rs               # Poll timer: engine_state.load() → Slint properties
-│   │   └── theme.rs, toast.rs, timecode_helpers.rs
-│   └── ui/                       # app.slint (root) + clapper/clock/converter/settings/status/theme/types/widgets.slint
+│   │   ├── theme.rs, toast.rs, timecode_helpers.rs
+│   └── ui/                       # app.slint (root) + clapper/clock/converter/offload/settings/status/theme/types/widgets.slint
 ├── audio-core/                   # Shared Rust audio crate (LTC generation + cpal output + decoders)
 │   └── src/
 │       ├── audio_output.rs       # AudioCore, device/stream lifecycle, config selection, error classification, scheduler thread
@@ -101,6 +110,11 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 ├── src-tauri-32bit/              # Legacy Tauri v1 (Docker cross-compile for i686)
 ├── scripts/
 │   └── sync-version.js           # Version propagation (see Version Management)
+├── perf-test/
+│   └── perf-test.sh              # Profiling harness: pidstat/strace/perf for idle vs. busy phases
+├── test-data/
+│   └── ltc-real-world-test-20sec.wav  # Real-world LTC sample for decode testing
+├── VERSION_LOG.org               # Org-mode changelog (newest-first, prose feature summaries)
 ├── Cargo.toml                    # Workspace root
 ├── index.html, vite.config.ts, tsconfig.json, package.json
 ├── build-32bit.sh, build-all-rust-targets.sh, deploy-to-onedrive.sh
@@ -149,38 +163,67 @@ Commands are sent from the GUI thread to the engine via `mpsc::Sender<GuiCommand
 - **Logs** — clear clap log
 - **LTC decode** — parse WAV file, probe video, parse video (stream/channel selection), cancel decode
 - **Converter** — fine-grained setters for every converter option: pipeline mode (`SetMetadataOnly`, `SetGenerateSyntheticVideo`, `SetCopyVideo`), track handling (`SetSplitTracks`, `SetDropLtcTrack`, `SetConcatAudio`, `SetStartFromLtc`, `SetEmbedCameraMetadata`, `SetTrimEnabled`, `SetLtcFileIndex`, `SwapChannelMapCells`), format/codec (`SetContainer`, `SetVideoCodec`, `SetAudioEncoder`), output paths (`SetOutputFolder`, `SetFilenamePrefix`, `SetAudioSuffixTemplate`, `SetVideoSuffixTemplate`), naming pattern (`SetNamingPattern`), folder/recording selection (`SelectFolder`, `SelectRecording`), and conversion lifecycle (`StartConversion`, `CancelConversion`).
-- **Offload** — scan cards, set parent folder/name, device naming, start/cancel offload
+- **Offload** — `Offload(OffloadCommand)`: `ScanCards`, `SetParentFolder`/`SetParentName`, `SetDeviceName`, `SetFileSelected`/`SetAllFilesSelected`/`SelectLatestDay`, `StartOffload`, `CancelOffload`
+- **Durations** — `ProbeFileDurations(Vec<PathBuf>)`
 - **Shutdown** — graceful engine stop
 - **Steppers** — up/down nudges for scene, take, and timecode segments
 
 ### AppStateSnapshot
 The full application state is published as an `AppStateSnapshot` struct wrapped in `Arc<ArcSwap<AppStateSnapshot>>`. The engine thread calls `state.store(Arc::new(snapshot))` after each tick. The GUI calls `state.load()` to get the latest snapshot — this is lock-free and always returns the latest state without queue management.
 
-Field groups (see `state.rs` for the full struct): generation counter; transport (is_playing/is_locked, current + start timecode); FPS; audio routing + device state; clapper metadata + clap log; engine-computed animations (clap flash alpha, arm angle); theme; status message + system time; drained `AudioEvent`s (surfaced as toasts by the GUI); decode state (decode FPS, decoder selection, decode result/error, in-flight flag + generation, video probe info, selected stream/channel, chunked decode progress); ffmpeg capability probe (`ffmpeg_caps`, `ffmpeg_probe_running` — engine-owned, async).
+Field groups (see `state.rs` for the full struct): generation counter; transport (is_playing/is_locked, current + start timecode); FPS; audio routing + device state; clapper metadata + clap log; engine-computed animations (clap flash alpha, arm angle); theme; status message + system time; drained `AudioEvent`s (surfaced as toasts by the GUI); decode state (decode FPS, decoder selection, decode result/error, in-flight flag + generation, video probe info, selected stream/channel, chunked decode progress); ffmpeg capability probe (`ffmpeg_caps`, `ffmpeg_probe_running` — engine-owned, async); offload (`OffloadSnapshot`: cards + per-file selection, parent folder/name, running/progress/speed, per-device status, completed devices, last_offload_parent + handoff version, error, per-file durations).
 
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 0. **Spawn ffmpeg capability probe** — before the loop starts, a background thread runs `query_ffmpeg_capabilities()` (hw-validated) and sends the result via an internal mpsc channel.
 1. **Drain folder scan results** — async scan result from background thread; applies any deferred `SelectRecording` that arrived while the scan was in flight.
-2. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop. Converter commands are handled inline (selectors, setters, side-effects, config persistence, deferred `SelectRecording` while `groups_loading`) or dispatched to `process_command`.
-3. **Drain async decode results** — generation-stamped, so stale results from rapid re-clicks are discarded. On completion, auto-applies LTC settings to converter (split/drop/start-from-LTC) once per generation.
-4. **Drain async group decode results** — same generation gating; on full group completion, same auto-apply.
-5. **Drain ffmpeg probe result** — sets `current.ffmpeg_caps`; calls `apply_available_defaults` to repair stale converter settings and `recompute_converter_derived`.
-6. **Drain converter clip probe results** — populates `ltc_probe` for video groups; resizes `channel_map` to identity if probe channel count changed.
-7. **Poll chunked/group decode progress** — updates progress pct from atomics
-8. **Poll conversion progress** — reads engine-owned `SharedConversionState` and writes into snapshot's `converter.conversion_state`; resets shared state on completion/failure.
-9. **Poll timecode** — `core.current_timecode()` when playing
-10. **Drain events** — clears `state.events` first, then drains `core.drain_events()`, dispatches to recovery or forwards to `state.events`
-11. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s)
-12. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
-13. **Update system time**
-14. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
-15. **Sleep** until next tick
+2. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop. Converter commands are handled inline (selectors, setters, side-effects, config persistence, deferred `SelectRecording` while `groups_loading`) or dispatched to `process_command`. Offload commands are handled by `handle_offload_command()`.
+3. **Drain async video probe result** — generation-stamped; used by decoder stream/channel selection.
+4. **Drain async decode results** — generation-stamped, so stale results from rapid re-clicks are discarded. On completion, auto-applies LTC settings to converter (split/drop/start-from-LTC) once per generation.
+5. **Drain async group decode results** — same generation gating; on full group completion, same auto-apply.
+6. **Drain ffmpeg probe result** — sets `current.ffmpeg_caps`; calls `apply_available_defaults` to repair stale converter settings and `recompute_converter_derived`.
+7. **Drain file-duration probe results** — populates offload file durations for display.
+8. **Drain converter clip probe results** — populates `ltc_probe` for video groups; resizes `channel_map` to identity if probe channel count changed.
+9. **Drain offload events** — generation-gated: `CardsScanned` applies default selection per card and spawns duration probing; `OffloadDurationResult` fills per-file durations; `OffloadDone` appends completed device names, records `last_offload_parent` for converter auto-switch, sets status message.
+10. **Poll chunked/group decode progress** — updates progress pct from atomics
+11. **Poll offload copy progress** — reads shared atomics via `snapshot_from_context()`; computes EMA-smoothed speed.
+12. **Poll conversion progress** — reads engine-owned `SharedConversionState` and writes into snapshot's `converter.conversion_state`; resets shared state on completion/failure.
+13. **Poll timecode** — `core.current_timecode()` when playing
+14. **Drain events** — clears `state.events` first, then drains `core.drain_events()`, dispatches to recovery or forwards to `state.events`
+15. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s); determines if clap animation is still visibly in progress.
+16. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
+17. **Update system time**
+18. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
+19. **Sleep** until next tick
 
 ### Audio Lifecycle
 - **Init**: 3 retries with exponential backoff (50ms → 100ms → 200ms). Distinguishes permanent errors (permission denied — no retry) from transient (device busy — retry).
 - **Recovery**: When `StreamDied` or `RecoveryNeeded` events are detected, the engine attempts up to 3 recovery cycles (stop → reinit → restart LTC if was playing).
 - **Device switching**: Stops LTC, stops output, re-initializes on new device, restarts LTC. Reverts to previous device on failure.
+
+### Offload / Card-Ingest Subsystem
+
+The offload subsystem ingests camera media from SD cards into organised folders. Implemented in `gui-engine/src/offload.rs` (~2000 lines) and exposed as a dedicated **Offload** tab in both Rust GUIs.
+
+- **Card detection** — platform-specific: Linux parses `/proc/mounts` + walks `/sys/class/block` for removable partitions (auto-mounts unmounted ones via `udisksctl`); Windows uses `GetLogicalDrives` / `GetDriveTypeW`; macOS lists `/Volumes`.
+- **Scan** — walks each card up to depth 6 (max 10 000 files), classifying media files by extension (video + `.wav`). Returns `SdCardInfo` with mount path, volume label, device name, file list.
+- **Device naming** — uses `device_name.rs` resolution chain: XAVC binary sniff → camera metadata → filename pattern (Sony/Canon/Panasonic/GoPro/TASCAM) → volume label → `"unknown"`.
+- **Selection** — `apply_selection()`: all/none/latest-recording-day per card; per-file toggles via `SetFileSelected`.
+- **Copy planning** — `plan_copies_for_files()`: flat `parent/<ISO-date>/<device>/` layout with `name (2).ext` collision renaming.
+- **Execution** — `run_offload()` runs on a background thread: chunked 1 MiB streaming reads, temporary `.offload_tmp` → atomic rename, size-only verification at the end. Idempotent resume: skips files whose destination already exists with matching size. Cancellation via `AtomicBool` flag. Per-device state machine: `Pending` / `Copying` / `Done` / `Failed(String)` / `Skipped`.
+- **Events** — internal mpsc channel carries `CardsScanned`, `OffloadDurationResult`, `OffloadDone` (generation-gated). Engine polls progress from atomics with EMA-smoothed speed.
+- **Config** — persists `parent_folder` via `config::save_offload_parent()`; restored by `seed_snapshot_from_config()` at startup.
+- **Converter handoff** — `last_offload_parent` is published in the snapshot; ltc-gui's `logic()` watches for changes and auto-switches the converter to the fresh offload destination.
+- **Safety** — card scans run under `catch_unwind` (panic → empty list); copy thread runs independently of the engine tick.
+
+### Shared Subprocess Helpers
+
+These modules are used by both the converter and offload subsystems (and the decoder):
+
+- **`subprocess.rs`** — Shared process-runner primitives: Windows console suppression, `run_output_with_timeout()` / `run_with_timeout()` for ffmpeg/ffprobe/exiftool/udisksctl spawns (concurrent pipe drain avoids deadlock), streaming stderr watchdog with stall kill (30 s of no stderr = `Stalled`). Types: `SubprocessFailure` (`Io` / `TimedOut`). Used by every ffmpeg, ffprobe, and udisksctl invocation.
+- **`duration.rs`** — File-duration helpers: WAV duration via fast `hound` header-only parse, all other formats via ffprobe (`format=duration`, 10 s timeout). Group aggregation: `MultiTrackAudio` → max = take duration, `VideoClipSequence` → sum = total. `H:MM:SS` formatting.
+- **`naming.rs`** — Named-placeholder output-filename template engine. Supports `{filename}`, `{device}`, `{clip}`, `{track}` plus zero-padded `{clip:0Nd}`/`{track:0Nd}` (N=1..9). Errors: `UnknownPlaceholder`, `InvalidWidth`, `UnbalancedBraces`. Defines the engine defaults for converter output naming.
+- **`device_name.rs`** — Device-name resolution chain shared by offload (card→folder naming) and converter (`{device}` naming template). Priority: 1. XAVC binary sniff (head/tail bytes, `modelName` XML / `ILCE-`/`ILME-`/`DSC-`/`HDR-`), 2. camera metadata (exiftool/ffprobe), 3. filename pattern (Sony/Canon/Panasonic/GoPro/TASCAM), 4. volume label (rejects "usb"), 5. `"unknown"`. Returns `(name, DeviceNameSource, pattern_name)`.
 
 ### CLI Modes
 `gui_engine::cli::process_cli()` handles all non-GUI modes (see CLI section below for flags):
@@ -202,7 +245,7 @@ Conversion execution runs in the engine thread via `StartConversion` which calls
 
 ### Components (`converter/` directory module)
   - `ConversionPipeline`: `AudioOnly { generate_synthetic_video }` (multi-track WAV → audio/video outputs), `VideoPassthrough` (camera clips → video outputs), and `MetadataOnly` (tag originals in place, rename, extract audio).
-  - `ConverterSettings`: input files, `RecordingType` (MultiTrackAudio / VideoClipSequence), `ChannelMap` (input→output permutation), `split_tracks` / `drop_ltc_track` / `ltc_video_source`, container + video codec / audio encoder, output folder + naming templates (defaults `_audio_track{:01d}` / `_video_clip{:02d}`), `trim_to_first_ltc` + per-file trim offsets, per-file `TimecodeMetadata` (start TC, fps, drop-frame).
+  - `ConverterSettings`: input files, `RecordingType` (MultiTrackAudio / VideoClipSequence), `ChannelMap` (input→output permutation), `split_tracks` / `drop_ltc_track` / `ltc_video_source`, container + video codec / audio encoder, output folder + naming templates (defaults via `naming.rs`: `{device}` prefix, `_clip{clip:01d}_tr{track:01d}` audio suffix, `_clip{clip:01d}` video suffix), `trim_to_first_ltc` + per-file trim offsets, per-file `TimecodeMetadata` (start TC, fps, drop-frame).
   - `conversion_sanity_check_metadata_only()` — lightweight preflight for `MetadataOnly` pipeline (only ffmpeg, file existence, template validation).
   - **Video encoder selection is codec-level** (see `video_codecs.rs` below): `ConverterSettings.video_encoder` stores a codec id (`"av1"`, `"h265"`, …); `resolved_video_encoder` holds the concrete ffmpeg encoder chosen at conversion time.
   - `query_ffmpeg_capabilities()` probes ffmpeg once; after listing encoders/formats and discovering HW devices (VAAPI/Vulkan), it **validates each hardware encoder candidate with a 1-frame test encode** (`-f lavfi -i testsrc=... -c:v <enc> -f null -` with 10s timeout). Non-functional encoders (missing driver, incompatible GPU) are removed from `available_encoders` so they never appear in the dropdown or encoder chain. `available_*_for_container()` filters audio encoders/containers; `select_best_combination()` picks defaults (codec-aware); `apply_available_defaults()` repairs stale settings.
@@ -222,7 +265,7 @@ Conversion execution runs in the engine thread via `StartConversion` which calls
   - **`hw_device.rs`** — hardware probe primitives: `discover()` (VAAPI/Vulkan init probes), `list_vaapi_render_nodes()`, `probe_vaapi()`/`probe_vulkan()`. Also contains `test_encode()` / `test_encode_with()` (1-frame null encode with timeout) and `validate_hw_encoders()` / `validate_hw_encoders_with()` (walk all `VIDEO_CODECS` hw candidates, run test encode, remove failures from `available_encoders`). All functions accept the ffmpeg path for testability; injectable runner closures enable pure unit tests.
 - **`file_pattern.rs`** — groups input files by naming convention. `BUILTIN_PATTERNS` (TASCAM Portacapture X8 `nameS<ch>`, `*` any) + `CAMERA_PATTERNS` (Sony Handycam, Sony FS100, Canon `MVI_`, Panasonic `GH`, GoPro `GOPR`/`GP`). `match_files_to_groups()` / `wrap_user_selected_files()` / `match_files_all_patterns()`; `default_output_filename()` derives the output name from the group.
 - **`ffprobe.rs`** — `probe_video_audio()` (ffprobe JSON → `VideoAudioProbe` with per-stream channels/codec/sample-rate), `path_is_video()`, `extract_audio_channel()` (ffmpeg extraction used by decode), `snap_trim_to_keyframe()` / `parse_last_keyframe()` (keyframe packet scan used by stream-copy trim snapping).
-- **`config.rs`** — persists last input/output folders to `<config_dir>/ltc-timecode-generator/converter_config.json`.
+- **`config.rs`** — persists last input/output folders to `<config_dir>/ltc-timecode-generator/converter_config.json`; also persists `last_offload_parent` via `save_offload_parent()` / `seed_snapshot_from_config()`.
 - **`tagger.rs`** — in-place timecode metadata tagger: dispatches MOV/MP4 (native O(1) in-place tagger: trailing moov → free + appended tmcd track + tiny mdat), WAV with existing bext (patches time_reference), and ffmpeg stream-copy remux (temp file + atomic rename) as fallback for other containers. `tag_file()` dispatches. `run_tagging()` runs batch tagging with progress/cancel for the metadata-only pipeline.
 
 ### Flow
@@ -233,11 +276,12 @@ Select files → group by naming pattern → probe (ffprobe) → (ffmpeg capabil
 The native GUI is built with **egui 0.35 + eframe** (glow backend, vsync off). It is a thin rendering shell over `gui-engine` — all audio, decode, and conversion logic lives in the engine thread. This is the target frontend for weak-GPU tablets (Intel Atom + GMA 500) where WebKitGTK performance is unusable.
 
 ### Architecture
-- **`AppState` struct** (`app.rs`): holds `cmd_tx` (command sender), `engine_state` (ArcSwap handle), theme, notifications, tab state (Clapper / Settings / Convert), debug log buffer. Implements `eframe::App`.
-- **Frame loop**: `logic()` syncs `self.latest` from `engine_state.load()`, drains `self.latest.events` into toast notifications, processes keyboard shortcuts (Space/C/R/L/Ctrl+D → send GuiCommand), handles repaint scheduling.
-- **Widgets** (`widgets/`): `clock` (glowing timecode display), `clapper` (board + arm + scene/take/roll + sync log), `settings` (FPS selector, steppers, device, routing, sliders), `status` (footer bar), `converter` (file picker via rfd, pattern/encoder selection, conversion progress). Widgets read from `state.latest.*` for display and call `state.send(GuiCommand::...)` for mutations.
+- **`AppState` struct** (`app.rs`): holds `cmd_tx` (command sender), `engine_state` (ArcSwap handle), theme, notifications, tab state (Clapper / Settings / Convert / Offload), debug log buffer, text-field edit state, offload→converter handoff tracking. Implements `eframe::App`.
+- **Frame loop**: `logic()` syncs `self.latest` from `engine_state.load()`, drains `self.latest.events` into toast notifications, processes keyboard shortcuts (Space/C/R/L/Ctrl+D → send GuiCommand), handles repaint scheduling. Also watches `offload.last_offload_version` and auto-switches the converter to the fresh offload destination (`SelectFolder` + `SelectRecording(0)`).
+- **Widgets** (`widgets/`): `clock` (glowing timecode display), `clapper` (board + arm + scene/take/roll + sync log), `settings` (FPS selector, steppers, device, routing, sliders), `status` (footer bar), `converter` (file picker via rfd, pattern/encoder selection, conversion progress), `offload` (3-step ingest UI: parent folder + date name, card/file selection with per-card device naming and per-file checkboxes, offload progress with per-device status). Widgets read from `state.latest.*` for display and call `state.send(GuiCommand::...)` for mutations.
+- **`ids.rs`** — egui `ScrollArea` id-salt constructors preventing sibling-widget ID clashes in egui's stable-ID system.
 - **Theme** (`theme.rs`): bridges the shared engine palettes (`gui_engine::theme`) to egui styles.
-- **File dialogs**: `rfd` (native open/save dialogs) — used by the converter and decode flows.
+- **File dialogs**: `rfd` (native open/save dialogs) — used by the converter, offload, and decode flows.
 
 ### Threading
 - **GUI thread**: egui immediate-mode rendering at 25-60 fps. Never touches AudioCore. Reads lock-free from ArcSwap.
@@ -255,10 +299,10 @@ LIBGL_ALWAYS_SOFTWARE=1 cargo run   # Force software OpenGL rendering
 ## Slint GUI (`ltc-slint/`)
 
 The Slint GUI follows the same pattern as ltc-gui — thin shell over `gui-engine`:
-- **`main.rs`** registers Slint callbacks that send `GuiCommand` variants and wires converter option models (containers/encoders from ffmpeg capabilities).
-- **`poll.rs`** sets up the poll timer that reads `engine_state.load()` and updates Slint properties (timecode segments, FPS names, routing pills, clapper metadata, decode results, device names, debug log entries).
+- **`main.rs`** registers Slint callbacks that send `GuiCommand` variants and wires converter option models (containers/encoders from ffmpeg capabilities). Offload callbacks: `on_off_select_parent_folder` (rfd → `SetParentFolder`), `on_off_parent_name_changed` (`SetParentName`), `on_off_card_name_changed` (`SetDeviceName`), `on_off_rescan` (`ScanCards`), `on_off_start` / `on_off_cancel` (`StartOffload` / `CancelOffload`), `on_off_file_toggled` (`SetFileSelected`), `on_off_select_all_files` (`SetAllFilesSelected`), `on_off_select_latest_day` (`SelectLatestDay`).
+- **`poll.rs`** sets up the poll timer that reads `engine_state.load()` and updates Slint properties (timecode segments, FPS names, routing pills, clapper metadata, decode results, device names, debug log entries, and offload state sync — `OffloadCardInfo`/`OffloadFileInfo`/per-device status).
 - **`toast.rs` / `theme.rs` / `timecode_helpers.rs`** — GUI-side toast management, palette application, and timecode segment formatting.
-- **`ui/`** is split per concern: `app.slint` (root window + tabs) plus `clapper/clock/converter/settings/status/theme/types/widgets.slint`.
+- **`ui/`** is split per concern: `app.slint` (root window + tabs) plus `clapper/clock/converter/offload/settings/status/theme/types/widgets.slint`. `offload.slint` exports `OffloadSection` with 4th tab wiring.
 - Uses `rfd` for file dialogs and `arboard` for clipboard access.
 
 ## audio-core Crate
@@ -274,7 +318,7 @@ The `audio-core` crate provides the raw audio engine, split by concern:
 ## Legacy Frontends
 
 - **Web app** (`src/`, React + Vite): runs in two modes detected via `window.__TAURI_INTERNALS__` — Tauri mode sends high-level commands to Rust (audio-core does all sample generation, no audio data over IPC) while browser mode uses the Web Audio API directly. Includes a converter tab (`ConverterTab.tsx`) and vitest tests with golden vectors.
-- **Tauri v2** (`src-tauri/`): 19 Tauri commands backed by `audio-core` (path dependency). Production builds via `npx tauri build` → AppImage/deb/msi.
+- **Tauri v2** (`src-tauri/`): 20 Tauri commands backed by `audio-core` (path dependency). Production builds via `npx tauri build` → AppImage/deb/msi.
 - **32-bit** (`src-tauri-32bit/`): Tauri v1 codebase cross-compiled for i686 inside Docker via `build-32bit.sh`.
 
 ## CLI
@@ -282,7 +326,7 @@ The `audio-core` crate provides the raw audio engine, split by concern:
 `gui_engine::cli` (shared by both Rust GUIs; binary `ltc-gui`). Modes: `--list-devices/-l`, `--output-to-file <PATH>` (WAV render), `--headless/-H` (live playback, ctrlc handler), `--decode <PATH>` (decode + summary), otherwise GUI.
 
 Flag groups (see `cli.rs::Cli` for the full list with defaults):
-- **Playback**: `--device <NAME>` / `--device-index <N>`, `--start-timecode` (default `01:00:00:00`), `--fps` (24/25/29.97/30), `--drop-frame`, `--channel left|right|both`, `--volume`, `--sample-rate`, `--duration`
+- **Playback**: `--device <NAME>` / `--device-index <N>`, `--start-timecode` (default `01:00:00:00`), `--fps` (24/25/29.97/30), `--drop-frame`, `--channel left|right|both`, `--volume`, `--sample-rate`, `--duration`, `--autostart`
 - **Decode**: `--decoder builtin|libltc`, `--decode-fps`, `--decode-drop-frame`, `--audio-stream <N>` / `--audio-channel <N>` (video files), `--single-pass`, `--context-frames <N>`, `--list-timecodes/-t`
 - **Misc**: `--verbose/-v` (timecode progression / detailed quality report), `--debug/-d`
 
@@ -378,6 +422,8 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
 - `gui-engine/tests/converter_integration.rs` — conversion pipelines (real ffmpeg)
 - `gui-engine/tests/video_extraction.rs` — ffprobe/ffmpeg extraction (real ffmpeg)
 
+In-module `#[cfg(test)]` unit tests cover offload (46 tests), naming (38), duration (20), device_name (14), and subprocess (11). `converter/test_fixtures.rs` provides shared fixtures for converter unit tests.
+
 Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 
 ## Build & Run
@@ -387,6 +433,8 @@ Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 sudo apt install libltc-dev
 export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
 ```
+
+**Windows x86_64 cross-compile** (Linux host → Windows binary): requires mingw-w64 linker + a prebuilt libltc for Windows. See the `[target.x86_64-pc-windows-gnu]` sections in `README.org` ("Cross Compiling Libltc on Linux for Windows builds") and the local `.cargo/config.toml` for the required env vars (`BINDGEN_EXTRA_CLANG_ARGS`).
 
 **Optional:** `exiftool` is auto-detected at runtime for camera metadata extraction during card scans (AVCHD SEI, MP4/MOV tags). Install it for more accurate device auto-naming:
 ```bash
