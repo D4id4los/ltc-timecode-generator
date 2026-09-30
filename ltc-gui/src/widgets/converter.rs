@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
+use gui_engine::{JobKind, JobPhase};
 use gui_engine::command::{GuiCommand, ConverterCommand};
 use gui_engine::converter::{
     apply_available_defaults, available_audio_encoders_for_container,
@@ -11,7 +12,7 @@ use gui_engine::converter::{
     evaluate_readiness,
     format_blockers,
     preview_output_files, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
-    ChannelMap, ConversionPipeline, ConversionStatus,
+    ChannelMap, ConversionPipeline,
     ConverterSettings, FfmpegCapabilities, OutputKind, RecordingType,
 };
 use gui_engine::video_codecs::{available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs};
@@ -184,14 +185,15 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
     });
 
     // File group selector (shows all matched groups with type badge)
-    let groups_clone = if state.latest.converter.groups_loading {
+    let groups_loading = state.latest.job(JobKind::FolderScan).phase == JobPhase::Running;
+    let groups_clone = if groups_loading {
         None
     } else {
         Some(state.latest.converter.groups.clone())
     };
     if groups_clone.is_none() && state.selected_folder.is_some() {
         // Groups async scan in progress or not yet adopted
-        if state.latest.converter.groups_loading {
+        if groups_loading {
             ui.label(RichText::new("Scanning folder for recordings…")
                 .font(FontId::proportional(10.0)).color(colors.text_muted));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
@@ -337,7 +339,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                         })
                     })
                     .collect()
-            } else if state.latest.converter.probes_loading {
+            } else if state.latest.job(JobKind::ClipProbe).phase == JobPhase::Running {
                 vec![ChannelOption {
                     stream: 0,
                     channel: 0,
@@ -450,14 +452,14 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
 
             ui.add_space(8.0);
 
-            let is_detecting = state.latest.ltc_is_detecting;
-            let is_group_detecting = state.latest.ltc_group_is_detecting;
+            let is_detecting = state.latest.job(JobKind::LtcDecode).phase == JobPhase::Running;
+            let is_group_detecting = state.latest.job(JobKind::LtcGroupDecode).phase == JobPhase::Running;
             let any_detecting = is_detecting || is_group_detecting;
 
             if any_detecting {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
-                let progress_pct = state.latest.ltc_decode_progress_pct;
-                let progress_str = state.latest.ltc_decode_progress_str.clone();
+                let progress_pct = state.latest.job(JobKind::LtcDecode).fraction;
+                let progress_str = state.latest.job(JobKind::LtcDecode).message.clone();
                 ui.add(egui::ProgressBar::new(progress_pct).show_percentage().desired_width(140.0));
                 ui.add_space(2.0);
                 ui.label(RichText::new(&progress_str).font(FontId::monospace(9.0)).color(colors.text_muted));
@@ -519,8 +521,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                 log::info!(
                     "GROUP VIEW: paths={} results={} errors={} detecting={} done/total={}/{} gen={} none={} recording={:?}",
                     group_results.len(), some_count, err_count,
-                    state.latest.ltc_group_is_detecting,
-                    state.latest.ltc_group_done, state.latest.ltc_group_total, gen,
+                    state.latest.job(JobKind::LtcGroupDecode).phase == JobPhase::Running,
+                    state.latest.job(JobKind::LtcGroupDecode).units.len(), state.latest.ltc_group_results.len(), gen,
                     none_count,
                     state.latest.converter.selected_recording_type(),
                 );
@@ -587,7 +589,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                                 });
                             }
                             (None, None) => {
-                                if state.latest.ltc_group_is_detecting {
+                                if state.latest.job(JobKind::LtcGroupDecode).phase == JobPhase::Running {
                                     let pill_frame = egui::Frame::new()
                                         .fill(colors.card_bg)
                                         .corner_radius(4.0)
@@ -1051,7 +1053,7 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
     if n == 0 {
         if is_video && state.latest.ltc_probe.is_none() {
-            if state.latest.converter.probes_loading {
+            if state.latest.job(JobKind::ClipProbe).phase == JobPhase::Running {
                 ui.label(RichText::new("Probing clip audio…").font(FontId::proportional(10.0)).color(colors.text_muted));
             } else {
                 ui.label(RichText::new("Clip audio probe failed.").font(FontId::proportional(10.0)).color(colors.error_red));
@@ -1250,7 +1252,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
     let caps_opt = state.latest.ffmpeg_caps.clone();
 
     // While the ffmpeg capability probe is still running, show a placeholder.
-    if caps_opt.is_none() && state.latest.ffmpeg_probe_running {
+    if caps_opt.is_none() && state.latest.job(JobKind::FfmpegCapProbe).phase == JobPhase::Running {
         ui.label(
             RichText::new("Probing ffmpeg capabilities…")
                 .font(FontId::proportional(10.0))
@@ -1627,7 +1629,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     // Set start time from LTC checkbox
     let is_video_group = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let group_has_results = state.latest.ltc_group_results.iter().any(|r| r.is_some());
-    let ltc_available = !state.latest.ltc_is_detecting && !state.latest.ltc_group_is_detecting
+    let ltc_available = state.latest.job(JobKind::LtcDecode).phase != JobPhase::Running && state.latest.job(JobKind::LtcGroupDecode).phase != JobPhase::Running
         && if is_video_group {
             group_has_results
         } else {
@@ -1660,7 +1662,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
                 );
             }
         }
-        if !ltc_available && !state.latest.ltc_is_detecting {
+        if !ltc_available && state.latest.job(JobKind::LtcDecode).phase != JobPhase::Running {
             ui.label(
                 RichText::new("(Detect LTC first)")
                     .font(FontId::proportional(10.0))
@@ -1681,10 +1683,7 @@ fn selected_input_files(state: &AppState) -> Vec<PathBuf> {
 
 fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), String>>) {
     let colors = state.theme.colors();
-    let is_running = matches!(
-        state.latest.converter.conversion_state.status,
-        ConversionStatus::Running { .. }
-    );
+    let is_running = state.latest.job(JobKind::Conversion).phase == JobPhase::Running;
 
     if is_running {
         if ui
@@ -1860,33 +1859,19 @@ fn start_conversion(state: &mut AppState) {
 
 fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let cs = state.latest.converter.conversion_state.clone();
-    let status = &cs.status;
+    let job = state.latest.job(JobKind::Conversion).clone();
 
-    if matches!(status, ConversionStatus::Running { .. }) {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
-    }
-
-    match status {
-        ConversionStatus::Idle => {}
-        ConversionStatus::Running { progress } => {
-            let progress_f32 = *progress;
-            drop(cs);
-
+    match job.phase {
+        JobPhase::Running | JobPhase::Indeterminate => {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             ui.label(RichText::new("Converting…").font(FontId::proportional(11.0)).color(colors.text_title).strong());
             ui.add_space(4.0);
-            let pb = egui::ProgressBar::new(progress_f32)
+            let pb = egui::ProgressBar::new(job.fraction)
                 .show_percentage()
                 .desired_width(ui.available_width());
             ui.add(pb);
             ui.add_space(4.0);
 
-            let log_text;
-            {
-                let cs2 = state.latest.converter.conversion_state.clone();
-                log_text = cs2.ffmpeg_output.clone();
-            }
-            let log_height = 120.0;
             let log_frame = egui::Frame::new()
                 .fill(Color32::from_rgb(0x0D, 0x0D, 0x0F))
                 .corner_radius(6.0)
@@ -1895,25 +1880,18 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             log_frame.show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt(crate::ids::ffmpeg_log_running_scroll())
-                    .max_height(log_height)
+                    .max_height(120.0)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(&log_text)
+                            RichText::new(&job.log)
                                 .font(FontId::monospace(9.0))
                                 .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
                         );
                     });
             });
         }
-        ConversionStatus::Completed => {
-            drop(cs);
-            let log_text;
-            {
-                let cs2 = state.latest.converter.conversion_state.clone();
-                log_text = cs2.ffmpeg_output.clone();
-            }
-
+        JobPhase::Succeeded => {
             ui.label(RichText::new("✓ Conversion completed successfully!").font(FontId::proportional(12.0)).color(colors.success_green).strong());
             ui.add_space(4.0);
             ui.label(
@@ -1935,7 +1913,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(&log_text)
+                            RichText::new(&job.log)
                                 .font(FontId::monospace(9.0))
                                 .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
                         );
@@ -1943,12 +1921,10 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             });
 
             if ui.button("Start New Conversion").clicked() {
-                // Engine manages conversion lifecycle; button triggers a fresh start
             }
         }
-        ConversionStatus::Failed { error_log } => {
-            let error_text = error_log.clone();
-            drop(cs);
+        JobPhase::Failed => {
+            let error_text = job.error.unwrap_or(job.log);
 
             let error_frame = egui::Frame::new()
                 .fill(Color32::from_rgb(0x44, 0x11, 0x11))
@@ -1985,10 +1961,33 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     ui.ctx().copy_text(error_text.clone());
                 }
                 if ui.button("Try Again").clicked() {
-                // Engine manages conversion lifecycle; triggers a fresh start
-            }
+                }
             });
         }
+        JobPhase::Cancelled => {
+            ui.label(RichText::new("■ Conversion canceled").font(FontId::proportional(12.0)).color(colors.warning_amber).strong());
+            ui.add_space(4.0);
+
+            let log_frame = egui::Frame::new()
+                .fill(Color32::from_rgb(0x0D, 0x0D, 0x0F))
+                .corner_radius(6.0)
+                .stroke(egui::Stroke::new(1.0, colors.border_main))
+                .inner_margin(egui::Margin::symmetric(8, 4));
+            log_frame.show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(crate::ids::ffmpeg_log_completed_scroll())
+                    .max_height(80.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(&job.log)
+                                .font(FontId::monospace(9.0))
+                                .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
+                        );
+                    });
+            });
+        }
+        JobPhase::Idle => {}
     }
 }
 

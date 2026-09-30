@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Error, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -135,26 +135,12 @@ pub struct SdCardInfo {
     pub selected_bytes: u64,
 }
 
-/// Per-device copy status for the published snapshot.
+/// Per-device copy totals captured from the plans at `StartOffload`.
 #[derive(Debug, Clone)]
-pub enum OffloadDeviceState {
-    Pending,
-    Copying,
-    Done,
-    Failed(String),
-    Skipped,
-}
-
-/// Per-device progress published in the snapshot.
-#[derive(Debug, Clone)]
-pub struct OffloadDeviceStatus {
-    pub device_name: String,
+pub struct OffloadDeviceTotals {
+    pub name: String,
     pub files_total: usize,
-    pub files_done: usize,
     pub bytes_total: u64,
-    pub bytes_done: u64,
-    pub current_file: String,
-    pub state: OffloadDeviceState,
 }
 
 /// Published snapshot of the entire offload subsystem.
@@ -162,23 +148,12 @@ pub struct OffloadDeviceStatus {
 pub struct OffloadSnapshot {
     /// Detected cards from the most recent scan.
     pub cards: Vec<SdCardInfo>,
-    /// True while a scan is in progress.
-    pub scanning: bool,
-    /// Per-drive scan progress message (e.g. "Scanning drive EOS_DIGITAL…").
-    /// Set from the scan thread via ScanProgress; cleared on scan completion.
-    pub scan_status: Option<String>,
     /// User-chosen parent directory (base folder for ISO-date subfolder).
     pub parent_folder: Option<PathBuf>,
     /// Editable folder name (defaults to today's ISO date).
     pub parent_name: String,
-    /// True while a copy operation is running.
-    pub running: bool,
-    /// Overall progress fraction 0.0…1.0.
-    pub overall_progress: f32,
-    /// Current copy speed in bytes per second (smoothed; 0.0 when idle).
-    pub speed_bytes_per_sec: f64,
-    /// Per-device progress details.
-    pub device_progress: Vec<OffloadDeviceStatus>,
+    /// Per-device totals captured from copy plans at StartOffload.
+    pub device_totals: Vec<OffloadDeviceTotals>,
     /// Device names that have been fully offloaded this session.
     pub completed_devices: Vec<String>,
     /// The last parent folder that was written to (for converter auto-switch).
@@ -198,14 +173,9 @@ impl OffloadSnapshot {
     pub fn initial() -> Self {
         OffloadSnapshot {
             cards: Vec::new(),
-            scanning: false,
-            scan_status: None,
             parent_folder: None,
             parent_name: default_parent_name(),
-            running: false,
-            overall_progress: 0.0,
-            speed_bytes_per_sec: 0.0,
-            device_progress: Vec::new(),
+            device_totals: Vec::new(),
             completed_devices: Vec::new(),
             last_offload_parent: None,
             last_offload_version: 0,
@@ -249,87 +219,12 @@ impl Default for ScanProgress {
     }
 }
 
-/// Shared progress state for a running offload copy operation.
-/// The engine reads atomics each tick to build the snapshot.
-pub struct OffloadContext {
-    pub devices_total: AtomicUsize,
-    pub devices_done: AtomicUsize,
-    pub overall_files_total: AtomicUsize,
-    pub overall_files_done: AtomicUsize,
-    /// Total bytes in 1 MiB units (to stay within usize range on 32-bit).
-    pub overall_blocks_total: AtomicUsize,
-    pub overall_blocks_done: AtomicUsize,
-    /// Per-device progress vectors, indexed by device index.
-    pub per_device: Vec<DeviceProgressInner>,
-    pub cancel: AtomicBool,
-}
-
-/// Per-device progress within `OffloadContext`.
-pub struct DeviceProgressInner {
-    pub files_total: AtomicUsize,
-    pub files_done: AtomicUsize,
-    pub bytes_total: u64,
-    pub bytes_done: AtomicU64,
-    pub current_file: Mutex<String>,
-    pub error: Mutex<Option<String>>,
-    pub(crate) state: Mutex<DeviceState>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DeviceState {
-    Pending,
-    Copying,
-    Done,
-    Failed,
-    Skipped,
-}
-
 /// Verification mode for copied files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyMode {
     /// Compare source and destination file sizes.
     SizeOnly,
     // Future: Checksum(ChecksumKind) — reserved for xxh3/blake3 later.
-}
-
-impl OffloadContext {
-    pub fn new(device_names: &[String], plans: &[Vec<CopyPlanItem>]) -> Self {
-        let per_device: Vec<DeviceProgressInner> = device_names
-            .iter()
-            .enumerate()
-            .map(|(idx, _name)| {
-                let files_total = plans.get(idx).map(|p| p.len()).unwrap_or(0);
-                let bytes_total: u64 = plans
-                    .get(idx)
-                    .map(|p| p.iter().map(|i| i.size).sum())
-                    .unwrap_or(0);
-                DeviceProgressInner {
-                    files_total: AtomicUsize::new(files_total),
-                    files_done: AtomicUsize::new(0),
-                    bytes_total,
-                    bytes_done: AtomicU64::new(0),
-                    current_file: Mutex::new(String::new()),
-                    error: Mutex::new(None),
-                    state: Mutex::new(DeviceState::Pending),
-                }
-            })
-            .collect();
-
-        let total_files: usize = per_device.iter().map(|d| d.files_total.load(Ordering::Relaxed)).sum();
-        let total_bytes: u64 = per_device.iter().map(|d| d.bytes_total).sum();
-        let total_blocks = (total_bytes.saturating_add((1 << 20) - 1)) >> 20; // ceil(MiB)
-
-        OffloadContext {
-            devices_total: AtomicUsize::new(device_names.len()),
-            devices_done: AtomicUsize::new(0),
-            overall_files_total: AtomicUsize::new(total_files),
-            overall_files_done: AtomicUsize::new(0),
-            overall_blocks_total: AtomicUsize::new(total_blocks as usize),
-            overall_blocks_done: AtomicUsize::new(0),
-            per_device,
-            cancel: AtomicBool::new(false),
-        }
-    }
 }
 
 // ── A single copy item ──────────────────────────────────────────────────
@@ -995,168 +890,7 @@ fn resolve_collision(name: &str, used: &mut HashMap<String, u32>) -> String {
 
 // ── Copy execution ──────────────────────────────────────────────────────
 
-/// Run the full offload copy job: copy each device's files, update context.
-/// Returns a list of successfully completed device names.
-pub fn run_offload(
-    plans_per_device: &[Vec<CopyPlanItem>],
-    device_names: &[String],
-    context: &OffloadContext,
-) -> Vec<String> {
-    let mut completed = Vec::new();
 
-    for (dev_idx, plans) in plans_per_device.iter().enumerate() {
-        if context.cancel.load(Ordering::Relaxed) {
-            // Mark all remaining (unstarted) devices as Skipped.
-            for remaining in dev_idx..plans_per_device.len() {
-                *context.per_device[remaining].state.lock().unwrap() = DeviceState::Skipped;
-            }
-            break;
-        }
-
-        let name = &device_names[dev_idx];
-
-        // Update state to Copying.
-        {
-            let inner = &context.per_device[dev_idx];
-            let mut s = inner.state.lock().unwrap();
-            *s = DeviceState::Copying;
-        }
-
-        let dest_parent = plans.first().and_then(|p| p.dst.parent()).unwrap_or(Path::new(""));
-
-        // Create device directory.
-        if let Err(e) = fs::create_dir_all(dest_parent) {
-            let msg = format!("Failed to create directory {:?}: {}", dest_parent, e);
-            {
-                let inner = &context.per_device[dev_idx];
-                *inner.error.lock().unwrap() = Some(msg.clone());
-                *inner.state.lock().unwrap() = DeviceState::Failed;
-            }
-            continue;
-        }
-
-        let mut dev_ok = true;
-
-        for item in plans {
-            if context.cancel.load(Ordering::Relaxed) {
-                dev_ok = false;
-                break;
-            }
-
-            // Update progress: current file.
-            {
-                let inner = &context.per_device[dev_idx];
-                *inner.current_file.lock().unwrap() = item
-                    .src
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-            }
-
-            // Skip if destination exists with the same size (idempotent resume).
-            if let Ok(existing_meta) = fs::metadata(&item.dst) {
-                if existing_meta.len() == item.size && existing_meta.is_file() {
-                    advance_counters(context, dev_idx, 1, item.size);
-                    continue;
-                }
-            }
-
-            // Copy the file with 1 MiB chunked IO.
-            let mut last_reported: u64 = 0;
-            match copy_file(&item.src, &item.dst, &context.cancel, &mut |copied| {
-                let delta = copied - last_reported;
-                last_reported = copied;
-                report_chunk_delta(context, dev_idx, delta);
-            }) {
-                Ok(()) => {
-                    // Verify after copy — bytes already accounted by chunk reports.
-                    match verify_copy(&item.src, &item.dst, &VerifyMode::SizeOnly) {
-                        Ok(()) => {
-                            advance_file_done(context, dev_idx);
-                        }
-                        Err(e) => {
-                            let msg = format!("Verification failed for {:?}: {}", item.dst, e);
-                            {
-                                let inner = &context.per_device[dev_idx];
-                                *inner.error.lock().unwrap() = Some(msg);
-                                *inner.state.lock().unwrap() = DeviceState::Failed;
-                            }
-                            dev_ok = false;
-                            break;
-                        }
-                    }
-                }
-                Err(CopyError::Cancelled) => {
-                    dev_ok = false;
-                    break;
-                }
-                Err(CopyError::Io(e)) => {
-                    let msg = format!("Copy failed for {:?}: {}", item.src, e);
-                    {
-                        let inner = &context.per_device[dev_idx];
-                        *inner.error.lock().unwrap() = Some(msg);
-                        *inner.state.lock().unwrap() = DeviceState::Failed;
-                    }
-                    dev_ok = false;
-                    break;
-                }
-            }
-        }
-
-        // Finalise device.
-        let inner = &context.per_device[dev_idx];
-        let final_state = if dev_ok {
-            DeviceState::Done
-        } else if context.cancel.load(Ordering::Relaxed) {
-            DeviceState::Skipped
-        } else {
-            DeviceState::Failed
-        };
-        *inner.state.lock().unwrap() = final_state;
-
-        if dev_ok {
-            completed.push(name.clone());
-            context.devices_done.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    completed
-}
-
-/// Advance file/byte counters after a successful file copy.
-/// Advance file/byte counters after a file is skipped (idempotent resume).
-fn advance_counters(ctx: &OffloadContext, dev_idx: usize, files_inc: usize, bytes_inc: u64) {
-    let blocks = ((bytes_inc.saturating_add((1 << 20) - 1)) >> 20) as usize;
-    let inner = &ctx.per_device[dev_idx];
-    inner.files_done.fetch_add(files_inc, Ordering::Relaxed);
-    inner.bytes_done.fetch_add(bytes_inc, Ordering::Relaxed);
-    ctx.overall_files_done.fetch_add(files_inc, Ordering::Relaxed);
-    ctx.overall_blocks_done.fetch_add(blocks, Ordering::Relaxed);
-}
-
-/// Advance only the file counter after a successful copy (bytes were
-/// already accounted by chunk reports via [`report_chunk_delta`]).
-fn advance_file_done(ctx: &OffloadContext, dev_idx: usize) {
-    let inner = &ctx.per_device[dev_idx];
-    inner.files_done.fetch_add(1, Ordering::Relaxed);
-    ctx.overall_files_done.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Report a chunk of bytes successfully copied for the current file.
-/// Adds the exact delta to per-device bytes_done and the corresponding
-/// blocks (in 1 MiB units, ceiled for the last partial chunk) to
-/// overall_blocks_done.
-fn report_chunk_delta(ctx: &OffloadContext, dev_idx: usize, delta_bytes: u64) {
-    if delta_bytes > 0 {
-        ctx.per_device[dev_idx]
-            .bytes_done
-            .fetch_add(delta_bytes, Ordering::Relaxed);
-        let blocks_delta = ((delta_bytes.saturating_add((1 << 20) - 1)) >> 20) as usize;
-        ctx.overall_blocks_done
-            .fetch_add(blocks_delta, Ordering::Relaxed);
-    }
-}
 
 /// Copy a single file with 1 MiB chunked IO.
 ///
@@ -1232,75 +966,7 @@ pub fn verify_copy(src: &Path, dst: &Path, mode: &VerifyMode) -> Result<(), Stri
     }
 }
 
-// ── Build snapshot from context ─────────────────────────────────────────
 
-/// Read the current state of an `OffloadContext` and produce a status snapshot.
-pub fn snapshot_from_context(
-    context: &OffloadContext,
-    device_names: &[String],
-    completed_devices: &[String],
-    parent_folder: Option<PathBuf>,
-    parent_name: &str,
-    error: Option<String>,
-    last_version: u64,
-) -> OffloadSnapshot {
-    let total = context.devices_total.load(Ordering::Relaxed);
-    let mut device_progress: Vec<OffloadDeviceStatus> = Vec::new();
-
-    for i in 0..total {
-        let inner = &context.per_device[i];
-        let state_val = inner.state.lock().unwrap().clone();
-        let err = inner.error.lock().unwrap().clone();
-        let device_state = match state_val {
-            DeviceState::Pending => OffloadDeviceState::Pending,
-            DeviceState::Copying => OffloadDeviceState::Copying,
-            DeviceState::Done => OffloadDeviceState::Done,
-            DeviceState::Failed => {
-                OffloadDeviceState::Failed(err.unwrap_or_else(|| "Unknown error".to_string()))
-            }
-            DeviceState::Skipped => OffloadDeviceState::Skipped,
-        };
-
-        device_progress.push(OffloadDeviceStatus {
-            device_name: device_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("Device {}", i)),
-            files_total: inner.files_total.load(Ordering::Relaxed),
-            files_done: inner.files_done.load(Ordering::Relaxed),
-            bytes_total: inner.bytes_total,
-            bytes_done: inner.bytes_done.load(Ordering::Relaxed),
-            current_file: inner.current_file.lock().unwrap().clone(),
-            state: device_state,
-        });
-    }
-
-    let total_blocks = context.overall_blocks_total.load(Ordering::Relaxed);
-    let done_blocks = context.overall_blocks_done.load(Ordering::Relaxed);
-    let progress = if total_blocks > 0 {
-        (done_blocks as f32) / (total_blocks as f32)
-    } else {
-        0.0
-    };
-
-    OffloadSnapshot {
-        cards: Vec::new(), // not updated from context; set elsewhere
-        scanning: false,
-        scan_status: None,
-        parent_folder: parent_folder.clone(),
-        parent_name: parent_name.to_string(),
-        running: true,
-        overall_progress: progress.min(1.0),
-        speed_bytes_per_sec: 0.0,
-        device_progress,
-        completed_devices: completed_devices.to_vec(),
-        last_offload_parent: parent_folder,
-        last_offload_version: last_version,
-        error,
-        file_durations: HashMap::new(),
-        durations_version: 0,
-    }
-}
 
 /// Resolve the base (whole-disk) device name from a partition or device name.
 /// Uses the sysfs `partition` attribute to detect partitions:
@@ -1703,78 +1369,7 @@ mod tests {
         assert!(verify_copy(&src, &dst, &VerifyMode::SizeOnly).is_err());
     }
 
-    // ── run_offload ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_run_offload_copies_files() {
-        let card = TempDir::new().unwrap();
-        let dest = TempDir::new().unwrap();
-        fs::write(card.path().join("C0001.MP4"), b"video_data").unwrap();
-        fs::write(card.path().join("C0002.MP4"), b"more_video").unwrap();
-
-        let plans = plan_copies_for_card(card.path(), "A6100", dest.path());
-        let device_names = vec!["A6100".to_string()];
-        let ctx = OffloadContext::new(&device_names, std::slice::from_ref(&plans));
-
-        let completed = run_offload(&[plans], &device_names, &ctx);
-
-        assert_eq!(completed.len(), 1);
-        assert!(dest.path().join("A6100").join("C0001.MP4").exists());
-        assert!(dest.path().join("A6100").join("C0002.MP4").exists());
-    }
-
-    #[test]
-    fn test_run_offload_ids_when_dest_exists() {
-        let card = TempDir::new().unwrap();
-        let dest = TempDir::new().unwrap();
-        let dst_dir = dest.path().join("A6100");
-        fs::create_dir_all(&dst_dir).unwrap();
-
-        // Pre-copy one file to dest.
-        fs::write(card.path().join("C0001.MP4"), b"data").unwrap();
-        fs::write(card.path().join("C0002.MP4"), b"other_data").unwrap();
-        fs::write(dst_dir.join("C0001.MP4"), b"data").unwrap(); // same size as source
-
-        let plans = plan_copies_for_card(card.path(), "A6100", dest.path());
-        let device_names = vec!["A6100".to_string()];
-        let ctx = OffloadContext::new(&device_names, std::slice::from_ref(&plans));
-
-        let completed = run_offload(&[plans], &device_names, &ctx);
-        assert_eq!(completed.len(), 1, "should succeed even with pre-existing file");
-    }
-
-    #[test]
-    fn test_run_offload_cancel_midway() {
-        let card = TempDir::new().unwrap();
-        let dest = TempDir::new().unwrap();
-        // Create several small files.
-        for i in 0..10 {
-            fs::write(card.path().join(format!("C{:04}.MP4", i)), vec![b'x'; 1024 * 10])
-                .unwrap();
-        }
-
-        let plans = plan_copies_for_card(card.path(), "Cam", dest.path());
-        let device_names = vec!["Cam".to_string()];
-        let ctx = OffloadContext::new(&device_names, std::slice::from_ref(&plans));
-        ctx.cancel.store(true, Ordering::Relaxed);
-
-        let completed = run_offload(&[plans], &device_names, &ctx);
-        // Should have been cancelled with no files completed.
-        assert!(completed.is_empty());
-        // Device should be Skipped.
-        assert_eq!(
-            *ctx.per_device[0].state.lock().unwrap(),
-            DeviceState::Skipped,
-        );
-        // No .offload_tmp files left behind.
-        let tmp_left: Vec<_> = fs::read_dir(dest.path().join("Cam"))
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|x| x == "offload_tmp").unwrap_or(false))
-            .collect();
-        assert!(tmp_left.is_empty(), "no leftover temp files on cancel");
-    }
+    
 
     #[test]
     fn test_copy_file_copies_content_correctly() {
@@ -1875,56 +1470,7 @@ mod tests {
         assert!(!dst.exists());
     }
 
-    // ── snapshot_from_context ─────────────────────────────────────────
-
-    #[test]
-    fn test_snapshot_from_context_progress() {
-        let device_names = vec!["A6100".to_string(), "A6700".to_string()];
-
-        // Create two small plans.
-        let plan0 = vec![CopyPlanItem {
-            src: PathBuf::from("/fake/src1.mp4"),
-            dst: PathBuf::from("/fake/dst1.mp4"),
-            size: 1_000_000,
-        }];
-        let plan1 = vec![CopyPlanItem {
-            src: PathBuf::from("/fake/src2.mp4"),
-            dst: PathBuf::from("/fake/dst2.mp4"),
-            size: 2_000_000,
-        }];
-
-        let ctx = OffloadContext::new(&device_names, &[plan0, plan1]);
-
-        // Mark file 0 as done.
-        ctx.per_device[0]
-            .files_done
-            .store(1, Ordering::Relaxed);
-        ctx.per_device[0]
-            .bytes_done
-            .store(1_000_000, Ordering::Relaxed);
-        ctx.overall_files_done.fetch_add(1, Ordering::Relaxed);
-        ctx.overall_blocks_done
-            .fetch_add(((1_000_000 + (1 << 20) - 1) >> 20) as usize, Ordering::Relaxed);
-
-        let snapshot = snapshot_from_context(
-            &ctx,
-            &device_names,
-            &[],
-            Some(PathBuf::from("/output")),
-            "2026-09-26",
-            None,
-            1,
-        );
-
-        assert!(snapshot.running);
-        assert!(snapshot.overall_progress > 0.0 && snapshot.overall_progress < 1.0);
-        assert_eq!(snapshot.device_progress.len(), 2);
-        assert_eq!(snapshot.device_progress[0].files_done, 1);
-        assert_eq!(snapshot.device_progress[0].bytes_done, 1_000_000);
-        assert_eq!(snapshot.last_offload_version, 1);
-        assert_eq!(snapshot.parent_name, "2026-09-26");
-        assert_eq!(snapshot.speed_bytes_per_sec, 0.0);
-    }
+    
 
     // ── detect_cards_from_mounts ──────────────────────────────────────
 
@@ -2433,95 +1979,5 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         assert_eq!(files.len(), MAX_CARD_FILES);
     }
 
-    // ── report_chunk_progress delta semantics ─────────────────────────
-
-    #[test]
-    fn test_report_chunk_delta_direct() {
-        let ctx = OffloadContext::new(&["DEV".to_string()], &[vec![CopyPlanItem {
-            src: PathBuf::from("/fake/src.bin"),
-            dst: PathBuf::from("/fake/dst.bin"),
-            size: 3_000_000,
-        }]]);
-        report_chunk_delta(&ctx, 0, 1 << 20);
-        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), 1 << 20);
-        assert_eq!(ctx.overall_blocks_done.load(Ordering::Relaxed), 1);
-        report_chunk_delta(&ctx, 0, 1 << 20);
-        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), 2 << 20);
-        assert_eq!(ctx.overall_blocks_done.load(Ordering::Relaxed), 2);
-        report_chunk_delta(&ctx, 0, (1 << 20) - 1);
-        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), (3 << 20) - 1);
-        // Last partial chunk: ceil(1MiB-1 / 1MiB) = 1 block
-        assert_eq!(ctx.overall_blocks_done.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn test_advance_file_done_keeps_bytes_unchanged() {
-        let ctx = OffloadContext::new(&["DEV".to_string()], &[vec![CopyPlanItem {
-            src: PathBuf::from("/fake/src.bin"),
-            dst: PathBuf::from("/fake/dst.bin"),
-            size: 2_000_000,
-        }]]);
-        // Simulate chunk reports already added bytes.
-        ctx.per_device[0].bytes_done.store(2_000_000, Ordering::Relaxed);
-        ctx.overall_blocks_done
-            .store(((2_000_000 + (1 << 20) - 1) >> 20) as usize, Ordering::Relaxed);
-        advance_file_done(&ctx, 0);
-        assert_eq!(ctx.per_device[0].files_done.load(Ordering::Relaxed), 1);
-        // bytes_done unchanged
-        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), 2_000_000);
-        assert_eq!(ctx.overall_files_done.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_advance_counters_skip_path() {
-        let ctx = OffloadContext::new(&["DEV".to_string()], &[vec![CopyPlanItem {
-            src: PathBuf::from("/fake/src.bin"),
-            dst: PathBuf::from("/fake/dst.bin"),
-            size: 2_000_000,
-        }]]);
-        advance_counters(&ctx, 0, 1, 2_000_000);
-        assert_eq!(ctx.per_device[0].files_done.load(Ordering::Relaxed), 1);
-        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), 2_000_000);
-        assert_eq!(ctx.overall_files_done.load(Ordering::Relaxed), 1);
-        let expected_blocks = ((2_000_000 + (1 << 20) - 1) >> 20) as usize;
-        assert_eq!(ctx.overall_blocks_done.load(Ordering::Relaxed), expected_blocks);
-    }
-
-    #[test]
-    fn test_run_offload_multi_file_progress_counts() {
-        let dir = TempDir::new().unwrap();
-        // Three files: 3 MiB, 1 MiB, 2 MiB
-        let f1 = dir.path().join("f1.bin");
-        let f2 = dir.path().join("f2.bin");
-        let f3 = dir.path().join("f3.bin");
-        fs::write(&f1, vec![0xAAu8; 3 * 1024 * 1024]).unwrap();
-        fs::write(&f2, vec![0xBBu8; 1024 * 1024]).unwrap();
-        fs::write(&f3, vec![0xCCu8; 2 * 1024 * 1024]).unwrap();
-
-        let dest = TempDir::new().unwrap();
-        let plans = vec![vec![
-            CopyPlanItem { src: f1, dst: dest.path().join("f1.bin"), size: 3 * 1024 * 1024 },
-            CopyPlanItem { src: f2, dst: dest.path().join("f2.bin"), size: 1024 * 1024 },
-            CopyPlanItem { src: f3, dst: dest.path().join("f3.bin"), size: 2 * 1024 * 1024 },
-        ]];
-        let device_names = vec!["CARD".to_string()];
-        let ctx = OffloadContext::new(&device_names, &plans);
-        let _completed = run_offload(&plans, &device_names, &ctx);
-
-        assert_eq!(ctx.per_device[0].files_done.load(Ordering::Relaxed), 3);
-        // Buggy code double-counts: 3+3 + 1+1 + 2+2 = 12 MiB.
-        // Correct: 3 + 1 + 2 = 6 MiB.
-        let expected_bytes: u64 = 6 * 1024 * 1024;
-        assert_eq!(
-            ctx.per_device[0].bytes_done.load(Ordering::Relaxed),
-            expected_bytes,
-            "bytes_done should be exactly the sum of file sizes, not double-counted"
-        );
-        let total_blocks = (6usize << 20).saturating_add((1 << 20) - 1) >> 20; // 6
-        assert_eq!(
-            ctx.overall_blocks_done.load(Ordering::Relaxed),
-            total_blocks,
-            "overall_blocks should be ceil(total_bytes/1MiB)"
-        );
-    }
+    
 }

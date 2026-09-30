@@ -10,7 +10,7 @@ use gui_engine::command::{ConverterCommand, GuiCommand, OffloadCommand};
 use gui_engine::config;
 use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
 use gui_engine::timecode::{self, FPS_OPTIONS};
-use gui_engine::{ArcSwap, SAMPLE_RATE_OPTIONS};
+use gui_engine::{ArcSwap, JobKind, SAMPLE_RATE_OPTIONS};
 use log::info;
 use slint::{ModelRc, SharedString, VecModel};
 
@@ -514,7 +514,7 @@ fn _run_gui(
         let state = engine_state.clone();
         ui.on_conv_copy_log(move || {
             let s = state.load();
-            let text = s.converter.conversion_state.ffmpeg_output.clone();
+            let text = s.job(JobKind::Conversion).log.clone();
             if let Ok(mut ctx) = arboard::Clipboard::new() {
                 let _ = ctx.set_text(text);
             }

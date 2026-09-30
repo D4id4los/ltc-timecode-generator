@@ -4,7 +4,7 @@ use gui_engine::command::{
     OffloadCommand,
 };
 use gui_engine::duration::format_duration_secs;
-use gui_engine::offload::OffloadDeviceState;
+use gui_engine::{JobKind, JobPhase, UnitState};
 
 use crate::app::AppState;
 use crate::theme::{ThemeColors, ACCENT};
@@ -113,8 +113,8 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let off = &s.offload;
     let cards = off.cards.clone();
-    let scanning = off.scanning;
-    let scan_msg = off.scan_status.clone().unwrap_or_else(|| "Scanning…".to_string());
+    let scanning = s.job(JobKind::OffloadScan).phase == JobPhase::Running;
+    let scan_msg = s.job(JobKind::OffloadScan).message.clone();
     let file_durations = off.file_durations.clone();
 
     ui.horizontal(|ui| {
@@ -299,11 +299,12 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
 
 fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let is_running = state.latest.offload.running;
+    let is_running = state.latest.job(JobKind::OffloadCopy).phase == JobPhase::Running;
+    let is_scanning = state.latest.job(JobKind::OffloadScan).phase == JobPhase::Running;
     let can_start = !state.latest.offload.cards.is_empty()
         && state.latest.offload.parent_folder.is_some()
         && !is_running
-        && !state.latest.offload.scanning;
+        && !is_scanning;
 
     ui.horizontal(|ui| {
         if is_running {
@@ -325,17 +326,21 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
     let s = &state.latest;
     let colors = state.theme.colors();
     let off = &s.offload;
+    let copy_job = s.job(JobKind::OffloadCopy);
+    let copy_phase = copy_job.phase;
+    let copy_running = copy_phase == JobPhase::Running;
+    let copy_fraction = copy_job.fraction;
+    let copy_speed = copy_job.speed.unwrap_or(0.0);
+    let units = copy_job.units.clone();
 
     // Overall progress bar.
-    if off.running || off.overall_progress > 0.0 {
-        let progress_f32 = off.overall_progress;
-        ui.add(egui::ProgressBar::new(progress_f32)
+    if copy_running || copy_fraction > 0.0 {
+        ui.add(egui::ProgressBar::new(copy_fraction)
             .show_percentage()
             .desired_width(ui.available_width()));
 
-        // Speed and total bytes next to the bar.
-        let speed_text = if off.speed_bytes_per_sec > 0.0 {
-            format!("{} / s", format_bytes(off.speed_bytes_per_sec as u64))
+        let speed_text = if copy_speed > 0.0 {
+            format!("{} / s", format_bytes(copy_speed as u64))
         } else {
             String::new()
         };
@@ -345,10 +350,11 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
                     .font(FontId::monospace(10.0))
                     .color(ACCENT));
             }
-            if off.running {
-                // Compute total bytes from per-device totals.
-                let total_bytes: u64 = off.device_progress.iter().map(|d| d.bytes_total).sum();
-                let done_bytes: u64 = off.device_progress.iter().map(|d| d.bytes_done).sum();
+            if copy_running {
+                let total_bytes: u64 = off.device_totals.iter().map(|d| d.bytes_total).sum();
+                let done_bytes: u64 = units.iter().zip(off.device_totals.iter())
+                    .map(|(u, t)| (u.fraction * t.bytes_total as f32) as u64)
+                    .sum();
                 if total_bytes > 0 {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!("{} / {}", format_bytes(done_bytes), format_bytes(total_bytes)))
@@ -360,56 +366,48 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
         });
         ui.add_space(4.0);
 
-        // Per-device progress.
-        for dev in &off.device_progress {
-            let dev_pct = if dev.bytes_total > 0 {
-                (dev.bytes_done as f32) / (dev.bytes_total as f32)
-            } else if dev.files_total > 0 {
-                dev.files_done as f32 / dev.files_total as f32
-            } else {
-                0.0
-            };
-            let (status_icon, status_color) = match &dev.state {
-                OffloadDeviceState::Pending => ("⏳", colors.text_muted),
-                OffloadDeviceState::Copying => ("▶", ACCENT),
-                OffloadDeviceState::Done => ("✅", colors.success_green),
-                OffloadDeviceState::Failed(_) => ("❌", colors.error_red),
-                OffloadDeviceState::Skipped => ("⏭", colors.text_muted),
+        // Per-device progress — merge units with device_totals.
+        for (i, unit) in units.iter().enumerate() {
+            let dev_pct = unit.fraction;
+            let totals = off.device_totals.get(i);
+            let dev_name = totals.map(|t| t.name.as_str()).unwrap_or(&unit.label);
+            let bytes_total = totals.map(|t| t.bytes_total).unwrap_or(0);
+            let bytes_done = (unit.fraction * bytes_total as f32) as u64;
+            let files_total = totals.map(|t| t.files_total).unwrap_or(0);
+
+            let (status_icon, status_color) = match unit.state {
+                UnitState::Pending => ("⏳", colors.text_muted),
+                UnitState::Running => ("▶", ACCENT),
+                UnitState::Done => ("✅", colors.success_green),
+                UnitState::Failed => ("❌", colors.error_red),
+                UnitState::Skipped => ("⏭", colors.text_muted),
             };
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{} {}", status_icon, dev.device_name))
+                ui.label(RichText::new(format!("{} {}", status_icon, dev_name))
                     .font(FontId::monospace(11.0))
                     .color(status_color));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Show byte progress + file count.
-                    let bytes_str = if dev.bytes_total > 0 {
-                        format!("{} / {}  ", format_bytes(dev.bytes_done), format_bytes(dev.bytes_total))
+                    let bytes_str = if bytes_total > 0 {
+                        format!("{} / {}  ", format_bytes(bytes_done), format_bytes(bytes_total))
                     } else {
                         String::new()
                     };
-                    ui.label(RichText::new(format!("{}{}/{} files", bytes_str, dev.files_done, dev.files_total))
+                    let files_done = if files_total > 0 { (unit.fraction * files_total as f32).round() as usize } else { 0 };
+                    ui.label(RichText::new(format!("{}{}/{} files", bytes_str, files_done, files_total))
                         .font(FontId::monospace(10.0))
                         .color(colors.text_muted));
                 });
             });
-            if dev.files_total > 0 || dev.bytes_total > 0 {
+            if files_total > 0 || bytes_total > 0 {
                 ui.add(egui::ProgressBar::new(dev_pct).desired_width(ui.available_width()));
             }
 
-            // Show current file when copying.
-            if let OffloadDeviceState::Copying = &dev.state {
-                if !dev.current_file.is_empty() {
-                    ui.label(RichText::new(format!("  {}", dev.current_file))
+            if let UnitState::Running = unit.state {
+                if !unit.message.is_empty() {
+                    ui.label(RichText::new(format!("  {}", unit.message))
                         .font(FontId::monospace(9.0))
                         .color(colors.text_muted));
                 }
-            }
-
-            // Show error if failed.
-            if let OffloadDeviceState::Failed(ref err) = &dev.state {
-                ui.label(RichText::new(err)
-                    .font(FontId::monospace(10.0))
-                    .color(colors.error_red));
             }
         }
         ui.add_space(8.0);

@@ -77,6 +77,7 @@ pub struct ProgressTracker(Arc<TrackerInner>);
 struct TrackerInner {
     units: Mutex<Vec<UnitInner>>,
     message: Mutex<String>,
+    log: Mutex<String>,
     indeterminate: AtomicBool,
     speed: AtomicU64, // bytes per second * 1000 (fixed-point for atomic)
 }
@@ -104,6 +105,7 @@ impl ProgressTracker {
         ProgressTracker(Arc::new(TrackerInner {
             units: Mutex::new(units),
             message: Mutex::new(String::new()),
+            log: Mutex::new(String::new()),
             indeterminate: AtomicBool::new(false),
             speed: AtomicU64::new(0),
         }))
@@ -189,6 +191,7 @@ impl ProgressTracker {
                 None
             },
             units: unit_snapshots,
+            log: inner.log.lock().unwrap().clone(),
         }
     }
 }
@@ -248,6 +251,70 @@ pub struct ProgressSnapshot {
     pub message: String,
     pub speed: Option<f64>,
     pub units: Vec<UnitSnapshot>,
+    pub log: String,
+}
+
+// ── JobStatus (published in snapshot) ───────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct JobStatus {
+    pub phase: JobPhase,
+    pub fraction: f32,
+    pub message: String,
+    pub speed: Option<f64>,
+    pub units: Vec<UnitSnapshot>,
+    pub log: String,
+    pub error: Option<String>,
+}
+
+impl JobStatus {
+    pub fn idle() -> Self {
+        JobStatus {
+            phase: JobPhase::Idle,
+            fraction: 0.0,
+            message: String::new(),
+            speed: None,
+            units: Vec::new(),
+            log: String::new(),
+            error: None,
+        }
+    }
+
+    pub fn from_progress(snap: &ProgressSnapshot) -> Self {
+        JobStatus {
+            phase: snap.phase,
+            fraction: snap.fraction,
+            message: snap.message.clone(),
+            speed: snap.speed,
+            units: snap.units.clone(),
+            log: snap.log.clone(),
+            error: None,
+        }
+    }
+
+    pub fn apply_outcome(&mut self, outcome: &JobOutcome) {
+        match outcome {
+            JobOutcome::Succeeded { log, .. } => {
+                self.phase = JobPhase::Succeeded;
+                if !log.is_empty() {
+                    self.log = log.clone();
+                }
+            }
+            JobOutcome::Cancelled { log } => {
+                self.phase = JobPhase::Cancelled;
+                if !log.is_empty() {
+                    self.log = log.clone();
+                }
+            }
+            JobOutcome::Failed { error, log } => {
+                self.phase = JobPhase::Failed;
+                self.error = Some(error.clone());
+                if !log.is_empty() {
+                    self.log = log.clone();
+                }
+            }
+        }
+    }
 }
 
 // ── Cancellation ────────────────────────────────────────────────────────

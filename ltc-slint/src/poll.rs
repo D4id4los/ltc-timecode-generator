@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gui_engine::converter::{format_blockers, ConversionStatus, RecordingType};
+use gui_engine::converter::{format_blockers, RecordingType};
+use gui_engine::{JobKind, JobPhase, UnitState};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
@@ -64,7 +65,7 @@ pub fn setup_poll_timer(
 
             // 4. LTC decode state sync
             {
-                if s.ltc_is_detecting || s.ltc_group_is_detecting {
+if s.job(JobKind::LtcDecode).phase == JobPhase::Running || s.job(JobKind::LtcGroupDecode).phase == JobPhase::Running {
                     ui.set_ltc_status(SharedString::from("detecting"));
                     ui.set_ltc_result_text(SharedString::from(""));
                     ui.set_ltc_error(SharedString::from(""));
@@ -163,16 +164,16 @@ pub fn setup_poll_timer(
 
             // 7. Probe-status flags for video recordings
             if ui.get_conv_is_video_recording() {
-                ui.set_conv_ltc_probe_loading(s.converter.probes_loading);
-                ui.set_conv_ltc_probe_failed(s.ltc_probe.is_none() && !s.converter.probes_loading);
+                ui.set_conv_ltc_probe_loading(s.job(JobKind::ClipProbe).phase == JobPhase::Running);
+                ui.set_conv_ltc_probe_failed(s.ltc_probe.is_none() && s.job(JobKind::ClipProbe).phase != JobPhase::Running);
             } else {
                 ui.set_conv_ltc_probe_loading(false);
                 ui.set_conv_ltc_probe_failed(false);
             }
 
             // 8. Sync decode progress
-            if s.ltc_is_detecting || s.ltc_group_is_detecting {
-                ui.set_ltc_decode_progress(s.ltc_decode_progress_pct);
+            if s.job(JobKind::LtcDecode).phase == JobPhase::Running || s.job(JobKind::LtcGroupDecode).phase == JobPhase::Running {
+                ui.set_ltc_decode_progress(s.job(JobKind::LtcDecode).fraction);
             }
 
             // 9. Pulse phase animation
@@ -297,7 +298,7 @@ pub fn setup_poll_timer(
 
             // 22. ffmpeg capability probe state sync
             {
-                ui.set_conv_ffmpeg_probing(s.ffmpeg_probe_running);
+                ui.set_conv_ffmpeg_probing(s.job(JobKind::FfmpegCapProbe).phase == JobPhase::Running);
                 if let Some(ref caps) = s.ffmpeg_caps {
                     ui.set_conv_has_ffmpeg(caps.has_ffmpeg);
                     if let Some(ref msg) = caps.error_message {
@@ -372,24 +373,21 @@ pub fn setup_poll_timer(
                 }
             }
 
-            // 25. Conversion state sync (from engine-owned snapshot)
+            // 25. Conversion state sync (from engine-owned snapshot via JobStatus)
             {
-                let cs = &s.converter.conversion_state;
-                let status_str = match &cs.status {
-                    ConversionStatus::Idle => "idle".to_string(),
-                    ConversionStatus::Running { progress } => {
-                        format!("running {:.0}%", progress * 100.0)
+                let jc = s.job(JobKind::Conversion);
+                let status_str = match jc.phase {
+                    JobPhase::Idle => "idle".to_string(),
+                    JobPhase::Running | JobPhase::Indeterminate => {
+                        format!("running {:.0}%", jc.fraction * 100.0)
                     }
-                    ConversionStatus::Completed => "completed".to_string(),
-                    ConversionStatus::Failed { .. } => "failed".to_string(),
-                };
-                let progress = match &cs.status {
-                    ConversionStatus::Running { progress } => *progress,
-                    _ => 0.0,
+                    JobPhase::Succeeded => "completed".to_string(),
+                    JobPhase::Cancelled => "cancelled".to_string(),
+                    JobPhase::Failed => "failed".to_string(),
                 };
                 ui.set_conv_status(SharedString::from(status_str));
-                ui.set_conv_progress(progress);
-                ui.set_conv_log(SharedString::from(cs.ffmpeg_output.clone()));
+                ui.set_conv_progress(jc.fraction);
+                ui.set_conv_log(SharedString::from(jc.log.clone()));
             }
 
             // 26. Readiness / sanity message
@@ -495,13 +493,16 @@ pub fn setup_poll_timer(
                     off.parent_folder.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
                 ));
                 ui.set_off_parent_name(SharedString::from(off.parent_name.clone()));
-                ui.set_off_scanning(off.scanning);
-                ui.set_off_scan_status(SharedString::from(off.scan_status.clone().unwrap_or_default()));
-                ui.set_off_running(off.running);
-                ui.set_off_overall_progress(off.overall_progress);
+                let scan_job = s.job(JobKind::OffloadScan);
+                ui.set_off_scanning(scan_job.phase == JobPhase::Running);
+                ui.set_off_scan_status(SharedString::from(scan_job.message.clone()));
+                let copy_job = s.job(JobKind::OffloadCopy);
+                ui.set_off_running(copy_job.phase == JobPhase::Running);
+                ui.set_off_overall_progress(copy_job.fraction);
+                let speed_bps = copy_job.speed.unwrap_or(0.0);
                 ui.set_off_speed_text(SharedString::from(
-                    if off.speed_bytes_per_sec > 0.0 {
-                        format!("{} / s", format_bytes(off.speed_bytes_per_sec as u64))
+                    if speed_bps > 0.0 {
+                        format!("{} / s", format_bytes(speed_bps as u64))
                     } else {
                         String::new()
                     },
@@ -548,39 +549,37 @@ pub fn setup_poll_timer(
                 }).collect();
                 ui.set_off_cards(ModelRc::new(VecModel::<crate::OffloadCardInfo>::from(card_infos)));
 
-                let device_status: Vec<crate::OffloadDeviceStatus> = off.device_progress.iter().map(|dp| {
-                    let state_text = match dp.state {
-                        gui_engine::offload::OffloadDeviceState::Pending => "Pending",
-                        gui_engine::offload::OffloadDeviceState::Copying => "Copying",
-                        gui_engine::offload::OffloadDeviceState::Done => "Done",
-                        gui_engine::offload::OffloadDeviceState::Failed(_) => "Failed",
-                        gui_engine::offload::OffloadDeviceState::Skipped => "Skipped",
+                let device_status: Vec<crate::OffloadDeviceStatus> = off.device_totals.iter().enumerate().map(|(i, dt)| {
+                    let unit = copy_job.units.get(i);
+                    let state_text = match unit.map(|u| u.state) {
+                        Some(UnitState::Pending) => "Pending",
+                        Some(UnitState::Running) => "Copying",
+                        Some(UnitState::Done) => "Done",
+                        Some(UnitState::Failed) => "Failed",
+                        Some(UnitState::Skipped) => "Skipped",
+                        None => "Pending",
                     };
-                    let error_str = match &dp.state {
-                        gui_engine::offload::OffloadDeviceState::Failed(e) => e.clone(),
+                    let fraction = unit.map(|u| u.fraction).unwrap_or(0.0);
+                    let bytes_done = (dt.bytes_total as f64 * fraction as f64) as u64;
+                    let bytes_text = if dt.bytes_total > 0 {
+                        format!("{} / {}", format_bytes(bytes_done), format_bytes(dt.bytes_total))
+                    } else {
+                        String::new()
+                    };
+                    let files_done = (dt.files_total as f32 * fraction) as i32;
+                    let current_file = unit.map(|u| u.message.clone()).unwrap_or_default();
+                    let error_str = match unit.map(|u| u.state) {
+                        Some(UnitState::Failed) => current_file.clone(),
                         _ => String::new(),
                     };
-                    let (progress, bytes_text) = if dp.bytes_total > 0 {
-                        (
-                            (dp.bytes_done as f32) / (dp.bytes_total as f32),
-                            format!("{} / {}", format_bytes(dp.bytes_done), format_bytes(dp.bytes_total)),
-                        )
-                    } else if dp.files_total > 0 {
-                        (
-                            dp.files_done as f32 / dp.files_total as f32,
-                            String::new(),
-                        )
-                    } else {
-                        (0.0, String::new())
-                    };
                     crate::OffloadDeviceStatus {
-                        device_name: SharedString::from(dp.device_name.clone()),
+                        device_name: SharedString::from(dt.name.clone()),
                         state_text: SharedString::from(state_text),
-                        files_total: dp.files_total as i32,
-                        files_done: dp.files_done as i32,
-                        progress,
+                        files_total: dt.files_total as i32,
+                        files_done,
+                        progress: fraction,
                         bytes_text: SharedString::from(bytes_text),
-                        current_file: SharedString::from(dp.current_file.clone()),
+                        current_file: SharedString::from(current_file),
                         error: SharedString::from(error_str),
                     }
                 }).collect();

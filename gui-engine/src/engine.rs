@@ -12,15 +12,15 @@ use crate::command::{ConverterCommand, GuiCommand};
 use crate::config;
 use crate::video_codecs::describe_chain;
 use crate::converter::{
-    query_ffmpeg_capabilities, ConversionState, ConversionStatus,
+    query_ffmpeg_capabilities,
     FfmpegCapabilities, ChannelMap, ConversionPipeline, ConverterSettings,
     RecordingType, duplicate_output_names, duplicate_output_warning, evaluate_readiness,
     output_collision_warning, preview_output_files, apply_available_defaults,
     spawn_conversion_job,
 };
 use crate::ffprobe::{self, VideoAudioProbe};
-use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobSupervisor, spawn_job};
-use crate::offload::{self, DeviceNameSource, run_offload_copy_job, run_offload_scan_job};
+use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor, spawn_job};
+use crate::offload::{DeviceNameSource, OffloadDeviceTotals, run_offload_copy_job, run_offload_scan_job};
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
 
@@ -49,7 +49,6 @@ pub fn engine_main_with_probe<F>(
 {
     let mut current = AppStateSnapshot::initial();
     current.use_libltc = use_libltc;
-    current.ffmpeg_probe_running = true;
 
     // Seed persisted paths into the engine snapshot (output folder,
     // offload parent dir). Input folder is restored by the GUI sending
@@ -129,15 +128,15 @@ pub fn engine_main_with_probe<F>(
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SelectFolder(path))) => {
                     current.converter.groups.clear();
-                    current.converter.groups_loading = true;
                     current.converter.groups_folder = Some(path.clone());
                     current.converter.groups_generation = current.converter.groups_generation.wrapping_add(1);
                     pending_recording = None; // new scan invalidates any deferred selection
                     current.converter.selected_group_idx = None;
                     current.converter.probes.clear();
-                    current.converter.probes_loading = false;
                     current.converter.probes_generation = 0;
-                    current.converter.conversion_state = ConversionState::idle();
+                    current.jobs.entry(JobKind::Conversion).or_insert_with(JobStatus::idle);
+                    current.jobs.entry(JobKind::FolderScan).or_insert_with(JobStatus::idle);
+                    current.jobs.entry(JobKind::ClipProbe).or_insert_with(JobStatus::idle);
                     // Fresh scan — reset user-set flag so the next recording
                     // selection re-defaults output_folder to the record's
                     // parent dir.
@@ -163,7 +162,7 @@ pub fn engine_main_with_probe<F>(
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SelectRecording(idx))) => {
-                    if current.converter.groups_loading {
+                    if supervisor.is_running(JobKind::FolderScan) {
                         info!(
                             "SelectRecording({}) deferred — folder scan still in progress",
                             idx,
@@ -266,7 +265,7 @@ pub fn engine_main_with_probe<F>(
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::StartConversion)) => {
-                    if matches!(current.converter.conversion_state.status, ConversionStatus::Running { .. }) {
+                    if current.job(JobKind::Conversion).phase == job::JobPhase::Running {
                         warn!("Conversion already in progress — ignoring duplicate StartConversion");
                     } else if let Some(settings) = assemble_converter_settings(&current) {
                         let caps = current.ffmpeg_caps.clone();
@@ -281,11 +280,10 @@ pub fn engine_main_with_probe<F>(
                             spawn_conversion_job(ctx, settings, caps)
                         });
                         // Immediately reflect running state in snapshot
-                        current.converter.conversion_state = ConversionState {
-                            status: ConversionStatus::Running { progress: 0.0 },
-                            ffmpeg_output: String::new(),
-                            current_line: String::new(),
-                        };
+                        let mut status = JobStatus::idle();
+                        status.phase = job::JobPhase::Running;
+                        status.message = "Conversion started…".to_string();
+                        current.jobs.insert(JobKind::Conversion, status);
                         current.status_message = "Conversion started…".to_string();
                         info!("Conversion started via engine StartConversion command (job-based)");
                     } else {
@@ -296,9 +294,10 @@ pub fn engine_main_with_probe<F>(
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::CancelConversion)) => {
                     supervisor.cancel(JobKind::Conversion);
-                    current.converter.conversion_state.status = ConversionStatus::Failed {
-                        error_log: "Cancelled by user".to_string(),
-                    };
+                    if let Some(status) = current.jobs.get_mut(&JobKind::Conversion) {
+                        status.phase = job::JobPhase::Cancelled;
+                        status.error = Some("Cancelled by user".to_string());
+                    }
                     current.status_message = "Conversion canceled".to_string();
                     info!("Conversion cancel signaled via engine CancelConversion command (job-based)");
                 }
@@ -351,105 +350,75 @@ pub fn engine_main_with_probe<F>(
         // 1.7 Poll supervisor for finished jobs and drain events — unified dispatcher
         //     for all async job results that were started via spawn_job.
         let progress_snapshots = supervisor.poll();
-        // Update conversion and offload progress from supervisor snapshots
         for (_id, kind, snap) in &progress_snapshots {
-            if *kind == JobKind::Conversion {
-                let pct = snap.fraction;
-                current.converter.conversion_state.status = ConversionStatus::Running { progress: pct };
-                if !snap.message.is_empty() {
+            // Only overwrite job status from poll if the current phase is not
+            // a terminal state (Succeeded/Cancelled/Failed). The poll snapshot
+            // always shows Running; the terminal phase comes from the Finished
+            // event which apply_outcome sets, and must not be clobbered if the
+            // thread hasn't finished yet but the event already arrived.
+            let is_terminal = current.jobs.get(kind)
+                .map(|s| matches!(s.phase, job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
+                .unwrap_or(false);
+            if !is_terminal {
+                current.jobs.insert(*kind, JobStatus::from_progress(snap));
+                if *kind == JobKind::Conversion && !snap.message.is_empty() {
                     current.status_message = snap.message.clone();
-                }
-            }
-            if *kind == JobKind::OffloadCopy && current.offload.running {
-                current.offload.overall_progress = snap.fraction;
-                // Map units to device_progress
-                let mut device_progress: Vec<offload::OffloadDeviceStatus> = Vec::new();
-                for (_, unit) in snap.units.iter().enumerate() {
-                    let state = match unit.state {
-                        job::UnitState::Pending => offload::OffloadDeviceState::Pending,
-                        job::UnitState::Running => offload::OffloadDeviceState::Copying,
-                        job::UnitState::Done => offload::OffloadDeviceState::Done,
-                        job::UnitState::Failed => offload::OffloadDeviceState::Failed(unit.message.clone()),
-                        job::UnitState::Skipped => offload::OffloadDeviceState::Skipped,
-                    };
-                    device_progress.push(offload::OffloadDeviceStatus {
-                        device_name: unit.label.clone(),
-                        files_total: 1,
-                        files_done: if matches!(unit.state, job::UnitState::Done) { 1 } else { 0 },
-                        bytes_total: 0,
-                        bytes_done: 0,
-                        current_file: unit.message.clone(),
-                        state,
-                    });
-                }
-                current.offload.device_progress = device_progress;
-                if !snap.message.is_empty() {
-                    current.status_message = snap.message.clone();
-                }
-                // Speed: use ProgressSnapshot.speed
-                if let Some(speed) = snap.speed {
-                    current.offload.speed_bytes_per_sec = speed;
-                }
-                // Set status message with speed
-                if snap.fraction > 0.0 && snap.fraction < 1.0 {
-                    let speed_mb = current.offload.speed_bytes_per_sec / (1024.0 * 1024.0);
-                    current.status_message = format!(
-                        "Offloading… {:.0}% ({:.1} MB/s)",
-                        snap.fraction * 100.0,
-                        speed_mb,
-                    );
                 }
             }
         }
         for event in supervisor.drain() {
+            // Stale-result gating: only accept events for currently-active jobs.
+            // active_job_ids is rebuilt from poll() results above.
+            let (event_job, event_kind) = match &event {
+                JobEvent::Finished { job, kind, .. } => (*job, *kind),
+                JobEvent::Item { job, kind, .. } => (*job, *kind),
+            };
+            if !progress_snapshots.iter().any(|(id, kind, _)| *id == event_job && *kind == event_kind) {
+                continue;
+            }
             match event {
                 JobEvent::Finished { kind: JobKind::Conversion, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::Conversion) {
+                        status.apply_outcome(&outcome);
+                    }
                     match outcome {
                         JobOutcome::Succeeded { .. } => {
-                            current.converter.conversion_state = ConversionState {
-                                status: ConversionStatus::Completed,
-                                ffmpeg_output: String::new(),
-                                current_line: String::new(),
-                            };
                             recompute_converter_derived(&mut current);
                             current.status_message = "Conversion completed".to_string();
                             info!("Engine-owned conversion completed successfully (job)");
                         }
                         JobOutcome::Cancelled { .. } => {
-                            current.converter.conversion_state = ConversionState {
-                                status: ConversionStatus::Failed { error_log: "Cancelled by user".to_string() },
-                                ffmpeg_output: String::new(),
-                                current_line: String::new(),
-                            };
                             recompute_converter_derived(&mut current);
                             current.status_message = "Conversion canceled".to_string();
                             info!("Engine-owned conversion cancelled (job)");
                         }
                         JobOutcome::Failed { error, .. } => {
-                            current.converter.conversion_state = ConversionState {
-                                status: ConversionStatus::Failed { error_log: error.clone() },
-                                ffmpeg_output: error.clone(),
-                                current_line: String::new(),
-                            };
+                            if let Some(status) = current.jobs.get_mut(&JobKind::Conversion) {
+                                status.error = Some(error.clone());
+                            }
                             recompute_converter_derived(&mut current);
                             current.status_message = format!("Conversion failed: {}", error);
                             warn!("Engine-owned conversion failed: {}", error);
                         }
                     }
                 }
-                JobEvent::Finished { kind: JobKind::FfmpegCapProbe, payload: JobFinal::FfmpegCaps { caps }, .. } => {
+                JobEvent::Finished { kind: JobKind::FfmpegCapProbe, payload: JobFinal::FfmpegCaps { caps }, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::FfmpegCapProbe) {
+                        status.apply_outcome(&outcome);
+                    }
                     if let Some(caps) = caps {
                         apply_ffmpeg_probe_result(&mut current, caps);
                     } else {
-                        current.ffmpeg_probe_running = false;
                         warn!("FFmpeg capability probe returned no caps");
                         recompute_converter_derived(&mut current);
                     }
                 }
-                JobEvent::Finished { kind: JobKind::FolderScan, payload: JobFinal::FolderScan { path, groups }, .. } => {
+                JobEvent::Finished { kind: JobKind::FolderScan, payload: JobFinal::FolderScan { path, groups }, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::FolderScan) {
+                        status.apply_outcome(&outcome);
+                    }
                     if Some(&path) == current.converter.groups_folder.as_ref() {
                         current.converter.groups = groups;
-                        current.converter.groups_loading = false;
                         info!("Folder scan complete: {} group(s)", current.converter.groups.len());
                         if let Some(idx) = pending_recording.take() {
                             info!("Applying deferred SelectRecording({}) after folder scan", idx);
@@ -464,7 +433,10 @@ pub fn engine_main_with_probe<F>(
                         warn!("Discarding stale supervisor folder scan result (path mismatch)");
                     }
                 }
-                JobEvent::Finished { kind: JobKind::VideoProbe, payload: JobFinal::VideoProbe { result }, .. } => {
+                JobEvent::Finished { kind: JobKind::VideoProbe, payload: JobFinal::VideoProbe { result }, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::VideoProbe) {
+                        status.apply_outcome(&outcome);
+                    }
                     match result {
                         Ok(probe) => {
                             current.ltc_probe = Some(probe.clone());
@@ -488,8 +460,10 @@ pub fn engine_main_with_probe<F>(
                         }
                     }
                 }
-                JobEvent::Finished { kind: JobKind::OffloadScan, payload: JobFinal::OffloadScan { mut cards }, .. } => {
-                    current.offload.scanning = false;
+                JobEvent::Finished { kind: JobKind::OffloadScan, payload: JobFinal::OffloadScan { mut cards }, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::OffloadScan) {
+                        status.apply_outcome(&outcome);
+                    }
                     // Apply default selection (latest recording day) to each card.
                     let file_paths: Vec<PathBuf> = cards.iter()
                         .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
@@ -543,41 +517,31 @@ pub fn engine_main_with_probe<F>(
                     current.offload.durations_version =
                         current.offload.durations_version.wrapping_add(1);
                 }
-                JobEvent::Finished { kind: JobKind::DurationProbe, payload: JobFinal::DurationsDone, .. } => {
+                JobEvent::Finished { kind: JobKind::DurationProbe, payload: JobFinal::DurationsDone, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::DurationProbe) {
+                        status.apply_outcome(&outcome);
+                    }
                     info!("Duration probe complete");
                 }
                 JobEvent::Finished { kind: JobKind::OffloadCopy, payload: JobFinal::OffloadCopy { completed_devices }, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::OffloadCopy) {
+                        status.apply_outcome(&outcome);
+                    }
                     let was_cancelled = matches!(&outcome, JobOutcome::Cancelled { .. });
                     if was_cancelled {
                         info!(
                             "Offload copy was cancelled by user: {} device(s) completed",
                             completed_devices.len(),
                         );
-                        current.offload.running = false;
-                        current.offload.overall_progress = 0.0;
-                        current.offload.speed_bytes_per_sec = 0.0;
-                        current.offload.device_progress.clear();
                         current.offload.error = Some("Canceled by user".to_string());
                         current.status_message = "Offload canceled".to_string();
                     } else {
-                        // Log per-device failures.
-                        for dev in &current.offload.device_progress {
-                            if let offload::OffloadDeviceState::Failed(ref msg) = dev.state {
-                                warn!(
-                                    "Offload device '{}' FAILED: {}",
-                                    dev.device_name, msg
-                                );
-                            }
-                        }
                         info!(
                             "Offload copy complete: {} device(s) offloaded of {}",
                             completed_devices.len(),
-                            current.offload.device_progress.len(),
+                            current.offload.device_totals.len(),
                         );
                         let parent = current.offload.parent_folder.clone();
-                        current.offload.running = false;
-                        current.offload.overall_progress = 1.0;
-                        current.offload.speed_bytes_per_sec = 0.0;
                         for name in &completed_devices {
                             if !current.offload.completed_devices.contains(name) {
                                 current.offload.completed_devices.push(name.clone());
@@ -593,11 +557,11 @@ pub fn engine_main_with_probe<F>(
                         );
                     }
                 }
-                JobEvent::Finished { kind: JobKind::LtcDecode, payload: JobFinal::Decode { result, path }, .. } => {
+                JobEvent::Finished { kind: JobKind::LtcDecode, payload: JobFinal::Decode { result, path }, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::LtcDecode) {
+                        status.apply_outcome(&outcome);
+                    }
                     let generation = current.ltc_decode_generation;
-                    current.ltc_is_detecting = false;
-                    current.ltc_decode_progress_pct = 1.0;
-                    current.ltc_decode_progress_str = String::new();
                     match result {
                         Ok(r) => {
                             let first_offset = r.first_ltc_timecode_secs;
@@ -637,33 +601,45 @@ pub fn engine_main_with_probe<F>(
                     }
                 }
                 JobEvent::Item { kind: JobKind::LtcGroupDecode, item: JobItem::ClipLtcResult { index, result }, .. } => {
-                    if current.ltc_group_is_detecting {
+                    if current.ltc_group_results.len() > index {
                         match result {
                             Ok(r) => {
                                 current.ltc_group_results[index] = Some(r.clone());
                                 current.ltc_group_errors[index] = None;
+                                let done = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
                                 info!(
                                     "LTC group decode [{}/{}]: {} frames (confidence {:.1}%)",
-                                    current.ltc_group_done + 1, current.ltc_group_total,
+                                    done, current.ltc_group_results.len(),
                                     r.valid_frames, r.avg_confidence * 100.0,
                                 );
                             }
                             Err(e) => {
                                 current.ltc_group_results[index] = None;
                                 current.ltc_group_errors[index] = Some(e.clone());
+                                let done = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
                                 warn!("LTC group decode [{}/{}]: failed: {}",
-                                    current.ltc_group_done + 1, current.ltc_group_total, e);
+                                    done, current.ltc_group_results.len(), e);
                             }
                         }
-                        current.ltc_group_done += 1;
+                        let done = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
                         current.status_message = format!(
                             "Decoding group: {}/{} clips",
-                            current.ltc_group_done, current.ltc_group_total,
+                            done, current.ltc_group_results.len(),
                         );
                     }
                 }
-                JobEvent::Finished { kind: JobKind::LtcGroupDecode, .. } => {
-                    current.ltc_group_is_detecting = false;
+                JobEvent::Finished { kind: JobKind::LtcGroupDecode, outcome, .. } => {
+                    let was_precancelled = current.job(JobKind::LtcGroupDecode).phase == job::JobPhase::Cancelled;
+                    if let Some(status) = current.jobs.get_mut(&JobKind::LtcGroupDecode) {
+                        if !was_precancelled {
+                            status.apply_outcome(&outcome);
+                        }
+                    }
+                    if was_precancelled {
+                        // Don't overwrite status_message or auto-apply when user already cancelled
+                        continue;
+                    }
+                    let total = current.ltc_group_results.len();
                     let successes = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
                     let failures = current.ltc_group_results.iter().filter(|r| r.is_none()).count();
                     let gen = current.ltc_group_decode_generation;
@@ -671,27 +647,28 @@ pub fn engine_main_with_probe<F>(
                         if let Some(Some(r)) = current.ltc_group_results.first() {
                             format!(
                                 "{} clips decoded ({} ok, {} fail) — {} fps{}",
-                                current.ltc_group_total, successes, failures,
+                                total, successes, failures,
                                 r.detected_fps, if r.drop_frame { " DF" } else { "" },
                             )
                         } else {
-                            format!("{} clips decoded ({} ok, {} fail)", current.ltc_group_total, successes, failures)
+                            format!("{} clips decoded ({} ok, {} fail)", total, successes, failures)
                         }
                     } else {
                         format!("Group decode complete (all {} clips failed)", failures)
                     };
                     current.status_message = tc_info;
-                    current.ltc_decode_progress_pct = 1.0;
-                    current.ltc_decode_progress_str = String::new();
                     info!("LTC group decode complete: {}/{} ok, {}/{} failed",
-                        successes, current.ltc_group_total, failures, current.ltc_group_total);
+                        successes, total, failures, total);
                     if gen > last_auto_applied_group_ltc_gen {
                         auto_apply_group_ltc_to_settings(&mut current);
                         last_auto_applied_group_ltc_gen = gen;
                         recompute_converter_derived(&mut current);
                     }
                 }
-                JobEvent::Finished { kind: JobKind::ClipProbe, payload: JobFinal::ClipProbes { probes, cameras, device_name }, .. } => {
+                JobEvent::Finished { kind: JobKind::ClipProbe, payload: JobFinal::ClipProbes { probes, cameras, device_name }, outcome, .. } => {
+                    if let Some(status) = current.jobs.get_mut(&JobKind::ClipProbe) {
+                        status.apply_outcome(&outcome);
+                    }
                     let probe_generation = current.converter.probes_generation;
                     if probe_generation > 0 {
                         if let Some(ref idx) = current.converter.selected_group_idx {
@@ -716,7 +693,6 @@ pub fn engine_main_with_probe<F>(
                         current.converter.probes = probes.iter().map(|r| r.as_ref().ok().cloned()).collect();
                         current.converter.camera_meta = cameras;
                         current.converter.device_name = device_name;
-                        current.converter.probes_loading = false;
                         info!("Converter clip probe complete: {} files", current.converter.probes.len());
                         let is_video_group = current.converter.selected_group_idx
                             .and_then(|i| current.converter.groups.get(i))
@@ -740,52 +716,8 @@ pub fn engine_main_with_probe<F>(
             }
         }
 
-        // 1.8 — File duration probe now via supervisor drain (section 1.7)
-
-        // 1.9 — Converter clip probe results now handled via supervisor drain
-
-        // 1.12 Poll LTC decode progress from supervisor progress snapshots
-        if current.ltc_is_detecting || current.ltc_group_is_detecting {
-            for (_id, kind, snap) in &progress_snapshots {
-                if *kind == JobKind::LtcDecode || *kind == JobKind::LtcGroupDecode {
-                    if !snap.message.is_empty() {
-                        current.ltc_decode_progress_str = snap.message.clone();
-                    }
-                    if snap.phase == job::JobPhase::Indeterminate || snap.fraction < 1.0 {
-                        current.ltc_decode_progress_pct = snap.fraction;
-                    }
-                }
-            }
-            // Fallback when detecting but no supervisor progress yet
-            if current.ltc_decode_progress_str.is_empty() {
-                if current.ltc_group_is_detecting && current.ltc_group_total > 0 {
-                    let pct = current.ltc_group_done as f32 / current.ltc_group_total as f32;
-                    current.ltc_decode_progress_pct = pct;
-                    current.ltc_decode_progress_str = format!(
-                        "Clip {}/{}",
-                        (current.ltc_group_done + 1).min(current.ltc_group_total),
-                        current.ltc_group_total,
-                    );
-                }
-            }
-        } else {
-            current.ltc_decode_progress_pct = 0.0;
-            current.ltc_decode_progress_str = String::new();
-        }
-
-        // 1.12 — Offload copy progress now reported via supervisor poll (section 1.7)
-        if !supervisor.is_running(JobKind::OffloadCopy) && !current.offload.running {
-            current.offload.device_progress.clear();
-            current.offload.speed_bytes_per_sec = 0.0;
-        }
-
-        // 1.13 Reset conversion state if job is no longer running and state is still Running
-        //     (the Finished event handler sets Completed/Failed directly).
-        if matches!(current.converter.conversion_state.status, ConversionStatus::Running { .. })
-            && !supervisor.is_running(JobKind::Conversion)
-        {
-            // Conversion finished but we missed the event somehow — reset to idle.
-            current.converter.conversion_state = ConversionState::idle();
+        // 1.12 — Offload copy idle cleanup
+        if !supervisor.is_running(JobKind::OffloadCopy) && current.job(JobKind::OffloadCopy).phase == job::JobPhase::Idle {
         }
 
         // 2. Poll current timecode if playing
@@ -1154,10 +1086,14 @@ fn process_command(
         GuiCommand::CancelDecode => {
             supervisor.cancel(JobKind::LtcDecode);
             supervisor.cancel(JobKind::LtcGroupDecode);
-            state.ltc_is_detecting = false;
-            state.ltc_group_is_detecting = false;
-            state.ltc_decode_progress_pct = 1.0;
-            state.ltc_decode_progress_str = String::new();
+            if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
+                status.phase = job::JobPhase::Cancelled;
+                status.message = "Canceled by user".to_string();
+            }
+            if let Some(status) = state.jobs.get_mut(&JobKind::LtcGroupDecode) {
+                status.phase = job::JobPhase::Cancelled;
+                status.message = "Canceled by user".to_string();
+            }
             state.status_message = "Decode canceled by user".to_string();
         }
 
@@ -1176,13 +1112,20 @@ fn process_command(
             supervisor.cancel(JobKind::LtcGroupDecode);
 
             // Reset group decode state with new generation
-            state.ltc_group_is_detecting = true;
             state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
             state.ltc_group_paths = paths.iter().map(std::path::PathBuf::from).collect();
             state.ltc_group_results = vec![None; total];
             state.ltc_group_errors = vec![None; total];
-            state.ltc_group_done = 0;
-            state.ltc_group_total = total;
+            // Pre-populate job status so CancelDecode can eager-cancel before poll()
+            state.jobs.insert(JobKind::LtcGroupDecode, job::JobStatus {
+                phase: job::JobPhase::Running,
+                fraction: 0.0,
+                message: format!("Decoding LTC group: 0/{} clips", total),
+                speed: None,
+                units: Vec::new(),
+                log: String::new(),
+                error: None,
+            });
             state.status_message = format!("Decoding LTC group: 0/{} clips", total);
 
             let capture_gen = state.ltc_group_decode_generation;
@@ -1239,19 +1182,15 @@ fn process_command(
             state.ltc_decode_error = None;
             state.ltc_probe = None;
             state.ltc_decode_is_video = false;
-            state.ltc_is_detecting = false;
-            state.ltc_decode_progress_pct = 0.0;
-            state.ltc_decode_progress_str = String::new();
             supervisor.cancel(JobKind::LtcDecode);
+            state.jobs.insert(JobKind::LtcDecode, job::JobStatus::idle());
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
             state.ltc_probe_generation = state.ltc_probe_generation.wrapping_add(1);
             state.ltc_group_paths = Vec::new();
             state.ltc_group_results = Vec::new();
             state.ltc_group_errors = Vec::new();
-            state.ltc_group_done = 0;
-            state.ltc_group_total = 0;
-            state.ltc_group_is_detecting = false;
             supervisor.cancel(JobKind::LtcGroupDecode);
+            state.jobs.insert(JobKind::LtcGroupDecode, job::JobStatus::idle());
             state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
         }
 
@@ -1268,14 +1207,23 @@ fn process_command(
                 path, stream_index, channel_index, decoder_name, state.decode_fps,
             );
 
-            state.ltc_is_detecting = true;
             state.ltc_decode_result = None;
             state.ltc_decode_error = None;
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
-            state.status_message = format!(
+            let msg = format!(
                 "Extracting audio from: {} stream={} ch={}",
                 path, stream_index, channel_index,
             );
+            state.status_message = msg.clone();
+            state.jobs.insert(JobKind::LtcDecode, job::JobStatus {
+                phase: job::JobPhase::Running,
+                fraction: 0.0,
+                message: msg,
+                speed: None,
+                units: Vec::new(),
+                log: String::new(),
+                error: None,
+            });
 
             let capture_gen = state.ltc_decode_generation;
             let use_libltc = state.use_libltc;
@@ -1305,7 +1253,10 @@ fn process_command(
                 };
                 if let Some(e) = validation_error {
                     error!("LTC video decode rejected: {}", e);
-                    state.ltc_is_detecting = false;
+                    if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
+                        status.phase = job::JobPhase::Failed;
+                        status.error = Some(e.clone());
+                    }
                     state.ltc_decode_error = Some(e.clone());
                     state.status_message = format!("Parse failed: {}", e);
                     return;
@@ -1363,21 +1314,33 @@ fn process_command(
                 Ok(c) => c,
                 Err(e) => {
                     error!("Failed to open WAV for chunked decode: {}", e);
-                    state.ltc_is_detecting = false;
                     state.ltc_decode_error = Some(e.clone());
                     state.status_message = format!("Parse failed: {}", e);
+                    if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
+                        status.phase = job::JobPhase::Failed;
+                        status.error = Some(e.clone());
+                    }
                     return;
                 }
             };
 
-            state.ltc_is_detecting = true;
             state.ltc_decode_result = None;
             state.ltc_decode_error = None;
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
-            state.status_message = format!(
+            let msg = format!(
                 "Decoding LTC from: {} [{}] at {:.2} fps ({} chunks)",
                 path, decoder_name, state.decode_fps, chunk_count
             );
+            state.status_message = msg.clone();
+            state.jobs.insert(JobKind::LtcDecode, job::JobStatus {
+                phase: job::JobPhase::Running,
+                fraction: 0.0,
+                message: msg,
+                speed: None,
+                units: Vec::new(),
+                log: String::new(),
+                error: None,
+            });
 
             let use_libltc = state.use_libltc;
             let decode_fps = state.decode_fps;
@@ -1685,7 +1648,6 @@ fn attempt_recovery(
 /// Apply an ffmpeg capability probe result to the current snapshot.
 fn apply_ffmpeg_probe_result(current: &mut AppStateSnapshot, caps: FfmpegCapabilities) {
     current.ffmpeg_caps = Some(caps.clone());
-    current.ffmpeg_probe_running = false;
     info!(
         "ffmpeg capability probe complete: {} encoder(s), {} format(s), hw_vaapi={}, hw_vulkan={}",
         caps.available_encoders.len(),
@@ -1715,7 +1677,6 @@ fn handle_offload_command(
                 info!("Offload scan already in progress — ignoring duplicate ScanCards");
                 return;
             }
-            state.offload.scanning = true;
             state.offload.error = None;
             let spec = job::JobSpec {
                 kind: JobKind::OffloadScan,
@@ -1815,11 +1776,16 @@ fn handle_offload_command(
                 return;
             }
 
-            state.offload.running = true;
             state.offload.error = None;
-            state.offload.overall_progress = 0.0;
-            state.offload.speed_bytes_per_sec = 0.0;
-            state.offload.device_progress.clear();
+            // Build per-device totals from the copy plans
+            let device_totals: Vec<OffloadDeviceTotals> = names.iter().zip(device_plans.iter()).map(|(name, plans)| {
+                OffloadDeviceTotals {
+                    name: name.clone(),
+                    files_total: plans.len(),
+                    bytes_total: plans.iter().map(|p| p.size).sum(),
+                }
+            }).collect();
+            state.offload.device_totals = device_totals;
             let total_files: usize = device_plans.iter().map(|p| p.len()).sum();
             let total_bytes: u64 = device_plans.iter().flat_map(|p| p.iter().map(|i| i.size)).sum();
             info!(
@@ -2066,9 +2032,9 @@ fn apply_recording_selection(
     state.converter.probes.clear();
     state.converter.camera_meta.clear();
     state.converter.device_name = None;
-    state.converter.probes_loading = true;
     state.converter.probes_generation += 1;
-    state.converter.conversion_state = ConversionState::idle();
+    state.jobs.entry(JobKind::Conversion).or_insert_with(JobStatus::idle);
+    state.jobs.entry(JobKind::ClipProbe).or_insert_with(JobStatus::idle);
     // Reset per-recording settings flags
     let channel_count = state.converter.groups.get(idx)
         .map(|g| {
@@ -2110,14 +2076,9 @@ fn apply_recording_selection(
     state.ltc_decode_is_video = false;
     state.ltc_decode_result = None;
     state.ltc_decode_error = None;
-    state.ltc_is_detecting = false;
-    state.ltc_decode_progress_pct = 0.0;
-    state.ltc_decode_progress_str = String::new();
     state.ltc_group_results.clear();
     state.ltc_group_errors.clear();
     state.ltc_group_paths.clear();
-    state.ltc_group_done = 0;
-    state.ltc_group_total = 0;
     // Cancel any running decode jobs via supervisor
     supervisor.cancel(JobKind::LtcDecode);
     supervisor.cancel(JobKind::LtcGroupDecode);
@@ -2167,7 +2128,6 @@ fn apply_recording_selection(
             "Recording selected: idx={} but engine has {} group(s) — probe skipped (was the folder sent to the engine?)",
             idx, group_count,
         );
-        state.converter.probes_loading = false;
     }
     recompute_converter_derived(state);
 }
@@ -2207,6 +2167,7 @@ mod tests {
     use super::*;
     use crate::converter::HwDeviceCapabilities;
     use crate::file_pattern::MatchedGroup;
+    use crate::job::JobPhase;
     use crate::state::AppStateSnapshot;
     use audio_core::Timecode;
     use std::collections::BTreeSet;
@@ -2921,12 +2882,10 @@ mod tests {
         };
 
         let mut state = AppStateSnapshot::initial();
-        state.ffmpeg_probe_running = true;
 
         apply_ffmpeg_probe_result(&mut state, caps.clone());
 
         assert!(state.ffmpeg_caps.is_some(), "caps should be stored");
-        assert!(!state.ffmpeg_probe_running, "probe flag should be cleared");
         let stored = state.ffmpeg_caps.as_ref().unwrap();
         assert_eq!(stored.has_ffmpeg, true);
     }
@@ -2961,9 +2920,6 @@ mod tests {
         s.ltc_group_paths = vec![std::path::PathBuf::from("clip.mp4")];
         s.ltc_group_results = vec![None];
         s.ltc_group_errors = vec![None];
-        s.ltc_group_done = 5;
-        s.ltc_group_total = 10;
-        s.ltc_group_is_detecting = true;
         s.ltc_decode_generation = 42;
         s.ltc_group_decode_generation = 99;
         s
@@ -2988,9 +2944,7 @@ mod tests {
         assert!(state.ltc_decode_error.is_none(), "error cleared");
         assert!(state.ltc_probe.is_none(), "probe cleared");
         assert!(!state.ltc_decode_is_video, "is_video cleared");
-        assert!(!state.ltc_is_detecting, "is_detecting cleared");
-        assert!((state.ltc_decode_progress_pct - 0.0).abs() < 1e-6, "progress reset");
-        assert!(state.ltc_decode_progress_str.is_empty(), "progress str cleared");
+        assert_eq!(state.job(JobKind::LtcDecode).phase, JobPhase::Idle, "LtcDecode job reset to Idle");
         assert_eq!(state.ltc_decode_generation, 43, "decode gen bumped from 42");
     }
 
@@ -3012,9 +2966,7 @@ mod tests {
         assert!(state.ltc_group_paths.is_empty(), "group paths cleared");
         assert!(state.ltc_group_results.is_empty(), "group results cleared");
         assert!(state.ltc_group_errors.is_empty(), "group errors cleared");
-        assert_eq!(state.ltc_group_done, 0, "group done reset");
-        assert_eq!(state.ltc_group_total, 0, "group total reset");
-        assert!(!state.ltc_group_is_detecting, "group is_detecting cleared");
+        assert_eq!(state.job(JobKind::LtcGroupDecode).phase, JobPhase::Idle, "LtcGroupDecode job reset to Idle");
         assert_eq!(state.ltc_group_decode_generation, 100, "group decode gen bumped from 99");
     }
 

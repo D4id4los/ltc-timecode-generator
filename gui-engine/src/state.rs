@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::camera_meta::CameraInfo;
 use crate::converter::{
-    ConversionState, FfmpegCapabilities, RecordingType, ChannelMap, ConvertBlocker, PreviewOutput,
+    FfmpegCapabilities, RecordingType, ChannelMap, ConvertBlocker, PreviewOutput,
 };
 use crate::ffprobe::VideoAudioProbe;
 use crate::file_pattern::MatchedGroup;
+use crate::job::{JobKind, JobStatus};
 use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, DEFAULT_PREFIX};
 use crate::offload::OffloadSnapshot;
 use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
@@ -112,17 +114,9 @@ pub struct ConverterSnapshot {
     /// exiftool/ffprobe, filename pattern, or `"unknown"`).  `None` while
     /// probes are loading or when no recording is selected.
     pub device_name: Option<String>,
-    /// True while probes are being loaded (background ffprobe).
-    pub probes_loading: bool,
     /// Generation counter — incremented on each recording selection so
     /// GUIs can discard stale probe results.
     pub probes_generation: u64,
-    /// Conversion state (idle/running/completed/failed).
-    /// Owned by the engine; GUIs only read it.
-    pub conversion_state: ConversionState,
-    /// True while a folder scan is in progress (background thread walking
-    /// the filesystem to discover file groups).
-    pub groups_loading: bool,
     /// The folder being (or last) scanned.
     pub groups_folder: Option<PathBuf>,
     /// Generation counter — incremented on each `SelectFolder` so stale
@@ -230,7 +224,6 @@ pub struct AppStateSnapshot {
     pub use_libltc: bool,   // decoder selection (set from CLI --decoder flag; false = builtin, true = libltc)
     pub ltc_decode_result: Option<LtcDetectionResult>,
     pub ltc_decode_error: Option<String>,
-    pub ltc_is_detecting: bool,
     pub ltc_decode_generation: u64,
 
     // Video file probe info (populated by ProbeVideo command)
@@ -244,7 +237,6 @@ pub struct AppStateSnapshot {
     pub ltc_probe_generation: u64,
 
     // LTC group (batch) decode — decode every clip in a video recording group
-    pub ltc_group_is_detecting: bool,
     pub ltc_group_decode_generation: u64,
     /// Paths of the group being decoded, index-aligned with results.
     pub ltc_group_paths: Vec<PathBuf>,
@@ -252,18 +244,12 @@ pub struct AppStateSnapshot {
     pub ltc_group_results: Vec<Option<LtcDetectionResult>>,
     /// Per-clip error messages when a clip's decode failed.
     pub ltc_group_errors: Vec<Option<String>>,
-    /// Number of clips decoded so far.
-    pub ltc_group_done: usize,
-    /// Total number of clips in the batch.
-    pub ltc_group_total: usize,
-
-    // Chunked decode progress
-    pub ltc_decode_progress_pct: f32,       // 0.0..1.0
-    pub ltc_decode_progress_str: String,    // "Chunk 3/12..."
 
     // ffmpeg capability probe (engine-owned, async)
     pub ffmpeg_caps: Option<FfmpegCapabilities>,
-    pub ffmpeg_probe_running: bool,
+
+    // Unified job status map
+    pub jobs: HashMap<JobKind, JobStatus>,
 
     // File duration probe (engine-owned, async)
     /// Per-file durations keyed by full path. `None` meaning the file
@@ -341,24 +327,18 @@ impl AppStateSnapshot {
             use_libltc: false,
             ltc_decode_result: None,
             ltc_decode_error: None,
-            ltc_is_detecting: false,
             ltc_decode_generation: 0,
             ltc_probe: None,
             ltc_selected_stream: 0,
             ltc_selected_channel: 0,
             ltc_decode_is_video: false,
             ltc_probe_generation: 0,
-            ltc_decode_progress_pct: 0.0,
-            ltc_decode_progress_str: String::new(),
-            ltc_group_is_detecting: false,
             ltc_group_decode_generation: 0,
             ltc_group_paths: Vec::new(),
             ltc_group_results: Vec::new(),
             ltc_group_errors: Vec::new(),
-            ltc_group_done: 0,
-            ltc_group_total: 0,
             ffmpeg_caps: None,
-            ffmpeg_probe_running: false,
+            jobs: HashMap::new(),
             file_durations: HashMap::new(),
             file_durations_generation: 0,
             file_durations_version: 0,
@@ -368,10 +348,7 @@ impl AppStateSnapshot {
                 probes: Vec::new(),
                 camera_meta: Vec::new(),
                 device_name: None,
-                probes_loading: false,
                 probes_generation: 0,
-                conversion_state: ConversionState::idle(),
-                groups_loading: false,
                 groups_folder: None,
                 groups_generation: 0,
                 settings: ConverterUserSettings::initial(),
@@ -384,6 +361,15 @@ impl AppStateSnapshot {
             offload: OffloadSnapshot::initial(),
         }
     }
+
+    pub fn job(&self, kind: JobKind) -> &JobStatus {
+        self.jobs.get(&kind).unwrap_or_else(|| job_idle_default())
+    }
+}
+
+fn job_idle_default() -> &'static JobStatus {
+    static IDLE: OnceLock<JobStatus> = OnceLock::new();
+    IDLE.get_or_init(|| JobStatus::idle())
 }
 
 #[cfg(test)]
@@ -523,7 +509,6 @@ mod tests {
         assert!(!s.use_libltc);
         assert!(s.ltc_decode_result.is_none());
         assert!(s.ltc_decode_error.is_none());
-        assert!(!s.ltc_is_detecting);
         assert_eq!(s.ltc_decode_generation, 0);
     }
 
@@ -539,13 +524,10 @@ mod tests {
     #[test]
     fn test_initial_group_decode_state() {
         let s = initial_state();
-        assert!(!s.ltc_group_is_detecting);
         assert_eq!(s.ltc_group_decode_generation, 0);
         assert!(s.ltc_group_paths.is_empty());
         assert!(s.ltc_group_results.is_empty());
         assert!(s.ltc_group_errors.is_empty());
-        assert_eq!(s.ltc_group_done, 0);
-        assert_eq!(s.ltc_group_total, 0);
     }
 
     // ── LTC probe generation ──────────────────────────────────────────────

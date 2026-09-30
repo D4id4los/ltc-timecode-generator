@@ -1108,7 +1108,7 @@ fn run_metadata_only(
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use crate::converter::test_fixtures::*;
     use crate::{ChannelMap, CancelFlag, ConversionState, ConversionStatus, SharedConversionState};
     use super::*;

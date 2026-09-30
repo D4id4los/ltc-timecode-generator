@@ -9,7 +9,7 @@ use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::config;
 use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
 use gui_engine::timecode::FPS_OPTIONS;
-use gui_engine::{ArcSwap, AudioEvent};
+use gui_engine::{ArcSwap, AudioEvent, JobKind, JobPhase};
 
 use crate::theme::{Theme, ACCENT};
 use crate::widgets;
@@ -299,12 +299,16 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     let predicted_dt = Duration::from_secs_f64(1.0 / 60.0);
     let floor = predicted_dt + Duration::from_millis(1);
 
-    let base = if s.is_playing || s.ltc_is_detecting {
+    let ltc_detecting = s.job(JobKind::LtcDecode).phase == JobPhase::Running
+        || s.job(JobKind::LtcDecode).phase == JobPhase::Indeterminate;
+    let offload_running = s.job(JobKind::OffloadCopy).phase == JobPhase::Running;
+
+    let base = if s.is_playing || ltc_detecting {
         let interval = Duration::from_secs_f64(1.0 / s.fps.max(1.0));
         interval.min(Duration::from_millis(40))
     } else if s.clap_animating {
         Duration::from_secs_f64(1.0 / 60.0)
-    } else if s.offload.running {
+    } else if offload_running {
         Duration::from_millis(100)
     } else {
         Duration::from_secs(1)
@@ -566,7 +570,8 @@ impl eframe::App for AppState {
         //     publishes running=true (or timeout) so the Start→Cancel button
         //     switch appears on the very next frame after engine publish.
         if let Some(pending_since) = self.offload_start_pending {
-            if self.latest.offload.running || now.duration_since(pending_since) >= OFFLOAD_PENDING_TIMEOUT {
+            let offload_running = self.latest.job(JobKind::OffloadCopy).phase == JobPhase::Running;
+            if offload_running || now.duration_since(pending_since) >= OFFLOAD_PENDING_TIMEOUT {
                 self.offload_start_pending = None;
             } else {
                 ctx.request_repaint_after(Duration::from_millis(40));
@@ -1103,6 +1108,7 @@ impl AppState {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use gui_engine::job::JobStatus;
 
     fn dummy_state() -> Arc<ArcSwap<AppStateSnapshot>> {
         Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())))
@@ -1116,6 +1122,16 @@ mod tests {
 
     fn make_snapshot() -> AppStateSnapshot {
         AppStateSnapshot::initial()
+    }
+
+    fn with_ltc_detecting(mut s: AppStateSnapshot) -> AppStateSnapshot {
+        s.jobs.insert(JobKind::LtcDecode, JobStatus { phase: JobPhase::Running, fraction: 0.0, message: String::new(), speed: None, units: Vec::new(), log: String::new(), error: None });
+        s
+    }
+
+    fn with_offload_running(mut s: AppStateSnapshot) -> AppStateSnapshot {
+        s.jobs.insert(JobKind::OffloadCopy, JobStatus { phase: JobPhase::Running, fraction: 0.0, message: String::new(), speed: None, units: Vec::new(), log: String::new(), error: None });
+        s
     }
 
     #[test]
@@ -1167,10 +1183,13 @@ mod tests {
 
     #[test]
     fn repaint_interval_detecting_same_as_playing() {
-        let mut s = make_snapshot();
-        s.ltc_is_detecting = true;
-        s.fps = 24.0;
-        let dur_detect = next_repaint_interval(&s);
+        let s = with_ltc_detecting(make_snapshot());
+        // s.fps is 25.0 from initial(), but we need 24.0 for the test.
+        // Currently the test uses `s.fps` from inside the function, so
+        // we adjust the fps directly.
+        let mut s_with_fps = s.clone();
+        s_with_fps.fps = 24.0;
+        let dur_detect = next_repaint_interval(&s_with_fps);
         let mut s2 = make_snapshot();
         s2.is_playing = true;
         s2.fps = 24.0;
@@ -1196,24 +1215,21 @@ mod tests {
         s.fps = 30.0;
         assert!(next_repaint_interval(&s) >= floor);
         // detecting
-        let mut s2 = make_snapshot();
-        s2.ltc_is_detecting = true;
-        s2.fps = 24.0;
+        let s2 = with_ltc_detecting(make_snapshot());
+        // s2.fps defaults to 25.0 from initial(), which is fine for floor test
         assert!(next_repaint_interval(&s2) >= floor);
         // animating
         let mut s3 = make_snapshot();
         s3.clap_animating = true;
         assert!(next_repaint_interval(&s3) >= floor);
         // offload running
-        let mut s4 = make_snapshot();
-        s4.offload.running = true;
+        let s4 = with_offload_running(make_snapshot());
         assert!(next_repaint_interval(&s4) >= floor);
     }
 
     #[test]
     fn repaint_interval_offload_running_returns_approx_100ms() {
-        let mut s = make_snapshot();
-        s.offload.running = true;
+        let s = with_offload_running(make_snapshot());
         let dur = next_repaint_interval(&s);
         // base = 100ms, plus predicted_dt 16.67ms = 116.67ms
         assert!(dur > Duration::from_millis(110) && dur < Duration::from_millis(130));

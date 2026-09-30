@@ -158,18 +158,25 @@ counters, and individual `catch_unwind` handling.
   - **`JobId`** — unique per-job identifier (monotonically increasing `u64`).
   - **`JobPhase`** — `Idle` / `Running` / `Indeterminate` / `Succeeded` /
     `Cancelled` / `Failed`.
+  - **`JobStatus`** — published in snapshot: `phase`, `fraction`, `message`,
+    `speed`, `units` (per-step/device detail), `log`, `error`. Constructed via
+    `JobStatus::idle()`, `JobStatus::from_progress(&ProgressSnapshot)`, and
+    `apply_outcome(&JobOutcome)` for terminal phase transitions.
   - **`ProgressTracker`** — weighted per-unit progress with `ProgressSnapshot`,
-    message, speed, and unit state machine (`Pending` / `Running` / `Done` /
-    `Failed` / `Skipped`).
+    message, speed, log, and unit state machine (`Pending` / `Running` / `Done` /
+    `Failed` / `Skipped`). Supports `set_log()` and `resize()` (weight-preserving).
+  - **`UnitProgress`** — per-unit handle: `set_fraction()`, `set_message()`,
+    `set_label()`, `set_state()`, `finish()`.
   - **`CancelToken`** — `Arc<AtomicBool>` wrapper; `check()` returns
     `Err(JobError::Cancelled)` when signalled.
   - **`ErrorMeter` (SpeedMeter)** — EMA-smoothed throughput tracker
     (α = 0.3, 2s stall decay).
   - **`JobSupervisor`** — manages active jobs: `is_running(kind)`,
-    `cancel(kind)`, `poll()` (drain + clean finished threads), `drain()` (events),
-    `shutdown(timeout)` (cancel-all + join).
+    `cancel(kind)`, `poll()` (drain + snapshots + clean finished threads),
+    `drain()` (events), `shutdown(timeout)` (cancel-all + join).
   - **`spawn_job()`** — uniform spawning with `catch_unwind`, thread naming,
-    and guaranteed `JobEvent::Finished` emission.
+    and guaranteed `JobEvent::Finished` emission (now captures `ProgressTracker`
+    log into `JobOutcome`).
 
 #### Event channel:
 One `mpsc` channel carries all `JobEvent` values:
@@ -186,6 +193,19 @@ compile-checked dispatch in the engine's unified event handler.
 The engine tracks the currently-active `JobId` per kind. When a `Finished`
 event arrives, the engine checks if its `JobId` still matches the active one
 for that kind — stale results from superseded jobs are discarded.
+
+#### Migration Status (Phase 4 completed — unified job status map):
+
+All async task progress and status is now published through the single
+`jobs: HashMap<JobKind, JobStatus>` field in `AppStateSnapshot`, replacing
+the previous ad-hoc fields (`conversion_state`, `groups_loading`,
+`probes_loading`, `offload.running`, `offload.overall_progress`, etc.).
+GUIs access job state via `state.job(kind)` which returns `JobStatus`
+with phase, fraction, speed, per-unit detail, log, and error — every
+async task kind (conversion, offload, decode, probe) follows the same
+contract. The legacy `OffloadContext`/`DeviceProgressInner`/`run_offload`
+code path has been deleted; only the `spawn_job`-based `run_offload_copy_job`
+remains.
 
 #### Migration Status (Phase 3 completed — all tasks migrated):
 - **FfmpegCapProbe** — via `spawn_job`, payload `JobFinal::FfmpegCaps`
@@ -229,7 +249,7 @@ Commands are sent from the GUI thread to the engine via `mpsc::Sender<GuiCommand
 ### AppStateSnapshot
 The full application state is published as an `AppStateSnapshot` struct wrapped in `Arc<ArcSwap<AppStateSnapshot>>`. The engine thread calls `state.store(Arc::new(snapshot))` after each tick. The GUI calls `state.load()` to get the latest snapshot — this is lock-free and always returns the latest state without queue management.
 
-Field groups (see `state.rs` for the full struct): generation counter; transport (is_playing/is_locked, current + start timecode); FPS; audio routing + device state; clapper metadata + clap log; engine-computed animations (clap flash alpha, arm angle); theme; status message + system time; drained `AudioEvent`s (surfaced as toasts by the GUI); decode state (decode FPS, decoder selection, decode result/error, in-flight flag + generation, video probe info, selected stream/channel, chunked decode progress); ffmpeg capability probe (`ffmpeg_caps`, `ffmpeg_probe_running` — engine-owned, async); offload (`OffloadSnapshot`: cards + per-file selection, parent folder/name, running/progress/speed, per-device status, completed devices, last_offload_parent + handoff version, error, per-file durations).
+Field groups (see `state.rs` for the full struct): generation counter; transport (is_playing/is_locked, current + start timecode); FPS; audio routing + device state; clapper metadata + clap log; engine-computed animations (clap flash alpha, arm angle); theme; status message + system time; drained `AudioEvent`s (surfaced as toasts by the GUI); decode state (decode FPS, decoder selection, decode result/error); video probe info; per-clip LTC group results; ffmpeg capability probe (`ffmpeg_caps` — engine-owned, async); unified job status map (`jobs: HashMap<JobKind, JobStatus>`) covering all async tasks; offload (`OffloadSnapshot`: cards + per-file selection, parent folder/name, `device_totals` from copy plans, completed devices, last_offload_parent + handoff version, error, per-file durations).
 
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
@@ -301,7 +321,7 @@ The converter turns raw recordings into deliverables: trim each file to its firs
 
 All converter user settings live in `ConverterUserSettings` (`state.rs`), owned by the engine. GUIs send `ConverterCommand` variants for every mutation. The engine applies side-effects (defaults repair, prefix prefill, channel-map resize, LTC auto-apply, config persistence, encoder re-selection on container change) and publishes the updated snapshot. Derived UI data (readiness blockers, collision warning, output preview, encoder chain description) is recomputed by `recompute_converter_derived()` in the engine and published for GUIs to render.
 
-Conversion execution runs in the engine thread via `StartConversion` which calls `assemble_converter_settings()` then `spawn_job` with `JobKind::Conversion`. The `spawn_conversion_job()` wrapper bridges the legacy `SharedConversionState`/`CancelFlag` to the unified `ProgressTracker`/`CancelToken`. Progress is polled each tick via `supervisor.poll()` and published into `ConverterSnapshot.conversion_state`.
+Conversion execution runs in the engine thread via `StartConversion` which calls `assemble_converter_settings()` then `spawn_job` with `JobKind::Conversion`. The `spawn_conversion_job()` wrapper bridges the legacy `SharedConversionState`/`CancelFlag` to the unified `ProgressTracker`/`CancelToken`. Progress is polled each tick via `supervisor.poll()` and published into `state.jobs[JobKind::Conversion]`.
 
 ### Components (`converter/` directory module)
   - `ConversionPipeline`: `AudioOnly { generate_synthetic_video }` (multi-track WAV → audio/video outputs), `VideoPassthrough` (camera clips → video outputs), and `MetadataOnly` (tag originals in place, rename, extract audio).

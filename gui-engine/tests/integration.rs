@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use gui_engine::command::{GuiCommand, OffloadCommand};
 use gui_engine::engine::engine_main_with_probe;
 use gui_engine::state::AppStateSnapshot;
-use gui_engine::{decode_ltc_from_wav, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities};
+use gui_engine::{decode_ltc_from_wav, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -101,8 +101,8 @@ where
         }
         if Instant::now() > deadline {
             panic!(
-                "Timeout waiting for predicate (generation={}, is_detecting={}, status={})",
-                snapshot.generation, snapshot.ltc_is_detecting, snapshot.status_message
+                "Timeout waiting for predicate (generation={}, ltc_job={:?}, status={})",
+                snapshot.generation, snapshot.job(JobKind::LtcDecode), snapshot.status_message
             );
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -185,7 +185,7 @@ fn test_engine_mpsc_parse_ltc_command() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
         false,
-        |s| !s.ltc_is_detecting && s.ltc_decode_result.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_result.is_some(),
     );
 
     assert!(snapshot.ltc_decode_result.is_some(), "expected ltc_decode_result to be Some");
@@ -193,7 +193,7 @@ fn test_engine_mpsc_parse_ltc_command() {
     assert!(matches!(result.status, LtcDecodeStatus::Success),
         "expected Success, got {:?}", result.status);
     assert!(result.valid_frames > 0, "expected valid_frames > 0");
-    assert!(!snapshot.ltc_is_detecting);
+    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
     assert!(snapshot.ltc_decode_error.is_none());
     assert!(snapshot.ltc_decode_generation > 0);
 }
@@ -203,14 +203,14 @@ fn test_engine_mpsc_parse_invalid_file() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile("/tmp/nonexistent_ltc_test_file.wav".to_string())],
         false,
-        |s| !s.ltc_is_detecting && s.ltc_decode_error.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_error.is_some(),
     );
 
     assert!(snapshot.status_message.contains("Parse failed"),
         "expected 'Parse failed', got: {}", snapshot.status_message);
     assert!(snapshot.ltc_decode_result.is_none());
     assert!(snapshot.ltc_decode_error.is_some());
-    assert!(!snapshot.ltc_is_detecting);
+    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
 }
 
 // ── Clap command integration ────────────────────────────────────────────
@@ -411,11 +411,11 @@ fn test_engine_decode_generation_increments() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
         false,
-        |s| !s.ltc_is_detecting && s.ltc_decode_result.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_result.is_some(),
     );
 
     assert!(snapshot.ltc_decode_generation > 0, "generation should be > 0");
-    assert!(!snapshot.ltc_is_detecting);
+    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
     assert!(snapshot.ltc_decode_result.is_some());
 }
 
@@ -424,12 +424,12 @@ fn test_engine_decode_error_on_nonexistent_file() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile("/tmp/definitely_not_a_real_ltc_file.wav".to_string())],
         false,
-        |s| !s.ltc_is_detecting && s.ltc_decode_error.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_error.is_some(),
     );
 
     assert!(snapshot.ltc_decode_error.is_some());
     assert!(snapshot.ltc_decode_result.is_none());
-    assert!(!snapshot.ltc_is_detecting);
+    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
 }
 
 // ── State mutation commands ─────────────────────────────────────────────
@@ -609,10 +609,10 @@ fn cancel_decode_clears_is_detecting_and_sets_status() {
             GuiCommand::CancelDecode,
         ],
         false,
-        |s| !s.ltc_is_detecting && s.status_message == "Decode canceled by user",
+        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.status_message == "Decode canceled by user",
     );
-    assert!(!snapshot.ltc_is_detecting,
-        "CancelDecode should clear ltc_is_detecting");
+    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running,
+        "CancelDecode should clear LtcDecode job phase");
     assert_eq!(snapshot.status_message, "Decode canceled by user",
         "CancelDecode should update status_message");
 }
@@ -629,12 +629,12 @@ fn cancel_decode_also_clears_group_detecting() {
             GuiCommand::CancelDecode,
         ],
         false,
-        |s| !s.ltc_group_is_detecting && s.status_message == "Decode canceled by user",
+        |s| s.job(JobKind::LtcGroupDecode).phase != JobPhase::Running && s.status_message == "Decode canceled by user",
     );
-    assert!(!snapshot.ltc_group_is_detecting,
-        "CancelDecode should clear ltc_group_is_detecting");
-    assert!(!snapshot.ltc_is_detecting,
-        "CancelDecode should clear ltc_is_detecting");
+    assert!(snapshot.job(JobKind::LtcGroupDecode).phase != JobPhase::Running,
+        "CancelDecode should clear LtcGroupDecode job phase");
+    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running,
+        "CancelDecode should clear LtcDecode job phase");
     assert_eq!(snapshot.status_message, "Decode canceled by user");
 }
 
