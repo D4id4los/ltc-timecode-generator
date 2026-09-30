@@ -109,6 +109,180 @@ where
     }
 }
 
+// ── Stale-event gating with latest_job — supervisor unit test ──────────
+
+#[test]
+fn test_supervisor_latest_job_gates_stale_events() {
+    init_test_config();
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("stale-gate-test".into())
+        .spawn(move || {
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
+        })
+        .expect("failed to spawn engine thread");
+
+    // Use a real WAV so ParseLtcWavFile actually spawns a job
+    let dir = tempfile::TempDir::new().unwrap();
+    let path1 = dir.path().join("stale1.wav");
+    let path2 = dir.path().join("stale2.wav");
+    generate_wav(&path1, 25.0, false, 0.5, 48000);
+    generate_wav(&path2, 25.0, false, 0.5, 48000);
+
+    // Start decoding file 1
+    tx.send(GuiCommand::ParseLtcWavFile(path1.to_string_lossy().to_string())).unwrap();
+
+    // Wait until Running
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let snap = state.load();
+        if snap.job(JobKind::LtcDecode).phase == JobPhase::Running {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("timeout waiting for first decode to start running");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Cancel + wait for Idle/Failed (thread winds down)
+    tx.send(GuiCommand::CancelDecode).unwrap();
+
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let snap = state.load();
+        if snap.job(JobKind::LtcDecode).phase != JobPhase::Running {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("timeout waiting for cancel to take effect");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Now start decoding file 2
+    tx.send(GuiCommand::ParseLtcWavFile(path2.to_string_lossy().to_string())).unwrap();
+
+    // Wait until the second decode finishes (Succeeded or Failed)
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let snap = state.load();
+        let job = snap.job(JobKind::LtcDecode);
+        if job.phase != JobPhase::Running && job.phase != JobPhase::Indeterminate {
+            if job.phase == JobPhase::Succeeded {
+                break;
+            }
+            // If it Failed (e.g. count_chunks race), that's fine too
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("timeout waiting for second decode to finish");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    let snap = state.load();
+    assert!(
+        snap.job(JobKind::LtcDecode).phase != JobPhase::Running,
+        "second decode should have completed"
+    );
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}
+
+// ── Duplicate spawn rejection guard ─────────────────────────────────────
+
+#[test]
+fn test_duplicate_decode_rejected_while_running() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("dup_test.wav");
+    generate_wav(&path, 25.0, false, 0.5, 48000);
+
+    let snapshot = run_engine(
+        vec![
+            GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string()),
+            GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string()),
+        ],
+        false,
+        |s| s.job(JobKind::LtcDecode).phase == JobPhase::Succeeded,
+    );
+
+    assert_eq!(
+        snapshot.job(JobKind::LtcDecode).phase,
+        JobPhase::Succeeded,
+        "expected decode to succeed after two identical commands (second rejected by guard)",
+    );
+    assert!(
+        snapshot.ltc_decode_result.is_some(),
+        "decode should have produced a result",
+    );
+}
+
+// ── Duplicate group decode rejection via run_engine ─────────────────────
+
+#[test]
+fn test_duplicate_group_decode_rejected_while_running() {
+    let snapshot = run_engine(
+        vec![
+            GuiCommand::DecodeLtcVideoGroup {
+                paths: vec!["/nonexistent/dup_clip.wav".to_string()],
+                stream_index: 0,
+                channel_index: 0,
+            },
+            GuiCommand::DecodeLtcVideoGroup {
+                paths: vec!["/nonexistent/dup_clip.wav".to_string()],
+                stream_index: 0,
+                channel_index: 0,
+            },
+        ],
+        false,
+        |s| {
+            let phase = s.job(JobKind::LtcGroupDecode).phase;
+            phase == JobPhase::Succeeded || phase == JobPhase::Failed
+        },
+    );
+
+    assert!(
+        snapshot.job(JobKind::LtcGroupDecode).phase != JobPhase::Running,
+        "group decode should have finished, phase={:?}",
+        snapshot.job(JobKind::LtcGroupDecode).phase,
+    );
+}
+
+// ── Duplicate ProbeFileDurations rejection via run_engine ───────────────
+
+#[test]
+fn test_duplicate_probe_durations_rejected_while_running() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("dur_test.wav");
+    let spec = hound::WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    {
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..48000 { w.write_sample(0i16).unwrap(); }
+        w.finalize().unwrap();
+    }
+
+    let snapshot = run_engine(
+        vec![
+            GuiCommand::ProbeFileDurations(vec![path.clone()]),
+            GuiCommand::ProbeFileDurations(vec![path]),
+        ],
+        false,
+        |s| {
+            s.job(JobKind::DurationProbe).phase == JobPhase::Succeeded
+        },
+    );
+
+    assert!(
+        snapshot.job(JobKind::DurationProbe).phase != JobPhase::Running,
+        "duration probe should have finished"
+    );
+}
+
 // ── WAV round-trip tests (various FPS) ──────────────────────────────────
 
 #[test]

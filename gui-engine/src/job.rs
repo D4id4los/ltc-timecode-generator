@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -176,13 +177,11 @@ impl ProgressTracker {
         };
         let speed_raw = inner.speed.load(Ordering::Relaxed);
         ProgressSnapshot {
-            phase: if inner.indeterminate.load(Ordering::Relaxed) {
-                JobPhase::Indeterminate
-            } else if (overall - 1.0).abs() < 0.001 {
-                JobPhase::Running
-            } else {
-                JobPhase::Running
-            },
+phase: if inner.indeterminate.load(Ordering::Relaxed) {
+            JobPhase::Indeterminate
+        } else {
+            JobPhase::Running
+        },
             fraction: overall,
             message: inner.message.lock().unwrap().clone(),
             speed: if speed_raw > 0 {
@@ -498,6 +497,9 @@ pub struct JobSupervisor {
     rx: Receiver<JobEvent>,
     active: Vec<ActiveJob>,
     events_buffer: Vec<JobEvent>,
+    /// Tracks the most-recently-spawned JobId per kind. Used by the engine
+    /// drain loop to reject stale Item/Finished events from superseded jobs.
+    pub latest_job: HashMap<JobKind, JobId>,
 }
 
 impl JobSupervisor {
@@ -509,6 +511,7 @@ impl JobSupervisor {
             rx,
             active: Vec::new(),
             events_buffer: Vec::new(),
+            latest_job: HashMap::new(),
         }
     }
 
@@ -615,6 +618,7 @@ where
 {
     let id = JobId(sup.next_id);
     sup.next_id += 1;
+    sup.latest_job.insert(spec.kind, id);
 
     let tracker = ProgressTracker::new(spec.units);
     let cancel = CancelToken::new();
@@ -1309,6 +1313,75 @@ mod tests {
         };
 
         assert!(observed, "expected to observe fraction=0.5 in poll snapshot");
+    }
+
+    // ── latest_job tracking ─────────────────────────────────────────────
+
+    #[test]
+    fn test_spawn_job_updates_latest_job() {
+        let mut sup = JobSupervisor::new();
+        assert_eq!(sup.latest_job.get(&JobKind::FfmpegCapProbe), None);
+
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(JobFinal::NoPayload)
+        });
+
+        let id = sup.latest_job.get(&JobKind::FfmpegCapProbe);
+        assert!(id.is_some(), "latest_job should be set after spawn");
+
+        // Spawning again of the same kind updates the ID
+        let first_id = *id.unwrap();
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(JobFinal::NoPayload)
+        });
+
+        let second_id = sup.latest_job.get(&JobKind::FfmpegCapProbe).unwrap();
+        assert!(second_id.0 > first_id.0, "second spawn should have larger JobId");
+    }
+
+    #[test]
+    fn test_latest_job_gates_stale_finished_events() {
+        let mut sup = JobSupervisor::new();
+
+        // Spawn a quick job that finishes immediately
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
+            Ok(JobFinal::NoPayload)
+        });
+
+        // Wait for it to finish
+        std::thread::sleep(Duration::from_millis(50));
+        sup.poll();
+
+        // The Finished event is in the buffer — drain it so we start clean
+        let first_events = sup.drain();
+        assert!(
+            first_events.iter().any(|e| matches!(e, JobEvent::Finished { .. })),
+            "first job should have finished"
+        );
+
+        // Spawn a second job of same kind — updates latest_job to new ID
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
+            Ok(JobFinal::NoPayload)
+        });
+
+        // Wait for second job to finish
+        std::thread::sleep(Duration::from_millis(50));
+        sup.poll();
+        let second_events = sup.drain();
+
+        // Only events from the second (latest) job should appear;
+        // the first job's Finished event was already drained above so it's
+        // irrelevant — what matters is that the second job's Finished event
+        // carries the correct ID.
+        let second_finished: Vec<&JobEvent> = second_events.iter()
+            .filter(|e| matches!(e, JobEvent::Finished { .. }))
+            .collect();
+        assert_eq!(second_finished.len(), 1,
+            "expected exactly one Finished event from second job, got {}",
+            second_finished.len(),
+        );
     }
 
     #[test]

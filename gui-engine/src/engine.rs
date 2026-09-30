@@ -107,6 +107,10 @@ pub fn engine_main_with_probe<F>(
                     return;
                 }
                 Ok(GuiCommand::ProbeFileDurations(paths)) => {
+                    if supervisor.is_running(JobKind::DurationProbe) {
+                        info!("Duration probe already in progress — ignoring duplicate ProbeFileDurations");
+                        continue;
+                    }
                     current.file_durations_generation += 1;
                     current.file_durations.clear();
                     let spec = job::JobSpec {
@@ -302,6 +306,10 @@ pub fn engine_main_with_probe<F>(
                     info!("Conversion cancel signaled via engine CancelConversion command (job-based)");
                 }
                 Ok(GuiCommand::ProbeVideo(path)) => {
+                    if supervisor.is_running(JobKind::VideoProbe) {
+                        info!("Video probe already in progress — ignoring duplicate ProbeVideo");
+                        continue;
+                    }
                     info!("Probing video file for audio streams (async via job): {}", path);
                     current.ltc_probe_generation += 1;
                     current.ltc_probe = None;
@@ -367,13 +375,14 @@ pub fn engine_main_with_probe<F>(
             }
         }
         for event in supervisor.drain() {
-            // Stale-result gating: only accept events for currently-active jobs.
-            // active_job_ids is rebuilt from poll() results above.
+            // Stale-result gating: reject events from superseded jobs by
+            // comparing the event's JobId to the most-recently-spawned one
+            // for that kind (tracked in supervisor.latest_job).
             let (event_job, event_kind) = match &event {
                 JobEvent::Finished { job, kind, .. } => (*job, *kind),
                 JobEvent::Item { job, kind, .. } => (*job, *kind),
             };
-            if !progress_snapshots.iter().any(|(id, kind, _)| *id == event_job && *kind == event_kind) {
+            if supervisor.latest_job.get(&event_kind) != Some(&event_job) {
                 continue;
             }
             match event {
@@ -629,16 +638,11 @@ pub fn engine_main_with_probe<F>(
                     }
                 }
                 JobEvent::Finished { kind: JobKind::LtcGroupDecode, outcome, .. } => {
-                    let was_precancelled = current.job(JobKind::LtcGroupDecode).phase == job::JobPhase::Cancelled;
                     if let Some(status) = current.jobs.get_mut(&JobKind::LtcGroupDecode) {
-                        if !was_precancelled {
-                            status.apply_outcome(&outcome);
-                        }
+                        status.apply_outcome(&outcome);
                     }
-                    if was_precancelled {
-                        // Don't overwrite status_message or auto-apply when user already cancelled
-                        continue;
-                    }
+                    // When the user cancelled and a new decode was spawned,
+                    // this event is already rejected by the latest_job gate above.
                     let total = current.ltc_group_results.len();
                     let successes = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
                     let failures = current.ltc_group_results.iter().filter(|r| r.is_none()).count();
@@ -714,10 +718,6 @@ pub fn engine_main_with_probe<F>(
                 }
                 _ => {}
             }
-        }
-
-        // 1.12 — Offload copy idle cleanup
-        if !supervisor.is_running(JobKind::OffloadCopy) && current.job(JobKind::OffloadCopy).phase == job::JobPhase::Idle {
         }
 
         // 2. Poll current timecode if playing
@@ -1122,15 +1122,16 @@ fn process_command(
             if paths.is_empty() {
                 return;
             }
+            if supervisor.is_running(JobKind::LtcGroupDecode) {
+                info!("LTC group decode already in progress — ignoring duplicate DecodeLtcVideoGroup");
+                return;
+            }
             let total = paths.len();
             let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
             info!(
                 "LTC group decode requested: {} clip(s), stream={}, channel={}, decoder={}, fps={}",
                 total, stream_index, channel_index, decoder_name, state.decode_fps,
             );
-
-            // Cancel any running group decode first
-            supervisor.cancel(JobKind::LtcGroupDecode);
 
             // Reset group decode state with new generation
             state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
@@ -1228,6 +1229,10 @@ fn process_command(
         }
 
         GuiCommand::ParseLtcVideo(path, stream_index, channel_index) => {
+            if supervisor.is_running(JobKind::LtcDecode) {
+                info!("LTC decode already in progress — ignoring duplicate ParseLtcVideo");
+                return;
+            }
             let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
             info!(
                 "LTC video decode requested: {} (stream={}, channel={}, decoder={}, fps={})",
@@ -1333,6 +1338,10 @@ fn process_command(
         }
 
         GuiCommand::ParseLtcWavFile(path) => {
+            if supervisor.is_running(JobKind::LtcDecode) {
+                info!("LTC decode already in progress — ignoring duplicate ParseLtcWavFile");
+                return;
+            }
             let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
             info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps);
 
@@ -2122,6 +2131,10 @@ fn apply_recording_selection(
 
     // Spawn background probing of all files in the group via unified job infrastructure
     if let Some(group) = state.converter.groups.get(idx) {
+        if supervisor.is_running(JobKind::ClipProbe) {
+            info!("Clip probe already in progress — cancelling old probe for new recording");
+            supervisor.cancel(JobKind::ClipProbe);
+        }
         info!(
             "Recording selected: idx={} of {} engine group(s), type={:?}, {} file(s) — spawning clip probe",
             idx, group_count, group.recording_type, group.files.len(),
