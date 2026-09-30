@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Error, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -269,7 +269,7 @@ pub struct DeviceProgressInner {
     pub files_total: AtomicUsize,
     pub files_done: AtomicUsize,
     pub bytes_total: u64,
-    pub bytes_done: AtomicUsize,
+    pub bytes_done: AtomicU64,
     pub current_file: Mutex<String>,
     pub error: Mutex<Option<String>>,
     pub(crate) state: Mutex<DeviceState>,
@@ -307,7 +307,7 @@ impl OffloadContext {
                     files_total: AtomicUsize::new(files_total),
                     files_done: AtomicUsize::new(0),
                     bytes_total,
-                    bytes_done: AtomicUsize::new(0),
+                    bytes_done: AtomicU64::new(0),
                     current_file: Mutex::new(String::new()),
                     error: Mutex::new(None),
                     state: Mutex::new(DeviceState::Pending),
@@ -1063,14 +1063,17 @@ pub fn run_offload(
             }
 
             // Copy the file with 1 MiB chunked IO.
+            let mut last_reported: u64 = 0;
             match copy_file(&item.src, &item.dst, &context.cancel, &mut |copied| {
-                report_chunk_progress(context, dev_idx, copied);
+                let delta = copied - last_reported;
+                last_reported = copied;
+                report_chunk_delta(context, dev_idx, delta);
             }) {
                 Ok(()) => {
-                    // Verify after copy.
+                    // Verify after copy — bytes already accounted by chunk reports.
                     match verify_copy(&item.src, &item.dst, &VerifyMode::SizeOnly) {
                         Ok(()) => {
-                            advance_counters(context, dev_idx, 1, item.size);
+                            advance_file_done(context, dev_idx);
                         }
                         Err(e) => {
                             let msg = format!("Verification failed for {:?}: {}", item.dst, e);
@@ -1122,29 +1125,34 @@ pub fn run_offload(
 }
 
 /// Advance file/byte counters after a successful file copy.
+/// Advance file/byte counters after a file is skipped (idempotent resume).
 fn advance_counters(ctx: &OffloadContext, dev_idx: usize, files_inc: usize, bytes_inc: u64) {
     let blocks = ((bytes_inc.saturating_add((1 << 20) - 1)) >> 20) as usize;
     let inner = &ctx.per_device[dev_idx];
     inner.files_done.fetch_add(files_inc, Ordering::Relaxed);
-    inner.bytes_done.fetch_add(bytes_inc as usize, Ordering::Relaxed);
+    inner.bytes_done.fetch_add(bytes_inc, Ordering::Relaxed);
     ctx.overall_files_done.fetch_add(files_inc, Ordering::Relaxed);
     ctx.overall_blocks_done.fetch_add(blocks, Ordering::Relaxed);
 }
 
-/// Progress callback invoked by [`copy_file`] after each chunk.
-/// Updates per-device and overall byte/block counters and tracks cumulative
-/// bytes copied for this file to compute the final exact total.
-fn report_chunk_progress(ctx: &OffloadContext, dev_idx: usize, cumulative_bytes: u64) {
-    // Per-device: store as raw bytes (wrapping on 32-bit for >4GiB is acceptable).
-    let prev = ctx.per_device[dev_idx]
-        .bytes_done
-        .fetch_add(0, Ordering::Relaxed) as u64;
-    let delta = cumulative_bytes.saturating_sub(prev);
-    if delta > 0 {
+/// Advance only the file counter after a successful copy (bytes were
+/// already accounted by chunk reports via [`report_chunk_delta`]).
+fn advance_file_done(ctx: &OffloadContext, dev_idx: usize) {
+    let inner = &ctx.per_device[dev_idx];
+    inner.files_done.fetch_add(1, Ordering::Relaxed);
+    ctx.overall_files_done.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Report a chunk of bytes successfully copied for the current file.
+/// Adds the exact delta to per-device bytes_done and the corresponding
+/// blocks (in 1 MiB units, ceiled for the last partial chunk) to
+/// overall_blocks_done.
+fn report_chunk_delta(ctx: &OffloadContext, dev_idx: usize, delta_bytes: u64) {
+    if delta_bytes > 0 {
         ctx.per_device[dev_idx]
             .bytes_done
-            .fetch_add(delta as usize, Ordering::Relaxed);
-        let blocks_delta = ((delta.saturating_add((1 << 20) - 1)) >> 20) as usize;
+            .fetch_add(delta_bytes, Ordering::Relaxed);
+        let blocks_delta = ((delta_bytes.saturating_add((1 << 20) - 1)) >> 20) as usize;
         ctx.overall_blocks_done
             .fetch_add(blocks_delta, Ordering::Relaxed);
     }
@@ -1261,7 +1269,7 @@ pub fn snapshot_from_context(
             files_total: inner.files_total.load(Ordering::Relaxed),
             files_done: inner.files_done.load(Ordering::Relaxed),
             bytes_total: inner.bytes_total,
-            bytes_done: inner.bytes_done.load(Ordering::Relaxed) as u64,
+            bytes_done: inner.bytes_done.load(Ordering::Relaxed),
             current_file: inner.current_file.lock().unwrap().clone(),
             state: device_state,
         });
@@ -2309,5 +2317,97 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
 
         let files = collect_media_files_shallow(dir.path());
         assert_eq!(files.len(), MAX_CARD_FILES);
+    }
+
+    // ── report_chunk_progress delta semantics ─────────────────────────
+
+    #[test]
+    fn test_report_chunk_delta_direct() {
+        let ctx = OffloadContext::new(&["DEV".to_string()], &[vec![CopyPlanItem {
+            src: PathBuf::from("/fake/src.bin"),
+            dst: PathBuf::from("/fake/dst.bin"),
+            size: 3_000_000,
+        }]]);
+        report_chunk_delta(&ctx, 0, 1 << 20);
+        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), 1 << 20);
+        assert_eq!(ctx.overall_blocks_done.load(Ordering::Relaxed), 1);
+        report_chunk_delta(&ctx, 0, 1 << 20);
+        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), 2 << 20);
+        assert_eq!(ctx.overall_blocks_done.load(Ordering::Relaxed), 2);
+        report_chunk_delta(&ctx, 0, (1 << 20) - 1);
+        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), (3 << 20) - 1);
+        // Last partial chunk: ceil(1MiB-1 / 1MiB) = 1 block
+        assert_eq!(ctx.overall_blocks_done.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn test_advance_file_done_keeps_bytes_unchanged() {
+        let ctx = OffloadContext::new(&["DEV".to_string()], &[vec![CopyPlanItem {
+            src: PathBuf::from("/fake/src.bin"),
+            dst: PathBuf::from("/fake/dst.bin"),
+            size: 2_000_000,
+        }]]);
+        // Simulate chunk reports already added bytes.
+        ctx.per_device[0].bytes_done.store(2_000_000, Ordering::Relaxed);
+        ctx.overall_blocks_done
+            .store(((2_000_000 + (1 << 20) - 1) >> 20) as usize, Ordering::Relaxed);
+        advance_file_done(&ctx, 0);
+        assert_eq!(ctx.per_device[0].files_done.load(Ordering::Relaxed), 1);
+        // bytes_done unchanged
+        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), 2_000_000);
+        assert_eq!(ctx.overall_files_done.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_advance_counters_skip_path() {
+        let ctx = OffloadContext::new(&["DEV".to_string()], &[vec![CopyPlanItem {
+            src: PathBuf::from("/fake/src.bin"),
+            dst: PathBuf::from("/fake/dst.bin"),
+            size: 2_000_000,
+        }]]);
+        advance_counters(&ctx, 0, 1, 2_000_000);
+        assert_eq!(ctx.per_device[0].files_done.load(Ordering::Relaxed), 1);
+        assert_eq!(ctx.per_device[0].bytes_done.load(Ordering::Relaxed), 2_000_000);
+        assert_eq!(ctx.overall_files_done.load(Ordering::Relaxed), 1);
+        let expected_blocks = ((2_000_000 + (1 << 20) - 1) >> 20) as usize;
+        assert_eq!(ctx.overall_blocks_done.load(Ordering::Relaxed), expected_blocks);
+    }
+
+    #[test]
+    fn test_run_offload_multi_file_progress_counts() {
+        let dir = TempDir::new().unwrap();
+        // Three files: 3 MiB, 1 MiB, 2 MiB
+        let f1 = dir.path().join("f1.bin");
+        let f2 = dir.path().join("f2.bin");
+        let f3 = dir.path().join("f3.bin");
+        fs::write(&f1, vec![0xAAu8; 3 * 1024 * 1024]).unwrap();
+        fs::write(&f2, vec![0xBBu8; 1024 * 1024]).unwrap();
+        fs::write(&f3, vec![0xCCu8; 2 * 1024 * 1024]).unwrap();
+
+        let dest = TempDir::new().unwrap();
+        let plans = vec![vec![
+            CopyPlanItem { src: f1, dst: dest.path().join("f1.bin"), size: 3 * 1024 * 1024 },
+            CopyPlanItem { src: f2, dst: dest.path().join("f2.bin"), size: 1024 * 1024 },
+            CopyPlanItem { src: f3, dst: dest.path().join("f3.bin"), size: 2 * 1024 * 1024 },
+        ]];
+        let device_names = vec!["CARD".to_string()];
+        let ctx = OffloadContext::new(&device_names, &plans);
+        let _completed = run_offload(&plans, &device_names, &ctx);
+
+        assert_eq!(ctx.per_device[0].files_done.load(Ordering::Relaxed), 3);
+        // Buggy code double-counts: 3+3 + 1+1 + 2+2 = 12 MiB.
+        // Correct: 3 + 1 + 2 = 6 MiB.
+        let expected_bytes: u64 = 6 * 1024 * 1024;
+        assert_eq!(
+            ctx.per_device[0].bytes_done.load(Ordering::Relaxed),
+            expected_bytes,
+            "bytes_done should be exactly the sum of file sizes, not double-counted"
+        );
+        let total_blocks = (6usize << 20).saturating_add((1 << 20) - 1) >> 20; // 6
+        assert_eq!(
+            ctx.overall_blocks_done.load(Ordering::Relaxed),
+            total_blocks,
+            "overall_blocks should be ceil(total_bytes/1MiB)"
+        );
     }
 }

@@ -29,6 +29,32 @@ const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 const MAX_CLAP_LOGS: usize = 1000;
 const BUFFER_SIZE: u32 = 0;
 
+/// Update the smoothed offload copy speed.
+///
+/// * `delta_blocks` — blocks copied since the last poll (0 if no progress).
+/// * `delta_t` — wall-clock seconds since last poll.
+/// * `since_progress` — seconds since the last non-zero `delta_blocks` (0.0
+///   when progress was made this tick).
+///
+/// Folds the instantaneous speed into the EMA (α = 0.3) when progress was
+/// made; holds the current value through short stalls (fsync/verify pauses);
+/// decays toward zero after a stall longer than 2 seconds.
+fn update_offload_speed(
+    smoothed: &mut f64,
+    delta_blocks: usize,
+    delta_t: f64,
+    since_progress: f64,
+) {
+    if delta_blocks > 0 {
+        let instant_speed = delta_blocks as f64 * (1 << 20) as f64 / delta_t;
+        *smoothed = 0.7 * *smoothed + 0.3 * instant_speed;
+    } else if since_progress > 2.0 {
+        // Decay toward zero during a genuine stall (e.g. fsync on slow media).
+        *smoothed *= 0.5;
+    }
+    // else: hold the current value through a short stall.
+}
+
 pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnapshot>>, use_libltc: bool) {
     engine_main_with_probe(cmd_rx, state, use_libltc, query_ffmpeg_capabilities)
 }
@@ -140,6 +166,7 @@ pub fn engine_main_with_probe<F>(
     // Speed tracking (smoothed MB/s via byte deltas between ticks)
     let mut offload_last_blocks_done: usize = 0;
     let mut offload_last_time: Option<Instant> = None;
+    let mut offload_last_progress: Option<Instant> = None;
     let mut offload_speed_smoothed: f64 = 0.0;
 
     // Conversion lifecycle state (engine-owned, shared with conversion thread)
@@ -930,13 +957,23 @@ pub fn engine_main_with_probe<F>(
                 // Compute smoothed copy speed from byte deltas.
                 let now = Instant::now();
                 let blocks_now = ctx.overall_blocks_done.load(Ordering::Relaxed);
+                let delta_blocks = blocks_now.saturating_sub(offload_last_blocks_done);
+                if delta_blocks > 0 {
+                    offload_last_progress = Some(now);
+                }
+                let since_progress = match offload_last_progress {
+                    Some(t) => now.saturating_duration_since(t).as_secs_f64(),
+                    None => 0.0,
+                };
                 if let Some(last_time) = offload_last_time {
                     let delta_t = now.saturating_duration_since(last_time).as_secs_f64();
                     if delta_t > 0.001 {
-                        let delta_blocks = blocks_now.saturating_sub(offload_last_blocks_done);
-                        let instant_speed = (delta_blocks as f64 * (1 << 20) as f64) / delta_t;
-                        // EMA smoothing (α=0.3)
-                        offload_speed_smoothed = 0.7 * offload_speed_smoothed + 0.3 * instant_speed;
+                        update_offload_speed(
+                            &mut offload_speed_smoothed,
+                            delta_blocks,
+                            delta_t,
+                            since_progress,
+                        );
                     }
                 } else {
                     offload_speed_smoothed = 0.0;
@@ -957,6 +994,7 @@ pub fn engine_main_with_probe<F>(
             // Reset speed tracking when idle.
             offload_last_blocks_done = 0;
             offload_last_time = None;
+            offload_last_progress = None;
             offload_speed_smoothed = 0.0;
             current.offload.speed_bytes_per_sec = 0.0;
         }
@@ -4004,5 +4042,48 @@ mod tests {
         apply_sel(&mut state, 1);
         assert_eq!(state.converter.settings.output_folder, second_dir,
             "second selection must still re-default after a no-op echo");
+    }
+
+    // ── update_offload_speed ───────────────────────────────────────────
+
+    #[test]
+    fn test_offload_speed_folds_progress_into_ema() {
+        let mut smoothed = 0.0;
+        // First tick with progress: instant = 10 blocks / 0.04 s = 256 MiB/s
+        update_offload_speed(&mut smoothed, 10, 0.04, 0.0);
+        // EMA: 0.7*0 + 0.3*(10 * 1MiB / 0.04) = 0.3 * 262144000.0
+        let expected = 0.3 * 10.0 * (1 << 20) as f64 / 0.04;
+        assert!((smoothed - expected).abs() < 1.0, "smoothed ≈ {}", smoothed);
+
+        // Second tick with same delta: EMA converges toward instant.
+        let instant = 10.0 * (1 << 20) as f64 / 0.04;
+        update_offload_speed(&mut smoothed, 10, 0.04, 0.0);
+        let expected2 = 0.7 * expected + 0.3 * instant;
+        assert!((smoothed - expected2).abs() < 1.0, "smoothed ≈ {}, expected ≈ {}", smoothed, expected2);
+    }
+
+    #[test]
+    fn test_offload_speed_holds_value_during_short_stall() {
+        let mut smoothed = 50_000_000.0; // 50 MB/s
+        // Short stall (0.5 s < 2 s threshold) — hold value.
+        update_offload_speed(&mut smoothed, 0, 0.04, 0.5);
+        assert_eq!(smoothed, 50_000_000.0, "short stall must hold value");
+    }
+
+    #[test]
+    fn test_offload_speed_decays_during_long_stall() {
+        let mut smoothed = 50_000_000.0;
+        // Long stall (2.5 s > 2 s threshold) — decay by half.
+        update_offload_speed(&mut smoothed, 0, 0.04, 2.5);
+        assert!((smoothed - 25_000_000.0).abs() < 1.0, "long stall must halve, got {}", smoothed);
+    }
+
+    #[test]
+    fn test_offload_speed_stays_zero_when_idle() {
+        let mut smoothed = 0.0;
+        update_offload_speed(&mut smoothed, 0, 0.04, 5.0);
+        assert_eq!(smoothed, 0.0, "stays at zero");
+        update_offload_speed(&mut smoothed, 5, 0.04, 0.0);
+        assert!(smoothed > 0.0, "progress wakes it up");
     }
 }
