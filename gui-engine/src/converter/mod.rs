@@ -3,7 +3,6 @@ pub use crate::naming::DEFAULT_VIDEO_SUFFIX;
 pub use crate::naming::DEFAULT_PREFIX;
 
 pub(crate) mod progress;
-pub use progress::{CancelFlag, ConversionState, ConversionStatus, SharedConversionState};
 
 pub(crate) mod channel_map;
 pub use channel_map::ChannelMap;
@@ -49,7 +48,7 @@ pub(crate) mod process;
 pub use process::StepFailure;
 
 pub(crate) mod runner;
-pub use runner::{spawn_conversion, spawn_conversion_job};
+pub use runner::{spawn_conversion_job, run_conversion, ConversionReport, JobConversionReport, TestReport};
 
 #[cfg(test)]
 pub(crate) mod test_fixtures;

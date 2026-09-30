@@ -42,14 +42,14 @@ pub use converter::{
     find_timecode_at_offset, format_blockers, format_ffmpeg_timecode,
     plan_concat_outputs, plan_video_outputs, query_ffmpeg_capabilities,
     select_best_combination,
-    spawn_conversion, spawn_conversion_job, start_timecode_from_ltc,
+    spawn_conversion_job, run_conversion, start_timecode_from_ltc,
     supported_audio_encoders, supported_containers,
     AudioKeep, ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
-    ConversionState, ConversionStatus, ConverterSettings, output_collision_warning,
+    ConversionReport, ConverterSettings, output_collision_warning,
     OutputKind, PreviewOutput, preview_output_files, StepFailure,
     VideoOutputStep, DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX,
-    FfmpegCapabilities, HwDeviceCapabilities, RecordingType, SharedConversionState, CancelFlag,
-    TimecodeMetadata,
+    FfmpegCapabilities, HwDeviceCapabilities, RecordingType,
+    TimecodeMetadata, JobConversionReport,
 };
 pub use file_pattern::{default_output_filename, group_display_key, group_key_prefix, match_files_to_groups, match_files_all_patterns, wrap_user_selected_files, FileNamingPattern, BUILTIN_PATTERNS, CAMERA_PATTERNS};
 pub use video_codecs::{

@@ -1,7 +1,6 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Output;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::time::Duration;
 
@@ -1029,21 +1028,15 @@ fn tag_via_ffmpeg_with(
 /// Process a tagging run for multiple files, with a shared progress+state
 /// reporter, advancing `overall_progress` and logging `overall_log`.
 /// Each file gets an equal weight `file_weight` in progress.
-pub fn run_tagging(
+pub fn run_tagging<R: crate::converter::runner::ConversionReport>(
     paths: &[PathBuf],
     timecodes: &[Option<TimecodeMetadata>],
     cameras: &[Option<CameraInfo>],
-    state: &crate::converter::SharedConversionState,
-    cancel: &std::sync::Arc<AtomicBool>,
-    file_weight: f32,
-    overall_progress: &mut f32,
-    overall_log: &mut String,
-    total_steps: usize,
-    current_step: usize,
+    report: &R,
 ) -> bool {
     for (i, path) in paths.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            overall_log.push_str("\n--- CANCELLED ---\n");
+        if report.is_cancelled() {
+            report.append_log("\n--- CANCELLED ---\n");
             return false;
         }
 
@@ -1055,7 +1048,7 @@ pub fn run_tagging(
                     path.display()
                 );
                 log::warn!("{}", msg.trim());
-                overall_log.push_str(&msg);
+                report.append_log(&msg);
                 continue;
             }
         };
@@ -1075,29 +1068,16 @@ pub fn run_tagging(
                     }
                 };
                 log::info!("{}", msg.trim());
-                overall_log.push_str(&msg);
+                report.append_log(&msg);
             }
             Err(e) => {
                 let msg = format!("✗ {} — failed: {}\n", path.display(), e);
                 log::error!("{}", msg.trim());
-                overall_log.push_str(&msg);
-                // Don't abort entire pipeline for one file — continue with next
+                report.append_log(&msg);
             }
         }
 
-        *overall_progress += file_weight;
-        {
-            let mut s = state.lock().unwrap();
-            s.status = crate::converter::ConversionStatus::Running {
-                progress: overall_progress.min(1.0),
-            };
-            s.current_line = format!(
-                "Tagging [{}/{}]: {}",
-                current_step + i + 1,
-                total_steps,
-                path.display()
-            );
-        }
+        report.advance_step();
     }
 
     true

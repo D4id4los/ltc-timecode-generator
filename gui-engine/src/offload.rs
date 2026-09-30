@@ -2049,7 +2049,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
 
         let dst = dir.path().join("dst.bin");
 
-        let (ctx, tracker) = test_job_context();
+        let (ctx, _tracker) = test_job_context();
         let plans = vec![vec![CopyPlanItem {
             src: src.clone(),
             dst: dst.clone(),

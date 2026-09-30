@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use log::{info, warn};
 
@@ -18,14 +18,241 @@ use crate::converter::planning::{
     plan_concat_outputs, plan_video_outputs_for_file, VideoOutputStep,
 };
 use crate::converter::process::{
-    mark_conversion_failed, run_ffmpeg_process, StepFailure,
+    run_ffmpeg_process, StepFailure,
 };
-use crate::converter::progress::{CancelFlag, ConversionStatus, SharedConversionState};
 use crate::converter::settings::{ConversionPipeline, ConverterSettings, RecordingType};
 use crate::ffprobe::VideoAudioProbe;
-use crate::job::{JobContext, JobError, JobFinal};
+use crate::job::{JobContext, JobError, JobFinal, UnitProgress};
 use crate::naming;
 use crate::video_codecs;
+
+/// Reporting interface for conversion pipelines, abstracting over
+/// production (JobContext-based) and test (in-memory) progress tracking.
+pub trait ConversionReport: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+    fn step_weight(&self) -> f32;
+    fn set_step_weight(&self, w: f32);
+    fn report_step_fraction(&self, step_fraction: f32, line: &str);
+    fn advance_step(&self);
+    fn set_log(&self, text: &str);
+    fn append_log(&self, text: &str);
+    fn set_message(&self, msg: &str);
+    fn mark_failed(&self, log: &str);
+    fn mark_completed(&self, summary: &str);
+    /// Returns `true` if `mark_failed` was called at any point.
+    fn is_failed(&self) -> bool;
+    fn set_unit_count(&self, n: usize);
+    fn unit(&self, idx: usize) -> Option<UnitProgress>;
+    /// Returns an optional `&AtomicBool` for the ffmpeg watchdog's
+    /// cancel‑checking loop (checked every ~100 ms regardless of stderr
+    /// output).  `None` = no 100‑ms cancel check (cancellation is only
+    /// detected between stderr lines).
+    fn cancel_atomic(&self) -> Option<&std::sync::atomic::AtomicBool>;
+}
+
+/// Production implementation of `ConversionReport` that bridges into
+/// the unified job infrastructure (`ProgressTracker` + `CancelToken`).
+pub struct JobConversionReport<'a> {
+    ctx: &'a JobContext,
+    step_weight: AtomicU32,
+    overall_progress: AtomicU32,
+    overall_log: Mutex<String>,
+    failed: AtomicBool,
+}
+
+impl<'a> JobConversionReport<'a> {
+    pub fn new(ctx: &'a JobContext) -> Self {
+        JobConversionReport {
+            ctx,
+            step_weight: AtomicU32::new(0),
+            overall_progress: AtomicU32::new(0),
+            overall_log: Mutex::new(String::new()),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn overall(&self) -> f32 {
+        self.overall_progress.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    fn set_overall(&self, f: f32) {
+        self.overall_progress.store((f.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+    }
+}
+
+impl<'a> ConversionReport for JobConversionReport<'a> {
+    fn is_cancelled(&self) -> bool {
+        self.ctx.cancel.is_cancelled()
+    }
+
+    fn step_weight(&self) -> f32 {
+        self.step_weight.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    fn set_step_weight(&self, w: f32) {
+        self.step_weight.store((w.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+    }
+
+    fn report_step_fraction(&self, step_fraction: f32, _line: &str) {
+        let overall = self.overall();
+        let sw = self.step_weight();
+        let combined = overall + step_fraction * sw;
+        let clamped = combined.min(1.0);
+        self.ctx.progress.unit(0).set_fraction(clamped);
+        self.ctx.progress.set_message(format!("Conversion: {:.0}%", clamped * 100.0));
+    }
+
+    fn advance_step(&self) {
+        let overall = self.overall();
+        let sw = self.step_weight();
+        self.set_overall(overall + sw);
+        self.ctx.progress.unit(0).set_fraction(self.overall().min(1.0));
+    }
+
+    fn set_log(&self, text: &str) {
+        *self.overall_log.lock().unwrap() = text.to_string();
+    }
+
+    fn append_log(&self, text: &str) {
+        self.overall_log.lock().unwrap().push_str(text);
+        let log = self.overall_log.lock().unwrap().clone();
+        self.ctx.progress.set_message(log);
+    }
+
+    fn set_message(&self, msg: &str) {
+        self.ctx.progress.set_message(msg);
+    }
+
+    fn mark_failed(&self, log: &str) {
+        self.failed.store(true, Ordering::Relaxed);
+        self.ctx.progress.unit(0).set_fraction(0.0);
+        let log_text = self.overall_log.lock().unwrap().clone();
+        let full = if log.is_empty() { log_text } else { format!("{}\n{}", log_text, log) };
+        self.ctx.progress.set_message(full.clone());
+        self.ctx.progress.unit(0).set_fraction(0.0);
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    fn mark_completed(&self, summary: &str) {
+        let log = self.overall_log.lock().unwrap().clone();
+        let msg = format!("{}\n\n--- CONVERSION COMPLETED SUCCESSFULLY ---{}", log, summary);
+        self.ctx.progress.unit(0).set_fraction(1.0);
+        self.ctx.progress.set_message(msg);
+    }
+
+    fn set_unit_count(&self, n: usize) {
+        self.ctx.progress.resize(n);
+    }
+
+    fn unit(&self, idx: usize) -> Option<UnitProgress> {
+        if idx < self.ctx.progress.snapshot().units.len() {
+            Some(self.ctx.progress.unit(idx))
+        } else {
+            None
+        }
+    }
+
+    fn cancel_atomic(&self) -> Option<&std::sync::atomic::AtomicBool> {
+        Some(self.ctx.cancel.inner())
+    }
+}
+
+/// In-memory report for unit tests. Wraps shared mutable state in
+/// `Arc` for thread-safety (tests run inside `spawn_job` threads).
+#[derive(Clone)]
+pub struct TestReport {
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub progress: std::sync::Arc<Mutex<f32>>,
+    pub log: std::sync::Arc<Mutex<String>>,
+    pub message: std::sync::Arc<Mutex<String>>,
+    pub failed: std::sync::Arc<Mutex<bool>>,
+    pub completed: std::sync::Arc<Mutex<bool>>,
+    step_weight: std::sync::Arc<Mutex<f32>>,
+}
+
+impl TestReport {
+    pub fn new() -> Self {
+        TestReport::default()
+    }
+}
+
+impl Default for TestReport {
+    fn default() -> Self {
+        TestReport {
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            progress: std::sync::Arc::new(Mutex::new(0.0)),
+            log: std::sync::Arc::new(Mutex::new(String::new())),
+            message: std::sync::Arc::new(Mutex::new(String::new())),
+            failed: std::sync::Arc::new(Mutex::new(false)),
+            completed: std::sync::Arc::new(Mutex::new(false)),
+            step_weight: std::sync::Arc::new(Mutex::new(0.0)),
+        }
+    }
+}
+
+impl ConversionReport for TestReport {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn step_weight(&self) -> f32 {
+        *self.step_weight.lock().unwrap()
+    }
+
+    fn set_step_weight(&self, w: f32) {
+        *self.step_weight.lock().unwrap() = w;
+    }
+
+    fn report_step_fraction(&self, step_fraction: f32, _line: &str) {
+        let overall = *self.progress.lock().unwrap();
+        let sw = *self.step_weight.lock().unwrap();
+        let combined = overall + step_fraction * sw;
+        *self.progress.lock().unwrap() = combined.min(1.0);
+    }
+
+    fn advance_step(&self) {
+        let overall = *self.progress.lock().unwrap();
+        let sw = *self.step_weight.lock().unwrap();
+        *self.progress.lock().unwrap() = (overall + sw).min(1.0);
+    }
+
+    fn set_log(&self, text: &str) {
+        *self.log.lock().unwrap() = text.to_string();
+    }
+
+    fn append_log(&self, text: &str) {
+        self.log.lock().unwrap().push_str(text);
+    }
+
+    fn set_message(&self, msg: &str) {
+        *self.message.lock().unwrap() = msg.to_string();
+    }
+
+    fn mark_failed(&self, _log: &str) {
+        *self.failed.lock().unwrap() = true;
+    }
+
+    fn is_failed(&self) -> bool {
+        *self.failed.lock().unwrap()
+    }
+
+    fn mark_completed(&self, _summary: &str) {
+        *self.completed.lock().unwrap() = true;
+    }
+
+    fn set_unit_count(&self, _n: usize) {}
+
+    fn unit(&self, _idx: usize) -> Option<UnitProgress> {
+        None
+    }
+
+    fn cancel_atomic(&self) -> Option<&std::sync::atomic::AtomicBool> {
+        Some(&self.cancelled)
+    }
+}
 
 pub struct EncoderFallback {
     chain: Vec<String>,
@@ -85,11 +312,7 @@ fn run_video_step_with_fallback(
     fallback: &mut EncoderFallback,
     build_args: &mut dyn FnMut(&ConverterSettings) -> Vec<String>,
     output: &Path,
-    state: &SharedConversionState,
-    cancel: &CancelFlag,
-    step_progress_weight: f32,
-    overall_progress: &mut f32,
-    overall_log: &mut String,
+    report: &impl ConversionReport,
     total_steps: usize,
     current_step: usize,
 ) -> bool {
@@ -97,15 +320,15 @@ fn run_video_step_with_fallback(
     if candidates.is_empty() {
         let msg = "no video encoder candidate available".to_string();
         warn!("{}", msg);
-        overall_log.push_str(&format!("\n\n--- {} ---", msg));
-        mark_conversion_failed(state, overall_log);
+        report.append_log(&format!("\n\n--- {} ---", msg));
+        report.mark_failed(&msg);
         return false;
     }
 
     let mut attempt = 0;
     while attempt < candidates.len() {
         let encoder = candidates[attempt].clone();
-        if cancel.load(Ordering::Relaxed) {
+        if report.is_cancelled() {
             return false;
         }
         settings.resolved_video_encoder = encoder.clone();
@@ -119,7 +342,7 @@ fn run_video_step_with_fallback(
                 encoder
             );
             warn!("{}", msg);
-            overall_log.push_str(&format!("\n--- {} ---\n", msg));
+            report.append_log(&format!("\n--- {} ---\n", msg));
             fallback.note_failure(&encoder);
             attempt += 1;
             continue;
@@ -129,11 +352,7 @@ fn run_video_step_with_fallback(
         match run_ffmpeg_process(
             &args,
             output,
-            state,
-            cancel,
-            step_progress_weight,
-            overall_progress,
-            overall_log,
+            report,
             total_steps,
             current_step,
         ) {
@@ -142,7 +361,7 @@ fn run_video_step_with_fallback(
                 return true;
             }
             Err(StepFailure::Fatal(_)) => {
-                mark_conversion_failed(state, overall_log);
+                report.mark_failed("");
                 return false;
             }
             Err(StepFailure::EncoderInit(_)) => {
@@ -154,7 +373,7 @@ fn run_video_step_with_fallback(
                         encoder, candidates[attempt]
                     );
                     warn!("{} (output: {})", msg, output.display());
-                    overall_log.push_str(&format!("\n--- {} ---\n", msg));
+                    report.append_log(&format!("\n--- {} ---\n", msg));
                 }
             }
         }
@@ -166,8 +385,8 @@ fn run_video_step_with_fallback(
         fallback.failed.iter().cloned().collect::<Vec<_>>().join(", ")
     );
     warn!("{}", msg);
-    overall_log.push_str(&format!("\n\n--- {} ---", msg));
-    mark_conversion_failed(state, overall_log);
+    report.append_log(&format!("\n\n--- {} ---", msg));
+    report.mark_failed(&msg);
     false
 }
 
@@ -215,12 +434,13 @@ fn prepare_copy_mode(settings: &mut ConverterSettings) {
     }
 }
 
-pub fn spawn_conversion(
-    settings: ConverterSettings,
-    state: SharedConversionState,
-    cancel: CancelFlag,
+/// Run the full conversion pipeline, reporting progress through the provided
+/// report. This is the main entry point called by `spawn_conversion_job`.
+pub fn run_conversion<R: ConversionReport>(
+    report: &R,
+    mut settings: ConverterSettings,
     caps: Option<&crate::converter::capabilities::FfmpegCapabilities>,
-) -> JoinHandle<()> {
+) -> (Option<String>, bool) {
     let no_encoder_needed = matches!(settings.pipeline, ConversionPipeline::MetadataOnly)
         || (settings.copy_video
             && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough));
@@ -244,218 +464,133 @@ pub fn spawn_conversion(
         })
         .unwrap_or_default();
 
-    std::thread::spawn(move || {
-        let mut settings = settings;
-        let copy_mode = settings.copy_video
-            && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough);
-        let metadata_only = matches!(settings.pipeline, ConversionPipeline::MetadataOnly);
-        if copy_mode {
-            prepare_copy_mode(&mut settings);
-        } else if metadata_only {
-            settings.trim_offsets_secs =
-                vec![0.0; settings.trim_offsets_secs.len()];
-        }
-        let mut fallback = EncoderFallback::new_with_hw(chain, hw_ctx);
-        if copy_mode {
-            info!(
-                "Video stream copy mode: video will not be re-encoded \
-                 (container '{}', video codec selection ignored)",
-                settings.container
-            );
-        } else {
-            info!(
-                "Encoder chain for codec '{}': {}",
-                codec_id,
-                fallback.remaining().join(" → ")
-            );
-        }
-
-        let (output_format, output_extension) = match settings.pipeline {
-            ConversionPipeline::AudioOnly { generate_synthetic_video: false } => {
-                let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
-                (fmt.to_string(), ext.to_string())
-            }
-            ConversionPipeline::MetadataOnly => {
-                let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
-                (fmt.to_string(), ext.to_string())
-            }
-            _ => {
-                let ext = extension_for_container(&settings.container);
-                (container_to_ffmpeg_format(&settings.container).to_string(), ext.to_string())
-            }
-        };
-        let extension = &output_extension;
-        let mut total_steps = match settings.pipeline {
-            ConversionPipeline::VideoPassthrough => settings.input_files.len(),
-            ConversionPipeline::MetadataOnly => {
-                let per_file_steps = if settings.recording_type == RecordingType::VideoClipSequence {
-                    2 + if settings.split_tracks { settings.channel_map.num_channels().max(1) } else { 1 }
-                } else {
-                    2
-                };
-                settings.input_files.len() * per_file_steps
-            }
-            _ => if settings.split_tracks { settings.channel_map.num_channels() } else { 1 },
-        };
-        let mut overall_progress: f32 = 0.0;
-        let mut overall_log = String::new();
-        let input_count = settings.input_files.len();
-
+    let copy_mode = settings.copy_video
+        && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough);
+    let metadata_only = matches!(settings.pipeline, ConversionPipeline::MetadataOnly);
+    if copy_mode {
+        prepare_copy_mode(&mut settings);
+    } else if metadata_only {
+        settings.trim_offsets_secs = vec![0.0; settings.trim_offsets_secs.len()];
+    }
+    let mut fallback = EncoderFallback::new_with_hw(chain, hw_ctx);
+    if copy_mode {
         info!(
-            "Starting conversion: {} input(s), pipeline={:?}, split={}, drop_ltc={}, video codec={}, audio encoder={}",
-            input_count,
-            settings.pipeline,
-            settings.split_tracks,
-            settings.drop_ltc_track,
-            settings.video_encoder,
-            settings.audio_encoder,
+            "Video stream copy mode: video will not be re-encoded \
+             (container '{}', video codec selection ignored)",
+            settings.container
         );
+    } else {
+        info!(
+            "Encoder chain for codec '{}': {}",
+            codec_id,
+            fallback.remaining().join(" → ")
+        );
+    }
 
-        {
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Running { progress: 0.0 };
-            s.ffmpeg_output = format!("Pipeline: {:?}, {} steps", settings.pipeline, total_steps);
-            s.current_line = String::new();
+    let (output_format, output_extension) = match settings.pipeline {
+        ConversionPipeline::AudioOnly { generate_synthetic_video: false } => {
+            let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
+            (fmt.to_string(), ext.to_string())
         }
-
-        if cancel.load(Ordering::Relaxed) {
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Failed { error_log: "Canceled before start".into() };
-            return;
+        ConversionPipeline::MetadataOnly => {
+            let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
+            (fmt.to_string(), ext.to_string())
         }
-
-        match settings.pipeline {
-            ConversionPipeline::AudioOnly { generate_synthetic_video: false } => {
-                run_audio_to_audio(&settings, &output_format, extension, &state, &cancel, total_steps, &mut overall_progress, &mut overall_log);
-            }
-            ConversionPipeline::AudioOnly { generate_synthetic_video: true } => {
-                run_audio_to_synthetic_video(&mut settings, extension, &mut fallback, &state, &cancel, &mut overall_progress, &mut overall_log);
-            }
-            ConversionPipeline::VideoPassthrough => {
-                run_video_to_video(&mut settings, extension, &mut fallback, &state, &cancel, &mut total_steps, &mut overall_progress, &mut overall_log);
-            }
-            ConversionPipeline::MetadataOnly => {
-                run_metadata_only(&settings, &state, &cancel, total_steps, &mut overall_progress, &mut overall_log);
-            }
+        _ => {
+            let ext = extension_for_container(&settings.container);
+            (container_to_ffmpeg_format(&settings.container).to_string(), ext.to_string())
         }
-
-        let final_status = {
-            let s = state.lock().unwrap();
-            s.status.clone()
-        };
-        if matches!(final_status, ConversionStatus::Failed { .. }) {
-            info!("Conversion failed - see log for details.");
-        } else {
-            let encoder_line = if metadata_only {
-                "\nTags written in place, audio extracted as PCM WAV".to_string()
-            } else if copy_mode {
-                "\nVideo stream: copied (no re-encode)".to_string()
+    };
+    let extension = &output_extension;
+    let mut total_steps = match settings.pipeline {
+        ConversionPipeline::VideoPassthrough => settings.input_files.len(),
+        ConversionPipeline::MetadataOnly => {
+            let per_file_steps = if settings.recording_type == RecordingType::VideoClipSequence {
+                2 + if settings.split_tracks { settings.channel_map.num_channels().max(1) } else { 1 }
             } else {
-                fallback
-                    .resolved()
-                    .map(|e| format!("\nVideo encoder used: {}", e))
-                    .unwrap_or_default()
+                2
             };
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Completed;
-            s.ffmpeg_output = format!(
-                "{}\n\n--- CONVERSION COMPLETED SUCCESSFULLY ---{}",
-                overall_log, encoder_line
-            );
+            settings.input_files.len() * per_file_steps
         }
-    })
+        _ => if settings.split_tracks { settings.channel_map.num_channels() } else { 1 },
+    };
+    let input_count = settings.input_files.len();
+
+    info!(
+        "Starting conversion: {} input(s), pipeline={:?}, split={}, drop_ltc={}, video codec={}, audio encoder={}",
+        input_count,
+        settings.pipeline,
+        settings.split_tracks,
+        settings.drop_ltc_track,
+        settings.video_encoder,
+        settings.audio_encoder,
+    );
+
+    report.set_message(&format!("Pipeline: {:?}, {} steps", settings.pipeline, total_steps));
+
+match settings.pipeline {
+        ConversionPipeline::AudioOnly { generate_synthetic_video: false } => {
+            run_audio_to_audio(&settings, &output_format, extension, report);
+        }
+        ConversionPipeline::AudioOnly { generate_synthetic_video: true } => {
+            run_audio_to_synthetic_video(&mut settings, extension, &mut fallback, report);
+        }
+        ConversionPipeline::VideoPassthrough => {
+            run_video_to_video(&mut settings, extension, &mut fallback, report, &mut total_steps);
+        }
+        ConversionPipeline::MetadataOnly => {
+            run_metadata_only(&settings, report, total_steps);
+        }
+    }
+
+    if !report.is_failed() && !report.is_cancelled() {
+        let encoder_line = if metadata_only {
+            "\nTags written in place, audio extracted as PCM WAV".to_string()
+        } else if copy_mode {
+            "\nVideo stream: copied (no re-encode)".to_string()
+        } else {
+            fallback
+                .resolved()
+                .map(|e| format!("\nVideo encoder used: {}", e))
+                .unwrap_or_default()
+        };
+        report.mark_completed(&encoder_line);
+    }
+
+    let encoder_used = fallback.resolved().map(|e| e.to_string());
+
+    (encoder_used, metadata_only)
 }
 
 /// Version of the conversion that works with `spawn_job` from the unified
-/// job infrastructure. Uses the existing `spawn_conversion` internally and
-/// bridges the progress reporting. Returns `JobFinal::Conversion`.
+/// job infrastructure. Calls `run_conversion` directly on the job thread
+/// without spawning an internal thread or using `SharedConversionState`.
 pub fn spawn_conversion_job(
     ctx: &JobContext,
     settings: ConverterSettings,
     caps: Option<crate::converter::capabilities::FfmpegCapabilities>,
 ) -> Result<JobFinal, JobError> {
-    let state: SharedConversionState = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::converter::progress::ConversionState::idle(),
-    ));
-    let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Forward cancel from JobContext to internal cancel flag
-    let cancel_inner = cancel.clone();
-    let ctx_cancel = ctx.cancel.inner().clone();
-    std::thread::spawn(move || {
-        while !ctx_cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        cancel_inner.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
-
-    ctx.progress.set_indeterminate(true);
-
-    // Spawn the actual conversion thread
-    let handle = spawn_conversion(settings, state.clone(), cancel, caps.as_ref());
-
-    // Poll for completion, bridging progress to JobContext
-    ctx.progress.set_indeterminate(false);
-    // Resize to 1 unit for overall progress
     ctx.progress.resize(1);
 
-    while !handle.is_finished() {
-        if let Ok(s) = state.lock() {
-            match &s.status {
-                ConversionStatus::Running { progress } => {
-                    ctx.progress.unit(0).set_fraction(*progress);
-                    ctx.progress.set_message(format!("Conversion: {:.0}%", progress * 100.0));
-                }
-                _ => {}
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(40));
-    }
+    let report = JobConversionReport::new(ctx);
+    let (encoder_used, _metadata_only) = run_conversion(&report, settings, caps.as_ref());
 
-    let _ = handle.join();
-
-    // Read final state
-    let (final_status, final_log) = {
-        let s = state.lock().unwrap();
-        (s.status.clone(), s.ffmpeg_output.clone())
-    };
-
-    // Mark unit as done
     ctx.progress.unit(0).finish();
     ctx.progress.set_message("");
 
-    match final_status {
-        ConversionStatus::Completed => {
-            // Extract encoder info from log
-            let encoder_used = if final_log.contains("Video encoder used:") {
-                final_log.lines()
-                    .find(|l| l.contains("Video encoder used"))
-                    .map(|l| l.trim_start_matches("Video encoder used: ").to_string())
-            } else if final_log.contains("stream copy") || final_log.contains("stream-copy") {
-                Some("stream-copy".to_string())
-            } else if final_log.contains("Tags written") {
-                None
-            } else {
-                None
-            };
-            info!("Conversion job completed successfully");
-            Ok(JobFinal::Conversion {
-                encoder_used,
-                steps_attempted: 0,
-            })
-        }
-        ConversionStatus::Failed { error_log } => {
-            if final_log.contains("CANCELLED") || error_log.contains("Cancel") || error_log.contains("cancel") {
-                info!("Conversion job cancelled");
-                Err(JobError::Cancelled)
-            } else {
-                let err = if error_log.is_empty() { final_log } else { error_log };
-                Err(JobError::Failed(err))
-            }
-        }
-        _ => {
-            Err(JobError::Failed("Unexpected conversion state".to_string()))
-        }
+    if report.is_failed() {
+        let log_msg = ctx.progress.snapshot().message.clone();
+        let err_msg = if log_msg.is_empty() { "Unknown conversion failure".to_string() } else { log_msg };
+        Err(JobError::Failed(err_msg))
+    } else if report.is_cancelled() {
+        info!("Conversion job cancelled");
+        Err(JobError::Cancelled)
+    } else {
+        info!("Conversion job completed successfully");
+        Ok(JobFinal::Conversion {
+            encoder_used,
+            steps_attempted: 0,
+        })
     }
 }
 
@@ -463,11 +598,7 @@ fn run_audio_to_audio(
     settings: &ConverterSettings,
     format: &str,
     extension: &str,
-    state: &SharedConversionState,
-    cancel: &CancelFlag,
-    total_steps: usize,
-    overall_progress: &mut f32,
-    overall_log: &mut String,
+    report: &impl ConversionReport,
 ) {
     let sample_rate = settings
         .input_files
@@ -481,7 +612,7 @@ fn run_audio_to_audio(
             if settings.is_ltc_output_track(track_idx) {
                 continue;
             }
-            if cancel.load(Ordering::Relaxed) { break; }
+            if report.is_cancelled() { break; }
 
             let output_path = settings.output_path_for_index("audio", track_idx + 1, extension);
             let mapping = settings.channel_map.mapping();
@@ -491,9 +622,11 @@ fn run_audio_to_audio(
                 .get(input_idx)
                 .and_then(|m| m.as_ref());
             let step_args = build_split_track_args(settings, format, track_idx, tc, sample_rate);
-            let step_progress = 1.0 / total_steps as f32;
-            if run_ffmpeg_process(&step_args, &output_path, state, cancel, step_progress, overall_progress, overall_log, total_steps, 1).is_err() {
-                mark_conversion_failed(state, overall_log);
+            let total_tracks = settings.channel_map.num_channels();
+            let current = emitted + 1;
+            report.set_step_weight(1.0 / total_tracks as f32);
+            if run_ffmpeg_process(&step_args, &output_path, report, total_tracks, current).is_err() {
+                report.mark_failed("");
                 return;
             }
             emitted += 1;
@@ -510,8 +643,8 @@ fn run_audio_to_audio(
                 settings.channel_map.num_channels(),
             );
             log::warn!("{}", msg);
-            overall_log.push_str(&format!("\n\n--- {} ---", msg));
-            mark_conversion_failed(state, overall_log);
+            report.append_log(&format!("\n\n--- {} ---", msg));
+            report.mark_failed(&msg);
         }
     } else {
         let tc = settings
@@ -520,8 +653,9 @@ fn run_audio_to_audio(
             .and_then(|m| m.as_ref());
         let base_args = build_audio_to_audio_args(settings, format, tc, sample_rate);
         let output_path = settings.output_path_for_index("audio", 0, extension);
-        if run_ffmpeg_process(&base_args, &output_path, state, cancel, 1.0, overall_progress, overall_log, 1, 1).is_err() {
-            mark_conversion_failed(state, overall_log);
+        report.set_step_weight(1.0);
+        if run_ffmpeg_process(&base_args, &output_path, report, 1, 1).is_err() {
+            report.mark_failed("");
         }
     }
 }
@@ -530,24 +664,18 @@ fn run_audio_to_synthetic_video(
     settings: &mut ConverterSettings,
     extension: &str,
     fallback: &mut EncoderFallback,
-    state: &SharedConversionState,
-    cancel: &CancelFlag,
-    overall_progress: &mut f32,
-    overall_log: &mut String,
+    report: &impl ConversionReport,
 ) {
     let output_path = settings.output_path_for_index("video", 1, extension);
     let mut build_args =
         |s: &ConverterSettings| build_audio_to_synthetic_video_args(s);
+    report.set_step_weight(1.0);
     run_video_step_with_fallback(
         settings,
         fallback,
         &mut build_args,
         &output_path,
-        state,
-        cancel,
-        1.0,
-        overall_progress,
-        overall_log,
+        report,
         1,
         1,
     );
@@ -562,16 +690,13 @@ fn run_video_to_video(
     settings: &mut ConverterSettings,
     _extension: &str,
     fallback: &mut EncoderFallback,
-    state: &SharedConversionState,
-    cancel: &CancelFlag,
-    _total_steps: &mut usize,
-    overall_progress: &mut f32,
-    overall_log: &mut String,
+    report: &impl ConversionReport,
+    total_steps: &mut usize,
 ) {
     let mut probes: Vec<Option<VideoAudioProbe>> = Vec::new();
 
     for file_idx in 0..settings.input_files.len() {
-        if cancel.load(Ordering::Relaxed) { break; }
+        if report.is_cancelled() { break; }
         let input = &settings.input_files[file_idx];
         match crate::ffprobe::probe_video_audio(input) {
             Ok(probe) => {
@@ -593,7 +718,7 @@ fn run_video_to_video(
     if use_concat {
         let ext = extension_for_container(&settings.container);
         for file_idx in 0..settings.input_files.len() {
-            if cancel.load(Ordering::Relaxed) { break; }
+            if report.is_cancelled() { break; }
             let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
             steps.push(StepEntry {
                 step: VideoOutputStep::VideoOnly { file_idx, output: video_out },
@@ -604,7 +729,7 @@ fn run_video_to_video(
         let (concat_steps, warning) = plan_concat_outputs(settings, &probes);
         if !warning.is_empty() {
             warn!("{}", warning.trim());
-            overall_log.push_str(&format!("\n--- {}\n", warning.trim()));
+            report.append_log(&format!("\n--- {}\n", warning.trim()));
         }
         for cs in concat_steps {
             steps.push(StepEntry { step: cs, is_audio_only: true });
@@ -625,26 +750,25 @@ fn run_video_to_video(
         }
     }
 
-    *_total_steps = steps.len();
+    *total_steps = steps.len();
 
     for (step_idx, entry) in steps.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) { break; }
+        if report.is_cancelled() { break; }
+
+        report.set_step_weight(1.0 / steps.len().max(1) as f32);
 
         if entry.is_audio_only {
             if let VideoOutputStep::AudioChannelConcat { segments, output, format, sample_rate } = &entry.step {
-                let step_progress = 1.0 / steps.len().max(1) as f32;
                 if run_ffmpeg_process(
                     &build_concat_audio_args(settings, segments, format, *sample_rate),
-                    output, state, cancel, step_progress, overall_progress, overall_log,
-                    steps.len(), step_idx + 1,
+                    output, report, steps.len(), step_idx + 1,
                 ).is_err() {
-                    mark_conversion_failed(state, overall_log);
+                    report.mark_failed("");
                     break;
                 }
             }
         } else {
             let output = entry.step.output().to_path_buf();
-            let step_progress = 1.0 / steps.len().max(1) as f32;
             let probe = probes.first().cloned().flatten().unwrap_or(VideoAudioProbe {
                 streams: Vec::new(),
                 total_audio_channels: 0,
@@ -657,11 +781,7 @@ fn run_video_to_video(
                 match run_ffmpeg_process(
                     &build_args(settings),
                     &output,
-                    state,
-                    cancel,
-                    step_progress,
-                    overall_progress,
-                    overall_log,
+                    report,
                     steps.len(),
                     step_idx + 1,
                 ) {
@@ -674,18 +794,14 @@ fn run_video_to_video(
                     fallback,
                     &mut build_args,
                     &output,
-                    state,
-                    cancel,
-                    step_progress,
-                    overall_progress,
-                    overall_log,
+                    report,
                     steps.len(),
                     step_idx + 1,
                 )
             };
             if !ok {
                 if settings.copy_video {
-                    mark_conversion_failed(state, overall_log);
+                    report.mark_failed("");
                 }
                 break;
             }
@@ -731,11 +847,8 @@ fn rename_target_in_source_dir(settings: &ConverterSettings, file_idx: usize, ex
 
 fn run_metadata_only(
     settings: &ConverterSettings,
-    state: &SharedConversionState,
-    cancel: &CancelFlag,
+    report: &impl ConversionReport,
     total_steps: usize,
-    overall_progress: &mut f32,
-    overall_log: &mut String,
 ) {
     let input_files = &settings.input_files;
     let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
@@ -746,12 +859,9 @@ fn run_metadata_only(
     let mut probes: Vec<Option<crate::ffprobe::VideoAudioProbe>> =
         Vec::with_capacity(input_files.len());
     for input_path in input_files.iter() {
-        if cancel.load(Ordering::Relaxed) {
-            overall_log.push_str("\n--- CANCELLED ---\n");
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Failed {
-                error_log: "Cancelled by user".into(),
-            };
+        if report.is_cancelled() {
+            report.append_log("\n--- CANCELLED ---\n");
+            report.mark_failed("Cancelled by user");
             return;
         }
 
@@ -765,7 +875,7 @@ fn run_metadata_only(
                         e
                     );
                     log::warn!("{}", msg.trim());
-                    overall_log.push_str(&msg);
+                    report.append_log(&msg);
                     None
                 }
             }
@@ -782,7 +892,7 @@ fn run_metadata_only(
         if !warning.is_empty() {
             let w = warning.trim().to_string();
             warn!("{}", w);
-            overall_log.push_str(&format!("\n--- {}\n", w));
+            report.append_log(&format!("\n--- {}\n", w));
         }
         let extraction_count = concat_steps.len();
         total_actual = extraction_count + input_files.len();
@@ -792,13 +902,12 @@ fn run_metadata_only(
             0.0
         };
 
+        report.set_step_weight(step_weight);
+
         for (step_idx, step) in concat_steps.iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
-                overall_log.push_str("\n--- CANCELLED ---\n");
-                let mut s = state.lock().unwrap();
-                s.status = ConversionStatus::Failed {
-                    error_log: "Cancelled by user".into(),
-                };
+            if report.is_cancelled() {
+                report.append_log("\n--- CANCELLED ---\n");
+                report.mark_failed("Cancelled by user");
                 return;
             }
             match step {
@@ -811,11 +920,7 @@ fn run_metadata_only(
                     if run_ffmpeg_process(
                         &build_concat_audio_args(settings, segments, format, *sample_rate),
                         output,
-                        state,
-                        cancel,
-                        step_weight,
-                        overall_progress,
-                        overall_log,
+                        report,
                         total_actual,
                         step_idx + 1,
                     )
@@ -825,7 +930,7 @@ fn run_metadata_only(
                             "✗ audio concatenation step {} failed\n",
                             step_idx + 1
                         );
-                        overall_log.push_str(&msg);
+                        report.append_log(&msg);
                     }
                 }
                 VideoOutputStep::AudioChannel {
@@ -847,11 +952,7 @@ fn run_metadata_only(
                             settings, *file_idx, *stream_idx, *channel_idx, format, sr,
                         ),
                         output,
-                        state,
-                        cancel,
-                        step_weight,
-                        overall_progress,
-                        overall_log,
+                        report,
                         total_actual,
                         step_idx + 1,
                     )
@@ -861,7 +962,7 @@ fn run_metadata_only(
                             "✗ {} — audio extraction failed\n",
                             input_files[*file_idx].display()
                         );
-                        overall_log.push_str(&msg);
+                        report.append_log(&msg);
                     }
                 }
                 _ => {}
@@ -869,13 +970,11 @@ fn run_metadata_only(
         }
     } else {
         total_actual = total_steps;
+        report.set_step_weight(1.0 / total_actual.max(1) as f32);
         for (file_idx, probed) in probes.iter().enumerate() {
-            if cancel.load(Ordering::Relaxed) {
-                overall_log.push_str("\n--- CANCELLED ---\n");
-                let mut s = state.lock().unwrap();
-                s.status = ConversionStatus::Failed {
-                    error_log: "Cancelled by user".into(),
-                };
+            if report.is_cancelled() {
+                report.append_log("\n--- CANCELLED ---\n");
+                report.mark_failed("Cancelled by user");
                 return;
             }
 
@@ -890,11 +989,12 @@ fn run_metadata_only(
                 let map_n = settings.channel_map.num_channels();
                 let use_split = settings.split_tracks && map_n > 0;
                 let step_weight = 1.0 / total_steps as f32;
+                report.set_step_weight(step_weight);
 
                 if use_split {
                     let mut emitted = 0usize;
                     for output_k in 0..map_n {
-                        if cancel.load(Ordering::Relaxed) {
+                        if report.is_cancelled() {
                             break;
                         }
                         let Some(input_i) =
@@ -926,11 +1026,7 @@ fn run_metadata_only(
                         if run_ffmpeg_process(
                             &args,
                             &output_path,
-                            state,
-                            cancel,
-                            step_weight,
-                            overall_progress,
-                            overall_log,
+                            report,
                             total_steps,
                             file_idx * 3 + 1,
                         )
@@ -940,11 +1036,11 @@ fn run_metadata_only(
                                 "✗ {} — audio extraction failed\n",
                                 input_path.display()
                             );
-                            overall_log.push_str(&msg);
+                            report.append_log(&msg);
                         }
                     }
                     if emitted == 0 {
-                        *overall_progress += step_weight;
+                        report.advance_step();
                     }
                 } else {
                     let output_path = settings.merged_audio_output_path(aext);
@@ -961,11 +1057,7 @@ fn run_metadata_only(
                     if run_ffmpeg_process(
                         &args,
                         &output_path,
-                        state,
-                        cancel,
-                        step_weight,
-                        overall_progress,
-                        overall_log,
+                        report,
                         total_steps,
                         file_idx * 3 + 1,
                     )
@@ -975,24 +1067,20 @@ fn run_metadata_only(
                             "✗ {} — audio extraction failed\n",
                             input_path.display()
                         );
-                        overall_log.push_str(&msg);
+                        report.append_log(&msg);
                     }
                 }
             } else if !is_video {
-                let sw = 1.0 / total_steps as f32;
-                *overall_progress += sw;
+                report.advance_step();
             }
         }
     }
 
     // Phase C: per-file tagging + rename
     for (file_idx, _probed) in probes.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            overall_log.push_str("\n--- CANCELLED ---\n");
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Failed {
-                error_log: "Cancelled by user".into(),
-            };
+        if report.is_cancelled() {
+            report.append_log("\n--- CANCELLED ---\n");
+            report.mark_failed("Cancelled by user");
             return;
         }
 
@@ -1024,7 +1112,7 @@ fn run_metadata_only(
                             )
                         }
                     };
-                    overall_log.push_str(&msg);
+                    report.append_log(&msg);
                 }
                 Err(e) => {
                     let msg = format!(
@@ -1033,7 +1121,7 @@ fn run_metadata_only(
                         e
                     );
                     log::error!("{}", msg.trim());
-                    overall_log.push_str(&msg);
+                    report.append_log(&msg);
                 }
             }
         } else {
@@ -1042,7 +1130,7 @@ fn run_metadata_only(
                 input_path.display()
             );
             log::warn!("{}", msg.trim());
-            overall_log.push_str(&msg);
+            report.append_log(&msg);
         }
 
         if !settings.filename_prefix.is_empty() {
@@ -1059,7 +1147,7 @@ fn run_metadata_only(
                         new_path.display()
                     );
                     log::warn!("{}", msg.trim());
-                    overall_log.push_str(&msg);
+                    report.append_log(&msg);
                 } else {
                     match std::fs::rename(input_path, &new_path) {
                         Ok(()) => {
@@ -1068,7 +1156,7 @@ fn run_metadata_only(
                                 input_path.display(),
                                 new_path.display()
                             );
-                            overall_log.push_str(&msg);
+                            report.append_log(&msg);
                         }
                         Err(e) => {
                             let msg = format!(
@@ -1077,67 +1165,22 @@ fn run_metadata_only(
                                 e
                             );
                             log::error!("{}", msg.trim());
-                            overall_log.push_str(&msg);
+                            report.append_log(&msg);
                         }
                     }
                 }
             }
         }
 
-        let step_weight = if total_actual > 0 {
-            1.0 / total_actual as f32
-        } else {
-            0.0
-        };
-        *overall_progress += step_weight;
-        {
-            let mut s = state.lock().unwrap();
-            s.status = ConversionStatus::Running {
-                progress: overall_progress.min(1.0),
-            };
-            s.current_line = format!(
-                "[{}/{}] {} — done",
-                file_idx + 1,
-                input_files.len(),
-                input_path.display()
-            );
-        }
+        report.advance_step();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-    use std::sync::atomic::AtomicBool;
     use crate::converter::test_fixtures::*;
-    use crate::{ChannelMap, CancelFlag, ConversionState, ConversionStatus, SharedConversionState};
+    use crate::ChannelMap;
     use super::*;
-
-    fn fresh_state() -> SharedConversionState {
-        Arc::new(Mutex::new(ConversionState::idle()))
-    }
-
-    fn fresh_cancel() -> CancelFlag {
-        Arc::new(AtomicBool::new(false))
-    }
-
-    /// Create a short PCM 16-bit mono WAV file in the given directory.
-    fn create_test_wav(dir: &std::path::Path, name: &str, sample_rate: u32, duration_secs: f64) -> std::path::PathBuf {
-        let path = dir.join(name);
-        let num_samples = (sample_rate as f64 * duration_secs) as u32;
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
-        for _ in 0..num_samples {
-            writer.write_sample(0i16).unwrap();
-        }
-        writer.finalize().unwrap();
-        path
-    }
 
     #[test]
     fn test_run_audio_to_audio_split_all_dropped_fails() {
@@ -1147,27 +1190,15 @@ mod tests {
         settings.channel_map = ChannelMap::identity(1);
         settings.ltc_track_channel_index = 0;
 
-        let state = fresh_state();
-        let cancel = fresh_cancel();
-        let mut progress = 0.0f32;
-        let mut log = String::new();
-        let total_steps = 1;
+        let report = TestReport::new();
 
         run_audio_to_audio(
-            &settings, "wav", "wav", &state, &cancel,
-            total_steps, &mut progress, &mut log,
+            &settings, "wav", "wav", &report,
         );
 
-        let s = state.lock().unwrap();
         assert!(
-            matches!(&s.status, ConversionStatus::Failed { .. }),
-            "expected Failed when all tracks are dropped, got {:?}",
-            s.status
-        );
-        assert!(
-            progress == 0.0,
-            "progress must remain 0 when no ffmpeg ran, got {}",
-            progress
+            *report.failed.lock().unwrap(),
+            "expected Failed when all tracks are dropped"
         );
     }
 
@@ -1184,23 +1215,33 @@ mod tests {
         settings.channel_map = ChannelMap::identity(2);
         settings.ltc_track_channel_index = 1;
 
-        let state = fresh_state();
-        let cancel = fresh_cancel();
-        let mut progress = 0.0f32;
-        let mut log = String::new();
-        let total_steps = 2;
+        let report = TestReport::new();
 
         run_audio_to_audio(
-            &settings, "wav", "wav", &state, &cancel,
-            total_steps, &mut progress, &mut log,
+            &settings, "wav", "wav", &report,
         );
 
-        let s = state.lock().unwrap();
         assert!(
-            matches!(&s.status, ConversionStatus::Running { .. } | ConversionStatus::Completed),
-            "expected Running or Completed when one track survives, got {:?}",
-            s.status
+            !*report.failed.lock().unwrap(),
+            "should not be failed when one track survives"
         );
+    }
+
+    fn create_test_wav(dir: &std::path::Path, name: &str, sample_rate: u32, duration_secs: f64) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let num_samples = (sample_rate as f64 * duration_secs) as u32;
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..num_samples {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
     }
 
     #[test]

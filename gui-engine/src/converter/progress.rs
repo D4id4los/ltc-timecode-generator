@@ -1,6 +1,4 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
-
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConversionStatus {
     Idle,
@@ -9,6 +7,7 @@ pub enum ConversionStatus {
     Failed { error_log: String },
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ConversionState {
     pub status: ConversionStatus,
@@ -16,6 +15,7 @@ pub struct ConversionState {
     pub current_line: String,
 }
 
+#[allow(dead_code)]
 impl ConversionState {
     pub fn idle() -> Self {
         ConversionState {
@@ -25,10 +25,6 @@ impl ConversionState {
         }
     }
 }
-
-pub type SharedConversionState = Arc<Mutex<ConversionState>>;
-
-pub type CancelFlag = Arc<AtomicBool>;
 
 #[cfg(test)]
 mod tests {
