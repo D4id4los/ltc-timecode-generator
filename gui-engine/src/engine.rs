@@ -18,7 +18,7 @@ use crate::converter::{
     output_collision_warning, preview_output_files, apply_available_defaults, spawn_conversion,
 };
 use crate::ffprobe::{self, VideoAudioProbe};
-use crate::offload::{self, DeviceNameSource, OffloadContext};
+use crate::offload::{self, DeviceNameSource, OffloadContext, ScanProgress};
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
 
@@ -136,6 +136,7 @@ pub fn engine_main_with_probe<F>(
     let mut offload_context: Option<Arc<OffloadContext>> = None;
     let mut offload_device_names: Vec<String> = Vec::new();
     let mut offload_completed_before: Vec<String> = Vec::new();
+    let mut scan_progress: Option<Arc<ScanProgress>> = None;
     // Speed tracking (smoothed MB/s via byte deltas between ticks)
     let mut offload_last_blocks_done: usize = 0;
     let mut offload_last_time: Option<Instant> = None;
@@ -275,6 +276,7 @@ pub fn engine_main_with_probe<F>(
                         &mut offload_device_names,
                         &mut offload_completed_before,
                         &offload_event_tx,
+                        &mut scan_progress,
                     );
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetNamingPattern(val))) => {
@@ -744,6 +746,7 @@ pub fn engine_main_with_probe<F>(
         loop {
             match offload_event_rx.try_recv() {
                 Ok(OffloadEvent::CardsScanned { mut cards, generation }) => {
+                    scan_progress = None;
                     if generation == offload_scan_generation {
                         // Collect file paths before consume for duration probing.
                         let file_paths: Vec<PathBuf> = cards.iter()
@@ -863,6 +866,16 @@ pub fn engine_main_with_probe<F>(
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
             }
+        }
+
+        // 1.11 Poll scan progress from shared cell
+        if let Some(ref sp) = scan_progress {
+            current.offload.scan_status = sp.read();
+            if let Some(ref msg) = current.offload.scan_status {
+                current.status_message = msg.clone();
+            }
+        } else {
+            current.offload.scan_status = None;
         }
 
         // 1.12 Poll chunked / group decode progress
@@ -2084,6 +2097,7 @@ fn handle_offload_command(
     device_names: &mut Vec<String>,
     completed_before: &mut Vec<String>,
     event_tx: &std::sync::mpsc::Sender<OffloadEvent>,
+    scan_progress: &mut Option<Arc<ScanProgress>>,
 ) {
     match cmd {
         crate::command::OffloadCommand::ScanCards => {
@@ -2093,6 +2107,9 @@ fn handle_offload_command(
             }
             state.offload.scanning = true;
             state.offload.error = None;
+            // Reset the scan progress cell.
+            let progress = Arc::new(ScanProgress::new());
+            *scan_progress = Some(progress.clone());
             *scan_generation = scan_generation.wrapping_add(1);
             let gen = *scan_generation;
             let tx = event_tx.clone();
@@ -2102,10 +2119,11 @@ fn handle_offload_command(
                     let scan_start = Instant::now();
                     info!("Offload card scan started (gen={})", gen);
                     let result = std::panic::catch_unwind(|| {
-                        crate::offload::detect_cards()
+                        crate::offload::detect_cards_with_progress(Some(&progress))
                     });
                     match result {
                         Ok(cards) => {
+                            progress.clear();
                             let elapsed = scan_start.elapsed();
                             info!(
                                 "Offload card scan finished in {:.2?} (gen={}): {} card(s)",
@@ -2116,6 +2134,7 @@ fn handle_offload_command(
                             let _ = tx.send(OffloadEvent::CardsScanned { cards, generation: gen });
                         }
                         Err(panic) => {
+                            progress.clear();
                             let msg = if let Some(s) = panic.downcast_ref::<&str>() {
                                 s.to_string()
                             } else if let Some(s) = panic.downcast_ref::<String>() {

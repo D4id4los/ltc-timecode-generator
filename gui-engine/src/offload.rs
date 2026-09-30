@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Error, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveDate};
@@ -164,6 +164,9 @@ pub struct OffloadSnapshot {
     pub cards: Vec<SdCardInfo>,
     /// True while a scan is in progress.
     pub scanning: bool,
+    /// Per-drive scan progress message (e.g. "Scanning drive EOS_DIGITAL…").
+    /// Set from the scan thread via ScanProgress; cleared on scan completion.
+    pub scan_status: Option<String>,
     /// User-chosen parent directory (base folder for ISO-date subfolder).
     pub parent_folder: Option<PathBuf>,
     /// Editable folder name (defaults to today's ISO date).
@@ -196,6 +199,7 @@ impl OffloadSnapshot {
         OffloadSnapshot {
             cards: Vec::new(),
             scanning: false,
+            scan_status: None,
             parent_folder: None,
             parent_name: default_parent_name(),
             running: false,
@@ -209,6 +213,39 @@ impl OffloadSnapshot {
             file_durations: HashMap::new(),
             durations_version: 0,
         }
+    }
+}
+
+/// Shared cell for scan progress: the scan thread writes per-drive messages,
+/// the engine reads them each tick and publishes into OffloadSnapshot.
+#[derive(Debug, Clone)]
+pub struct ScanProgress {
+    inner: Arc<Mutex<Option<String>>>,
+}
+
+impl ScanProgress {
+    pub fn new() -> Self {
+        ScanProgress {
+            inner: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn set(&self, msg: String) {
+        *self.inner.lock().unwrap() = Some(msg);
+    }
+
+    pub fn clear(&self) {
+        *self.inner.lock().unwrap() = None;
+    }
+
+    pub fn read(&self) -> Option<String> {
+        self.inner.lock().unwrap().clone()
+    }
+}
+
+impl Default for ScanProgress {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -331,12 +368,18 @@ pub fn is_media_file(path: &Path) -> bool {
 /// via `udisksctl` (so they become available for offload).
 #[cfg(target_os = "linux")]
 pub fn detect_cards() -> Vec<SdCardInfo> {
+    detect_cards_with_progress(None)
+}
+
+/// Like `detect_cards()` but reports per-drive progress into the shared cell.
+#[cfg(target_os = "linux")]
+pub fn detect_cards_with_progress(progress: Option<&ScanProgress>) -> Vec<SdCardInfo> {
     let deadline = Instant::now() + CARD_SCAN_BUDGET;
     let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
     let sys_root = Path::new("/sys");
 
     // 1. Detect already-mounted cards.
-    let mut cards = detect_cards_from_mounts(&mounts, sys_root, deadline);
+    let mut cards = detect_cards_from_mounts(&mounts, sys_root, deadline, progress);
 
     // 2. Find unmounted card-like partitions and try to auto-mount.
     let unmounted = find_unmounted_card_partitions(&mounts, sys_root);
@@ -349,6 +392,9 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
             break;
         }
         let dev_path = format!("/dev/{}", dev_name);
+        if let Some(p) = progress {
+            p.set(format!("Mounting /dev/{dev_name}…"));
+        }
         match udisks_mount(&dev_path) {
             Ok(Some(mount_point)) => {
                 info!(
@@ -357,7 +403,7 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
                 );
                 let updated_mounts =
                     fs::read_to_string("/proc/mounts").unwrap_or_else(|_| mounts.clone());
-                let new_cards = detect_cards_from_mounts(&updated_mounts, sys_root, deadline);
+                let new_cards = detect_cards_from_mounts(&updated_mounts, sys_root, deadline, progress);
                 let existing: std::collections::HashSet<PathBuf> =
                     cards.iter().map(|c| c.mount.clone()).collect();
                 for c in new_cards {
@@ -497,6 +543,12 @@ fn udisks_mount(dev_path: &str) -> std::io::Result<Option<PathBuf>> {
 /// Fallback for non-Linux: enumerate common mount roots.
 #[cfg(not(target_os = "linux"))]
 pub fn detect_cards() -> Vec<SdCardInfo> {
+    detect_cards_with_progress(None)
+}
+
+/// Like `detect_cards()` but reports per-drive progress into the shared cell.
+#[cfg(not(target_os = "linux"))]
+pub fn detect_cards_with_progress(progress: Option<&ScanProgress>) -> Vec<SdCardInfo> {
     let deadline = Instant::now() + CARD_SCAN_BUDGET;
     let mut cards = Vec::new();
     let start = std::time::Instant::now();
@@ -517,6 +569,9 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
             if Instant::now() >= deadline {
                 warn!("Windows card scan: budget exceeded — skipping drive {}", cand.letter);
                 break;
+            }
+            if let Some(p) = progress {
+                p.set(format!("Scanning drive {}:…", cand.letter));
             }
             debug!("Probing removable drive {}: {:?}", cand.letter, cand.root);
             if let Some(info) = classify_mount(&cand.root, &cand.root, deadline) {
@@ -543,6 +598,14 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
                     if Instant::now() >= deadline {
                         warn!("macOS card scan: budget exceeded — skipping {:?}", mp);
                         break;
+                    }
+                    if let Some(p) = progress {
+                        let label = volume_label_for(&mp);
+                        if label.is_empty() {
+                            p.set(format!("Scanning {}…", mp.display()));
+                        } else {
+                            p.set(format!("Scanning drive {label} ({})…", mp.display()));
+                        }
                     }
                     debug!("Probing macOS volume: {:?}", mp);
                     if let Some(info) = classify_mount(&mp, &mp, deadline) {
@@ -577,7 +640,12 @@ pub fn detect_cards() -> Vec<SdCardInfo> {
 /// Parse `/proc/mounts` content and return detected cards.
 /// `sys_root` is typically `/sys` on Linux.  `deadline` caps the overall
 /// time budget for the mount probes.
-fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path, deadline: Instant) -> Vec<SdCardInfo> {
+fn detect_cards_from_mounts(
+    mounts_content: &str,
+    sys_root: &Path,
+    deadline: Instant,
+    progress: Option<&ScanProgress>,
+) -> Vec<SdCardInfo> {
     let user = whoami_fallback();
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut skipped = 0u32;
@@ -654,6 +722,14 @@ fn detect_cards_from_mounts(mounts_content: &str, sys_root: &Path, deadline: Ins
             continue;
         }
         debug!("Probing mount candidate: {:?}", mp);
+        if let Some(p) = progress {
+            let label = volume_label_for(mp);
+            if label.is_empty() {
+                p.set(format!("Scanning drive {}…", mp.display()));
+            } else {
+                p.set(format!("Scanning drive {label} ({})…", mp.display()));
+            }
+        }
         if let Some(info) = classify_mount(mp, mp, deadline) {
             info!(
                 "Mount {:?} → card: {} files, {} bytes, name='{}'",
@@ -1202,6 +1278,7 @@ pub fn snapshot_from_context(
     OffloadSnapshot {
         cards: Vec::new(), // not updated from context; set elsewhere
         scanning: false,
+        scan_status: None,
         parent_folder: parent_folder.clone(),
         parent_name: parent_name.to_string(),
         running: true,
@@ -1735,7 +1812,7 @@ mod tests {
 
     #[test]
     fn test_detect_cards_from_mounts_empty() {
-        let cards = detect_cards_from_mounts("", Path::new("/sys"), far_deadline());
+        let cards = detect_cards_from_mounts("", Path::new("/sys"), far_deadline(), None);
         assert!(cards.is_empty());
     }
 
@@ -1746,7 +1823,7 @@ mod tests {
 /dev/nvme0n1p1 /boot/efi vfat rw 0 0
 proc /proc proc rw 0 0
 ";
-        let cards = detect_cards_from_mounts(mounts, Path::new("/sys"), far_deadline());
+        let cards = detect_cards_from_mounts(mounts, Path::new("/sys"), far_deadline(), None);
         assert!(cards.is_empty());
     }
 
@@ -2022,7 +2099,7 @@ proc /proc proc rw 0 0
 /dev/sdb1 /run/media/viktoria/NONEXISTENT_UNIQUE_CARD_DIR_42 vfat rw 0 0
 ";
         let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
-        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline());
+        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline(), None);
         // The mount directory doesn't exist, so classify_mount rejects it
         // (0 files). But the filter should accept it (sdb is removable,
         // sdb1 is its partition).
@@ -2038,7 +2115,7 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
 /dev/loop0 /snap/emacs/4391 squashfs ro 0 0
 ";
         let sys = make_mock_sys(&[], &[], &[], &[]);
-        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline());
+        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline(), None);
         assert!(cards.is_empty());
     }
 
@@ -2049,7 +2126,7 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
 /dev/sdd1 /mnt/card vfat rw 0 0
 ";
         let sys = make_mock_sys(&["sdc", "sdd"], &[], &[], &["sdc1", "sdd1"]);
-        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline());
+        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline(), None);
         assert!(cards.is_empty());
     }
 
@@ -2059,7 +2136,7 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
 /dev/nvme0n1p3 /run/media/viktoria/1440965240963B06 ntfs3 rw 0 0
 ";
         let sys = make_mock_sys(&[], &[], &[], &[]);
-        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline());
+        let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline(), None);
         assert!(cards.is_empty(), "nvme under /run/media should be excluded by bus heuristic");
     }
 
@@ -2128,6 +2205,94 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
     fn test_collect_mounted_devices_empty() {
         let mounted = collect_mounted_devices("");
         assert!(mounted.is_empty());
+    }
+
+    // ── ScanProgress ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_scan_progress_set_read_clear() {
+        let p = ScanProgress::new();
+        assert!(p.read().is_none());
+
+        p.set("Scanning drive FOO…".to_string());
+        assert_eq!(p.read().as_deref(), Some("Scanning drive FOO…"));
+
+        p.clear();
+        assert!(p.read().is_none());
+    }
+
+    #[test]
+    fn test_scan_progress_default_is_none() {
+        let p: ScanProgress = Default::default();
+        assert!(p.read().is_none());
+    }
+
+    #[test]
+    fn test_scan_progress_is_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<ScanProgress>();
+        assert_sync::<ScanProgress>();
+    }
+
+    #[test]
+    fn test_detect_cards_from_mounts_with_progress_fires_for_each_candidate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mp = dir.path();
+        // Place a media file so classify_mount accepts it.
+        fs::write(mp.join("C0001.MP4"), b"data").unwrap();
+
+        // The mount path must start with /media, /run/media, or /mnt to pass
+        // the filter in detect_cards_from_mounts. Use /mnt/../tmp/... which
+        // starts with /mnt as a prefix path component but resolves to the TempDir.
+        let fake_mount = format!("/mnt/..{}", mp.display());
+        let mounts = format!(
+            "/dev/sdb1 {} vfat rw 0 0",
+            fake_mount
+        );
+        let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
+
+        let progress = ScanProgress::new();
+        let cards = detect_cards_from_mounts(
+            &mounts,
+            sys.path(),
+            far_deadline(),
+            Some(&progress),
+        );
+
+        // The progress cell should have been set with a message about the mount path.
+        let last_msg = progress.read();
+        assert!(last_msg.is_some(), "progress should have been set");
+        let msg = last_msg.unwrap();
+        assert!(
+            msg.contains(&fake_mount),
+            "progress message '{}' should contain mount path '{}'",
+            msg,
+            fake_mount,
+        );
+        // Should also mention "Scanning drive".
+        assert!(msg.contains("Scanning drive"), "progress message should mention 'Scanning drive'");
+
+        // Ensure the card was properly discovered.
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].media_file_count, 1);
+    }
+
+    #[test]
+    fn test_detect_cards_with_progress_none_still_works() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mp = dir.path();
+        fs::write(mp.join("C0001.MP4"), b"data").unwrap();
+
+        let fake_mount = format!("/mnt/..{}", mp.display());
+        let mounts = format!(
+            "/dev/sdb1 {} vfat rw 0 0",
+            fake_mount
+        );
+        let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
+
+        let cards = detect_cards_from_mounts(&mounts, sys.path(), far_deadline(), None);
+        assert_eq!(cards.len(), 1);
     }
 
     // ── MAX_CARD_FILES limit in collect_media_files_shallow ──────────────

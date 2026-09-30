@@ -496,6 +496,7 @@ pub fn setup_poll_timer(
                 ));
                 ui.set_off_parent_name(SharedString::from(off.parent_name.clone()));
                 ui.set_off_scanning(off.scanning);
+                ui.set_off_scan_status(SharedString::from(off.scan_status.clone().unwrap_or_default()));
                 ui.set_off_running(off.running);
                 ui.set_off_overall_progress(off.overall_progress);
                 ui.set_off_speed_text(SharedString::from(

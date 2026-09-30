@@ -6,6 +6,7 @@ export component OffloadSection {
     in-out property <string> parent-name: "2026-09-26";
     in-out property <[OffloadCardInfo]> cards: [];
     in-out property <bool> scanning: false;
+    in-out property <string> scan-status: "";
     in-out property <bool> running: false;
     in-out property <float> overall-progress: 0.0;
     in-out property <string> speed-text: "";
@@ -77,7 +78,7 @@ export component OffloadSection {
                             Text { text: "Rescan"; font-size: 11px; color: AppColors.text-title; }
                         }
                     }
-                    if (root.scanning) : Text { text: "Scanning…"; font-size: 11px; color: AppColors.text-muted; vertical-alignment: center; }
+                    if (root.scanning) : Text { text: root.scan-status == "" ? "Scanning…" : root.scan-status; font-size: 11px; color: AppColors.text-muted; vertical-alignment: center; }
                 }
 
                 if (root.cards.length == 0 && !root.scanning) : Text {

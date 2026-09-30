@@ -126,6 +126,7 @@ export component AppWindow inherits Window {
     in-out property <string> off-parent-name: "2026-09-26";
     in-out property <[OffloadCardInfo]> off-cards: [];
     in-out property <bool> off-scanning: false;
+    in-out property <string> off-scan-status: "";
     in-out property <bool> off-running: false;
     in-out property <float> off-overall-progress: 0.0;
     in-out property <string> off-speed-text: "";
@@ -796,6 +797,7 @@ export component AppWindow inherits Window {
                     parent-name: root.off-parent-name;
                     cards: root.off-cards;
                     scanning: root.off-scanning;
+                    scan-status: root.off-scan-status;
                     running: root.off-running;
                     overall-progress: root.off-overall-progress;
                     speed-text: root.off-speed-text;

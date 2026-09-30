@@ -114,6 +114,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
     let off = &s.offload;
     let cards = off.cards.clone();
     let scanning = off.scanning;
+    let scan_msg = off.scan_status.clone().unwrap_or_else(|| "Scanning…".to_string());
     let file_durations = off.file_durations.clone();
 
     ui.horizontal(|ui| {
@@ -122,7 +123,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
         }
         if scanning {
             ui.add(egui::Spinner::new());
-            ui.label("Scanning…");
+            ui.label(scan_msg);
         }
     });
 
