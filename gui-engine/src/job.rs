@@ -177,11 +177,11 @@ impl ProgressTracker {
         };
         let speed_raw = inner.speed.load(Ordering::Relaxed);
         ProgressSnapshot {
-phase: if inner.indeterminate.load(Ordering::Relaxed) {
-            JobPhase::Indeterminate
-        } else {
-            JobPhase::Running
-        },
+            phase: if inner.indeterminate.load(Ordering::Relaxed) {
+                JobPhase::Indeterminate
+            } else {
+                JobPhase::Running
+            },
             fraction: overall,
             message: inner.message.lock().unwrap().clone(),
             speed: if speed_raw > 0 {

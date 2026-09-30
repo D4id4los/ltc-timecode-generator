@@ -95,8 +95,6 @@ pub fn engine_main_with_probe<F>(
         let dt = (now - last_tick).as_secs_f32();
         last_tick = now;
 
-        // 0. Folder scan results now handled via supervisor drain (section 1.7)
-
         // 1. Drain all pending commands
         loop {
             match cmd_rx.try_recv() {
@@ -351,11 +349,7 @@ pub fn engine_main_with_probe<F>(
             }
         }
 
-        // 1.4 — Video probe now handled via supervisor drain (section 1.7)
-
-        // 1.5 — LTC decode results now handled via supervisor drain
-
-        // 1.7 Poll supervisor for finished jobs and drain events — unified dispatcher
+        // 1.4 Poll supervisor for finished jobs and drain events — unified dispatcher
         //     for all async job results that were started via spawn_job.
         let progress_snapshots = supervisor.poll();
         for (_id, kind, snap) in &progress_snapshots {
@@ -2055,7 +2049,7 @@ fn apply_set_output_folder(state: &mut AppStateSnapshot, folder: PathBuf) {
 ///
 /// Extracted so it can be called both from the command handler (directly when
 /// groups are ready) and from the folder-scan result drain (when a deferred
-/// `SelectRecording` was queued during `groups_loading`).
+/// `SelectRecording` was queued during a pending folder scan).
 fn apply_recording_selection(
     state: &mut AppStateSnapshot,
     idx: usize,
