@@ -9,7 +9,7 @@ use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::config;
 use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
 use gui_engine::timecode::FPS_OPTIONS;
-use gui_engine::{ArcSwap, AudioEvent, JobKind, JobPhase};
+use gui_engine::{ArcSwap, AudioEvent, JobKind};
 
 use crate::theme::{Theme, ACCENT};
 use crate::widgets;
@@ -299,9 +299,8 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     let predicted_dt = Duration::from_secs_f64(1.0 / 60.0);
     let floor = predicted_dt + Duration::from_millis(1);
 
-    let ltc_detecting = s.job(JobKind::LtcDecode).phase == JobPhase::Running
-        || s.job(JobKind::LtcDecode).phase == JobPhase::Indeterminate;
-    let offload_running = s.job(JobKind::OffloadCopy).phase == JobPhase::Running;
+    let ltc_detecting = s.job(JobKind::LtcDecode).is_active();
+    let offload_running = s.job(JobKind::OffloadCopy).is_active();
 
     let base = if s.is_playing || ltc_detecting {
         let interval = Duration::from_secs_f64(1.0 / s.fps.max(1.0));
@@ -570,7 +569,7 @@ impl eframe::App for AppState {
         //     publishes running=true (or timeout) so the Start→Cancel button
         //     switch appears on the very next frame after engine publish.
         if let Some(pending_since) = self.offload_start_pending {
-            let offload_running = self.latest.job(JobKind::OffloadCopy).phase == JobPhase::Running;
+            let offload_running = self.latest.job(JobKind::OffloadCopy).is_active();
             if offload_running || now.duration_since(pending_since) >= OFFLOAD_PENDING_TIMEOUT {
                 self.offload_start_pending = None;
             } else {
@@ -1109,6 +1108,7 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use gui_engine::job::JobStatus;
+    use gui_engine::JobPhase;
 
     fn dummy_state() -> Arc<ArcSwap<AppStateSnapshot>> {
         Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())))

@@ -292,6 +292,10 @@ impl JobStatus {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        matches!(self.phase, JobPhase::Running | JobPhase::Indeterminate)
+    }
+
     pub fn apply_outcome(&mut self, outcome: &JobOutcome) {
         match outcome {
             JobOutcome::Succeeded { log, .. } => {
@@ -1171,5 +1175,103 @@ mod tests {
 
         sup.shutdown(Duration::from_secs(5));
         assert!(flag.load(Ordering::Relaxed), "job should have been cancelled");
+    }
+
+    // ── JobStatus::is_active ──────────────────────────────────────────────
+
+    fn can_start_offload(cards_empty: bool, has_parent: bool, copy: &JobStatus, scan: &JobStatus) -> bool {
+        !cards_empty && has_parent && !copy.is_active() && !scan.is_active()
+    }
+
+    #[test]
+    fn test_can_start_offload_blocks_on_indeterminate() {
+        let mut copy = JobStatus::idle();
+        let mut scan = JobStatus::idle();
+
+        assert!(can_start_offload(false, true, &copy, &scan),
+            "should start when both jobs idle");
+
+        copy.phase = JobPhase::Indeterminate;
+        assert!(!can_start_offload(false, true, &copy, &scan),
+            "should not start when copy is Indeterminate");
+
+        copy.phase = JobPhase::Idle;
+        scan.phase = JobPhase::Indeterminate;
+        assert!(!can_start_offload(false, true, &copy, &scan),
+            "should not start when scan is Indeterminate");
+
+        copy.phase = JobPhase::Running;
+        scan.phase = JobPhase::Running;
+        assert!(!can_start_offload(false, true, &copy, &scan),
+            "should not start when both are Running");
+    }
+
+    fn probe_status_label(probe_active: bool, probe_is_none: bool) -> &'static str {
+        if probe_active {
+            "Probing clip audio…"
+        } else if probe_is_none {
+            "Clip audio probe failed."
+        } else {
+            "No channels to map."
+        }
+    }
+
+    #[test]
+    fn test_probe_label_shows_probing_during_indeterminate() {
+        assert_eq!(probe_status_label(true, true), "Probing clip audio…",
+            "Indeterminate/Running → show Probing");
+        assert_eq!(probe_status_label(true, false), "Probing clip audio…");
+        assert_eq!(probe_status_label(false, true), "Clip audio probe failed.",
+            "Idle/Succeeded/Failed + no probe → show failed");
+        assert_eq!(probe_status_label(false, false), "No channels to map.",
+            "Probe exists → show no channels (unreachable in this branch)");
+    }
+
+    fn probe_is_loading(probe_job: &JobStatus) -> bool {
+        probe_job.is_active()
+    }
+
+    fn probe_has_failed(probe_job: &JobStatus, ltc_probe_is_none: bool) -> bool {
+        ltc_probe_is_none && !probe_job.is_active()
+    }
+
+    #[test]
+    fn test_probe_loading_and_failed_with_indeterminate() {
+        let mut probe = JobStatus::idle();
+
+        assert!(!probe_is_loading(&probe), "Idle → not loading");
+        assert!(probe_has_failed(&probe, true), "Idle + none → failed");
+
+        probe.phase = JobPhase::Indeterminate;
+        assert!(probe_is_loading(&probe), "Indeterminate → loading");
+        assert!(!probe_has_failed(&probe, true), "Indeterminate + none → not failed");
+
+        probe.phase = JobPhase::Running;
+        assert!(probe_is_loading(&probe), "Running → loading");
+        assert!(!probe_has_failed(&probe, true), "Running + none → not failed");
+
+        probe.phase = JobPhase::Succeeded;
+        assert!(!probe_is_loading(&probe), "Succeeded → not loading");
+    }
+
+    #[test]
+    fn test_job_status_is_active() {
+        let mut status = JobStatus::idle();
+        assert!(!status.is_active(), "Idle should not be active");
+
+        status.phase = JobPhase::Running;
+        assert!(status.is_active(), "Running should be active");
+
+        status.phase = JobPhase::Indeterminate;
+        assert!(status.is_active(), "Indeterminate should be active");
+
+        status.phase = JobPhase::Succeeded;
+        assert!(!status.is_active(), "Succeeded should not be active");
+
+        status.phase = JobPhase::Cancelled;
+        assert!(!status.is_active(), "Cancelled should not be active");
+
+        status.phase = JobPhase::Failed;
+        assert!(!status.is_active(), "Failed should not be active");
     }
 }

@@ -4,7 +4,7 @@ use gui_engine::command::{
     OffloadCommand,
 };
 use gui_engine::duration::format_duration_secs;
-use gui_engine::{JobKind, JobPhase, UnitState};
+use gui_engine::{JobKind, UnitState};
 
 use crate::app::AppState;
 use crate::theme::{ThemeColors, ACCENT};
@@ -113,7 +113,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let off = &s.offload;
     let cards = off.cards.clone();
-    let scanning = s.job(JobKind::OffloadScan).phase == JobPhase::Running;
+    let scanning = s.job(JobKind::OffloadScan).is_active();
     let scan_msg = s.job(JobKind::OffloadScan).message.clone();
     let file_durations = off.file_durations.clone();
 
@@ -299,8 +299,8 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
 
 fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let is_running = state.latest.job(JobKind::OffloadCopy).phase == JobPhase::Running;
-    let is_scanning = state.latest.job(JobKind::OffloadScan).phase == JobPhase::Running;
+    let is_running = state.latest.job(JobKind::OffloadCopy).is_active();
+    let is_scanning = state.latest.job(JobKind::OffloadScan).is_active();
     let can_start = !state.latest.offload.cards.is_empty()
         && state.latest.offload.parent_folder.is_some()
         && !is_running
@@ -327,8 +327,7 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let off = &s.offload;
     let copy_job = s.job(JobKind::OffloadCopy);
-    let copy_phase = copy_job.phase;
-    let copy_running = copy_phase == JobPhase::Running;
+    let copy_running = copy_job.is_active();
     let copy_fraction = copy_job.fraction;
     let copy_speed = copy_job.speed.unwrap_or(0.0);
     let units = copy_job.units.clone();

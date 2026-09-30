@@ -185,7 +185,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
     });
 
     // File group selector (shows all matched groups with type badge)
-    let groups_loading = state.latest.job(JobKind::FolderScan).phase == JobPhase::Running;
+    let groups_loading = state.latest.job(JobKind::FolderScan).is_active();
     let groups_clone = if groups_loading {
         None
     } else {
@@ -339,7 +339,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                         })
                     })
                     .collect()
-            } else if state.latest.job(JobKind::ClipProbe).phase == JobPhase::Running {
+            } else if state.latest.job(JobKind::ClipProbe).is_active() {
                 vec![ChannelOption {
                     stream: 0,
                     channel: 0,
@@ -452,8 +452,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
 
             ui.add_space(8.0);
 
-            let is_detecting = state.latest.job(JobKind::LtcDecode).phase == JobPhase::Running;
-            let is_group_detecting = state.latest.job(JobKind::LtcGroupDecode).phase == JobPhase::Running;
+            let is_detecting = state.latest.job(JobKind::LtcDecode).is_active();
+            let is_group_detecting = state.latest.job(JobKind::LtcGroupDecode).is_active();
             let any_detecting = is_detecting || is_group_detecting;
 
             if any_detecting {
@@ -521,7 +521,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                 log::info!(
                     "GROUP VIEW: paths={} results={} errors={} detecting={} done/total={}/{} gen={} none={} recording={:?}",
                     group_results.len(), some_count, err_count,
-                    state.latest.job(JobKind::LtcGroupDecode).phase == JobPhase::Running,
+                    state.latest.job(JobKind::LtcGroupDecode).is_active(),
                     state.latest.job(JobKind::LtcGroupDecode).units.len(), state.latest.ltc_group_results.len(), gen,
                     none_count,
                     state.latest.converter.selected_recording_type(),
@@ -589,7 +589,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                                 });
                             }
                             (None, None) => {
-                                if state.latest.job(JobKind::LtcGroupDecode).phase == JobPhase::Running {
+                                if state.latest.job(JobKind::LtcGroupDecode).is_active() {
                                     let pill_frame = egui::Frame::new()
                                         .fill(colors.card_bg)
                                         .corner_radius(4.0)
@@ -1053,7 +1053,7 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
     if n == 0 {
         if is_video && state.latest.ltc_probe.is_none() {
-            if state.latest.job(JobKind::ClipProbe).phase == JobPhase::Running {
+            if state.latest.job(JobKind::ClipProbe).is_active() {
                 ui.label(RichText::new("Probing clip audio…").font(FontId::proportional(10.0)).color(colors.text_muted));
             } else {
                 ui.label(RichText::new("Clip audio probe failed.").font(FontId::proportional(10.0)).color(colors.error_red));
@@ -1252,7 +1252,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
     let caps_opt = state.latest.ffmpeg_caps.clone();
 
     // While the ffmpeg capability probe is still running, show a placeholder.
-    if caps_opt.is_none() && state.latest.job(JobKind::FfmpegCapProbe).phase == JobPhase::Running {
+    if caps_opt.is_none() && state.latest.job(JobKind::FfmpegCapProbe).is_active() {
         ui.label(
             RichText::new("Probing ffmpeg capabilities…")
                 .font(FontId::proportional(10.0))
@@ -1629,7 +1629,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     // Set start time from LTC checkbox
     let is_video_group = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let group_has_results = state.latest.ltc_group_results.iter().any(|r| r.is_some());
-    let ltc_available = state.latest.job(JobKind::LtcDecode).phase != JobPhase::Running && state.latest.job(JobKind::LtcGroupDecode).phase != JobPhase::Running
+    let ltc_available = !state.latest.job(JobKind::LtcDecode).is_active() && !state.latest.job(JobKind::LtcGroupDecode).is_active()
         && if is_video_group {
             group_has_results
         } else {
@@ -1662,7 +1662,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
                 );
             }
         }
-        if !ltc_available && state.latest.job(JobKind::LtcDecode).phase != JobPhase::Running {
+        if !ltc_available && !state.latest.job(JobKind::LtcDecode).is_active() {
             ui.label(
                 RichText::new("(Detect LTC first)")
                     .font(FontId::proportional(10.0))
@@ -1683,7 +1683,7 @@ fn selected_input_files(state: &AppState) -> Vec<PathBuf> {
 
 fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), String>>) {
     let colors = state.theme.colors();
-    let is_running = state.latest.job(JobKind::Conversion).phase == JobPhase::Running;
+    let is_running = state.latest.job(JobKind::Conversion).is_active();
 
     if is_running {
         if ui

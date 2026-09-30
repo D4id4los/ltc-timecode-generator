@@ -65,7 +65,7 @@ pub fn setup_poll_timer(
 
             // 4. LTC decode state sync
             {
-if s.job(JobKind::LtcDecode).phase == JobPhase::Running || s.job(JobKind::LtcGroupDecode).phase == JobPhase::Running {
+if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_active() {
                     ui.set_ltc_status(SharedString::from("detecting"));
                     ui.set_ltc_result_text(SharedString::from(""));
                     ui.set_ltc_error(SharedString::from(""));
@@ -164,15 +164,15 @@ if s.job(JobKind::LtcDecode).phase == JobPhase::Running || s.job(JobKind::LtcGro
 
             // 7. Probe-status flags for video recordings
             if ui.get_conv_is_video_recording() {
-                ui.set_conv_ltc_probe_loading(s.job(JobKind::ClipProbe).phase == JobPhase::Running);
-                ui.set_conv_ltc_probe_failed(s.ltc_probe.is_none() && s.job(JobKind::ClipProbe).phase != JobPhase::Running);
+                ui.set_conv_ltc_probe_loading(s.job(JobKind::ClipProbe).is_active());
+                ui.set_conv_ltc_probe_failed(s.ltc_probe.is_none() && !s.job(JobKind::ClipProbe).is_active());
             } else {
                 ui.set_conv_ltc_probe_loading(false);
                 ui.set_conv_ltc_probe_failed(false);
             }
 
             // 8. Sync decode progress
-            if s.job(JobKind::LtcDecode).phase == JobPhase::Running || s.job(JobKind::LtcGroupDecode).phase == JobPhase::Running {
+if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_active() {
                 ui.set_ltc_decode_progress(s.job(JobKind::LtcDecode).fraction);
             }
 
@@ -298,7 +298,7 @@ if s.job(JobKind::LtcDecode).phase == JobPhase::Running || s.job(JobKind::LtcGro
 
             // 22. ffmpeg capability probe state sync
             {
-                ui.set_conv_ffmpeg_probing(s.job(JobKind::FfmpegCapProbe).phase == JobPhase::Running);
+                ui.set_conv_ffmpeg_probing(s.job(JobKind::FfmpegCapProbe).is_active());
                 if let Some(ref caps) = s.ffmpeg_caps {
                     ui.set_conv_has_ffmpeg(caps.has_ffmpeg);
                     if let Some(ref msg) = caps.error_message {
@@ -494,10 +494,10 @@ if s.job(JobKind::LtcDecode).phase == JobPhase::Running || s.job(JobKind::LtcGro
                 ));
                 ui.set_off_parent_name(SharedString::from(off.parent_name.clone()));
                 let scan_job = s.job(JobKind::OffloadScan);
-                ui.set_off_scanning(scan_job.phase == JobPhase::Running);
+                ui.set_off_scanning(scan_job.is_active());
                 ui.set_off_scan_status(SharedString::from(scan_job.message.clone()));
                 let copy_job = s.job(JobKind::OffloadCopy);
-                ui.set_off_running(copy_job.phase == JobPhase::Running);
+                ui.set_off_running(copy_job.is_active());
                 ui.set_off_overall_progress(copy_job.fraction);
                 let speed_bps = copy_job.speed.unwrap_or(0.0);
                 ui.set_off_speed_text(SharedString::from(
