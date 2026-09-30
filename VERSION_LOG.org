@@ -1,6 +1,64 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* v0.4.7
+
+Main features are a hardened, more responsive card-offload workflow —
+live per-drive scan status, a non-blocking Start button, fixed
+multi-file progress/speed reporting, an end to the endless card-scan
+hang on FS100 (AVCHD) cards, and per-card scroll isolation — plus a
+converter fix that stops the wrong track being dropped as LTC.
+
+List of Changes:
+- Offloading:
+  - Fix progress/speed reporting for multi-file copies: the bar froze
+    during files 2..N with speed reading 0 MB/s, then jumped by a whole
+    file's share on completion (and could clamp at 100% early).
+    Per-file deltas are now reported correctly; per-device byte
+    counters use AtomicU64 so cards over 4 GiB no longer wrap on
+    32-bit builds; the speed EMA no longer collapses to 0 MB/s during
+    fsync/verify pauses between files.
+  - Live scan status: the static "Scanning…" indicator is replaced by
+    per-drive messages (e.g. "Scanning drive EOS_DIGITAL
+    (/run/media/…)…"), covering the Linux auto-mount phase too, shown
+    in the Offload tab and status bar of both GUIs.
+  - Start Offload is non-blocking: copy plans are built from the sizes
+    already collected during the card scan (zero I/O) instead of
+    stat'ing every file on the card on the engine thread — the
+    Start→Cancel switch is instant and the engine no longer stalls;
+    ltc-gui also repaints continuously while an offload is pending or
+    running (fixing the 1 Hz progress bar).
+  - Fix endless card-scan hang on FS100 (AVCHD) cards: device-name
+    resolution read the head+tail (8 MB) of every video file on the
+    card — minutes of cold reads with no timeout. Hardened with
+    bounded budgets: camera-meta probes sample at most 3 clips, file
+    reads run on a detached thread with a 10 s budget, resolution
+    carries a 60 s overall budget (degrading to pattern → label →
+    "unknown"), and the whole card scan is capped at 120 s. The chain
+    now logs per-step progress. The converter's clip probe is likewise
+    capped at 3 camera-meta probes per group.
+  - Fix all card file lists scrolling together (ltc-gui): every card's
+    scroll area shared one egui id, so scrolling one card scrolled all
+    of them in lockstep; cards are now id-salted per mount path.
+  - Fix Windows cross-compile: DRIVE_* constants (windows-sys 0.59)
+    referenced from the wrong module path.
+- Convert tab:
+  - Fix converter sometimes dropping the wrong track as LTC: the
+    ltc-gui decode-section track selector never propagated to the
+    engine, so conversion kept dropping track 1 even when another
+    track was selected and decoded (the offload→converter handoff hit
+    exactly this, silently losing a production-audio track). Track
+    selection is now engine-synced, auto-derived from the decoded
+    file's position in the group, and LTC dropping matches the input
+    index so it stays correct under permuted channel maps.
+  - Fix output folder re-defaulting only on the first recording: the
+    GUI's settings-reconcile loop echoed engine-initiated folder
+    changes back as user edits, permanently freezing the folder;
+    engine-initiated changes are now adopted, never echoed back.
+- Misc:
+  - The default log filter is now defined once in gui-engine
+    (log_buffer.rs), unifying the project log level at debug.
+
 * v0.4.6
 
 Main features are a faster, more reliable card-offload workflow —
