@@ -188,7 +188,7 @@ pub struct AppState {
     pub offload_last_version: u64,
     /// When the user clicks Start Offload, set to `Instant::now()` so the
     /// next frame forces a fast repaint until the engine publishes
-    /// `offload.running = true`. Resets once running is visible.
+    /// `job(JobKind::OffloadCopy).is_active()`. Resets once active is visible.
     offload_start_pending: Option<Instant>,
 
     // ── GUI-local text edit buffers ────────────────────────────────────
@@ -210,7 +210,7 @@ impl AppState {
     }
 
     /// Mark the offload start as pending so the next frame forces a fast repaint
-    /// until the engine publishes `running = true`.
+    /// until the engine publishes `job(JobKind::OffloadCopy).is_active()`.
     pub fn mark_offload_start_pending(&mut self) {
         self.offload_start_pending = Some(Instant::now());
     }
@@ -566,7 +566,7 @@ impl eframe::App for AppState {
         ctx.request_repaint_after(next_repaint_interval(&self.latest));
 
         // 7a. Offload start-pending latch: force fast repaints until the engine
-        //     publishes running=true (or timeout) so the Start→Cancel button
+        //     publishes is_active() (or timeout) so the Start→Cancel button
         //     switch appears on the very next frame after engine publish.
         if let Some(pending_since) = self.offload_start_pending {
             let offload_running = self.latest.job(JobKind::OffloadCopy).is_active();

@@ -2,8 +2,6 @@ pub use crate::naming::DEFAULT_AUDIO_SUFFIX;
 pub use crate::naming::DEFAULT_VIDEO_SUFFIX;
 pub use crate::naming::DEFAULT_PREFIX;
 
-pub(crate) mod progress;
-
 pub(crate) mod channel_map;
 pub use channel_map::ChannelMap;
 

@@ -119,9 +119,6 @@ pub struct ConverterSnapshot {
     pub probes_generation: u64,
     /// The folder being (or last) scanned.
     pub groups_folder: Option<PathBuf>,
-    /// Generation counter — incremented on each `SelectFolder` so stale
-    /// scan results from rapid re-clicks are discarded.
-    pub groups_generation: u64,
     /// Engine-owned user settings — sole source of truth.
     pub settings: ConverterUserSettings,
     /// Readiness blockers — recomputed by the engine on settings/groups/
@@ -231,11 +228,6 @@ pub struct AppStateSnapshot {
     pub ltc_selected_stream: usize,
     pub ltc_selected_channel: usize,
     pub ltc_decode_is_video: bool,
-    /// Monotonically increasing generation — only probe results matching the
-    /// current generation are accepted (discards stale results from rapid
-    /// re-clicks).
-    pub ltc_probe_generation: u64,
-
     // LTC group (batch) decode — decode every clip in a video recording group
     pub ltc_group_decode_generation: u64,
     /// Paths of the group being decoded, index-aligned with results.
@@ -255,14 +247,6 @@ pub struct AppStateSnapshot {
     /// Per-file durations keyed by full path. `None` meaning the file
     /// could not be probed (unreadable, no ffprobe, etc).
     pub file_durations: HashMap<PathBuf, Option<f64>>,
-    /// Monotonically increasing generation — only results matching the
-    /// current generation are accepted (discards stale results from
-    /// rapid re-scans).
-    pub file_durations_generation: u64,
-    /// Monotonically increasing version — incremented on each successful
-    /// duration insertion so poll.rs can detect changes.
-    pub file_durations_version: u64,
-
     // Engine-owned converter state
     pub converter: ConverterSnapshot,
 
@@ -332,7 +316,6 @@ impl AppStateSnapshot {
             ltc_selected_stream: 0,
             ltc_selected_channel: 0,
             ltc_decode_is_video: false,
-            ltc_probe_generation: 0,
             ltc_group_decode_generation: 0,
             ltc_group_paths: Vec::new(),
             ltc_group_results: Vec::new(),
@@ -340,8 +323,7 @@ impl AppStateSnapshot {
             ffmpeg_caps: None,
             jobs: HashMap::new(),
             file_durations: HashMap::new(),
-            file_durations_generation: 0,
-            file_durations_version: 0,
+            
             converter: ConverterSnapshot {
                 groups: Vec::new(),
                 selected_group_idx: None,
@@ -350,7 +332,6 @@ impl AppStateSnapshot {
                 device_name: None,
                 probes_generation: 0,
                 groups_folder: None,
-                groups_generation: 0,
                 settings: ConverterUserSettings::initial(),
                 readiness: Vec::new(),
                 collision_warning: None,
@@ -528,14 +509,6 @@ mod tests {
         assert!(s.ltc_group_paths.is_empty());
         assert!(s.ltc_group_results.is_empty());
         assert!(s.ltc_group_errors.is_empty());
-    }
-
-    // ── LTC probe generation ──────────────────────────────────────────────
-
-    #[test]
-    fn test_initial_probe_generation_zero() {
-        let s = initial_state();
-        assert_eq!(s.ltc_probe_generation, 0);
     }
 
     #[test]

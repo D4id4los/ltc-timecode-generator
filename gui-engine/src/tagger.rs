@@ -1,5 +1,5 @@
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Output;
 
 use std::time::Duration;
@@ -1023,64 +1023,6 @@ fn tag_via_ffmpeg_with(
 
     log::info!("Tagged {} via ffmpeg (stream copy)", path.display());
     Ok(TagOutcome::TaggedViaFfmpeg)
-}
-
-/// Process a tagging run for multiple files, with a shared progress+state
-/// reporter, advancing `overall_progress` and logging `overall_log`.
-/// Each file gets an equal weight `file_weight` in progress.
-pub fn run_tagging<R: crate::converter::runner::ConversionReport>(
-    paths: &[PathBuf],
-    timecodes: &[Option<TimecodeMetadata>],
-    cameras: &[Option<CameraInfo>],
-    report: &R,
-) -> bool {
-    for (i, path) in paths.iter().enumerate() {
-        if report.is_cancelled() {
-            report.append_log("\n--- CANCELLED ---\n");
-            return false;
-        }
-
-        let tc = match timecodes.get(i).and_then(|m| m.as_ref()) {
-            Some(tc) => tc,
-            None => {
-                let msg = format!(
-                    "Skipping {}: no start timecode available\n",
-                    path.display()
-                );
-                log::warn!("{}", msg.trim());
-                report.append_log(&msg);
-                continue;
-            }
-        };
-
-        let camera = cameras.get(i).and_then(|c| c.as_ref());
-        match tag_file(path, tc, camera) {
-            Ok(outcome) => {
-                let msg = match outcome {
-                    TagOutcome::TaggedInPlace => {
-                        format!("✓ {} — tagged in place\n", path.display())
-                    }
-                    TagOutcome::TaggedViaFfmpeg => {
-                        format!("✓ {} — tagged via ffmpeg\n", path.display())
-                    }
-                    TagOutcome::Skipped { reason } => {
-                        format!("⚠ {} — skipped: {}\n", path.display(), reason)
-                    }
-                };
-                log::info!("{}", msg.trim());
-                report.append_log(&msg);
-            }
-            Err(e) => {
-                let msg = format!("✗ {} — failed: {}\n", path.display(), e);
-                log::error!("{}", msg.trim());
-                report.append_log(&msg);
-            }
-        }
-
-        report.advance_step();
-    }
-
-    true
 }
 
 // ── Endian helpers ─────────────────────────────────────────────────────

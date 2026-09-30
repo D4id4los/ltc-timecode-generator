@@ -68,7 +68,6 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── hw_device.rs          # VAAPI/Vulkan hw-device discovery, render-node enumeration, test-encode validation
 │   │   ├── converter/            # Converter directory module (see Converter section)
 │   │   │   ├── mod.rs            # Facade: re-exports public API from submodules
-│   │   │   ├── progress.rs       # ConversionState, ConversionStatus, SharedConversionState, CancelFlag
 │   │   │   ├── channel_map.rs    # ChannelMap (input→output permutation)
 │   │   │   ├── timecode.rs       # TimecodeMetadata, format_ffmpeg_timecode, shift_timecode_back, TC math
 │   │   │   ├── capabilities.rs   # FfmpegCapabilities, HwDeviceCapabilities, query_ffmpeg_capabilities
@@ -194,33 +193,6 @@ The engine tracks the currently-active `JobId` per kind. When a `Finished`
 event arrives, the engine checks if its `JobId` still matches the active one
 for that kind — stale results from superseded jobs are discarded.
 
-#### Migration Status (Phase 4 completed — unified job status map):
-
-All async task progress and status is now published through the single
-`jobs: HashMap<JobKind, JobStatus>` field in `AppStateSnapshot`, replacing
-the previous ad-hoc fields (`conversion_state`, `groups_loading`,
-`probes_loading`, `offload.running`, `offload.overall_progress`, etc.).
-GUIs access job state via `state.job(kind)` which returns `JobStatus`
-with phase, fraction, speed, per-unit detail, log, and error — every
-async task kind (conversion, offload, decode, probe) follows the same
-contract. The legacy `OffloadContext`/`DeviceProgressInner`/`run_offload`
-code path has been deleted; only the `spawn_job`-based `run_offload_copy_job`
-remains.
-
-#### Migration Status (Phase 3 completed — all tasks migrated):
-- **FfmpegCapProbe** — via `spawn_job`, payload `JobFinal::FfmpegCaps`
-- **FolderScan** — via `spawn_job`, payload `JobFinal::FolderScan`
-- **Conversion** — via `spawn_conversion_job()` wrapper, payload `JobFinal::Conversion`
-- **OffloadScan** — via `run_offload_scan_job()`, payload `JobFinal::OffloadScan`
-- **OffloadCopy** — via `run_offload_copy_job()`, payload `JobFinal::OffloadCopy`
-- **VideoProbe** — via `spawn_job`, payload `JobFinal::VideoProbe`
-- **DurationProbe** — via `spawn_job`, payload `JobItem::DurationResult` per file, `JobFinal::DurationsDone`
-- **LtcDecode** (WAV + video) — via `spawn_job`, payload `JobFinal::Decode`, 1–2 unit(s) with `bridge_decode_progress()` for chunked progress
-- **LtcGroupDecode** — via `spawn_job`, payload `JobItem::ClipLtcResult` per clip, `JobFinal::NoPayload`
-- **ClipProbe** (converter probe) — via `spawn_job`, payload `JobFinal::ClipProbes`
-
-Progress polling and speed tracking are handled by `ProgressTracker.snapshot()` and `SpeedMeter` (offload copy speed read from `ProgressSnapshot.speed`).
-
 ### Sole Source of Truth — State Ownership
 
 The engine is the **sole source of truth** for all application state. GUIs hold only framework-level state (tab index, popup visibility, toast notifications, text-edit-in-progress buffers, scroll offsets). All user-configurable options — including every converter setting (container, codecs, split/drop/trim toggles, channel map, output paths, naming templates) — are engine-owned via `ConverterUserSettings` in `AppStateSnapshot.converter.settings`.
@@ -254,27 +226,25 @@ Field groups (see `state.rs` for the full struct): generation counter; transport
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 0. **Spawn ffmpeg capability probe** — before the loop starts, a `spawn_job` with `JobKind::FfmpegCapProbe` runs `query_ffmpeg_capabilities()`.
-1. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop. Converter commands are handled inline (selectors, setters, side-effects, config persistence, deferred `SelectRecording` while `groups_loading`) or dispatched to `process_command`. Offload commands are handled by `handle_offload_command()`.
-2. **Poll supervisor + drain events** — `supervisor.poll()` returns progress snapshots for all active job types (Conversion, OffloadCopy, OffloadScan, DurationProbe, VideoProbe, FolderScan, FfmpegCapProbe). Conversion and offload copy progress snapshots are mapped to snapshot fields. Then `supervisor.drain()` dispatches `JobEvent::Finished` events:
-    - Conversion → updates `converter.conversion_state`, manages status transitions
+1. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop (calling `supervisor.shutdown()` to cancel+join active jobs first). Converter commands are handled inline (selectors, setters, side-effects, config persistence, deferred `SelectRecording` while a folder scan is in flight) or dispatched to `process_command`. Offload commands are handled by `handle_offload_command()`.
+2. **Poll supervisor + drain events** — `supervisor.poll()` returns progress snapshots for all active job types; progress is published into `state.jobs[kind]`. Then `supervisor.drain()` dispatches `JobEvent::Finished` and `JobEvent::Item` events — the unified dispatcher handles all 10 `JobKind` variants (Conversion, FfmpegCapProbe, FolderScan, VideoProbe, OffloadScan, DurationProbe, OffloadCopy, LtcDecode, LtcGroupDecode, ClipProbe), replacing the previous per-kind legacy mpsc channels and generation-gated result drains:
+    - Conversion → updates `state.jobs[Conversion]`, manages status transitions
     - FfmpegCapProbe → `apply_ffmpeg_probe_result()`
     - FolderScan → updates `converter.groups`, applies deferred `SelectRecording`
     - VideoProbe → updates `ltc_probe` for decoder stream/channel selection
     - OffloadScan → updates `offload.cards`, spawns `DurationProbe` for file durations
     - DurationProbe `Item` → fills `file_durations` + `offload.file_durations`
     - OffloadCopy → completes device names, updates `last_offload_version`
-3. **Drain async decode results** (legacy mpsc channel) — generation-stamped, so stale results from rapid re-clicks are discarded. On completion, auto-applies LTC settings to converter (split/drop/start-from-LTC) once per generation.
-4. **Drain async group decode results** (legacy mpsc channel) — same generation gating; on full group completion, same auto-apply.
-5. **Drain converter clip probe results** (legacy mpsc channel) — populates `ltc_probe` for video groups; resizes `channel_map` to identity if probe channel count changed.
-6. **Poll chunked/group decode progress** — updates progress pct from atomics
-7. **Reset conversion idle** — if conversion job finished but state is still Running, resets to idle.
-8. **Poll timecode** — `core.current_timecode()` when playing
-9. **Drain events** — clears `state.events` first, then drains `core.drain_events()`, dispatches to recovery or forwards to `state.events`
-10. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s); determines if clap animation is still visibly in progress.
-11. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
-12. **Update system time**
-13. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
-14. **Sleep** until next tick
+    - LtcDecode → updates `ltc_decode_result`, auto-applies settings once per generation
+    - LtcGroupDecode `Item` → fills per-clip results; `Finished` → auto-applies group settings
+    - ClipProbe → populates `converter.probes`/`camera_meta`/`device_name`
+3. **Poll timecode** — `core.current_timecode()` when playing
+4. **Drain audio events** — clears `state.events` first, then drains `core.drain_events()`, dispatches to recovery or forwards to `state.events`
+5. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s); determines if clap animation is still visibly in progress.
+6. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
+7. **Update system time**
+8. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
+9. **Sleep** until next tick
 
 ### Audio Lifecycle
 - **Init**: 3 retries with exponential backoff (50ms → 100ms → 200ms). Distinguishes permanent errors (permission denied — no retry) from transient (device busy — retry).
@@ -290,7 +260,7 @@ The offload subsystem ingests camera media from SD cards into organised folders.
 - **Device naming** — uses `device_name.rs` resolution chain: XAVC binary sniff → camera metadata → filename pattern (Sony/Canon/Panasonic/GoPro/TASCAM) → volume label → `"unknown"`.
 - **Selection** — `apply_selection()`: all/none/latest-recording-day per card; per-file toggles via `SetFileSelected`.
 - **Copy planning** — `plan_copies_for_files()`: flat `parent/<ISO-date>/<device>/` layout with `name (2).ext` collision renaming.
-- **Execution** — `run_offload()` runs on a background thread: chunked 1 MiB streaming reads, temporary `.offload_tmp` → atomic rename, size-only verification at the end. Idempotent resume: skips files whose destination already exists with matching size. Cancellation via `CancelToken`. Per-device state machine: `Pending` / `Copying` / `Done` / `Failed(String)` / `Skipped`.
+- **Execution** — `run_offload_copy_job()` runs via `spawn_job` on a background thread: chunked 1 MiB streaming reads, temporary `.offload_tmp` → atomic rename, size-only verification at the end. Idempotent resume: skips files whose destination already exists with matching size. Cancellation via `CancelToken`. Per-device state machine: `Pending` / `Copying` / `Done` / `Failed(String)` / `Skipped`.
 - **Events** — offload scan and copy are managed via `spawn_job` with `JobKind::OffloadScan`/`OffloadCopy`. Progress reported via `ProgressTracker` and polled by `supervisor.poll()`. Duration probing uses `JobKind::DurationProbe` with per-file `JobItem::DurationResult` emissions.
 - **Config** — persists `parent_folder` via `config::save_offload_parent()`; restored by `seed_snapshot_from_config()` at startup.
 - **Converter handoff** — `last_offload_parent` is published in the snapshot; ltc-gui's `logic()` watches for changes and auto-switches the converter to the fresh offload destination.
@@ -321,7 +291,7 @@ The converter turns raw recordings into deliverables: trim each file to its firs
 
 All converter user settings live in `ConverterUserSettings` (`state.rs`), owned by the engine. GUIs send `ConverterCommand` variants for every mutation. The engine applies side-effects (defaults repair, prefix prefill, channel-map resize, LTC auto-apply, config persistence, encoder re-selection on container change) and publishes the updated snapshot. Derived UI data (readiness blockers, collision warning, output preview, encoder chain description) is recomputed by `recompute_converter_derived()` in the engine and published for GUIs to render.
 
-Conversion execution runs in the engine thread via `StartConversion` which calls `assemble_converter_settings()` then `spawn_job` with `JobKind::Conversion`. The `spawn_conversion_job()` wrapper bridges the legacy `SharedConversionState`/`CancelFlag` to the unified `ProgressTracker`/`CancelToken`. Progress is polled each tick via `supervisor.poll()` and published into `state.jobs[JobKind::Conversion]`.
+Conversion execution runs in the engine thread via `StartConversion` which calls `assemble_converter_settings()` then `spawn_job` with `JobKind::Conversion`. The `spawn_conversion_job()` wrapper bridges the `ConversionReport` trait to the unified `ProgressTracker`/`CancelToken`. Progress is polled each tick via `supervisor.poll()` and published into `state.jobs[JobKind::Conversion]`.
 
 ### Components (`converter/` directory module)
   - `ConversionPipeline`: `AudioOnly { generate_synthetic_video }` (multi-track WAV → audio/video outputs), `VideoPassthrough` (camera clips → video outputs), and `MetadataOnly` (tag originals in place, rename, extract audio).
@@ -330,14 +300,14 @@ Conversion execution runs in the engine thread via `StartConversion` which calls
   - **Video encoder selection is codec-level** (see `video_codecs.rs` below): `ConverterSettings.video_encoder` stores a codec id (`"av1"`, `"h265"`, …); `resolved_video_encoder` holds the concrete ffmpeg encoder chosen at conversion time.
   - `query_ffmpeg_capabilities()` probes ffmpeg once; after listing encoders/formats and discovering HW devices (VAAPI/Vulkan), it **validates each hardware encoder candidate with a 1-frame test encode** (`-f lavfi -i testsrc=... -c:v <enc> -f null -` with 10s timeout). Non-functional encoders (missing driver, incompatible GPU) are removed from `available_encoders` so they never appear in the dropdown or encoder chain. `available_*_for_container()` filters audio encoders/containers; `select_best_combination()` picks defaults (codec-aware); `apply_available_defaults()` repairs stale settings.
   - `plan_video_outputs()` → ordered `VideoOutputStep` list (`VideoOnly`, `VideoMux` with `AudioKeep`, `AudioChannel` extraction); caller executes each step.
-  - `spawn_conversion()` takes `caps: Option<&FfmpegCapabilities>`, resolves the codec into an ordered encoder chain, and runs the steps on a background thread, publishing `ConversionState` (`Idle`/`Running{progress}`/`Completed`/`Failed` + ffmpeg output lines); cancellation via `CancelFlag`. Failures are classified as `StepFailure::EncoderInit` (no output produced → retry with next encoder in the chain) or `StepFailure::Fatal`; failed encoders are memoized for the rest of the run and the first successful one is pinned (reported as `Video encoder used: …` in the log).
+  - `spawn_conversion()` takes `caps: Option<&FfmpegCapabilities>`, resolves the codec into an ordered encoder chain, and runs the steps on a background thread, publishing progress via the `ConversionReport` trait; cancellation via `CancelToken`. Failures are classified as `StepFailure::EncoderInit` (no output produced → retry with next encoder in the chain) or `StepFailure::Fatal`; failed encoders are memoized for the rest of the run and the first successful one is pinned (reported as `Video encoder used: …` in the log).
   - **Stream-copy mode** (`copy_video`, UI: "Leave Video Encoding Untouched", VideoPassthrough only): video is remuxed with `-c:v copy` — no encoder chain, no `-r`; muxed audio is `-c:a copy` unless channel filtering forces an audio-only re-encode. `prepare_copy_mode()` derives the output container from the input (`copy_mode_container_for_input()`: mp4/m4v→mp4, mov→mov, mkv→mkv, mxf→mxf, mts/m2ts/ts→mp4, else mkv), snaps each trim offset to the nearest video keyframe at-or-before it (`ffprobe::snap_trim_to_keyframe()` packet scan), and re-anchors the start timecode via `shift_timecode_back()` (DF-aware, inverse of `audio_core::increment_timecode`) so the embedded TC matches the actual first video frame. Sanity check: `conversion_sanity_check_with_naming(…, copy_video)` / `conversion_sanity_check_copy()` skip video-codec validation in this mode.
   - `evaluate_readiness()` / `ConvertBlocker` / `conversion_sanity_check()` — preflight validation surfaced in the UI before starting.
   - `format_ffmpeg_timecode()` (HH:MM:SS:FF or HH:MM:SS;FF), `find_timecode_at_offset()` (maps decode results → per-file start TC).
   - **`push_metadata_args()`** (`converter/args.rs`) — adds camera metadata to ffmpeg arg lists: `-metadata make/model` (or `com.apple.quicktime.*` for MOV) on video outputs, `-write_bext 1` + `originator` + `origination_date` on WAV outputs. Gated by `embed_camera_metadata`. Originator defaults to `"LTC Timecode Generator"` when no camera is detected. Origination date falls back to file mtime via `chrono`.
   - **`tagger.rs` bext extension** — in-place WAV tagging now writes `originator` (payload offset 256, 32 B, NUL-padded) and `origination_date` (payload offset 320, 10 B) in addition to `time_reference` (offset 338). A `chunk_size >= 346` guard rejects undersized bext chunks, falling back to ffmpeg remux.
   - **Camera metadata probe** — during converter clip probing, the engine also runs `camera_meta::probe_camera_info()` for each file (cheap second subprocess parallel to ffprobe). Results are published as `Vec<Option<CameraInfo>>` in `ConverterSnapshot.camera_meta`, generation-gated and cleared on recording re-selection.
-  - **`embed_camera_metadata` toggle** — `ConverterUserSettings.embed_camera_metadata` (default `true`) is engine-owned. Both GUIs expose a checkbox (ltc-gui: converter widget step 3; ltc-slint: step 4 near Set Start Time from LTC). The converter metadata-only pipeline (`tagger::tag_file`, `run_tagging`) also accepts and embeds camera info.
+  - **`embed_camera_metadata` toggle** — `ConverterUserSettings.embed_camera_metadata` (default `true`) is engine-owned. Both GUIs expose a checkbox (ltc-gui: converter widget step 3; ltc-slint: step 4 near Set Start Time from LTC). The converter metadata-only pipeline (`tagger::tag_file`) also accepts and embeds camera info.
 - **`video_codecs.rs`** — codec → encoder registry (single source of truth for video encoding):
   - `VIDEO_CODECS`: per codec (`av1`, `h264`, `h265`, `prores`, `dnxhd`) the user-facing label, allowed containers, codec-level args (e.g. `-tag:v hvc1` for HEVC), and a priority-ordered `EncoderCandidate` chain — hardware encoders (nvenc/qsv/amf/mf/vaapi/vulkan/v4l2m2m) first, software encoders (libsvtav1/libaom-av1/libx264/libx265/prores_ks/dnxhd) as fallbacks. Candidates carry their own args (e.g. `pix_fmt=yuv420p`); hardware candidates negotiate pixel format themselves.
   - `available_video_codecs()` (dropdown source), `resolve_encoder_chain()` (ordered available candidates, gated by hw-device availability for vaapi/vulkan), `static_encoder_chain()`, `normalize_video_codec()` (maps legacy concrete encoder names like `libx264` to codec ids), `describe_chain()` (UI summary "av1_nvenc (hardware) → libsvtav1").
@@ -346,7 +316,7 @@ Conversion execution runs in the engine thread via `StartConversion` which calls
 - **`file_pattern.rs`** — groups input files by naming convention. `BUILTIN_PATTERNS` (TASCAM Portacapture X8 `nameS<ch>`, `*` any) + `CAMERA_PATTERNS` (Sony Handycam, Sony FS100, Canon `MVI_`, Panasonic `GH`, GoPro `GOPR`/`GP`). `match_files_to_groups()` / `wrap_user_selected_files()` / `match_files_all_patterns()`; `default_output_filename()` derives the output name from the group.
 - **`ffprobe.rs`** — `probe_video_audio()` (ffprobe JSON → `VideoAudioProbe` with per-stream channels/codec/sample-rate), `path_is_video()`, `extract_audio_channel()` (ffmpeg extraction used by decode), `snap_trim_to_keyframe()` / `parse_last_keyframe()` (keyframe packet scan used by stream-copy trim snapping).
 - **`config.rs`** — persists last input/output folders to `<config_dir>/ltc-timecode-generator/converter_config.json`; also persists `last_offload_parent` via `save_offload_parent()` / `seed_snapshot_from_config()`.
-- **`tagger.rs`** — in-place timecode metadata tagger: dispatches MOV/MP4 (native O(1) in-place tagger: trailing moov → free + appended tmcd track + tiny mdat), WAV with existing bext (patches time_reference), and ffmpeg stream-copy remux (temp file + atomic rename) as fallback for other containers. `tag_file()` dispatches. `run_tagging()` runs batch tagging with progress/cancel for the metadata-only pipeline.
+- **`tagger.rs`** — in-place timecode metadata tagger: dispatches MOV/MP4 (native O(1) in-place tagger: trailing moov → free + appended tmcd track + tiny mdat), WAV with existing bext (patches time_reference), and ffmpeg stream-copy remux (temp file + atomic rename) as fallback for other containers. `tag_file()` dispatches per-file tagging. The metadata-only pipeline calls `tag_file()` inline for each input.
 
 ### Flow
 Select files → group by naming pattern → probe (ffprobe) → (ffmpeg capabilities already probed async at engine startup) → readiness/blockers check → channel mapping + LTC track handling → trim-to-first-LTC + timecode metadata → `spawn_conversion` (progress + cancel). `MetadataOnly` pipeline skips trimming and encoder checks: originals are tagged in place (native MP4/MOV or ffmpeg remux), renamed, and audio extracted per channel. See `run_metadata_only()` and `tagger::tag_file()`.

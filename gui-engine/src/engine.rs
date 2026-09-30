@@ -90,7 +90,7 @@ pub fn engine_main_with_probe<F>(
         });
     }
 
-    loop {
+    'engine: loop {
         let now = Instant::now();
         let dt = (now - last_tick).as_secs_f32();
         last_tick = now;
@@ -102,14 +102,13 @@ pub fn engine_main_with_probe<F>(
                     let _ = core.stop_ltc();
                     let _ = core.stop_output();
                     info!("Engine shutdown via Shutdown command");
-                    return;
+                    break 'engine;
                 }
                 Ok(GuiCommand::ProbeFileDurations(paths)) => {
                     if supervisor.is_running(JobKind::DurationProbe) {
                         info!("Duration probe already in progress — ignoring duplicate ProbeFileDurations");
                         continue;
                     }
-                    current.file_durations_generation += 1;
                     current.file_durations.clear();
                     let spec = job::JobSpec {
                         kind: JobKind::DurationProbe,
@@ -131,7 +130,6 @@ pub fn engine_main_with_probe<F>(
                 Ok(GuiCommand::Converter(ConverterCommand::SelectFolder(path))) => {
                     current.converter.groups.clear();
                     current.converter.groups_folder = Some(path.clone());
-                    current.converter.groups_generation = current.converter.groups_generation.wrapping_add(1);
                     pending_recording = None; // new scan invalidates any deferred selection
                     current.converter.selected_group_idx = None;
                     current.converter.probes.clear();
@@ -309,7 +307,6 @@ pub fn engine_main_with_probe<F>(
                         continue;
                     }
                     info!("Probing video file for audio streams (async via job): {}", path);
-                    current.ltc_probe_generation += 1;
                     current.ltc_probe = None;
                     current.ltc_decode_error = None;
                     current.ltc_decode_is_video = false;
@@ -343,7 +340,7 @@ pub fn engine_main_with_probe<F>(
                     info!("Engine shutdown via channel disconnect");
                     let _ = core.stop_ltc();
                     let _ = core.stop_output();
-                    return;
+                    break 'engine;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
             }
@@ -513,8 +510,6 @@ pub fn engine_main_with_probe<F>(
                 JobEvent::Item { kind: JobKind::DurationProbe, item: JobItem::DurationResult { path, secs }, .. } => {
                     // Write to converter file_durations
                     current.file_durations.insert(path.clone(), secs);
-                    current.file_durations_version =
-                        current.file_durations_version.wrapping_add(1);
                     // Write to offload file_durations
                     current.offload.file_durations.insert(path, secs);
                     current.offload.durations_version =
@@ -754,6 +749,8 @@ pub fn engine_main_with_probe<F>(
             std::thread::sleep(sleep_dur);
         }
     }
+
+    supervisor.shutdown(Duration::from_secs(2));
 }
 
 /// Extract a single audio channel from a video file and decode LTC from it.
@@ -1207,7 +1204,6 @@ fn process_command(
             supervisor.cancel(JobKind::LtcDecode);
             state.jobs.insert(JobKind::LtcDecode, job::JobStatus::idle());
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
-            state.ltc_probe_generation = state.ltc_probe_generation.wrapping_add(1);
             state.ltc_group_paths = Vec::new();
             state.ltc_group_results = Vec::new();
             state.ltc_group_errors = Vec::new();
@@ -2116,7 +2112,6 @@ fn apply_recording_selection(
     // Bump decode generations so in-flight results from the old
     // recording are discarded by the generation check.
     state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
-    state.ltc_probe_generation = state.ltc_probe_generation.wrapping_add(1);
     state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
     // Reset auto-apply latches so next decode re-applies defaults
     *last_auto_applied_ltc_gen = 0;
