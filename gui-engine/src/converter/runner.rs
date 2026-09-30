@@ -23,6 +23,7 @@ use crate::converter::process::{
 use crate::converter::progress::{CancelFlag, ConversionStatus, SharedConversionState};
 use crate::converter::settings::{ConversionPipeline, ConverterSettings, RecordingType};
 use crate::ffprobe::VideoAudioProbe;
+use crate::job::{JobContext, JobError, JobFinal};
 use crate::naming;
 use crate::video_codecs;
 
@@ -363,6 +364,99 @@ pub fn spawn_conversion(
             );
         }
     })
+}
+
+/// Version of the conversion that works with `spawn_job` from the unified
+/// job infrastructure. Uses the existing `spawn_conversion` internally and
+/// bridges the progress reporting. Returns `JobFinal::Conversion`.
+pub fn spawn_conversion_job(
+    ctx: &JobContext,
+    settings: ConverterSettings,
+    caps: Option<crate::converter::capabilities::FfmpegCapabilities>,
+) -> Result<JobFinal, JobError> {
+    let state: SharedConversionState = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::converter::progress::ConversionState::idle(),
+    ));
+    let cancel: CancelFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Forward cancel from JobContext to internal cancel flag
+    let cancel_inner = cancel.clone();
+    let ctx_cancel = ctx.cancel.inner().clone();
+    std::thread::spawn(move || {
+        while !ctx_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        cancel_inner.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    ctx.progress.set_indeterminate(true);
+
+    // Spawn the actual conversion thread
+    let handle = spawn_conversion(settings, state.clone(), cancel, caps.as_ref());
+
+    // Poll for completion, bridging progress to JobContext
+    ctx.progress.set_indeterminate(false);
+    // Resize to 1 unit for overall progress
+    ctx.progress.resize(1);
+
+    while !handle.is_finished() {
+        if let Ok(s) = state.lock() {
+            match &s.status {
+                ConversionStatus::Running { progress } => {
+                    ctx.progress.unit(0).set_fraction(*progress);
+                    ctx.progress.set_message(format!("Conversion: {:.0}%", progress * 100.0));
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+
+    let _ = handle.join();
+
+    // Read final state
+    let (final_status, final_log) = {
+        let s = state.lock().unwrap();
+        (s.status.clone(), s.ffmpeg_output.clone())
+    };
+
+    // Mark unit as done
+    ctx.progress.unit(0).finish();
+    ctx.progress.set_message("");
+
+    match final_status {
+        ConversionStatus::Completed => {
+            // Extract encoder info from log
+            let encoder_used = if final_log.contains("Video encoder used:") {
+                final_log.lines()
+                    .find(|l| l.contains("Video encoder used"))
+                    .map(|l| l.trim_start_matches("Video encoder used: ").to_string())
+            } else if final_log.contains("stream copy") || final_log.contains("stream-copy") {
+                Some("stream-copy".to_string())
+            } else if final_log.contains("Tags written") {
+                None
+            } else {
+                None
+            };
+            info!("Conversion job completed successfully");
+            Ok(JobFinal::Conversion {
+                encoder_used,
+                steps_attempted: 0,
+            })
+        }
+        ConversionStatus::Failed { error_log } => {
+            if final_log.contains("CANCELLED") || error_log.contains("Cancel") || error_log.contains("cancel") {
+                info!("Conversion job cancelled");
+                Err(JobError::Cancelled)
+            } else {
+                let err = if error_log.is_empty() { final_log } else { error_log };
+                Err(JobError::Failed(err))
+            }
+        }
+        _ => {
+            Err(JobError::Failed("Unexpected conversion state".to_string()))
+        }
+    }
 }
 
 fn run_audio_to_audio(

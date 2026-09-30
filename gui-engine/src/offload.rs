@@ -1381,6 +1381,120 @@ fn whoami_fallback() -> String {
     String::new()
 }
 
+// ── Job-wrapped functions (for use with spawn_job) ──────────────────────
+
+use crate::job::{JobContext, JobError, JobFinal, UnitState};
+
+pub fn run_offload_scan_job(ctx: &JobContext) -> Result<JobFinal, JobError> {
+    ctx.cancel.check()?;
+    ctx.progress.set_indeterminate(true);
+    ctx.progress.set_message("Scanning media cards…");
+
+    let cards = detect_cards_with_progress(None);
+
+    ctx.progress.set_message(format!("Found {} card(s)", cards.len()));
+    ctx.progress.set_indeterminate(false);
+    ctx.progress.resize(1);
+    ctx.progress.unit(0).finish();
+
+    Ok(JobFinal::OffloadScan { cards })
+}
+
+/// Run the full offload copy job, reporting progress via `ctx.progress`.
+/// Units = devices, per-unit state mirrors the device state machine
+/// (Pending/Running/Done/Failed/Skipped). Byte-weighted progress is
+/// approximated by equal weights.
+pub fn run_offload_copy_job(
+    ctx: &JobContext,
+    device_plans: Vec<Vec<CopyPlanItem>>,
+    device_names: Vec<String>,
+    dest_parent: std::path::PathBuf,
+) -> Result<JobFinal, JobError> {
+    ctx.cancel.check()?;
+
+    let grand_total: u64 = device_plans.iter().flat_map(|p| p.iter()).map(|i| i.size).sum();
+    if grand_total == 0 || device_names.is_empty() {
+        return Ok(JobFinal::OffloadCopy { completed_devices: Vec::new() });
+    }
+
+    let dev_count = device_names.len();
+    ctx.progress.resize(dev_count);
+
+    let mut completed: Vec<String> = Vec::new();
+
+    for (dev_idx, plans) in device_plans.iter().enumerate() {
+        if ctx.cancel.is_cancelled() {
+            break;
+        }
+
+        let name = &device_names[dev_idx];
+        let dev_unit = ctx.progress.unit(dev_idx);
+        dev_unit.set_state(UnitState::Running);
+        dev_unit.set_message(format!("Starting device '{}'…", name));
+
+        let dest_parent_dev = plans.first()
+            .and_then(|p| p.dst.parent())
+            .unwrap_or(&dest_parent)
+            .to_path_buf();
+
+        if let Err(e) = std::fs::create_dir_all(&dest_parent_dev) {
+            dev_unit.set_state(UnitState::Failed);
+            dev_unit.set_message(format!("Failed to create directory: {}", e));
+            continue;
+        }
+
+        let mut dev_ok = true;
+        let dev_total = plans.len();
+        let cancel_flag = ctx.cancel.inner().clone();
+        let verify_mode = VerifyMode::SizeOnly;
+
+        for (item_idx, item) in plans.iter().enumerate() {
+            if ctx.cancel.is_cancelled() {
+                dev_ok = false;
+                break;
+            }
+
+            dev_unit.set_message(format!("[{}/{}] {}", item_idx + 1, dev_total, item.dst.display()));
+
+            let mut bytes_copied: u64 = 0;
+            match copy_file(&item.src, &item.dst, &cancel_flag, &mut |total| {
+                bytes_copied = total;
+            }) {
+                Ok(()) => {
+                    if verify_copy(&item.src, &item.dst, &verify_mode).is_ok() {
+                        dev_unit.set_fraction((item_idx + 1) as f32 / dev_total as f32);
+                    } else {
+                        let msg = format!("Verify failed: {}", item.dst.display());
+                        warn!("{}", msg);
+                        dev_unit.set_state(UnitState::Failed);
+                        dev_unit.set_message(msg);
+                        dev_ok = false;
+                        break;
+                    }
+                }
+                Err(CopyError::Cancelled) => {
+                    dev_ok = false;
+                    break;
+                }
+                Err(CopyError::Io(e)) => {
+                    dev_unit.set_state(UnitState::Failed);
+                    dev_unit.set_message(format!("Copy error: {}", e));
+                    dev_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if dev_ok {
+            completed.push(name.clone());
+            dev_unit.finish();
+            dev_unit.set_message("Completed");
+        }
+    }
+
+    Ok(JobFinal::OffloadCopy { completed_devices: completed })
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

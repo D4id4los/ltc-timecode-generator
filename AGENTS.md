@@ -53,6 +53,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── command.rs            # GuiCommand enum (source of truth for all commands)
 │   │   ├── state.rs              # AppStateSnapshot + ClapLogItem (source of truth for published state)
 │   │   ├── engine.rs             # Threaded engine loop, AudioCore lifecycle, retry/recovery, decode handling, offload handling
+│   │   ├── job.rs                # Unified async IO job infrastructure: JobSupervisor, ProgressTracker, CancelToken, SpeedMeter, spawn_job
 │   │   ├── camera_meta.rs        # Camera model detection from clips (exiftool/ffprobe probe)
 │   │   ├── cli.rs                # Cli struct, parse_args(), process_cli(); headless/WAV/list-devices/decode modes
 │   │   ├── timecode.rs           # FPS_OPTIONS (24/25/29.97 ND/29.97 DF/30), timecode formatting helpers
@@ -143,6 +144,66 @@ User action → GUI event handler → mpsc::Sender<GuiCommand>
                     GUI reads state.load() each frame
 ```
 
+### Unified Async IO Job Infrastructure (`job.rs`)
+
+The `job.rs` module provides a uniform infrastructure for all async background
+tasks in the engine (conversion, offload, decode, probes, scans, etc.),
+replacing the previous ad-hoc pattern of per-task mpsc channels, generation
+counters, and individual `catch_unwind` handling.
+
+#### Core types:
+  - **`JobKind`** — closed enum of all task types (Conversion, OffloadCopy,
+    OffloadScan, LtcDecode, LtcGroupDecode, FolderScan, ClipProbe, VideoProbe,
+    DurationProbe, FfmpegCapProbe).
+  - **`JobId`** — unique per-job identifier (monotonically increasing `u64`).
+  - **`JobPhase`** — `Idle` / `Running` / `Indeterminate` / `Succeeded` /
+    `Cancelled` / `Failed`.
+  - **`ProgressTracker`** — weighted per-unit progress with `ProgressSnapshot`,
+    message, speed, and unit state machine (`Pending` / `Running` / `Done` /
+    `Failed` / `Skipped`).
+  - **`CancelToken`** — `Arc<AtomicBool>` wrapper; `check()` returns
+    `Err(JobError::Cancelled)` when signalled.
+  - **`ErrorMeter` (SpeedMeter)** — EMA-smoothed throughput tracker
+    (α = 0.3, 2s stall decay).
+  - **`JobSupervisor`** — manages active jobs: `is_running(kind)`,
+    `cancel(kind)`, `poll()` (drain + clean finished threads), `drain()` (events),
+    `shutdown(timeout)` (cancel-all + join).
+  - **`spawn_job()`** — uniform spawning with `catch_unwind`, thread naming,
+    and guaranteed `JobEvent::Finished` emission.
+
+#### Event channel:
+One `mpsc` channel carries all `JobEvent` values:
+  - `JobEvent::Item { job, kind, item }` — incremental per-item results
+    (`DurationResult`, `ClipLtcResult`).
+  - `JobEvent::Finished { job, kind, outcome, payload }` — final result with
+    `JobOutcome` (Succeeded/Cancelled/Failed) and `JobFinal` payload.
+
+#### Closed payload enums (`JobItem`, `JobFinal`):
+All possible result payloads enumerated as closed Rust enums, providing
+compile-checked dispatch in the engine's unified event handler.
+
+#### Stale-result gating:
+The engine tracks the currently-active `JobId` per kind. When a `Finished`
+event arrives, the engine checks if its `JobId` still matches the active one
+for that kind — stale results from superseded jobs are discarded.
+
+#### Migration Status (Phase 2 completed):
+The following task types have been migrated to `spawn_job`:
+- **FfmpegCapProbe** — via `spawn_job`, payload `JobFinal::FfmpegCaps`
+- **FolderScan** — via `spawn_job`, payload `JobFinal::FolderScan`
+- **Conversion** — via `spawn_conversion_job()` wrapper, payload `JobFinal::Conversion`
+- **OffloadScan** — via `run_offload_scan_job()`, payload `JobFinal::OffloadScan`
+- **OffloadCopy** — via `run_offload_copy_job()`, payload `JobFinal::OffloadCopy`
+- **VideoProbe** — via `spawn_job`, payload `JobFinal::VideoProbe`
+- **DurationProbe** — via `spawn_job`, payload `JobItem::DurationResult` per file, `JobFinal::DurationsDone`
+
+Legacy (not yet migrated, still using per-task mpsc channels):
+- **LtcDecode** (WAV + video) — manual thread with `decode_result_tx`
+- **LtcGroupDecode** — manual thread with `group_result_tx`
+- **ClipProbe** (converter probe) — manual thread with `conv_probe_tx`
+
+Progress polling and speed tracking are handled by `ProgressTracker.snapshot()` and `SpeedMeter` (offload copy speed read from `ProgressSnapshot.speed`).
+
 ### Sole Source of Truth — State Ownership
 
 The engine is the **sole source of truth** for all application state. GUIs hold only framework-level state (tab index, popup visibility, toast notifications, text-edit-in-progress buffers, scroll offsets). All user-configurable options — including every converter setting (container, codecs, split/drop/trim toggles, channel map, output paths, naming templates) — are engine-owned via `ConverterUserSettings` in `AppStateSnapshot.converter.settings`.
@@ -175,26 +236,28 @@ Field groups (see `state.rs` for the full struct): generation counter; transport
 
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
-0. **Spawn ffmpeg capability probe** — before the loop starts, a background thread runs `query_ffmpeg_capabilities()` (hw-validated) and sends the result via an internal mpsc channel.
-1. **Drain folder scan results** — async scan result from background thread; applies any deferred `SelectRecording` that arrived while the scan was in flight.
-2. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop. Converter commands are handled inline (selectors, setters, side-effects, config persistence, deferred `SelectRecording` while `groups_loading`) or dispatched to `process_command`. Offload commands are handled by `handle_offload_command()`.
-3. **Drain async video probe result** — generation-stamped; used by decoder stream/channel selection.
-4. **Drain async decode results** — generation-stamped, so stale results from rapid re-clicks are discarded. On completion, auto-applies LTC settings to converter (split/drop/start-from-LTC) once per generation.
-5. **Drain async group decode results** — same generation gating; on full group completion, same auto-apply.
-6. **Drain ffmpeg probe result** — sets `current.ffmpeg_caps`; calls `apply_available_defaults` to repair stale converter settings and `recompute_converter_derived`.
-7. **Drain file-duration probe results** — populates offload file durations for display.
-8. **Drain converter clip probe results** — populates `ltc_probe` for video groups; resizes `channel_map` to identity if probe channel count changed.
-9. **Drain offload events** — generation-gated: `CardsScanned` applies default selection per card and spawns duration probing; `OffloadDurationResult` fills per-file durations; `OffloadDone` appends completed device names, records `last_offload_parent` for converter auto-switch, sets status message.
-10. **Poll chunked/group decode progress** — updates progress pct from atomics
-11. **Poll offload copy progress** — reads shared atomics via `snapshot_from_context()`; computes EMA-smoothed speed.
-12. **Poll conversion progress** — reads engine-owned `SharedConversionState` and writes into snapshot's `converter.conversion_state`; resets shared state on completion/failure.
-13. **Poll timecode** — `core.current_timecode()` when playing
-14. **Drain events** — clears `state.events` first, then drains `core.drain_events()`, dispatches to recovery or forwards to `state.events`
-15. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s); determines if clap animation is still visibly in progress.
-16. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
-17. **Update system time**
-18. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
-19. **Sleep** until next tick
+0. **Spawn ffmpeg capability probe** — before the loop starts, a `spawn_job` with `JobKind::FfmpegCapProbe` runs `query_ffmpeg_capabilities()`.
+1. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop. Converter commands are handled inline (selectors, setters, side-effects, config persistence, deferred `SelectRecording` while `groups_loading`) or dispatched to `process_command`. Offload commands are handled by `handle_offload_command()`.
+2. **Poll supervisor + drain events** — `supervisor.poll()` returns progress snapshots for all active job types (Conversion, OffloadCopy, OffloadScan, DurationProbe, VideoProbe, FolderScan, FfmpegCapProbe). Conversion and offload copy progress snapshots are mapped to snapshot fields. Then `supervisor.drain()` dispatches `JobEvent::Finished` events:
+    - Conversion → updates `converter.conversion_state`, manages status transitions
+    - FfmpegCapProbe → `apply_ffmpeg_probe_result()`
+    - FolderScan → updates `converter.groups`, applies deferred `SelectRecording`
+    - VideoProbe → updates `ltc_probe` for decoder stream/channel selection
+    - OffloadScan → updates `offload.cards`, spawns `DurationProbe` for file durations
+    - DurationProbe `Item` → fills `file_durations` + `offload.file_durations`
+    - OffloadCopy → completes device names, updates `last_offload_version`
+3. **Drain async decode results** (legacy mpsc channel) — generation-stamped, so stale results from rapid re-clicks are discarded. On completion, auto-applies LTC settings to converter (split/drop/start-from-LTC) once per generation.
+4. **Drain async group decode results** (legacy mpsc channel) — same generation gating; on full group completion, same auto-apply.
+5. **Drain converter clip probe results** (legacy mpsc channel) — populates `ltc_probe` for video groups; resizes `channel_map` to identity if probe channel count changed.
+6. **Poll chunked/group decode progress** — updates progress pct from atomics
+7. **Reset conversion idle** — if conversion job finished but state is still Running, resets to idle.
+8. **Poll timecode** — `core.current_timecode()` when playing
+9. **Drain events** — clears `state.events` first, then drains `core.drain_events()`, dispatches to recovery or forwards to `state.events`
+10. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s); determines if clap animation is still visibly in progress.
+11. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
+12. **Update system time**
+13. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
+14. **Sleep** until next tick
 
 ### Audio Lifecycle
 - **Init**: 3 retries with exponential backoff (50ms → 100ms → 200ms). Distinguishes permanent errors (permission denied — no retry) from transient (device busy — retry).
@@ -210,8 +273,8 @@ The offload subsystem ingests camera media from SD cards into organised folders.
 - **Device naming** — uses `device_name.rs` resolution chain: XAVC binary sniff → camera metadata → filename pattern (Sony/Canon/Panasonic/GoPro/TASCAM) → volume label → `"unknown"`.
 - **Selection** — `apply_selection()`: all/none/latest-recording-day per card; per-file toggles via `SetFileSelected`.
 - **Copy planning** — `plan_copies_for_files()`: flat `parent/<ISO-date>/<device>/` layout with `name (2).ext` collision renaming.
-- **Execution** — `run_offload()` runs on a background thread: chunked 1 MiB streaming reads, temporary `.offload_tmp` → atomic rename, size-only verification at the end. Idempotent resume: skips files whose destination already exists with matching size. Cancellation via `AtomicBool` flag. Per-device state machine: `Pending` / `Copying` / `Done` / `Failed(String)` / `Skipped`.
-- **Events** — internal mpsc channel carries `CardsScanned`, `OffloadDurationResult`, `OffloadDone` (generation-gated). Engine polls progress from atomics with EMA-smoothed speed.
+- **Execution** — `run_offload()` runs on a background thread: chunked 1 MiB streaming reads, temporary `.offload_tmp` → atomic rename, size-only verification at the end. Idempotent resume: skips files whose destination already exists with matching size. Cancellation via `CancelToken`. Per-device state machine: `Pending` / `Copying` / `Done` / `Failed(String)` / `Skipped`.
+- **Events** — offload scan and copy are managed via `spawn_job` with `JobKind::OffloadScan`/`OffloadCopy`. Progress reported via `ProgressTracker` and polled by `supervisor.poll()`. Duration probing uses `JobKind::DurationProbe` with per-file `JobItem::DurationResult` emissions.
 - **Config** — persists `parent_folder` via `config::save_offload_parent()`; restored by `seed_snapshot_from_config()` at startup.
 - **Converter handoff** — `last_offload_parent` is published in the snapshot; ltc-gui's `logic()` watches for changes and auto-switches the converter to the fresh offload destination.
 - **Safety** — card scans run under `catch_unwind` (panic → empty list); copy thread runs independently of the engine tick.
@@ -241,7 +304,7 @@ The converter turns raw recordings into deliverables: trim each file to its firs
 
 All converter user settings live in `ConverterUserSettings` (`state.rs`), owned by the engine. GUIs send `ConverterCommand` variants for every mutation. The engine applies side-effects (defaults repair, prefix prefill, channel-map resize, LTC auto-apply, config persistence, encoder re-selection on container change) and publishes the updated snapshot. Derived UI data (readiness blockers, collision warning, output preview, encoder chain description) is recomputed by `recompute_converter_derived()` in the engine and published for GUIs to render.
 
-Conversion execution runs in the engine thread via `StartConversion` which calls `assemble_converter_settings()` then `spawn_conversion()` with engine-owned `SharedConversionState` and `CancelFlag`. Progress is polled each tick and published into `ConverterSnapshot.conversion_state`.
+Conversion execution runs in the engine thread via `StartConversion` which calls `assemble_converter_settings()` then `spawn_job` with `JobKind::Conversion`. The `spawn_conversion_job()` wrapper bridges the legacy `SharedConversionState`/`CancelFlag` to the unified `ProgressTracker`/`CancelToken`. Progress is polled each tick via `supervisor.poll()` and published into `ConverterSnapshot.conversion_state`.
 
 ### Components (`converter/` directory module)
   - `ConversionPipeline`: `AudioOnly { generate_synthetic_video }` (multi-track WAV → audio/video outputs), `VideoPassthrough` (camera clips → video outputs), and `MetadataOnly` (tag originals in place, rename, extract audio).

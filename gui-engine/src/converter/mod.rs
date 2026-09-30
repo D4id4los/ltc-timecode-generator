@@ -49,7 +49,7 @@ pub(crate) mod process;
 pub use process::StepFailure;
 
 pub(crate) mod runner;
-pub use runner::spawn_conversion;
+pub use runner::{spawn_conversion, spawn_conversion_job};
 
 #[cfg(test)]
 pub(crate) mod test_fixtures;

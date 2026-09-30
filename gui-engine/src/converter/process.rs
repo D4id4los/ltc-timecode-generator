@@ -5,6 +5,7 @@ use std::time::Duration;
 use log::{info, warn};
 
 use crate::converter::progress::{CancelFlag, ConversionStatus, SharedConversionState};
+use crate::job::{UnitProgress, UnitState};
 use crate::subprocess::{no_window_command, watch_stderr_lines, WatchdogStop, FFMPEG_STALL_TIMEOUT};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,12 +90,38 @@ pub fn run_ffmpeg_process(
     total_steps: usize,
     current_step: usize,
 ) -> Result<(), StepFailure> {
+    run_ffmpeg_process_with_unit(
+        args,
+        output,
+        state,
+        cancel,
+        step_progress_weight,
+        overall_progress,
+        overall_log,
+        total_steps,
+        current_step,
+        None,
+    )
+}
+
+pub fn run_ffmpeg_process_with_unit(
+    args: &[String],
+    output: &Path,
+    state: &SharedConversionState,
+    cancel: &CancelFlag,
+    step_progress_weight: f32,
+    overall_progress: &mut f32,
+    overall_log: &mut String,
+    total_steps: usize,
+    current_step: usize,
+    unit: Option<UnitProgress>,
+) -> Result<(), StepFailure> {
     let step_label = format!("[{}/{}]", current_step, total_steps);
     info!("{} Spawning ffmpeg with {} args → {}", step_label, args.len(), output.display());
 
     let full_args: Vec<String> = args.iter().cloned().chain(std::iter::once(output.to_string_lossy().to_string())).collect();
 
-    run_ffmpeg_process_with(
+    run_ffmpeg_process_with_unit_progress(
         &full_args,
         output,
         state,
@@ -112,6 +139,7 @@ pub fn run_ffmpeg_process(
                 .spawn()
         },
         FFMPEG_STALL_TIMEOUT,
+        unit,
     )
 }
 
@@ -133,6 +161,29 @@ pub fn run_ffmpeg_process_with(
     current_step: usize,
     spawner: &mut dyn FnMut(&[String]) -> std::io::Result<Child>,
     stall: Duration,
+) -> Result<(), StepFailure> {
+    run_ffmpeg_process_with_unit_progress(
+        full_args, output, state, cancel,
+        step_progress_weight, overall_progress, overall_log,
+        total_steps, current_step, spawner, stall, None,
+    )
+}
+
+/// Like [`run_ffmpeg_process_with`] but also updates an optional `UnitProgress`
+/// for job-infrastructure progress reporting.
+pub fn run_ffmpeg_process_with_unit_progress(
+    full_args: &[String],
+    output: &Path,
+    state: &SharedConversionState,
+    cancel: &CancelFlag,
+    step_progress_weight: f32,
+    overall_progress: &mut f32,
+    overall_log: &mut String,
+    total_steps: usize,
+    current_step: usize,
+    spawner: &mut dyn FnMut(&[String]) -> std::io::Result<Child>,
+    stall: Duration,
+    unit: Option<UnitProgress>,
 ) -> Result<(), StepFailure> {
     let step_label = format!("[{}/{}]", current_step, total_steps);
 
@@ -217,6 +268,9 @@ pub fn run_ffmpeg_process_with(
                 s.status = ConversionStatus::Running { progress: combined.min(1.0) };
                 s.current_line = line.to_string();
             }
+            if let Some(ref u) = unit {
+                u.set_fraction(combined.min(1.0));
+            }
         },
     );
 
@@ -225,6 +279,9 @@ pub fn run_ffmpeg_process_with(
     match watchdog_result {
         Ok(status) if status.success() => {
             *overall_progress += step_progress_weight;
+            if let Some(ref u) = unit {
+                u.set_state(UnitState::Done);
+            }
             info!("{} Step completed: {}", step_label, output.display());
             Ok(())
         }
@@ -236,11 +293,17 @@ pub fn run_ffmpeg_process_with(
             if matches!(classification, StepFailure::EncoderInit(_)) {
                 let _ = std::fs::remove_file(output);
             }
+            if let Some(ref u) = unit {
+                u.set_state(UnitState::Failed);
+            }
             Err(classification)
         }
         Err(WatchdogStop::Cancelled) => {
             overall_log.push_str(&format!("{} --- CANCELLED ---\n", step_label));
             overall_log.push_str("\n\n--- CANCELLED BY USER ---");
+            if let Some(ref u) = unit {
+                u.set_state(UnitState::Failed);
+            }
             Err(StepFailure::Fatal("cancelled by user".to_string()))
         }
         Err(WatchdogStop::Stalled) => {
@@ -250,12 +313,18 @@ pub fn run_ffmpeg_process_with(
             );
             warn!("{} {}", step_label, msg);
             overall_log.push_str(&format!("\n\n--- {} ---", msg));
+            if let Some(ref u) = unit {
+                u.set_state(UnitState::Failed);
+            }
             Err(StepFailure::Fatal(msg))
         }
         Err(WatchdogStop::Wait(e)) => {
             let msg = format!("ffmpeg process wait error: {}", e);
             warn!("{} {}", step_label, msg);
             overall_log.push_str(&format!("\n\n--- {} ---", msg));
+            if let Some(ref u) = unit {
+                u.set_state(UnitState::Failed);
+            }
             Err(StepFailure::Fatal(msg))
         }
     }

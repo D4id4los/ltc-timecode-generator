@@ -1,0 +1,1108 @@
+use std::any::Any;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use audio_core::LtcDetectionResult;
+use log::{error, warn};
+
+use crate::camera_meta::CameraInfo;
+use crate::converter::FfmpegCapabilities;
+use crate::ffprobe::VideoAudioProbe;
+use crate::file_pattern::MatchedGroup;
+use crate::offload::SdCardInfo;
+
+// ── Core type aliases ───────────────────────────────────────────────────
+
+pub type JobIdValue = u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JobId(pub JobIdValue);
+
+// ── Job kind ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JobKind {
+    Conversion,
+    OffloadCopy,
+    OffloadScan,
+    LtcDecode,
+    LtcGroupDecode,
+    FolderScan,
+    ClipProbe,
+    VideoProbe,
+    DurationProbe,
+    FfmpegCapProbe,
+}
+
+// ── Job phase ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JobPhase {
+    Idle,
+    Running,
+    Indeterminate,
+    Succeeded,
+    Cancelled,
+    Failed,
+}
+
+// ── Unit specification ──────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct UnitSpec {
+    pub weight: f32,
+    pub label: String,
+}
+
+// ── Unit state ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UnitState {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+// ── Progress tracking (worker writes; engine reads each tick) ──────────
+
+#[derive(Clone)]
+pub struct ProgressTracker(Arc<TrackerInner>);
+
+struct TrackerInner {
+    units: Mutex<Vec<UnitInner>>,
+    message: Mutex<String>,
+    indeterminate: AtomicBool,
+    speed: AtomicU64, // bytes per second * 1000 (fixed-point for atomic)
+}
+
+struct UnitInner {
+    weight: f32,
+    label: String,
+    fraction: std::sync::atomic::AtomicU32, // 0..1000 (fixed-point)
+    state: Mutex<UnitState>,
+    message: Mutex<String>,
+}
+
+impl ProgressTracker {
+    pub fn new(units: impl IntoIterator<Item = UnitSpec>) -> Self {
+        let units: Vec<UnitInner> = units
+            .into_iter()
+            .map(|u| UnitInner {
+                weight: u.weight,
+                label: u.label,
+                fraction: std::sync::atomic::AtomicU32::new(0),
+                state: Mutex::new(UnitState::Pending),
+                message: Mutex::new(String::new()),
+            })
+            .collect();
+        ProgressTracker(Arc::new(TrackerInner {
+            units: Mutex::new(units),
+            message: Mutex::new(String::new()),
+            indeterminate: AtomicBool::new(false),
+            speed: AtomicU64::new(0),
+        }))
+    }
+
+    pub fn resize(&self, len: usize) {
+        let mut units = self.0.units.lock().unwrap();
+        let old_len = units.len();
+        if len > old_len {
+            let weight = if old_len > 0 {
+                units[0].weight
+            } else {
+                1.0 / len as f32
+            };
+            for i in old_len..len {
+                units.push(UnitInner {
+                    weight,
+                    label: format!("Step {}", i + 1),
+                    fraction: std::sync::atomic::AtomicU32::new(0),
+                    state: Mutex::new(UnitState::Pending),
+                    message: Mutex::new(String::new()),
+                });
+            }
+        }
+    }
+
+    pub fn unit(&self, idx: usize) -> UnitProgress {
+        UnitProgress {
+            tracker: Arc::clone(&self.0),
+            idx,
+        }
+    }
+
+    pub fn set_message(&self, msg: impl Into<String>) {
+        *self.0.message.lock().unwrap() = msg.into();
+    }
+
+    pub fn set_indeterminate(&self, b: bool) {
+        self.0.indeterminate.store(b, Ordering::Relaxed);
+    }
+
+    pub fn set_speed(&self, bytes_per_sec: f64) {
+        self.0
+            .speed
+            .store((bytes_per_sec * 1000.0) as u64, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        let inner = &self.0;
+        let units = inner.units.lock().unwrap();
+        let total_weight: f32 = units.iter().map(|u| u.weight).sum();
+        let mut fraction = 0.0f32;
+        let mut unit_snapshots = Vec::with_capacity(units.len());
+        for u in units.iter() {
+            let frac = u.fraction.load(Ordering::Relaxed) as f32 / 1000.0;
+            fraction += u.weight * frac;
+            unit_snapshots.push(UnitSnapshot {
+                label: u.label.clone(),
+                message: u.message.lock().unwrap().clone(),
+                fraction: frac.min(1.0),
+                state: *u.state.lock().unwrap(),
+            });
+        }
+        let overall = if total_weight > 0.0 {
+            (fraction / total_weight).min(1.0)
+        } else {
+            0.0
+        };
+        let speed_raw = inner.speed.load(Ordering::Relaxed);
+        ProgressSnapshot {
+            phase: if inner.indeterminate.load(Ordering::Relaxed) {
+                JobPhase::Indeterminate
+            } else if (overall - 1.0).abs() < 0.001 {
+                JobPhase::Running
+            } else {
+                JobPhase::Running
+            },
+            fraction: overall,
+            message: inner.message.lock().unwrap().clone(),
+            speed: if speed_raw > 0 {
+                Some(speed_raw as f64 / 1000.0)
+            } else {
+                None
+            },
+            units: unit_snapshots,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct UnitProgress {
+    tracker: Arc<TrackerInner>,
+    idx: usize,
+}
+
+impl UnitProgress {
+    pub fn set_fraction(&self, f: f32) {
+        let units = self.tracker.units.lock().unwrap();
+        if let Some(u) = units.get(self.idx) {
+            u.fraction
+                .store((f.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_message(&self, msg: impl Into<String>) {
+        let units = self.tracker.units.lock().unwrap();
+        if let Some(u) = units.get(self.idx) {
+            *u.message.lock().unwrap() = msg.into();
+        }
+    }
+
+    pub fn set_state(&self, s: UnitState) {
+        let units = self.tracker.units.lock().unwrap();
+        if let Some(u) = units.get(self.idx) {
+            *u.state.lock().unwrap() = s;
+        }
+    }
+
+    pub fn finish(&self) {
+        let units = self.tracker.units.lock().unwrap();
+        if let Some(u) = units.get(self.idx) {
+            u.fraction.store(1000, Ordering::Relaxed);
+            *u.state.lock().unwrap() = UnitState::Done;
+        }
+    }
+}
+
+// ── Progress snapshot (read by engine each tick) ────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct UnitSnapshot {
+    pub label: String,
+    pub message: String,
+    pub fraction: f32,
+    pub state: UnitState,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgressSnapshot {
+    pub phase: JobPhase,
+    pub fraction: f32,
+    pub message: String,
+    pub speed: Option<f64>,
+    pub units: Vec<UnitSnapshot>,
+}
+
+// ── Cancellation ────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        CancelToken(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn check(&self) -> Result<(), JobError> {
+        if self.is_cancelled() {
+            Err(JobError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn inner(&self) -> &Arc<AtomicBool> {
+        &self.0
+    }
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Job error ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum JobError {
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for JobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobError::Cancelled => write!(f, "cancelled"),
+            JobError::Failed(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+// ── Job outcome ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum JobOutcome {
+    Succeeded { summary: String, log: String },
+    Cancelled { log: String },
+    Failed { error: String, log: String },
+}
+
+// ── Payload enums ───────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub enum JobItem {
+    DurationResult {
+        path: PathBuf,
+        secs: Option<f64>,
+    },
+    ClipLtcResult {
+        index: usize,
+        result: Result<LtcDetectionResult, String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum JobFinal {
+    Conversion {
+        encoder_used: Option<String>,
+        steps_attempted: usize,
+    },
+    OffloadCopy {
+        completed_devices: Vec<String>,
+    },
+    OffloadScan {
+        cards: Vec<SdCardInfo>,
+    },
+    FolderScan {
+        path: PathBuf,
+        groups: Vec<MatchedGroup>,
+    },
+    Decode {
+        result: Result<LtcDetectionResult, String>,
+        path: PathBuf,
+    },
+    VideoProbe {
+        result: Result<VideoAudioProbe, String>,
+    },
+    ClipProbes {
+        probes: Vec<Result<VideoAudioProbe, String>>,
+        cameras: Vec<Option<CameraInfo>>,
+        device_name: Option<String>,
+    },
+    DurationsDone,
+    FfmpegCaps {
+        caps: Option<FfmpegCapabilities>,
+    },
+    NoPayload,
+}
+
+// ── Events ──────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum JobEvent {
+    Item {
+        job: JobId,
+        kind: JobKind,
+        item: JobItem,
+    },
+    Finished {
+        job: JobId,
+        kind: JobKind,
+        outcome: JobOutcome,
+        payload: JobFinal,
+    },
+}
+
+// ── Job context (passed to the worker closure) ──────────────────────────
+
+pub struct JobContext {
+    pub progress: ProgressTracker,
+    pub cancel: CancelToken,
+    emit: Box<dyn Fn(JobItem) + Send + Sync>,
+}
+
+impl JobContext {
+    pub fn emit(&self, item: JobItem) {
+        (self.emit)(item);
+    }
+}
+
+// ── Job spec ────────────────────────────────────────────────────────────
+
+pub struct JobSpec<'a> {
+    pub kind: JobKind,
+    pub name: &'a str,
+    pub units: Vec<UnitSpec>,
+}
+
+// ── Active job tracking ─────────────────────────────────────────────────
+
+struct ActiveJob {
+    id: JobId,
+    kind: JobKind,
+    tracker: ProgressTracker,
+    cancel: CancelToken,
+    handle: Option<JoinHandle<()>>,
+    _started: Instant,
+}
+
+// ── Job supervisor ──────────────────────────────────────────────────────
+
+pub struct JobSupervisor {
+    next_id: JobIdValue,
+    tx: Sender<JobEvent>,
+    rx: Receiver<JobEvent>,
+    active: Vec<ActiveJob>,
+    events_buffer: Vec<JobEvent>,
+}
+
+impl JobSupervisor {
+    pub fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        JobSupervisor {
+            next_id: 1,
+            tx,
+            rx,
+            active: Vec::new(),
+            events_buffer: Vec::new(),
+        }
+    }
+
+    pub fn is_running(&self, kind: JobKind) -> bool {
+        self.active.iter().any(|j| j.kind == kind)
+    }
+
+    /// Cancel the running job of the given kind. Returns true if a job was cancelled.
+    pub fn cancel(&self, kind: JobKind) -> bool {
+        for job in &self.active {
+            if job.kind == kind {
+                job.cancel.cancel();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Poll all active jobs and return their progress snapshots.
+    /// Removes finished jobs (handles that have completed).
+    pub fn poll(&mut self) -> Vec<(JobId, JobKind, ProgressSnapshot)> {
+        // Drain events from the channel
+        loop {
+            match self.rx.try_recv() {
+                Ok(event) => self.events_buffer.push(event),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("Job event channel disconnected");
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // Check for finished threads and collect progress
+        let mut results = Vec::new();
+        let mut finished_indices: Vec<usize> = Vec::new();
+
+        for job in self.active.iter() {
+            let snapshot = job.tracker.snapshot();
+            results.push((job.id, job.kind, snapshot));
+        }
+
+        for i in (0..self.active.len()).rev() {
+            if let Some(ref handle) = self.active[i].handle {
+                if handle.is_finished() {
+                    finished_indices.push(i);
+                }
+            }
+        }
+
+        for &idx in &finished_indices {
+            let mut job = self.active.swap_remove(idx);
+            if let Some(handle) = job.handle.take() {
+                let _ = handle.join();
+            }
+        }
+
+        results
+    }
+
+    /// Drain accumulated events from the events buffer.
+    pub fn drain(&mut self) -> Vec<JobEvent> {
+        std::mem::take(&mut self.events_buffer)
+    }
+
+    /// Shutdown all active jobs and join their threads with a timeout.
+    pub fn shutdown(self, timeout: Duration) {
+        // Cancel all active jobs
+        for job in &self.active {
+            job.cancel.cancel();
+        }
+
+        let deadline = Instant::now() + timeout;
+        for mut job in self.active {
+            if let Some(handle) = job.handle.take() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining > Duration::from_millis(10) {
+                    let _ = handle.join();
+                }
+            }
+        }
+    }
+
+    /// Cancel all active jobs.
+    pub fn cancel_all(&self) {
+        for job in &self.active {
+            job.cancel.cancel();
+        }
+    }
+}
+
+impl Default for JobSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── spawn_job ───────────────────────────────────────────────────────────
+
+pub fn spawn_job<T, F>(sup: &mut JobSupervisor, spec: JobSpec, f: F)
+where
+    F: FnOnce(&JobContext) -> Result<T, JobError> + Send + 'static,
+    T: Into<JobFinal> + Send + 'static,
+{
+    let id = JobId(sup.next_id);
+    sup.next_id += 1;
+
+    let tracker = ProgressTracker::new(spec.units);
+    let cancel = CancelToken::new();
+    let event_tx = sup.tx.clone();
+    let kind = spec.kind;
+    let job_name = spec.name.to_string();
+    let tracker_clone = tracker.clone();
+    let cancel_clone = cancel.clone();
+
+    let emit_tx = sup.tx.clone();
+    let emit: Box<dyn Fn(JobItem) + Send + Sync> = Box::new(move |item| {
+        let _ = emit_tx.send(JobEvent::Item {
+            job: id,
+            kind,
+            item,
+        });
+    });
+
+    let ctx = JobContext {
+        progress: tracker_clone,
+        cancel: cancel_clone,
+        emit,
+    };
+
+    let handle = std::thread::Builder::new()
+        .name(job_name.clone())
+        .spawn(move || {
+            let (outcome, payload) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                f(&ctx)
+            })) {
+                Ok(Ok(result)) => {
+                    let payload: JobFinal = result.into();
+                    (JobOutcome::Succeeded {
+                        summary: String::new(),
+                        log: String::new(),
+                    }, payload)
+                }
+                Ok(Err(JobError::Cancelled)) => (JobOutcome::Cancelled {
+                    log: String::new(),
+                }, JobFinal::NoPayload),
+                Ok(Err(JobError::Failed(msg))) => (JobOutcome::Failed {
+                    error: msg,
+                    log: String::new(),
+                }, JobFinal::NoPayload),
+                Err(panic) => {
+                    let msg = panic_message(&panic);
+                    error!("Job '{}' (id={:?}) panicked: {}", job_name, id, msg);
+                    (JobOutcome::Failed {
+                        error: format!("internal error (panic in {})", job_name),
+                        log: msg,
+                    }, JobFinal::NoPayload)
+                }
+            };
+
+            let _ = event_tx.send(JobEvent::Finished {
+                job: id,
+                kind,
+                outcome,
+                payload,
+            });
+        })
+        .expect("failed to spawn job thread");
+
+    sup.active.push(ActiveJob {
+        id,
+        kind: spec.kind,
+        tracker,
+        cancel,
+        handle: Some(handle),
+        _started: Instant::now(),
+    });
+}
+
+fn panic_message(p: &Box<dyn Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+// ── Speed meter ─────────────────────────────────────────────────────────
+
+/// EMA-smoothed throughput meter. Tracks byte/block deltas between polls
+/// and computes a smoothed speed with stall decay.
+pub struct SpeedMeter {
+    last_value: usize,
+    last_time: Option<Instant>,
+    last_progress: Option<Instant>,
+    smoothed: f64,
+}
+
+impl SpeedMeter {
+    pub fn new() -> Self {
+        SpeedMeter {
+            last_value: 0,
+            last_time: None,
+            last_progress: None,
+            smoothed: 0.0,
+        }
+    }
+
+    /// Feed a new cumulative block/byte count and the current instant.
+    /// Returns the smoothed speed in the same units per second.
+    pub fn update(&mut self, value: usize, now: Instant) -> f64 {
+        let delta_v = value.saturating_sub(self.last_value);
+        self.last_value = value;
+
+        if delta_v > 0 {
+            self.last_progress = Some(now);
+        }
+
+        let since_progress = match self.last_progress {
+            Some(t) => now.saturating_duration_since(t).as_secs_f64(),
+            None => 0.0,
+        };
+
+        if let Some(last_time) = self.last_time {
+            let delta_t = now.saturating_duration_since(last_time).as_secs_f64();
+            if delta_t > 0.001 {
+                if delta_v > 0 {
+                    let instant_speed = delta_v as f64 / delta_t;
+                    self.smoothed = 0.7 * self.smoothed + 0.3 * instant_speed;
+                } else if since_progress > 2.0 {
+                    self.smoothed *= 0.5;
+                }
+            }
+        } else {
+            self.smoothed = 0.0;
+        }
+
+        self.last_time = Some(now);
+        self.smoothed
+    }
+
+    pub fn reset(&mut self) {
+        self.last_value = 0;
+        self.last_time = None;
+        self.last_progress = None;
+        self.smoothed = 0.0;
+    }
+
+    pub fn current(&self) -> f64 {
+        self.smoothed
+    }
+}
+
+impl Default for SpeedMeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Unit tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn empty_spec() -> JobSpec<'static> {
+        JobSpec {
+            kind: JobKind::FfmpegCapProbe,
+            name: "test",
+            units: Vec::new(),
+        }
+    }
+
+    // ── ProgressTracker: weighted fraction & resize ──────────────────────
+
+    #[test]
+    fn test_progress_tracker_weighted_fraction() {
+        let units = vec![
+            UnitSpec {
+                weight: 0.3,
+                label: "A".into(),
+            },
+            UnitSpec {
+                weight: 0.7,
+                label: "B".into(),
+            },
+        ];
+        let pt = ProgressTracker::new(units);
+        let snap = pt.snapshot();
+        assert!((snap.fraction - 0.0).abs() < 0.001);
+
+        pt.unit(0).set_fraction(1.0);
+        let snap = pt.snapshot();
+        assert!((snap.fraction - 0.3).abs() < 0.001);
+
+        pt.unit(1).set_fraction(1.0);
+        let snap = pt.snapshot();
+        assert!((snap.fraction - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_progress_tracker_resize() {
+        let pt = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "initial".into(),
+        }]);
+        assert_eq!(pt.snapshot().units.len(), 1);
+
+        pt.resize(3);
+        assert_eq!(pt.snapshot().units.len(), 3);
+
+        // resize to smaller: no-op
+        pt.resize(1);
+        assert_eq!(pt.snapshot().units.len(), 3);
+    }
+
+    // ── Unit state transitions ──────────────────────────────────────────
+
+    #[test]
+    fn test_unit_state_transitions() {
+        let pt = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "X".into(),
+        }]);
+        let u = pt.unit(0);
+        assert_eq!(u.idx, 0);
+
+        let snap = pt.snapshot();
+        assert_eq!(snap.units[0].state, UnitState::Pending);
+
+        u.set_state(UnitState::Running);
+        assert_eq!(pt.snapshot().units[0].state, UnitState::Running);
+
+        u.set_state(UnitState::Done);
+        assert_eq!(pt.snapshot().units[0].state, UnitState::Done);
+
+        u.set_state(UnitState::Failed);
+        assert_eq!(pt.snapshot().units[0].state, UnitState::Failed);
+
+        u.set_state(UnitState::Skipped);
+        assert_eq!(pt.snapshot().units[0].state, UnitState::Skipped);
+    }
+
+    // ── Snapshot clamping ───────────────────────────────────────────────
+
+    #[test]
+    fn test_snapshot_clamps_fraction() {
+        let pt = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "X".into(),
+        }]);
+        pt.unit(0).set_fraction(2.0);
+        let snap = pt.snapshot();
+        assert!((snap.fraction - 1.0).abs() < 0.001);
+    }
+
+    // ── CancelToken ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_cancel_token_default_not_cancelled() {
+        let ct = CancelToken::new();
+        assert!(!ct.is_cancelled());
+        assert!(ct.check().is_ok());
+    }
+
+    #[test]
+    fn test_cancel_token_cancel() {
+        let ct = CancelToken::new();
+        ct.cancel();
+        assert!(ct.is_cancelled());
+        assert!(ct.check().is_err());
+    }
+
+    #[test]
+    fn test_cancel_token_clone_shares_state() {
+        let ct = CancelToken::new();
+        let ct2 = ct.clone();
+        ct.cancel();
+        assert!(ct2.is_cancelled());
+    }
+
+    // ── Panic → Failed outcome ─────────────────────────────────────────
+
+    #[test]
+    fn test_spawn_job_panic_converts_to_failed() {
+        let mut sup = JobSupervisor::new();
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
+            panic!("deliberate panic");
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        sup.poll();
+
+        let events = sup.drain();
+        let finished = events.iter().find(|e| matches!(e, JobEvent::Finished { .. }));
+        assert!(finished.is_some(), "expected a Finished event");
+        if let Some(JobEvent::Finished { outcome, .. }) = finished {
+            match outcome {
+                JobOutcome::Failed { error, .. } => {
+                    assert!(
+                        error.contains("panic"),
+                        "expected panic in error, got: {}",
+                        error
+                    );
+                }
+                other => panic!("expected Failed, got {:?}", other),
+            }
+        }
+    }
+
+    // ── Cancelled outcome ──────────────────────────────────────────────
+
+    #[test]
+    fn test_spawn_job_cancelled_check() {
+        let mut sup = JobSupervisor::new();
+        let cancel_outer = CancelToken::new();
+        let cancel_clone = cancel_outer.clone();
+
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), move |ctx| -> Result<JobFinal, JobError> {
+            // Signal cancellation from outside
+            cancel_clone.cancel();
+            ctx.cancel.check()?;
+            Ok(JobFinal::NoPayload)
+        });
+
+        sup.cancel_all();
+
+        std::thread::sleep(Duration::from_millis(50));
+        sup.poll();
+
+        let events = sup.drain();
+        let finished = events.iter().find(|e| matches!(e, JobEvent::Finished { .. }));
+        assert!(finished.is_some(), "expected a Finished event");
+    }
+
+    // ── emit ordering ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_spawn_job_emit_before_finished() {
+        let mut sup = JobSupervisor::new();
+        let path = PathBuf::from("/test/file.wav");
+
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), move |ctx| -> Result<JobFinal, JobError> {
+            ctx.emit(JobItem::DurationResult {
+                path: path.clone(),
+                secs: Some(10.0),
+            });
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(JobFinal::DurationsDone)
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        sup.poll();
+
+        let events: Vec<_> = sup.drain();
+        // Emitted item and Finished should both appear
+        let has_item = events
+            .iter()
+            .any(|e| matches!(e, JobEvent::Item { item: JobItem::DurationResult { .. }, .. }));
+        let has_finished = events.iter().any(|e| matches!(e, JobEvent::Finished { .. }));
+        assert!(has_item, "should have received an Item event");
+        assert!(has_finished, "should have received a Finished event");
+    }
+
+    // ── is_running guard ───────────────────────────────────────────────
+
+    #[test]
+    fn test_is_running_guard() {
+        let mut sup = JobSupervisor::new();
+        assert!(!sup.is_running(JobKind::FfmpegCapProbe));
+
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(JobFinal::NoPayload)
+        });
+
+        assert!(sup.is_running(JobKind::FfmpegCapProbe));
+    }
+
+    // ── Drain generation semantics ─────────────────────────────────────
+
+    #[test]
+    fn test_drain_returns_accumulated_events() {
+        let mut sup = JobSupervisor::new();
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(JobFinal::NoPayload)
+        });
+
+        // Wait for job to finish
+        std::thread::sleep(Duration::from_millis(50));
+        sup.poll();
+
+        let events = sup.drain();
+        assert!(!events.is_empty(), "should have events after drain");
+
+        // Second drain should be empty
+        let events2 = sup.drain();
+        assert!(events2.is_empty(), "second drain should be empty");
+    }
+
+    // ── SpeedMeter ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_speed_meter_initial_zero() {
+        let sm = SpeedMeter::new();
+        assert!((sm.current() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_speed_meter_positive_delta() {
+        let mut sm = SpeedMeter::new();
+        let now = Instant::now();
+        // First update sets baseline
+        let s = sm.update(0, now);
+        assert!((s - 0.0).abs() < 1e-6);
+
+        // Second update with positive delta
+        let later = now + Duration::from_secs(1);
+        let s = sm.update(1000, later);
+        assert!(s > 0.0, "speed should be positive, got {}", s);
+    }
+
+    #[test]
+    fn test_speed_meter_stall_decay() {
+        let mut sm = SpeedMeter::new();
+        let now = Instant::now();
+        sm.update(0, now);
+        let later = now + Duration::from_secs(1);
+        sm.update(100, later);
+
+        let speed_after_progress = sm.current();
+        assert!(speed_after_progress > 0.0);
+
+        // Stall longer than 2s
+        let stall = later + Duration::from_secs(3);
+        sm.update(100, stall);
+        assert!(
+            sm.current() < speed_after_progress,
+            "speed should decay during stall"
+        );
+    }
+
+    #[test]
+    fn test_speed_meter_reset() {
+        let mut sm = SpeedMeter::new();
+        let now = Instant::now();
+        sm.update(0, now);
+        sm.update(100, now + Duration::from_secs(1));
+        sm.reset();
+        assert!((sm.current() - 0.0).abs() < 1e-6);
+        assert!(sm.last_time.is_none());
+    }
+
+    #[test]
+    fn test_speed_meter_short_stall_holds_value() {
+        let mut sm = SpeedMeter::new();
+        let now = Instant::now();
+        sm.update(0, now);
+        sm.update(100, now + Duration::from_millis(500));
+        let speed = sm.current();
+        assert!(speed > 0.0);
+
+        // Short stall (< 2s) should hold value
+        sm.update(100, now + Duration::from_secs(1));
+        assert!(
+            (sm.current() - speed).abs() < 0.001,
+            "short stall should hold value"
+        );
+    }
+
+    // ── ProgressTracker: message & indeterminate ───────────────────────
+
+    #[test]
+    fn test_progress_tracker_set_message() {
+        let pt = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "X".into(),
+        }]);
+        pt.set_message("working");
+        assert_eq!(pt.snapshot().message, "working");
+    }
+
+    #[test]
+    fn test_progress_tracker_indeterminate() {
+        let pt = ProgressTracker::new(Vec::<UnitSpec>::new());
+        pt.set_indeterminate(true);
+        assert_eq!(pt.snapshot().phase, JobPhase::Indeterminate);
+    }
+
+    #[test]
+    fn test_progress_tracker_unit_message() {
+        let pt = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "X".into(),
+        }]);
+        pt.unit(0).set_message("processing file");
+        assert_eq!(pt.snapshot().units[0].message, "processing file");
+    }
+
+    // ── UnitProgress finish ────────────────────────────────────────────
+
+    #[test]
+    fn test_unit_progress_finish() {
+        let pt = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "X".into(),
+        }]);
+        pt.unit(0).finish();
+        let snap = pt.snapshot();
+        assert!((snap.fraction - 1.0).abs() < 0.001);
+        assert_eq!(snap.units[0].state, UnitState::Done);
+    }
+
+    // ── ProgressTracker set_speed ──────────────────────────────────────
+
+    #[test]
+    fn test_progress_tracker_speed() {
+        let pt = ProgressTracker::new(Vec::<UnitSpec>::new());
+        assert!(pt.snapshot().speed.is_none());
+        pt.set_speed(1_500_000.0);
+        let snap = pt.snapshot();
+        assert!(snap.speed.is_some());
+        assert!((snap.speed.unwrap() - 1_500_000.0).abs() < 1.0);
+    }
+
+    // ── Cancel via supervisor ──────────────────────────────────────────
+
+    #[test]
+    fn test_supervisor_cancel_by_kind() {
+        let mut sup = JobSupervisor::new();
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |ctx| {
+            while !ctx.cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(JobError::Cancelled)
+        });
+
+        assert!(sup.is_running(JobKind::FfmpegCapProbe));
+        assert!(sup.cancel(JobKind::FfmpegCapProbe));
+
+        std::thread::sleep(Duration::from_millis(50));
+        sup.poll();
+
+        let events = sup.drain();
+        let cancelled = events.iter().any(|e| matches!(e, JobEvent::Finished { outcome: JobOutcome::Cancelled { .. }, .. }));
+        assert!(cancelled, "expected Cancelled outcome");
+    }
+
+    // ── Shutdown cancels all ───────────────────────────────────────────
+
+    #[test]
+    fn test_supervisor_shutdown_joins() {
+        let mut sup = JobSupervisor::new();
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&flag);
+
+        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), move |ctx| {
+            while !ctx.cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            flag_clone.store(true, Ordering::Relaxed);
+            Err(JobError::Cancelled)
+        });
+
+        sup.shutdown(Duration::from_secs(5));
+        assert!(flag.load(Ordering::Relaxed), "job should have been cancelled");
+    }
+}

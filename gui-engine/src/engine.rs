@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -12,13 +12,15 @@ use crate::command::{ConverterCommand, GuiCommand};
 use crate::config;
 use crate::video_codecs::describe_chain;
 use crate::converter::{
-    query_ffmpeg_capabilities, ConversionState, ConversionStatus, SharedConversionState,
-    CancelFlag, FfmpegCapabilities, ChannelMap, ConversionPipeline, ConverterSettings,
+    query_ffmpeg_capabilities, ConversionState, ConversionStatus,
+    FfmpegCapabilities, ChannelMap, ConversionPipeline, ConverterSettings,
     RecordingType, duplicate_output_names, duplicate_output_warning, evaluate_readiness,
-    output_collision_warning, preview_output_files, apply_available_defaults, spawn_conversion,
+    output_collision_warning, preview_output_files, apply_available_defaults,
+    spawn_conversion_job,
 };
 use crate::ffprobe::{self, VideoAudioProbe};
-use crate::offload::{self, DeviceNameSource, OffloadContext, ScanProgress};
+use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobSupervisor, spawn_job};
+use crate::offload::{self, DeviceNameSource, OffloadContext, run_offload_copy_job, run_offload_scan_job};
 use crate::state::{AppStateSnapshot, ClapLogItem};
 use crate::timecode;
 
@@ -59,11 +61,6 @@ pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnap
     engine_main_with_probe(cmd_rx, state, use_libltc, query_ffmpeg_capabilities)
 }
 
-/// Internal message sent from the ffmpeg-capability probe thread.
-struct FfmpegProbeResult {
-    caps: FfmpegCapabilities,
-}
-
 /// Like [`engine_main`] but accepts an injectable capability-probe function
 /// for testing.
 pub fn engine_main_with_probe<F>(
@@ -101,46 +98,34 @@ pub fn engine_main_with_probe<F>(
     // when the scan result arrives).
     let mut pending_recording: Option<usize> = None;
 
-    // Internal result channel for async decode operations
+    // Job supervisor — single channel for all async task result events
+    let mut supervisor = JobSupervisor::new();
+
+    // Legacy channels for LTC decode operations (not yet migrated)
     let (decode_result_tx, decode_result_rx) =
         std::sync::mpsc::channel::<LtcDecodeResult>();
-
-    // Internal result channel for group (batch) decode operations
     let (group_result_tx, group_result_rx) =
         std::sync::mpsc::channel::<GroupLtcResult>();
-
-    // Internal result channel for ffmpeg capability probe
-    let (caps_tx, caps_rx) =
-        std::sync::mpsc::channel::<FfmpegProbeResult>();
-
-    // Internal result channel for file duration probe
-    let (dur_tx, dur_rx) =
-        std::sync::mpsc::channel::<DurationResult>();
-
-    // Internal result channel for converter clip probe
+    // Converter clip probe channel (used by apply_recording_selection)
     let (conv_probe_tx, conv_probe_rx) =
         std::sync::mpsc::channel::<ConverterProbeResult>();
-
-    // Internal result channel for video-file probe (async ProbeVideo)
-    let (probe_tx, probe_rx) =
-        std::sync::mpsc::channel::<VideoProbeResult>();
-
-    // Internal result channel for offload card scan and copy completion
-    let (offload_event_tx, offload_event_rx) =
+    // Legacy offload event channel (kept for compatibility with handle_offload_command signature)
+    let (offload_event_tx, _offload_event_rx) =
         std::sync::mpsc::channel::<OffloadEvent>();
 
-    // Internal result channel for folder scan (file group discovery)
-    let (scan_tx, scan_rx) =
-        std::sync::mpsc::channel::<FolderScanResult>();
-
-    // Spawn the ffmpeg capability probe on a background thread
-    std::thread::Builder::new()
-        .name("ffmpeg-probe".into())
-        .spawn(move || {
+    // Spawn the ffmpeg capability probe on a background thread (via job supervisor)
+    {
+        let spec = job::JobSpec {
+            kind: JobKind::FfmpegCapProbe,
+            name: "ffmpeg-probe",
+            units: Vec::new(),
+        };
+        spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
+            ctx.progress.set_indeterminate(true);
             let caps = probe_fn();
-            let _ = caps_tx.send(FfmpegProbeResult { caps });
-        })
-        .expect("failed to spawn ffmpeg-probe thread");
+            Ok(JobFinal::FfmpegCaps { caps: Some(caps) })
+        });
+    }
 
     // Chunked decode progress / cancel tracking (WAV single-file path)
     let mut decode_cancel: Option<Arc<AtomicBool>> = None;
@@ -153,69 +138,15 @@ pub fn engine_main_with_probe<F>(
     let mut group_cancel: Option<Arc<AtomicBool>> = None;
     let mut group_clip_progress: Option<ClipProgress> = None;
 
-    // Duration probe tracking
-    let mut dur_total: usize = 0;
-    let mut dur_done: usize = 0;
-
-    // Offload state (scan + copy)
-    let mut offload_scan_generation: u64 = 0;
+    // Offload variables (used by handle_offload_command)
     let mut offload_context: Option<Arc<OffloadContext>> = None;
-    let mut offload_device_names: Vec<String> = Vec::new();
-    let mut offload_completed_before: Vec<String> = Vec::new();
-    let mut scan_progress: Option<Arc<ScanProgress>> = None;
-    // Speed tracking (smoothed MB/s via byte deltas between ticks)
-    let mut offload_last_blocks_done: usize = 0;
-    let mut offload_last_time: Option<Instant> = None;
-    let mut offload_last_progress: Option<Instant> = None;
-    let mut offload_speed_smoothed: f64 = 0.0;
 
-    // Conversion lifecycle state (engine-owned, shared with conversion thread)
-    let mut conv_state_shared: SharedConversionState = Arc::new(Mutex::new(ConversionState::idle()));
-    let mut conv_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     loop {
         let now = Instant::now();
         let dt = (now - last_tick).as_secs_f32();
         last_tick = now;
 
-        // 0. Drain folder scan results FIRST — before commands — so that a
-        //     SelectRecording processed in step 1 always finds the latest
-        //     scanned groups.
-        loop {
-            match scan_rx.try_recv() {
-                Ok(FolderScanResult { path, groups, generation }) => {
-                    if generation == current.converter.groups_generation
-                        && Some(&path) == current.converter.groups_folder.as_ref()
-                    {
-                        current.converter.groups = groups;
-                        current.converter.groups_loading = false;
-                        info!("Folder scan complete: {} group(s)", current.converter.groups.len());
-                        // Apply a deferred SelectRecording, if any was queued
-                        // while the scan was in flight.
-                        if let Some(idx) = pending_recording.take() {
-                            info!(
-                                "Applying deferred SelectRecording({}) after folder scan",
-                                idx,
-                            );
-                            apply_recording_selection(
-                                &mut current, idx,
-                                &mut decode_cancel, &mut group_cancel,
-                                &mut group_clip_progress,
-                                &mut last_auto_applied_ltc_gen,
-                                &mut last_auto_applied_group_ltc_gen,
-                                &conv_probe_tx,
-                            );
-                        }
-                    } else {
-                        warn!("Discarding stale folder scan result (gen {} != {} or path mismatch)", generation, current.converter.groups_generation);
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    warn!("Folder scan channel disconnected");
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            }
-        }
+        // 0. Folder scan results now handled via supervisor drain (section 1.7)
 
         // 1. Drain all pending commands
         loop {
@@ -228,20 +159,23 @@ pub fn engine_main_with_probe<F>(
                 }
                 Ok(GuiCommand::ProbeFileDurations(paths)) => {
                     current.file_durations_generation += 1;
-                    let gen = current.file_durations_generation;
                     current.file_durations.clear();
-                    dur_total = paths.len();
-                    dur_done = 0;
-                    let tx = dur_tx.clone();
-                    std::thread::Builder::new()
-                        .name("duration-probe".into())
-                        .spawn(move || {
-                            for path in paths {
-                                let secs = crate::duration::file_duration_secs(&path);
-                                let _ = tx.send(DurationResult { path, generation: gen, secs });
+                    let spec = job::JobSpec {
+                        kind: JobKind::DurationProbe,
+                        name: "duration-probe",
+                        units: vec![job::UnitSpec { weight: 1.0, label: "duration probe".into() }],
+                    };
+                    spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
+                        ctx.progress.set_indeterminate(true);
+                        for path in paths {
+                            if ctx.cancel.is_cancelled() {
+                                return Ok(JobFinal::DurationsDone);
                             }
-                        })
-                        .expect("failed to spawn duration-probe thread");
+                            let secs = crate::duration::file_duration_secs(&path);
+                            ctx.emit(JobItem::DurationResult { path, secs });
+                        }
+                        Ok(JobFinal::DurationsDone)
+                    });
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SelectFolder(path))) => {
                     current.converter.groups.clear();
@@ -249,7 +183,6 @@ pub fn engine_main_with_probe<F>(
                     current.converter.groups_folder = Some(path.clone());
                     current.converter.groups_generation = current.converter.groups_generation.wrapping_add(1);
                     pending_recording = None; // new scan invalidates any deferred selection
-                    let gen = current.converter.groups_generation;
                     current.converter.selected_group_idx = None;
                     current.converter.probes.clear();
                     current.converter.probes_loading = false;
@@ -261,19 +194,22 @@ pub fn engine_main_with_probe<F>(
                     current.converter.settings.output_folder_user_set = false;
                     // Persist input folder
                     config::save_input_folder(&path);
-                    let tx = scan_tx.clone();
-                    std::thread::Builder::new()
-                        .name("folder-scan".into())
-                        .spawn(move || {
-                            let groups = crate::file_pattern::match_files_all_patterns(&path);
-                            info!(
-                                "Folder scan complete: {} — {} group(s) matched",
-                                path.display(),
-                                groups.len(),
-                            );
-                            let _ = tx.send(FolderScanResult { path, groups, generation: gen });
-                        })
-                        .expect("failed to spawn folder-scan thread");
+                    let scan_path = path.clone();
+                    let spec = job::JobSpec {
+                        kind: JobKind::FolderScan,
+                        name: "folder-scan",
+                        units: Vec::new(),
+                    };
+                    spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
+                        ctx.progress.set_indeterminate(true);
+                        let groups = crate::file_pattern::match_files_all_patterns(&scan_path);
+                        info!(
+                            "Folder scan complete: {} — {} group(s) matched",
+                            scan_path.display(),
+                            groups.len(),
+                        );
+                        Ok(JobFinal::FolderScan { path: scan_path, groups })
+                    });
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SelectRecording(idx))) => {
@@ -298,12 +234,9 @@ pub fn engine_main_with_probe<F>(
                     handle_offload_command(
                         cmd,
                         &mut current,
-                        &mut offload_scan_generation,
-                        &mut offload_context,
-                        &mut offload_device_names,
-                        &mut offload_completed_before,
+                        &mut supervisor,
                         &offload_event_tx,
-                        &mut scan_progress,
+                        &mut offload_context,
                     );
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetNamingPattern(val))) => {
@@ -395,17 +328,16 @@ pub fn engine_main_with_probe<F>(
                         warn!("Conversion already in progress — ignoring duplicate StartConversion");
                     } else if let Some(settings) = assemble_converter_settings(&current) {
                         let caps = current.ffmpeg_caps.clone();
-                        // Create fresh shared state and cancel flag for this conversion
-                        let fresh_state: SharedConversionState = Arc::new(Mutex::new(ConversionState::idle()));
-                        let fresh_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-                        let _ = spawn_conversion(
-                            settings,
-                            fresh_state.clone(),
-                            fresh_cancel.clone(),
-                            caps.as_ref(),
-                        );
-                        conv_state_shared = fresh_state;
-                        conv_cancel = fresh_cancel;
+                        // Cancel any previous conversion job first
+                        supervisor.cancel(JobKind::Conversion);
+                        let spec = job::JobSpec {
+                            kind: JobKind::Conversion,
+                            name: "conversion",
+                            units: vec![job::UnitSpec { weight: 1.0, label: "conversion".into() }],
+                        };
+                        spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
+                            spawn_conversion_job(ctx, settings, caps)
+                        });
                         // Immediately reflect running state in snapshot
                         current.converter.conversion_state = ConversionState {
                             status: ConversionStatus::Running { progress: 0.0 },
@@ -413,7 +345,7 @@ pub fn engine_main_with_probe<F>(
                             current_line: String::new(),
                         };
                         current.status_message = "Conversion started…".to_string();
-                        info!("Conversion started via engine StartConversion command");
+                        info!("Conversion started via engine StartConversion command (job-based)");
                     } else {
                         let msg = "Cannot start conversion — no recording group selected or settings incomplete".to_string();
                         current.status_message = msg.clone();
@@ -421,26 +353,32 @@ pub fn engine_main_with_probe<F>(
                     }
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::CancelConversion)) => {
-                    conv_cancel.store(true, Ordering::Relaxed);
+                    supervisor.cancel(JobKind::Conversion);
+                    current.converter.conversion_state.status = ConversionStatus::Failed {
+                        error_log: "Cancelled by user".to_string(),
+                    };
                     current.status_message = "Conversion canceled".to_string();
-                    info!("Conversion cancel signaled via engine CancelConversion command");
+                    info!("Conversion cancel signaled via engine CancelConversion command (job-based)");
                 }
                 Ok(GuiCommand::ProbeVideo(path)) => {
-                    info!("Probing video file for audio streams (async): {}", path);
+                    info!("Probing video file for audio streams (async via job): {}", path);
                     current.ltc_probe_generation += 1;
-                    let gen = current.ltc_probe_generation;
                     current.ltc_probe = None;
                     current.ltc_decode_error = None;
                     current.ltc_decode_is_video = false;
                     current.status_message = format!("Probing video: {}", path);
-                    let tx = probe_tx.clone();
-                    std::thread::Builder::new()
-                        .name("video-probe".into())
-                        .spawn(move || {
-                            let result = crate::ffprobe::probe_video_audio(Path::new(&path));
-                            let _ = tx.send(VideoProbeResult { path, generation: gen, result });
-                        })
-                        .expect("failed to spawn video-probe thread");
+                    let path_clone = path.clone();
+                    let spec = job::JobSpec {
+                        kind: JobKind::VideoProbe,
+                        name: "video-probe",
+                        units: Vec::new(),
+                    };
+                    spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
+                        ctx.progress.set_indeterminate(true);
+                        let result = crate::ffprobe::probe_video_audio(Path::new(&path_clone))
+                            .map_err(|e| e.to_string());
+                        Ok(JobFinal::VideoProbe { result })
+                    });
                 }
                 Ok(cmd) => {
                     process_command(
@@ -470,44 +408,7 @@ pub fn engine_main_with_probe<F>(
             }
         }
 
-        // 1.4 Drain async video probe result
-        loop {
-            match probe_rx.try_recv() {
-                Ok(VideoProbeResult { path, generation, result }) => {
-                    if generation == current.ltc_probe_generation {
-                        match result {
-                            Ok(probe) => {
-                                current.ltc_probe = Some(probe.clone());
-                                current.ltc_selected_stream = 0;
-                                current.ltc_selected_channel = 0;
-                                current.ltc_decode_is_video = true;
-                                current.status_message = format!(
-                                    "Video probed: {} audio stream(s), {} total channel(s)",
-                                    probe.streams.len(),
-                                    probe.total_audio_channels,
-                                );
-                                info!("Probe succeeded: {} streams, {} channels — {}", probe.streams.len(), probe.total_audio_channels, path);
-                            }
-                            Err(e) => {
-                                current.ltc_probe = None;
-                                current.ltc_decode_error = Some(e.clone());
-                                current.ltc_decode_is_video = false;
-                                current.status_message = format!("Video probe failed: {}", e);
-                                error!("Video probe failed: {} — {}", path, e);
-                            }
-                        }
-                    } else {
-                        warn!("Discarding stale video probe result: generation={}, expected={}, path={}",
-                            generation, current.ltc_probe_generation, path);
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    warn!("Video probe result channel disconnected");
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            }
-        }
+        // 1.4 — Video probe now handled via supervisor drain (section 1.7)
 
         // 1.5 Drain async decode results
         loop {
@@ -659,29 +560,258 @@ pub fn engine_main_with_probe<F>(
             }
         }
 
-        // 1.7 Drain ffmpeg capability probe result
-        drain_ffmpeg_probe_result(&caps_rx, &mut current);
-
-        // 1.8 Drain file duration probe results
-        loop {
-            match dur_rx.try_recv() {
-                Ok(DurationResult { path, generation, secs }) => {
-                    if generation == current.file_durations_generation {
-                        current.file_durations.insert(path, secs);
-                        current.file_durations_version = current.file_durations_version.wrapping_add(1);
-                        dur_done += 1;
-                        if dur_done >= dur_total {
-                            info!("File duration probe complete: {}/{} files", dur_done, dur_total);
+        // 1.7 Poll supervisor for finished jobs and drain events — unified dispatcher
+        //     for all async job results that were started via spawn_job.
+        let progress_snapshots = supervisor.poll();
+        // Update conversion and offload progress from supervisor snapshots
+        for (_id, kind, snap) in &progress_snapshots {
+            if *kind == JobKind::Conversion {
+                let pct = snap.fraction;
+                current.converter.conversion_state.status = ConversionStatus::Running { progress: pct };
+                if !snap.message.is_empty() {
+                    current.status_message = snap.message.clone();
+                }
+            }
+            if *kind == JobKind::OffloadCopy && current.offload.running {
+                current.offload.overall_progress = snap.fraction;
+                // Map units to device_progress
+                let mut device_progress: Vec<offload::OffloadDeviceStatus> = Vec::new();
+                for (_, unit) in snap.units.iter().enumerate() {
+                    let state = match unit.state {
+                        job::UnitState::Pending => offload::OffloadDeviceState::Pending,
+                        job::UnitState::Running => offload::OffloadDeviceState::Copying,
+                        job::UnitState::Done => offload::OffloadDeviceState::Done,
+                        job::UnitState::Failed => offload::OffloadDeviceState::Failed(unit.message.clone()),
+                        job::UnitState::Skipped => offload::OffloadDeviceState::Skipped,
+                    };
+                    device_progress.push(offload::OffloadDeviceStatus {
+                        device_name: unit.label.clone(),
+                        files_total: 1,
+                        files_done: if matches!(unit.state, job::UnitState::Done) { 1 } else { 0 },
+                        bytes_total: 0,
+                        bytes_done: 0,
+                        current_file: unit.message.clone(),
+                        state,
+                    });
+                }
+                current.offload.device_progress = device_progress;
+                if !snap.message.is_empty() {
+                    current.status_message = snap.message.clone();
+                }
+                // Speed: use ProgressSnapshot.speed
+                if let Some(speed) = snap.speed {
+                    current.offload.speed_bytes_per_sec = speed;
+                }
+                // Set status message with speed
+                if snap.fraction > 0.0 && snap.fraction < 1.0 {
+                    let speed_mb = current.offload.speed_bytes_per_sec / (1024.0 * 1024.0);
+                    current.status_message = format!(
+                        "Offloading… {:.0}% ({:.1} MB/s)",
+                        snap.fraction * 100.0,
+                        speed_mb,
+                    );
+                }
+            }
+        }
+        for event in supervisor.drain() {
+            match event {
+                JobEvent::Finished { kind: JobKind::Conversion, outcome, .. } => {
+                    match outcome {
+                        JobOutcome::Succeeded { .. } => {
+                            current.converter.conversion_state = ConversionState {
+                                status: ConversionStatus::Completed,
+                                ffmpeg_output: String::new(),
+                                current_line: String::new(),
+                            };
+                            recompute_converter_derived(&mut current);
+                            current.status_message = "Conversion completed".to_string();
+                            info!("Engine-owned conversion completed successfully (job)");
+                        }
+                        JobOutcome::Cancelled { .. } => {
+                            current.converter.conversion_state = ConversionState {
+                                status: ConversionStatus::Failed { error_log: "Cancelled by user".to_string() },
+                                ffmpeg_output: String::new(),
+                                current_line: String::new(),
+                            };
+                            recompute_converter_derived(&mut current);
+                            current.status_message = "Conversion canceled".to_string();
+                            info!("Engine-owned conversion cancelled (job)");
+                        }
+                        JobOutcome::Failed { error, .. } => {
+                            current.converter.conversion_state = ConversionState {
+                                status: ConversionStatus::Failed { error_log: error.clone() },
+                                ffmpeg_output: error.clone(),
+                                current_line: String::new(),
+                            };
+                            recompute_converter_derived(&mut current);
+                            current.status_message = format!("Conversion failed: {}", error);
+                            warn!("Engine-owned conversion failed: {}", error);
                         }
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    warn!("Duration probe channel disconnected");
-                    break;
+                JobEvent::Finished { kind: JobKind::FfmpegCapProbe, payload: JobFinal::FfmpegCaps { caps }, .. } => {
+                    if let Some(caps) = caps {
+                        apply_ffmpeg_probe_result(&mut current, caps);
+                    } else {
+                        current.ffmpeg_probe_running = false;
+                        warn!("FFmpeg capability probe returned no caps");
+                        recompute_converter_derived(&mut current);
+                    }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                JobEvent::Finished { kind: JobKind::FolderScan, payload: JobFinal::FolderScan { path, groups }, .. } => {
+                    if Some(&path) == current.converter.groups_folder.as_ref() {
+                        current.converter.groups = groups;
+                        current.converter.groups_loading = false;
+                        info!("Folder scan complete: {} group(s)", current.converter.groups.len());
+                        if let Some(idx) = pending_recording.take() {
+                            info!("Applying deferred SelectRecording({}) after folder scan", idx);
+                            apply_recording_selection(
+                                &mut current, idx,
+                                &mut decode_cancel, &mut group_cancel,
+                                &mut group_clip_progress,
+                                &mut last_auto_applied_ltc_gen,
+                                &mut last_auto_applied_group_ltc_gen,
+                                &conv_probe_tx,
+                            );
+                        }
+                    } else {
+                        warn!("Discarding stale supervisor folder scan result (path mismatch)");
+                    }
+                }
+                JobEvent::Finished { kind: JobKind::VideoProbe, payload: JobFinal::VideoProbe { result }, .. } => {
+                    match result {
+                        Ok(probe) => {
+                            current.ltc_probe = Some(probe.clone());
+                            current.ltc_selected_stream = 0;
+                            current.ltc_selected_channel = 0;
+                            current.ltc_decode_is_video = true;
+                            current.ltc_decode_error = None;
+                            current.status_message = format!(
+                                "Video probed: {} audio stream(s), {} total channel(s)",
+                                probe.streams.len(),
+                                probe.total_audio_channels,
+                            );
+                            info!("Video probe succeeded (job): {} streams, {} channels", probe.streams.len(), probe.total_audio_channels);
+                        }
+                        Err(e) => {
+                            current.ltc_probe = None;
+                            current.ltc_decode_error = Some(e.clone());
+                            current.ltc_decode_is_video = false;
+                            current.status_message = format!("Video probe failed: {}", e);
+                            error!("Video probe failed (job): {}", e);
+                        }
+                    }
+                }
+                JobEvent::Finished { kind: JobKind::OffloadScan, payload: JobFinal::OffloadScan { mut cards }, .. } => {
+                    current.offload.scanning = false;
+                    // Apply default selection (latest recording day) to each card.
+                    let file_paths: Vec<PathBuf> = cards.iter()
+                        .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
+                        .collect();
+                    for card in &mut cards {
+                        let sel = crate::offload::default_selection(&card.files);
+                        crate::offload::apply_selection(card, sel);
+                    }
+                    current.offload.cards = cards;
+                    current.offload.file_durations.clear();
+                    current.offload.durations_version =
+                        current.offload.durations_version.wrapping_add(1);
+
+                    if current.offload.cards.is_empty() {
+                        info!(
+                            "Offload card scan complete: 0 cards — if your card reader \
+                             is connected, check that the card is mounted and has \
+                             video/audio files"
+                        );
+                    } else {
+                        info!(
+                            "Offload card scan complete: {} card(s)",
+                            current.offload.cards.len()
+                        );
+                        // Spawn async duration probe for all scanned files
+                        let spec = job::JobSpec {
+                            kind: JobKind::DurationProbe,
+                            name: "offload-dur-probe",
+                            units: Vec::new(),
+                        };
+                        spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
+                            ctx.progress.set_indeterminate(true);
+                            for path in file_paths {
+                                if ctx.cancel.is_cancelled() {
+                                    break;
+                                }
+                                let secs = crate::duration::file_duration_secs(&path);
+                                ctx.emit(job::JobItem::DurationResult { path, secs });
+                            }
+                            Ok(JobFinal::DurationsDone)
+                        });
+                    }
+                }
+                JobEvent::Item { kind: JobKind::DurationProbe, item: JobItem::DurationResult { path, secs }, .. } => {
+                    // Write to converter file_durations
+                    current.file_durations.insert(path.clone(), secs);
+                    current.file_durations_version =
+                        current.file_durations_version.wrapping_add(1);
+                    // Write to offload file_durations
+                    current.offload.file_durations.insert(path, secs);
+                    current.offload.durations_version =
+                        current.offload.durations_version.wrapping_add(1);
+                }
+                JobEvent::Finished { kind: JobKind::DurationProbe, payload: JobFinal::DurationsDone, .. } => {
+                    info!("Duration probe complete");
+                }
+                JobEvent::Finished { kind: JobKind::OffloadCopy, payload: JobFinal::OffloadCopy { completed_devices }, outcome, .. } => {
+                    let was_cancelled = matches!(&outcome, JobOutcome::Cancelled { .. });
+                    if was_cancelled {
+                        info!(
+                            "Offload copy was cancelled by user: {} device(s) completed",
+                            completed_devices.len(),
+                        );
+                        current.offload.running = false;
+                        current.offload.overall_progress = 0.0;
+                        current.offload.speed_bytes_per_sec = 0.0;
+                        current.offload.device_progress.clear();
+                        current.offload.error = Some("Canceled by user".to_string());
+                        current.status_message = "Offload canceled".to_string();
+                    } else {
+                        // Log per-device failures.
+                        for dev in &current.offload.device_progress {
+                            if let offload::OffloadDeviceState::Failed(ref msg) = dev.state {
+                                warn!(
+                                    "Offload device '{}' FAILED: {}",
+                                    dev.device_name, msg
+                                );
+                            }
+                        }
+                        info!(
+                            "Offload copy complete: {} device(s) offloaded of {}",
+                            completed_devices.len(),
+                            current.offload.device_progress.len(),
+                        );
+                        let parent = current.offload.parent_folder.clone();
+                        current.offload.running = false;
+                        current.offload.overall_progress = 1.0;
+                        current.offload.speed_bytes_per_sec = 0.0;
+                        for name in &completed_devices {
+                            if !current.offload.completed_devices.contains(name) {
+                                current.offload.completed_devices.push(name.clone());
+                            }
+                        }
+                        let target = parent.map(|p| p.join(&current.offload.parent_name));
+                        current.offload.last_offload_parent = target;
+                        current.offload.last_offload_version =
+                            current.offload.last_offload_version.wrapping_add(1);
+                        current.status_message = format!(
+                            "Offload complete: {} device(s) copied",
+                            completed_devices.len(),
+                        );
+                    }
+                }
+                _ => {}
             }
         }
+
+        // 1.8 — File duration probe now via supervisor drain (section 1.7)
 
         // 1.9 Drain converter clip probe results
         loop {
@@ -769,141 +899,9 @@ pub fn engine_main_with_probe<F>(
             }
         }
 
-        // 1.10 Drain offload events (card scans + copy completion)
-        loop {
-            match offload_event_rx.try_recv() {
-                Ok(OffloadEvent::CardsScanned { mut cards, generation }) => {
-                    scan_progress = None;
-                    if generation == offload_scan_generation {
-                        // Collect file paths before consume for duration probing.
-                        let file_paths: Vec<PathBuf> = cards.iter()
-                            .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
-                            .collect();
-
-                        // Apply default selection (latest recording day) to each card.
-                        for card in &mut cards {
-                            let sel = crate::offload::default_selection(&card.files);
-                            crate::offload::apply_selection(card, sel);
-                        }
-                        current.offload.cards = cards;
-                        current.offload.scanning = false;
-                        current.offload.file_durations.clear();
-                        current.offload.durations_version =
-                            current.offload.durations_version.wrapping_add(1);
-
-                        if current.offload.cards.is_empty() {
-                            info!(
-                                "Offload card scan complete: 0 cards — if your card reader \
-                                 is connected, check that the card is mounted and has \
-                                 video/audio files"
-                            );
-                        } else {
-                            info!(
-                                "Offload card scan complete: {} card(s)",
-                                current.offload.cards.len()
-                            );
-                            // Spawn async duration probe for all scanned files.
-                            let tx = offload_event_tx.clone();
-                            let gen = generation;
-                            std::thread::Builder::new()
-                                .name("offload-dur-probe".into())
-                                .spawn(move || {
-                                    for path in file_paths {
-                                        let secs = crate::duration::file_duration_secs(&path);
-                                        let _ = tx.send(OffloadEvent::OffloadDurationResult {
-                                            path, secs, generation: gen,
-                                        });
-                                    }
-                                })
-                                .expect("failed to spawn offload duration-probe thread");
-                        }
-                    } else {
-                        warn!("Discarding stale offload scan result: gen={}", generation);
-                    }
-                }
-                Ok(OffloadEvent::OffloadDone { completed, generation }) => {
-                    if generation == offload_scan_generation {
-                        let was_cancelled = offload_context
-                            .as_ref()
-                            .map(|c| c.cancel.load(Ordering::Relaxed))
-                            .unwrap_or(false);
-
-                        if was_cancelled {
-                            info!(
-                                "Offload copy was cancelled by user (gen={}): {} device(s) completed",
-                                generation,
-                                completed.len(),
-                            );
-                            current.offload.running = false;
-                            current.offload.overall_progress = 0.0;
-                            current.offload.speed_bytes_per_sec = 0.0;
-                            current.offload.device_progress.clear();
-                            current.offload.error = Some("Canceled by user".to_string());
-                            current.status_message = "Offload canceled".to_string();
-                        } else {
-                            // Log per-device failures.
-                            for dev in &current.offload.device_progress {
-                                if let offload::OffloadDeviceState::Failed(ref msg) = dev.state {
-                                    warn!(
-                                        "Offload device '{}' FAILED: {}",
-                                        dev.device_name, msg
-                                    );
-                                }
-                            }
-                            info!(
-                                "Offload copy complete (gen={}): {} device(s) offloaded of {}",
-                                generation,
-                                completed.len(),
-                                current.offload.device_progress.len(),
-                            );
-                            let parent = current.offload.parent_folder.clone();
-                            current.offload.running = false;
-                            current.offload.overall_progress = 1.0;
-                            current.offload.speed_bytes_per_sec = 0.0;
-                            for name in &completed {
-                                if !current.offload.completed_devices.contains(name) {
-                                    current.offload.completed_devices.push(name.clone());
-                                }
-                            }
-                            // New offload output → set last_offload_parent for converter auto-switch.
-                            let target = parent.map(|p| p.join(&current.offload.parent_name));
-                            current.offload.last_offload_parent = target;
-                            current.offload.last_offload_version =
-                                current.offload.last_offload_version.wrapping_add(1);
-                            current.status_message = format!(
-                                "Offload complete: {} device(s) copied",
-                                completed.len(),
-                            );
-                        }
-                        offload_context = None;
-                    } else {
-                        warn!("Discarding stale offload copy result: gen={}", generation);
-                    }
-                }
-                Ok(OffloadEvent::OffloadDurationResult { path, secs, generation }) => {
-                    if generation == offload_scan_generation {
-                        current.offload.file_durations.insert(path, secs);
-                        current.offload.durations_version =
-                            current.offload.durations_version.wrapping_add(1);
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    warn!("Offload event channel disconnected");
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            }
-        }
-
-        // 1.11 Poll scan progress from shared cell
-        if let Some(ref sp) = scan_progress {
-            current.offload.scan_status = sp.read();
-            if let Some(ref msg) = current.offload.scan_status {
-                current.status_message = msg.clone();
-            }
-        } else {
-            current.offload.scan_status = None;
-        }
+        // 1.10 — Offload events now handled via supervisor drain (section 1.7)
+        
+        // 1.11 — Scan progress now reported via ProgressTracker (supervisor poll)
 
         // 1.12 Poll chunked / group decode progress
         if current.ltc_is_detecting {
@@ -939,91 +937,19 @@ pub fn engine_main_with_probe<F>(
             current.ltc_decode_progress_str = String::new();
         }
 
-        // 1.12 Poll offload copy progress from shared atomics
-        if current.offload.running {
-            if let Some(ref ctx) = offload_context {
-                let snapshot = offload::snapshot_from_context(
-                    ctx,
-                    &offload_device_names,
-                    &current.offload.completed_devices,
-                    current.offload.parent_folder.clone(),
-                    &current.offload.parent_name,
-                    None,
-                    current.offload.last_offload_version,
-                );
-                current.offload.overall_progress = snapshot.overall_progress;
-                current.offload.device_progress = snapshot.device_progress;
-
-                // Compute smoothed copy speed from byte deltas.
-                let now = Instant::now();
-                let blocks_now = ctx.overall_blocks_done.load(Ordering::Relaxed);
-                let delta_blocks = blocks_now.saturating_sub(offload_last_blocks_done);
-                if delta_blocks > 0 {
-                    offload_last_progress = Some(now);
-                }
-                let since_progress = match offload_last_progress {
-                    Some(t) => now.saturating_duration_since(t).as_secs_f64(),
-                    None => 0.0,
-                };
-                if let Some(last_time) = offload_last_time {
-                    let delta_t = now.saturating_duration_since(last_time).as_secs_f64();
-                    if delta_t > 0.001 {
-                        update_offload_speed(
-                            &mut offload_speed_smoothed,
-                            delta_blocks,
-                            delta_t,
-                            since_progress,
-                        );
-                    }
-                } else {
-                    offload_speed_smoothed = 0.0;
-                }
-                offload_last_blocks_done = blocks_now;
-                offload_last_time = Some(now);
-                current.offload.speed_bytes_per_sec = offload_speed_smoothed;
-
-                let speed_mb = offload_speed_smoothed / (1024.0 * 1024.0);
-                current.status_message = format!(
-                    "Offloading… {:.0}% ({:.1} MB/s)",
-                    snapshot.overall_progress * 100.0,
-                    speed_mb,
-                );
-            }
-        } else {
+        // 1.12 — Offload copy progress now reported via supervisor poll (section 1.7)
+        if !supervisor.is_running(JobKind::OffloadCopy) && !current.offload.running {
             current.offload.device_progress.clear();
-            // Reset speed tracking when idle.
-            offload_last_blocks_done = 0;
-            offload_last_time = None;
-            offload_last_progress = None;
-            offload_speed_smoothed = 0.0;
             current.offload.speed_bytes_per_sec = 0.0;
         }
 
-        // 1.13 Poll conversion progress from engine-owned shared state
-        if let Ok(mut locked) = conv_state_shared.lock() {
-            match &locked.status {
-                ConversionStatus::Running { progress } => {
-                    current.converter.conversion_state = locked.clone();
-                    current.status_message =
-                        format!("Conversion in progress: {:.0}%", progress * 100.0);
-                }
-                ConversionStatus::Completed => {
-                    current.converter.conversion_state = locked.clone();
-                    *locked = ConversionState::idle();
-                    recompute_converter_derived(&mut current);
-                    current.status_message = "Conversion completed".to_string();
-                    info!("Engine-owned conversion completed successfully");
-                }
-                ConversionStatus::Failed { error_log } => {
-                    current.converter.conversion_state = locked.clone();
-                    let err = error_log.clone();
-                    *locked = ConversionState::idle();
-                    recompute_converter_derived(&mut current);
-                    current.status_message = format!("Conversion failed: {}", err);
-                    warn!("Engine-owned conversion failed: {}", err);
-                }
-                _ => {} // Idle — nothing to do
-            }
+        // 1.13 Reset conversion state if job is no longer running and state is still Running
+        //     (the Finished event handler sets Completed/Failed directly).
+        if matches!(current.converter.conversion_state.status, ConversionStatus::Running { .. })
+            && !supervisor.is_running(JobKind::Conversion)
+        {
+            // Conversion finished but we missed the event somehow — reset to idle.
+            current.converter.conversion_state = ConversionState::idle();
         }
 
         // 2. Poll current timecode if playing
@@ -1068,25 +994,11 @@ pub fn engine_main_with_probe<F>(
     }
 }
 
-/// Internal message sent from a spawned decode thread back to the engine loop.
+/// Remaining legacy channel type for LTC decode (not yet fully migrated).
 struct LtcDecodeResult {
     path: String,
     generation: u64,
     result: Result<LtcDetectionResult, String>,
-}
-
-/// Internal message sent from a spawned duration-probe thread back to the engine loop.
-struct DurationResult {
-    path: std::path::PathBuf,
-    generation: u64,
-    secs: Option<f64>,
-}
-
-/// Internal message sent from a spawned video-probe thread back to the engine loop.
-struct VideoProbeResult {
-    path: String,
-    generation: u64,
-    result: Result<VideoAudioProbe, String>,
 }
 
 /// Internal message sent from the converter-probe thread back to the engine loop.
@@ -1094,13 +1006,6 @@ struct ConverterProbeResult {
     probes: Vec<Result<VideoAudioProbe, String>>,
     cameras: Vec<Option<crate::CameraInfo>>,
     device_name: String,
-    generation: u64,
-}
-
-/// Internal message sent from the folder-scan thread back to the engine loop.
-struct FolderScanResult {
-    path: std::path::PathBuf,
-    groups: Vec<crate::file_pattern::MatchedGroup>,
     generation: u64,
 }
 
@@ -2064,46 +1969,25 @@ fn attempt_recovery(
     }
 }
 
-/// Drain the ffmpeg capability probe result from the background thread.
-/// Returns `true` if the probe thread disconnected without sending a result
-/// (genuine probe failure), `false` otherwise.
-fn drain_ffmpeg_probe_result(
-    caps_rx: &std::sync::mpsc::Receiver<FfmpegProbeResult>,
-    current: &mut AppStateSnapshot,
-) -> bool {
-    if !current.ffmpeg_probe_running {
-        return false;
-    }
-    match caps_rx.try_recv() {
-        Ok(FfmpegProbeResult { caps }) => {
-            current.ffmpeg_caps = Some(caps.clone());
-            current.ffmpeg_probe_running = false;
-            info!(
-                "ffmpeg capability probe complete: {} encoder(s), {} format(s), hw_vaapi={}, hw_vulkan={}",
-                caps.available_encoders.len(),
-                caps.available_formats.len(),
-                caps.hw.vaapi_device.is_some(),
-                caps.hw.vulkan_available,
-            );
-            // Repair user settings defaults now that caps are available
-            apply_available_defaults(
-                &mut current.converter.settings.container,
-                &mut current.converter.settings.video_encoder,
-                &mut current.converter.settings.audio_encoder,
-                &caps,
-            );
-            recompute_converter_derived(current);
-            false
-        }
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            // Probe thread exited without sending — treat as no ffmpeg
-            warn!("ffmpeg capability probe thread disconnected unexpectedly");
-            current.ffmpeg_probe_running = false;
-            recompute_converter_derived(current);
-            true
-        }
-        Err(std::sync::mpsc::TryRecvError::Empty) => false,
-    }
+/// Apply an ffmpeg capability probe result to the current snapshot.
+fn apply_ffmpeg_probe_result(current: &mut AppStateSnapshot, caps: FfmpegCapabilities) {
+    current.ffmpeg_caps = Some(caps.clone());
+    current.ffmpeg_probe_running = false;
+    info!(
+        "ffmpeg capability probe complete: {} encoder(s), {} format(s), hw_vaapi={}, hw_vulkan={}",
+        caps.available_encoders.len(),
+        caps.available_formats.len(),
+        caps.hw.vaapi_device.is_some(),
+        caps.hw.vulkan_available,
+    );
+    // Repair user settings defaults now that caps are available
+    apply_available_defaults(
+        &mut current.converter.settings.container,
+        &mut current.converter.settings.video_encoder,
+        &mut current.converter.settings.audio_encoder,
+        &caps,
+    );
+    recompute_converter_derived(current);
 }
 
 // ── Offload event channel ─────────────────────────────────────────────
@@ -2130,65 +2014,26 @@ enum OffloadEvent {
 fn handle_offload_command(
     cmd: crate::command::OffloadCommand,
     state: &mut AppStateSnapshot,
-    scan_generation: &mut u64,
-    context: &mut Option<Arc<OffloadContext>>,
-    device_names: &mut Vec<String>,
-    completed_before: &mut Vec<String>,
-    event_tx: &std::sync::mpsc::Sender<OffloadEvent>,
-    scan_progress: &mut Option<Arc<ScanProgress>>,
+    supervisor: &mut JobSupervisor,
+    _event_tx: &std::sync::mpsc::Sender<OffloadEvent>,
+    _context: &mut Option<Arc<OffloadContext>>,
 ) {
     match cmd {
         crate::command::OffloadCommand::ScanCards => {
-            if state.offload.scanning {
+            if supervisor.is_running(JobKind::OffloadScan) {
                 info!("Offload scan already in progress — ignoring duplicate ScanCards");
                 return;
             }
             state.offload.scanning = true;
             state.offload.error = None;
-            // Reset the scan progress cell.
-            let progress = Arc::new(ScanProgress::new());
-            *scan_progress = Some(progress.clone());
-            *scan_generation = scan_generation.wrapping_add(1);
-            let gen = *scan_generation;
-            let tx = event_tx.clone();
-            std::thread::Builder::new()
-                .name("offload-scan".into())
-                .spawn(move || {
-                    let scan_start = Instant::now();
-                    info!("Offload card scan started (gen={})", gen);
-                    let result = std::panic::catch_unwind(|| {
-                        crate::offload::detect_cards_with_progress(Some(&progress))
-                    });
-                    match result {
-                        Ok(cards) => {
-                            progress.clear();
-                            let elapsed = scan_start.elapsed();
-                            info!(
-                                "Offload card scan finished in {:.2?} (gen={}): {} card(s)",
-                                elapsed,
-                                gen,
-                                cards.len(),
-                            );
-                            let _ = tx.send(OffloadEvent::CardsScanned { cards, generation: gen });
-                        }
-                        Err(panic) => {
-                            progress.clear();
-                            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                                s.to_string()
-                            } else if let Some(s) = panic.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "unknown panic".to_string()
-                            };
-                            error!("Offload card scan panicked (gen={}): {}", gen, msg);
-                            let _ = tx.send(OffloadEvent::CardsScanned {
-                                cards: Vec::new(),
-                                generation: gen,
-                            });
-                        }
-                    }
-                })
-                .expect("failed to spawn offload scan thread");
+            let spec = job::JobSpec {
+                kind: JobKind::OffloadScan,
+                name: "offload-scan",
+                units: vec![job::UnitSpec { weight: 1.0, label: "scan".into() }],
+            };
+            spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+                run_offload_scan_job(ctx)
+            });
         }
 
         crate::command::OffloadCommand::SetParentFolder(path) => {
@@ -2237,7 +2082,7 @@ fn handle_offload_command(
         }
 
         crate::command::OffloadCommand::StartOffload => {
-            if state.offload.running {
+            if supervisor.is_running(JobKind::OffloadCopy) {
                 info!("Offload already running — ignoring duplicate StartOffload");
                 return;
             }
@@ -2254,8 +2099,7 @@ fn handle_offload_command(
             };
             let dest_parent = parent_folder.join(&state.offload.parent_name);
 
-            // Build plans per device from selected files only,
-            // using sizes already collected during the card scan (no I/O).
+            // Build plans per device from selected files only
             let cards = state.offload.cards.clone();
             let names: Vec<String> = cards.iter().map(|c| c.device_name.clone()).collect();
             let device_plans: Vec<Vec<crate::offload::CopyPlanItem>> = cards
@@ -2280,11 +2124,6 @@ fn handle_offload_command(
                 return;
             }
 
-            let ctx = Arc::new(OffloadContext::new(&names, &device_plans));
-
-            *device_names = names.clone();
-            *context = Some(ctx.clone());
-            *completed_before = state.offload.completed_devices.clone();
             state.offload.running = true;
             state.offload.error = None;
             state.offload.overall_progress = 0.0;
@@ -2300,25 +2139,26 @@ fn handle_offload_command(
                 dest_parent,
             );
 
-            *scan_generation = scan_generation.wrapping_add(1);
-            let gen = *scan_generation;
-            let tx = event_tx.clone();
+            let dest_parent_job = dest_parent.clone();
+            let names_job = names.clone();
+            let plans_job = device_plans;
 
-            std::thread::Builder::new()
-                .name("offload-copy".into())
-                .spawn(move || {
-                    info!("Offload copy thread started (gen={})", gen);
-                    let completed = crate::offload::run_offload(&device_plans, &names, &ctx);
-                    let _ = tx.send(OffloadEvent::OffloadDone { completed, generation: gen });
-                })
-                .expect("failed to spawn offload copy thread");
+            let spec = job::JobSpec {
+                kind: JobKind::OffloadCopy,
+                name: "offload-copy",
+                units: names.iter().map(|n| job::UnitSpec {
+                    weight: 1.0 / names.len() as f32,
+                    label: n.clone(),
+                }).collect(),
+            };
+            spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+                run_offload_copy_job(ctx, plans_job, names_job, dest_parent_job)
+            });
         }
 
         crate::command::OffloadCommand::CancelOffload => {
-            if let Some(ref ctx) = context {
-                ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                info!("Offload cancel signaled");
-            }
+            supervisor.cancel(JobKind::OffloadCopy);
+            supervisor.cancel(JobKind::OffloadScan);
             state.offload.error = Some("Canceled by user".to_string());
         }
     }
@@ -3462,9 +3302,7 @@ mod tests {
     // ── drain_ffmpeg_probe_result ─────────────────────────────────────────
 
     #[test]
-    fn test_drain_ffmpeg_probe_receives_result_and_clears_no_disconnect() {
-        let (tx, rx) = std::sync::mpsc::channel::<FfmpegProbeResult>();
-
+    fn test_apply_ffmpeg_probe_result_stores_caps_and_clears_running() {
         let caps = FfmpegCapabilities {
             has_ffmpeg: true,
             available_encoders: BTreeSet::new(),
@@ -3472,44 +3310,16 @@ mod tests {
             hw: HwDeviceCapabilities::default(),
             error_message: None,
         };
-        tx.send(FfmpegProbeResult { caps: caps.clone() }).unwrap();
-        drop(tx);
 
         let mut state = AppStateSnapshot::initial();
         state.ffmpeg_probe_running = true;
 
-        let unexpected = drain_ffmpeg_probe_result(&rx, &mut state);
+        apply_ffmpeg_probe_result(&mut state, caps.clone());
 
-        assert!(!unexpected, "should NOT report disconnect when result was received");
         assert!(state.ffmpeg_caps.is_some(), "caps should be stored");
         assert!(!state.ffmpeg_probe_running, "probe flag should be cleared");
-    }
-
-    #[test]
-    fn test_drain_ffmpeg_probe_disconnect_without_result_still_warns() {
-        let (tx, rx) = std::sync::mpsc::channel::<FfmpegProbeResult>();
-        drop(tx);
-
-        let mut state = AppStateSnapshot::initial();
-        state.ffmpeg_probe_running = true;
-
-        let unexpected = drain_ffmpeg_probe_result(&rx, &mut state);
-
-        assert!(unexpected, "should report disconnect when thread died without sending");
-        assert!(state.ffmpeg_caps.is_none(), "caps should NOT be stored");
-        assert!(!state.ffmpeg_probe_running, "probe flag should be cleared");
-    }
-
-    #[test]
-    fn test_drain_ffmpeg_probe_empty_noop_when_not_running() {
-        let (_tx, rx) = std::sync::mpsc::channel::<FfmpegProbeResult>();
-        let mut state = AppStateSnapshot::initial();
-        state.ffmpeg_probe_running = false;
-
-        let unexpected = drain_ffmpeg_probe_result(&rx, &mut state);
-
-        assert!(!unexpected);
-        assert!(state.ffmpeg_caps.is_none());
+        let stored = state.ffmpeg_caps.as_ref().unwrap();
+        assert_eq!(stored.has_ffmpeg, true);
     }
 
     // ── ClipProgress ──────────────────────────────────────────────────────

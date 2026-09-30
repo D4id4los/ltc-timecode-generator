@@ -8,6 +8,7 @@ pub mod duration;
 pub mod engine;
 pub mod ffprobe;
 pub mod file_pattern;
+pub mod job;
 pub mod naming;
 pub mod hw_device;
 pub mod log_buffer;
@@ -41,7 +42,7 @@ pub use converter::{
     find_timecode_at_offset, format_blockers, format_ffmpeg_timecode,
     plan_concat_outputs, plan_video_outputs, query_ffmpeg_capabilities,
     select_best_combination,
-    spawn_conversion, start_timecode_from_ltc,
+    spawn_conversion, spawn_conversion_job, start_timecode_from_ltc,
     supported_audio_encoders, supported_containers,
     AudioKeep, ChannelMap, ConvertBlocker, ConvertReadiness, ConversionPipeline,
     ConversionState, ConversionStatus, ConverterSettings, output_collision_warning,
@@ -63,11 +64,19 @@ pub use ffprobe::{extract_audio_channel, extract_audio_channel_with_progress, pa
 // Re-export duration helpers
 pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs};
 
+// Re-export job types
+pub use job::{
+    CancelToken, JobContext, JobError, JobEvent, JobFinal, JobId, JobItem, JobKind, JobOutcome,
+    JobPhase, JobSpec, JobSupervisor, ProgressSnapshot, ProgressTracker, SpeedMeter, UnitProgress,
+    UnitSnapshot, UnitSpec, UnitState, spawn_job,
+};
+
 // Re-export offload types
 pub use offload::{
     apply_selection, default_parent_name, default_selection, detect_cards,
     detect_cards_with_progress, is_media_file, latest_recording_date, plan_copies_for_card,
-    plan_copies_for_files, plan_copies_for_files_with_sizes, run_offload, verify_copy,
+    plan_copies_for_files, plan_copies_for_files_with_sizes, run_offload,
+    run_offload_copy_job, run_offload_scan_job, verify_copy,
     DeviceNameSource, OffloadContext, OffloadDeviceState, OffloadDeviceStatus, OffloadFileInfo,
     OffloadSnapshot, ScanProgress, SdCardInfo, VerifyMode,
 };
