@@ -187,8 +187,7 @@ The engine tracks the currently-active `JobId` per kind. When a `Finished`
 event arrives, the engine checks if its `JobId` still matches the active one
 for that kind — stale results from superseded jobs are discarded.
 
-#### Migration Status (Phase 2 completed):
-The following task types have been migrated to `spawn_job`:
+#### Migration Status (Phase 3 completed — all tasks migrated):
 - **FfmpegCapProbe** — via `spawn_job`, payload `JobFinal::FfmpegCaps`
 - **FolderScan** — via `spawn_job`, payload `JobFinal::FolderScan`
 - **Conversion** — via `spawn_conversion_job()` wrapper, payload `JobFinal::Conversion`
@@ -196,11 +195,9 @@ The following task types have been migrated to `spawn_job`:
 - **OffloadCopy** — via `run_offload_copy_job()`, payload `JobFinal::OffloadCopy`
 - **VideoProbe** — via `spawn_job`, payload `JobFinal::VideoProbe`
 - **DurationProbe** — via `spawn_job`, payload `JobItem::DurationResult` per file, `JobFinal::DurationsDone`
-
-Legacy (not yet migrated, still using per-task mpsc channels):
-- **LtcDecode** (WAV + video) — manual thread with `decode_result_tx`
-- **LtcGroupDecode** — manual thread with `group_result_tx`
-- **ClipProbe** (converter probe) — manual thread with `conv_probe_tx`
+- **LtcDecode** (WAV + video) — via `spawn_job`, payload `JobFinal::Decode`, 1–2 unit(s) with `bridge_decode_progress()` for chunked progress
+- **LtcGroupDecode** — via `spawn_job`, payload `JobItem::ClipLtcResult` per clip, `JobFinal::NoPayload`
+- **ClipProbe** (converter probe) — via `spawn_job`, payload `JobFinal::ClipProbes`
 
 Progress polling and speed tracking are handled by `ProgressTracker.snapshot()` and `SpeedMeter` (offload copy speed read from `ProgressSnapshot.speed`).
 
