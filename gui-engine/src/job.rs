@@ -211,6 +211,13 @@ impl UnitProgress {
         }
     }
 
+    pub fn set_label(&self, label: impl Into<String>) {
+        let mut units = self.tracker.units.lock().unwrap();
+        if let Some(u) = units.get_mut(self.idx) {
+            u.label = label.into();
+        }
+    }
+
     pub fn set_message(&self, msg: impl Into<String>) {
         let units = self.tracker.units.lock().unwrap();
         if let Some(u) = units.get(self.idx) {
@@ -1252,6 +1259,56 @@ mod tests {
 
         probe.phase = JobPhase::Succeeded;
         assert!(!probe_is_loading(&probe), "Succeeded → not loading");
+    }
+
+    // ── set_label ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_unit_progress_set_label() {
+        let pt = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "initial".into(),
+        }]);
+        pt.unit(0).set_label("updated label");
+        let snap = pt.snapshot();
+        assert_eq!(snap.units[0].label, "updated label");
+    }
+
+    // ── Supervisor poll shows worker progress ────────────────────────────
+
+    #[test]
+    fn test_supervisor_poll_shows_worker_progress() {
+        let mut sup = JobSupervisor::new();
+        let spec = JobSpec {
+            kind: JobKind::LtcDecode,
+            name: "progress-test",
+            units: vec![UnitSpec { weight: 1.0, label: "phase1".into() }],
+        };
+
+        spawn_job::<JobFinal, _>(&mut sup, spec, |ctx| -> Result<JobFinal, JobError> {
+            ctx.progress.unit(0).set_fraction(0.5);
+            ctx.progress.set_message("halfway");
+            std::thread::sleep(Duration::from_millis(200));
+            Ok(JobFinal::NoPayload)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let observed: bool = loop {
+            // Drain any finished events first so they don't accumulate
+            let _ = sup.drain();
+            let snapshots = sup.poll();
+            if let Some((_, _, snap)) = snapshots.first() {
+                if (snap.fraction - 0.5).abs() < 0.001 {
+                    break true;
+                }
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        assert!(observed, "expected to observe fraction=0.5 in poll snapshot");
     }
 
     #[test]

@@ -767,8 +767,10 @@ pub fn engine_main_with_probe<F>(
 ///
 /// `cancel` — shared atomic bool checked during extraction and decode.
 /// `on_extract_progress` — called during extraction with fraction 0.0..1.0.
-/// The decode phase bridges its chunk progress via the returned `DecodeProgress`
-/// atomics so callers can observe or bridge them to a `UnitProgress`.
+/// `decode_unit` — if `Some`, a progress bridge thread is spawned during the
+/// chunked decode phase to report "Chunk {done}/{total}" progress into this
+/// unit. Pass `None` to skip bridging (e.g. when the caller has no unit, or
+/// when the caller will bridge externally).
 fn decode_one_video_clip<F: Fn(f32)>(
     path: &str,
     stream_index: usize,
@@ -779,6 +781,7 @@ fn decode_one_video_clip<F: Fn(f32)>(
     capture_gen: u64,
     cancel: &Arc<AtomicBool>,
     on_extract_progress: &F,
+    decode_unit: Option<job::UnitProgress>,
 ) -> Result<LtcDetectionResult, String> {
     static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -840,10 +843,21 @@ fn decode_one_video_clip<F: Fn(f32)>(
                     chunks_completed: chunks_done.clone(),
                     cancel_flag: cancel.clone(),
                 };
-                audio_core::decode_ltc_chunked(
+
+                let bridge = decode_unit.as_ref().map(|unit| {
+                    bridge_decode_progress(decode_progress.clone(), unit.clone(), None)
+                });
+
+                let result = audio_core::decode_ltc_chunked(
                     &wav_path, use_libltc, decode_fps, decode_drop_frame,
                     config, &decode_progress,
-                )
+                );
+
+                if let Some(h) = bridge {
+                    let _ = h.join();
+                }
+
+                result
             }
         }
         Err(e) => Err(format!("Failed to open extracted WAV: {}", e)),
@@ -866,16 +880,23 @@ fn decode_one_video_clip<F: Fn(f32)>(
 fn bridge_decode_progress(
     dp: DecodeProgress,
     unit: job::UnitProgress,
+    msg_prefix: Option<String>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("dp-bridge".into())
         .spawn(move || {
             loop {
                 let done = dp.chunks_completed.load(Ordering::Relaxed);
-                if dp.chunks_total > 0 {
-                    unit.set_fraction(done as f32 / dp.chunks_total as f32);
+                let total = dp.chunks_total;
+                if total > 0 {
+                    unit.set_fraction(done as f32 / total as f32);
+                    let msg = match &msg_prefix {
+                        Some(prefix) => format!("{} — Chunk {}/{}", prefix, done.min(total), total),
+                        None => format!("Chunk {}/{}", done.min(total), total),
+                    };
+                    unit.set_message(msg);
                 }
-                if done >= dp.chunks_total || dp.cancel_flag.load(Ordering::Relaxed) {
+                if done >= total || dp.cancel_flag.load(Ordering::Relaxed) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -1149,13 +1170,19 @@ fn process_command(
                         return Err(job::JobError::Cancelled);
                     }
 
-                    ctx.progress.set_message(format!("Decoding clip {}/{}", idx + 1, total));
+                    let clip_unit = ctx.progress.unit(idx);
+                    let clip_name = path.rsplit('/').next()
+                        .or_else(|| path.rsplit('\\').next())
+                        .unwrap_or(path);
+                    clip_unit.set_label(clip_name.to_string());
+                    clip_unit.set_message(format!("Clip {}/{}", idx + 1, total));
 
                     info!("LTC group decode clip {}/{} started: {}", idx + 1, total, path);
                     let result = decode_one_video_clip(
                         path, stream_index, channel_index,
                         use_libltc, decode_fps, decode_drop_frame, capture_gen,
                         &cancel, &|_| {},
+                        Some(clip_unit),
                     );
                     if ctx.cancel.is_cancelled() {
                         return Err(job::JobError::Cancelled);
@@ -1287,6 +1314,7 @@ fn process_command(
                     &path_job, stream_index, channel_index,
                     use_libltc, decode_fps, decode_drop_frame, capture_gen,
                     &cancel, &on_extract,
+                    Some(decode_unit),
                 );
                 extract_unit.set_fraction(1.0);
 
@@ -1369,7 +1397,7 @@ fn process_command(
                     cancel_flag: cancel.clone(),
                 };
 
-                let dp_bridge = bridge_decode_progress(dp.clone(), unit);
+                let dp_bridge = bridge_decode_progress(dp.clone(), unit, None);
 
                 let result = if chunk_count <= 1 {
                     let r = audio_core::decode_ltc_with_decoder(

@@ -649,3 +649,84 @@ fn set_parent_folder_persists_in_snapshot() {
     assert_eq!(snapshot.offload.parent_folder, Some(dir.path().to_path_buf()),
         "SetParentFolder should update the snapshot parent_folder");
 }
+
+// ── Multi-chunk WAV decode progress ───────────────────────────────────────
+
+#[test]
+fn test_multi_chunk_decode_shows_intermediate_progress() {
+    init_test_config();
+    let dir = tempfile::TempDir::new().unwrap();
+    // Generate a WAV large enough to span multiple decode chunks at default
+    // DecodeConfig (50 MB / chunk).  At 48 kHz stereo 16-bit:
+    //   bytes_per_mono = 4,  chunk_mono = 12.5 M
+    //   310 s × 48000 = 14.88 M mono samples → 2 chunks
+    let path = dir.path().join("multi_chunk_decode.wav");
+    generate_wav(&path, 25.0, false, 310.0, 48000);
+
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-multi-chunk-test".into())
+        .spawn(move || {
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
+        })
+        .expect("failed to spawn engine thread");
+
+    tx.send(GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut observed_intermediate = false;
+
+    loop {
+        let snapshot: AppStateSnapshot = state.load().as_ref().clone();
+        let job = snapshot.job(JobKind::LtcDecode);
+
+        if job.phase == JobPhase::Running {
+            let f = job.fraction;
+            if f > 0.0 && f < 1.0 {
+                observed_intermediate = true;
+                break;
+            }
+        }
+
+        if job.phase == JobPhase::Succeeded || job.phase == JobPhase::Failed {
+            break;
+        }
+
+        if Instant::now() > deadline {
+            panic!(
+                "Timeout waiting for decode: phase={:?}, fraction={}, observed_intermediate={}",
+                job.phase, job.fraction, observed_intermediate,
+            );
+        }
+
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Verify final success
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let snapshot: AppStateSnapshot = state.load().as_ref().clone();
+        let job = snapshot.job(JobKind::LtcDecode);
+        if job.phase != JobPhase::Running {
+            if job.phase == JobPhase::Succeeded {
+                assert!(
+                    observed_intermediate,
+                    "expected to observe intermediate fraction in (0,1) \
+                     before succeeded, but never did (final fraction={})",
+                    job.fraction,
+                );
+            }
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("Timeout waiting for decode to finish");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}
