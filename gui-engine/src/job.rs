@@ -461,7 +461,7 @@ pub enum JobEvent {
 pub struct JobContext {
     pub progress: ProgressTracker,
     pub cancel: CancelToken,
-    emit: Box<dyn Fn(JobItem) + Send + Sync>,
+    pub emit: Box<dyn Fn(JobItem) + Send + Sync>,
 }
 
 impl JobContext {

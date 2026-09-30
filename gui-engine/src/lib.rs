@@ -73,7 +73,7 @@ pub use job::{
 
 // Re-export offload types
 pub use offload::{
-    apply_selection, default_parent_name, default_selection, detect_cards,
+    apply_selection, default_parent_name, default_selection,
     detect_cards_with_progress, is_media_file, plan_copies_for_card,
     plan_copies_for_files, plan_copies_for_files_with_sizes,
     run_offload_copy_job, run_offload_scan_job, verify_copy,

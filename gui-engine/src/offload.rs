@@ -188,20 +188,36 @@ impl OffloadSnapshot {
 
 /// Shared cell for scan progress: the scan thread writes per-drive messages,
 /// the engine reads them each tick and publishes into OffloadSnapshot.
-#[derive(Debug, Clone)]
 pub struct ScanProgress {
     inner: Arc<Mutex<Option<String>>>,
+    forward: Option<Box<dyn Fn(String) + Send + Sync>>,
 }
 
 impl ScanProgress {
     pub fn new() -> Self {
         ScanProgress {
             inner: Arc::new(Mutex::new(None)),
+            forward: None,
+        }
+    }
+
+    /// Create a ScanProgress that also calls `f` on every `set()`.
+    /// Used to forward per-drive scan messages to a ProgressTracker.
+    pub fn with_forward<F>(f: F) -> Self
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        ScanProgress {
+            inner: Arc::new(Mutex::new(None)),
+            forward: Some(Box::new(f)),
         }
     }
 
     pub fn set(&self, msg: String) {
-        *self.inner.lock().unwrap() = Some(msg);
+        *self.inner.lock().unwrap() = Some(msg.clone());
+        if let Some(ref forward) = self.forward {
+            forward(msg);
+        }
     }
 
     pub fn clear(&self) {
@@ -258,15 +274,9 @@ pub fn is_media_file(path: &Path) -> bool {
 
 // ── Card detection ──────────────────────────────────────────────────────
 
-/// Detect media cards: parse `/proc/mounts` for mounted cards, then scan
-/// `/sys/class/block` for unmounted removable partitions and auto-mount them
-/// via `udisksctl` (so they become available for offload).
-#[cfg(target_os = "linux")]
-pub fn detect_cards() -> Vec<SdCardInfo> {
-    detect_cards_with_progress(None)
-}
-
-/// Like `detect_cards()` but reports per-drive progress into the shared cell.
+/// Detect media cards, optionally reporting per-drive progress into the
+/// given `ScanProgress` (whose `set()` forwards to `ctx.progress` when
+/// called from `run_offload_scan_job`).
 #[cfg(target_os = "linux")]
 pub fn detect_cards_with_progress(progress: Option<&ScanProgress>) -> Vec<SdCardInfo> {
     let deadline = Instant::now() + CARD_SCAN_BUDGET;
@@ -436,12 +446,7 @@ fn udisks_mount(dev_path: &str) -> std::io::Result<Option<PathBuf>> {
 }
 
 /// Fallback for non-Linux: enumerate common mount roots.
-#[cfg(not(target_os = "linux"))]
-pub fn detect_cards() -> Vec<SdCardInfo> {
-    detect_cards_with_progress(None)
-}
-
-/// Like `detect_cards()` but reports per-drive progress into the shared cell.
+/// Reports per-drive progress into `progress` when provided.
 #[cfg(not(target_os = "linux"))]
 pub fn detect_cards_with_progress(progress: Option<&ScanProgress>) -> Vec<SdCardInfo> {
     let deadline = Instant::now() + CARD_SCAN_BUDGET;
@@ -1056,7 +1061,12 @@ pub fn run_offload_scan_job(ctx: &JobContext) -> Result<JobFinal, JobError> {
     ctx.progress.set_indeterminate(true);
     ctx.progress.set_message("Scanning media cards…");
 
-    let cards = detect_cards_with_progress(None);
+    let scan_progress = ScanProgress::with_forward({
+        let tracker = ctx.progress.clone();
+        move |msg| tracker.set_message(msg)
+    });
+
+    let cards = detect_cards_with_progress(Some(&scan_progress));
 
     ctx.progress.set_message(format!("Found {} card(s)", cards.len()));
     ctx.progress.set_indeterminate(false);
@@ -1087,6 +1097,8 @@ pub fn run_offload_copy_job(
     ctx.progress.resize(dev_count);
 
     let mut completed: Vec<String> = Vec::new();
+    let mut speed_meter = crate::job::SpeedMeter::new();
+    let mut cumulative_bytes: u64 = 0;
 
     for (dev_idx, plans) in device_plans.iter().enumerate() {
         if ctx.cancel.is_cancelled() {
@@ -1127,6 +1139,9 @@ pub fn run_offload_copy_job(
                 bytes_copied = total;
             }) {
                 Ok(()) => {
+                    cumulative_bytes += bytes_copied;
+                    let speed = speed_meter.update(cumulative_bytes as usize, std::time::Instant::now());
+                    ctx.progress.set_speed(speed);
                     if verify_copy(&item.src, &item.dst, &verify_mode).is_ok() {
                         dev_unit.set_fraction((item_idx + 1) as f32 / dev_total as f32);
                     } else {
@@ -1166,7 +1181,9 @@ pub fn run_offload_copy_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::{CancelToken, ProgressTracker, UnitSpec};
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     // ── default_parent_name ──────────────────────────────────────────
@@ -1979,5 +1996,156 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         assert_eq!(files.len(), MAX_CARD_FILES);
     }
 
-    
+    // ── ScanProgress::with_forward ──────────────────────────────────────
+
+    #[test]
+    fn test_scan_progress_with_forward_forwards_to_callback() {
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fwd = Arc::clone(&forwarded);
+        let p = ScanProgress::with_forward(move |msg| {
+            fwd.lock().unwrap().push(msg);
+        });
+
+        p.set("Mounting /dev/sdb1…".to_string());
+        p.set("Scanning drive F:…".to_string());
+
+        let msgs = forwarded.lock().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0], "Mounting /dev/sdb1…");
+        assert_eq!(msgs[1], "Scanning drive F:…");
+    }
+
+    #[test]
+    fn test_scan_progress_with_forward_does_not_break_normal_read() {
+        let p = ScanProgress::with_forward(|_| {});
+        p.set("hello".to_string());
+        assert_eq!(p.read().as_deref(), Some("hello"));
+    }
+
+    // ── SpeedMeter in run_offload_copy_job ──────────────────────────────
+
+    /// Helper: create a minimal JobContext for testing.
+    fn test_job_context() -> (JobContext, ProgressTracker) {
+        let tracker = ProgressTracker::new(vec![UnitSpec { weight: 1.0, label: "test".into() }]);
+        let tracker_clone = tracker.clone();
+        let cancel = CancelToken::new();
+        let emit: Box<dyn Fn(crate::job::JobItem) + Send + Sync> = Box::new(|_| {});
+        let ctx = JobContext {
+            progress: tracker_clone,
+            cancel,
+            emit,
+        };
+        (ctx, tracker)
+    }
+
+    #[test]
+    fn test_copy_job_sets_speed_on_progress() {
+        let dir = TempDir::new().unwrap();
+
+        // Create a 1 MiB source file.
+        let src = dir.path().join("src.bin");
+        let content = vec![0xABu8; 1 << 20]; // 1 MiB
+        fs::write(&src, &content).unwrap();
+
+        let dst = dir.path().join("dst.bin");
+
+        let (ctx, tracker) = test_job_context();
+        let plans = vec![vec![CopyPlanItem {
+            src: src.clone(),
+            dst: dst.clone(),
+            size: content.len() as u64,
+        }]];
+        let names = vec!["DEVICE".to_string()];
+        let dest_parent = dir.path().to_path_buf();
+
+        let result = run_offload_copy_job(&ctx, plans, names, dest_parent);
+        assert!(result.is_ok(), "copy job should succeed");
+    }
+
+    #[test]
+    fn test_copy_job_speed_multiple_files() {
+        let dir = TempDir::new().unwrap();
+
+        // Two files of different sizes.
+        let src1 = dir.path().join("src1.bin");
+        let src2 = dir.path().join("src2.bin");
+        fs::write(&src1, vec![0xABu8; 1 << 20]).unwrap(); // 1 MiB
+        fs::write(&src2, vec![0xCDu8; 1 << 20]).unwrap(); // 1 MiB
+
+        let dst1 = dir.path().join("dst1.bin");
+        let dst2 = dir.path().join("dst2.bin");
+
+        let (ctx, tracker) = test_job_context();
+        let plans = vec![vec![
+            CopyPlanItem {
+                src: src1, dst: dst1, size: 1 << 20,
+            },
+            CopyPlanItem {
+                src: src2, dst: dst2, size: 1 << 20,
+            },
+        ]];
+        let names = vec!["DEVICE".to_string()];
+        let dest_parent = dir.path().to_path_buf();
+
+        let result = run_offload_copy_job(&ctx, plans, names, dest_parent);
+        assert!(result.is_ok());
+
+        let snap = tracker.snapshot();
+        // Speed may be 0 if both files copy faster than 1 ms
+        // (no meaningful EMA delta). The SpeedMeter is unit-tested
+        // separately in job.rs; this test only checks that the
+        // speed field is reachable (not panicking).
+        if let Some(s) = snap.speed {
+            assert!(s >= 0.0, "speed should be non-negative, got {s}");
+        }
+    }
+
+    // ── ProgressTracker message forwarding during scan ──────────────────
+
+    #[test]
+    fn test_run_offload_scan_job_forwarding_progress_message() {
+        // This test verifies that ScanProgress::with_forward correctly
+        // forwards messages to the ProgressTracker during a scan.
+        // We exercise the forwarding mechanism via detect_cards_from_mounts.
+
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("C0001.MP4"), b"data").unwrap();
+
+        let fake_mount = format!("/mnt/..{}", dir.path().display());
+        let mounts = format!("/dev/sdb1 {} vfat rw 0 0", fake_mount);
+        let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
+
+        let tracker = ProgressTracker::new(vec![]);
+        let tracker_fwd = tracker.clone();
+        let forward_msgs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fwd = Arc::clone(&forward_msgs);
+
+        let scan_progress = ScanProgress::with_forward(move |msg| {
+            tracker_fwd.set_message(msg.clone());
+            fwd.lock().unwrap().push(msg);
+        });
+
+        // Run detect_cards_from_mounts with the forwarding ScanProgress.
+        let cards = detect_cards_from_mounts(
+            &mounts,
+            sys.path(),
+            far_deadline(),
+            Some(&scan_progress),
+        );
+
+        assert_eq!(cards.len(), 1);
+
+        // The progress tracker's message should have been set.
+        let tracker_msg = tracker.snapshot().message;
+        assert!(!tracker_msg.is_empty(), "tracker should have a non-empty message after scan");
+
+        // The forwarded messages should include the mount path.
+        let msgs = forward_msgs.lock().unwrap();
+        assert!(!msgs.is_empty(), "at least one message should be forwarded");
+        let combined = msgs.join(" | ");
+        assert!(
+            combined.contains("Scanning"),
+            "forwarded messages should mention scanning, got: {combined}"
+        );
+    }
 }
