@@ -10,7 +10,7 @@ use crate::job::{JobKind, JobStatus};
 use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, DEFAULT_PREFIX};
 use crate::timecode::FPS_OPTIONS;
 use crate::offload::OffloadSnapshot;
-use audio_core::{AudioDeviceInfo, AudioEvent, ChannelSel, LtcDetectionResult, Timecode};
+use audio_core::{AudioDeviceInfo, ChannelSel, LtcDetectionResult, Timecode};
 
 // ── Converter user settings (single source of truth) ─────────────────
 
@@ -347,9 +347,6 @@ pub struct AppStateSnapshot {
     // Status (per-subsystem channels; see `StatusChannels`)
     pub status: StatusChannels,
 
-    // Events drained from AudioCore (to be surfaced as toasts by the GUI)
-    pub events: Vec<AudioEvent>,
-
     // LTC decode (probe, single-file and batch results)
     pub decode: DecodeSnapshot,
 
@@ -418,7 +415,6 @@ impl AppStateSnapshot {
             },
             is_dark_theme: false,
             status: StatusChannels::initial(),
-            events: Vec::new(),
             decode: DecodeSnapshot {
                 fps_index: 1,
                 probe: None,

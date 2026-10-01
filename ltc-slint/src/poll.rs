@@ -24,6 +24,7 @@ const POLL_INTERVAL_MS: u64 = 40;
 pub fn setup_poll_timer(
     ui: &AppWindow,
     engine_state: Arc<ArcSwap<AppStateSnapshot>>,
+    event_rx: std::sync::mpsc::Receiver<AudioEvent>,
     toasts: Arc<Mutex<Vec<ToastItem>>>,
     next_toast_id: Arc<Mutex<i32>>,
     log_buffer: Arc<Mutex<LogBuffer>>,
@@ -453,8 +454,9 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 }
             }
 
-            // 29. Process events into toasts
-            for event in &s.events {
+            // 29. Process events into toasts — drained from the
+            // audio-event channel, not the snapshot (one-shot mailbox).
+            while let Ok(event) = event_rx.try_recv() {
                 let (msg, typ) = match event {
                     AudioEvent::StreamError(m) => (m.clone(), "error"),
                     AudioEvent::StreamDied => ("Audio stream died".to_string(), "error"),

@@ -82,7 +82,8 @@ where
     let handle = std::thread::Builder::new()
         .name("gui-engine-test".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, use_libltc, fake_probe);
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, use_libltc, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -121,7 +122,8 @@ fn test_supervisor_latest_job_gates_stale_events() {
     let handle = std::thread::Builder::new()
         .name("stale-gate-test".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -456,7 +458,8 @@ fn test_engine_shutdown_via_command() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-shutdown-test".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -488,7 +491,8 @@ fn test_engine_shutdown_via_channel_drop() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-drop-test".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -746,7 +750,8 @@ fn test_engine_probe_file_durations_wav() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-test".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -844,7 +849,8 @@ fn test_multi_chunk_decode_shows_intermediate_progress() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-multi-chunk-test".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -916,7 +922,8 @@ fn test_idle_engine_does_not_republish() {
     let handle = std::thread::Builder::new()
         .name("publish-gate-test".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 

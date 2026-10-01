@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,8 +32,13 @@ const BUFFER_SIZE: u32 = 0;
 
 
 
-pub fn engine_main(cmd_rx: Receiver<GuiCommand>, state: Arc<ArcSwap<AppStateSnapshot>>, use_libltc: bool) {
-    engine_main_with_probe(cmd_rx, state, use_libltc, query_ffmpeg_capabilities)
+pub fn engine_main(
+    cmd_rx: Receiver<GuiCommand>,
+    state: Arc<ArcSwap<AppStateSnapshot>>,
+    use_libltc: bool,
+    event_tx: Sender<AudioEvent>,
+) {
+    engine_main_with_probe(cmd_rx, state, use_libltc, event_tx, query_ffmpeg_capabilities)
 }
 
 /// Like [`engine_main`] but accepts an injectable capability-probe function
@@ -42,6 +47,7 @@ pub fn engine_main_with_probe<F>(
     cmd_rx: Receiver<GuiCommand>,
     state: Arc<ArcSwap<AppStateSnapshot>>,
     use_libltc: bool,
+    event_tx: Sender<AudioEvent>,
     probe_fn: F,
 ) where
     F: FnOnce() -> FfmpegCapabilities + Send + 'static,
@@ -329,6 +335,7 @@ pub fn engine_main_with_probe<F>(
                         &mut last_device_id,
                         &mut previous_device,
                         &mut supervisor,
+                        &event_tx,
                     );
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -695,11 +702,19 @@ pub fn engine_main_with_probe<F>(
             current.current_timecode = core.current_timecode();
         }
 
-        // 3. Drain events from AudioCore
-        // Clear previous-tick events first so the GUIs only see each event once.
-        current.events.clear();
+        // 3. Drain events from AudioCore and deliver them to the GUI
+        // through the audio-event channel.  Events are a one-shot mailbox,
+        // not state — they must not ride in the snapshot (which is also
+        // publish-gated: an empty-events tick must compare equal).
         for event in core.drain_events() {
-            handle_event(event, &core, &mut current, &mut recovery_attempts, &mut last_device_id);
+            handle_event(
+                event,
+                &core,
+                &mut current,
+                &mut recovery_attempts,
+                &mut last_device_id,
+                &event_tx,
+            );
         }
 
         // 4. Animation: flash alpha decays at 2.0/s
@@ -888,10 +903,11 @@ fn process_command(
     last_device_id: &mut Option<String>,
     previous_device: &mut Option<String>,
     supervisor: &mut JobSupervisor,
+    event_tx: &Sender<AudioEvent>,
 ) {
     match cmd {
         GuiCommand::StartLtc => {
-            ensure_audio_init(core, state, last_device_id, recovery_attempts);
+            ensure_audio_init(core, state, last_device_id, recovery_attempts, event_tx);
             if !state.audio_initialized {
                 state.status.set_audio("Cannot start — audio not initialized");
                 return;
@@ -1000,7 +1016,7 @@ fn process_command(
                 } else {
                     // Previous selection may have been automatic (None);
                     // fall back to the default/first device.
-                    ensure_audio_init(core, state, last_device_id, recovery_attempts);
+                    ensure_audio_init(core, state, last_device_id, recovery_attempts, event_tx);
                 }
             }
         }
@@ -1026,7 +1042,7 @@ fn process_command(
         }
 
         GuiCommand::InitAudio => {
-            ensure_audio_init(core, state, last_device_id, recovery_attempts);
+            ensure_audio_init(core, state, last_device_id, recovery_attempts, event_tx);
         }
 
         GuiCommand::SetLtcChannel(ch) => {
@@ -1479,6 +1495,7 @@ fn ensure_audio_init(
     state: &mut AppStateSnapshot,
     last_device_id: &mut Option<String>,
     recovery_attempts: &mut u8,
+    event_tx: &Sender<AudioEvent>,
 ) -> bool {
     if state.audio_initialized {
         return true;
@@ -1528,7 +1545,7 @@ fn ensure_audio_init(
 
     error!("Audio init failed after {} attempts: {}", max_attempts, last_error);
     state.status.set_audio(format!("Audio init failed: {}", last_error));
-    state.events.push(AudioEvent::StreamError(last_error.clone()));
+    let _ = event_tx.send(AudioEvent::StreamError(last_error.clone()));
     false
 }
 
@@ -1569,6 +1586,7 @@ fn handle_event(
     state: &mut AppStateSnapshot,
     recovery_attempts: &mut u8,
     last_device_id: &mut Option<String>,
+    event_tx: &Sender<AudioEvent>,
 ) {
     let event_str = match &event {
         AudioEvent::StreamError(msg) => format!("Audio stream error: {}", msg),
@@ -1593,13 +1611,13 @@ fn handle_event(
             // The scheduler watchdog already exhausted 3 soft-recovery attempts
             // before emitting StreamDead, so this is the final hard reset.
             state.status.set_audio("Stream dead — performing hard reset");
-            attempt_recovery(core, state, recovery_attempts, last_device_id);
+            attempt_recovery(core, state, recovery_attempts, last_device_id, event_tx);
         }
         AudioEvent::RecoveryNeeded { .. } | AudioEvent::StreamDied => {
             if *recovery_attempts < MAX_RECOVERY_ATTEMPTS {
                 *recovery_attempts += 1;
                 state.status.set_audio(format!("Recovery attempt {}/{}", recovery_attempts, MAX_RECOVERY_ATTEMPTS));
-                attempt_recovery(core, state, recovery_attempts, last_device_id);
+                attempt_recovery(core, state, recovery_attempts, last_device_id, event_tx);
             } else {
                 state.is_playing = false;
                 state.status.set_audio("Recovery exhausted");
@@ -1608,7 +1626,7 @@ fn handle_event(
         _ => {}
     }
 
-    state.events.push(event);
+    let _ = event_tx.send(event);
 }
 
 fn attempt_recovery(
@@ -1616,6 +1634,7 @@ fn attempt_recovery(
     state: &mut AppStateSnapshot,
     recovery_attempts: &mut u8,
     last_device_id: &mut Option<String>,
+    event_tx: &Sender<AudioEvent>,
 ) {
     let was_playing = state.is_playing;
     let stored_tc = state.current_timecode;
@@ -1629,7 +1648,7 @@ fn attempt_recovery(
     // (ALSA/PulseAudio/PipeWire cleanup after dropping the cpal::Stream)
     std::thread::sleep(Duration::from_millis(150));
 
-    if ensure_audio_init(core, state, last_device_id, recovery_attempts)
+    if ensure_audio_init(core, state, last_device_id, recovery_attempts, event_tx)
         && was_playing
     {
         let _ = core.reset_ltc(stored_tc);
@@ -2511,11 +2530,12 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         // ToggleLock on: false → true
         process_command(
             GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
-            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor,
+            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx,
         );
         assert!(state.is_locked);
     }
@@ -2529,11 +2549,12 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
-            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         process_command(GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
-            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!(!state.is_locked);
     }
 
@@ -2546,9 +2567,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetFpsIndex(4), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.fps_index, 4);
         assert_eq!(state.fps(), 30.0);
         assert!(!state.drop_frame());
@@ -2563,9 +2585,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetFpsIndex(3), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.fps_index, 3);
         assert!((state.fps() - 29.97).abs() < 0.01);
         assert!(state.drop_frame());
@@ -2580,9 +2603,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetFpsIndex(99), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.fps_index, 1);
         assert_eq!(state.fps(), 25.0);
     }
@@ -2596,13 +2620,14 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetTheme(true), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!(state.is_dark_theme);
 
         process_command(GuiCommand::SetTheme(false), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!(!state.is_dark_theme);
     }
 
@@ -2615,13 +2640,14 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::ToggleTheme, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!(state.is_dark_theme, "toggle from initial false → true");
 
         process_command(GuiCommand::ToggleTheme, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!(!state.is_dark_theme, "toggle again true → false");
     }
 
@@ -2642,9 +2668,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::ClearLogs, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!(state.clapper.logs.is_empty());
     }
 
@@ -2657,9 +2684,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetLtcChannel(ChannelSel::Both), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.ltc_channel, ChannelSel::Both);
     }
 
@@ -2672,9 +2700,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetBeepVolume(0.75), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!((state.beep_volume - 0.75).abs() < 1e-6);
     }
 
@@ -2687,10 +2716,11 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
         let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
 
         process_command(GuiCommand::SetStartTimecode(tc), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.start_timecode, tc);
     }
 
@@ -2703,17 +2733,18 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetScene(42), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.scene, 42);
 
         process_command(GuiCommand::SetTake(7), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.take, 7);
 
         process_command(GuiCommand::SetRoll("B002".into()), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.roll, "B002");
     }
 
@@ -2726,14 +2757,15 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         state.clapper.scene = 5;
         process_command(GuiCommand::SceneUp, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.scene, 6);
 
         process_command(GuiCommand::SceneDown, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.scene, 5);
     }
 
@@ -2746,14 +2778,15 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         state.clapper.take = 3;
         process_command(GuiCommand::TakeUp, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.take, 4);
 
         process_command(GuiCommand::TakeDown, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.take, 3);
     }
 
@@ -2766,10 +2799,11 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         state.clapper.scene = 0;
         process_command(GuiCommand::SceneDown, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.scene, 0, "scene should not go below 0");
     }
 
@@ -2782,10 +2816,11 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         state.clapper.take = 0;
         process_command(GuiCommand::TakeDown, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.clapper.take, 0, "take should not go below 0");
     }
 
@@ -2798,9 +2833,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetSampleRate(48000), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.sample_rate, 48000);
     }
 
@@ -2813,13 +2849,14 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetAutoIncrement(false), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!(!state.clapper.auto_increment_take);
 
         process_command(GuiCommand::SetAutoIncrement(true), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!(state.clapper.auto_increment_take);
     }
 
@@ -2832,9 +2869,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetDecodeFpsIndex(4), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert_eq!(state.decode.fps_index, 4);
         assert_eq!(state.decode_fps(), 30.0);
         assert!(!state.decode_drop_frame());
@@ -2849,9 +2887,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetDecodeFpsIndex(3), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         assert!((state.decode_fps() - 29.97).abs() < 0.01);
         assert!(state.decode_drop_frame());
     }
@@ -2865,9 +2904,10 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(GuiCommand::SetDecodeFpsIndex(99), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
         // Should not change since index is out of range
         assert_eq!(state.decode.fps_index, 1);
     }
@@ -2935,10 +2975,11 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(
             GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx,
         );
 
         assert!(state.decode.result.is_none(), "single result cleared");
@@ -2957,10 +2998,11 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(
             GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx,
         );
 
         assert!(state.decode.group_paths.is_empty(), "group paths cleared");
@@ -2978,10 +3020,11 @@ mod tests {
         let mut last_dev = None;
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
 
         process_command(
             GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor,
+            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx,
         );
 
         // Should not panic on empty state, just bump generations

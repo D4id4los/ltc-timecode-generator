@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gui_engine::command::{ConverterCommand, GuiCommand, OffloadCommand};
-use gui_engine::ChannelSel;
+use gui_engine::{AudioEvent, ChannelSel};
 use gui_engine::config;
 use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
 use gui_engine::timecode::{self, FPS_OPTIONS};
@@ -32,8 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match gui_engine::cli::process_cli(cli) {
         gui_engine::cli::CliOutcome::Done => Ok(()),
-        gui_engine::cli::CliOutcome::RunGui { cmd_tx, state } => {
-            _run_gui(cmd_tx, state)
+        gui_engine::cli::CliOutcome::RunGui { cmd_tx, state, event_rx } => {
+            _run_gui(cmd_tx, state, event_rx)
         }
     }
 }
@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn _run_gui(
     cmd_tx: mpsc::Sender<GuiCommand>,
     engine_state: Arc<ArcSwap<AppStateSnapshot>>,
+    event_rx: std::sync::mpsc::Receiver<AudioEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let log_buffer = gui_engine::log_buffer::init_logger(
         gui_engine::log_buffer::DEFAULT_LOG_FILTER,
@@ -964,6 +965,7 @@ fn _run_gui(
     setup_poll_timer(
         &ui,
         engine_state,
+        event_rx,
         toasts,
         next_toast_id,
         log_buffer,

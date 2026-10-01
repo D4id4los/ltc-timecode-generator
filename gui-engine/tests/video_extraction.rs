@@ -161,7 +161,8 @@ fn run_engine_with_commands(commands: Vec<GuiCommand>) -> AppStateSnapshot {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = std::sync::mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -266,7 +267,8 @@ fn test_single_clip_decode_via_group_command() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = std::sync::mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -373,7 +375,8 @@ where
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = std::sync::mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -750,7 +753,8 @@ fn test_select_recording_probe_failure_publishes_error() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = std::sync::mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -813,7 +817,8 @@ fn test_select_recording_probe_falls_back_to_successful_clip() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = std::sync::mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -870,7 +875,8 @@ fn test_select_recording_preserves_ltc_probe() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = std::sync::mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 
@@ -922,7 +928,8 @@ fn test_select_recording_without_folder_does_not_probe() {
     let handle = std::thread::Builder::new()
         .name("gui-engine-vtest".into())
         .spawn(move || {
-            engine_main_with_probe(rx, state_clone, false, fake_probe);
+            let (event_tx, _event_rx) = std::sync::mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("failed to spawn engine thread");
 

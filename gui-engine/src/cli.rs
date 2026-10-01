@@ -717,6 +717,7 @@ pub enum CliOutcome {
     RunGui {
         cmd_tx: std::sync::mpsc::Sender<GuiCommand>,
         state: Arc<arc_swap::ArcSwap<AppStateSnapshot>>,
+        event_rx: std::sync::mpsc::Receiver<audio_core::AudioEvent>,
     },
 }
 
@@ -853,11 +854,12 @@ pub fn process_cli(cli: Cli) -> CliOutcome {
     let init_state = AppStateSnapshot::initial();
     let state = Arc::new(arc_swap::ArcSwap::new(Arc::new(init_state)));
     let state_clone = Arc::clone(&state);
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<audio_core::AudioEvent>();
 
     std::thread::Builder::new()
         .name("gui-engine".to_string())
         .spawn(move || {
-            crate::engine::engine_main(cmd_rx, state_clone, use_libltc);
+            crate::engine::engine_main(cmd_rx, state_clone, use_libltc, event_tx);
         })
         .expect("failed to spawn gui-engine thread");
 
@@ -868,6 +870,7 @@ pub fn process_cli(cli: Cli) -> CliOutcome {
     CliOutcome::RunGui {
         cmd_tx,
         state,
+        event_rx,
     }
 }
 

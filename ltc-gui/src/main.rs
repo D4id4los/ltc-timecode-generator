@@ -10,13 +10,13 @@ fn main() {
 
     match gui_engine::cli::process_cli(cli) {
         gui_engine::cli::CliOutcome::Done => {}
-        gui_engine::cli::CliOutcome::RunGui { cmd_tx, state } => {
+        gui_engine::cli::CliOutcome::RunGui { cmd_tx, state, event_rx } => {
             let log_buffer = gui_engine::log_buffer::init_logger(
                 gui_engine::log_buffer::DEFAULT_LOG_FILTER,
             )
             .expect("Failed to initialize logger");
 
-            let app = app::AppState::new(cmd_tx, state, log_buffer);
+            let app = app::AppState::new(cmd_tx, event_rx, state, log_buffer);
 
             let options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()

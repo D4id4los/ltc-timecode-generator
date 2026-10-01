@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -136,6 +136,7 @@ pub struct ToastNotification {
 pub struct AppState {
     // Engine communication
     pub cmd_tx: Sender<GuiCommand>,
+    event_rx: Receiver<AudioEvent>,
     engine_state: Arc<ArcSwap<AppStateSnapshot>>,
     pub latest: Arc<AppStateSnapshot>,
 
@@ -208,15 +209,17 @@ impl AppState {
 
     pub fn new(
         cmd_tx: Sender<GuiCommand>,
+        event_rx: Receiver<AudioEvent>,
         engine_state: Arc<ArcSwap<AppStateSnapshot>>,
         log_buffer: Arc<Mutex<gui_engine::log_buffer::LogBuffer>>,
     ) -> Self {
         let cfg = config::load();
-        Self::new_with_config(cmd_tx, engine_state, log_buffer, cfg)
+        Self::new_with_config(cmd_tx, event_rx, engine_state, log_buffer, cfg)
     }
 
     pub fn new_with_config(
         cmd_tx: Sender<GuiCommand>,
+        event_rx: Receiver<AudioEvent>,
         engine_state: Arc<ArcSwap<AppStateSnapshot>>,
         log_buffer: Arc<Mutex<gui_engine::log_buffer::LogBuffer>>,
         cfg: gui_engine::config::ConverterConfig,
@@ -230,6 +233,7 @@ impl AppState {
 
         let result = Self {
             cmd_tx,
+            event_rx,
             latest: Arc::new(initial.clone()),
             engine_state,
             theme: if is_dark { Theme::Dark } else { Theme::Light },
@@ -515,9 +519,9 @@ impl eframe::App for AppState {
             .min(0.1);
         self.last_frame_time = Some(now);
 
-        // 5. Process engine events into toasts
-        let events = self.latest.events.clone();
-        for evt in events {
+        // 5. Process engine events into toasts — drained from the
+        // audio-event channel, not the snapshot (one-shot mailbox).
+        while let Ok(evt) = self.event_rx.try_recv() {
             match evt {
                 AudioEvent::StreamError(msg) => {
                     self.add_notification(NotificationType::Error, format!("Audio stream error: {}", msg));
@@ -1418,8 +1422,10 @@ mod tests {
 
     fn app_with_no_decode_state() -> super::AppState {
         let (tx, _) = mpsc::channel();
+        let (_event_tx, event_rx) = mpsc::channel();
         super::AppState::new_with_config(
             tx,
+            event_rx,
             dummy_state(),
             dummy_log_buffer(),
             gui_engine::config::ConverterConfig::default(),
@@ -1504,8 +1510,10 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel();
+        let (_event_tx, event_rx) = mpsc::channel();
         let _app = super::AppState::new_with_config(
             tx,
+            event_rx,
             dummy_state(),
             dummy_log_buffer(),
             cfg,
