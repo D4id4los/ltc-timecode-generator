@@ -217,7 +217,7 @@ fn test_duplicate_decode_rejected_while_running() {
         "expected decode to succeed after two identical commands (second rejected by guard)",
     );
     assert!(
-        snapshot.ltc_decode_result.is_some(),
+        snapshot.decode.result.is_some(),
         "decode should have produced a result",
     );
 }
@@ -359,17 +359,17 @@ fn test_engine_mpsc_parse_ltc_command() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
         false,
-        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_result.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.result.is_some(),
     );
 
-    assert!(snapshot.ltc_decode_result.is_some(), "expected ltc_decode_result to be Some");
-    let result = snapshot.ltc_decode_result.as_ref().unwrap();
+    assert!(snapshot.decode.result.is_some(), "expected ltc_decode_result to be Some");
+    let result = snapshot.decode.result.as_ref().unwrap();
     assert!(matches!(result.status, LtcDecodeStatus::Success),
         "expected Success, got {:?}", result.status);
     assert!(result.valid_frames > 0, "expected valid_frames > 0");
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
-    assert!(snapshot.ltc_decode_error.is_none());
-    assert!(snapshot.ltc_decode_generation > 0);
+    assert!(snapshot.decode.error.is_none());
+    assert!(snapshot.decode.generation > 0);
 }
 
 #[test]
@@ -377,13 +377,13 @@ fn test_engine_mpsc_parse_invalid_file() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile("/tmp/nonexistent_ltc_test_file.wav".to_string())],
         false,
-        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_error.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.error.is_some(),
     );
 
     assert!(snapshot.status_message.contains("Parse failed"),
         "expected 'Parse failed', got: {}", snapshot.status_message);
-    assert!(snapshot.ltc_decode_result.is_none());
-    assert!(snapshot.ltc_decode_error.is_some());
+    assert!(snapshot.decode.result.is_none());
+    assert!(snapshot.decode.error.is_some());
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
 }
 
@@ -391,10 +391,10 @@ fn test_engine_mpsc_parse_invalid_file() {
 
 #[test]
 fn test_engine_clap_creates_log_entry() {
-    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.logs.len() == 1);
+    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.clapper.logs.len() == 1);
 
-    assert_eq!(snapshot.logs.len(), 1, "expected 1 log entry after Clap");
-    let log = &snapshot.logs[0];
+    assert_eq!(snapshot.clapper.logs.len(), 1, "expected 1 log entry after Clap");
+    let log = &snapshot.clapper.logs[0];
     assert_eq!(log.note, "Scene 1");
     assert!(log.timecode.contains(':'), "expected timecode in log, got {}", log.timecode);
     assert_eq!(log.id, 1);
@@ -402,10 +402,10 @@ fn test_engine_clap_creates_log_entry() {
 
 #[test]
 fn test_engine_clap_auto_increments_take() {
-    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.take == 2);
+    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.clapper.take == 2);
 
     // auto_increment_take defaults to true, take starts at 1
-    assert_eq!(snapshot.take, 2, "take should auto-increment from 1 to 2");
+    assert_eq!(snapshot.clapper.take, 2, "take should auto-increment from 1 to 2");
 }
 
 #[test]
@@ -420,12 +420,12 @@ fn test_engine_multiple_claps_accumulate_logs() {
     let snapshot = run_engine(
         vec![GuiCommand::Clap, GuiCommand::Clap, GuiCommand::Clap],
         false,
-        |s| s.logs.len() == 3,
+        |s| s.clapper.logs.len() == 3,
     );
 
-    assert_eq!(snapshot.logs.len(), 3, "expected 3 log entries after 3 Claps");
+    assert_eq!(snapshot.clapper.logs.len(), 3, "expected 3 log entries after 3 Claps");
     // take auto-increments 3 times from 1
-    assert_eq!(snapshot.take, 4, "take should be 4 after 3 Claps starting from 1");
+    assert_eq!(snapshot.clapper.take, 4, "take should be 4 after 3 Claps starting from 1");
 }
 
 #[test]
@@ -437,11 +437,11 @@ fn test_engine_clap_without_auto_increment() {
             GuiCommand::Clap,
         ],
         false,
-        |s| s.logs.len() == 2,
+        |s| s.clapper.logs.len() == 2,
     );
 
-    assert_eq!(snapshot.logs.len(), 2, "expected 2 log entries");
-    assert_eq!(snapshot.take, 1, "take should remain 1 when auto-increment is off");
+    assert_eq!(snapshot.clapper.logs.len(), 2, "expected 2 log entries");
+    assert_eq!(snapshot.clapper.take, 1, "take should remain 1 when auto-increment is off");
 }
 
 // ── Engine shutdown ─────────────────────────────────────────────────────
@@ -585,12 +585,12 @@ fn test_engine_decode_generation_increments() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
         false,
-        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_result.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.result.is_some(),
     );
 
-    assert!(snapshot.ltc_decode_generation > 0, "generation should be > 0");
+    assert!(snapshot.decode.generation > 0, "generation should be > 0");
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
-    assert!(snapshot.ltc_decode_result.is_some());
+    assert!(snapshot.decode.result.is_some());
 }
 
 #[test]
@@ -598,11 +598,11 @@ fn test_engine_decode_error_on_nonexistent_file() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile("/tmp/definitely_not_a_real_ltc_file.wav".to_string())],
         false,
-        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_error.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.error.is_some(),
     );
 
-    assert!(snapshot.ltc_decode_error.is_some());
-    assert!(snapshot.ltc_decode_result.is_none());
+    assert!(snapshot.decode.error.is_some());
+    assert!(snapshot.decode.result.is_none());
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
 }
 
@@ -617,11 +617,11 @@ fn test_engine_set_scene_take_roll() {
             GuiCommand::SetRoll("B002".into()),
         ],
         false,
-        |s| s.scene == 42 && s.take == 7 && s.roll == "B002",
+        |s| s.clapper.scene == 42 && s.clapper.take == 7 && s.clapper.roll == "B002",
     );
-    assert_eq!(snapshot.scene, 42);
-    assert_eq!(snapshot.take, 7);
-    assert_eq!(snapshot.roll, "B002");
+    assert_eq!(snapshot.clapper.scene, 42);
+    assert_eq!(snapshot.clapper.take, 7);
+    assert_eq!(snapshot.clapper.roll, "B002");
 }
 
 #[test]
@@ -629,9 +629,9 @@ fn test_engine_clear_logs() {
     let snapshot = run_engine(
         vec![GuiCommand::Clap, GuiCommand::Clap, GuiCommand::ClearLogs],
         false,
-        |s| s.logs.is_empty(),
+        |s| s.clapper.logs.is_empty(),
     );
-    assert!(snapshot.logs.is_empty(), "expected empty logs after ClearLogs");
+    assert!(snapshot.clapper.logs.is_empty(), "expected empty logs after ClearLogs");
 }
 
 #[test]
@@ -692,14 +692,14 @@ fn test_engine_reset_current_timecode() {
 
 #[test]
 fn test_engine_set_ltc_decode_stream() {
-    let snapshot = run_engine(vec![GuiCommand::SetLtcDecodeStream(2)], false, |s| s.ltc_selected_stream == 2);
-    assert_eq!(snapshot.ltc_selected_stream, 2);
+    let snapshot = run_engine(vec![GuiCommand::SetLtcDecodeStream(2)], false, |s| s.decode.selected_stream == 2);
+    assert_eq!(snapshot.decode.selected_stream, 2);
 }
 
 #[test]
 fn test_engine_set_ltc_decode_channel() {
-    let snapshot = run_engine(vec![GuiCommand::SetLtcDecodeChannel(3)], false, |s| s.ltc_selected_channel == 3);
-    assert_eq!(snapshot.ltc_selected_channel, 3);
+    let snapshot = run_engine(vec![GuiCommand::SetLtcDecodeChannel(3)], false, |s| s.decode.selected_channel == 3);
+    assert_eq!(snapshot.decode.selected_channel, 3);
 }
 
 #[test]
@@ -710,10 +710,10 @@ fn test_engine_set_ltc_decode_stream_and_channel() {
             GuiCommand::SetLtcDecodeChannel(2),
         ],
         false,
-        |s| s.ltc_selected_stream == 1 && s.ltc_selected_channel == 2,
+        |s| s.decode.selected_stream == 1 && s.decode.selected_channel == 2,
     );
-    assert_eq!(snapshot.ltc_selected_stream, 1);
-    assert_eq!(snapshot.ltc_selected_channel, 2);
+    assert_eq!(snapshot.decode.selected_stream, 1);
+    assert_eq!(snapshot.decode.selected_channel, 2);
 }
 
 // ── File duration probe ──────────────────────────────────────────────────

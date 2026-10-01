@@ -28,7 +28,7 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
         .stroke(egui::Stroke::new(1.5, colors.border_main))
         .inner_margin(egui::Margin::same(16));
     frame.show(ui, |ui| {
-        let mut auto_inc = state.latest.auto_increment_take;
+        let mut auto_inc = state.latest.clapper.auto_increment_take;
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("SMART CLAPPER SLATE").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
@@ -105,7 +105,7 @@ fn render_clapper_board_drawing(ui: &mut Ui, state: &mut AppState) {
     }
 
     let pivot = egui::pos2(x_offset + 0.1 * w, y_base);
-    let angle = s.clap_arm_angle;
+    let angle = s.clapper.arm_angle;
     let cos = angle.cos();
     let sin = angle.sin();
     let rotate = |dx: f32, dy: f32| -> egui::Pos2 {
@@ -169,7 +169,7 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
         ui.set_min_height(76.0);
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("SCENE").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
-            ui.label(RichText::new(format!("{}", s.scene)).font(FontId::monospace(18.0)).color(colors.text_title).strong());
+            ui.label(RichText::new(format!("{}", s.clapper.scene)).font(FontId::monospace(18.0)).color(colors.text_title).strong());
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 0.0);
@@ -197,7 +197,7 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
         ui.set_min_height(76.0);
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("TAKE").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
-            ui.label(RichText::new(format!("{}", s.take)).font(FontId::monospace(18.0)).color(ACCENT).strong());
+            ui.label(RichText::new(format!("{}", s.clapper.take)).font(FontId::monospace(18.0)).color(ACCENT).strong());
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 0.0);
@@ -230,7 +230,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                         // Clear is GUI-only (just clear the local view)
                     }
                     if ui.button("Copy").clicked() {
-                        let text = s.logs.iter()
+                        let text = s.clapper.logs.iter()
                             .map(|l| format!("[{}] LTC: {} | MS: {} | {}", l.timestamp, l.timecode, l.milliseconds, l.note))
                             .collect::<Vec<_>>().join("\n");
                         ui.ctx().copy_text(text);
@@ -247,14 +247,14 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                 egui::ScrollArea::vertical()
                     .id_salt(crate::ids::clap_log_scroll())
                     .max_height(200.0).min_scrolled_height(176.0).show(ui, |ui| {
-                    if s.logs.is_empty() {
+                    if s.clapper.logs.is_empty() {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
                             ui.label(RichText::new("No clapper marks recorded yet.").color(colors.text_muted).strong());
                             ui.label(RichText::new("Tap CLAP & BEEP to capture markings.").font(FontId::proportional(10.0)).color(colors.text_muted));
                         });
                     } else {
-                        for log in s.logs.iter() {
+                        for log in s.clapper.logs.iter() {
                             let item_frame = egui::Frame::new()
                                 .fill(colors.nested_bg)
                                 .corner_radius(6.0)

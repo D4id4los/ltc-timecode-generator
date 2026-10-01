@@ -151,7 +151,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
     // Folder picker (all patterns are applied simultaneously)
     ui.horizontal(|ui| {
         ui.label(RichText::new("Folder:").font(FontId::proportional(10.0)).color(colors.text_muted));
-        let folder_label = match &state.selected_folder {
+        let folder_label = match &state.latest.converter.groups_folder {
             Some(p) => p.to_string_lossy().to_string(),
             None => String::from("(No folder selected)"),
         };
@@ -164,14 +164,12 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
         );
         if ui.button("Browse…").clicked() {
             let mut dialog = rfd::FileDialog::new();
-            if let Some(ref last) = state.selected_folder {
+            if let Some(ref last) = state.latest.converter.groups_folder {
                 dialog = dialog.set_directory(last);
             }
             let folder = dialog.pick_folder();
             if let Some(path) = folder {
-                state.selected_folder = Some(path.clone());
-
-                // Notify engine to scan folder and manage groups (engine runs
+                                // Notify engine to scan folder and manage groups (engine runs
                 // the scan on a background thread and publishes results via
                 // the snapshot's converter.groups / groups_loading flags).
                 state.send(GuiCommand::Converter(ConverterCommand::SelectFolder(path.clone())));
@@ -191,7 +189,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
     } else {
         Some(state.latest.converter.groups.clone())
     };
-    if groups_clone.is_none() && state.selected_folder.is_some() {
+    if groups_clone.is_none() && state.latest.converter.groups_folder.is_some() {
         // Groups async scan in progress or not yet adopted
         if groups_loading {
             ui.label(RichText::new("Scanning folder for recordings…")
@@ -303,9 +301,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
 
     if file_count > 0 {
         // Clamp out-of-range track index to the last file.
-        if state.ltc_file_idx >= file_count && file_count > 0 {
-            state.ltc_file_idx = file_count.saturating_sub(1);
-            state.local_settings.ltc_file_idx = state.ltc_file_idx;
+        if state.local_settings.ltc_file_idx >= file_count && file_count > 0 {
+            state.local_settings.ltc_file_idx = file_count.saturating_sub(1);
         }
 
         let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
@@ -319,7 +316,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
         }
 
         let channel_options: Vec<ChannelOption> = if is_video {
-            if let Some(ref probe) = state.latest.ltc_probe {
+            if let Some(ref probe) = state.latest.decode.probe {
                 probe
                     .streams
                     .iter()
@@ -371,16 +368,15 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
         // Ensure selected stream/channel is within range
         if is_video {
             let in_range = channel_options.iter().any(|o| {
-                o.stream == state.latest.ltc_selected_stream && o.channel == state.latest.ltc_selected_channel
+                o.stream == state.latest.decode.selected_stream && o.channel == state.latest.decode.selected_channel
             });
             if !in_range && !channel_options.is_empty() {
                 let _ = cmd_tx.send(GuiCommand::SetLtcDecodeStream(channel_options[0].stream));
                 let _ = cmd_tx.send(GuiCommand::SetLtcDecodeChannel(channel_options[0].channel));
             }
         } else {
-            if state.ltc_file_idx >= channel_options.len() && !channel_options.is_empty() {
-                state.ltc_file_idx = channel_options.len().saturating_sub(1);
-                state.local_settings.ltc_file_idx = state.ltc_file_idx;
+            if state.local_settings.ltc_file_idx >= channel_options.len() && !channel_options.is_empty() {
+                state.local_settings.ltc_file_idx = channel_options.len().saturating_sub(1);
             }
         }
 
@@ -392,14 +388,14 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                 channel_options
                     .iter()
                     .find(|o| {
-                        o.stream == state.latest.ltc_selected_stream
-                            && o.channel == state.latest.ltc_selected_channel
+                        o.stream == state.latest.decode.selected_stream
+                            && o.channel == state.latest.decode.selected_channel
                     })
                     .map(|o| o.label.clone())
                     .unwrap_or_else(|| "Select…".to_string())
             } else {
                 channel_options
-                    .get(state.ltc_file_idx)
+                    .get(state.local_settings.ltc_file_idx)
                     .map(|o| o.label.clone())
                     .unwrap_or_else(|| "Select…".to_string())
             };
@@ -415,8 +411,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                 .show_ui(ui, |ui| {
                     if is_video {
                         for opt in &channel_options {
-                            let is_sel = opt.stream == state.latest.ltc_selected_stream
-                                && opt.channel == state.latest.ltc_selected_channel;
+                            let is_sel = opt.stream == state.latest.decode.selected_stream
+                                && opt.channel == state.latest.decode.selected_channel;
                             if ui.selectable_label(is_sel, &opt.label).clicked() && !opt.disabled {
                                 let _ = cmd_tx.send(GuiCommand::SetLtcDecodeStream(opt.stream));
                                 let _ = cmd_tx.send(GuiCommand::SetLtcDecodeChannel(opt.channel));
@@ -424,8 +420,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                         }
                     } else {
                         for (i, opt) in channel_options.iter().enumerate() {
-                            if ui.selectable_label(i == state.ltc_file_idx, &opt.label).clicked() {
-                                state.ltc_file_idx = i;
+                            if ui.selectable_label(i == state.local_settings.ltc_file_idx, &opt.label).clicked() {
                                 state.local_settings.ltc_file_idx = i;
                             }
                         }
@@ -439,7 +434,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("FPS:").font(FontId::proportional(10.0)).color(colors.text_muted));
             for (i, opt) in FPS_OPTIONS.iter().enumerate() {
-                let is_sel = i == state.latest.decode_fps_index;
+                let is_sel = i == state.latest.decode.fps_index;
                 let btn = egui::Button::new(
                     RichText::new(opt.name).font(FontId::monospace(9.0)).color(if is_sel { Color32::BLACK } else { colors.text_muted })
                 )
@@ -471,8 +466,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                 }
             } else {
                 if is_video {
-                    let stream_idx = state.latest.ltc_selected_stream;
-                    let channel_idx = state.latest.ltc_selected_channel;
+                    let stream_idx = state.latest.decode.selected_stream;
+                    let channel_idx = state.latest.decode.selected_channel;
                     if ui.add(egui::Button::new(RichText::new("🔍 Detect LTC All Clips").font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
                         .fill(ACCENT).min_size(egui::vec2(140.0, 24.0))).clicked()
                     {
@@ -482,7 +477,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                         state.send(GuiCommand::DecodeLtcVideoGroup { paths, stream_index: stream_idx, channel_index: channel_idx });
                     }
                 } else {
-                    let file_path = group.unwrap().files[state.ltc_file_idx].to_string_lossy().to_string();
+                    let file_path = group.unwrap().files[state.local_settings.ltc_file_idx].to_string_lossy().to_string();
                     if ui.add(egui::Button::new(RichText::new("🔍 Detect LTC").font(FontId::proportional(11.0)).color(Color32::BLACK).strong())
                         .fill(ACCENT).min_size(egui::vec2(100.0, 24.0))).clicked()
                     {
@@ -498,8 +493,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     // Show group decode results (video clip groups)
     let is_video_group = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let group_results: Vec<(String, Option<gui_engine::LtcDetectionResult>, Option<String>)> = {
-        let paths = &state.latest.ltc_group_paths;
-        let results = &state.latest.ltc_group_results;
+        let paths = &state.latest.decode.group_paths;
+        let results = &state.latest.decode.group_results;
         paths.iter().enumerate().map(|(i, p)| {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
             match results.get(i) {
@@ -513,7 +508,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     if is_video_group && !group_results.is_empty() {
         // Change-gated logging for Windows diagnostics
         {
-            let gen = state.latest.ltc_group_decode_generation;
+            let gen = state.latest.decode.group_generation;
             if gen != state.last_logged_group_decode_gen {
                 state.last_logged_group_decode_gen = gen;
                 let some_count = group_results.iter().filter(|(_, r, _)| r.is_some()).count();
@@ -523,7 +518,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                     "GROUP VIEW: paths={} results={} errors={} detecting={} done/total={}/{} gen={} none={} recording={:?}",
                     group_results.len(), some_count, err_count,
                     state.latest.job(JobKind::LtcGroupDecode).is_active(),
-                    state.latest.job(JobKind::LtcGroupDecode).units().len(), state.latest.ltc_group_results.len(), gen,
+                    state.latest.job(JobKind::LtcGroupDecode).units().len(), state.latest.decode.group_results.len(), gen,
                     none_count,
                     state.latest.converter.selected_recording_type(),
                 );
@@ -625,8 +620,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
         });
     } else {
         // Show single-file decode result (audio-only, or single-file video)
-        let decode_result = state.latest.ltc_decode_result.clone();
-        let decode_error = state.latest.ltc_decode_error.clone();
+        let decode_result = state.latest.decode.result.clone();
+        let decode_error = state.latest.decode.error.clone();
 
         if let Some(ref error) = decode_error {
             let error_frame = egui::Frame::new()
@@ -1006,7 +1001,7 @@ fn format_ltc_report_text(result: &gui_engine::LtcDetectionResult) -> String {
 fn sync_channel_map_from_probe(state: &mut AppState) {
     let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let expected = if is_video {
-        state.latest.ltc_probe.as_ref().map(|p| p.total_audio_channels).unwrap_or(0)
+        state.latest.decode.probe.as_ref().map(|p| p.total_audio_channels).unwrap_or(0)
     } else {
         // Audio: the group's file count = channel count
 state.latest.converter.selected_group_idx
@@ -1023,7 +1018,7 @@ state.latest.converter.selected_group_idx
 /// (e.g. "T1 L", "T1 R", "S2 C1"). For audio, show "CH n".
 fn channel_row_labels(state: &AppState) -> Vec<String> {
     if state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence) {
-        if let Some(ref probe) = state.latest.ltc_probe {
+        if let Some(ref probe) = state.latest.decode.probe {
             let mut labels = Vec::new();
             for s in &probe.streams {
                 for ch in 0..s.channels {
@@ -1053,7 +1048,7 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
     let n = state.local_settings.channel_map.num_channels();
 
     if n == 0 {
-        if is_video && state.latest.ltc_probe.is_none() {
+        if is_video && state.latest.decode.probe.is_none() {
             if state.latest.job(JobKind::ClipProbe).is_active() {
                 ui.label(RichText::new("Probing clip audio…").font(FontId::proportional(10.0)).color(colors.text_muted));
             } else {
@@ -1070,11 +1065,11 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
     let row_labels = channel_row_labels(state);
     let ltc_row = if is_video {
-        state.latest.ltc_probe.as_ref().and_then(|probe| {
+        state.latest.decode.probe.as_ref().and_then(|probe| {
             let mut idx = 0usize;
             for s in &probe.streams {
                 for ch in 0..s.channels {
-                    if s.stream_index == state.latest.ltc_selected_stream && ch == state.latest.ltc_selected_channel {
+                    if s.stream_index == state.latest.decode.selected_stream && ch == state.latest.decode.selected_channel {
                         return Some(idx);
                     }
                     idx += 1;
@@ -1195,9 +1190,9 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let ltc_available = if is_video {
-        state.latest.ltc_group_results.iter().any(|r| r.is_done())
+        state.latest.decode.group_results.iter().any(|r| r.is_done())
     } else {
-        state.latest.ltc_decode_result.is_some()
+        state.latest.decode.result.is_some()
     };
 
     ui.add_space(8.0);
@@ -1606,7 +1601,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
     if has_group && !state.local_settings.filename_prefix.is_empty() {
         ui.add_space(4.0);
         let settings = current_converter_settings(state);
-        let previews = preview_output_files(&settings, state.latest.ltc_probe.as_ref());
+        let previews = preview_output_files(&settings, state.latest.decode.probe.as_ref());
 
         if !previews.is_empty() {
             let count = previews.len();
@@ -1629,12 +1624,12 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
 
     // Set start time from LTC checkbox
     let is_video_group = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
-    let group_has_results = state.latest.ltc_group_results.iter().any(gui_engine::state::ClipDecodeState::is_done);
+    let group_has_results = state.latest.decode.group_results.iter().any(gui_engine::state::ClipDecodeState::is_done);
     let ltc_available = !state.latest.job(JobKind::LtcDecode).is_active() && !state.latest.job(JobKind::LtcGroupDecode).is_active()
         && if is_video_group {
             group_has_results
         } else {
-            state.latest.ltc_decode_result.is_some() || state.latest.ltc_decode_error.is_some()
+            state.latest.decode.result.is_some() || state.latest.decode.error.is_some()
         };
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -1644,13 +1639,13 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
         ));
         if state.local_settings.set_start_from_ltc {
             let tc_text = if is_video_group {
-                state.latest.ltc_group_results.first()
+                state.latest.decode.group_results.first()
                     .and_then(|r| r.ok())
                     .and_then(start_timecode_from_ltc)
                     .map(|m| gui_engine::converter::format_ffmpeg_timecode(&m.start, m.drop_frame))
                     .unwrap_or_default()
             } else {
-                state.latest.ltc_decode_result.as_ref()
+                state.latest.decode.result.as_ref()
                     .and_then(start_timecode_from_ltc)
                     .map(|m| gui_engine::converter::format_ffmpeg_timecode(&m.start, m.drop_frame))
                     .unwrap_or_default()
@@ -1788,7 +1783,7 @@ fn current_converter_settings(state: &AppState) -> ConverterSettings {
     };
     let ltc_video_source = match state.latest.converter.selected_recording_type() {
         Some(RecordingType::VideoClipSequence) => {
-            Some((state.latest.ltc_selected_stream, state.latest.ltc_selected_channel))
+            Some((state.latest.decode.selected_stream, state.latest.decode.selected_channel))
         }
         _ => None,
     };

@@ -159,14 +159,6 @@ pub struct AppState {
     pub app_menu_pos: Option<egui::Pos2>,
     pub log_buffer: Arc<Mutex<gui_engine::log_buffer::LogBuffer>>,
 
-    // ── LTC detection state (GUI-local) ──────────────────────────────
-    pub ltc_file_idx: usize,
-
-    // ── Converter folder (GUI-local display) ──────────────────────────
-    /// Last known converter selected folder — used to detect engine scan
-    /// result arrival and for offload auto-switch.
-    pub selected_folder: Option<PathBuf>,
-
     /// Local cache of converter settings (GUI editing buffer).
     /// egui's immediate-mode render functions need `&mut` access for
     /// checkboxes and TextEdits; this cache provides that while keeping
@@ -205,7 +197,6 @@ impl AppState {
     /// field and the `local_settings` merge buffer, so the diff machinery
     /// (`diff_converter_commands`) emits `SetLtcFileIndex` to the engine.
     pub fn set_ltc_file_idx(&mut self, idx: usize) {
-        self.ltc_file_idx = idx;
         self.local_settings.ltc_file_idx = idx;
     }
 
@@ -251,14 +242,12 @@ impl AppState {
             show_app_menu: false,
             app_menu_pos: None,
             log_buffer,
-            ltc_file_idx: 0,
-            selected_folder: selected_folder.clone(),
             local_settings: gui_engine::state::ConverterUserSettings::initial(),
             prev_engine_settings: None,
             last_logged_group_decode_gen: 0,
             offload_last_version: 0,
             offload_start_pending: None,
-            roll_edit: TextFieldEdit::new(&initial.roll),
+            roll_edit: TextFieldEdit::new(&initial.clapper.roll),
             parent_name_edit: TextFieldEdit::new(&initial.offload.parent_name),
             device_name_edits: HashMap::new(),
         };
@@ -305,7 +294,7 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     let base = if s.is_playing || ltc_detecting {
         let interval = Duration::from_secs_f64(1.0 / s.fps().max(1.0));
         interval.min(Duration::from_millis(40))
-    } else if s.clap_animating {
+    } else if s.clapper.animating {
         Duration::from_secs_f64(1.0 / 60.0)
     } else if offload_running {
         Duration::from_millis(100)
@@ -493,7 +482,7 @@ impl eframe::App for AppState {
         //      user types.  Engine values are adopted only when the field is
         //      not focused and no in-flight edit awaits confirmation.
         let now = Instant::now();
-        self.roll_edit.sync(&self.latest.roll, now);
+        self.roll_edit.sync(&self.latest.clapper.roll, now);
         self.parent_name_edit.sync(&self.latest.offload.parent_name, now);
 
         // Device-name buffers keyed by mount point: prune vanished mounts,
@@ -610,7 +599,6 @@ impl eframe::App for AppState {
             if let Some(ref path) = self.latest.offload.last_offload_parent {
                 let path = path.clone();
                 log::info!("Offload completed — auto-switching converter folder to {:?}", path);
-                self.selected_folder = Some(path.clone());
                 self.set_ltc_file_idx(1);
                 let _ = self.cmd_tx.send(GuiCommand::Converter(
                     gui_engine::command::ConverterCommand::SelectFolder(path.clone()),
@@ -651,10 +639,10 @@ impl eframe::App for AppState {
         self.render_app_menu(ui);
         self.render_debug_log_window(ui);
 
-        if self.latest.clap_flash_alpha > 0.01 {
+        if self.latest.clapper.flash_alpha > 0.01 {
             let ctx = ui.ctx();
             let screen = ctx.viewport_rect();
-            let alpha = (self.latest.clap_flash_alpha * 255.0) as u8;
+            let alpha = (self.latest.clapper.flash_alpha * 255.0) as u8;
             let color = Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
             egui::Area::new(egui::Id::new("clap_flash"))
                 .order(egui::Order::Foreground)
@@ -1191,7 +1179,7 @@ mod tests {
     #[test]
     fn repaint_interval_clap_animating_returns_approx_33ms() {
         let mut s = make_snapshot();
-        s.clap_animating = true;
+        s.clapper.animating = true;
         let dur = next_repaint_interval(&s);
         // base = 16.67ms → request = 33.33ms
         assert!(dur > Duration::from_millis(28) && dur < Duration::from_millis(38));
@@ -1211,7 +1199,7 @@ mod tests {
         assert!(next_repaint_interval(&s2) >= floor);
         // animating
         let mut s3 = make_snapshot();
-        s3.clap_animating = true;
+        s3.clapper.animating = true;
         assert!(next_repaint_interval(&s3) >= floor);
         // offload running
         let s4 = with_offload_running(make_snapshot());
@@ -1456,11 +1444,9 @@ mod tests {
         };
         let groups = vec![group];
 
-        app.ltc_file_idx = 5;
         app.local_settings.ltc_file_idx = 5;
         let cmds = apply_group_selection(&mut app, &groups, 0);
 
-        assert_eq!(app.ltc_file_idx, 0);
         assert_eq!(app.local_settings.ltc_file_idx, 0,
             "apply_group_selection must reset local_settings.ltc_file_idx too");
         assert_eq!(cmds.len(), 2);
@@ -1488,7 +1474,6 @@ mod tests {
 
         let cmds = apply_group_selection(&mut app, &groups, 0);
 
-        assert_eq!(app.ltc_file_idx, 0);
         assert_eq!(app.local_settings.ltc_file_idx, 0,
             "apply_group_selection must reset local_settings.ltc_file_idx too");
         assert_eq!(cmds.len(), 2, "video group should return 2 commands");
@@ -1497,15 +1482,12 @@ mod tests {
     }
 
     #[test]
-    fn set_ltc_file_idx_writes_both_fields() {
+    fn set_ltc_file_idx_writes_merge_buffer() {
         let mut app = app_with_no_decode_state();
-        assert_eq!(app.ltc_file_idx, 0);
         assert_eq!(app.local_settings.ltc_file_idx, 0);
 
         app.set_ltc_file_idx(2);
 
-        assert_eq!(app.ltc_file_idx, 2,
-            "set_ltc_file_idx must write the GUI-local field");
         assert_eq!(app.local_settings.ltc_file_idx, 2,
             "set_ltc_file_idx must write the merge-buffer field");
     }

@@ -58,10 +58,10 @@ pub fn setup_poll_timer(
             AppColors::get(&ui).set_theme_dark(s.is_dark_theme);
 
             // 3. Clapper metadata (fix one-way sync gaps)
-            ui.set_roll(SharedString::from(s.roll.clone()));
-            ui.set_scene(s.scene as i32);
-            ui.set_take(s.take as i32);
-            ui.set_auto_increment(s.auto_increment_take);
+            ui.set_roll(SharedString::from(s.clapper.roll.clone()));
+            ui.set_scene(s.clapper.scene as i32);
+            ui.set_take(s.clapper.take as i32);
+            ui.set_auto_increment(s.clapper.auto_increment_take);
 
             // 4. LTC decode state sync
             {
@@ -69,11 +69,11 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                     ui.set_ltc_status(SharedString::from("detecting"));
                     ui.set_ltc_result_text(SharedString::from(""));
                     ui.set_ltc_error(SharedString::from(""));
-                } else if let Some(ref err) = s.ltc_decode_error {
+                } else if let Some(ref err) = s.decode.error {
                     ui.set_ltc_status(SharedString::from("error"));
                     ui.set_ltc_result_text(SharedString::from(""));
                     ui.set_ltc_error(SharedString::from(err));
-                } else if let Some(ref r) = s.ltc_decode_result {
+                } else if let Some(ref r) = s.decode.result {
                     let status_str = match &r.status {
                         gui_engine::LtcDecodeStatus::Success => "success",
                         gui_engine::LtcDecodeStatus::LowConfidence => "low_confidence",
@@ -133,10 +133,10 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             }
 
             // 5. LTC decode FPS index sync (fix one-way gap)
-            ui.set_decode_fps_index(s.decode_fps_index as i32);
+            ui.set_decode_fps_index(s.decode.fps_index as i32);
 
             // 6. Video audio probe info
-            if let Some(ref probe) = s.ltc_probe {
+            if let Some(ref probe) = s.decode.probe {
                 let mut channel_names_vec: Vec<SharedString> = Vec::new();
                 let mut ltc_row_idx: i32 = -1;
                 for s_info in &probe.streams {
@@ -150,7 +150,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                             format!("Ch {}", ch + 1)
                         };
                         channel_names_vec.push(SharedString::from(label));
-                        if s_info.stream_index == s.ltc_selected_stream && ch == s.ltc_selected_channel {
+                        if s_info.stream_index == s.decode.selected_stream && ch == s.decode.selected_channel {
                             ltc_row_idx = idx as i32;
                         }
                     }
@@ -165,7 +165,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             // 7. Probe-status flags for video recordings
             if ui.get_conv_is_video_recording() {
                 ui.set_conv_ltc_probe_loading(s.job(JobKind::ClipProbe).is_active());
-                ui.set_conv_ltc_probe_failed(s.ltc_probe.is_none() && !s.job(JobKind::ClipProbe).is_active());
+                ui.set_conv_ltc_probe_failed(s.decode.probe.is_none() && !s.job(JobKind::ClipProbe).is_active());
             } else {
                 ui.set_conv_ltc_probe_loading(false);
                 ui.set_conv_ltc_probe_failed(false);
@@ -225,8 +225,8 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             ui.set_sample_format(SharedString::from(s.sample_format_name.to_uppercase()));
 
             // 16. Arm angle and flash opacity
-            ui.set_arm_angle(s.clap_arm_angle);
-            ui.set_flash_opacity(s.clap_flash_alpha);
+            ui.set_arm_angle(s.clapper.arm_angle);
+            ui.set_flash_opacity(s.clapper.flash_alpha);
 
             // 17. Device selection sync
             ui.set_device_index(s.selected_device as i32);
@@ -408,10 +408,10 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
 
             // 27. Log entries (only rebuild if log count changed)
             {
-                let current_log_count = s.logs.len();
+                let current_log_count = s.clapper.logs.len();
                 let mut last = last_log_count.lock().unwrap();
                 if current_log_count != *last {
-                    let log_entries: Vec<LogEntry> = s.logs
+                    let log_entries: Vec<LogEntry> = s.clapper.logs
                         .iter()
                         .map(|l| LogEntry {
                             timestamp: SharedString::from(&l.timestamp),

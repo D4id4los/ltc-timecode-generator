@@ -160,8 +160,11 @@ pub struct OffloadSnapshot {
     pub last_offload_version: u64,
     /// Global error message (e.g. no parent folder set).
     pub error: Option<String>,
-    /// Per-file durations (seconds), probed asynchronously after scan.
-    /// Keyed by full file path; value is `None` when probing failed or is pending.
+    /// Per-file durations (seconds) for offload-scope files (card contents),
+    /// probed asynchronously after scan. Keyed by full file path; value is
+    /// `None` when probing failed or is pending. Separate from the
+    /// converter-scope `AppStateSnapshot::file_durations` (different
+    /// clearing points: `OffloadScan` vs `ProbeFileDurations`).
     pub file_durations: HashMap<PathBuf, Option<f64>>,
     /// Monotonically increasing version — incremented on each duration insertion.
     pub durations_version: u64,

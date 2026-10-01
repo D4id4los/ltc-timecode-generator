@@ -149,7 +149,7 @@ fn _run_gui(
         set_tc_segments(&ui, &tc_str);
         ui.set_ms_text(SharedString::from(timecode::timecode_to_ms_string(s.current_timecode, s.fps())));
         ui.set_fps_name(SharedString::from(FPS_OPTIONS[s.fps_index].name));
-        ui.set_decode_fps_index(s.decode_fps_index as i32);
+        ui.set_decode_fps_index(s.decode.fps_index as i32);
     }
 
     // ── Refresh devices ────────────────────────────────────────────────────
@@ -305,7 +305,7 @@ fn _run_gui(
         let ui_weak = ui.as_weak();
         ui.on_copy_logs(move || {
             let s = state.load();
-            let text = s.logs
+            let text = s.clapper.logs
                 .iter()
                 .map(|l| format!("[{}] LTC: {} | MS: {} | {}", l.timestamp, l.timecode, l.milliseconds, l.note))
                 .collect::<Vec<_>>()
@@ -708,7 +708,7 @@ fn _run_gui(
                 let flat_idx = ui_weak.upgrade()
                     .map(|u| u.get_ltc_selected_channel() as usize)
                     .unwrap_or(0);
-                let (stream_idx, channel_idx) = s.ltc_probe.as_ref().map_or((0, 0), |probe| {
+                let (stream_idx, channel_idx) = s.decode.probe.as_ref().map_or((0, 0), |probe| {
                     let mut flat = 0usize;
                     for st in &probe.streams {
                         for ch in 0..st.channels {
@@ -742,7 +742,7 @@ fn _run_gui(
         let chan_engine_state = engine_state.clone();
         ui.on_channel_selected(move |flat_idx| {
             let s = chan_engine_state.load();
-            if let Some(ref probe) = s.ltc_probe {
+            if let Some(ref probe) = s.decode.probe {
                 let mut flat = 0usize;
                 for st in &probe.streams {
                     for ch in 0..st.channels {
@@ -780,7 +780,7 @@ fn _run_gui(
         let ui_weak = ui.as_weak();
         ui.on_conv_copy_ltc_report(move || {
             let s = state.load();
-            if let Some(ref result) = s.ltc_decode_result {
+            if let Some(ref result) = s.decode.result {
                 let drop_flag = if result.drop_frame { " DF" } else { "" };
                 let fps_str = if result.detected_fps > 0.0 {
                     format!("{:.2}{}", result.detected_fps, drop_flag)

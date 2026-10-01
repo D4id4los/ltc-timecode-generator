@@ -175,6 +175,59 @@ pub struct ClapLogItem {
     pub note: String,
 }
 
+// ── Decode snapshot (engine-owned) ─────────────────────────────────────
+
+/// Engine-managed LTC-decode state: decode FPS, video probe, single-file
+/// and batch group-decode results.  `generation` counters are engine
+/// latches (also used by integration tests as progress handles); no GUI
+/// renders them.
+#[derive(Clone, Debug)]
+pub struct DecodeSnapshot {
+    /// Index into `FPS_OPTIONS` used when decoding.
+    pub fps_index: usize,
+    /// Video/audio stream probe of the selected file (from `ProbeVideo`
+    /// or the first clip probe of a video group).
+    pub probe: Option<VideoAudioProbe>,
+    /// Selected audio stream for video decode.
+    pub selected_stream: usize,
+    /// Selected channel within the selected stream.
+    pub selected_channel: usize,
+    /// Single-file decode result.
+    pub result: Option<LtcDetectionResult>,
+    /// Last decode/probe error message, if any.
+    pub error: Option<String>,
+    /// Bumped whenever single-file decode state resets; used by the engine
+    /// to latch auto-apply and discard stale results.
+    pub generation: u64,
+    /// Paths of the batch being decoded, index-aligned with `group_results`.
+    pub group_paths: Vec<PathBuf>,
+    /// Per-clip batch decode state (index matches `group_paths`).
+    pub group_results: Vec<ClipDecodeState>,
+    /// Bumped whenever the batch decode resets (same role as `generation`).
+    pub group_generation: u64,
+}
+
+// ── Clapper snapshot (engine-owned) ────────────────────────────────────
+
+/// Engine-managed clapper-board state and clap animation.  The animation
+/// fields are engine-computed each tick (decay curves) and consumed for
+/// rendering/repaint pacing.
+#[derive(Clone, Debug)]
+pub struct ClapperSnapshot {
+    pub scene: u32,
+    pub take: u32,
+    pub roll: String,
+    pub auto_increment_take: bool,
+    /// Clap log, newest first, capped at `MAX_CLAP_LOGS`.
+    pub logs: Vec<ClapLogItem>,
+    /// Fullscreen white-flash opacity (1.0 on clap, decays to 0).
+    pub flash_alpha: f32,
+    /// Clapper arm angle in radians (animated toward rest on clap).
+    pub arm_angle: f32,
+    /// True while the clap animation is still visibly in progress.
+    pub animating: bool,
+}
+
 // ── Application state snapshot ─────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -200,21 +253,14 @@ pub struct AppStateSnapshot {
     // Audio device
     pub devices: Vec<AudioDeviceInfo>,
     pub selected_device: usize,
+    /// Engine-internal working flag: whether the audio output stream was
+    /// successfully initialized.  Not rendered by any GUI.
     pub audio_initialized: bool,
     pub sample_rate: u32,
     pub sample_format_name: String,
 
-    // Clapper metadata
-    pub scene: u32,
-    pub take: u32,
-    pub roll: String,
-    pub auto_increment_take: bool,
-    pub logs: Vec<ClapLogItem>,
-
-    // Animation (engine-computed)
-    pub clap_flash_alpha: f32,
-    pub clap_arm_angle: f32,
-    pub clap_animating: bool,
+    // Clapper (metadata, log, engine-computed clap animation)
+    pub clapper: ClapperSnapshot,
 
     // Theme
     pub is_dark_theme: bool,
@@ -225,24 +271,8 @@ pub struct AppStateSnapshot {
     // Events drained from AudioCore (to be surfaced as toasts by the GUI)
     pub events: Vec<AudioEvent>,
 
-    // LTC decode FPS (stored as an index into `FPS_OPTIONS`)
-    pub decode_fps_index: usize,
-
-    // LTC file decode
-    pub ltc_decode_result: Option<LtcDetectionResult>,
-    pub ltc_decode_error: Option<String>,
-    pub ltc_decode_generation: u64,
-
-    // Video file probe info (populated by ProbeVideo command)
-    pub ltc_probe: Option<VideoAudioProbe>,
-    pub ltc_selected_stream: usize,
-    pub ltc_selected_channel: usize,
-    // LTC group (batch) decode — decode every clip in a video recording group
-    pub ltc_group_decode_generation: u64,
-    /// Paths of the group being decoded, index-aligned with results.
-    pub ltc_group_paths: Vec<PathBuf>,
-    /// Per-clip decode state (index matches ltc_group_paths).
-    pub ltc_group_results: Vec<ClipDecodeState>,
+    // LTC decode (probe, single-file and batch results)
+    pub decode: DecodeSnapshot,
 
     // ffmpeg capability probe (engine-owned, async)
     pub ffmpeg_caps: Option<FfmpegCapabilities>,
@@ -251,8 +281,13 @@ pub struct AppStateSnapshot {
     pub jobs: HashMap<JobKind, JobStatus>,
 
     // File duration probe (engine-owned, async)
-    /// Per-file durations keyed by full path. `None` meaning the file
-    /// could not be probed (unreadable, no ffprobe, etc).
+    /// Per-file durations for converter-scope files (converter groups),
+    /// keyed by full path. `None` meaning the file could not be probed
+    /// (unreadable, no ffprobe, etc).
+    ///
+    /// Kept separate from `offload.file_durations` on purpose: the two
+    /// maps have different lifetimes (cleared on `ProbeFileDurations` vs
+    /// `OffloadScan`) even though a `DurationProbe` job may fill both.
     pub file_durations: HashMap<PathBuf, Option<f64>>,
     // Engine-owned converter state
     pub converter: ConverterSnapshot,
@@ -292,27 +327,31 @@ impl AppStateSnapshot {
             audio_initialized: false,
             sample_rate: suggest_sr,
             sample_format_name: String::new(),
-            scene: 1,
-            take: 1,
-            roll: "A001".to_string(),
-            auto_increment_take: true,
-            logs: Vec::new(),
-            clap_flash_alpha: 0.0,
-            clap_arm_angle: -25.0f32.to_radians(),
-            clap_animating: false,
+            clapper: ClapperSnapshot {
+                scene: 1,
+                take: 1,
+                roll: "A001".to_string(),
+                auto_increment_take: true,
+                logs: Vec::new(),
+                flash_alpha: 0.0,
+                arm_angle: -25.0f32.to_radians(),
+                animating: false,
+            },
             is_dark_theme: false,
             status_message: "Ready".to_string(),
             events: Vec::new(),
-            decode_fps_index: 1,
-            ltc_decode_result: None,
-            ltc_decode_error: None,
-            ltc_decode_generation: 0,
-            ltc_probe: None,
-            ltc_selected_stream: 0,
-            ltc_selected_channel: 0,
-            ltc_group_decode_generation: 0,
-            ltc_group_paths: Vec::new(),
-            ltc_group_results: Vec::new(),
+            decode: DecodeSnapshot {
+                fps_index: 1,
+                probe: None,
+                selected_stream: 0,
+                selected_channel: 0,
+                result: None,
+                error: None,
+                generation: 0,
+                group_paths: Vec::new(),
+                group_results: Vec::new(),
+                group_generation: 0,
+            },
             ffmpeg_caps: None,
             jobs: HashMap::new(),
             file_durations: HashMap::new(),
@@ -348,14 +387,14 @@ impl AppStateSnapshot {
         FPS_OPTIONS[self.fps_index].drop_frame
     }
 
-    /// Decode-side frame rate, derived from `decode_fps_index`.
+    /// Decode-side frame rate, derived from `decode.fps_index`.
     pub fn decode_fps(&self) -> f64 {
-        FPS_OPTIONS[self.decode_fps_index].fps
+        FPS_OPTIONS[self.decode.fps_index].fps
     }
 
-    /// Decode-side drop-frame flag, derived from `decode_fps_index`.
+    /// Decode-side drop-frame flag, derived from `decode.fps_index`.
     pub fn decode_drop_frame(&self) -> bool {
-        FPS_OPTIONS[self.decode_fps_index].drop_frame
+        FPS_OPTIONS[self.decode.fps_index].drop_frame
     }
 }
 
@@ -418,7 +457,7 @@ mod tests {
         s.fps_index = 3; // 29.97 DF
         assert!((s.fps() - 29.97).abs() < 0.01);
         assert!(s.drop_frame());
-        s.decode_fps_index = 4; // 30
+        s.decode.fps_index = 4; // 30
         assert_eq!(s.decode_fps(), 30.0);
         assert!(!s.decode_drop_frame());
     }
@@ -463,15 +502,15 @@ mod tests {
     #[test]
     fn test_initial_clapper() {
         let s = initial_state();
-        assert_eq!(s.scene, 1);
-        assert_eq!(s.take, 1);
-        assert_eq!(s.roll, "A001");
-        assert!(s.auto_increment_take);
+        assert_eq!(s.clapper.scene, 1);
+        assert_eq!(s.clapper.take, 1);
+        assert_eq!(s.clapper.roll, "A001");
+        assert!(s.clapper.auto_increment_take);
     }
 
     #[test]
     fn test_initial_logs_empty() {
-        assert!(initial_state().logs.is_empty());
+        assert!(initial_state().clapper.logs.is_empty());
     }
 
     // ── Animation defaults ────────────────────────────────────────────────
@@ -479,14 +518,14 @@ mod tests {
     #[test]
     fn test_initial_animation() {
         let s = initial_state();
-        assert_eq!(s.clap_flash_alpha, 0.0);
-        assert!((s.clap_arm_angle - (-25.0f32).to_radians()).abs() < 1e-6);
+        assert_eq!(s.clapper.flash_alpha, 0.0);
+        assert!((s.clapper.arm_angle - (-25.0f32).to_radians()).abs() < 1e-6);
     }
 
     #[test]
     fn test_initial_clap_arm_angle_negative() {
         let s = initial_state();
-        assert!(s.clap_arm_angle < 0.0);
+        assert!(s.clapper.arm_angle < 0.0);
     }
 
     // ── Theme defaults ────────────────────────────────────────────────────
@@ -508,12 +547,12 @@ mod tests {
     #[test]
     fn test_initial_decode_state() {
         let s = initial_state();
-        assert_eq!(s.decode_fps_index, 1);
+        assert_eq!(s.decode.fps_index, 1);
         assert_eq!(s.decode_fps(), 25.0);
         assert!(!s.decode_drop_frame());
-        assert!(s.ltc_decode_result.is_none());
-        assert!(s.ltc_decode_error.is_none());
-        assert_eq!(s.ltc_decode_generation, 0);
+        assert!(s.decode.result.is_none());
+        assert!(s.decode.error.is_none());
+        assert_eq!(s.decode.generation, 0);
     }
 
     // ── LTC group decode defaults ──────────────────────────────────────────
@@ -521,15 +560,15 @@ mod tests {
     #[test]
     fn test_initial_group_decode_state() {
         let s = initial_state();
-        assert_eq!(s.ltc_group_decode_generation, 0);
-        assert!(s.ltc_group_paths.is_empty());
-        assert!(s.ltc_group_results.is_empty());
+        assert_eq!(s.decode.group_generation, 0);
+        assert!(s.decode.group_paths.is_empty());
+        assert!(s.decode.group_results.is_empty());
     }
 
     #[test]
     fn test_initial_probe_is_none() {
         let s = initial_state();
-        assert!(s.ltc_probe.is_none());
+        assert!(s.decode.probe.is_none());
     }
 
     // ── Clone produces independent copy ───────────────────────────────────
@@ -538,11 +577,11 @@ mod tests {
     fn test_state_clone_is_independent() {
         let mut a = AppStateSnapshot::initial();
         let mut b = a.clone();
-        a.scene = 99;
-        b.take = 88;
-        assert_eq!(a.scene, 99);
-        assert_eq!(b.scene, 1);
-        assert_eq!(a.take, 1);
-        assert_eq!(b.take, 88);
+        a.clapper.scene = 99;
+        b.clapper.take = 88;
+        assert_eq!(a.clapper.scene, 99);
+        assert_eq!(b.clapper.scene, 1);
+        assert_eq!(a.clapper.take, 1);
+        assert_eq!(b.clapper.take, 88);
     }
 }
