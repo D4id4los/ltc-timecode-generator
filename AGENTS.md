@@ -221,7 +221,7 @@ Commands are sent from the GUI thread to the engine via `mpsc::Sender<GuiCommand
 ### AppStateSnapshot
 The full application state is published as an `AppStateSnapshot` struct wrapped in `Arc<ArcSwap<AppStateSnapshot>>`. The engine thread calls `state.store(Arc::new(snapshot))` after each tick. The GUI calls `state.load()` to get the latest snapshot — this is lock-free and always returns the latest state without queue management.
 
-Field groups (see `state.rs` for the full struct): generation counter; transport (is_playing/is_locked, current + start timecode); FPS; audio routing + device state; clapper metadata + clap log; engine-computed animations (clap flash alpha, arm angle); theme; status message + system time; drained `AudioEvent`s (surfaced as toasts by the GUI); decode state (decode FPS, decoder selection, decode result/error); video probe info; per-clip LTC group results; ffmpeg capability probe (`ffmpeg_caps` — engine-owned, async); unified job status map (`jobs: HashMap<JobKind, JobStatus>`) covering all async tasks; offload (`OffloadSnapshot`: cards + per-file selection, parent folder/name, `device_totals` from copy plans, completed devices, last_offload_parent + handoff version, error, per-file durations).
+Field groups (see `state.rs` for the full struct): generation counter; transport (is_playing/is_locked, current + start timecode); FPS; audio routing + device state; clapper metadata + clap log; engine-computed animations (clap flash alpha, arm angle); theme; per-subsystem status channels (`StatusChannels`: audio/decode/converter/offload + last-writer tag); decode state (decode FPS, decoder selection, decode result/error); video probe info; per-clip LTC group results; ffmpeg capability probe (`ffmpeg_caps` — engine-owned, async); unified job status map (`jobs: HashMap<JobKind, JobStatus>`) covering all async tasks; offload (`OffloadSnapshot`: cards + per-file selection, parent folder/name, `device_totals` from copy plans, completed devices, last_offload_parent + handoff version, error, per-file durations).
 
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
@@ -239,11 +239,11 @@ The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
     - LtcGroupDecode `Item` → fills per-clip results; `Finished` → auto-applies group settings
     - ClipProbe → populates `converter.probes`/`camera_meta`/`device_name`
 3. **Poll timecode** — `core.current_timecode()` when playing
-4. **Drain audio events** — clears `state.events` first, then drains `core.drain_events()`, dispatches to recovery or forwards to `state.events`
+4. **Drain audio events** — drains `core.drain_events()`, dispatches to recovery, and sends each event through the engine→GUI `mpsc::Sender<AudioEvent>` channel (events are a one-shot mailbox, not snapshot state)
 5. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s); determines if clap animation is still visibly in progress.
 6. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
 7. **Update system time**
-8. **Publish** — increments generation, calls `state.store(Arc::new(snapshot))`
+8. **Publish** — increments generation and stores the snapshot only when it differs from the last published one (structural `PartialEq` compare against the cached `Arc`; idle ticks skip the deep clone)
 9. **Sleep** until next tick
 
 ### Audio Lifecycle
@@ -327,7 +327,7 @@ The native GUI is built with **egui 0.35 + eframe** (glow backend, vsync off). I
 
 ### Architecture
 - **`AppState` struct** (`app.rs`): holds `cmd_tx` (command sender), `engine_state` (ArcSwap handle), theme, notifications, tab state (Clapper / Settings / Convert / Offload), debug log buffer, text-field edit state, offload→converter handoff tracking. Implements `eframe::App`.
-- **Frame loop**: `logic()` syncs `self.latest` from `engine_state.load()`, drains `self.latest.events` into toast notifications, processes keyboard shortcuts (Space/C/R/L/Ctrl+D → send GuiCommand), handles repaint scheduling. Also watches `offload.last_offload_version` and auto-switches the converter to the fresh offload destination (`SelectFolder` + `SelectRecording(0)`).
+- **Frame loop**: `logic()` syncs `self.latest` from `engine_state.load()`, drains the engine's `Receiver<AudioEvent>` into toast notifications, processes keyboard shortcuts (Space/C/R/L/Ctrl+D → send GuiCommand), handles repaint scheduling. Also watches `offload.last_offload_version` and auto-switches the converter to the fresh offload destination (`SelectFolder` + `SelectRecording(0)`).
 - **Widgets** (`widgets/`): `clock` (glowing timecode display), `clapper` (board + arm + scene/take/roll + sync log), `settings` (FPS selector, steppers, device, routing, sliders), `status` (footer bar), `converter` (file picker via rfd, pattern/encoder selection, conversion progress), `offload` (3-step ingest UI: parent folder + date name, card/file selection with per-card device naming and per-file checkboxes, offload progress with per-device status). Widgets read from `state.latest.*` for display and call `state.send(GuiCommand::...)` for mutations.
 - **`ids.rs`** — egui `ScrollArea` id-salt constructors preventing sibling-widget ID clashes in egui's stable-ID system.
 - **Theme** (`theme.rs`): bridges the shared engine palettes (`gui_engine::theme`) to egui styles.
@@ -350,7 +350,7 @@ LIBGL_ALWAYS_SOFTWARE=1 cargo run   # Force software OpenGL rendering
 
 The Slint GUI follows the same pattern as ltc-gui — thin shell over `gui-engine`:
 - **`main.rs`** registers Slint callbacks that send `GuiCommand` variants and wires converter option models (containers/encoders from ffmpeg capabilities). Offload callbacks: `on_off_select_parent_folder` (rfd → `SetParentFolder`), `on_off_parent_name_changed` (`SetParentName`), `on_off_card_name_changed` (`SetDeviceName`), `on_off_rescan` (`ScanCards`), `on_off_start` / `on_off_cancel` (`StartOffload` / `CancelOffload`), `on_off_file_toggled` (`SetFileSelected`), `on_off_select_all_files` (`SetAllFilesSelected`), `on_off_select_latest_day` (`SelectLatestDay`).
-- **`poll.rs`** sets up the poll timer that reads `engine_state.load()` and updates Slint properties (timecode segments, FPS names, routing pills, clapper metadata, decode results, device names, debug log entries, and offload state sync — `OffloadCardInfo`/`OffloadFileInfo`/per-device status).
+- **`poll.rs`** sets up the poll timer that reads `engine_state.load()` and updates Slint properties (timecode segments, FPS names, routing pills, clapper metadata, decode results, device names, debug log entries, and offload state sync — `OffloadCardInfo`/`OffloadFileInfo`/per-device status). The poll timer also drains the engine's `Receiver<AudioEvent>` into toasts.
 - **`toast.rs` / `theme.rs` / `timecode_helpers.rs`** — GUI-side toast management, palette application, and timecode segment formatting.
 - **`ui/`** is split per concern: `app.slint` (root window + tabs) plus `clapper/clock/converter/offload/settings/status/theme/types/widgets.slint`. `offload.slint` exports `OffloadSection` with 4th tab wiring.
 - Uses `rfd` for file dialogs and `arboard` for clipboard access.
