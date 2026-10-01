@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use gui_engine::command::{GuiCommand, OffloadCommand};
 use gui_engine::engine::engine_main_with_probe;
 use gui_engine::state::AppStateSnapshot;
-use gui_engine::{decode_ltc_from_wav, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities};
+use gui_engine::{decode_ltc_from_wav, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities, ChannelSel};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -139,7 +139,7 @@ fn test_supervisor_latest_job_gates_stale_events() {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         let snap = state.load();
-        if snap.job(JobKind::LtcDecode).phase == JobPhase::Running {
+        if snap.job(JobKind::LtcDecode).phase() == JobPhase::Running {
             break;
         }
         if Instant::now() > deadline {
@@ -154,7 +154,7 @@ fn test_supervisor_latest_job_gates_stale_events() {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         let snap = state.load();
-        if snap.job(JobKind::LtcDecode).phase != JobPhase::Running {
+        if snap.job(JobKind::LtcDecode).phase() != JobPhase::Running {
             break;
         }
         if Instant::now() > deadline {
@@ -171,8 +171,8 @@ fn test_supervisor_latest_job_gates_stale_events() {
     loop {
         let snap = state.load();
         let job = snap.job(JobKind::LtcDecode);
-        if job.phase != JobPhase::Running && job.phase != JobPhase::Indeterminate {
-            if job.phase == JobPhase::Succeeded {
+        if job.phase() != JobPhase::Running && job.phase() != JobPhase::Indeterminate {
+            if job.phase() == JobPhase::Succeeded {
                 break;
             }
             // If it Failed (e.g. count_chunks race), that's fine too
@@ -186,7 +186,7 @@ fn test_supervisor_latest_job_gates_stale_events() {
 
     let snap = state.load();
     assert!(
-        snap.job(JobKind::LtcDecode).phase != JobPhase::Running,
+        snap.job(JobKind::LtcDecode).phase() != JobPhase::Running,
         "second decode should have completed"
     );
 
@@ -208,11 +208,11 @@ fn test_duplicate_decode_rejected_while_running() {
             GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string()),
         ],
         false,
-        |s| s.job(JobKind::LtcDecode).phase == JobPhase::Succeeded,
+        |s| s.job(JobKind::LtcDecode).phase() == JobPhase::Succeeded,
     );
 
     assert_eq!(
-        snapshot.job(JobKind::LtcDecode).phase,
+        snapshot.job(JobKind::LtcDecode).phase(),
         JobPhase::Succeeded,
         "expected decode to succeed after two identical commands (second rejected by guard)",
     );
@@ -241,15 +241,15 @@ fn test_duplicate_group_decode_rejected_while_running() {
         ],
         false,
         |s| {
-            let phase = s.job(JobKind::LtcGroupDecode).phase;
+            let phase = s.job(JobKind::LtcGroupDecode).phase();
             phase == JobPhase::Succeeded || phase == JobPhase::Failed
         },
     );
 
     assert!(
-        snapshot.job(JobKind::LtcGroupDecode).phase != JobPhase::Running,
+        snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running,
         "group decode should have finished, phase={:?}",
-        snapshot.job(JobKind::LtcGroupDecode).phase,
+        snapshot.job(JobKind::LtcGroupDecode).phase(),
     );
 }
 
@@ -273,12 +273,12 @@ fn test_duplicate_probe_durations_rejected_while_running() {
         ],
         false,
         |s| {
-            s.job(JobKind::DurationProbe).phase == JobPhase::Succeeded
+            s.job(JobKind::DurationProbe).phase() == JobPhase::Succeeded
         },
     );
 
     assert!(
-        snapshot.job(JobKind::DurationProbe).phase != JobPhase::Running,
+        snapshot.job(JobKind::DurationProbe).phase() != JobPhase::Running,
         "duration probe should have finished"
     );
 }
@@ -359,7 +359,7 @@ fn test_engine_mpsc_parse_ltc_command() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
         false,
-        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_result.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_result.is_some(),
     );
 
     assert!(snapshot.ltc_decode_result.is_some(), "expected ltc_decode_result to be Some");
@@ -367,7 +367,7 @@ fn test_engine_mpsc_parse_ltc_command() {
     assert!(matches!(result.status, LtcDecodeStatus::Success),
         "expected Success, got {:?}", result.status);
     assert!(result.valid_frames > 0, "expected valid_frames > 0");
-    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
     assert!(snapshot.ltc_decode_error.is_none());
     assert!(snapshot.ltc_decode_generation > 0);
 }
@@ -377,14 +377,14 @@ fn test_engine_mpsc_parse_invalid_file() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile("/tmp/nonexistent_ltc_test_file.wav".to_string())],
         false,
-        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_error.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_error.is_some(),
     );
 
     assert!(snapshot.status_message.contains("Parse failed"),
         "expected 'Parse failed', got: {}", snapshot.status_message);
     assert!(snapshot.ltc_decode_result.is_none());
     assert!(snapshot.ltc_decode_error.is_some());
-    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
 }
 
 // ── Clap command integration ────────────────────────────────────────────
@@ -397,7 +397,7 @@ fn test_engine_clap_creates_log_entry() {
     let log = &snapshot.logs[0];
     assert_eq!(log.note, "Scene 1");
     assert!(log.timecode.contains(':'), "expected timecode in log, got {}", log.timecode);
-    assert_eq!(log.id, "1");
+    assert_eq!(log.id, 1);
 }
 
 #[test]
@@ -537,24 +537,24 @@ fn test_engine_frame_up_wrap() {
 fn test_engine_set_fps_24() {
     let snapshot = run_engine(vec![GuiCommand::SetFpsIndex(0)], false, |s| s.fps_index == 0);
     assert_eq!(snapshot.fps_index, 0);
-    assert_eq!(snapshot.fps, 24.0);
-    assert!(!snapshot.drop_frame);
+    assert_eq!(snapshot.fps(), 24.0);
+    assert!(!snapshot.drop_frame());
 }
 
 #[test]
 fn test_engine_set_fps_2997_df() {
     let snapshot = run_engine(vec![GuiCommand::SetFpsIndex(3)], false, |s| s.fps_index == 3);
     assert_eq!(snapshot.fps_index, 3);
-    assert!((snapshot.fps - 29.97).abs() < 0.01);
-    assert!(snapshot.drop_frame);
+    assert!((snapshot.fps() - 29.97).abs() < 0.01);
+    assert!(snapshot.drop_frame());
 }
 
 #[test]
 fn test_engine_set_fps_30() {
     let snapshot = run_engine(vec![GuiCommand::SetFpsIndex(4)], false, |s| s.fps_index == 4);
     assert_eq!(snapshot.fps_index, 4);
-    assert_eq!(snapshot.fps, 30.0);
-    assert!(!snapshot.drop_frame);
+    assert_eq!(snapshot.fps(), 30.0);
+    assert!(!snapshot.drop_frame());
 }
 
 // ── Theme commands ──────────────────────────────────────────────────────
@@ -585,11 +585,11 @@ fn test_engine_decode_generation_increments() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
         false,
-        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_result.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_result.is_some(),
     );
 
     assert!(snapshot.ltc_decode_generation > 0, "generation should be > 0");
-    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
     assert!(snapshot.ltc_decode_result.is_some());
 }
 
@@ -598,12 +598,12 @@ fn test_engine_decode_error_on_nonexistent_file() {
     let snapshot = run_engine(
         vec![GuiCommand::ParseLtcWavFile("/tmp/definitely_not_a_real_ltc_file.wav".to_string())],
         false,
-        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_error.is_some(),
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_error.is_some(),
     );
 
     assert!(snapshot.ltc_decode_error.is_some());
     assert!(snapshot.ltc_decode_result.is_none());
-    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
 }
 
 // ── State mutation commands ─────────────────────────────────────────────
@@ -644,14 +644,14 @@ fn test_engine_set_sample_rate() {
 fn test_engine_set_ltc_and_beep_channels() {
     let snapshot = run_engine(
         vec![
-            GuiCommand::SetLtcChannel("both".into()),
-            GuiCommand::SetBeepChannel("left".into()),
+            GuiCommand::SetLtcChannel(ChannelSel::Both),
+            GuiCommand::SetBeepChannel(ChannelSel::Left),
         ],
         false,
-        |s| s.ltc_channel == "both" && s.beep_channel == "left",
+        |s| s.ltc_channel == ChannelSel::Both && s.beep_channel == ChannelSel::Left,
     );
-    assert_eq!(snapshot.ltc_channel, "both");
-    assert_eq!(snapshot.beep_channel, "left");
+    assert_eq!(snapshot.ltc_channel, ChannelSel::Both);
+    assert_eq!(snapshot.beep_channel, ChannelSel::Left);
 }
 
 #[test]
@@ -783,9 +783,9 @@ fn cancel_decode_clears_is_detecting_and_sets_status() {
             GuiCommand::CancelDecode,
         ],
         false,
-        |s| s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.status_message == "Decode canceled by user",
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.status_message == "Decode canceled by user",
     );
-    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running,
+    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcDecode job phase");
     assert_eq!(snapshot.status_message, "Decode canceled by user",
         "CancelDecode should update status_message");
@@ -803,11 +803,11 @@ fn cancel_decode_also_clears_group_detecting() {
             GuiCommand::CancelDecode,
         ],
         false,
-        |s| s.job(JobKind::LtcGroupDecode).phase != JobPhase::Running && s.status_message == "Decode canceled by user",
+        |s| s.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running && s.status_message == "Decode canceled by user",
     );
-    assert!(snapshot.job(JobKind::LtcGroupDecode).phase != JobPhase::Running,
+    assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcGroupDecode job phase");
-    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running,
+    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcDecode job phase");
     assert_eq!(snapshot.status_message, "Decode canceled by user");
 }
@@ -857,22 +857,22 @@ fn test_multi_chunk_decode_shows_intermediate_progress() {
         let snapshot: AppStateSnapshot = state.load().as_ref().clone();
         let job = snapshot.job(JobKind::LtcDecode);
 
-        if job.phase == JobPhase::Running {
-            let f = job.fraction;
+        if job.phase() == JobPhase::Running {
+            let f = job.fraction();
             if f > 0.0 && f < 1.0 {
                 observed_intermediate = true;
                 break;
             }
         }
 
-        if job.phase == JobPhase::Succeeded || job.phase == JobPhase::Failed {
+        if job.phase() == JobPhase::Succeeded || job.phase() == JobPhase::Failed {
             break;
         }
 
         if Instant::now() > deadline {
             panic!(
                 "Timeout waiting for decode: phase={:?}, fraction={}, observed_intermediate={}",
-                job.phase, job.fraction, observed_intermediate,
+                job.phase(), job.fraction(), observed_intermediate,
             );
         }
 
@@ -884,13 +884,13 @@ fn test_multi_chunk_decode_shows_intermediate_progress() {
     loop {
         let snapshot: AppStateSnapshot = state.load().as_ref().clone();
         let job = snapshot.job(JobKind::LtcDecode);
-        if job.phase != JobPhase::Running {
-            if job.phase == JobPhase::Succeeded {
+        if job.phase() != JobPhase::Running {
+            if job.phase() == JobPhase::Succeeded {
                 assert!(
                     observed_intermediate,
                     "expected to observe intermediate fraction in (0,1) \
                      before succeeded, but never did (final fraction={})",
-                    job.fraction,
+                    job.fraction(),
                 );
             }
             break;

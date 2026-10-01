@@ -1,4 +1,4 @@
-use crate::Timecode;
+use crate::{ChannelSel, Timecode};
 
 // ── Volume mapping ──────────────────────────────────────────────────────────
 
@@ -161,7 +161,7 @@ pub fn compute_frame_sample_count(
 /// low-pass-filtered output value, and **must** be passed between successive
 /// frames for glitch-free continuous output.
 ///
-/// `channel` is `"both"`, `"left"`, or `"right"`.
+/// `channel` selects which stereo outputs carry the signal.
 ///
 /// `stereo_out` must be at least `total_samples * 2` elements.
 #[allow(clippy::too_many_arguments)]
@@ -171,13 +171,13 @@ pub fn generate_ltc_frame_stereo(
     total_samples: usize,
     samples_per_bit: f32,
     volume: f32,
-    channel: &str,
+    channel: ChannelSel,
     last_level: &mut (f32, f32),
     stereo_out: &mut [f32],
 ) {
     let bits = get_ltc_bits(tc, drop_frame);
-    let play_left = channel == "both" || channel == "left";
-    let play_right = channel == "both" || channel == "right";
+    let play_left = matches!(channel, ChannelSel::Both | ChannelSel::Left);
+    let play_right = matches!(channel, ChannelSel::Both | ChannelSel::Right);
     let alpha = 0.35f32;
     let mut current_level = last_level.0;
     let mut last_y = last_level.1;
@@ -221,22 +221,22 @@ pub fn generate_ltc_frame_stereo(
 
 /// Generate stereo beep tone samples with attack/release envelope.
 ///
-/// `channel` is `"both"`, `"left"`, or `"right"`.  Returns interleaved stereo
-/// samples (L, R, L, R, …).
+/// `channel` selects which stereo outputs carry the tone.  Returns interleaved
+/// stereo samples (L, R, L, R, …).
 pub(crate) fn generate_beep_samples(
     sample_rate: u32,
     frequency: f32,
     duration: f32,
     volume: f32,
-    channel: &str,
+    channel: ChannelSel,
 ) -> Vec<f32> {
     let num_samples = (sample_rate as f32 * duration) as usize;
     let attack = (sample_rate as f32 * 0.005) as usize;
     let release = (sample_rate as f32 * 0.02) as usize;
     let mut samples = Vec::with_capacity(num_samples * 2);
 
-    let play_left = channel == "both" || channel == "left";
-    let play_right = channel == "both" || channel == "right";
+    let play_left = matches!(channel, ChannelSel::Both | ChannelSel::Left);
+    let play_right = matches!(channel, ChannelSel::Both | ChannelSel::Right);
 
     for i in 0..num_samples {
         let t = i as f32 / sample_rate as f32;
@@ -717,7 +717,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, ChannelSel::Both, &mut level, &mut buf);
 
         assert_eq!(buf.len(), total_samples * 2);
     }
@@ -730,7 +730,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
 
         let has_energy = buf.iter().any(|&s| s.abs() > 0.5);
         assert!(has_energy, "frame should contain non-trivial signal");
@@ -746,7 +746,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
@@ -764,7 +764,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "left", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Left, &mut level, &mut buf);
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
@@ -780,7 +780,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "right", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Right, &mut level, &mut buf);
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
@@ -798,7 +798,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.0, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.0, ChannelSel::Both, &mut level, &mut buf);
 
         let max_amp = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(max_amp < 1e-10, "zero volume should produce silence");
@@ -812,7 +812,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
 
         let max_amp = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(max_amp <= 1.0, "amplitude should not exceed 1.0, got {}", max_amp);
@@ -828,7 +828,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
 
         // After one frame, level.0 (current_level) should be inverted from start
         // Start: 1.0. First bit always toggles: -1.0. After 80 bits (40 toggles = even), back to 1.0.
@@ -848,10 +848,10 @@ mod tests {
         let mut buf2 = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "both", &mut level, &mut buf1);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf1);
         let last_sample_frame1 = buf1[buf1.len() - 2]; // left channel, last sample
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "both", &mut level, &mut buf2);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf2);
         let first_sample_frame2 = buf2[0]; // left channel, first sample
 
         // The last sample of frame 1 and first sample of frame 2 should be close
@@ -902,7 +902,7 @@ mod tests {
         let mut buf = vec![-1.0f32; total_samples * 2]; // init with sentinel
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
 
         // All samples should have been overwritten (not -1.0)
         // Actually some may be exactly 0.0, but the sentinel should not remain
@@ -920,7 +920,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
 
         let mean: f32 = buf.iter().sum::<f32>() / buf.len() as f32;
         // Bi-phase is DC-free, so mean should be very close to 0
@@ -937,7 +937,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, ChannelSel::Both, &mut level, &mut buf);
 
         assert_eq!(buf.len(), total_samples * 2);
         let has_energy = buf.iter().any(|&s| s.abs() > 0.1);
@@ -952,7 +952,7 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, "both", &mut level, &mut buf);
+        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, ChannelSel::Both, &mut level, &mut buf);
 
         assert_eq!(buf.len(), total_samples * 2);
         let has_energy = buf.iter().any(|&s| s.abs() > 0.1);
@@ -963,14 +963,14 @@ mod tests {
 
     #[test]
     fn test_beep_basic_properties() {
-        let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.5, "both");
+        let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.5, ChannelSel::Both);
         let expected_len = (48000.0 * 0.1) as usize * 2;
         assert_eq!(samples.len(), expected_len, "beep sample count");
     }
 
     #[test]
     fn test_beep_channel_left() {
-        let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.5, "left");
+        let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.5, ChannelSel::Left);
         let left_energy: f32 = samples.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = samples.iter().skip(1).step_by(2).map(|s| s * s).sum();
         assert!(left_energy > 0.0);
@@ -979,7 +979,7 @@ mod tests {
 
     #[test]
     fn test_beep_channel_right() {
-        let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.5, "right");
+        let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.5, ChannelSel::Right);
         let left_energy: f32 = samples.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = samples.iter().skip(1).step_by(2).map(|s| s * s).sum();
         assert!(left_energy < 1e-10, "left channel silent for right-only beep");
@@ -988,14 +988,14 @@ mod tests {
 
     #[test]
     fn test_beep_zero_volume() {
-        let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.0, "both");
+        let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.0, ChannelSel::Both);
         let max_amp = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(max_amp < 1e-10, "zero-volume beep should be silent");
     }
 
     #[test]
     fn test_beep_envelope_attack() {
-        let samples = generate_beep_samples(48000, 1000.0, 0.1, 1.0, "both");
+        let samples = generate_beep_samples(48000, 1000.0, 0.1, 1.0, ChannelSel::Both);
         // The attack is 5ms = 240 samples. First sample should be near 0, then ramp up.
         assert!(
             samples[0].abs() < samples[100].abs(),
@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test]
     fn test_beep_envelope_release() {
-        let samples = generate_beep_samples(48000, 1000.0, 0.1, 1.0, "both");
+        let samples = generate_beep_samples(48000, 1000.0, 0.1, 1.0, ChannelSel::Both);
         let _num_samples = samples.len() / 2;
         // Release is 20ms = 960 samples. End should taper off.
         let near_end = samples[samples.len() - 4];
@@ -1037,7 +1037,7 @@ mod tests {
             frame_buf[..samples * 2].fill(0.0);
             generate_ltc_frame_stereo(
                 &tc, false, samples, spb,
-                0.5, "both", &mut last_level, &mut frame_buf[..samples * 2],
+                0.5, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
             );
             total_generated += samples as u64;
             tc = increment_timecode(&tc, fps, false);
@@ -1072,7 +1072,7 @@ mod tests {
             frame_buf[..samples * 2].fill(0.0);
             generate_ltc_frame_stereo(
                 &tc, false, samples, spb,
-                0.5, "both", &mut last_level, &mut frame_buf[..samples * 2],
+                0.5, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
             );
             total_generated += samples as u64;
             tc = increment_timecode(&tc, fps, false);
@@ -1415,7 +1415,7 @@ mod tests {
             frame_buf[..samples * 2].fill(0.0);
             generate_ltc_frame_stereo(
                 &tc, false, samples, spb,
-                0.5, "both", &mut last_level, &mut frame_buf[..samples * 2],
+                0.5, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
             );
             total_generated += samples as u64;
             tc = increment_timecode(&tc, fps, false);
@@ -1449,7 +1449,7 @@ mod tests {
             frame_buf[..samples * 2].fill(0.0);
             generate_ltc_frame_stereo(
                 &tc, false, samples, spb,
-                0.5, "both", &mut last_level, &mut frame_buf[..samples * 2],
+                0.5, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
             );
             total_generated += samples as u64;
             tc = increment_timecode(&tc, fps, false);
@@ -1492,7 +1492,7 @@ mod tests {
             frame_buf[..samples * 2].fill(0.0);
             generate_ltc_frame_stereo(
                 &tc, false, samples, spb,
-                0.8, "both", &mut last_level, &mut frame_buf[..samples * 2],
+                0.8, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
             );
             audio.extend(frame_buf[..samples * 2].iter().step_by(2).copied());
             expected.push(tc);

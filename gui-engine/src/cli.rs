@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use std::path::Path;
 
 use audio_core::{
-    generate_ltc_frame_stereo, increment_timecode, list_audio_devices, AudioCore, Timecode,
+    generate_ltc_frame_stereo, increment_timecode, list_audio_devices, AudioCore, ChannelSel,
+    Timecode,
 };
 use clap::Parser;
 use log::{error, info, warn};
@@ -261,7 +262,12 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let start_tc = parse_timecode(&cli.start_timecode)?;
     let fps = cli.fps;
     let drop_frame = cli.drop_frame;
-    let channel = cli.channel.clone();
+    let channel = ChannelSel::parse(&cli.channel).ok_or_else(|| {
+        format!(
+            "Unsupported channel: '{}'. Must be one of: left, right, both",
+            cli.channel
+        )
+    })?;
     let volume = cli.volume;
     let verbose = cli.verbose;
 
@@ -270,15 +276,6 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Err(
             format!("Unsupported fps: {}. Must be one of: 24, 25, 29.97, 30", fps).into(),
         );
-    }
-
-    let valid_channels = ["left", "right", "both"];
-    if !valid_channels.iter().any(|c| *c == channel) {
-        return Err(format!(
-            "Unsupported channel: '{}'. Must be one of: left, right, both",
-            channel
-        )
-        .into());
     }
 
     if !(0.0..=1.0).contains(&volume) {
@@ -290,7 +287,7 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         timecode_fmt(&start_tc),
         fps,
         drop_frame,
-        channel,
+        channel.as_str(),
         volume
     );
 
@@ -424,7 +421,12 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let start_tc = parse_timecode(&cli.start_timecode)?;
     let fps = cli.fps;
     let drop_frame = cli.drop_frame;
-    let channel = cli.channel.clone();
+    let channel = ChannelSel::parse(&cli.channel).ok_or_else(|| {
+        format!(
+            "Unsupported channel: '{}'. Must be one of: left, right, both",
+            cli.channel
+        )
+    })?;
     let volume = cli.volume;
 
     let duration_secs = cli
@@ -481,7 +483,7 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             samples_per_frame,
             samples_per_bit,
             volume,
-            &channel,
+            channel,
             &mut last_level,
             &mut frame_buf[..samples_per_frame * 2],
         );

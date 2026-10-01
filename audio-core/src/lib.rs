@@ -35,6 +35,35 @@ pub struct Timecode {
     pub frames: u32,
 }
 
+/// Stereo channel routing for generated LTC/beep tones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelSel {
+    Left,
+    Right,
+    Both,
+}
+
+impl ChannelSel {
+    /// Canonical lowercase name (used by the CLI and UI labels).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChannelSel::Left => "left",
+            ChannelSel::Right => "right",
+            ChannelSel::Both => "both",
+        }
+    }
+
+    /// Parse a channel name; case-insensitive. `None` for unknown names.
+    pub fn parse(s: &str) -> Option<ChannelSel> {
+        match s.to_ascii_lowercase().as_str() {
+            "left" => Some(ChannelSel::Left),
+            "right" => Some(ChannelSel::Right),
+            "both" => Some(ChannelSel::Both),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AudioEvent {
     StreamError(String),
@@ -1426,7 +1455,7 @@ mod tests {
                 samples_per_frame,
                 samples_per_bit,
                 0.5,
-                "both",
+                ChannelSel::Both,
                 &mut last_level,
                 &mut frame_buf[..samples_per_frame * 2],
             );
@@ -1475,7 +1504,7 @@ mod tests {
                 samples_per_frame,
                 samples_per_bit,
                 0.5,
-                "both",
+                ChannelSel::Both,
                 &mut last_level,
                 &mut frame_buf[..samples_per_frame * 2],
             );
@@ -1703,5 +1732,30 @@ mod tests {
         assert!(total > 0, "progress should have completed at least 1 chunk");
         let has_read_error = result.details.iter().any(|d| d.contains("Failed to read"));
         assert!(has_read_error, "expected detail mentioning 'Failed to read', got: {:?}", result.details);
+    }
+
+    // ── ChannelSel ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_channel_sel_parse_valid() {
+        assert_eq!(ChannelSel::parse("left"), Some(ChannelSel::Left));
+        assert_eq!(ChannelSel::parse("right"), Some(ChannelSel::Right));
+        assert_eq!(ChannelSel::parse("both"), Some(ChannelSel::Both));
+        assert_eq!(ChannelSel::parse("LEFT"), Some(ChannelSel::Left));
+        assert_eq!(ChannelSel::parse("Both"), Some(ChannelSel::Both));
+    }
+
+    #[test]
+    fn test_channel_sel_parse_invalid() {
+        assert_eq!(ChannelSel::parse(""), None);
+        assert_eq!(ChannelSel::parse("centre"), None);
+        assert_eq!(ChannelSel::parse("lefft"), None);
+    }
+
+    #[test]
+    fn test_channel_sel_as_str_roundtrip() {
+        for sel in [ChannelSel::Left, ChannelSel::Right, ChannelSel::Both] {
+            assert_eq!(ChannelSel::parse(sel.as_str()), Some(sel));
+        }
     }
 }

@@ -114,7 +114,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
     let off = &s.offload;
     let cards = off.cards.clone();
     let scanning = s.job(JobKind::OffloadScan).is_active();
-    let scan_msg = s.job(JobKind::OffloadScan).message.clone();
+    let scan_msg = s.job(JobKind::OffloadScan).message().to_string();
     let file_durations = off.file_durations.clone();
 
     ui.horizontal(|ui| {
@@ -328,9 +328,9 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
     let off = &s.offload;
     let copy_job = s.job(JobKind::OffloadCopy);
     let copy_running = copy_job.is_active();
-    let copy_fraction = copy_job.fraction;
-    let copy_speed = copy_job.speed.unwrap_or(0.0);
-    let units = copy_job.units.clone();
+    let copy_fraction = copy_job.fraction();
+    let copy_speed = copy_job.speed().unwrap_or(0.0);
+    let units = copy_job.units().to_vec();
 
     // Overall progress bar.
     if copy_running || copy_fraction > 0.0 {

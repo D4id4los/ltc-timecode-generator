@@ -9,7 +9,7 @@ use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
 use gui_engine::timecode;
-use gui_engine::{ArcSwap, AudioEvent, SAMPLE_RATE_OPTIONS};
+use gui_engine::{ArcSwap, AudioEvent, ChannelSel, SAMPLE_RATE_OPTIONS};
 use log::info;
 use slint::{ModelRc, SharedString, VecModel};
 
@@ -173,7 +173,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
 
             // 8. Sync decode progress
 if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_active() {
-                ui.set_ltc_decode_progress(s.job(JobKind::LtcDecode).fraction);
+                ui.set_ltc_decode_progress(s.job(JobKind::LtcDecode).fraction());
             }
 
             // 9. Pulse phase animation
@@ -183,8 +183,8 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             ui.set_pulse_phase(*pp as f32);
 
             // 10. Timecode display
-            let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame);
-            let ms_str = timecode::timecode_to_ms_string(s.current_timecode, s.fps);
+            let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame());
+            let ms_str = timecode::timecode_to_ms_string(s.current_timecode, s.fps());
             set_tc_segments(&ui, &tc_str);
             ui.set_ms_text(SharedString::from(ms_str));
 
@@ -198,21 +198,21 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             ui.set_fps_name(fps_name);
 
             // 13. Routing pills
-            ui.set_ltc_route(SharedString::from(s.ltc_channel.to_uppercase()));
-            ui.set_beep_route(SharedString::from(s.beep_channel.to_uppercase()));
+            ui.set_ltc_route(SharedString::from(s.ltc_channel.as_str().to_uppercase()));
+            ui.set_beep_route(SharedString::from(s.beep_channel.as_str().to_uppercase()));
 
             // 14. LTC/beep channel indices (fix one-way gaps)
             {
-                let ltc_idx = match s.ltc_channel.as_str() {
-                    "left" => 0,
-                    "right" => 1,
-                    _ => 2,
+                let ltc_idx = match s.ltc_channel {
+                    ChannelSel::Left => 0,
+                    ChannelSel::Right => 1,
+                    ChannelSel::Both => 2,
                 };
                 ui.set_ltc_channel_index(ltc_idx);
-                let beep_idx = match s.beep_channel.as_str() {
-                    "left" => 0,
-                    "right" => 1,
-                    _ => 2,
+                let beep_idx = match s.beep_channel {
+                    ChannelSel::Left => 0,
+                    ChannelSel::Right => 1,
+                    ChannelSel::Both => 2,
                 };
                 ui.set_beep_channel_index(beep_idx);
             }
@@ -220,7 +220,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             // 15. Sample rate metadata
             let rate_khz = format!("{:.1}", s.sample_rate as f32 / 1000.0);
             ui.set_sample_rate_khz(SharedString::from(rate_khz));
-            let buffer_smp = (s.sample_rate as f64 / s.fps).round() as i32;
+            let buffer_smp = (s.sample_rate as f64 / s.fps()).round() as i32;
             ui.set_buffer_size(buffer_smp);
             ui.set_sample_format(SharedString::from(s.sample_format_name.to_uppercase()));
 
@@ -241,7 +241,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             ui.set_hour(s.start_timecode.hours as i32);
             ui.set_minute(s.start_timecode.minutes as i32);
             ui.set_second(s.start_timecode.seconds as i32);
-            let max_frame = s.fps.round() as i32;
+            let max_frame = s.fps().round() as i32;
             ui.set_max_frame(if max_frame > 0 { max_frame - 1 } else { 0 });
             ui.set_frame(s.start_timecode.frames as i32);
 
@@ -376,18 +376,18 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             // 25. Conversion state sync (from engine-owned snapshot via JobStatus)
             {
                 let jc = s.job(JobKind::Conversion);
-                let status_str = match jc.phase {
+                let status_str = match jc.phase() {
                     JobPhase::Idle => "idle".to_string(),
                     JobPhase::Running | JobPhase::Indeterminate => {
-                        format!("running {:.0}%", jc.fraction * 100.0)
+                        format!("running {:.0}%", jc.fraction() * 100.0)
                     }
                     JobPhase::Succeeded => "completed".to_string(),
                     JobPhase::Cancelled => "cancelled".to_string(),
                     JobPhase::Failed => "failed".to_string(),
                 };
                 ui.set_conv_status(SharedString::from(status_str));
-                ui.set_conv_progress(jc.fraction);
-                ui.set_conv_log(SharedString::from(jc.log.clone()));
+                ui.set_conv_progress(jc.fraction());
+                ui.set_conv_log(SharedString::from(jc.log().to_string()));
             }
 
             // 26. Readiness / sanity message
@@ -495,11 +495,11 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 ui.set_off_parent_name(SharedString::from(off.parent_name.clone()));
                 let scan_job = s.job(JobKind::OffloadScan);
                 ui.set_off_scanning(scan_job.is_active());
-                ui.set_off_scan_status(SharedString::from(scan_job.message.clone()));
+                ui.set_off_scan_status(SharedString::from(scan_job.message().to_string()));
                 let copy_job = s.job(JobKind::OffloadCopy);
                 ui.set_off_running(copy_job.is_active());
-                ui.set_off_overall_progress(copy_job.fraction);
-                let speed_bps = copy_job.speed.unwrap_or(0.0);
+                ui.set_off_overall_progress(copy_job.fraction());
+                let speed_bps = copy_job.speed().unwrap_or(0.0);
                 ui.set_off_speed_text(SharedString::from(
                     if speed_bps > 0.0 {
                         format!("{} / s", format_bytes(speed_bps as u64))
@@ -549,7 +549,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 ui.set_off_cards(ModelRc::new(VecModel::<crate::OffloadCardInfo>::from(card_infos)));
 
                 let device_status: Vec<crate::OffloadDeviceStatus> = off.device_totals.iter().enumerate().map(|(i, dt)| {
-                    let unit = copy_job.units.get(i);
+                    let unit = copy_job.units().get(i);
                     let state_text = match unit.map(|u| u.state) {
                         Some(UnitState::Pending) => "Pending",
                         Some(UnitState::Running) => "Copying",

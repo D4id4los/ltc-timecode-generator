@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use audio_core::Timecode;
+use audio_core::{ChannelSel, Timecode};
 
 #[derive(Debug, Clone)]
 pub enum GuiCommand {
@@ -20,8 +20,8 @@ pub enum GuiCommand {
     SetSampleRate(u32),
     SetDevice(usize),
     RefreshDevices,
-    SetLtcChannel(String),
-    SetBeepChannel(String),
+    SetLtcChannel(ChannelSel),
+    SetBeepChannel(ChannelSel),
     SetLtcVolume(f32),
     SetBeepVolume(f32),
     SetBeepFrequency(f32),

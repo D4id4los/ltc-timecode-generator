@@ -1,4 +1,4 @@
-use crate::{AudioDeviceInfo, AudioEvent, Timecode};
+use crate::{AudioDeviceInfo, AudioEvent, ChannelSel, Timecode};
 use crate::ltc_encoder::{self, generate_ltc_frame_stereo, increment_timecode};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use keepawake::{Builder as WakeBuilder, KeepAwake};
@@ -22,7 +22,7 @@ struct LtcStreamState {
     tc: Timecode,
     fps: f64,
     drop_frame: bool,
-    ltc_channel: String,
+    ltc_channel: ChannelSel,
     ltc_volume: f32,
     sample_rate: u32,
     last_level: (f32, f32),
@@ -137,7 +137,7 @@ impl AudioCore {
             },
             fps: 25.0,
             drop_frame: false,
-            ltc_channel: String::from("both"),
+            ltc_channel: ChannelSel::Both,
             ltc_volume: 0.25,
             sample_rate: stream_config.sample_rate,
             last_level: (1.0, 1.0),
@@ -212,7 +212,7 @@ impl AudioCore {
         tc: Timecode,
         fps: f64,
         drop_frame: bool,
-        ltc_channel: String,
+        ltc_channel: ChannelSel,
         ltc_volume: f32,
     ) -> Result<(), String> {
         let audio = self
@@ -237,7 +237,7 @@ impl AudioCore {
             tc,
             fps,
             drop_frame,
-            ltc_channel: ltc_channel.clone(),
+            ltc_channel,
             ltc_volume,
             sample_rate: ltc.sample_rate,
             last_level: (1.0, 1.0),
@@ -270,7 +270,7 @@ impl AudioCore {
                     prefill_total,
                     prefill_spb,
                     ltc_volume,
-                    &ltc_channel,
+                    ltc_channel,
                     &mut prefill_level,
                     &mut frame_buf[..prefill_total * 2],
                 );
@@ -424,7 +424,7 @@ impl AudioCore {
         frequency: f32,
         duration: f32,
         volume: f32,
-        channel: &str,
+        channel: ChannelSel,
     ) -> Result<(), String> {
         let audio = self
             .audio
@@ -1043,7 +1043,7 @@ fn ltc_scheduler_thread(
             let tc = state.tc;
             let fps = state.fps;
             let drop_frame = state.drop_frame;
-            let ltc_channel = state.ltc_channel.clone();
+            let ltc_channel = state.ltc_channel;
             let ltc_volume = state.ltc_volume;
             let frame_dur = state.frame_duration;
             let last_level = state.last_level;
@@ -1126,7 +1126,7 @@ fn ltc_scheduler_thread(
             total_samples,
             samples_per_bit,
             ltc_volume,
-            &ltc_channel,
+            ltc_channel,
             &mut last_level,
             &mut frame_buf[..needed],
         );
@@ -1159,7 +1159,7 @@ fn ltc_scheduler_thread(
         frame_count += 1;
         if frame_count % 1000 == 0 {
             info!("LTC scheduler: frame={}, drops={}, channel={}, fps={}, tc={:02}:{:02}:{:02}:{:02}",
-                frame_count, drop_count, ltc_channel,
+                frame_count, drop_count, ltc_channel.as_str(),
                 fps, tc.hours, tc.minutes, tc.seconds, tc.frames);
         }
 

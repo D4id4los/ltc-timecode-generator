@@ -1,6 +1,6 @@
 use egui::{Color32, FontId, RichText, Ui, Vec2, Sense};
 use gui_engine::command::GuiCommand;
-use gui_engine::timecode::FPS_OPTIONS;
+use gui_engine::{timecode::FPS_OPTIONS, ChannelSel};
 
 use crate::app::AppState;
 use crate::theme::ACCENT;
@@ -60,7 +60,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 
 fn render_timecode_steppers(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let max_frames = state.latest.fps.ceil() as u32;
+    let max_frames = state.latest.fps().ceil() as u32;
     let is_playing = state.latest.is_playing;
     let tc = state.latest.start_timecode;
 
@@ -265,18 +265,24 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     let ltc_ch = &state.latest.ltc_channel;
     let beep_ch = &state.latest.beep_channel;
 
+    const CHANNEL_CHOICES: [(ChannelSel, &str); 3] = [
+        (ChannelSel::Left, "Left"),
+        (ChannelSel::Right, "Right"),
+        (ChannelSel::Both, "Both"),
+    ];
+
     ui.label(RichText::new("LTC OUTPUT").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        for (lbl, val) in &[("Left", "left"), ("Right", "right"), ("Both", "both")] {
-            let active = ltc_ch.as_str() == *val;
+        for (val, lbl) in CHANNEL_CHOICES {
+            let active = *ltc_ch == val;
             let btn = if active {
-                egui::Button::new(RichText::new(*lbl).strong().color(Color32::BLACK)).fill(ACCENT)
+                egui::Button::new(RichText::new(lbl).strong().color(Color32::BLACK)).fill(ACCENT)
             } else {
-                egui::Button::new(RichText::new(*lbl)).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
+                egui::Button::new(RichText::new(lbl)).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
             };
             if ui.add(btn).clicked() {
-                state.send(GuiCommand::SetLtcChannel(val.to_string()));
+                state.send(GuiCommand::SetLtcChannel(val));
             }
         }
     });
@@ -285,15 +291,15 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     ui.label(RichText::new("CLAPPER OUTPUT").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        for (lbl, val) in &[("Left", "left"), ("Right", "right"), ("Both", "both")] {
-            let active = beep_ch.as_str() == *val;
+        for (val, lbl) in CHANNEL_CHOICES {
+            let active = *beep_ch == val;
             let btn = if active {
-                egui::Button::new(RichText::new(*lbl).strong().color(Color32::BLACK)).fill(ACCENT)
+                egui::Button::new(RichText::new(lbl).strong().color(Color32::BLACK)).fill(ACCENT)
             } else {
-                egui::Button::new(RichText::new(*lbl)).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
+                egui::Button::new(RichText::new(lbl)).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
             };
             if ui.add(btn).clicked() {
-                state.send(GuiCommand::SetBeepChannel(val.to_string()));
+                state.send(GuiCommand::SetBeepChannel(val));
             }
         }
     });

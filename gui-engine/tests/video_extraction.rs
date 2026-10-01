@@ -29,6 +29,7 @@ use gui_engine::{
     decode_ltc_from_wav, extract_audio_channel, path_is_video, probe_video_audio,
     FfmpegCapabilities, HwDeviceCapabilities, JobKind, JobPhase, LtcDecodeStatus,
 };
+use gui_engine::state::ClipDecodeState;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -73,7 +74,7 @@ fn wait_for_folder_scan(state: &Arc<ArcSwap<AppStateSnapshot>>) {
     loop {
         let snapshot = state.load().as_ref().clone();
         let done = snapshot.converter.groups_folder.is_some()
-            && snapshot.job(JobKind::FolderScan).phase != JobPhase::Running;
+            && snapshot.job(JobKind::FolderScan).phase() != JobPhase::Running;
         if done {
             return;
         }
@@ -173,7 +174,7 @@ fn run_engine_with_commands(commands: Vec<GuiCommand>) -> AppStateSnapshot {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = state.load().as_ref().clone();
-        if snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running
+        if snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running
             && snapshot.ltc_decode_generation > 0
         {
             break;
@@ -205,9 +206,9 @@ fn test_select_recording_deferred_during_folder_scan() {
         ],
         |s, deadline| {
             if s.converter.groups_folder.is_some()
-                && s.job(JobKind::FolderScan).phase != JobPhase::Running
+                && s.job(JobKind::FolderScan).phase() != JobPhase::Running
                 && s.converter.selected_group_idx == Some(0)
-                && s.job(JobKind::ClipProbe).phase != JobPhase::Running
+                && s.job(JobKind::ClipProbe).phase() != JobPhase::Running
             {
                 return true;
             }
@@ -223,7 +224,7 @@ fn test_select_recording_deferred_during_folder_scan() {
          after the async folder scan completes",
     );
     assert!(
-        snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running,
+        snapshot.job(JobKind::ClipProbe).phase() != JobPhase::Running,
         "probes must have completed (even if they failed due to missing ffmpeg)",
     );
     assert!(
@@ -278,19 +279,19 @@ fn test_single_clip_decode_via_group_command() {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let snapshot = state.load().as_ref().clone();
-        if matches!(snapshot.job(JobKind::LtcGroupDecode).phase, JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
+        if matches!(snapshot.job(JobKind::LtcGroupDecode).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
             eprintln!("Group done! results={:?} errors={:?} pct={}",
                 snapshot.ltc_group_results.len(),
-                snapshot.ltc_group_errors.iter().filter(|e| e.is_some()).count(),
-                snapshot.job(JobKind::LtcDecode).fraction);
+                snapshot.ltc_group_results.iter().filter(|r| matches!(r, ClipDecodeState::Done(Err(_)))).count(),
+                snapshot.job(JobKind::LtcDecode).fraction());
             break;
         }
         if Instant::now() > deadline {
             eprintln!("TIMEOUT! group_ltc_job={:?} results={} failures={} pct={}",
-                snapshot.job(JobKind::LtcGroupDecode).phase,
-                snapshot.ltc_group_results.iter().filter(|r| r.is_some()).count(),
-                snapshot.ltc_group_results.iter().filter(|r| r.is_none()).count(),
-                snapshot.job(JobKind::LtcDecode).fraction);
+                snapshot.job(JobKind::LtcGroupDecode).phase(),
+                snapshot.ltc_group_results.iter().filter(|r| r.ok().is_some()).count(),
+                snapshot.ltc_group_results.iter().filter(|r| !r.is_done()).count(),
+                snapshot.job(JobKind::LtcDecode).fraction());
             panic!("test timed out waiting for group decode");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -300,8 +301,8 @@ fn test_single_clip_decode_via_group_command() {
     drop(tx);
     handle.join().expect("engine thread panicked");
 
-    assert!(snapshot.ltc_group_results.iter().any(|r| r.is_some()), "should have processed at least 1 clip");
-    assert!(snapshot.job(JobKind::LtcGroupDecode).phase != JobPhase::Running);
+    assert!(snapshot.ltc_group_results.iter().any(|r| r.is_done()), "should have processed at least 1 clip");
+    assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running);
 }
 
 #[test]
@@ -433,10 +434,10 @@ fn test_group_decode_progress_reaches_100_percent() {
             channel_index: 0,
         }],
         |s, deadline| {
-            if s.job(JobKind::LtcGroupDecode).fraction > max_pct {
-                max_pct = s.job(JobKind::LtcGroupDecode).fraction;
+            if s.job(JobKind::LtcGroupDecode).fraction() > max_pct {
+                max_pct = s.job(JobKind::LtcGroupDecode).fraction();
             }
-            if s.ltc_group_results.len() > 0 && matches!(s.job(JobKind::LtcGroupDecode).phase, JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
+            if s.ltc_group_results.len() > 0 && matches!(s.job(JobKind::LtcGroupDecode).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
                 return true;
             }
             Instant::now() > *deadline
@@ -446,9 +447,9 @@ fn test_group_decode_progress_reaches_100_percent() {
 
     assert!(max_pct > 0.0,
         "decode progress never exceeded 0 (max_pct={})", max_pct);
-    assert!(snapshot.job(JobKind::LtcGroupDecode).phase != JobPhase::Running, "group decode should not be detecting after completion");
+    assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running, "group decode should not be detecting after completion");
     assert_eq!(snapshot.ltc_group_results.len(), 2, "two clip results expected");
-    assert_eq!(snapshot.ltc_group_results.iter().filter(|r| r.is_some()).count(), 2,
+    assert_eq!(snapshot.ltc_group_results.iter().filter(|r| r.ok().is_some()).count(), 2,
         "both clips should have decode results");
 }
 
@@ -484,10 +485,10 @@ fn test_single_video_decode_progress() {
             GuiCommand::ParseLtcVideo(mp4_str.clone(), 1, 0),
         ],
         |s, deadline| {
-            if s.job(JobKind::LtcDecode).fraction > 0.0 {
+            if s.job(JobKind::LtcDecode).fraction() > 0.0 {
                 progress_gt_zero = true;
             }
-            if s.job(JobKind::LtcDecode).phase != JobPhase::Running && s.ltc_decode_generation > 0 {
+            if s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.ltc_decode_generation > 0 {
                 return true;
             }
             Instant::now() > *deadline
@@ -499,7 +500,7 @@ fn test_single_video_decode_progress() {
         progress_gt_zero,
         "single video decode progress never exceeded 0"
     );
-    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running, "should not still be detecting");
+    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running, "should not still be detecting");
     assert!(
         snapshot.ltc_decode_error.is_none() || snapshot.ltc_decode_result.is_some(),
         "should have either result or error, got error={:?}, result={:?}",
@@ -727,7 +728,7 @@ fn test_engine_parse_ltc_video_rejects_out_of_range_stream() {
         "out-of-range stream must produce an error instead of invoking ffmpeg"
     );
     assert!(snapshot.ltc_decode_result.is_none());
-    assert!(snapshot.job(JobKind::LtcDecode).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
 }
 
 // ── Regression: probe failure must publish ltc_decode_error ──
@@ -761,7 +762,7 @@ fn test_select_recording_probe_failure_publishes_error() {
     loop {
         let snapshot = state.load().as_ref().clone();
         if snapshot.converter.probes_generation > initial_probe_gen
-            && matches!(snapshot.job(JobKind::ClipProbe).phase, JobPhase::Succeeded | JobPhase::Failed)
+            && matches!(snapshot.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded | JobPhase::Failed)
         {
             break;
         }
@@ -781,7 +782,7 @@ fn test_select_recording_probe_failure_publishes_error() {
         snapshot.ltc_probe.is_none(),
         "ltc_probe must remain None when clip probe fails",
     );
-    assert!(snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::ClipProbe).phase() != JobPhase::Running);
 
     drop(tx);
     handle.join().expect("engine thread panicked");
@@ -823,7 +824,7 @@ fn test_select_recording_probe_falls_back_to_successful_clip() {
     loop {
         let snapshot = state.load().as_ref().clone();
 if snapshot.converter.probes_generation > initial_probe_gen
-            && matches!(snapshot.job(JobKind::ClipProbe).phase, JobPhase::Succeeded | JobPhase::Failed)
+            && matches!(snapshot.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded | JobPhase::Failed)
         {
             break;
         }
@@ -839,7 +840,7 @@ if snapshot.converter.probes_generation > initial_probe_gen
         "ltc_probe must be populated from a later successful clip when the first fails",
     );
     assert!(snapshot.ltc_decode_error.is_none(), "ltc_decode_error must be None when at least one clip succeeds: {:?}", snapshot.ltc_decode_error);
-    assert!(snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::ClipProbe).phase() != JobPhase::Running);
 
     drop(tx);
     handle.join().expect("engine thread panicked");
@@ -884,7 +885,7 @@ fn test_select_recording_preserves_ltc_probe() {
     loop {
         let snapshot = state.load().as_ref().clone();
         if snapshot.converter.probes_generation > initial_probe_gen
-            && matches!(snapshot.job(JobKind::ClipProbe).phase, JobPhase::Succeeded | JobPhase::Failed)
+            && matches!(snapshot.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded | JobPhase::Failed)
         {
             break;
         }
@@ -899,7 +900,7 @@ fn test_select_recording_preserves_ltc_probe() {
         snapshot.ltc_probe.is_some(),
         "ltc_probe must be populated after converter clip probe completes"
     );
-    assert!(snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::ClipProbe).phase() != JobPhase::Running);
 
     drop(tx);
     handle.join().expect("engine thread panicked");
@@ -934,15 +935,15 @@ fn test_select_recording_without_folder_does_not_probe() {
         // probes_loading is set to true on entry; the else branch sets it
         // to false so this is the signal the command was processed.
         if snapshot.converter.probes_generation > initial_probe_gen
-            && (snapshot.job(JobKind::ClipProbe).phase == JobPhase::Idle
-                || matches!(snapshot.job(JobKind::ClipProbe).phase, JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled))
+            && (snapshot.job(JobKind::ClipProbe).phase() == JobPhase::Idle
+                || matches!(snapshot.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled))
         {
             break;
         }
         if Instant::now() > deadline {
             let s = state.load();
             panic!("engine did not process SelectRecording within 10s (phase={:?}, gen={})",
-                s.job(JobKind::ClipProbe).phase, s.converter.probes_generation);
+                s.job(JobKind::ClipProbe).phase(), s.converter.probes_generation);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -952,7 +953,7 @@ fn test_select_recording_without_folder_does_not_probe() {
         snapshot.ltc_probe.is_none(),
         "ltc_probe must remain None when no folder was selected (no group to probe)",
     );
-    assert!(snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running);
+    assert!(snapshot.job(JobKind::ClipProbe).phase() != JobPhase::Running);
 
     drop(tx);
     handle.join().expect("engine thread panicked");

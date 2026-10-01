@@ -48,12 +48,55 @@ pub struct LtcDetectionResult {
     pub quality: Option<LtcQualityReport>,
 }
 
+/// Qualitative grade bucket for a [`LtcQualityReport`], derived from the
+/// overall score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QualityGrade {
+    Excellent,
+    Good,
+    Fair,
+    Poor,
+    Bad,
+}
+
+impl std::fmt::Display for QualityGrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl QualityGrade {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QualityGrade::Excellent => "Excellent",
+            QualityGrade::Good => "Good",
+            QualityGrade::Fair => "Fair",
+            QualityGrade::Poor => "Poor",
+            QualityGrade::Bad => "Bad",
+        }
+    }
+
+    pub fn from_score(score: f64) -> QualityGrade {
+        if score >= 0.95 {
+            QualityGrade::Excellent
+        } else if score >= 0.80 {
+            QualityGrade::Good
+        } else if score >= 0.60 {
+            QualityGrade::Fair
+        } else if score >= 0.30 {
+            QualityGrade::Poor
+        } else {
+            QualityGrade::Bad
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LtcQualityReport {
     /// Overall quality score 0.0–1.0
     pub score: f64,
-    /// Human-readable grade: Excellent / Good / Fair / Poor / Bad
-    pub grade: String,
+    /// Qualitative grade bucket derived from `score`
+    pub grade: QualityGrade,
     /// Number of undetected frames within the span between the first and last
     /// decoded frame (silent lead-in/out and pre-LTC silence are not counted)
     pub missing_frames: u32,
@@ -968,17 +1011,7 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
     score = score.clamp(0.0, 1.0);
 
     // Grade
-    let grade = if score >= 0.95 {
-        "Excellent".to_string()
-    } else if score >= 0.80 {
-        "Good".to_string()
-    } else if score >= 0.60 {
-        "Fair".to_string()
-    } else if score >= 0.30 {
-        "Poor".to_string()
-    } else {
-        "Bad".to_string()
-    };
+    let grade = QualityGrade::from_score(score);
 
     // Build summary
     let mut parts: Vec<String> = Vec::new();
@@ -1605,7 +1638,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::{generate_ltc_frame_stereo, increment_timecode, Timecode};
+    use crate::{generate_ltc_frame_stereo, increment_timecode, ChannelSel, Timecode};
 
     // ── bits_to_u8 ───────────────────────────────────────────────────────
 
@@ -2089,7 +2122,7 @@ mod tests {
         start_tc: Timecode,
         fps: f64,
         drop_frame: bool,
-        channel: &str,
+        channel: ChannelSel,
         volume: f32,
         sample_rate: u32,
         duration_secs: f64,
@@ -2142,7 +2175,7 @@ mod tests {
         start_tc: Timecode,
         fps: f64,
         drop_frame: bool,
-        channel: &str,
+        channel: ChannelSel,
         volume: f32,
         sample_rate: u32,
         duration_secs: f64,
@@ -2198,7 +2231,7 @@ mod tests {
         start_tc: Timecode,
         fps: f64,
         drop_frame: bool,
-        channel: &str,
+        channel: ChannelSel,
         volume: f32,
         sample_rate: u32,
         duration_secs: f64,
@@ -2215,7 +2248,7 @@ mod tests {
     fn test_wav_roundtrip_25fps() {
         let result = verify_roundtrip(
             Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "both", 0.5, 48000, 2.0,
+            25.0, false, ChannelSel::Both, 0.5, 48000, 2.0,
         );
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
@@ -2226,7 +2259,7 @@ mod tests {
     fn test_wav_roundtrip_24fps() {
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            24.0, false, "both", 0.5, 48000, 2.0,
+            24.0, false, ChannelSel::Both, 0.5, 48000, 2.0,
         );
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
@@ -2237,7 +2270,7 @@ mod tests {
     fn test_wav_roundtrip_30fps() {
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            30.0, false, "both", 0.5, 48000, 2.0,
+            30.0, false, ChannelSel::Both, 0.5, 48000, 2.0,
         );
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
@@ -2248,7 +2281,7 @@ mod tests {
     fn test_wav_roundtrip_2997_nd() {
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            29.97, false, "both", 0.5, 48000, 3.0,
+            29.97, false, ChannelSel::Both, 0.5, 48000, 3.0,
         );
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
             "expected no Error for 29.97 ND, got {:?} (valid={})",
@@ -2259,7 +2292,7 @@ mod tests {
     fn test_wav_roundtrip_2997_df() {
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            29.97, true, "both", 0.5, 48000, 3.0,
+            29.97, true, ChannelSel::Both, 0.5, 48000, 3.0,
         );
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
             "expected no Error for 29.97 DF, got {:?} (valid={})",
@@ -2270,7 +2303,7 @@ mod tests {
     fn test_wav_roundtrip_different_start_tc() {
         let result = verify_roundtrip(
             Timecode { hours: 10, minutes: 15, seconds: 30, frames: 12 },
-            25.0, false, "both", 0.5, 48000, 1.0,
+            25.0, false, ChannelSel::Both, 0.5, 48000, 1.0,
         );
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
@@ -2281,7 +2314,7 @@ mod tests {
     fn test_wav_roundtrip_44khz() {
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "both", 0.5, 44100, 2.0,
+            25.0, false, ChannelSel::Both, 0.5, 44100, 2.0,
         );
         assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
             "expected no Error at 44kHz, got {:?}", result.status);
@@ -2291,7 +2324,7 @@ mod tests {
     fn test_wav_roundtrip_48khz() {
         let result = verify_roundtrip(
             Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "both", 0.5, 48000, 2.0,
+            25.0, false, ChannelSel::Both, 0.5, 48000, 2.0,
         );
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success at 48kHz, got {:?}", result.status);
@@ -2301,7 +2334,7 @@ mod tests {
     fn test_wav_roundtrip_left_channel() {
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "left", 0.5, 48000, 1.0,
+            25.0, false, ChannelSel::Left, 0.5, 48000, 1.0,
         );
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success on left channel, got {:?}", result.status);
@@ -2311,7 +2344,7 @@ mod tests {
     fn test_wav_roundtrip_right_channel() {
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "right", 0.5, 48000, 1.0,
+            25.0, false, ChannelSel::Right, 0.5, 48000, 1.0,
         );
         assert!(!matches!(result.status, LtcDecodeStatus::Success),
             "right-only signal should not be decoded (left channel is silent), got {:?}", result.status);
@@ -2328,7 +2361,7 @@ mod tests {
             &path,
             0.5,
             Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "both", 0.5, 48000, 1.5,
+            25.0, false, ChannelSel::Both, 0.5, 48000, 1.5,
         );
 
         let result = decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
@@ -2356,7 +2389,7 @@ mod tests {
                 &path,
                 silent_secs,
                 Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 },
-                25.0, false, "both", 0.5, 48000, 1.0,
+                25.0, false, ChannelSel::Both, 0.5, 48000, 1.0,
             );
 
             let result = decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
@@ -2391,7 +2424,7 @@ mod tests {
     fn test_wav_single_frame() {
         let result = verify_roundtrip(
             Timecode { hours: 12, minutes: 34, seconds: 56, frames: 18 },
-            25.0, false, "both", 0.5, 48000, 0.12,
+            25.0, false, ChannelSel::Both, 0.5, 48000, 0.12,
         );
         assert!(result.valid_frames >= 1,
             "expected at least 1 valid frame with 3-frame signal, got {}", result.valid_frames);
@@ -2497,7 +2530,7 @@ mod tests {
     fn test_wav_low_amplitude_ltc() {
         let result = verify_roundtrip(
             Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "both", 0.12, 48000, 2.0,
+            25.0, false, ChannelSel::Both, 0.12, 48000, 2.0,
         );
         assert!(result.valid_frames > 0,
             "expected >0 valid frames with low-amplitude LTC (volume=0.12, amp≈0.014), got {}/{}",
@@ -2513,7 +2546,7 @@ mod tests {
         generate_test_wav(
             &path,
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, "both", 0.5, 48000, 1.0,
+            25.0, false, ChannelSel::Both, 0.5, 48000, 1.0,
         );
         let result = quick_check_ltc(&path).unwrap();
         assert!(result, "quick_check_ltc should return true for valid LTC");

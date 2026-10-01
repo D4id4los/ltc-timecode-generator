@@ -303,7 +303,7 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     let offload_running = s.job(JobKind::OffloadCopy).is_active();
 
     let base = if s.is_playing || ltc_detecting {
-        let interval = Duration::from_secs_f64(1.0 / s.fps.max(1.0));
+        let interval = Duration::from_secs_f64(1.0 / s.fps().max(1.0));
         interval.min(Duration::from_millis(40))
     } else if s.clap_animating {
         Duration::from_secs_f64(1.0 / 60.0)
@@ -738,7 +738,7 @@ impl AppState {
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
                         ui.label(RichText::new("BUFFER").font(FontId::proportional(8.0)).color(colors.text_muted).strong());
-                        let buffer_smp = (s.sample_rate as f64 / s.fps).round() as u32;
+                        let buffer_smp = (s.sample_rate as f64 / s.fps()).round() as u32;
                         ui.label(RichText::new(format!("{} SMP", buffer_smp)).font(FontId::proportional(10.0)).strong().color(colors.text_title));
                     });
                 });
@@ -858,7 +858,7 @@ impl AppState {
                             .stroke(egui::Stroke::new(1.0, colors.border_main))
                             .inner_margin(egui::Margin::symmetric(8, 3));
                         route_pill.show(ui, |ui| {
-                            let route = format!("LTC: {} | CLAP: {}", s.ltc_channel.to_uppercase(), s.beep_channel.to_uppercase());
+                            let route = format!("LTC: {} | CLAP: {}", s.ltc_channel.as_str().to_uppercase(), s.beep_channel.as_str().to_uppercase());
                             ui.label(RichText::new(route).font(FontId::monospace(8.0)).color(colors.text_muted));
                         });
                     });
@@ -1099,7 +1099,7 @@ impl AppState {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use gui_engine::job::JobStatus;
+    use gui_engine::job::{JobStatus, ProgressSnapshot};
     use gui_engine::JobPhase;
 
     fn dummy_state() -> Arc<ArcSwap<AppStateSnapshot>> {
@@ -1117,12 +1117,12 @@ mod tests {
     }
 
     fn with_ltc_detecting(mut s: AppStateSnapshot) -> AppStateSnapshot {
-        s.jobs.insert(JobKind::LtcDecode, JobStatus { phase: JobPhase::Running, fraction: 0.0, message: String::new(), speed: None, units: Vec::new(), log: String::new(), error: None });
+        s.jobs.insert(JobKind::LtcDecode, JobStatus { progress: ProgressSnapshot { phase: JobPhase::Running, fraction: 0.0, message: String::new(), speed: None, units: Vec::new(), log: String::new() }, error: None });
         s
     }
 
     fn with_offload_running(mut s: AppStateSnapshot) -> AppStateSnapshot {
-        s.jobs.insert(JobKind::OffloadCopy, JobStatus { phase: JobPhase::Running, fraction: 0.0, message: String::new(), speed: None, units: Vec::new(), log: String::new(), error: None });
+        s.jobs.insert(JobKind::OffloadCopy, JobStatus { progress: ProgressSnapshot { phase: JobPhase::Running, fraction: 0.0, message: String::new(), speed: None, units: Vec::new(), log: String::new() }, error: None });
         s
     }
 
@@ -1147,7 +1147,7 @@ mod tests {
     fn repaint_interval_playing_24fps_returns_approx_58ms() {
         let mut s = make_snapshot();
         s.is_playing = true;
-        s.fps = 24.0;
+        s.fps_index = 0;
         let dur = next_repaint_interval(&s);
         // base = min(41.67ms, 40ms) = 40ms → request = 56.67ms
         assert!(dur > Duration::from_millis(50) && dur < Duration::from_millis(65));
@@ -1157,7 +1157,7 @@ mod tests {
     fn repaint_interval_playing_25fps_returns_approx_57ms() {
         let mut s = make_snapshot();
         s.is_playing = true;
-        s.fps = 25.0;
+        s.fps_index = 1;
         let dur = next_repaint_interval(&s);
         // base = min(40ms, 40ms) = 40ms → request = 56.67ms
         assert!(dur > Duration::from_millis(50) && dur < Duration::from_millis(65));
@@ -1167,7 +1167,7 @@ mod tests {
     fn repaint_interval_playing_30fps_returns_approx_50ms() {
         let mut s = make_snapshot();
         s.is_playing = true;
-        s.fps = 30.0;
+        s.fps_index = 4;
         let dur = next_repaint_interval(&s);
         // base = min(33.33ms, 40ms) = 33.33ms → request = 50ms
         assert!(dur > Duration::from_millis(44) && dur < Duration::from_millis(56));
@@ -1176,15 +1176,14 @@ mod tests {
     #[test]
     fn repaint_interval_detecting_same_as_playing() {
         let s = with_ltc_detecting(make_snapshot());
-        // s.fps is 25.0 from initial(), but we need 24.0 for the test.
-        // Currently the test uses `s.fps` from inside the function, so
-        // we adjust the fps directly.
+        // s.fps() derives from fps_index, but we need 24 fps for the test.
+        // We adjust the index directly.
         let mut s_with_fps = s.clone();
-        s_with_fps.fps = 24.0;
+        s_with_fps.fps_index = 0;
         let dur_detect = next_repaint_interval(&s_with_fps);
         let mut s2 = make_snapshot();
         s2.is_playing = true;
-        s2.fps = 24.0;
+        s2.fps_index = 0;
         let dur_play = next_repaint_interval(&s2);
         assert!((dur_detect.as_secs_f64() - dur_play.as_secs_f64()).abs() < 1e-9);
     }
@@ -1204,7 +1203,7 @@ mod tests {
         // playing
         let mut s = make_snapshot();
         s.is_playing = true;
-        s.fps = 30.0;
+        s.fps_index = 4;
         assert!(next_repaint_interval(&s) >= floor);
         // detecting
         let s2 = with_ltc_detecting(make_snapshot());

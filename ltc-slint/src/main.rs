@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gui_engine::command::{ConverterCommand, GuiCommand, OffloadCommand};
+use gui_engine::ChannelSel;
 use gui_engine::config;
 use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
 use gui_engine::timecode::{self, FPS_OPTIONS};
@@ -142,11 +143,11 @@ fn _run_gui(
         let rate = s.sample_rate;
         let rate_khz = format!("{:.1}", rate as f32 / 1000.0);
         ui.set_sample_rate_khz(SharedString::from(rate_khz));
-        let buffer_smp = (rate as f64 / s.fps).round() as i32;
+        let buffer_smp = (rate as f64 / s.fps()).round() as i32;
         ui.set_buffer_size(buffer_smp);
-        let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame);
+        let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame());
         set_tc_segments(&ui, &tc_str);
-        ui.set_ms_text(SharedString::from(timecode::timecode_to_ms_string(s.current_timecode, s.fps)));
+        ui.set_ms_text(SharedString::from(timecode::timecode_to_ms_string(s.current_timecode, s.fps())));
         ui.set_fps_name(SharedString::from(FPS_OPTIONS[s.fps_index].name));
         ui.set_decode_fps_index(s.decode_fps_index as i32);
     }
@@ -406,18 +407,19 @@ fn _run_gui(
     }
 
     // ── Routing ───────────────────────────────────────────────────────────
+    const CHANNEL_CHOICES: [ChannelSel; 3] = [ChannelSel::Left, ChannelSel::Right, ChannelSel::Both];
     {
         let cmd = cmd_tx.clone();
         ui.on_ltc_channel_selected(move |index| {
-            let ch = ["left", "right", "both"][index as usize];
-            let _ = cmd.send(GuiCommand::SetLtcChannel(ch.to_string()));
+            let ch = CHANNEL_CHOICES[index as usize];
+            let _ = cmd.send(GuiCommand::SetLtcChannel(ch));
         });
     }
     {
         let cmd = cmd_tx.clone();
         ui.on_beep_channel_selected(move |index| {
-            let ch = ["left", "right", "both"][index as usize];
-            let _ = cmd.send(GuiCommand::SetBeepChannel(ch.to_string()));
+            let ch = CHANNEL_CHOICES[index as usize];
+            let _ = cmd.send(GuiCommand::SetBeepChannel(ch));
         });
     }
 
@@ -507,7 +509,7 @@ fn _run_gui(
         let state = engine_state.clone();
         ui.on_conv_copy_log(move || {
             let s = state.load();
-            let text = s.job(JobKind::Conversion).log.clone();
+            let text = s.job(JobKind::Conversion).log().to_string();
             if let Ok(mut ctx) = arboard::Clipboard::new() {
                 let _ = ctx.set_text(text);
             }

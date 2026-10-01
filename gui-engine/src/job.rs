@@ -262,65 +262,84 @@ pub struct ProgressSnapshot {
 
 // ── JobStatus (published in snapshot) ───────────────────────────────────
 
+/// Published status of one job kind: a `ProgressSnapshot` plus the final
+/// error, if the job failed.  Progress data is accessed through the
+/// delegate methods (`phase()`, `fraction()`, …).
 #[derive(Clone, Debug)]
 pub struct JobStatus {
-    pub phase: JobPhase,
-    pub fraction: f32,
-    pub message: String,
-    pub speed: Option<f64>,
-    pub units: Vec<UnitSnapshot>,
-    pub log: String,
+    pub progress: ProgressSnapshot,
     pub error: Option<String>,
 }
 
 impl JobStatus {
     pub fn idle() -> Self {
         JobStatus {
-            phase: JobPhase::Idle,
-            fraction: 0.0,
-            message: String::new(),
-            speed: None,
-            units: Vec::new(),
-            log: String::new(),
+            progress: ProgressSnapshot {
+                phase: JobPhase::Idle,
+                fraction: 0.0,
+                message: String::new(),
+                speed: None,
+                units: Vec::new(),
+                log: String::new(),
+            },
             error: None,
         }
     }
 
     pub fn from_progress(snap: &ProgressSnapshot) -> Self {
         JobStatus {
-            phase: snap.phase,
-            fraction: snap.fraction,
-            message: snap.message.clone(),
-            speed: snap.speed,
-            units: snap.units.clone(),
-            log: snap.log.clone(),
+            progress: snap.clone(),
             error: None,
         }
     }
 
+    pub fn phase(&self) -> JobPhase {
+        self.progress.phase
+    }
+
+    pub fn fraction(&self) -> f32 {
+        self.progress.fraction
+    }
+
+    pub fn message(&self) -> &str {
+        &self.progress.message
+    }
+
+    pub fn speed(&self) -> Option<f64> {
+        self.progress.speed
+    }
+
+    pub fn units(&self) -> &[UnitSnapshot] {
+        &self.progress.units
+    }
+
+    pub fn log(&self) -> &str {
+        &self.progress.log
+    }
+
     pub fn is_active(&self) -> bool {
-        matches!(self.phase, JobPhase::Running | JobPhase::Indeterminate)
+        matches!(self.phase(), JobPhase::Running | JobPhase::Indeterminate)
     }
 
     pub fn apply_outcome(&mut self, outcome: &JobOutcome) {
         match outcome {
             JobOutcome::Succeeded { log, .. } => {
-                self.phase = JobPhase::Succeeded;
+                self.progress.phase = JobPhase::Succeeded;
                 if !log.is_empty() {
-                    self.log = log.clone();
+                    self.progress.log = log.clone();
                 }
             }
             JobOutcome::Cancelled { log } => {
-                self.phase = JobPhase::Cancelled;
+                self.progress.phase = JobPhase::Cancelled;
                 if !log.is_empty() {
-                    self.log = log.clone();
+                    self.progress.log = log.clone();
                 }
             }
             JobOutcome::Failed { error, log } => {
-                self.phase = JobPhase::Failed;
+                self.progress.phase = JobPhase::Failed;
                 self.error = Some(error.clone());
                 if !log.is_empty() {
-                    self.log = log.clone();
+                    self.progress.log = log.clone();
                 }
             }
         }
@@ -1201,17 +1220,17 @@ mod tests {
         assert!(can_start_offload(false, true, &copy, &scan),
             "should start when both jobs idle");
 
-        copy.phase = JobPhase::Indeterminate;
+        copy.progress.phase = JobPhase::Indeterminate;
         assert!(!can_start_offload(false, true, &copy, &scan),
             "should not start when copy is Indeterminate");
 
-        copy.phase = JobPhase::Idle;
-        scan.phase = JobPhase::Indeterminate;
+        copy.progress.phase = JobPhase::Idle;
+        scan.progress.phase = JobPhase::Indeterminate;
         assert!(!can_start_offload(false, true, &copy, &scan),
             "should not start when scan is Indeterminate");
 
-        copy.phase = JobPhase::Running;
-        scan.phase = JobPhase::Running;
+        copy.progress.phase = JobPhase::Running;
+        scan.progress.phase = JobPhase::Running;
         assert!(!can_start_offload(false, true, &copy, &scan),
             "should not start when both are Running");
     }
@@ -1252,15 +1271,15 @@ mod tests {
         assert!(!probe_is_loading(&probe), "Idle → not loading");
         assert!(probe_has_failed(&probe, true), "Idle + none → failed");
 
-        probe.phase = JobPhase::Indeterminate;
+        probe.progress.phase = JobPhase::Indeterminate;
         assert!(probe_is_loading(&probe), "Indeterminate → loading");
         assert!(!probe_has_failed(&probe, true), "Indeterminate + none → not failed");
 
-        probe.phase = JobPhase::Running;
+        probe.progress.phase = JobPhase::Running;
         assert!(probe_is_loading(&probe), "Running → loading");
         assert!(!probe_has_failed(&probe, true), "Running + none → not failed");
 
-        probe.phase = JobPhase::Succeeded;
+        probe.progress.phase = JobPhase::Succeeded;
         assert!(!probe_is_loading(&probe), "Succeeded → not loading");
     }
 
@@ -1388,19 +1407,19 @@ mod tests {
         let mut status = JobStatus::idle();
         assert!(!status.is_active(), "Idle should not be active");
 
-        status.phase = JobPhase::Running;
+        status.progress.phase = JobPhase::Running;
         assert!(status.is_active(), "Running should be active");
 
-        status.phase = JobPhase::Indeterminate;
+        status.progress.phase = JobPhase::Indeterminate;
         assert!(status.is_active(), "Indeterminate should be active");
 
-        status.phase = JobPhase::Succeeded;
+        status.progress.phase = JobPhase::Succeeded;
         assert!(!status.is_active(), "Succeeded should not be active");
 
-        status.phase = JobPhase::Cancelled;
+        status.progress.phase = JobPhase::Cancelled;
         assert!(!status.is_active(), "Cancelled should not be active");
 
-        status.phase = JobPhase::Failed;
+        status.progress.phase = JobPhase::Failed;
         assert!(!status.is_active(), "Failed should not be active");
     }
 }

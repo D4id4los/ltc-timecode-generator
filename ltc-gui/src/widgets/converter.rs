@@ -458,8 +458,8 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
 
             if any_detecting {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
-                let progress_pct = state.latest.job(JobKind::LtcDecode).fraction;
-                let progress_str = state.latest.job(JobKind::LtcDecode).message.clone();
+                let progress_pct = state.latest.job(JobKind::LtcDecode).fraction();
+                let progress_str = state.latest.job(JobKind::LtcDecode).message().to_string();
                 ui.add(egui::ProgressBar::new(progress_pct).show_percentage().desired_width(140.0));
                 ui.add_space(2.0);
                 ui.label(RichText::new(&progress_str).font(FontId::monospace(9.0)).color(colors.text_muted));
@@ -500,12 +500,13 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     let group_results: Vec<(String, Option<gui_engine::LtcDetectionResult>, Option<String>)> = {
         let paths = &state.latest.ltc_group_paths;
         let results = &state.latest.ltc_group_results;
-        let errors = &state.latest.ltc_group_errors;
         paths.iter().enumerate().map(|(i, p)| {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
-            let r = results.get(i).and_then(|r| r.clone());
-            let e = errors.get(i).and_then(|e| e.clone());
-            (name, r, e)
+            match results.get(i) {
+                Some(gui_engine::state::ClipDecodeState::Done(Ok(r))) => (name, Some((**r).clone()), None),
+                Some(gui_engine::state::ClipDecodeState::Done(Err(e))) => (name, None, Some(e.clone())),
+                _ => (name, None, None),
+            }
         }).collect()
     };
 
@@ -522,7 +523,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
                     "GROUP VIEW: paths={} results={} errors={} detecting={} done/total={}/{} gen={} none={} recording={:?}",
                     group_results.len(), some_count, err_count,
                     state.latest.job(JobKind::LtcGroupDecode).is_active(),
-                    state.latest.job(JobKind::LtcGroupDecode).units.len(), state.latest.ltc_group_results.len(), gen,
+                    state.latest.job(JobKind::LtcGroupDecode).units().len(), state.latest.ltc_group_results.len(), gen,
                     none_count,
                     state.latest.converter.selected_recording_type(),
                 );
@@ -816,7 +817,7 @@ fn render_ltc_result(ui: &mut Ui, state: &mut AppState, result: &gui_engine::Ltc
                             .font(FontId::monospace(11.0))
                             .color(grade_color)
                             .strong());
-                        ui.label(RichText::new(&q.grade)
+                        ui.label(RichText::new(q.grade.as_str())
                             .font(FontId::proportional(9.0))
                             .color(grade_color));
                     });
@@ -1194,7 +1195,7 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let is_video = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
     let ltc_available = if is_video {
-        state.latest.ltc_group_results.iter().any(|r| r.is_some())
+        state.latest.ltc_group_results.iter().any(|r| r.is_done())
     } else {
         state.latest.ltc_decode_result.is_some()
     };
@@ -1628,7 +1629,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
 
     // Set start time from LTC checkbox
     let is_video_group = state.latest.converter.selected_recording_type() == Some(RecordingType::VideoClipSequence);
-    let group_has_results = state.latest.ltc_group_results.iter().any(|r| r.is_some());
+    let group_has_results = state.latest.ltc_group_results.iter().any(gui_engine::state::ClipDecodeState::is_done);
     let ltc_available = !state.latest.job(JobKind::LtcDecode).is_active() && !state.latest.job(JobKind::LtcGroupDecode).is_active()
         && if is_video_group {
             group_has_results
@@ -1644,7 +1645,7 @@ fn render_output_path(ui: &mut Ui, state: &mut AppState) {
         if state.local_settings.set_start_from_ltc {
             let tc_text = if is_video_group {
                 state.latest.ltc_group_results.first()
-                    .and_then(|r| r.as_ref())
+                    .and_then(|r| r.ok())
                     .and_then(start_timecode_from_ltc)
                     .map(|m| gui_engine::converter::format_ffmpeg_timecode(&m.start, m.drop_frame))
                     .unwrap_or_default()
@@ -1861,12 +1862,12 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let job = state.latest.job(JobKind::Conversion).clone();
 
-    match job.phase {
+    match job.phase() {
         JobPhase::Running | JobPhase::Indeterminate => {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             ui.label(RichText::new("Converting…").font(FontId::proportional(11.0)).color(colors.text_title).strong());
             ui.add_space(4.0);
-            let pb = egui::ProgressBar::new(job.fraction)
+            let pb = egui::ProgressBar::new(job.fraction())
                 .show_percentage()
                 .desired_width(ui.available_width());
             ui.add(pb);
@@ -1884,7 +1885,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(&job.log)
+                            RichText::new(job.log())
                                 .font(FontId::monospace(9.0))
                                 .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
                         );
@@ -1913,7 +1914,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(&job.log)
+                            RichText::new(job.log())
                                 .font(FontId::monospace(9.0))
                                 .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
                         );
@@ -1924,7 +1925,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             }
         }
         JobPhase::Failed => {
-            let error_text = job.error.unwrap_or(job.log);
+            let error_text = job.error.clone().unwrap_or_else(|| job.log().to_string());
 
             let error_frame = egui::Frame::new()
                 .fill(Color32::from_rgb(0x44, 0x11, 0x11))
@@ -1980,7 +1981,7 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(&job.log)
+                            RichText::new(job.log())
                                 .font(FontId::monospace(9.0))
                                 .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
                         );

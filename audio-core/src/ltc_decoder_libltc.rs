@@ -237,6 +237,7 @@ fn error_result(msg: impl Into<String>) -> LtcDetectionResult {
 
 #[cfg(test)]
 mod tests {
+    use crate::ChannelSel;
     use super::*;
 
     // ── Helper: generate synthetic LTC samples for testing ──────────────
@@ -264,7 +265,7 @@ mod tests {
                 samples_per_frame,
                 samples_per_bit,
                 volume,
-                "left",
+                ChannelSel::Left,
                 &mut last_level,
                 &mut frame_buf,
             );

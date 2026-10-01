@@ -8,8 +8,9 @@ use crate::ffprobe::VideoAudioProbe;
 use crate::file_pattern::MatchedGroup;
 use crate::job::{JobKind, JobStatus};
 use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, DEFAULT_PREFIX};
+use crate::timecode::FPS_OPTIONS;
 use crate::offload::OffloadSnapshot;
-use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
+use audio_core::{AudioDeviceInfo, AudioEvent, ChannelSel, LtcDetectionResult, Timecode};
 
 // ── Converter user settings (single source of truth) ─────────────────
 
@@ -133,11 +134,41 @@ impl ConverterSnapshot {
     }
 }
 
+// ── LTC group decode per-clip state ─────────────────────────────────────
+
+/// Per-clip state of a batch LTC group decode; index-aligned with
+/// `AppStateSnapshot::ltc_group_paths`.  The decode result is boxed to keep
+/// the pending variant cheap (the Vec is republished every engine tick).
+#[derive(Clone, Debug)]
+pub enum ClipDecodeState {
+    /// Decode still in flight for this clip.
+    Pending,
+    /// Clip finished; carries the decode result or the error message.
+    Done(Result<Box<LtcDetectionResult>, String>),
+}
+
+impl ClipDecodeState {
+    /// True once the clip finished (successfully or not).
+    pub fn is_done(&self) -> bool {
+        matches!(self, ClipDecodeState::Done(_))
+    }
+
+    /// The decoded result, if the clip finished successfully.
+    pub fn ok(&self) -> Option<&LtcDetectionResult> {
+        match self {
+            ClipDecodeState::Done(Ok(r)) => Some(&**r),
+            _ => None,
+        }
+    }
+}
+
 // ── Clap log entry ──────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct ClapLogItem {
-    pub id: String,
+    /// Monotonic clap counter (presentation fields are pre-formatted strings
+    /// so both GUIs share a single formatting site in the engine).
+    pub id: u64,
     pub timestamp: String,
     pub timecode: String,
     pub milliseconds: String,
@@ -154,14 +185,12 @@ pub struct AppStateSnapshot {
     pub current_timecode: Timecode,
     pub start_timecode: Timecode,
 
-    // FPS
+    // FPS (stored as an index into `FPS_OPTIONS`; derive the value via `fps()`)
     pub fps_index: usize,
-    pub fps: f64,
-    pub drop_frame: bool,
 
     // Audio routing
-    pub ltc_channel: String,
-    pub beep_channel: String,
+    pub ltc_channel: ChannelSel,
+    pub beep_channel: ChannelSel,
     pub ltc_volume: f32,
     pub beep_volume: f32,
     pub beep_frequency: f32,
@@ -196,10 +225,8 @@ pub struct AppStateSnapshot {
     // Events drained from AudioCore (to be surfaced as toasts by the GUI)
     pub events: Vec<AudioEvent>,
 
-    // LTC decode FPS
+    // LTC decode FPS (stored as an index into `FPS_OPTIONS`)
     pub decode_fps_index: usize,
-    pub decode_fps: f64,
-    pub decode_drop_frame: bool,
 
     // LTC file decode
     pub ltc_decode_result: Option<LtcDetectionResult>,
@@ -214,10 +241,8 @@ pub struct AppStateSnapshot {
     pub ltc_group_decode_generation: u64,
     /// Paths of the group being decoded, index-aligned with results.
     pub ltc_group_paths: Vec<PathBuf>,
-    /// Per-clip decode results (index matches ltc_group_paths).
-    pub ltc_group_results: Vec<Option<LtcDetectionResult>>,
-    /// Per-clip error messages when a clip's decode failed.
-    pub ltc_group_errors: Vec<Option<String>>,
+    /// Per-clip decode state (index matches ltc_group_paths).
+    pub ltc_group_results: Vec<ClipDecodeState>,
 
     // ffmpeg capability probe (engine-owned, async)
     pub ffmpeg_caps: Option<FfmpegCapabilities>,
@@ -256,10 +281,8 @@ impl AppStateSnapshot {
                 frames: 0,
             },
             fps_index: 1,
-            fps: 25.0,
-            drop_frame: false,
-            ltc_channel: "left".to_string(),
-            beep_channel: "right".to_string(),
+            ltc_channel: ChannelSel::Left,
+            beep_channel: ChannelSel::Right,
             ltc_volume: 0.25,
             beep_volume: 0.5,
             beep_frequency: 1000.0,
@@ -281,8 +304,6 @@ impl AppStateSnapshot {
             status_message: "Ready".to_string(),
             events: Vec::new(),
             decode_fps_index: 1,
-            decode_fps: 25.0,
-            decode_drop_frame: false,
             ltc_decode_result: None,
             ltc_decode_error: None,
             ltc_decode_generation: 0,
@@ -292,7 +313,6 @@ impl AppStateSnapshot {
             ltc_group_decode_generation: 0,
             ltc_group_paths: Vec::new(),
             ltc_group_results: Vec::new(),
-            ltc_group_errors: Vec::new(),
             ffmpeg_caps: None,
             jobs: HashMap::new(),
             file_durations: HashMap::new(),
@@ -316,6 +336,26 @@ impl AppStateSnapshot {
 
     pub fn job(&self, kind: JobKind) -> &JobStatus {
         self.jobs.get(&kind).unwrap_or_else(|| job_idle_default())
+    }
+
+    /// Generate-side frame rate, derived from `fps_index`.
+    pub fn fps(&self) -> f64 {
+        FPS_OPTIONS[self.fps_index].fps
+    }
+
+    /// Generate-side drop-frame flag, derived from `fps_index`.
+    pub fn drop_frame(&self) -> bool {
+        FPS_OPTIONS[self.fps_index].drop_frame
+    }
+
+    /// Decode-side frame rate, derived from `decode_fps_index`.
+    pub fn decode_fps(&self) -> f64 {
+        FPS_OPTIONS[self.decode_fps_index].fps
+    }
+
+    /// Decode-side drop-frame flag, derived from `decode_fps_index`.
+    pub fn decode_drop_frame(&self) -> bool {
+        FPS_OPTIONS[self.decode_fps_index].drop_frame
     }
 }
 
@@ -365,8 +405,22 @@ mod tests {
     fn test_initial_fps() {
         let s = initial_state();
         assert_eq!(s.fps_index, 1);
-        assert_eq!(s.fps, 25.0);
-        assert!(!s.drop_frame);
+        assert_eq!(s.fps(), 25.0);
+        assert!(!s.drop_frame());
+    }
+
+    #[test]
+    fn test_fps_accessors_track_index() {
+        let mut s = initial_state();
+        s.fps_index = 0;
+        assert_eq!(s.fps(), 24.0);
+        assert!(!s.drop_frame());
+        s.fps_index = 3; // 29.97 DF
+        assert!((s.fps() - 29.97).abs() < 0.01);
+        assert!(s.drop_frame());
+        s.decode_fps_index = 4; // 30
+        assert_eq!(s.decode_fps(), 30.0);
+        assert!(!s.decode_drop_frame());
     }
 
     // ── Audio routing defaults ────────────────────────────────────────────
@@ -374,8 +428,8 @@ mod tests {
     #[test]
     fn test_initial_audio_routing() {
         let s = initial_state();
-        assert_eq!(s.ltc_channel, "left");
-        assert_eq!(s.beep_channel, "right");
+        assert_eq!(s.ltc_channel, ChannelSel::Left);
+        assert_eq!(s.beep_channel, ChannelSel::Right);
         assert!((s.ltc_volume - 0.25).abs() < 1e-6);
         assert!((s.beep_volume - 0.5).abs() < 1e-6);
         assert!((s.beep_frequency - 1000.0).abs() < 1e-6);
@@ -455,8 +509,8 @@ mod tests {
     fn test_initial_decode_state() {
         let s = initial_state();
         assert_eq!(s.decode_fps_index, 1);
-        assert_eq!(s.decode_fps, 25.0);
-        assert!(!s.decode_drop_frame);
+        assert_eq!(s.decode_fps(), 25.0);
+        assert!(!s.decode_drop_frame());
         assert!(s.ltc_decode_result.is_none());
         assert!(s.ltc_decode_error.is_none());
         assert_eq!(s.ltc_decode_generation, 0);
@@ -470,7 +524,6 @@ mod tests {
         assert_eq!(s.ltc_group_decode_generation, 0);
         assert!(s.ltc_group_paths.is_empty());
         assert!(s.ltc_group_results.is_empty());
-        assert!(s.ltc_group_errors.is_empty());
     }
 
     #[test]

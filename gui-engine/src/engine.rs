@@ -18,9 +18,9 @@ use crate::converter::{
     spawn_conversion_job,
 };
 use crate::ffprobe::{self, VideoAudioProbe};
-use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor, spawn_job};
+use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor, ProgressSnapshot, spawn_job};
 use crate::offload::{DeviceNameSource, OffloadDeviceTotals, run_offload_copy_job, run_offload_scan_job};
-use crate::state::{AppStateSnapshot, ClapLogItem};
+use crate::state::{AppStateSnapshot, ClapLogItem, ClipDecodeState};
 use crate::timecode;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(40);
@@ -255,7 +255,7 @@ pub fn engine_main_with_probe<F>(
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::StartConversion)) => {
-                    if current.job(JobKind::Conversion).phase == job::JobPhase::Running {
+                    if current.job(JobKind::Conversion).phase() == job::JobPhase::Running {
                         warn!("Conversion already in progress — ignoring duplicate StartConversion");
                     } else if let Some(settings) = assemble_converter_settings(&current) {
                         let caps = current.ffmpeg_caps.clone();
@@ -271,8 +271,8 @@ pub fn engine_main_with_probe<F>(
                         });
                         // Immediately reflect running state in snapshot
                         let mut status = JobStatus::idle();
-                        status.phase = job::JobPhase::Running;
-                        status.message = "Conversion started…".to_string();
+                        status.progress.phase = job::JobPhase::Running;
+                        status.progress.message = "Conversion started…".to_string();
                         current.jobs.insert(JobKind::Conversion, status);
                         current.status_message = "Conversion started…".to_string();
                         info!("Conversion started via engine StartConversion command (job-based)");
@@ -285,7 +285,7 @@ pub fn engine_main_with_probe<F>(
                 Ok(GuiCommand::Converter(ConverterCommand::CancelConversion)) => {
                     supervisor.cancel(JobKind::Conversion);
                     if let Some(status) = current.jobs.get_mut(&JobKind::Conversion) {
-                        status.phase = job::JobPhase::Cancelled;
+                        status.progress.phase = job::JobPhase::Cancelled;
                         status.error = Some("Cancelled by user".to_string());
                     }
                     current.status_message = "Conversion canceled".to_string();
@@ -346,7 +346,7 @@ pub fn engine_main_with_probe<F>(
             // event which apply_outcome sets, and must not be clobbered if the
             // thread hasn't finished yet but the event already arrived.
             let is_terminal = current.jobs.get(kind)
-                .map(|s| matches!(s.phase, job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
+                .map(|s| matches!(s.phase(), job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
                 .unwrap_or(false);
             if !is_terminal {
                 current.jobs.insert(*kind, JobStatus::from_progress(snap));
@@ -588,30 +588,22 @@ pub fn engine_main_with_probe<F>(
                 }
                 JobEvent::Item { kind: JobKind::LtcGroupDecode, item: JobItem::ClipLtcResult { index, result }, .. } => {
                     if current.ltc_group_results.len() > index {
-                        match result {
-                            Ok(r) => {
-                                current.ltc_group_results[index] = Some(r.clone());
-                                current.ltc_group_errors[index] = None;
-                                let done = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
-                                info!(
-                                    "LTC group decode [{}/{}]: {} frames (confidence {:.1}%)",
-                                    done, current.ltc_group_results.len(),
-                                    r.valid_frames, r.avg_confidence * 100.0,
-                                );
-                            }
-                            Err(e) => {
-                                current.ltc_group_results[index] = None;
-                                current.ltc_group_errors[index] = Some(e.clone());
-                                let done = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
-                                warn!("LTC group decode [{}/{}]: failed: {}",
-                                    done, current.ltc_group_results.len(), e);
-                            }
-                        }
-                        let done = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
+                        current.ltc_group_results[index] = ClipDecodeState::Done(result.map(Box::new));
+                        let done = current.ltc_group_results.iter().filter(|r| r.is_done()).count();
                         current.status_message = format!(
                             "Decoding group: {}/{} clips",
                             done, current.ltc_group_results.len(),
                         );
+                        if let ClipDecodeState::Done(Ok(r)) = &current.ltc_group_results[index] {
+                            info!(
+                                "LTC group decode [{}/{}]: {} frames (confidence {:.1}%)",
+                                done, current.ltc_group_results.len(),
+                                r.valid_frames, r.avg_confidence * 100.0,
+                            );
+                        } else if let ClipDecodeState::Done(Err(e)) = &current.ltc_group_results[index] {
+                            warn!("LTC group decode [{}/{}]: failed: {}",
+                                done, current.ltc_group_results.len(), e);
+                        }
                     }
                 }
                 JobEvent::Finished { kind: JobKind::LtcGroupDecode, outcome, .. } => {
@@ -621,11 +613,11 @@ pub fn engine_main_with_probe<F>(
                     // When the user cancelled and a new decode was spawned,
                     // this event is already rejected by the latest_job gate above.
                     let total = current.ltc_group_results.len();
-                    let successes = current.ltc_group_results.iter().filter(|r| r.is_some()).count();
-                    let failures = current.ltc_group_results.iter().filter(|r| r.is_none()).count();
+                    let successes = current.ltc_group_results.iter().filter(|r| r.ok().is_some()).count();
+                    let failures = total - successes;
                     let gen = current.ltc_group_decode_generation;
                     let tc_info = if successes > 0 {
-                        if let Some(Some(r)) = current.ltc_group_results.first() {
+                        if let Some(ClipDecodeState::Done(Ok(r))) = current.ltc_group_results.first() {
                             format!(
                                 "{} clips decoded ({} ok, {} fail) — {} fps{}",
                                 total, successes, failures,
@@ -900,9 +892,9 @@ fn process_command(
             }
             match core.start_ltc(
                 state.start_timecode,
-                state.fps,
-                state.drop_frame,
-                state.ltc_channel.clone(),
+                state.fps(),
+                state.drop_frame(),
+                state.ltc_channel,
                 state.ltc_volume,
             ) {
                 Ok(()) => {
@@ -939,20 +931,20 @@ fn process_command(
                 state.beep_frequency,
                 state.beep_duration,
                 state.beep_volume,
-                &state.beep_channel,
+                state.beep_channel,
             );
             state.clap_flash_alpha = 1.0;
             state.clap_arm_angle = 0.0;
 
-            let tc_str = timecode::timecode_to_string(state.current_timecode, state.drop_frame);
+            let tc_str = timecode::timecode_to_string(state.current_timecode, state.drop_frame());
             let ms_str =
-                timecode::timecode_to_ms_string(state.current_timecode, state.fps);
+                timecode::timecode_to_ms_string(state.current_timecode, state.fps());
             *log_id_counter += 1;
             let ts = timecode::chrono_now_string();
             let note = format!("Scene {}", state.scene);
 
             state.logs.push(ClapLogItem {
-                id: format!("{}", log_id_counter),
+                id: *log_id_counter,
                 timestamp: ts,
                 timecode: tc_str,
                 milliseconds: ms_str,
@@ -975,8 +967,6 @@ fn process_command(
         GuiCommand::SetFpsIndex(index) => {
             if index < timecode::FPS_OPTIONS.len() {
                 state.fps_index = index;
-                state.fps = timecode::FPS_OPTIONS[index].fps;
-                state.drop_frame = timecode::FPS_OPTIONS[index].drop_frame;
             }
         }
 
@@ -1072,8 +1062,6 @@ fn process_command(
         GuiCommand::SetDecodeFpsIndex(index) => {
             if let Some(opt) = timecode::FPS_OPTIONS.get(index) {
                 state.decode_fps_index = index;
-                state.decode_fps = opt.fps;
-                state.decode_drop_frame = opt.drop_frame;
                 info!("Decode FPS set to: {} (index={})", opt.name, index);
             }
         }
@@ -1082,12 +1070,12 @@ fn process_command(
             supervisor.cancel(JobKind::LtcDecode);
             supervisor.cancel(JobKind::LtcGroupDecode);
             if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
-                status.phase = job::JobPhase::Cancelled;
-                status.message = "Canceled by user".to_string();
+                status.progress.phase = job::JobPhase::Cancelled;
+                status.progress.message = "Canceled by user".to_string();
             }
             if let Some(status) = state.jobs.get_mut(&JobKind::LtcGroupDecode) {
-                status.phase = job::JobPhase::Cancelled;
-                status.message = "Canceled by user".to_string();
+                status.progress.phase = job::JobPhase::Cancelled;
+                status.progress.message = "Canceled by user".to_string();
             }
             state.status_message = "Decode canceled by user".to_string();
         }
@@ -1104,29 +1092,30 @@ fn process_command(
             let decoder_name = if use_libltc { "libltc" } else { "builtin" };
             info!(
                 "LTC group decode requested: {} clip(s), stream={}, channel={}, decoder={}, fps={}",
-                total, stream_index, channel_index, decoder_name, state.decode_fps,
+                total, stream_index, channel_index, decoder_name, state.decode_fps(),
             );
 
             // Reset group decode state with new generation
             state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
             state.ltc_group_paths = paths.iter().map(std::path::PathBuf::from).collect();
-            state.ltc_group_results = vec![None; total];
-            state.ltc_group_errors = vec![None; total];
+            state.ltc_group_results = vec![ClipDecodeState::Pending; total];
             // Pre-populate job status so CancelDecode can eager-cancel before poll()
             state.jobs.insert(JobKind::LtcGroupDecode, job::JobStatus {
-                phase: job::JobPhase::Running,
-                fraction: 0.0,
-                message: format!("Decoding LTC group: 0/{} clips", total),
-                speed: None,
-                units: Vec::new(),
-                log: String::new(),
+                progress: ProgressSnapshot {
+                    phase: job::JobPhase::Running,
+                    fraction: 0.0,
+                    message: format!("Decoding LTC group: 0/{} clips", total),
+                    speed: None,
+                    units: Vec::new(),
+                    log: String::new(),
+                },
                 error: None,
             });
             state.status_message = format!("Decoding LTC group: 0/{} clips", total);
 
             let capture_gen = state.ltc_group_decode_generation;
-            let decode_fps = state.decode_fps;
-            let decode_drop_frame = state.decode_drop_frame;
+            let decode_fps = state.decode_fps();
+            let decode_drop_frame = state.decode_drop_frame();
 
             let spec = job::JobSpec {
                 kind: JobKind::LtcGroupDecode,
@@ -1187,7 +1176,6 @@ fn process_command(
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
             state.ltc_group_paths = Vec::new();
             state.ltc_group_results = Vec::new();
-            state.ltc_group_errors = Vec::new();
             supervisor.cancel(JobKind::LtcGroupDecode);
             state.jobs.insert(JobKind::LtcGroupDecode, job::JobStatus::idle());
             state.ltc_group_decode_generation = state.ltc_group_decode_generation.wrapping_add(1);
@@ -1207,7 +1195,7 @@ fn process_command(
             let decoder_name = if use_libltc { "libltc" } else { "builtin" };
             info!(
                 "LTC video decode requested: {} (stream={}, channel={}, decoder={}, fps={})",
-                path, stream_index, channel_index, decoder_name, state.decode_fps,
+                path, stream_index, channel_index, decoder_name, state.decode_fps(),
             );
 
             state.ltc_decode_result = None;
@@ -1219,18 +1207,20 @@ fn process_command(
             );
             state.status_message = msg.clone();
             state.jobs.insert(JobKind::LtcDecode, job::JobStatus {
-                phase: job::JobPhase::Running,
-                fraction: 0.0,
-                message: msg,
-                speed: None,
-                units: Vec::new(),
-                log: String::new(),
+                progress: ProgressSnapshot {
+                    phase: job::JobPhase::Running,
+                    fraction: 0.0,
+                    message: msg,
+                    speed: None,
+                    units: Vec::new(),
+                    log: String::new(),
+                },
                 error: None,
             });
 
             let capture_gen = state.ltc_decode_generation;
-            let decode_fps = state.decode_fps;
-            let decode_drop_frame = state.decode_drop_frame;
+            let decode_fps = state.decode_fps();
+            let decode_drop_frame = state.decode_drop_frame();
 
             // Hardening: validate the selection against the probe data so a
             // stale or out-of-range GUI state fails fast with a clear message
@@ -1256,7 +1246,7 @@ fn process_command(
                 if let Some(e) = validation_error {
                     error!("LTC video decode rejected: {}", e);
                     if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
-                        status.phase = job::JobPhase::Failed;
+                        status.progress.phase = job::JobPhase::Failed;
                         status.error = Some(e.clone());
                     }
                     state.ltc_decode_error = Some(e.clone());
@@ -1313,7 +1303,7 @@ fn process_command(
                 return;
             }
             let decoder_name = if use_libltc { "libltc" } else { "builtin" };
-            info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps);
+            info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps());
 
             // Quick open to calculate chunk count
             let config = DecodeConfig::default();
@@ -1324,7 +1314,7 @@ fn process_command(
                     state.ltc_decode_error = Some(e.clone());
                     state.status_message = format!("Parse failed: {}", e);
                     if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
-                        status.phase = job::JobPhase::Failed;
+                        status.progress.phase = job::JobPhase::Failed;
                         status.error = Some(e.clone());
                     }
                     return;
@@ -1336,21 +1326,23 @@ fn process_command(
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
             let msg = format!(
                 "Decoding LTC from: {} [{}] at {:.2} fps ({} chunks)",
-                path, decoder_name, state.decode_fps, chunk_count
+                path, decoder_name, state.decode_fps(), chunk_count
             );
             state.status_message = msg.clone();
             state.jobs.insert(JobKind::LtcDecode, job::JobStatus {
-                phase: job::JobPhase::Running,
-                fraction: 0.0,
-                message: msg,
-                speed: None,
-                units: Vec::new(),
-                log: String::new(),
+                progress: ProgressSnapshot {
+                    phase: job::JobPhase::Running,
+                    fraction: 0.0,
+                    message: msg,
+                    speed: None,
+                    units: Vec::new(),
+                    log: String::new(),
+                },
                 error: None,
             });
 
-            let decode_fps = state.decode_fps;
-            let decode_drop_frame = state.decode_drop_frame;
+            let decode_fps = state.decode_fps();
+            let decode_drop_frame = state.decode_drop_frame();
 
             info!("Spawning chunked decode ({} chunks, decoder={}, fps={})",
                 chunk_count, decoder_name, decode_fps);
@@ -1465,7 +1457,7 @@ fn stepper_second(state: &mut AppStateSnapshot, delta: i32) {
 
 fn stepper_frame(state: &mut AppStateSnapshot, delta: i32) {
     let mut tc = state.start_timecode;
-    let max_frame = (state.fps.round() as u32).saturating_sub(1);
+    let max_frame = (state.fps().round() as u32).saturating_sub(1);
     tc.frames = (tc.frames as i32 + delta).rem_euclid(max_frame as i32 + 1) as u32;
     state.start_timecode = tc;
 }
@@ -1634,9 +1626,9 @@ fn attempt_recovery(
         let _ = core.reset_ltc(stored_tc);
         match core.start_ltc(
             stored_tc,
-            state.fps,
-            state.drop_frame,
-            state.ltc_channel.clone(),
+            state.fps(),
+            state.drop_frame(),
+            state.ltc_channel,
             state.ltc_volume,
         ) {
             Ok(()) => {
@@ -1891,7 +1883,7 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
         } else if !state.ltc_group_results.is_empty() {
             // Group decode — one per clip
             state.ltc_group_results.iter()
-                .map(|r| r.as_ref().and_then(crate::converter::start_timecode_from_ltc))
+                .map(|r| r.ok().and_then(crate::converter::start_timecode_from_ltc))
                 .collect()
         } else {
             vec![None; group.files.len()]
@@ -1906,8 +1898,8 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
     // H264:TimeCode) for the timecode-embedding step.
     // When both LTC and native TC exist, log a warning if they differ.
     if s.set_start_from_ltc {
-        let native_fps = state.fps;
-        let native_df = state.drop_frame;
+        let native_fps = state.fps();
+        let native_df = state.drop_frame();
         for (i, meta) in timecode_meta_per_file.iter_mut().enumerate() {
             let camera_native = state.converter.camera_meta.get(i)
                 .and_then(|c| c.as_ref())
@@ -2079,7 +2071,6 @@ fn apply_recording_selection(
     state.ltc_decode_result = None;
     state.ltc_decode_error = None;
     state.ltc_group_results.clear();
-    state.ltc_group_errors.clear();
     state.ltc_group_paths.clear();
     // Cancel any running decode jobs via supervisor
     supervisor.cancel(JobKind::LtcDecode);
@@ -2169,6 +2160,7 @@ fn auto_apply_group_ltc_to_settings(state: &mut AppStateSnapshot) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use audio_core::ChannelSel;
     use super::*;
     use crate::converter::HwDeviceCapabilities;
     use crate::file_pattern::MatchedGroup;
@@ -2411,7 +2403,7 @@ mod tests {
     #[test]
     fn test_stepper_frame_up() {
         let mut state = setup_state();
-        state.fps = 25.0;
+        state.fps_index = 1;
         state.start_timecode.frames = 0;
         stepper_frame(&mut state, 1);
         assert_eq!(state.start_timecode.frames, 1);
@@ -2420,7 +2412,7 @@ mod tests {
     #[test]
     fn test_stepper_frame_wrap_forward_25fps() {
         let mut state = setup_state();
-        state.fps = 25.0;
+        state.fps_index = 1;
         state.start_timecode.frames = 24;
         stepper_frame(&mut state, 1);
         assert_eq!(state.start_timecode.frames, 0);
@@ -2429,7 +2421,7 @@ mod tests {
     #[test]
     fn test_stepper_frame_wrap_forward_30fps() {
         let mut state = setup_state();
-        state.fps = 30.0;
+        state.fps_index = 4;
         state.start_timecode.frames = 29;
         stepper_frame(&mut state, 1);
         assert_eq!(state.start_timecode.frames, 0);
@@ -2438,7 +2430,7 @@ mod tests {
     #[test]
     fn test_stepper_frame_wrap_forward_24fps() {
         let mut state = setup_state();
-        state.fps = 24.0;
+        state.fps_index = 0;
         state.start_timecode.frames = 23;
         stepper_frame(&mut state, 1);
         assert_eq!(state.start_timecode.frames, 0);
@@ -2447,7 +2439,7 @@ mod tests {
     #[test]
     fn test_stepper_frame_down() {
         let mut state = setup_state();
-        state.fps = 25.0;
+        state.fps_index = 1;
         state.start_timecode.frames = 15;
         stepper_frame(&mut state, -1);
         assert_eq!(state.start_timecode.frames, 14);
@@ -2456,7 +2448,7 @@ mod tests {
     #[test]
     fn test_stepper_frame_wrap_backward_25fps() {
         let mut state = setup_state();
-        state.fps = 25.0;
+        state.fps_index = 1;
         state.start_timecode.frames = 0;
         stepper_frame(&mut state, -1);
         assert_eq!(state.start_timecode.frames, 24);
@@ -2465,7 +2457,7 @@ mod tests {
     #[test]
     fn test_stepper_frame_wrap_backward_30fps() {
         let mut state = setup_state();
-        state.fps = 30.0;
+        state.fps_index = 4;
         state.start_timecode.frames = 0;
         stepper_frame(&mut state, -1);
         assert_eq!(state.start_timecode.frames, 29);
@@ -2474,17 +2466,17 @@ mod tests {
     #[test]
     fn test_stepper_frame_fps_changes_max() {
         let mut state = setup_state();
-        state.fps = 25.0;
+        state.fps_index = 1;
         state.start_timecode.frames = 24;
         stepper_frame(&mut state, 1);
         assert_eq!(state.start_timecode.frames, 0, "25fps: 24→0");
 
-        state.fps = 30.0;
+        state.fps_index = 4;
         state.start_timecode.frames = 29;
         stepper_frame(&mut state, 1);
         assert_eq!(state.start_timecode.frames, 0, "30fps: 29→0");
 
-        state.fps = 24.0;
+        state.fps_index = 0;
         state.start_timecode.frames = 23;
         stepper_frame(&mut state, 1);
         assert_eq!(state.start_timecode.frames, 0, "24fps: 23→0");
@@ -2493,7 +2485,7 @@ mod tests {
     #[test]
     fn test_stepper_frame_large_delta() {
         let mut state = setup_state();
-        state.fps = 25.0;
+        state.fps_index = 1;
         state.start_timecode.frames = 5;
         stepper_frame(&mut state, 50);
         assert_eq!(state.start_timecode.frames, 5);
@@ -2549,8 +2541,8 @@ mod tests {
         process_command(GuiCommand::SetFpsIndex(4), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.fps_index, 4);
-        assert_eq!(state.fps, 30.0);
-        assert!(!state.drop_frame);
+        assert_eq!(state.fps(), 30.0);
+        assert!(!state.drop_frame());
     }
 
     #[test]
@@ -2566,8 +2558,8 @@ mod tests {
         process_command(GuiCommand::SetFpsIndex(3), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.fps_index, 3);
-        assert!((state.fps - 29.97).abs() < 0.01);
-        assert!(state.drop_frame);
+        assert!((state.fps() - 29.97).abs() < 0.01);
+        assert!(state.drop_frame());
     }
 
     #[test]
@@ -2583,7 +2575,7 @@ mod tests {
         process_command(GuiCommand::SetFpsIndex(99), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.fps_index, 1);
-        assert_eq!(state.fps, 25.0);
+        assert_eq!(state.fps(), 25.0);
     }
 
     #[test]
@@ -2628,11 +2620,11 @@ mod tests {
     fn test_process_command_clear_logs() {
         let mut state = setup_state();
         state.logs.push(ClapLogItem {
-            id: "1".into(), timestamp: "12:00:00".into(),
+            id: 1, timestamp: "12:00:00".into(),
             timecode: "01:00:00:00".into(), milliseconds: "0".into(), note: "test".into(),
         });
         state.logs.push(ClapLogItem {
-            id: "2".into(), timestamp: "12:00:01".into(),
+            id: 2, timestamp: "12:00:01".into(),
             timecode: "01:00:00:01".into(), milliseconds: "0".into(), note: "test2".into(),
         });
         let core = audio_core::AudioCore::new();
@@ -2657,9 +2649,9 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetLtcChannel("both".into()), &core, true, &mut state,
+        process_command(GuiCommand::SetLtcChannel(ChannelSel::Both), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
-        assert_eq!(state.ltc_channel, "both");
+        assert_eq!(state.ltc_channel, ChannelSel::Both);
     }
 
     #[test]
@@ -2835,8 +2827,8 @@ mod tests {
         process_command(GuiCommand::SetDecodeFpsIndex(4), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.decode_fps_index, 4);
-        assert_eq!(state.decode_fps, 30.0);
-        assert!(!state.decode_drop_frame);
+        assert_eq!(state.decode_fps(), 30.0);
+        assert!(!state.decode_drop_frame());
     }
 
     #[test]
@@ -2851,8 +2843,8 @@ mod tests {
 
         process_command(GuiCommand::SetDecodeFpsIndex(3), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
-        assert!((state.decode_fps - 29.97).abs() < 0.01);
-        assert!(state.decode_drop_frame);
+        assert!((state.decode_fps() - 29.97).abs() < 0.01);
+        assert!(state.decode_drop_frame());
     }
 
     #[test]
@@ -2919,8 +2911,7 @@ mod tests {
             is_video_file: true,
         });
         s.ltc_group_paths = vec![std::path::PathBuf::from("clip.mp4")];
-        s.ltc_group_results = vec![None];
-        s.ltc_group_errors = vec![None];
+        s.ltc_group_results = vec![ClipDecodeState::Pending];
         s.ltc_decode_generation = 42;
         s.ltc_group_decode_generation = 99;
         s
@@ -2944,7 +2935,7 @@ mod tests {
         assert!(state.ltc_decode_result.is_none(), "single result cleared");
         assert!(state.ltc_decode_error.is_none(), "error cleared");
         assert!(state.ltc_probe.is_none(), "probe cleared");
-        assert_eq!(state.job(JobKind::LtcDecode).phase, JobPhase::Idle, "LtcDecode job reset to Idle");
+        assert_eq!(state.job(JobKind::LtcDecode).phase(), JobPhase::Idle, "LtcDecode job reset to Idle");
         assert_eq!(state.ltc_decode_generation, 43, "decode gen bumped from 42");
     }
 
@@ -2965,8 +2956,7 @@ mod tests {
 
         assert!(state.ltc_group_paths.is_empty(), "group paths cleared");
         assert!(state.ltc_group_results.is_empty(), "group results cleared");
-        assert!(state.ltc_group_errors.is_empty(), "group errors cleared");
-        assert_eq!(state.job(JobKind::LtcGroupDecode).phase, JobPhase::Idle, "LtcGroupDecode job reset to Idle");
+        assert_eq!(state.job(JobKind::LtcGroupDecode).phase(), JobPhase::Idle, "LtcGroupDecode job reset to Idle");
         assert_eq!(state.ltc_group_decode_generation, 100, "group decode gen bumped from 99");
     }
 
