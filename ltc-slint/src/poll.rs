@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 use gui_engine::converter::{format_blockers, RecordingType};
 use gui_engine::{JobKind, JobPhase, UnitState};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
+use gui_engine::edit_state::EditState;
 use gui_engine::log_buffer::LogBuffer;
-use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
+use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode;
 use gui_engine::{ArcSwap, AudioEvent, ChannelSel, SAMPLE_RATE_OPTIONS};
 use log::info;
 use slint::{ModelRc, SharedString, VecModel};
 
+use crate::shadows::Shadows;
 use crate::toast::{push_toast, ToastItem};
 use crate::timecode_helpers::set_tc_segments;
 use crate::{AppColors, AppWindow, FileGroupInfo, LogEntry};
@@ -30,7 +32,7 @@ pub fn setup_poll_timer(
     log_buffer: Arc<Mutex<LogBuffer>>,
     last_debug_log_count: Arc<Mutex<usize>>,
     pulse_phase: Arc<Mutex<f64>>,
-    conv_settings_cache: Arc<Mutex<ConverterUserSettings>>,
+    shadows: Arc<Mutex<Shadows>>,
 ) {
     let ui_weak = ui.as_weak();
     let last_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
@@ -51,6 +53,9 @@ pub fn setup_poll_timer(
             };
 
             let s = engine_state.load();
+            let applied_seq = s.applied_command_seq;
+            let now = Instant::now();
+            let mut sh = shadows.lock().unwrap();
 
             // 1. System time
             ui.set_system_time(SharedString::from(format!("{} UTC", timecode::chrono_now_string())));
@@ -58,16 +63,22 @@ pub fn setup_poll_timer(
             // 2. Theme sync
             AppColors::get(&ui).set_theme_dark(s.is_dark_theme);
 
-            // 3. Clapper metadata (fix one-way sync gaps). The roll push is
-            //    focus-gated: the ROLL TextInput is two-way bound to the
-            //    `roll` property, so pushing while the user edits would
-            //    clobber in-progress keystrokes.
-            if !ui.get_roll_editing() {
-                ui.set_roll(SharedString::from(s.clapper.roll.clone()));
+            // 3. Clapper metadata (fix one-way sync gaps). Shadow-backed:
+            //    the roll push is skipped while an edit awaits its ack (the
+            //    ROLL TextInput is two-way bound to the `roll` property);
+            //    auto-increment likewise until its toggle is acked.
+            if let Some(roll) = sh.roll.sync_and_push(
+                &s.clapper.roll,
+                ui.get_roll_editing(),
+                applied_seq,
+                now,
+            ) {
+                ui.set_roll(SharedString::from(roll));
             }
             ui.set_scene(s.clapper.scene as i32);
             ui.set_take(s.clapper.take as i32);
-            ui.set_auto_increment(s.clapper.auto_increment_take);
+            push_shadow(&mut sh.auto_increment, &s.clapper.auto_increment_take, applied_seq, now,
+                |v| ui.set_auto_increment(v));
 
             // 4. LTC decode state sync
             {
@@ -138,8 +149,9 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 }
             }
 
-            // 5. LTC decode FPS index sync (fix one-way gap)
-            ui.set_decode_fps_index(s.decode.fps_index as i32);
+            // 5. LTC decode FPS index sync (shadow-backed, gated on ack)
+            push_shadow(&mut sh.decode_fps_index, &s.decode.fps_index, applied_seq, now,
+                |v| ui.set_decode_fps_index(v as i32));
 
             // 6. Video audio probe info
             if let Some(ref probe) = s.decode.probe {
@@ -241,11 +253,16 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 .unwrap_or(-1);
             ui.set_device_index(dev_idx);
 
-            // 18. Volume / pitch / duration
-            ui.set_ltc_volume(s.ltc_volume);
-            ui.set_beep_volume(s.beep_volume);
-            ui.set_beep_frequency(s.beep_frequency);
-            ui.set_beep_duration(s.beep_duration);
+            // 18. Volume / pitch / duration (shadow-backed, gated on ack —
+            //     avoids fighting the user mid-drag)
+            push_shadow(&mut sh.ltc_volume, &s.ltc_volume, applied_seq, now,
+                |v| ui.set_ltc_volume(v));
+            push_shadow(&mut sh.beep_volume, &s.beep_volume, applied_seq, now,
+                |v| ui.set_beep_volume(v));
+            push_shadow(&mut sh.beep_frequency, &s.beep_frequency, applied_seq, now,
+                |v| ui.set_beep_frequency(v));
+            push_shadow(&mut sh.beep_duration, &s.beep_duration, applied_seq, now,
+                |v| ui.set_beep_duration(v));
 
             // 19. Start timecode steppers
             ui.set_hour(s.start_timecode.hours as i32);
@@ -255,41 +272,56 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             ui.set_max_frame(if max_frame > 0 { max_frame - 1 } else { 0 });
             ui.set_frame(s.start_timecode.frames as i32);
 
-            // 20. FPS and sample rate index
-            ui.set_fps_index(s.fps_index as i32);
-            let sr_index = SAMPLE_RATE_OPTIONS.iter()
+            // 20. FPS and sample rate index (shadow-backed, gated on ack)
+            push_shadow(&mut sh.fps_index, &s.fps_index, applied_seq, now,
+                |v| ui.set_fps_index(v as i32));
+            let sr_truth = SAMPLE_RATE_OPTIONS.iter()
                 .position(|&r| r == s.sample_rate)
                 .unwrap_or(0);
-            ui.set_sample_rate_index(sr_index as i32);
+            push_shadow(&mut sh.sample_rate, &sr_truth, applied_seq, now,
+                |v| ui.set_sample_rate_index(v as i32));
 
-            // 21. Converter user settings sync — copy all fields from engine to cache + Slint
+            // 21. Converter user settings sync — shadow-backed, gated on ack
             {
-                let mut cache = conv_settings_cache.lock().unwrap();
-                *cache = s.converter.settings.clone();
-
-                ui.set_conv_container(SharedString::from(s.converter.settings.container.clone()));
-                ui.set_conv_video_encoder(SharedString::from(s.converter.settings.video_encoder.clone()));
-                ui.set_conv_audio_encoder(SharedString::from(s.converter.settings.audio_encoder.clone()));
-                ui.set_conv_split_tracks(s.converter.settings.split_tracks);
-                ui.set_conv_drop_ltc_track(s.converter.settings.drop_ltc_track);
-                ui.set_conv_concat_audio(s.converter.settings.concat_audio);
-                ui.set_conv_generate_synthetic_video(s.converter.settings.generate_synthetic_video);
-                ui.set_conv_copy_video(s.converter.settings.copy_video);
-                ui.set_conv_metadata_only(s.converter.settings.metadata_only);
-                ui.set_conv_embed_camera_meta(s.converter.settings.embed_camera_metadata);
-                ui.set_set_start_from_ltc(s.converter.settings.set_start_from_ltc);
-                // Don't push text-field values while the user is actively
-                // editing them — focus-gated to prevent flicker/races
-                // between keystroke and engine publish (~40 ms).
+                push_shadow(&mut sh.conv.container, &s.converter.settings.container, applied_seq, now,
+                    |v| ui.set_conv_container(SharedString::from(v)));
+                push_shadow(&mut sh.conv.video_encoder, &s.converter.settings.video_encoder, applied_seq, now,
+                    |v| ui.set_conv_video_encoder(SharedString::from(v)));
+                push_shadow(&mut sh.conv.audio_encoder, &s.converter.settings.audio_encoder, applied_seq, now,
+                    |v| ui.set_conv_audio_encoder(SharedString::from(v)));
+                push_shadow(&mut sh.conv.split_tracks, &s.converter.settings.split_tracks, applied_seq, now,
+                    |v| ui.set_conv_split_tracks(v));
+                push_shadow(&mut sh.conv.drop_ltc_track, &s.converter.settings.drop_ltc_track, applied_seq, now,
+                    |v| ui.set_conv_drop_ltc_track(v));
+                push_shadow(&mut sh.conv.concat_audio, &s.converter.settings.concat_audio, applied_seq, now,
+                    |v| ui.set_conv_concat_audio(v));
+                push_shadow(&mut sh.conv.generate_synthetic_video, &s.converter.settings.generate_synthetic_video, applied_seq, now,
+                    |v| ui.set_conv_generate_synthetic_video(v));
+                push_shadow(&mut sh.conv.copy_video, &s.converter.settings.copy_video, applied_seq, now,
+                    |v| ui.set_conv_copy_video(v));
+                push_shadow(&mut sh.conv.metadata_only, &s.converter.settings.metadata_only, applied_seq, now,
+                    |v| ui.set_conv_metadata_only(v));
+                push_shadow(&mut sh.conv.embed_camera_metadata, &s.converter.settings.embed_camera_metadata, applied_seq, now,
+                    |v| ui.set_conv_embed_camera_meta(v));
+                push_shadow(&mut sh.conv.set_start_from_ltc, &s.converter.settings.set_start_from_ltc, applied_seq, now,
+                    |v| ui.set_set_start_from_ltc(v));
+                // Text fields: skip the push while an edit awaits its ack,
+                // and never re-push the text the user already typed.
                 let editing = ui.get_conv_text_editing();
-                if !editing {
-                    ui.set_conv_filename_prefix(SharedString::from(s.converter.settings.filename_prefix.clone()));
-                    ui.set_conv_audio_suffix_template(SharedString::from(
-                        s.converter.settings.audio_suffix_template.clone(),
-                    ));
-                    ui.set_conv_video_suffix_template(SharedString::from(
-                        s.converter.settings.video_suffix_template.clone(),
-                    ));
+                if let Some(v) = sh.conv.filename_prefix.sync_and_push(
+                    &s.converter.settings.filename_prefix, editing, applied_seq, now,
+                ) {
+                    ui.set_conv_filename_prefix(SharedString::from(v));
+                }
+                if let Some(v) = sh.conv.audio_suffix_template.sync_and_push(
+                    &s.converter.settings.audio_suffix_template, editing, applied_seq, now,
+                ) {
+                    ui.set_conv_audio_suffix_template(SharedString::from(v));
+                }
+                if let Some(v) = sh.conv.video_suffix_template.sync_and_push(
+                    &s.converter.settings.video_suffix_template, editing, applied_seq, now,
+                ) {
+                    ui.set_conv_video_suffix_template(SharedString::from(v));
                 }
                 ui.set_conv_output_folder(SharedString::from(
                     s.converter.settings.output_folder.to_string_lossy().as_ref(),
@@ -370,11 +402,9 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                         let is_audio = matches!(groups[idx].recording_type, RecordingType::MultiTrackAudio);
                         ui.set_conv_is_video_recording(!is_audio);
                         ui.set_conv_num_channels(if is_audio { files.len() as i32 } else { 0 });
-                        ui.set_ltc_file_idx(s.converter.settings.ltc_file_idx as i32);
+                        push_shadow(&mut sh.conv.ltc_file_idx, &s.converter.settings.ltc_file_idx, applied_seq, now,
+                            |v| ui.set_ltc_file_idx(v as i32));
                         ui.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
-                        if !ui.get_conv_text_editing() {
-                            ui.set_conv_filename_prefix(SharedString::from(s.converter.settings.filename_prefix.clone()));
-                        }
                     }
                 }
 
@@ -503,7 +533,9 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 ui.set_off_parent_folder(SharedString::from(
                     off.parent_folder.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
                 ));
-                ui.set_off_parent_name(SharedString::from(off.parent_name.clone()));
+                if let Some(v) = sh.parent_name.sync_and_push(&off.parent_name, false, applied_seq, now) {
+                    ui.set_off_parent_name(SharedString::from(v));
+                }
                 let scan_job = s.job(JobKind::OffloadScan);
                 ui.set_off_scanning(scan_job.is_active());
                 ui.set_off_scan_status(SharedString::from(scan_job.message().to_string()));
@@ -610,6 +642,20 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
     );
 
     Box::leak(Box::new(poll_timer));
+}
+
+fn push_shadow<T: PartialEq + Clone>(
+    es: &mut EditState<T>,
+    truth: &T,
+    applied_seq: u64,
+    now: Instant,
+    set: impl FnOnce(T),
+) {
+    es.set_focused(false);
+    es.sync(truth, applied_seq, now);
+    if !es.is_pending() {
+        set(es.value().clone());
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {

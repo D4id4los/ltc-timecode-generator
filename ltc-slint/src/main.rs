@@ -4,23 +4,27 @@ slint::include_modules!();
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gui_engine::command::{ConverterCommand, GuiCommand, OffloadCommand};
 use gui_engine::{AudioEvent, ChannelSel};
 use gui_engine::config;
-use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
+use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::{ArcSwap, JobKind, SAMPLE_RATE_OPTIONS};
 use log::info;
 use slint::{ModelRc, SharedString, VecModel};
 
 use crate::poll::setup_poll_timer;
+use crate::shadows::Shadows;
+use crate::sink::CommandSink;
 use crate::theme::set_theme_palette;
 use crate::timecode_helpers::set_tc_segments;
 use crate::toast::{push_toast, update_toast_model, ToastItem};
 
 mod poll;
+mod shadows;
+mod sink;
 mod theme;
 mod timecode_helpers;
 mod toast;
@@ -61,9 +65,12 @@ fn _run_gui(
     let last_debug_log_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let pulse_phase: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
 
-    // ── Converter state cache (mirrored from engine each tick by poll.rs) ──
-    let conv_settings_cache: Arc<Mutex<ConverterUserSettings>> =
-        Arc::new(Mutex::new(ConverterUserSettings::initial()));
+    // ── Command sink + widget shadows ────────────────────────────────────────
+    // Every command goes through the sink so the sender-assigned sequence
+    // stays 1:1 with the engine's `applied_command_seq` ack counter; the
+    // shadows use it to confirm edits and gate poll pushes (see shadows.rs).
+    let sink = Arc::new(CommandSink::new(cmd_tx));
+    let shadows = Arc::new(Mutex::new(Shadows::new(&engine_state.load())));
 
     // ── Restore last used converter folders from config ─────────────────────
     {
@@ -72,12 +79,12 @@ fn _run_gui(
             let path = std::path::Path::new(folder);
             if path.exists() {
                 ui.set_conv_selected_folder(SharedString::from(folder.as_str()));
-                let _ = cmd_tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(
+                sink.send(GuiCommand::Converter(ConverterCommand::SelectFolder(
                     path.to_path_buf(),
                 )));
                 // Auto-select first recording — deferred by the engine until
                 // the async folder scan completes, then applied race-free.
-                let _ = cmd_tx.send(GuiCommand::Converter(
+                sink.send(GuiCommand::Converter(
                     ConverterCommand::SelectRecording(0),
                 ));
             }
@@ -159,7 +166,7 @@ fn _run_gui(
         let ui_weak = ui.as_weak();
         let toasts_clone = toasts.clone();
         let next_id = next_toast_id.clone();
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
 
         let refresh = move || {
             let _ = cmd.send(GuiCommand::RefreshDevices);
@@ -197,7 +204,7 @@ fn _run_gui(
 
     // ── Theme toggle ────────────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_toggle_theme(move || {
             let _ = cmd.send(GuiCommand::ToggleTheme);
         });
@@ -239,64 +246,70 @@ fn _run_gui(
 
     // ── Transport callbacks ────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_start_ltc(move || { let _ = cmd.send(GuiCommand::StartLtc); });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_stop_ltc(move || { let _ = cmd.send(GuiCommand::StopLtc); });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_reset_tc(move || { let _ = cmd.send(GuiCommand::Reset); });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_toggle_lock(move || { let _ = cmd.send(GuiCommand::ToggleLock); });
     }
 
     // ── Clapper callbacks ──────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_clap_beep(move || { let _ = cmd.send(GuiCommand::Clap); });
     }
 
     // ── Scene / Take / Roll ────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_scene_up(move || { let _ = cmd.send(GuiCommand::SceneUp); });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_scene_down(move || { let _ = cmd.send(GuiCommand::SceneDown); });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_take_up(move || { let _ = cmd.send(GuiCommand::TakeUp); });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_take_down(move || { let _ = cmd.send(GuiCommand::TakeDown); });
     }
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
         ui.on_roll_changed(move |val| {
-            let _ = cmd.send(GuiCommand::SetRoll(val.to_string()));
+            let seq = sink.send(GuiCommand::SetRoll(val.to_string()));
+            shadows.lock().unwrap().roll.send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
         let ui_weak = ui.as_weak();
         ui.on_auto_increment_toggled(move || {
-            if let Some(u) = ui_weak.upgrade() {
-                let _ = cmd.send(GuiCommand::SetAutoIncrement(u.get_auto_increment()));
-            }
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.auto_increment.value();
+            let seq = sink.send(GuiCommand::SetAutoIncrement(val));
+            sh.auto_increment.send_and_mark(val, seq, Instant::now());
+            u.set_auto_increment(val);
         });
     }
 
     // ── Logs ───────────────────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_clear_logs(move || {
             let _ = cmd.send(GuiCommand::ClearLogs);
         });
@@ -360,43 +373,66 @@ fn _run_gui(
 
     // ── Timecode steppers ──────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
-        let cmd2 = cmd_tx.clone();
+        let cmd = sink.clone();
+        let cmd2 = sink.clone();
         ui.on_hour_up(move || { let _ = cmd.send(GuiCommand::HourUp); });
         ui.on_hour_down(move || { let _ = cmd2.send(GuiCommand::HourDown); });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cmd2 = cmd_tx.clone();
+        let cmd = sink.clone();
+        let cmd2 = sink.clone();
         ui.on_minute_up(move || { let _ = cmd.send(GuiCommand::MinuteUp); });
         ui.on_minute_down(move || { let _ = cmd2.send(GuiCommand::MinuteDown); });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cmd2 = cmd_tx.clone();
+        let cmd = sink.clone();
+        let cmd2 = sink.clone();
         ui.on_second_up(move || { let _ = cmd.send(GuiCommand::SecondUp); });
         ui.on_second_down(move || { let _ = cmd2.send(GuiCommand::SecondDown); });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cmd2 = cmd_tx.clone();
+        let cmd = sink.clone();
+        let cmd2 = sink.clone();
         ui.on_frame_up(move || { let _ = cmd.send(GuiCommand::FrameUp); });
         ui.on_frame_down(move || { let _ = cmd2.send(GuiCommand::FrameDown); });
     }
 
     // ── FPS selection ──────────────────────────────────────────────────────
+    // settings.slint sends the selected item's fps × 100; map it back to the
+    // FPS_OPTIONS index before sending.
     {
-        let cmd = cmd_tx.clone();
-        ui.on_fps_selected(move |index| { let _ = cmd.send(GuiCommand::SetFpsIndex(index as usize)); });
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_fps_selected(move |fps_x100| {
+            let fps_val = fps_x100 as f64 / 100.0;
+            let Some(idx) = FPS_OPTIONS.iter().position(|o| (o.fps - fps_val).abs() < 0.01) else {
+                return;
+            };
+            let seq = sink.send(GuiCommand::SetFpsIndex(idx));
+            let mut sh = shadows.lock().unwrap();
+            sh.fps_index.send_and_mark(idx, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_fps_index(idx as i32);
+            }
+        });
     }
 
     // ── Sample rate selection ──────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_sample_rate_tapped(move |_val| {
             if let Some(rate_str) = _val.split_whitespace().next() {
                 if let Ok(rate) = rate_str.parse::<u32>() {
-                    let _ = cmd.send(GuiCommand::SetSampleRate(rate));
+                    let idx = SAMPLE_RATE_OPTIONS.iter().position(|&r| r == rate).unwrap_or(0);
+                    let seq = sink.send(GuiCommand::SetSampleRate(rate));
+                    let mut sh = shadows.lock().unwrap();
+                    sh.sample_rate.send_and_mark(idx, seq, Instant::now());
+                    if let Some(u) = ui_weak.upgrade() {
+                        u.set_sample_rate_index(idx as i32);
+                    }
                 }
             }
         });
@@ -404,7 +440,7 @@ fn _run_gui(
 
     // ── Device selection ──────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         let state_for_device = engine_state.clone();
         ui.on_device_selected(move |index| {
             let s = state_for_device.load();
@@ -417,14 +453,14 @@ fn _run_gui(
     // ── Routing ───────────────────────────────────────────────────────────
     const CHANNEL_CHOICES: [ChannelSel; 3] = [ChannelSel::Left, ChannelSel::Right, ChannelSel::Both];
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_ltc_channel_selected(move |index| {
             let ch = CHANNEL_CHOICES[index as usize];
             let _ = cmd.send(GuiCommand::SetLtcChannel(ch));
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_beep_channel_selected(move |index| {
             let ch = CHANNEL_CHOICES[index as usize];
             let _ = cmd.send(GuiCommand::SetBeepChannel(ch));
@@ -433,25 +469,49 @@ fn _run_gui(
 
     // ── Volume / pitch / duration sliders ──────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
-        ui.on_ltc_volume_changed(move |val| { let _ = cmd.send(GuiCommand::SetLtcVolume(val)); });
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_ltc_volume_changed(move |val| {
+            let seq = sink.send(GuiCommand::SetLtcVolume(val));
+            shadows.lock().unwrap().ltc_volume.send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() { u.set_ltc_volume(val); }
+        });
     }
     {
-        let cmd = cmd_tx.clone();
-        ui.on_beep_volume_changed(move |val| { let _ = cmd.send(GuiCommand::SetBeepVolume(val)); });
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_beep_volume_changed(move |val| {
+            let seq = sink.send(GuiCommand::SetBeepVolume(val));
+            shadows.lock().unwrap().beep_volume.send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() { u.set_beep_volume(val); }
+        });
     }
     {
-        let cmd = cmd_tx.clone();
-        ui.on_beep_frequency_changed(move |val| { let _ = cmd.send(GuiCommand::SetBeepFrequency(val)); });
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_beep_frequency_changed(move |val| {
+            let seq = sink.send(GuiCommand::SetBeepFrequency(val));
+            shadows.lock().unwrap().beep_frequency.send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() { u.set_beep_frequency(val); }
+        });
     }
     {
-        let cmd = cmd_tx.clone();
-        ui.on_beep_duration_changed(move |val| { let _ = cmd.send(GuiCommand::SetBeepDuration(val)); });
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_beep_duration_changed(move |val| {
+            let seq = sink.send(GuiCommand::SetBeepDuration(val));
+            shadows.lock().unwrap().beep_duration.send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() { u.set_beep_duration(val); }
+        });
     }
 
     // ── Converter callbacks ──────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         let ui_weak = ui.as_weak();
         ui.on_conv_select_folder(move || {
             let dialog = rfd::FileDialog::new();
@@ -468,7 +528,7 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_conv_select_group(move |group_idx| {
             if group_idx >= 0 {
                 let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SelectRecording(
@@ -478,7 +538,7 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_conv_map_cell_clicked(move |row, col| {
             let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SwapChannelMapCells(
                 row as usize, col as usize,
@@ -486,31 +546,41 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_conv_start(move || {
             let _ = cmd.send(GuiCommand::Converter(ConverterCommand::StartConversion));
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_conv_cancel(move || {
             let _ = cmd.send(GuiCommand::Converter(ConverterCommand::CancelConversion));
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_toggle_embed_camera_meta(move || {
-            let val = !cache.lock().unwrap().embed_camera_metadata;
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetEmbedCameraMetadata(val)));
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.conv.embed_camera_metadata.value();
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetEmbedCameraMetadata(val)));
+            sh.conv.embed_camera_metadata.send_and_mark(val, seq, Instant::now());
+            u.set_conv_embed_camera_meta(val);
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_toggle_set_start_ltc(move || {
-            let val = !cache.lock().unwrap().set_start_from_ltc;
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetStartFromLtc(val)));
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.conv.set_start_from_ltc.value();
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetStartFromLtc(val)));
+            sh.conv.set_start_from_ltc.send_and_mark(val, seq, Instant::now());
+            u.set_set_start_from_ltc(val);
         });
     }
     {
@@ -524,46 +594,55 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_conv_container_selected(move |idx| {
-            let settings = cache.lock().unwrap();
             let options = gui_engine::converter::supported_containers();
             if idx >= 0 && (idx as usize) < options.len() {
                 let key = options[idx as usize].0.to_string();
-                drop(settings);
-                let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetContainer(key)));
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetContainer(key.clone())));
+                shadows.lock().unwrap().conv.container.send_and_mark(key.clone(), seq, Instant::now());
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_container(SharedString::from(key));
+                }
             }
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_conv_video_selected(move |idx| {
-            let settings = cache.lock().unwrap();
             let options = gui_engine::video_codecs::supported_video_codecs();
             if idx >= 0 && (idx as usize) < options.len() {
                 let key = options[idx as usize].0.to_string();
-                drop(settings);
-                let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetVideoCodec(key)));
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetVideoCodec(key.clone())));
+                shadows.lock().unwrap().conv.video_encoder.send_and_mark(key.clone(), seq, Instant::now());
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_video_encoder(SharedString::from(key));
+                }
             }
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_conv_audio_selected(move |idx| {
-            let settings = cache.lock().unwrap();
             let options = gui_engine::converter::supported_audio_encoders();
             if idx >= 0 && (idx as usize) < options.len() {
                 let key = options[idx as usize].0.to_string();
-                drop(settings);
-                let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetAudioEncoder(key)));
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetAudioEncoder(key.clone())));
+                shadows.lock().unwrap().conv.audio_encoder.send_and_mark(key.clone(), seq, Instant::now());
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_conv_audio_encoder(SharedString::from(key));
+                }
             }
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         let ui_weak = ui.as_weak();
         ui.on_conv_select_output_folder(move || {
             let dialog = rfd::FileDialog::new();
@@ -578,110 +657,185 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
         ui.on_conv_filename_prefix_changed(move |val| {
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(
                 val.to_string(),
             )));
+            shadows.lock().unwrap().conv.filename_prefix.send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
         ui.on_conv_audio_suffix_changed(move |val| {
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(
                 val.to_string(),
             )));
+            shadows.lock().unwrap().conv.audio_suffix_template.send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
         ui.on_conv_video_suffix_changed(move |val| {
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(
                 val.to_string(),
             )));
+            shadows.lock().unwrap().conv.video_suffix_template.send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_toggle_split_tracks(move || {
-            let val = !cache.lock().unwrap().split_tracks;
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetSplitTracks(val)));
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.conv.split_tracks.value();
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetSplitTracks(val)));
+            sh.conv.split_tracks.send_and_mark(val, seq, Instant::now());
+            u.set_conv_split_tracks(val);
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_toggle_drop_ltc_track(move || {
-            let val = !cache.lock().unwrap().drop_ltc_track;
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(val)));
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.conv.drop_ltc_track.value();
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(val)));
+            sh.conv.drop_ltc_track.send_and_mark(val, seq, Instant::now());
+            u.set_conv_drop_ltc_track(val);
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_toggle_concat_audio(move || {
-            let val = !cache.lock().unwrap().concat_audio;
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetConcatAudio(val)));
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.conv.concat_audio.value();
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetConcatAudio(val)));
+            sh.conv.concat_audio.send_and_mark(val, seq, Instant::now());
+            u.set_conv_concat_audio(val);
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_toggle_synthetic_video(move || {
-            let val = !cache.lock().unwrap().generate_synthetic_video;
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(val)));
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.conv.generate_synthetic_video.value();
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(val)));
+            sh.conv.generate_synthetic_video.send_and_mark(val, seq, Instant::now());
+            u.set_conv_generate_synthetic_video(val);
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_toggle_copy_video(move || {
-            let val = !cache.lock().unwrap().copy_video;
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetCopyVideo(val)));
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.conv.copy_video.value();
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetCopyVideo(val)));
+            sh.conv.copy_video.send_and_mark(val, seq, Instant::now());
+            u.set_conv_copy_video(val);
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_toggle_metadata_only(move || {
-            let val = !cache.lock().unwrap().metadata_only;
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetMetadataOnly(val)));
+            let Some(u) = ui_weak.upgrade() else { return };
+            let mut sh = shadows.lock().unwrap();
+            let val = !*sh.conv.metadata_only.value();
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetMetadataOnly(val)));
+            sh.conv.metadata_only.send_and_mark(val, seq, Instant::now());
+            u.set_conv_metadata_only(val);
         });
     }
     {
-        let cmd = cmd_tx.clone();
-        let cache = conv_settings_cache.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_conv_reset(move || {
-            *cache.lock().unwrap() = ConverterUserSettings::initial();
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetMetadataOnly(false)));
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetSplitTracks(false)));
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(false)));
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetConcatAudio(false)));
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(false)));
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetCopyVideo(false)));
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(String::new())));
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(
-                gui_engine::naming::DEFAULT_AUDIO_SUFFIX.to_string(),
-            )));
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(
-                gui_engine::naming::DEFAULT_VIDEO_SUFFIX.to_string(),
-            )));
+            let mut sh = shadows.lock().unwrap();
+            let mark_bool = |es: &mut gui_engine::edit_state::EditState<bool>, cmd| {
+                let seq = sink.send(cmd);
+                es.send_and_mark(false, seq, Instant::now());
+            };
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_conv_metadata_only(false);
+                u.set_conv_split_tracks(false);
+                u.set_conv_drop_ltc_track(false);
+                u.set_conv_concat_audio(false);
+                u.set_conv_generate_synthetic_video(false);
+                u.set_conv_copy_video(false);
+            }
+            mark_bool(&mut sh.conv.metadata_only,
+                GuiCommand::Converter(ConverterCommand::SetMetadataOnly(false)));
+            mark_bool(&mut sh.conv.split_tracks,
+                GuiCommand::Converter(ConverterCommand::SetSplitTracks(false)));
+            mark_bool(&mut sh.conv.drop_ltc_track,
+                GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(false)));
+            mark_bool(&mut sh.conv.concat_audio,
+                GuiCommand::Converter(ConverterCommand::SetConcatAudio(false)));
+            mark_bool(&mut sh.conv.generate_synthetic_video,
+                GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(false)));
+            mark_bool(&mut sh.conv.copy_video,
+                GuiCommand::Converter(ConverterCommand::SetCopyVideo(false)));
+            {
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(String::new())));
+                sh.conv.filename_prefix.send_and_mark(String::new(), seq, Instant::now());
+            }
+            {
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(
+                    gui_engine::naming::DEFAULT_AUDIO_SUFFIX.to_string(),
+                )));
+                sh.conv.audio_suffix_template.send_and_mark(
+                    gui_engine::naming::DEFAULT_AUDIO_SUFFIX.to_string(), seq, Instant::now(),
+                );
+            }
+            {
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(
+                    gui_engine::naming::DEFAULT_VIDEO_SUFFIX.to_string(),
+                )));
+                sh.conv.video_suffix_template.send_and_mark(
+                    gui_engine::naming::DEFAULT_VIDEO_SUFFIX.to_string(), seq, Instant::now(),
+                );
+            }
         });
     }
 
     // ── LTC file index changed callback ────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_ltc_file_selected(move |idx| {
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(idx as usize)));
+            let idx = idx as usize;
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(idx)));
+            shadows.lock().unwrap().conv.ltc_file_idx.send_and_mark(idx, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_ltc_file_idx(idx as i32);
+            }
         });
     }
 
     // ── LTC detection callback ─────────────────────────────────────────────
     {
         let ui_weak = ui.as_weak();
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         let detect_engine_state = engine_state.clone();
         ui.on_ltc_detect(move || {
             let s = detect_engine_state.load();
@@ -746,7 +900,7 @@ fn _run_gui(
 
     // ── Channel selection callback (for video probe) ──────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         let chan_engine_state = engine_state.clone();
         ui.on_channel_selected(move |flat_idx| {
             let s = chan_engine_state.load();
@@ -768,15 +922,22 @@ fn _run_gui(
 
     // ── Decode FPS selection callback ───────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
+        let ui_weak = ui.as_weak();
         ui.on_decode_fps_selected(move |index| {
-            let _ = cmd.send(GuiCommand::SetDecodeFpsIndex(index as usize));
+            let idx = index as usize;
+            let seq = sink.send(GuiCommand::SetDecodeFpsIndex(idx));
+            shadows.lock().unwrap().decode_fps_index.send_and_mark(idx, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_decode_fps_index(idx as i32);
+            }
         });
     }
 
     // ── Cancel LTC decode callback ───────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_cancel_decode(move || {
             let _ = cmd.send(GuiCommand::CancelDecode);
         });
@@ -883,7 +1044,7 @@ fn _run_gui(
 
     // ── Offload callbacks ───────────────────────────────────────────────────
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         let ui_weak = ui.as_weak();
         ui.on_off_select_parent_folder(move || {
             let mut dialog = rfd::FileDialog::new();
@@ -900,15 +1061,17 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let sink = sink.clone();
+        let shadows = shadows.clone();
         ui.on_off_parent_name_changed(move |val| {
-            let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetParentName(
+            let seq = sink.send(GuiCommand::Offload(OffloadCommand::SetParentName(
                 val.to_string(),
             )));
+            shadows.lock().unwrap().parent_name.send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_off_card_name_changed(move |idx, val| {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetDeviceName(
                 idx as usize, val.to_string(),
@@ -916,25 +1079,25 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_off_rescan(move || {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::ScanCards));
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_off_start(move || {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::StartOffload));
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_off_cancel(move || {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::CancelOffload));
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_off_file_toggled(move |card_idx, file_idx, sel| {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetFileSelected(
                 card_idx as usize, file_idx as usize, sel,
@@ -942,7 +1105,7 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_off_select_all_files(move |card_idx, sel| {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(
                 card_idx as usize, sel,
@@ -950,7 +1113,7 @@ fn _run_gui(
         });
     }
     {
-        let cmd = cmd_tx.clone();
+        let cmd = sink.clone();
         ui.on_off_select_latest_day(move |card_idx| {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SelectLatestDay(
                 card_idx as usize,
@@ -968,7 +1131,7 @@ fn _run_gui(
         log_buffer,
         last_debug_log_count,
         pulse_phase,
-        conv_settings_cache,
+        shadows,
     );
 
     info!("LTC Slint GUI initialized, showing window");
