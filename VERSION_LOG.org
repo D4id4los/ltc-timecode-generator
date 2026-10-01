@@ -1,6 +1,44 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — state audit and cleanup
+
+A full audit of the published application state
+(`gui-engine::state::AppStateSnapshot`) — necessity, grouping, and
+type quality — followed by a three-phase cleanup.  No user-visible
+behaviour changes except where noted.
+
+List of Changes:
+- Dead state removed: `generation` (bumped every tick, never read),
+  `wake_lock_active` (could never be true; its status chip is gone
+  from both GUIs), `ltc_decode_is_video` (write-only), the
+  "Trim to first LTC frame" toggle (a no-op — the pipeline supported
+  trimming but the engine always passed zero offsets; embedding the
+  start timecode from LTC remains the sync mechanism), the decorative
+  naming-pattern selector in the Slint converter (the engine always
+  scans with all patterns; its display branches now key off each
+  group's actual recording type), plus published-but-unread
+  `output_preview`/`encoder_chain_desc`, `system_time` (the egui GUI
+  now formats its own clock, as Slint already did), and several
+  set-only fields.
+- Type upgrades: LTC/beep channel routing is a `ChannelSel` enum
+  instead of `"left"/"right"/"both"` strings end-to-end (CLI,
+  engine, audio-core); FPS is stored only as an index with `fps()` /
+  `drop_frame()` accessors replacing four lockstep-maintained fields;
+  the three parallel group-decode vectors collapse into a single
+  `Vec<ClipDecodeState>`; `JobStatus` is now a `ProgressSnapshot`
+  plus an error; `ClapLogItem.id` is a `u64`;
+  `LtcQualityReport.grade` is a `QualityGrade` enum.
+- Regrouping: the ten loose LTC-decode fields move into
+  `AppStateSnapshot.decode` and the eight clapper/animation fields
+  into `AppStateSnapshot.clapper`; device selection is by stable
+  device id instead of an index into the (volatile) device list, so
+  re-scans can no longer silently repoint the selection; the egui
+  GUI dropped its duplicate copies of the LTC track index and the
+  selected converter folder.
+- All workspace clippy warnings fixed (the codebase is now
+  warning-free under the workspace lint configuration).
+
 * v0.4.7
 
 Main features are a hardened, more responsive card-offload workflow —
