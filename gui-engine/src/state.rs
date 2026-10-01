@@ -252,7 +252,9 @@ pub struct AppStateSnapshot {
 
     // Audio device
     pub devices: Vec<AudioDeviceInfo>,
-    pub selected_device: usize,
+    /// Selected output device by stable id (`AudioDeviceInfo::id`).
+    /// `None` = automatic (default/first available device).
+    pub selected_device: Option<String>,
     /// Engine-internal working flag: whether the audio output stream was
     /// successfully initialized.  Not rendered by any GUI.
     pub audio_initialized: bool,
@@ -323,7 +325,7 @@ impl AppStateSnapshot {
             beep_frequency: 1000.0,
             beep_duration: 0.5,
             devices: Vec::new(),
-            selected_device: 0,
+            selected_device: None,
             audio_initialized: false,
             sample_rate: suggest_sr,
             sample_format_name: String::new(),
@@ -481,7 +483,7 @@ mod tests {
     fn test_initial_audio_state() {
         let s = initial_state();
         assert!(s.devices.is_empty());
-        assert_eq!(s.selected_device, 0);
+        assert!(s.selected_device.is_none());
         assert!(!s.audio_initialized);
         assert!(s.sample_format_name.is_empty());
     }

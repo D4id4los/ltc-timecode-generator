@@ -60,7 +60,7 @@ pub fn engine_main_with_probe<F>(
     let mut recovery_attempts: u8 = 0;
     let mut log_id_counter: u64 = 0;
     let mut last_device_id: Option<String> = None;
-    let mut previous_device: Option<usize> = None;
+    let mut previous_device: Option<String> = None;
 
     // Engine-internal auto-apply latches — user un-ticks survive decode re-runs
     let mut last_auto_applied_ltc_gen: u64 = 0;
@@ -880,7 +880,7 @@ fn process_command(
     recovery_attempts: &mut u8,
     log_id_counter: &mut u64,
     last_device_id: &mut Option<String>,
-    previous_device: &mut Option<usize>,
+    previous_device: &mut Option<String>,
     supervisor: &mut JobSupervisor,
 ) {
     match cmd {
@@ -974,7 +974,7 @@ fn process_command(
             state.sample_rate = rate;
         }
 
-        GuiCommand::SetDevice(index) => {
+        GuiCommand::SetDevice(device_id) => {
             if state.is_playing {
                 let _ = core.stop_ltc();
                 state.is_playing = false;
@@ -983,17 +983,19 @@ fn process_command(
             let _ = core.stop_output();
             state.audio_initialized = false;
 
-            *previous_device = Some(state.selected_device);
-            state.selected_device = index;
+            *previous_device = state.selected_device.clone();
+            state.selected_device = Some(device_id);
 
             if !try_init_device(core, state, last_device_id, recovery_attempts) {
                 // Revert to previous device
-                if let Some(prev) = previous_device {
-                    state.selected_device = *prev;
-                    if try_init_device(core, state, last_device_id, recovery_attempts) {
-                        state.status_message =
-                            "Device selection reverted to previous".to_string();
-                    }
+                state.selected_device = previous_device.take();
+                if try_init_device(core, state, last_device_id, recovery_attempts) {
+                    state.status_message =
+                        "Device selection reverted to previous".to_string();
+                } else {
+                    // Previous selection may have been automatic (None);
+                    // fall back to the default/first device.
+                    ensure_audio_init(core, state, last_device_id, recovery_attempts);
                 }
             }
         }
@@ -1002,8 +1004,12 @@ fn process_command(
             match audio_core::list_audio_devices() {
                 Ok(devices) => {
                     state.devices = devices;
-                    if state.selected_device >= state.devices.len() {
-                        state.selected_device = 0;
+                    // Drop the selection if the chosen device vanished;
+                    // the next init falls back to the default/first device.
+                    if let Some(ref id) = state.selected_device {
+                        if !state.devices.iter().any(|d| &d.id == id) {
+                            state.selected_device = None;
+                        }
                     }
                     state.status_message =
                         format!("{} devices found", state.devices.len());
@@ -1474,13 +1480,14 @@ fn ensure_audio_init(
         return true;
     }
 
-    let device_id = if state.selected_device < state.devices.len() {
-        state.devices[state.selected_device].id.clone()
-    } else if !state.devices.is_empty() {
-        state.selected_device = 0;
-        state.devices[0].id.clone()
-    } else {
-        String::new()
+    let device_id = match &state.selected_device {
+        Some(id) if state.devices.iter().any(|d| &d.id == id) => id.clone(),
+        _ if !state.devices.is_empty() => {
+            let fallback = state.devices[0].id.clone();
+            state.selected_device = Some(fallback.clone());
+            fallback
+        }
+        _ => String::new(),
     };
 
     let max_attempts = 3;
@@ -1527,10 +1534,9 @@ fn try_init_device(
     last_device_id: &mut Option<String>,
     recovery_attempts: &mut u8,
 ) -> bool {
-    let device_id = if state.selected_device < state.devices.len() {
-        state.devices[state.selected_device].id.clone()
-    } else {
-        return false;
+    let device_id = match &state.selected_device {
+        Some(id) if state.devices.iter().any(|d| &d.id == id) => id.clone(),
+        _ => return false,
     };
 
     match core.init_output(&device_id, state.sample_rate, BUFFER_SIZE) {

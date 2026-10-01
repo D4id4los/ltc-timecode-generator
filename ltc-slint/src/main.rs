@@ -180,7 +180,11 @@ fn _run_gui(
                 .collect();
             ui.set_device_names(ModelRc::new(VecModel::<SharedString>::from(device_names)));
             ui.set_device_count(s.devices.len() as i32);
-            ui.set_device_index(s.selected_device as i32);
+            let dev_idx = s.selected_device.as_ref()
+                .and_then(|id| s.devices.iter().position(|d| &d.id == id))
+                .map(|i| i as i32)
+                .unwrap_or(-1);
+            ui.set_device_index(dev_idx);
             if !s.devices.is_empty() {
                 push_toast(&toasts_clone, &next_id, &ui, &format!("{} devices found", s.devices.len()), "info");
             }
@@ -403,7 +407,13 @@ fn _run_gui(
     // ── Device selection ──────────────────────────────────────────────────
     {
         let cmd = cmd_tx.clone();
-        ui.on_device_selected(move |index| { let _ = cmd.send(GuiCommand::SetDevice(index as usize)); });
+        let state_for_device = engine_state.clone();
+        ui.on_device_selected(move |index| {
+            let s = state_for_device.load();
+            if let Some(dev) = s.devices.get(index as usize) {
+                let _ = cmd.send(GuiCommand::SetDevice(dev.id.clone()));
+            }
+        });
     }
 
     // ── Routing ───────────────────────────────────────────────────────────

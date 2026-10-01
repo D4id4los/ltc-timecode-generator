@@ -203,14 +203,18 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
                 if device_names.is_empty() {
                     ui.label(RichText::new("No devices found — using default output").font(FontId::monospace(12.0)).color(colors.text_muted));
                 } else {
-                    let selected_text = device_names.get(state.latest.selected_device).cloned().unwrap_or_else(|| "Default".to_string());
+                    let selected_text = state.latest.selected_device.as_ref()
+                        .and_then(|id| state.latest.devices.iter().find(|d| &d.id == id))
+                        .map(|d| if d.is_default { format!("{} (Default)", d.name) } else { d.name.clone() })
+                        .unwrap_or_else(|| "Default".to_string());
                     ui.label(RichText::new("Interface:").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
                     egui::ComboBox::from_id_salt("settings_device_combo")
                         .selected_text(&selected_text)
                         .show_ui(ui, |ui| {
-                            for (i, _name) in device_names.iter().enumerate() {
-                                if ui.selectable_label(false, &device_names[i]).clicked() {
-                                    state.send(GuiCommand::SetDevice(i));
+                            for (i, dev) in state.latest.devices.iter().enumerate() {
+                                let active = state.latest.selected_device.as_ref() == Some(&dev.id);
+                                if ui.selectable_label(active, &device_names[i]).clicked() {
+                                    state.send(GuiCommand::SetDevice(dev.id.clone()));
                                 }
                             }
                         });

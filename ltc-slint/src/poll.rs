@@ -229,7 +229,11 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             ui.set_flash_opacity(s.clapper.flash_alpha);
 
             // 17. Device selection sync
-            ui.set_device_index(s.selected_device as i32);
+            let dev_idx = s.selected_device.as_ref()
+                .and_then(|id| s.devices.iter().position(|d| &d.id == id))
+                .map(|i| i as i32)
+                .unwrap_or(-1);
+            ui.set_device_index(dev_idx);
 
             // 18. Volume / pitch / duration
             ui.set_ltc_volume(s.ltc_volume);

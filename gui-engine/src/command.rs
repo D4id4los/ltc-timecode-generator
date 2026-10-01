@@ -18,7 +18,7 @@ pub enum GuiCommand {
     // ── Audio ────────────────────────────────────────────────────────────
     InitAudio,
     SetSampleRate(u32),
-    SetDevice(usize),
+    SetDevice(String),
     RefreshDevices,
     SetLtcChannel(ChannelSel),
     SetBeepChannel(ChannelSel),
