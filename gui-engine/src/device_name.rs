@@ -526,7 +526,7 @@ mod tests {
         // DEVICE_NAME_PROBE_SAMPLE = 3 → step 1 must NOT find it.
         // Use `clipNNNN.mp4` suffix — no camera pattern matches `clip*`.
         for i in 0..3 {
-            let f = dir.path().join(&format!("clip{:04}.mp4", i));
+            let f = dir.path().join(format!("clip{:04}.mp4", i));
             let content = vec![0u8; 5000];
             fs::write(&f, &content).unwrap();
         }
@@ -557,7 +557,7 @@ mod tests {
         content0[4500..4500 + xml.len()].copy_from_slice(xml);
         fs::write(dir.path().join("clip0000.mp4"), &content0).unwrap();
         for i in 1..6 {
-            fs::write(dir.path().join(&format!("clip{:04}.mp4", i)), vec![0u8; 5000]).unwrap();
+            fs::write(dir.path().join(format!("clip{:04}.mp4", i)), vec![0u8; 5000]).unwrap();
         }
 
         let mut files: Vec<_> = std::fs::read_dir(dir.path()).unwrap()

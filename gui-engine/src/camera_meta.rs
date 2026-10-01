@@ -235,7 +235,7 @@ fn parse_exiftool_json(stdout: &str) -> Option<CameraInfo> {
                 .map(|s| s.to_string())
         });
 
-    let exposure_summary = build_exposure_summary(&entry);
+    let exposure_summary = build_exposure_summary(entry);
 
     Some(CameraInfo {
         make,

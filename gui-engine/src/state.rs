@@ -402,7 +402,7 @@ impl AppStateSnapshot {
 
 fn job_idle_default() -> &'static JobStatus {
     static IDLE: OnceLock<JobStatus> = OnceLock::new();
-    IDLE.get_or_init(|| JobStatus::idle())
+    IDLE.get_or_init(JobStatus::idle)
 }
 
 #[cfg(test)]

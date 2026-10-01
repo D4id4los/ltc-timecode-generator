@@ -95,8 +95,8 @@ pub fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<
 
     args.push("-shortest".to_string());
     let format = container_to_ffmpeg_format(&settings.container);
-    push_metadata_args(&mut args, settings, None, &format);
-    push_output_trailer(&mut args, &format);
+    push_metadata_args(&mut args, settings, None, format);
+    push_output_trailer(&mut args, format);
 
     args
 }
@@ -128,8 +128,8 @@ pub fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> V
     }
 
     let format = container_to_ffmpeg_format(&settings.container);
-    push_metadata_args(&mut args, settings, Some(file_idx), &format);
-    push_output_trailer(&mut args, &format);
+    push_metadata_args(&mut args, settings, Some(file_idx), format);
+    push_output_trailer(&mut args, format);
     args
 }
 
@@ -249,8 +249,8 @@ pub fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep:
     }
 
     let format = container_to_ffmpeg_format(&settings.container);
-    push_metadata_args(&mut args, settings, Some(file_idx), &format);
-    push_output_trailer(&mut args, &format);
+    push_metadata_args(&mut args, settings, Some(file_idx), format);
+    push_output_trailer(&mut args, format);
     args
 }
 

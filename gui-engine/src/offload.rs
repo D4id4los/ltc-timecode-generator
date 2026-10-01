@@ -661,7 +661,7 @@ fn detect_cards_from_mounts(
 /// `deadline` caps the overall time spent on I/O-heavy probe steps.
 fn classify_mount(mount: &Path, _label_source: &Path, deadline: Instant) -> Option<SdCardInfo> {
     let mut infos = collect_media_files_shallow(mount);
-    infos.sort_by(|a, b| b.modified.cmp(&a.modified));
+    infos.sort_by_key(|i| std::cmp::Reverse(i.modified));
     let media_files: Vec<PathBuf> = infos.iter().map(|f| f.path.clone()).collect();
     let total_bytes: u64 = infos.iter().map(|f| f.size_bytes).sum();
     let volume_label = volume_label_for(mount);

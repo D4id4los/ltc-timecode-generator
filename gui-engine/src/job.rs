@@ -419,7 +419,8 @@ pub enum JobItem {
     },
     ClipLtcResult {
         index: usize,
-        result: Result<LtcDetectionResult, String>,
+        /// Boxed to keep this variant's size close to `DurationResult`.
+        result: Result<Box<LtcDetectionResult>, String>,
     },
 }
 

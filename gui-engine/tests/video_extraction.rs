@@ -437,7 +437,7 @@ fn test_group_decode_progress_reaches_100_percent() {
             if s.job(JobKind::LtcGroupDecode).fraction() > max_pct {
                 max_pct = s.job(JobKind::LtcGroupDecode).fraction();
             }
-            if s.decode.group_results.len() > 0 && matches!(s.job(JobKind::LtcGroupDecode).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
+            if !s.decode.group_results.is_empty() && matches!(s.job(JobKind::LtcGroupDecode).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
                 return true;
             }
             Instant::now() > *deadline

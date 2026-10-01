@@ -588,7 +588,7 @@ pub fn engine_main_with_probe<F>(
                 }
                 JobEvent::Item { kind: JobKind::LtcGroupDecode, item: JobItem::ClipLtcResult { index, result }, .. } => {
                     if current.decode.group_results.len() > index {
-                        current.decode.group_results[index] = ClipDecodeState::Done(result.map(Box::new));
+                        current.decode.group_results[index] = ClipDecodeState::Done(result);
                         let done = current.decode.group_results.iter().filter(|r| r.is_done()).count();
                         current.status_message = format!(
                             "Decoding group: {}/{} clips",
@@ -1152,7 +1152,7 @@ fn process_command(
                         use_libltc, decode_fps, decode_drop_frame, capture_gen,
                         &cancel, &|_| {},
                         Some(clip_unit),
-                    );
+                    ).map(Box::new);
                     if ctx.cancel.is_cancelled() {
                         return Err(job::JobError::Cancelled);
                     }
@@ -1394,7 +1394,7 @@ fn process_command(
 
                 let path_final = path_job;
                 Ok(JobFinal::Decode {
-                    result: result.map_err(|e| e),
+                    result,
                     path: PathBuf::from(path_final),
                 })
             });
@@ -2887,7 +2887,7 @@ mod tests {
 
         assert!(state.ffmpeg_caps.is_some(), "caps should be stored");
         let stored = state.ffmpeg_caps.as_ref().unwrap();
-        assert_eq!(stored.has_ffmpeg, true);
+        assert!(stored.has_ffmpeg);
     }
 
     // ── ClearRecordingDecodeState ──────────────────────────────────────────
