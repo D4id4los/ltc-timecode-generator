@@ -4,6 +4,7 @@ use gui_engine::{timecode::FPS_OPTIONS, ChannelSel};
 
 use crate::app::AppState;
 use crate::theme::ACCENT;
+use super::bound;
 
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
@@ -66,10 +67,10 @@ fn render_timecode_steppers(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_enabled_ui(!is_playing, |ui| {
         ui.columns(4, |cols| {
-            stepper_card_col(&mut cols[0], "HOURS", tc.hours, 24, &colors, || state.send(GuiCommand::HourUp), || state.send(GuiCommand::HourDown));
-            stepper_card_col(&mut cols[1], "MINUTES", tc.minutes, 60, &colors, || state.send(GuiCommand::MinuteUp), || state.send(GuiCommand::MinuteDown));
-            stepper_card_col(&mut cols[2], "SECONDS", tc.seconds, 60, &colors, || state.send(GuiCommand::SecondUp), || state.send(GuiCommand::SecondDown));
-            stepper_card_col(&mut cols[3], "FRAMES", tc.frames, max_frames, &colors, || state.send(GuiCommand::FrameUp), || state.send(GuiCommand::FrameDown));
+            stepper_card_col(&mut cols[0], "HOURS", tc.hours, 24, &colors, GuiCommand::HourUp, GuiCommand::HourDown, state);
+            stepper_card_col(&mut cols[1], "MINUTES", tc.minutes, 60, &colors, GuiCommand::MinuteUp, GuiCommand::MinuteDown, state);
+            stepper_card_col(&mut cols[2], "SECONDS", tc.seconds, 60, &colors, GuiCommand::SecondUp, GuiCommand::SecondDown, state);
+            stepper_card_col(&mut cols[3], "FRAMES", tc.frames, max_frames, &colors, GuiCommand::FrameUp, GuiCommand::FrameDown, state);
         });
     });
 }
@@ -77,7 +78,7 @@ fn render_timecode_steppers(ui: &mut Ui, state: &mut AppState) {
 fn stepper_card_col(
     ui: &mut Ui, label: &str, value: u32, _max: u32,
     colors: &crate::theme::ThemeColors,
-    on_up: impl FnOnce(), on_down: impl FnOnce(),
+    cmd_up: GuiCommand, cmd_down: GuiCommand, state: &mut AppState,
 ) {
     let card = egui::Frame::new()
         .fill(colors.deep_bg)
@@ -86,13 +87,13 @@ fn stepper_card_col(
         .inner_margin(egui::Margin::symmetric(10, 8));
     card.show(ui, |ui| {
         ui.vertical_centered(|ui| {
-            if ui.button(RichText::new("^").strong()).clicked() { on_up(); }
+            if ui.button(RichText::new("^").strong()).clicked() { state.send(cmd_up.clone()); }
             ui.add_space(1.0);
             ui.label(RichText::new(format!("{:02}", value)).font(FontId::monospace(20.0)).color(colors.text_title).strong());
             ui.add_space(1.0);
             ui.label(RichText::new(label).font(FontId::proportional(7.5)).color(colors.text_muted).strong());
             ui.add_space(1.0);
-            if ui.button(RichText::new("v").strong()).clicked() { on_down(); }
+            if ui.button(RichText::new("v").strong()).clicked() { state.send(cmd_down.clone()); }
         });
     });
 }
@@ -154,6 +155,8 @@ fn render_sample_rate(ui: &mut Ui, state: &mut AppState) {
     let is_playing = state.latest.is_playing;
     let rates = gui_engine::SAMPLE_RATE_OPTIONS;
     let selected_rate = state.latest.sample_rate;
+    bound::sync(state, |s| &mut s.sh.sample_rate, selected_rate);
+    let selected_rate = *state.sh.sample_rate.value();
     ui.add_enabled_ui(!is_playing, |ui| {
         let width = ui.available_width();
         if width > 300.0 {
@@ -166,7 +169,7 @@ fn render_sample_rate(ui: &mut Ui, state: &mut AppState) {
                         egui::Button::new(RichText::new(format!("{} Hz", rate))).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
                     };
                     if ui.add(btn).clicked() {
-                        state.send(GuiCommand::SetSampleRate(rate));
+                        bound::select_value(state, |s| &mut s.sh.sample_rate, selected_rate, rate, GuiCommand::SetSampleRate);
                     }
                 }
             });
@@ -179,7 +182,7 @@ fn render_sample_rate(ui: &mut Ui, state: &mut AppState) {
                     egui::Button::new(RichText::new(format!("{} Hz", rate))).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
                 };
                 if ui.add(btn).clicked() {
-                    state.send(GuiCommand::SetSampleRate(rate));
+                    bound::select_value(state, |s| &mut s.sh.sample_rate, selected_rate, rate, GuiCommand::SetSampleRate);
                 }
                 ui.add_space(6.0);
             }
@@ -203,7 +206,9 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
                 if device_names.is_empty() {
                     ui.label(RichText::new("No devices found — using default output").font(FontId::monospace(12.0)).color(colors.text_muted));
                 } else {
-                    let selected_text = state.latest.selected_device.as_ref()
+                    let selected = state.sh.selected_device.value().clone();
+                    let selected_text = selected
+                        .as_ref()
                         .and_then(|id| state.latest.devices.iter().find(|d| &d.id == id))
                         .map(|d| if d.is_default { format!("{} (Default)", d.name) } else { d.name.clone() })
                         .unwrap_or_else(|| "Default".to_string());
@@ -211,10 +216,16 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
                     egui::ComboBox::from_id_salt("settings_device_combo")
                         .selected_text(&selected_text)
                         .show_ui(ui, |ui| {
-                            for (i, dev) in state.latest.devices.iter().enumerate() {
-                                let active = state.latest.selected_device.as_ref() == Some(&dev.id);
+                            for (i, dev) in state.latest.devices.clone().into_iter().enumerate() {
+                                let active = selected.as_ref() == Some(&dev.id);
                                 if ui.selectable_label(active, &device_names[i]).clicked() {
-                                    state.send(GuiCommand::SetDevice(dev.id.clone()));
+                                    bound::select_value(
+                                        state,
+                                        |s| &mut s.sh.selected_device,
+                                        selected.clone(),
+                                        Some(dev.id.clone()),
+                                        |id| GuiCommand::SetDevice(id.unwrap_or_default()),
+                                    );
                                 }
                             }
                         });
@@ -266,8 +277,12 @@ fn render_routing_and_volume(ui: &mut Ui, state: &mut AppState) {
 
 fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let ltc_ch = &state.latest.ltc_channel;
-    let beep_ch = &state.latest.beep_channel;
+    let ltc_truth = state.latest.ltc_channel;
+    let beep_truth = state.latest.beep_channel;
+    bound::sync(state, |s| &mut s.sh.ltc_channel, ltc_truth);
+    bound::sync(state, |s| &mut s.sh.beep_channel, beep_truth);
+    let ltc_ch = *state.sh.ltc_channel.value();
+    let beep_ch = *state.sh.beep_channel.value();
 
     const CHANNEL_CHOICES: [(ChannelSel, &str); 3] = [
         (ChannelSel::Left, "Left"),
@@ -279,14 +294,14 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         for (val, lbl) in CHANNEL_CHOICES {
-            let active = *ltc_ch == val;
+            let active = ltc_ch == val;
             let btn = if active {
                 egui::Button::new(RichText::new(lbl).strong().color(Color32::BLACK)).fill(ACCENT)
             } else {
                 egui::Button::new(RichText::new(lbl)).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
             };
             if ui.add(btn).clicked() {
-                state.send(GuiCommand::SetLtcChannel(val));
+                bound::select_value(state, |s| &mut s.sh.ltc_channel, ltc_truth, val, GuiCommand::SetLtcChannel);
             }
         }
     });
@@ -296,14 +311,14 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         for (val, lbl) in CHANNEL_CHOICES {
-            let active = *beep_ch == val;
+            let active = beep_ch == val;
             let btn = if active {
                 egui::Button::new(RichText::new(lbl).strong().color(Color32::BLACK)).fill(ACCENT)
             } else {
                 egui::Button::new(RichText::new(lbl)).stroke(egui::Stroke::new(0.5, colors.border_main)).fill(colors.card_bg)
             };
             if ui.add(btn).clicked() {
-                state.send(GuiCommand::SetBeepChannel(val));
+                bound::select_value(state, |s| &mut s.sh.beep_channel, beep_truth, val, GuiCommand::SetBeepChannel);
             }
         }
     });
@@ -312,39 +327,35 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
 fn render_sliders(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
 
-    let mut vol = state.latest.ltc_volume;
+    let truth = state.latest.ltc_volume;
     ui.horizontal(|ui| {
         ui.label(RichText::new("LTC VOL").font(FontId::monospace(9.0)).color(colors.text_muted));
-        if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).step_by(0.01).show_value(false)).changed() {
-            state.send(GuiCommand::SetLtcVolume(vol));
-        }
-        ui.label(RichText::new(format!("{}%", (vol * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
+        bound::slider(ui, state, |s| &mut s.sh.ltc_volume, truth, 0.0..=1.0, Some(0.01), GuiCommand::SetLtcVolume);
+        let shown = *state.sh.ltc_volume.value();
+        ui.label(RichText::new(format!("{}%", (shown * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
-    let mut beep_vol = state.latest.beep_volume;
+    let truth = state.latest.beep_volume;
     ui.horizontal(|ui| {
         ui.label(RichText::new("BEEP VOL").font(FontId::monospace(9.0)).color(colors.text_muted));
-        if ui.add(egui::Slider::new(&mut beep_vol, 0.0..=1.0).step_by(0.01).show_value(false)).changed() {
-            state.send(GuiCommand::SetBeepVolume(beep_vol));
-        }
-        ui.label(RichText::new(format!("{}%", (beep_vol * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
+        bound::slider(ui, state, |s| &mut s.sh.beep_volume, truth, 0.0..=1.0, Some(0.01), GuiCommand::SetBeepVolume);
+        let shown = *state.sh.beep_volume.value();
+        ui.label(RichText::new(format!("{}%", (shown * 100.0).round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
-    let mut freq = state.latest.beep_frequency;
+    let truth = state.latest.beep_frequency;
     ui.horizontal(|ui| {
         ui.label(RichText::new("PITCH").font(FontId::monospace(9.0)).color(colors.text_muted));
-        if ui.add(egui::Slider::new(&mut freq, 400.0..=2000.0).show_value(false)).changed() {
-            state.send(GuiCommand::SetBeepFrequency(freq));
-        }
-        ui.label(RichText::new(format!("{} Hz", freq.round())).font(FontId::monospace(10.0)).color(colors.text_title));
+        bound::slider(ui, state, |s| &mut s.sh.beep_frequency, truth, 400.0..=2000.0, None, GuiCommand::SetBeepFrequency);
+        let shown = *state.sh.beep_frequency.value();
+        ui.label(RichText::new(format!("{} Hz", shown.round())).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 
-    let mut dur = state.latest.beep_duration;
+    let truth = state.latest.beep_duration;
     ui.horizontal(|ui| {
         ui.label(RichText::new("DUR").font(FontId::monospace(9.0)).color(colors.text_muted));
-        if ui.add(egui::Slider::new(&mut dur, 0.05..=2.0).step_by(0.05).show_value(false)).changed() {
-            state.send(GuiCommand::SetBeepDuration(dur));
-        }
-        ui.label(RichText::new(format!("{:.0} ms", dur * 1000.0)).font(FontId::monospace(10.0)).color(colors.text_title));
+        bound::slider(ui, state, |s| &mut s.sh.beep_duration, truth, 0.05..=2.0, Some(0.05), GuiCommand::SetBeepDuration);
+        let shown = *state.sh.beep_duration.value();
+        ui.label(RichText::new(format!("{:.0} ms", shown * 1000.0)).font(FontId::monospace(10.0)).color(colors.text_title));
     });
 }

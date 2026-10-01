@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -7,95 +6,17 @@ use std::time::{Duration, Instant};
 use egui::{Color32, FontId, RichText, Sense, Ui};
 use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::config;
-use gui_engine::state::{AppStateSnapshot, ConverterUserSettings};
+use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::{ArcSwap, AudioEvent, JobKind};
 
+use crate::shadows::Shadows;
 use crate::theme::{Theme, ACCENT};
 use crate::widgets;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const TEXT_FIELD_EDIT_TIMEOUT: Duration = Duration::from_secs(2);
 const OFFLOAD_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// GUI-side state for a single text entry field bound to an engine value.
-///
-/// egui `TextEdit` buffers must be stable across frames: re-seeding from the
-/// (stale) engine snapshot every frame makes egui clamp the stored cursor to
-/// the reverted text, jumping the caret behind the last typed character.
-/// This struct instead keeps a persistent buffer that only adopts the engine
-/// value when the field is not focused and any in-flight edit has been
-/// confirmed by the engine (value echoed back verbatim), with a timeout
-/// fallback for engine-side overrides (e.g., rescan replacing device names).
-pub struct TextFieldEdit {
-    buffer: String,
-    pending: Option<String>,
-    pending_since: Option<Instant>,
-    was_focused: bool,
-}
-
-impl TextFieldEdit {
-    pub fn new(initial: impl Into<String>) -> Self {
-        Self {
-            buffer: initial.into(),
-            pending: None,
-            pending_since: None,
-            was_focused: false,
-        }
-    }
-
-    pub fn buffer(&self) -> &str {
-        &self.buffer
-    }
-
-    pub fn buffer_mut(&mut self) -> &mut String {
-        &mut self.buffer
-    }
-
-    /// Call once per frame before any widget rendering, using the fresh
-    /// engine snapshot value.  Adopts the engine value only when:
-    /// - No unconfirmed pending edit, AND
-    /// - The widget was not focused last frame, AND
-    /// - The values actually differ.
-    pub fn sync(&mut self, engine: &str, now: Instant) {
-        // Check if engine has confirmed our pending edit
-        if let Some(sent) = &self.pending {
-            if sent == engine {
-                // Engine echoed back our value — confirmed.
-                self.pending = None;
-                self.pending_since = None;
-            } else if self.pending_since
-                .is_some_and(|t| now.duration_since(t) > TEXT_FIELD_EDIT_TIMEOUT)
-            {
-                // Pending timed out (engine overrode our value, e.g. rescan).
-                // Drop the pending and adopt the current engine value.
-                self.pending = None;
-                self.pending_since = None;
-            } else {
-                // Still waiting for confirmation — keep the user's text.
-                return;
-            }
-        }
-
-        if !self.was_focused && self.buffer != engine {
-            self.buffer = engine.to_string();
-        }
-    }
-
-    /// Must be called each frame after the widget is shown, to track focus
-    /// state for the next frame's `sync` decision.
-    pub fn set_focused(&mut self, focused: bool) {
-        self.was_focused = focused;
-    }
-
-    /// Marks the current buffer as having been sent to the engine, so
-    /// `sync` will not overwrite it until the engine echoes the value back.
-    pub fn mark_edited(&mut self, now: Instant) {
-        self.pending = Some(self.buffer.clone());
-        self.pending_since = Some(now);
-    }
-}
 
 // ── GUI-only types ──────────────────────────────────────────────────────
 
@@ -160,17 +81,19 @@ pub struct AppState {
     pub app_menu_pos: Option<egui::Pos2>,
     pub log_buffer: Arc<Mutex<gui_engine::log_buffer::LogBuffer>>,
 
-    /// Local cache of converter settings (GUI editing buffer).
-    /// egui's immediate-mode render functions need `&mut` access for
-    /// checkboxes and TextEdits; this cache provides that while keeping
-    /// the engine as the true source of truth.  The three-way merge in
-    /// `logic()` reconciles this with the engine snapshot each frame.
-    pub local_settings: gui_engine::state::ConverterUserSettings,
-
-    /// Previous frame's engine snapshot — used as the merge base so
-    /// in-flight user edits are not visually reverted between command
-    /// send and engine publish.
-    pub prev_engine_settings: Option<gui_engine::state::ConverterUserSettings>,
+    /// GUI-local shadow state for every interactive widget, synced against
+    /// the engine snapshot each frame via `EditState` (see `shadows.rs`).
+    pub sh: Shadows,
+    /// Sender-assigned sequence for the next command — the engine acks via
+    /// `AppStateSnapshot.applied_command_seq`, and `EditState::sync` treats
+    /// a pending edit as applied once `applied_seq >= sent seq`.
+    next_send_seq: u64,
+    /// Latest engine ack counter (copied from the snapshot each frame).
+    pub applied_seq: u64,
+    /// Set by `send()` until the engine's ack counter has caught up — keeps
+    /// fast repaints running so every command's echo is rendered promptly
+    /// (egui would otherwise idle for up to 1 s before showing the result).
+    awaiting_echo: bool,
 
     // Diagnostic: last group decode generation that was logged to avoid spam
     pub last_logged_group_decode_gen: u64,
@@ -183,24 +106,9 @@ pub struct AppState {
     /// next frame forces a fast repaint until the engine publishes
     /// `job(JobKind::OffloadCopy).is_active()`. Resets once active is visible.
     offload_start_pending: Option<Instant>,
-
-    // ── GUI-local text edit buffers ────────────────────────────────────
-    /// Persistent buffer for the clapper ROLL field.
-    pub roll_edit: TextFieldEdit,
-    /// Persistent buffer for the offload subfolder name field.
-    pub parent_name_edit: TextFieldEdit,
-    /// Persistent buffers for offload device folder names, keyed by mount.
-    pub device_name_edits: HashMap<PathBuf, TextFieldEdit>,
 }
 
 impl AppState {
-    /// Set the LTC file/track index in *both* the GUI-local decode-section
-    /// field and the `local_settings` merge buffer, so the diff machinery
-    /// (`diff_converter_commands`) emits `SetLtcFileIndex` to the engine.
-    pub fn set_ltc_file_idx(&mut self, idx: usize) {
-        self.local_settings.ltc_file_idx = idx;
-    }
-
     /// Mark the offload start as pending so the next frame forces a fast repaint
     /// until the engine publishes `job(JobKind::OffloadCopy).is_active()`.
     pub fn mark_offload_start_pending(&mut self) {
@@ -231,7 +139,7 @@ impl AppState {
             .map(PathBuf::from)
             .filter(|p| p.exists());
 
-        let result = Self {
+        let mut result = Self {
             cmd_tx,
             event_rx,
             latest: Arc::new(initial.clone()),
@@ -246,36 +154,45 @@ impl AppState {
             show_app_menu: false,
             app_menu_pos: None,
             log_buffer,
-            local_settings: gui_engine::state::ConverterUserSettings::initial(),
-            prev_engine_settings: None,
+            sh: Shadows::new(&initial),
+            next_send_seq: 0,
+            applied_seq: initial.applied_command_seq,
+            awaiting_echo: false,
             last_logged_group_decode_gen: 0,
             offload_last_version: 0,
             offload_start_pending: None,
-            roll_edit: TextFieldEdit::new(&initial.clapper.roll),
-            parent_name_edit: TextFieldEdit::new(&initial.offload.parent_name),
-            device_name_edits: HashMap::new(),
         };
 
         // Tell the engine to scan the restored input folder and auto-select
         // the first recording (deferred by the engine until scan completes).
+        // Routed through `send` so the ack-counter sequence stays 1:1 with
+        // the engine's `applied_command_seq`.
         if let Some(ref folder) = selected_folder {
-            let _ = result.cmd_tx.send(GuiCommand::Converter(
-                gui_engine::command::ConverterCommand::SelectFolder(folder.clone()),
+            let folder = folder.clone();
+            result.send(GuiCommand::Converter(
+                gui_engine::command::ConverterCommand::SelectFolder(folder),
             ));
-            let _ = result.cmd_tx.send(GuiCommand::Converter(
+            result.send(GuiCommand::Converter(
                 gui_engine::command::ConverterCommand::SelectRecording(0),
             ));
             log::info!(
                 "Sent SelectFolder + SelectRecording(0) to engine on startup: {}",
-                folder.display(),
+                selected_folder.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             );
         }
 
         result
     }
 
-    pub fn send(&self, cmd: GuiCommand) {
+    /// Send a command to the engine and return the sender-assigned sequence
+    /// number. All commands must go through here so the GUI's sequence stays
+    /// 1:1 with the engine's `applied_command_seq` ack counter — shadow
+    /// edits treat a send as confirmed once `applied_seq >= sent seq`.
+    pub fn send(&mut self, cmd: GuiCommand) -> u64 {
+        self.next_send_seq += 1;
+        self.awaiting_echo = true;
         let _ = self.cmd_tx.send(cmd);
+        self.next_send_seq
     }
 
 }
@@ -309,153 +226,6 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     (base + predicted_dt).max(floor)
 }
 
-/// Three-way merge of `ConverterUserSettings`: for each field, if the
-/// local (GUI-edited) value differs from the `base` (previous frame's
-/// engine snapshot), the user's edit is preserved; otherwise the engine's
-/// latest value is adopted.  This prevents in-flight edits from being
-/// visually reverted between command send and engine publish (~40 ms).
-///
-/// The channel map is a special case: when the engine changes its
-/// dimensions (resize on probe), engine's map wins unconditionally.
-fn merge_converter_settings(
-    base: &ConverterUserSettings,
-    local: &ConverterUserSettings,
-    engine: &ConverterUserSettings,
-) -> ConverterUserSettings {
-    let channel_map = if engine.channel_map.num_channels() != base.channel_map.num_channels() {
-        // Resize event (probe): engine's new dimensions are authoritative
-        engine.channel_map.clone()
-    } else {
-        // Normal merge: adopt engine if user hasn't touched
-        merge_field(&base.channel_map, &local.channel_map, &engine.channel_map)
-    };
-
-    ConverterUserSettings {
-        metadata_only: merge_field(&base.metadata_only, &local.metadata_only, &engine.metadata_only),
-        generate_synthetic_video: merge_field(&base.generate_synthetic_video, &local.generate_synthetic_video, &engine.generate_synthetic_video),
-        copy_video: merge_field(&base.copy_video, &local.copy_video, &engine.copy_video),
-        split_tracks: merge_field(&base.split_tracks, &local.split_tracks, &engine.split_tracks),
-        drop_ltc_track: merge_field(&base.drop_ltc_track, &local.drop_ltc_track, &engine.drop_ltc_track),
-        concat_audio: merge_field(&base.concat_audio, &local.concat_audio, &engine.concat_audio),
-        set_start_from_ltc: merge_field(&base.set_start_from_ltc, &local.set_start_from_ltc, &engine.set_start_from_ltc),
-        embed_camera_metadata: merge_field(&base.embed_camera_metadata, &local.embed_camera_metadata, &engine.embed_camera_metadata),
-        ltc_file_idx: merge_field(&base.ltc_file_idx, &local.ltc_file_idx, &engine.ltc_file_idx),
-        channel_map,
-        container: merge_field(&base.container, &local.container, &engine.container),
-        video_encoder: merge_field(&base.video_encoder, &local.video_encoder, &engine.video_encoder),
-        audio_encoder: merge_field(&base.audio_encoder, &local.audio_encoder, &engine.audio_encoder),
-        output_folder: merge_field(&base.output_folder, &local.output_folder, &engine.output_folder),
-        output_folder_user_set: engine.output_folder_user_set,
-        filename_prefix: merge_field(&base.filename_prefix, &local.filename_prefix, &engine.filename_prefix),
-        audio_suffix_template: merge_field(&base.audio_suffix_template, &local.audio_suffix_template, &engine.audio_suffix_template),
-        video_suffix_template: merge_field(&base.video_suffix_template, &local.video_suffix_template, &engine.video_suffix_template),
-    }
-}
-
-fn merge_field<T: PartialEq + Clone>(base: &T, local: &T, engine: &T) -> T {
-    if local == base { engine.clone() } else { local.clone() }
-}
-
-/// Compare two `ConverterUserSettings` snapshots and emit the
-/// `ConverterCommand` variants needed to reconcile `new` into the engine.
-///
-/// Channel-map differences use `SwapChannelMapCells` (the only channel-map
-/// mutation primitive) by computing a minimal swap sequence.
-///
-/// NOTE: arguments are `(old, new)` — commands carry `new.*` values.
-fn diff_converter_commands(
-    old: &ConverterUserSettings,
-    new: &ConverterUserSettings,
-) -> Vec<ConverterCommand> {
-    let mut cmds = Vec::new();
-
-    if old.metadata_only != new.metadata_only {
-        cmds.push(ConverterCommand::SetMetadataOnly(new.metadata_only));
-    }
-    if old.generate_synthetic_video != new.generate_synthetic_video {
-        cmds.push(ConverterCommand::SetGenerateSyntheticVideo(new.generate_synthetic_video));
-    }
-    if old.copy_video != new.copy_video {
-        cmds.push(ConverterCommand::SetCopyVideo(new.copy_video));
-    }
-    if old.split_tracks != new.split_tracks {
-        cmds.push(ConverterCommand::SetSplitTracks(new.split_tracks));
-    }
-    if old.drop_ltc_track != new.drop_ltc_track {
-        cmds.push(ConverterCommand::SetDropLtcTrack(new.drop_ltc_track));
-    }
-    if old.concat_audio != new.concat_audio {
-        cmds.push(ConverterCommand::SetConcatAudio(new.concat_audio));
-    }
-    if old.set_start_from_ltc != new.set_start_from_ltc {
-        cmds.push(ConverterCommand::SetStartFromLtc(new.set_start_from_ltc));
-    }
-    if old.embed_camera_metadata != new.embed_camera_metadata {
-        cmds.push(ConverterCommand::SetEmbedCameraMetadata(new.embed_camera_metadata));
-    }
-    if old.ltc_file_idx != new.ltc_file_idx {
-        cmds.push(ConverterCommand::SetLtcFileIndex(new.ltc_file_idx));
-    }
-    if old.container != new.container {
-        cmds.push(ConverterCommand::SetContainer(new.container.clone()));
-    }
-    if old.video_encoder != new.video_encoder {
-        cmds.push(ConverterCommand::SetVideoCodec(new.video_encoder.clone()));
-    }
-    if old.audio_encoder != new.audio_encoder {
-        cmds.push(ConverterCommand::SetAudioEncoder(new.audio_encoder.clone()));
-    }
-    if old.output_folder != new.output_folder {
-        cmds.push(ConverterCommand::SetOutputFolder(new.output_folder.clone()));
-    }
-    if old.filename_prefix != new.filename_prefix {
-        cmds.push(ConverterCommand::SetFilenamePrefix(new.filename_prefix.clone()));
-    }
-    if old.audio_suffix_template != new.audio_suffix_template {
-        cmds.push(ConverterCommand::SetAudioSuffixTemplate(new.audio_suffix_template.clone()));
-    }
-    if old.video_suffix_template != new.video_suffix_template {
-        cmds.push(ConverterCommand::SetVideoSuffixTemplate(new.video_suffix_template.clone()));
-    }
-
-    // Channel-map: emit SwapChannelMapCells for each position where the
-    // mapping changed.  Only meaningful when dimensions match (engine
-    // resizes via identity on probe).
-    if old.channel_map.num_channels() == new.channel_map.num_channels() {
-        let old_map = old.channel_map.mapping();
-        let new_map = new.channel_map.mapping();
-        let mut working = old_map.to_vec();
-        for i in 0..working.len() {
-            if working[i] != new_map[i] {
-                if let Some(j) = working.iter().position(|&v| v == new_map[i]) {
-                    cmds.push(ConverterCommand::SwapChannelMapCells(i, j));
-                    working.swap(i, j);
-                }
-            }
-        }
-    }
-
-    cmds
-}
-
-/// Reconcile the converter settings between user-local edits and the
-/// engine's latest snapshot.
-///
-/// Returns (merged user-visible settings, commands to forward to engine).
-/// Only fields the user actually changed (`local != base`) produce commands
-/// — engine-initiated changes (recording-selection re-defaults, flag resets)
-/// are adopted silently, never echoed back.
-fn reconcile_converter_settings(
-    prev_engine: Option<&ConverterUserSettings>,
-    local: &ConverterUserSettings,
-    engine: &ConverterUserSettings,
-) -> (ConverterUserSettings, Vec<ConverterCommand>) {
-    let base = prev_engine.cloned().unwrap_or_else(|| local.clone());
-    let merged = merge_converter_settings(&base, local, engine);
-    let cmds = diff_converter_commands(&base, local);
-    (merged, cmds)
-}
-
 // ── egui App ────────────────────────────────────────────────────────────
 
 impl eframe::App for AppState {
@@ -463,41 +233,29 @@ impl eframe::App for AppState {
         // 1. Sync latest state from engine
         let snapshot = self.engine_state.load();
         self.latest = Arc::clone(&snapshot);
+        self.applied_seq = snapshot.applied_command_seq;
 
-        // 2. Three-way merge of converter settings: fields the user edited
-        //    (local != base = previous engine snapshot) keep their value and
-        //    are forwarded as commands; untouched fields adopt the engine's
-        //    latest (prefills, flag resets, capability repairs).
-        let engine_settings = self.latest.converter.settings.clone();
-        let (merged, cmds) = reconcile_converter_settings(
-            self.prev_engine_settings.as_ref(),
-            &self.local_settings,
-            &engine_settings,
-        );
-        for cmd in cmds {
-            let _ = self.cmd_tx.send(GuiCommand::Converter(cmd));
-        }
-        self.local_settings = merged;
-        self.prev_engine_settings = Some(engine_settings);
-
-        // 2.5 Reconcile GUI-local text edit buffers with the engine snapshot.
-        //      Buffers persist across frames (unlike cloning from the snapshot
-        //      each time) so that egui's stored cursor stays valid while the
-        //      user types.  Engine values are adopted only when the field is
-        //      not focused and no in-flight edit awaits confirmation.
-        let now = Instant::now();
-        self.roll_edit.sync(&self.latest.clapper.roll, now);
-        self.parent_name_edit.sync(&self.latest.offload.parent_name, now);
-
-        // Device-name buffers keyed by mount point: prune vanished mounts,
-        // seed new ones, sync each with the engine's current name.
+        // 2. Maintain keyed offload shadows (value sync happens per-widget at
+        //    draw time inside the `bound::` wrappers): prune vanished
+        //    mounts/files and seed new entries from the engine snapshot.
         let mounts: Vec<PathBuf> = self.latest.offload.cards.iter().map(|c| c.mount.clone()).collect();
-        self.device_name_edits.retain(|mount, _| mounts.contains(mount));
+        self.sh.device_names.retain(|mount, _| mounts.contains(mount));
         for card in &self.latest.offload.cards {
-            let edit = self.device_name_edits
+            self.sh.device_names
                 .entry(card.mount.clone())
-                .or_insert_with(|| TextFieldEdit::new(&card.device_name));
-            edit.sync(&card.device_name, now);
+                .or_insert_with(|| gui_engine::edit_state::EditState::new(card.device_name.clone()));
+        }
+        let file_keys: Vec<(PathBuf, PathBuf)> = self.latest.offload.cards.iter()
+            .flat_map(|c| c.files.iter().map(move |f| (c.mount.clone(), f.path.clone())))
+            .collect();
+        self.sh.file_selection.retain(|k, _| file_keys.contains(k));
+        for card in &self.latest.offload.cards {
+            for (i, file) in card.files.iter().enumerate() {
+                let selected = card.selected.get(i).copied().unwrap_or(false);
+                self.sh.file_selection
+                    .entry((card.mount.clone(), file.path.clone()))
+                    .or_insert_with(|| gui_engine::edit_state::EditState::new(selected));
+            }
         }
 
         // 3. Maximize once
@@ -550,7 +308,21 @@ impl eframe::App for AppState {
         // 7. Repaint scheduling
         ctx.request_repaint_after(next_repaint_interval(&self.latest));
 
-        // 7a. Offload start-pending latch: force fast repaints until the engine
+        // 7a. While commands await the engine ack, keep fast repaints so the
+        //     echo round-trip (~40 ms engine tick) is rendered on the next
+        //     frame instead of waiting out the idle repaint interval.
+        if self.awaiting_echo {
+            if self.applied_seq >= self.next_send_seq {
+                self.awaiting_echo = false;
+            } else {
+                let floor = Duration::from_secs_f64(1.0 / 60.0) + Duration::from_millis(1);
+                ctx.request_repaint_after(
+                    (Duration::from_millis(40) + Duration::from_secs_f64(1.0 / 60.0)).max(floor),
+                );
+            }
+        }
+
+        // 7b. Offload start-pending latch: force fast repaints until the engine
         //     publishes is_active() (or timeout) so the Start→Cancel button
         //     switch appears on the very next frame after engine publish.
         if let Some(pending_since) = self.offload_start_pending {
@@ -603,11 +375,18 @@ impl eframe::App for AppState {
             if let Some(ref path) = self.latest.offload.last_offload_parent {
                 let path = path.clone();
                 log::info!("Offload completed — auto-switching converter folder to {:?}", path);
-                self.set_ltc_file_idx(1);
-                let _ = self.cmd_tx.send(GuiCommand::Converter(
+                // Preset the LTC source to the second track, mirroring the
+                // previous merge-buffer behavior, then switch the folder.
+                widgets::bound::set_value(
+                    self,
+                    |s| &mut s.sh.conv.ltc_file_idx,
+                    1,
+                    |v| GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(v)),
+                );
+                self.send(GuiCommand::Converter(
                     gui_engine::command::ConverterCommand::SelectFolder(path.clone()),
                 ));
-                let _ = self.cmd_tx.send(GuiCommand::Converter(
+                self.send(GuiCommand::Converter(
                     gui_engine::command::ConverterCommand::SelectRecording(0),
                 ));
             }
@@ -687,7 +466,7 @@ pub fn centered_horizontal_row<R>(
 impl AppState {
     fn render_header(&mut self, ui: &mut Ui) {
         let colors = self.theme.colors();
-        let s = &self.latest;
+        let s = std::sync::Arc::clone(&self.latest);
         ui.horizontal(|ui| {
             let (rect, icon_response) = ui.allocate_exact_size(egui::Vec2::new(34.0, 34.0), Sense::click());
             ui.painter().rect_filled(rect, 4.0, ACCENT);
@@ -755,7 +534,7 @@ impl AppState {
                 let icon = if self.theme == Theme::Dark { "\u{2600}\u{FE0F}" } else { "\u{1F319}" };
                 let theme_btn = egui::Button::new(RichText::new(icon).font(FontId::proportional(12.0))).fill(colors.nested_bg);
                 if ui.add(theme_btn).clicked() {
-                    let _ = self.cmd_tx.send(GuiCommand::ToggleTheme);
+                    self.send(GuiCommand::ToggleTheme);
                 }
             });
         });
@@ -808,7 +587,7 @@ impl AppState {
 
     fn render_clock_section(&mut self, ui: &mut Ui) {
         let colors = self.theme.colors();
-        let s = &self.latest;
+        let s = std::sync::Arc::clone(&self.latest);
         let frame = egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::symmetric(20, 16))
             .fill(colors.card_bg)
@@ -1218,226 +997,27 @@ mod tests {
         assert!(dur > Duration::from_millis(110) && dur < Duration::from_millis(130));
     }
 
-    // ── merge_converter_settings tests ───────────────────────────────────
-
-    fn make_cus() -> ConverterUserSettings {
-        ConverterUserSettings::initial()
-    }
-
-    #[test]
-    fn merge_user_edit_preserved_vs_engine_change() {
-        let mut base = make_cus();
-        let mut local = make_cus();
-        let mut engine = make_cus();
-
-        // User edits filename_prefix → local differs from base
-        base.filename_prefix = "{device}".to_string();
-        local.filename_prefix = "my_project".to_string();
-        engine.filename_prefix = "{device}".to_string(); // engine hasn't applied yet
-
-        let merged = merge_converter_settings(&base, &local, &engine);
-        assert_eq!(merged.filename_prefix, "my_project", "user edit must survive");
-    }
-
-    #[test]
-    fn merge_engine_change_adopted_when_untouched() {
-        let mut base = make_cus();
-        let mut local = make_cus();
-        let mut engine = make_cus();
-
-        // Engine prefilled output_folder; user didn't touch it
-        base.output_folder = PathBuf::new();
-        local.output_folder = PathBuf::new();
-        engine.output_folder = PathBuf::from("/media/clips");
-
-        let merged = merge_converter_settings(&base, &local, &engine);
-        assert_eq!(merged.output_folder, PathBuf::from("/media/clips"),
-                   "engine prefill must be adopted when user hasn't edited the field");
-    }
-
-    #[test]
-    fn merge_engine_and_user_both_changed_user_wins() {
-        let mut base = make_cus();
-        let mut local = make_cus();
-        let mut engine = make_cus();
-
-        // Engine reset split_tracks to false; user had set it to true
-        base.split_tracks = false;
-        local.split_tracks = true;
-        engine.split_tracks = false;
-
-        let merged = merge_converter_settings(&base, &local, &engine);
-        assert!(merged.split_tracks, "user edit wins when both engine and user changed");
-    }
-
-    #[test]
-    fn merge_channel_map_dimension_change_adopts_engine() {
-        use gui_engine::converter::ChannelMap;
-
-        let mut base = make_cus();
-        let mut local = make_cus();
-        let mut engine = make_cus();
-
-        // Probe resized channel map from 0 to 4 channels
-        base.channel_map = ChannelMap::identity(0);
-        local.channel_map = ChannelMap::identity(0);
-        engine.channel_map = ChannelMap::identity(4);
-
-        let merged = merge_converter_settings(&base, &local, &engine);
-        assert_eq!(merged.channel_map.num_channels(), 4,
-                   "engine dimension change must win");
-    }
-
-    #[test]
-    fn merge_channel_map_cell_swap_preserved() {
-        use gui_engine::converter::ChannelMap;
-
-        let mut base = make_cus();
-        let mut local = make_cus();
-        let mut engine = make_cus();
-
-        // 2-channel map; user swapped cells [0,1] → [1,0]
-        base.channel_map = ChannelMap::identity(2);
-        local.channel_map = ChannelMap::from_mapping(vec![1, 0]);
-        engine.channel_map = ChannelMap::identity(2); // engine hasn't applied yet
-
-        let merged = merge_converter_settings(&base, &local, &engine);
-        assert_eq!(merged.channel_map.mapping(), &[1, 0],
-                   "user cell swap must survive");
-    }
-
-    #[test]
-    fn merge_diff_carries_user_values_for_text_fields() {
-        let base = make_cus();
-        let mut local = make_cus();
-
-        local.filename_prefix = "edited_prefix".to_string();
-        local.output_folder = PathBuf::from("/user/out");
-        local.audio_suffix_template = "_my_audio{:02d}".to_string();
-        local.video_suffix_template = "_my_video{:02d}".to_string();
-
-        // Engine has not changed these fields
-        let engine = base.clone();
-
-        let merged = merge_converter_settings(&base, &local, &engine);
-        let cmds = diff_converter_commands(&base, &merged);
-
-        let has_set = |variant: ConverterCommand| cmds.iter().any(|c| std::mem::discriminant(c) == std::mem::discriminant(&variant));
-        assert!(has_set(ConverterCommand::SetFilenamePrefix(String::new())),
-                "SetFilenamePrefix must be emitted");
-        assert!(has_set(ConverterCommand::SetOutputFolder(PathBuf::new())),
-                "SetOutputFolder must be emitted");
-        assert!(has_set(ConverterCommand::SetAudioSuffixTemplate(String::new())),
-                "SetAudioSuffixTemplate must be emitted");
-        assert!(has_set(ConverterCommand::SetVideoSuffixTemplate(String::new())),
-                "SetVideoSuffixTemplate must be emitted");
-
-        // Verify the emitted commands carry the USER's values
-        let find_cmd = |needle: &str| -> bool {
-            cmds.iter().any(|c| match c {
-                ConverterCommand::SetFilenamePrefix(v) => v == needle,
-                _ => false,
-            })
-        };
-        assert!(find_cmd("edited_prefix"),
-                "SetFilenamePrefix must carry user value 'edited_prefix'");
-
-        let find_cmd = |needle: &str| -> bool {
-            cmds.iter().any(|c| match c {
-                ConverterCommand::SetAudioSuffixTemplate(v) => v == needle,
-                _ => false,
-            })
-        };
-        assert!(find_cmd("_my_audio{:02d}"),
-                "SetAudioSuffixTemplate must carry user value");
-    }
-
-    #[test]
-    fn merge_first_frame_adopts_engine_values() {
-        // First frame: prev_engine_settings is None, so base = local.
-        // If engine has already processed a recording selection (output_folder filled),
-        // the merge should adopt engine values since local == base for all fields.
-        let local = make_cus(); // initial: empty output_folder
-        let base = local.clone(); // base = local (first frame)
-        let mut engine = make_cus();
-        engine.output_folder = PathBuf::from("/media/clips");
-
-        let merged = merge_converter_settings(&base, &local, &engine);
-        assert_eq!(merged.output_folder, PathBuf::from("/media/clips"),
-                   "first frame must adopt engine's output folder");
-    }
-
-    // ── reconcile_converter_settings tests ─────────────────────────────
-
-    #[test]
-    fn reconcile_does_not_echo_engine_output_folder_change() {
-        let mut base = make_cus();
-        let mut local = make_cus();
-        let mut engine = make_cus();
-
-        // User hasn't touched output_folder — it matches the previous engine snapshot
-        base.output_folder = PathBuf::from("/recording1");
-        local.output_folder = PathBuf::from("/recording1");
-        // Engine re-defaulted to recording 2's parent after recording switch
-        engine.output_folder = PathBuf::from("/recording2");
-
-        let (merged, cmds) = reconcile_converter_settings(
-            Some(&base), &local, &engine,
-        );
-
-        assert_eq!(merged.output_folder, PathBuf::from("/recording2"),
-            "merged must adopt engine's new folder");
-        let has_set_output = cmds.iter().any(|c| {
-            matches!(c, ConverterCommand::SetOutputFolder(_))
-        });
-        assert!(!has_set_output,
-            "engine-initiated folder change must NOT be echoed as SetOutputFolder");
-    }
-
-    #[test]
-    fn reconcile_forwards_user_output_folder_edit() {
-        let mut base = make_cus();
-        let mut local = make_cus();
-
-        base.output_folder = PathBuf::from("/recording1");
-        // User changed the folder via Browse or text field
-        local.output_folder = PathBuf::from("/custom/path");
-        // Engine hasn't changed it
-        let engine = base.clone();
-
-        let (merged, cmds) = reconcile_converter_settings(
-            Some(&base), &local, &engine,
-        );
-
-        assert_eq!(merged.output_folder, PathBuf::from("/custom/path"),
-            "merged must keep user's folder");
-        let has_set_output = cmds.iter().any(|c| {
-            matches!(c, ConverterCommand::SetOutputFolder(p) if p == "/custom/path")
-        });
-        assert!(has_set_output,
-            "user-initiated folder change must be forwarded as SetOutputFolder");
-    }
-
     // ── apply_group_selection tests ─────────────────────────────────────
 
-    fn app_with_no_decode_state() -> super::AppState {
-        let (tx, _) = mpsc::channel();
+    fn app_with_decode_state() -> (super::AppState, std::sync::mpsc::Receiver<GuiCommand>) {
+        let (tx, rx) = mpsc::channel();
         let (_event_tx, event_rx) = mpsc::channel();
-        super::AppState::new_with_config(
+        let app = super::AppState::new_with_config(
             tx,
             event_rx,
             dummy_state(),
             dummy_log_buffer(),
             gui_engine::config::ConverterConfig::default(),
-        )
+        );
+        (app, rx)
     }
 
     #[test]
-    fn apply_group_selection_audio_returns_commands() {
+    fn apply_group_selection_audio_sends_and_resets_shadow() {
         use gui_engine::file_pattern::MatchedGroup;
         use crate::widgets::converter::apply_group_selection;
 
-        let mut app = app_with_no_decode_state();
+        let (mut app, rx) = app_with_decode_state();
 
         let group = MatchedGroup {
             prefix: "TEST".to_string(),
@@ -1450,22 +1030,24 @@ mod tests {
         };
         let groups = vec![group];
 
-        app.local_settings.ltc_file_idx = 5;
-        let cmds = apply_group_selection(&mut app, &groups, 0);
+        app.sh.conv.ltc_file_idx.force_adopt(&5);
+        apply_group_selection(&mut app, &groups, 0);
 
-        assert_eq!(app.local_settings.ltc_file_idx, 0,
-            "apply_group_selection must reset local_settings.ltc_file_idx too");
+        assert_eq!(*app.sh.conv.ltc_file_idx.value(), 0,
+            "apply_group_selection must reset the ltc_file_idx shadow");
+
+        let mut cmds: Vec<GuiCommand> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(cmds.len(), 2);
-        assert!(matches!(cmds[0], GuiCommand::ClearRecordingDecodeState));
-        assert!(matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
+        assert!(matches!(cmds.remove(0), GuiCommand::ClearRecordingDecodeState));
+        assert!(matches!(cmds.remove(0), GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
     }
 
     #[test]
-    fn apply_group_selection_video_returns_commands() {
+    fn apply_group_selection_video_sends_and_resets_shadow() {
         use gui_engine::file_pattern::MatchedGroup;
         use crate::widgets::converter::apply_group_selection;
 
-        let mut app = app_with_no_decode_state();
+        let (mut app, rx) = app_with_decode_state();
 
         let group = MatchedGroup {
             prefix: "CLIP".to_string(),
@@ -1478,24 +1060,34 @@ mod tests {
         };
         let groups = vec![group];
 
-        let cmds = apply_group_selection(&mut app, &groups, 0);
+        apply_group_selection(&mut app, &groups, 0);
 
-        assert_eq!(app.local_settings.ltc_file_idx, 0,
-            "apply_group_selection must reset local_settings.ltc_file_idx too");
-        assert_eq!(cmds.len(), 2, "video group should return 2 commands");
-        assert!(matches!(cmds[0], GuiCommand::ClearRecordingDecodeState));
-        assert!(matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
+        assert_eq!(*app.sh.conv.ltc_file_idx.value(), 0,
+            "apply_group_selection must reset the ltc_file_idx shadow");
+
+        let mut cmds: Vec<GuiCommand> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(cmds.len(), 2, "video group should send 2 commands");
+        assert!(matches!(cmds.remove(0), GuiCommand::ClearRecordingDecodeState));
+        assert!(matches!(cmds.remove(0), GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))));
     }
 
     #[test]
-    fn set_ltc_file_idx_writes_merge_buffer() {
-        let mut app = app_with_no_decode_state();
-        assert_eq!(app.local_settings.ltc_file_idx, 0);
+    fn send_assigns_monotonic_sequences() {
+        let (mut app, rx) = app_with_decode_state();
+        assert_eq!(app.send(GuiCommand::Clap), 1);
+        assert_eq!(app.send(GuiCommand::Reset), 2);
+        assert_eq!(app.next_send_seq, 2);
+        assert_eq!(rx.iter().take(2).count(), 2);
+    }
 
-        app.set_ltc_file_idx(2);
-
-        assert_eq!(app.local_settings.ltc_file_idx, 2,
-            "set_ltc_file_idx must write the merge-buffer field");
+    #[test]
+    fn shadows_seed_from_initial_snapshot() {
+        let (mut app, _rx) = app_with_decode_state();
+        app.sh.conv.ltc_file_idx.force_adopt(&2);
+        assert_eq!(*app.sh.conv.ltc_file_idx.value(), 2);
+        // Adoption via sync when unfocused and no pending edit.
+        app.sh.conv.ltc_file_idx.sync(&0, 0, Instant::now());
+        assert_eq!(*app.sh.conv.ltc_file_idx.value(), 0);
     }
 
     #[test]
@@ -1534,107 +1126,4 @@ mod tests {
         );
     }
 
-    // ── TextFieldEdit tests ─────────────────────────────────────────────
-
-    /// Helper: sync at instant 0 (no pending timeout) and at instant 1
-    /// (after a 1 ns pause — well within the 2 s timeout).
-    fn sync_now(edit: &mut TextFieldEdit, engine: &str) {
-        edit.sync(engine, Instant::now());
-    }
-
-    #[test]
-    fn textfield_sync_adopts_engine_when_idle_and_different() {
-        let mut edit = TextFieldEdit::new("old");
-        sync_now(&mut edit, "new");
-        assert_eq!(edit.buffer(), "new", "idle field must adopt engine value");
-    }
-
-    #[test]
-    fn textfield_sync_noop_when_equal() {
-        let mut edit = TextFieldEdit::new("same");
-        sync_now(&mut edit, "same");
-        assert_eq!(edit.buffer(), "same", "equal values must not change buffer");
-    }
-
-    #[test]
-    fn textfield_sync_keeps_buffer_while_focused() {
-        let mut edit = TextFieldEdit::new("old");
-        edit.set_focused(true); // widget was focused last frame
-        sync_now(&mut edit, "engine_changed");
-        assert_eq!(edit.buffer(), "old",
-                   "focused field must NOT adopt engine value (would move cursor)");
-    }
-
-    #[test]
-    fn textfield_sync_keeps_buffer_while_pending_unconfirmed() {
-        let mut edit = TextFieldEdit::new("user_text");
-        edit.set_focused(false);
-        edit.mark_edited(Instant::now());
-        // Engine has not echoed our value yet
-        sync_now(&mut edit, "old_engine_value");
-        assert_eq!(edit.buffer(), "user_text",
-                   "pending-unconfirmed field must keep user text");
-    }
-
-    #[test]
-    fn textfield_sync_adopts_after_confirmation() {
-        let mut edit = TextFieldEdit::new("user_text");
-        edit.mark_edited(Instant::now());
-        // Engine echoes back our value — confirmation
-        sync_now(&mut edit, "user_text");
-        assert_eq!(edit.buffer(), "user_text", "confirmed: buffer unchanged");
-
-        // Now a NEW engine change arrives; field is idle → must adopt
-        edit.set_focused(false);
-        sync_now(&mut edit, "new_engine_value");
-        assert_eq!(edit.buffer(), "new_engine_value",
-                   "after confirm, idle field must adopt new engine value");
-    }
-
-    #[test]
-    fn textfield_sync_drops_stale_pending_after_timeout() {
-        let mut edit = TextFieldEdit::new("user_text");
-        edit.mark_edited(Instant::now());
-        // Engine never applied our edit; advance well beyond the 2 s timeout
-        let far_future = Instant::now() + Duration::from_secs(3);
-        edit.sync("engine_override", far_future);
-        assert_eq!(edit.buffer(), "engine_override",
-                   "stale pending must be dropped after timeout");
-    }
-
-    #[test]
-    fn textfield_sync_keeps_pending_if_before_timeout() {
-        let mut edit = TextFieldEdit::new("user_text");
-        edit.mark_edited(Instant::now());
-        // Just 1 second later — inside the 2 s window
-        let soon = Instant::now() + Duration::from_secs(1);
-        edit.sync("engine_override", soon);
-        assert_eq!(edit.buffer(), "user_text",
-                   "pending must be kept while within the timeout window");
-    }
-
-    #[test]
-    fn textfield_mark_edited_protects_buffer_from_sync() {
-        let mut edit = TextFieldEdit::new("my_value");
-        edit.mark_edited(Instant::now());
-        // Engine differs but we marked edited → sync must keep user text
-        sync_now(&mut edit, "engine_value");
-        assert_eq!(edit.buffer(), "my_value",
-                   "mark_edited must keep buffer safe from engine overwrite");
-    }
-
-    #[test]
-    fn textfield_adopts_engine_after_unfocus() {
-        let mut edit = TextFieldEdit::new("user_type");
-        edit.set_focused(true);
-        sync_now(&mut edit, "engine_value");
-        assert_eq!(edit.buffer(), "user_type",
-                   "focused: no adoption");
-
-        // Next frame: focus lost
-        edit.set_focused(false);
-        sync_now(&mut edit, "engine_value");
-        assert_eq!(edit.buffer(), "engine_value",
-                   "after unfocus, idle field adopts engine value");
-    }
 }

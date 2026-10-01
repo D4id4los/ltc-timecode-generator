@@ -6,7 +6,7 @@ use crate::theme::ACCENT;
 
 pub fn render(ui: &mut Ui, state: &AppState) {
     let colors = state.theme.colors();
-    let s = &state.latest;
+    let s = std::sync::Arc::clone(&state.latest);
 
     let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame());
     let ms_str = timecode::timecode_to_ms_string(s.current_timecode, s.fps());

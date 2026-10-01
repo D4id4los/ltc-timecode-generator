@@ -967,3 +967,54 @@ fn test_idle_engine_does_not_republish() {
     drop(tx);
     handle.join().expect("engine thread panicked");
 }
+
+// ── Applied-command ack counter ──────────────────────────────────────────
+
+/// Every drained command bumps `applied_command_seq` and forces a publish —
+/// including idempotent writes that would otherwise be gated by the
+/// structural-PartialEq publish skip.
+#[test]
+fn test_applied_command_seq_counts_commands() {
+    let snapshot = run_engine(
+        vec![
+            GuiCommand::SetFpsIndex(0),      // seq 1 — value change
+            GuiCommand::SetLtcVolume(0.25),  // seq 2 — idempotent vs default 0.25
+            GuiCommand::SetBeepFrequency(1234.0), // seq 3 — value change
+        ],
+        false,
+        |s| {
+            s.applied_command_seq >= 3
+                && s.fps_index == 0
+                && s.ltc_volume == 0.25
+                && s.beep_frequency == 1234.0
+        },
+    );
+    assert_eq!(snapshot.applied_command_seq, 3);
+}
+
+/// An idle engine (no commands) must keep `applied_command_seq` at zero and
+/// never republish — the counter must not break the publish gate.
+#[test]
+fn test_applied_command_seq_stays_zero_when_idle() {
+    init_test_config();
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("idle-seq-test".into())
+        .spawn(move || {
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
+        })
+        .expect("failed to spawn engine thread");
+
+    // Drop the sender right away: no commands are ever sent. Wait a few
+    // ticks, then check the counter and pointer stability.
+    std::thread::sleep(Duration::from_millis(150));
+    let snapshot = state.load_full();
+    assert_eq!(snapshot.applied_command_seq, 0);
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}

@@ -4,7 +4,7 @@ use crate::app::AppState;
 
 pub fn render(ui: &mut Ui, state: &AppState) {
     let colors = state.theme.colors();
-    let s = &state.latest;
+    let s = std::sync::Arc::clone(&state.latest);
     let frame = egui::Frame::new()
         .fill(colors.deep_bg)
         .inner_margin(egui::Margin::symmetric(12, 6));

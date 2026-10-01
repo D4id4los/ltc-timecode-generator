@@ -280,11 +280,8 @@ fn _run_gui(
     }
     {
         let cmd = cmd_tx.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_roll_changed(move || {
-            if let Some(u) = ui_weak.upgrade() {
-                let _ = cmd.send(GuiCommand::SetRoll(u.get_roll().to_string()));
-            }
+        ui.on_roll_changed(move |val| {
+            let _ = cmd.send(GuiCommand::SetRoll(val.to_string()));
         });
     }
     {

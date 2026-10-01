@@ -3,6 +3,7 @@ use gui_engine::command::GuiCommand;
 
 use crate::app::AppState;
 use crate::theme::ACCENT;
+use super::bound;
 
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let width = ui.available_width();
@@ -28,14 +29,19 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
         .stroke(egui::Stroke::new(1.5, colors.border_main))
         .inner_margin(egui::Margin::same(16));
     frame.show(ui, |ui| {
-        let mut auto_inc = state.latest.clapper.auto_increment_take;
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("SMART CLAPPER SLATE").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.checkbox(&mut auto_inc, "Auto-Increment Take").changed() {
-                        state.send(GuiCommand::SetAutoIncrement(auto_inc));
-                    }
+                    let truth = state.latest.clapper.auto_increment_take;
+                    bound::checkbox(
+                        ui, state,
+                        |s| &mut s.sh.auto_increment,
+                        truth,
+                        "Auto-Increment Take",
+                        true,
+                        GuiCommand::SetAutoIncrement,
+                    );
                 });
             });
             ui.add_space(8.0);
@@ -70,7 +76,7 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
 
 fn render_clapper_board_drawing(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let s = &state.latest;
+    let s = std::sync::Arc::clone(&state.latest);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 100.0), Sense::click());
     if response.clicked() && !s.is_locked {
         state.send(GuiCommand::Clap);
@@ -145,21 +151,21 @@ fn render_roll_card(ui: &mut Ui, state: &mut AppState) {
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("ROLL").font(FontId::proportional(9.0)).color(colors.text_muted).strong());
             ui.add_space(4.0);
-            let resp = ui.add(egui::TextEdit::singleline(state.roll_edit.buffer_mut()).font(FontId::monospace(14.0)).text_color(colors.text_title).margin(egui::Margin::symmetric(4, 4)));
-            let focused = resp.has_focus();
-            if resp.changed() {
-                let value = state.roll_edit.buffer().to_string();
-                state.roll_edit.mark_edited(std::time::Instant::now());
-                state.send(GuiCommand::SetRoll(value));
-            }
-            state.roll_edit.set_focused(focused);
+            let truth = state.latest.clapper.roll.clone();
+            bound::text(
+                ui, state,
+                |s| &mut s.sh.roll,
+                &truth,
+                GuiCommand::SetRoll,
+                |edit| edit.font(FontId::monospace(14.0)).text_color(colors.text_title).margin(egui::Margin::symmetric(4, 4)),
+            );
         });
     });
 }
 
 fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let s = &state.latest;
+    let s = std::sync::Arc::clone(&state.latest);
     let card = egui::Frame::new()
         .fill(colors.nested_bg)
         .corner_radius(8.0)
@@ -187,7 +193,7 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
 
 fn render_take_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let s = &state.latest;
+    let s = std::sync::Arc::clone(&state.latest);
     let card = egui::Frame::new()
         .fill(colors.nested_bg)
         .corner_radius(8.0)
@@ -215,7 +221,7 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
 
 fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let s = &state.latest;
+    let s = std::sync::Arc::clone(&state.latest);
     let frame = egui::Frame::group(ui.style())
         .fill(colors.card_bg)
         .corner_radius(12.0)

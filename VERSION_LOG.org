@@ -1,6 +1,57 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — unified shadow-state interaction architecture
+
+Rework of how the GUIs communicate with the engine around interactive
+widgets, following established immediate-mode-UI patterns (local shadow
+state, controlled synchronisation, and an exact echo acknowledgement)
+to eliminate the class of races where a widget's freshly edited value
+was overwritten by a stale engine snapshot.
+
+List of Changes:
+- Engine acknowledgement counter: `AppStateSnapshot.applied_command_seq`
+  is bumped by the engine once per command drained from the command
+  channel and published with the tick, so a GUI can confirm exactly
+  when a sent command landed (the previous mechanisms relied on value
+  echo or fixed timeouts).  Idempotent writes now publish too — the
+  counter forces the structural-PartialEq publish gate open.
+- `gui-engine::edit_state::EditState<T>`: a GUI-framework-agnostic
+  shadow-state machine (shadow value, pending send with assigned ack
+  sequence, focus gate, ack confirmation, 2 s timeout fallback)
+  shared by both frontends; unit-tested in-module.
+- ltc-gui: every interactive widget — text fields (roll, offload
+  parent/device names, converter naming templates, output folder),
+  checkboxes, sliders, and all selector combos/buttons — now renders
+  from a typed `EditState` shadow (`shadows.rs`) through `bound.rs`
+  wrapper functions instead of re-seeding from the snapshot each
+  frame.  All commands flow through a sequence-assigning sink, and
+  fast repaints run while commands await their ack, so engine echoes
+  appear on the next frame instead of after the idle repaint
+  interval.
+- ltc-gui: the two previous ad-hoc mechanisms were removed —
+  `TextFieldEdit` (superseded by the generalised `EditState`) and the
+  converter three-way merge/diff machinery (`local_settings`,
+  `prev_engine_settings`, `merge_converter_settings`,
+  `diff_converter_commands`, `reconcile_converter_settings`, the
+  per-frame GUI-side `apply_available_defaults` and
+  `sync_channel_map_from_probe` rewrites).  Engine-side side-effects
+  (capability repair, decode auto-apply, probe channel-map resize,
+  recording-selection resets) now propagate through shadow sync.
+- Offload device-folder renaming is addressed by mount path
+  (`OffloadCommand::SetDeviceNameByMount`) instead of the volatile
+  card-list index, so a rescan during an edit can no longer retarget
+  the wrong card; per-file selection checkboxes are shadow-backed.
+- ltc-slint bugfixes: the converter focus gate was dead code (an
+  instantiation-site property override replaced the internal focus
+  aggregation with a never-written property — the gate now aggregates
+  `changed has-focus` from each editable input and is two-way linked
+  to the window); the ROLL TextInput lost every keystroke (the
+  callback re-read the stale window property — it now carries the new
+  value through a two-way binding and its poll push is focus-gated);
+  the converter prefix/suffix inputs silently detached from engine
+  updates after the first keystroke (one-way bindings — now two-way).
+
 * Unreleased — state audit and cleanup
 
 A full audit of the published application state

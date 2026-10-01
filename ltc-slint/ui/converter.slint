@@ -734,11 +734,13 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                         border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                         background: AppColors.deep-bg; min-height: 26px; horizontal-stretch: 1;
                         prefix-input := TextInput {
-                            text: root.filename-prefix;
+                            text <=> root.filename-prefix;
                             font-size: 10px; font-family: "monospace";
                             color: AppColors.text-title;
                             horizontal-alignment: left; vertical-alignment: center;
                             edited => { root.filename-prefix-changed(self.text); }
+                            changed has-focus => { root.text-editing = self.has-focus
+                                || audio-suffix-input.has-focus || video-suffix-input.has-focus; }
                         }
                     }
                 }
@@ -751,11 +753,13 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                         border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                         background: AppColors.deep-bg; min-height: 26px; horizontal-stretch: 1;
                         audio-suffix-input := TextInput {
-                            text: root.audio-suffix-template;
+                            text <=> root.audio-suffix-template;
                             font-size: 10px; font-family: "monospace";
                             color: AppColors.text-title;
                             horizontal-alignment: left; vertical-alignment: center;
                             edited => { root.audio-suffix-changed(self.text); }
+                            changed has-focus => { root.text-editing = self.has-focus
+                                || prefix-input.has-focus || video-suffix-input.has-focus; }
                         }
                     }
                 }
@@ -768,11 +772,13 @@ for row in root.num-channels : HorizontalLayout { spacing: 4px;
                         border-radius: 6px; border-width: 1px; border-color: AppColors.border-main;
                         background: AppColors.deep-bg; min-height: 26px; horizontal-stretch: 1;
                         video-suffix-input := TextInput {
-                            text: root.video-suffix-template;
+                            text <=> root.video-suffix-template;
                             font-size: 10px; font-family: "monospace";
                             color: AppColors.text-title;
                             horizontal-alignment: left; vertical-alignment: center;
                             edited => { root.video-suffix-changed(self.text); }
+                            changed has-focus => { root.text-editing = self.has-focus
+                                || prefix-input.has-focus || audio-suffix-input.has-focus; }
                         }
                     }
                 }
@@ -959,8 +965,9 @@ Text {
         }
     }
 
-    // True while any of the editable text fields has focus —
-    // poll.rs uses this to avoid pushing engine values that
-    // would overwrite the user's in-progress keystrokes.
-    text-editing: prefix-input.has-focus || audio-suffix-input.has-focus || video-suffix-input.has-focus;
+    // `text-editing` (declared above) is maintained by the
+    // `changed has-focus` handlers on each editable input — a plain binding
+    // here would be overridden by the two-way link at the instantiation site.
+    // poll.rs reads it via the window's two-way-linked property to avoid
+    // pushing engine values that would overwrite in-progress keystrokes.
 }

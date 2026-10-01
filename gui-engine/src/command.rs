@@ -165,6 +165,10 @@ pub enum OffloadCommand {
     SetParentName(String),
     /// Override the device folder name for a detected card by index.
     SetDeviceName(usize, String),
+    /// Override the device folder name for a detected card by mount path.
+    /// Stable across rescans that reorder the card list (unlike the index
+    /// variant), so GUIs should prefer this one.
+    SetDeviceNameByMount(PathBuf, String),
     /// Toggle selection of a single file on a card.
     SetFileSelected(usize, usize, bool),
     /// Select or deselect all files on a card.

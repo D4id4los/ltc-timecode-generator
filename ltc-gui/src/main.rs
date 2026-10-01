@@ -2,6 +2,7 @@
 
 mod app;
 mod ids;
+mod shadows;
 mod theme;
 mod widgets;
 

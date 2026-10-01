@@ -16,7 +16,11 @@ export component ClapperSection {
     callback scene-down;
     callback take-up;
     callback take-down;
-    callback roll-changed;
+    callback roll-changed(/* new value */ string);
+
+    // True while the ROLL TextInput has focus — poll.rs gates the roll
+    // property push with this to avoid clobbering in-progress edits.
+    in-out property <bool> text-editing;
     callback auto-increment-toggled;
     callback clap-beep;
     callback clear-logs;
@@ -120,12 +124,13 @@ export component ClapperSection {
                             font-weight: 700;
                         }
                         TextInput {
-                            text: root.roll;
+                            text <=> root.roll;
                             font-size: 14px;
                             color: AppColors.text-title;
                             font-weight: 700;
                             horizontal-alignment: center;
-                            edited => { root.roll-changed(); }
+                            edited => { root.roll-changed(self.text); }
+                            changed has-focus => { root.text-editing = self.has-focus; }
                         }
                     }
                 }
@@ -464,12 +469,13 @@ export component ClapperSection {
                         font-weight: 700;
                     }
                     TextInput {
-                        text: root.roll;
+                        text <=> root.roll;
                         font-size: 14px;
                         color: AppColors.text-title;
                         font-weight: 700;
                         horizontal-alignment: center;
-                        edited => { root.roll-changed(); }
+                        edited => { root.roll-changed(self.text); }
+                        changed has-focus => { root.text-editing = self.has-focus; }
                     }
                 }
             }

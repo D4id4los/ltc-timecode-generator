@@ -309,6 +309,14 @@ impl StatusChannels {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppStateSnapshot {
+    // Command acknowledgement counter — bumped by the engine once per
+    // command drained from the command channel, before it is applied.
+    // GUIs use it to confirm that a sent command has landed: a shadow
+    // edit sent at seq N is "applied" once `applied_command_seq >= N`.
+    // The GUI is the sole producer on the command channel, so seqs are
+    // assigned monotonically by the sender and compared with `>=`.
+    pub applied_command_seq: u64,
+
     // Transport
     pub is_playing: bool,
     pub is_locked: bool,
@@ -377,6 +385,7 @@ impl AppStateSnapshot {
         let suggest_sr = audio_core::suggest_sample_rate();
 
         AppStateSnapshot {
+            applied_command_seq: 0,
             is_playing: false,
             is_locked: false,
             current_timecode: Timecode {

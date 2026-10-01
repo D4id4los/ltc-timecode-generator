@@ -8,6 +8,7 @@ use gui_engine::{JobKind, UnitState};
 
 use crate::app::AppState;
 use crate::theme::{ThemeColors, ACCENT};
+use super::bound;
 
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
@@ -78,34 +79,20 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_space(4.0);
 
-    // Editable parent name (ISO date) — persistent buffer via parent_name_edit.
-    // Use a local copy inside the horizontal closure to avoid borrow conflicts;
-    // write back through state.parent_name_edit after the closure exits.
-    let mut name = state.parent_name_edit.buffer().to_string();
-    let mut changed = false;
-    let mut focused = false;
+    // Editable parent name (ISO date) — bound shadow; sends on each change
+    // with a non-empty value.
     ui.horizontal(|ui| {
         ui.label(RichText::new("Subfolder: ").font(FontId::monospace(12.0)).color(colors.text_muted));
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut name)
-                .font(FontId::monospace(14.0))
-                .desired_width(160.0)
+        let truth = state.latest.offload.parent_name.clone();
+        bound::text(
+            ui, state,
+            |s| &mut s.sh.parent_name,
+            &truth,
+            |v| GuiCommand::Offload(OffloadCommand::SetParentName(v)),
+            |edit| edit.font(FontId::monospace(14.0)).desired_width(160.0),
         );
-        focused = resp.has_focus();
-        changed = resp.changed() && !name.is_empty();
         ui.label(RichText::new("(date subfolder)").font(FontId::monospace(10.0)).color(colors.text_muted));
     });
-    // Write back the local copy to the persistent buffer BEFORE mark_edited,
-    // so that mark_edited captures the latest value as the pending confirmation.
-    let parent_value = name.clone();
-    *state.parent_name_edit.buffer_mut() = name;
-    if changed {
-        state.parent_name_edit.mark_edited(std::time::Instant::now());
-    }
-    state.parent_name_edit.set_focused(focused);
-    if changed {
-        state.send(GuiCommand::Offload(OffloadCommand::SetParentName(parent_value)));
-    }
 }
 
 fn render_cards(ui: &mut Ui, state: &mut AppState) {
@@ -155,37 +142,24 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
 
                 ui.add_space(2.0);
 
-                // Editable device name — persistent buffers in device_name_edits keyed by mount
+                // Editable device name — bound shadow keyed by mount (stable
+                // across rescans); the command targets the mount, not the
+                // list index, so a rescan mid-edit cannot retarget the card.
                 let mount = card.mount.clone();
-                let copy = state.device_name_edits.get(&mount)
-                    .map(|e| e.buffer().to_string())
-                    .unwrap_or_else(|| card.device_name.clone());
-                let mut dev_name = copy;
-                let mut dev_changed = false;
-                let mut dev_focused = false;
+                let truth = card.device_name.clone();
+                let mount_for_cmd = mount.clone();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Device folder: ")
                         .font(FontId::monospace(11.0))
                         .color(colors.text_muted));
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut dev_name)
-                            .font(FontId::monospace(14.0))
-                            .desired_width(140.0)
+                    bound::text(
+                        ui, state,
+                        |s| s.sh.device_names.get_mut(&mount).expect("device shadow seeded in logic()"),
+                        &truth,
+                        move |v| GuiCommand::Offload(OffloadCommand::SetDeviceNameByMount(mount_for_cmd.clone(), v)),
+                        |edit| edit.font(FontId::monospace(14.0)).desired_width(140.0),
                     );
-                    dev_focused = resp.has_focus();
-                    dev_changed = resp.changed();
                 });
-                let dev_value = dev_name.clone();
-                if let Some(edit) = state.device_name_edits.get_mut(&mount) {
-                    *edit.buffer_mut() = dev_name;
-                    if dev_changed {
-                        edit.mark_edited(std::time::Instant::now());
-                    }
-                    edit.set_focused(dev_focused);
-                }
-                if dev_changed {
-                    state.send(GuiCommand::Offload(OffloadCommand::SetDeviceName(idx, dev_value)));
-                }
 
                 // File count summary (now with selection info).
                 ui.horizontal(|ui| {
@@ -244,16 +218,20 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
                             for i in range {
                                 let file = &card.files[i];
                                 let selected = card.selected.get(i).copied().unwrap_or(false);
-                                let mut checked = selected;
+                                let file_key = file.path.clone();
+                                let mount_key = card.mount.clone();
                                 ui.horizontal(|ui| {
                                     ui.set_min_height(row_height);
                                     ui.set_height(row_height);
-                                    let resp = ui.checkbox(&mut checked, "");
-                                    if resp.changed() {
-                                        state.send(GuiCommand::Offload(
-                                            OffloadCommand::SetFileSelected(idx, i, checked),
-                                        ));
-                                    }
+                                    bound::checkbox(
+                                        ui, state,
+                                        |s| s.sh.file_selection.get_mut(&(mount_key.clone(), file_key.clone()))
+                                            .expect("file-selection shadow seeded in logic()"),
+                                        selected,
+                                        "",
+                                        true,
+                                        |v| GuiCommand::Offload(OffloadCommand::SetFileSelected(idx, i, v)),
+                                    );
 
                                     // Filename
                                     ui.label(RichText::new(&file.name)

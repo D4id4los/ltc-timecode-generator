@@ -85,6 +85,12 @@ pub fn engine_main_with_probe<F>(
     // skipped until something actually changes.
     let mut last_published: Option<Arc<AppStateSnapshot>> = None;
 
+    // Command ack counter — bumped once per drained command and mirrored
+    // into the published snapshot so GUIs can confirm their edits landed
+    // (see `AppStateSnapshot.applied_command_seq`).  The GUI is the sole
+    // producer on the channel, so this matches the sender's seq 1:1.
+    let mut applied_command_seq: u64 = 0;
+
     // Spawn the ffmpeg capability probe on a background thread (via job supervisor)
     {
         let spec = job::JobSpec {
@@ -104,9 +110,20 @@ pub fn engine_main_with_probe<F>(
         let dt = (now - last_tick).as_secs_f32();
         last_tick = now;
 
-        // 1. Drain all pending commands
+        // 1. Drain all pending commands.  Every successfully received
+        //    command bumps the ack counter before the match so the
+        //    snapshot published at the end of this tick carries it.
         loop {
-            match cmd_rx.try_recv() {
+            let received = cmd_rx.try_recv();
+            let received = match received {
+                Ok(cmd) => {
+                    applied_command_seq += 1;
+                    current.applied_command_seq = applied_command_seq;
+                    Ok(cmd)
+                }
+                err => err,
+            };
+            match received {
                 Ok(GuiCommand::Shutdown) => {
                     let _ = core.stop_ltc();
                     let _ = core.stop_output();
@@ -1726,6 +1743,13 @@ fn handle_offload_command(
 
         crate::command::OffloadCommand::SetDeviceName(idx, name) => {
             if let Some(card) = state.offload.cards.get_mut(idx) {
+                card.device_name = name;
+                card.name_source = DeviceNameSource::Manual;
+            }
+        }
+
+        crate::command::OffloadCommand::SetDeviceNameByMount(mount, name) => {
+            if let Some(card) = state.offload.cards.iter_mut().find(|c| c.mount == mount) {
                 card.device_name = name;
                 card.name_source = DeviceNameSource::Manual;
             }

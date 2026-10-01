@@ -58,8 +58,13 @@ pub fn setup_poll_timer(
             // 2. Theme sync
             AppColors::get(&ui).set_theme_dark(s.is_dark_theme);
 
-            // 3. Clapper metadata (fix one-way sync gaps)
-            ui.set_roll(SharedString::from(s.clapper.roll.clone()));
+            // 3. Clapper metadata (fix one-way sync gaps). The roll push is
+            //    focus-gated: the ROLL TextInput is two-way bound to the
+            //    `roll` property, so pushing while the user edits would
+            //    clobber in-progress keystrokes.
+            if !ui.get_roll_editing() {
+                ui.set_roll(SharedString::from(s.clapper.roll.clone()));
+            }
             ui.set_scene(s.clapper.scene as i32);
             ui.set_take(s.clapper.take as i32);
             ui.set_auto_increment(s.clapper.auto_increment_take);

@@ -115,6 +115,7 @@ export component AppWindow inherits Window {
     in-out property <[string]> conv-video-encoder-options: [];
     in-out property <[string]> conv-audio-encoder-options: [];
     in-out property <bool> conv-text-editing: false;
+    in-out property <bool> roll-editing: false;
     in-out property <bool> set-start-from-ltc: false;
     in-out property <float> ltc-offset-secs: 0.0;
     in-out property <string> ltc-start-tc-text: "";
@@ -167,7 +168,7 @@ export component AppWindow inherits Window {
     callback scene-down;
     callback take-up;
     callback take-down;
-    callback roll-changed;
+    callback roll-changed(/* new value */ string);
     callback auto-increment-toggled;
     callback clear-logs;
     callback copy-logs;
@@ -654,7 +655,8 @@ export component AppWindow inherits Window {
                 if (root.active-tab == 0) : ClapperSection {
                     scene: root.scene;
                     take: root.take;
-                    roll: root.roll;
+                    roll <=> root.roll;
+                    text-editing <=> root.roll-editing;
                     auto-increment: root.auto-increment;
                     logs: root.logs;
                     arm-angle: root.arm-angle;
@@ -663,7 +665,7 @@ export component AppWindow inherits Window {
                     scene-down => { root.scene-down(); }
                     take-up => { root.take-up(); }
                     take-down => { root.take-down(); }
-                    roll-changed => { root.roll-changed(); }
+                    roll-changed(new-value) => { root.roll-changed(new-value); }
                     auto-increment-toggled => { root.auto-increment-toggled(); }
                     clap-beep => { root.clap-beep(); }
                     clear-logs => { root.clear-logs(); }
@@ -750,7 +752,7 @@ export component AppWindow inherits Window {
                     filename-prefix: root.conv-filename-prefix;
                     audio-suffix-template: root.conv-audio-suffix-template;
                     video-suffix-template: root.conv-video-suffix-template;
-                    text-editing: root.conv-text-editing;
+                    text-editing <=> root.conv-text-editing;
                     conv-status: root.conv-status;
                     conv-progress: root.conv-progress;
                     conv-log: root.conv-log;

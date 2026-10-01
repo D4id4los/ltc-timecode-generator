@@ -5,6 +5,7 @@ pub mod config;
 pub mod converter;
 pub mod device_name;
 pub mod duration;
+pub mod edit_state;
 pub mod engine;
 pub mod ffprobe;
 pub mod file_pattern;

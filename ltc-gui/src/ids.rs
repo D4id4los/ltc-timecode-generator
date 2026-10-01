@@ -47,7 +47,8 @@ pub fn debug_log_scroll() -> &'static str {
 }
 
 /// Salt for the per-card file-list ScrollArea in the Offload tab.
-/// Keyed by the card mount path (same per-card key as `device_name_edits`)
+/// Keyed by the card mount path (same per-card key as the device-name
+/// shadows in `shadows.rs`)
 /// so scroll state follows the card across rescans.
 pub fn offload_card_files_scroll(mount: &std::path::Path) -> String {
     format!("offload_card_files_scroll_{}", mount.display())
