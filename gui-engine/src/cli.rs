@@ -848,8 +848,7 @@ pub fn process_cli(cli: Cli) -> CliOutcome {
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let use_libltc = cli.decoder == "libltc";
-    let mut init_state = AppStateSnapshot::initial();
-    init_state.use_libltc = use_libltc;
+    let init_state = AppStateSnapshot::initial();
     let state = Arc::new(arc_swap::ArcSwap::new(Arc::new(init_state)));
     let state_clone = Arc::clone(&state);
 

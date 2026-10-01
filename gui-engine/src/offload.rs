@@ -123,8 +123,6 @@ pub struct SdCardInfo {
     pub media_file_count: usize,
     /// Total size in bytes of all media files.
     pub total_bytes: u64,
-    /// Pattern name from file_pattern matching, if any.
-    pub pattern_name: Option<String>,
     /// Per-file metadata collected during scan.
     pub files: Vec<OffloadFileInfo>,
     /// Per-file selection (aligned with `files`). Filled by engine on scan.
@@ -187,7 +185,8 @@ impl OffloadSnapshot {
 }
 
 /// Shared cell for scan progress: the scan thread writes per-drive messages,
-/// the engine reads them each tick and publishes into OffloadSnapshot.
+/// the engine forwards them into the scan job's `ProgressTracker`, which is
+/// polled each tick and published as `jobs[OffloadScan].message`.
 pub struct ScanProgress {
     inner: Arc<Mutex<Option<String>>>,
     forward: Option<Box<dyn Fn(String) + Send + Sync>>,
@@ -692,7 +691,6 @@ fn classify_mount(mount: &Path, _label_source: &Path, deadline: Instant) -> Opti
         name_source,
         media_file_count: media_files.len(),
         total_bytes,
-        pattern_name,
         files: infos,
         selected: Vec::new(),
         selected_count: 0,

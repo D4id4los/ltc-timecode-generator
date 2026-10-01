@@ -271,7 +271,6 @@ pub struct MatchedGroup {
     /// Relative directory under the scanned root (empty for root-level files).
     pub rel_dir: String,
     pub files: Vec<PathBuf>,
-    pub pattern_name: &'static str,
     pub recording_type: crate::converter::RecordingType,
 }
 
@@ -385,7 +384,6 @@ pub fn match_files_all_patterns(folder: &Path) -> Vec<MatchedGroup> {
                 prefix,
                 rel_dir,
                 files,
-                pattern_name: pattern.name,
                 recording_type,
             });
         }
@@ -870,7 +868,6 @@ mod tests {
                 group.recording_type,
                 crate::converter::RecordingType::MultiTrackAudio
             );
-            assert_eq!(group.pattern_name, "TASCAM");
         }
     }
 

@@ -338,7 +338,6 @@ fn merge_converter_settings(
     };
 
     ConverterUserSettings {
-        naming_pattern: merge_field(&base.naming_pattern, &local.naming_pattern, &engine.naming_pattern),
         metadata_only: merge_field(&base.metadata_only, &local.metadata_only, &engine.metadata_only),
         generate_synthetic_video: merge_field(&base.generate_synthetic_video, &local.generate_synthetic_video, &engine.generate_synthetic_video),
         copy_video: merge_field(&base.copy_video, &local.copy_video, &engine.copy_video),
@@ -347,7 +346,6 @@ fn merge_converter_settings(
         concat_audio: merge_field(&base.concat_audio, &local.concat_audio, &engine.concat_audio),
         set_start_from_ltc: merge_field(&base.set_start_from_ltc, &local.set_start_from_ltc, &engine.set_start_from_ltc),
         embed_camera_metadata: merge_field(&base.embed_camera_metadata, &local.embed_camera_metadata, &engine.embed_camera_metadata),
-        trim_enabled: merge_field(&base.trim_enabled, &local.trim_enabled, &engine.trim_enabled),
         ltc_file_idx: merge_field(&base.ltc_file_idx, &local.ltc_file_idx, &engine.ltc_file_idx),
         channel_map,
         container: merge_field(&base.container, &local.container, &engine.container),
@@ -402,14 +400,8 @@ fn diff_converter_commands(
     if old.embed_camera_metadata != new.embed_camera_metadata {
         cmds.push(ConverterCommand::SetEmbedCameraMetadata(new.embed_camera_metadata));
     }
-    if old.trim_enabled != new.trim_enabled {
-        cmds.push(ConverterCommand::SetTrimEnabled(new.trim_enabled));
-    }
     if old.ltc_file_idx != new.ltc_file_idx {
         cmds.push(ConverterCommand::SetLtcFileIndex(new.ltc_file_idx));
-    }
-    if old.naming_pattern != new.naming_pattern {
-        cmds.push(ConverterCommand::SetNamingPattern(new.naming_pattern));
     }
     if old.container != new.container {
         cmds.push(ConverterCommand::SetContainer(new.container.clone()));
@@ -754,7 +746,7 @@ impl AppState {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.available_width() > 180.0 {
-                    let time_str = format!("{} UTC", s.system_time);
+                    let time_str = format!("{} UTC", gui_engine::timecode::chrono_now_string());
                     let frame = egui::Frame::new()
                         .fill(colors.nested_bg)
                         .stroke(egui::Stroke::new(1.0, colors.border_main))
@@ -1457,7 +1449,6 @@ mod tests {
         let group = MatchedGroup {
             prefix: "TEST".to_string(),
             rel_dir: String::new(),
-            pattern_name: "TASCAM",
             recording_type: gui_engine::converter::RecordingType::MultiTrackAudio,
             files: vec![
                 PathBuf::from("TEST_S01.wav"),
@@ -1488,7 +1479,6 @@ mod tests {
         let group = MatchedGroup {
             prefix: "CLIP".to_string(),
             rel_dir: String::new(),
-            pattern_name: "GoPro",
             recording_type: gui_engine::converter::RecordingType::VideoClipSequence,
             files: vec![
                 PathBuf::from("GOPR0001.MP4"),

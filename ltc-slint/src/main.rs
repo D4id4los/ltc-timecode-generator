@@ -459,13 +459,6 @@ fn _run_gui(
     }
     {
         let cmd = cmd_tx.clone();
-        ui.on_conv_select_pattern(move |new_pattern| {
-            let val = if new_pattern >= 0 { Some(new_pattern as usize) } else { None };
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SetNamingPattern(val)));
-        });
-    }
-    {
-        let cmd = cmd_tx.clone();
         ui.on_conv_select_group(move |group_idx| {
             if group_idx >= 0 {
                 let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SelectRecording(

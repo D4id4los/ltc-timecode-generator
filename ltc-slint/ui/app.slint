@@ -73,7 +73,6 @@ export component AppWindow inherits Window {
     in-out property <string> os-name: "LINUX";
     in-out property <int> device-count: 0;
     in-out property <string> sample-format: "";
-    in-out property <bool> wake-lock-active: false;
     in-out property <string> system-time: "12:00:00 UTC";
     in-out property <string> status-message: "Ready";
     in-out property <string> power-status: "AC";
@@ -112,7 +111,6 @@ export component AppWindow inherits Window {
     in-out property <string> conv-sanity-msg: "";
     in-out property <string> conv-collision-warning: "";
     in-out property <string> conv-duplicate-output-warning: "";
-    in-out property <int> conv-selected-pattern: 0;
     in-out property <[string]> conv-container-options: [];
     in-out property <[string]> conv-video-encoder-options: [];
     in-out property <[string]> conv-audio-encoder-options: [];
@@ -225,7 +223,6 @@ export component AppWindow inherits Window {
     callback toggle-copy-video;
     callback toggle-metadata-only;
     callback toggle-embed-camera-meta;
-    callback conv-select-pattern(int);
     callback toggle-set-start-ltc;
 
     // ── Offload callbacks ──
@@ -763,7 +760,6 @@ export component AppWindow inherits Window {
                     container-options: root.conv-container-options;
                     video-encoder-options: root.conv-video-encoder-options;
                     audio-encoder-options: root.conv-audio-encoder-options;
-                    selected-pattern: root.conv-selected-pattern;
                     set-start-from-ltc: root.set-start-from-ltc;
                     ltc-offset-secs: root.ltc-offset-secs;
                     ltc-start-tc-text: root.ltc-start-tc-text;
@@ -790,7 +786,6 @@ export component AppWindow inherits Window {
                     toggle-copy-video => { root.toggle-copy-video(); }
                     toggle-metadata-only => { root.toggle-metadata-only(); }
                     toggle-embed-camera-meta => { root.toggle-embed-camera-meta(); }
-                    select-pattern(idx) => { root.conv-select-pattern(idx); }
                 }
                 if (root.active-tab == 3) : OffloadSection {
                     parent-folder: root.off-parent-folder;
@@ -824,7 +819,6 @@ export component AppWindow inherits Window {
             device-count: root.device-count;
             is-playing: root.is-playing;
             sample-format: root.sample-format;
-            wake-lock-active: root.wake-lock-active;
             status-message: root.status-message;
             power-status: root.power-status;
         }

@@ -23,6 +23,7 @@ export struct FileGroupInfo {
     prefix: string,
     files: [string],
     channel-count: int,
+    is-audio-recording: bool,
     duration-text: string,
 }
 
@@ -44,7 +45,6 @@ export struct OffloadCardInfo {
     files: [OffloadFileInfo],
     selected-count: int,
     selected-bytes: string,
-    durations-version: int,
 }
 
 export struct OffloadDeviceStatus {

@@ -10,7 +10,6 @@ use log::{error, info, warn};
 
 use crate::command::{ConverterCommand, GuiCommand};
 use crate::config;
-use crate::video_codecs::describe_chain;
 use crate::converter::{
     query_ffmpeg_capabilities,
     FfmpegCapabilities, ChannelMap, ConversionPipeline, ConverterSettings,
@@ -48,7 +47,6 @@ pub fn engine_main_with_probe<F>(
     F: FnOnce() -> FfmpegCapabilities + Send + 'static,
 {
     let mut current = AppStateSnapshot::initial();
-    current.use_libltc = use_libltc;
 
     // Seed persisted paths into the engine snapshot (output folder,
     // offload parent dir). Input folder is restored by the GUI sending
@@ -180,10 +178,6 @@ pub fn engine_main_with_probe<F>(
                 Ok(GuiCommand::Offload(cmd)) => {
                     handle_offload_command(cmd, &mut current, &mut supervisor);
                 }
-                Ok(GuiCommand::Converter(ConverterCommand::SetNamingPattern(val))) => {
-                    current.converter.settings.naming_pattern = val;
-                    recompute_converter_derived(&mut current);
-                }
                 Ok(GuiCommand::Converter(ConverterCommand::SetMetadataOnly(val)))=> {
                     current.converter.settings.metadata_only = val;
                     recompute_converter_derived(&mut current);
@@ -214,10 +208,6 @@ pub fn engine_main_with_probe<F>(
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetEmbedCameraMetadata(val)))=> {
                     current.converter.settings.embed_camera_metadata = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetTrimEnabled(val)))=> {
-                    current.converter.settings.trim_enabled = val;
                     recompute_converter_derived(&mut current);
                 }
                 Ok(GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(val)))=> {
@@ -309,7 +299,6 @@ pub fn engine_main_with_probe<F>(
                     info!("Probing video file for audio streams (async via job): {}", path);
                     current.ltc_probe = None;
                     current.ltc_decode_error = None;
-                    current.ltc_decode_is_video = false;
                     current.status_message = format!("Probing video: {}", path);
                     let path_clone = path.clone();
                     let spec = job::JobSpec {
@@ -328,6 +317,7 @@ pub fn engine_main_with_probe<F>(
                     process_command(
                         cmd,
                         &core,
+                        use_libltc,
                         &mut current,
                         &mut recovery_attempts,
                         &mut log_id_counter,
@@ -442,7 +432,6 @@ pub fn engine_main_with_probe<F>(
                             current.ltc_probe = Some(probe.clone());
                             current.ltc_selected_stream = 0;
                             current.ltc_selected_channel = 0;
-                            current.ltc_decode_is_video = true;
                             current.ltc_decode_error = None;
                             current.status_message = format!(
                                 "Video probed: {} audio stream(s), {} total channel(s)",
@@ -454,7 +443,6 @@ pub fn engine_main_with_probe<F>(
                         Err(e) => {
                             current.ltc_probe = None;
                             current.ltc_decode_error = Some(e.clone());
-                            current.ltc_decode_is_video = false;
                             current.status_message = format!("Video probe failed: {}", e);
                             error!("Video probe failed (job): {}", e);
                         }
@@ -671,7 +659,6 @@ pub fn engine_main_with_probe<F>(
                                         current.ltc_probe = Some(probe.clone());
                                         current.ltc_selected_stream = 0;
                                         current.ltc_selected_channel = 0;
-                                        current.ltc_decode_is_video = true;
                                         current.ltc_decode_error = None;
                                     } else {
                                         let err = probes.iter().find_map(|r| {
@@ -736,14 +723,10 @@ pub fn engine_main_with_probe<F>(
         current.clap_animating = current.clap_flash_alpha > 0.0
             || (current.clap_arm_angle - TARGET_ARM_ANGLE).abs() > ARM_SETTLE_EPS;
 
-        // 6. System time
-        current.system_time = timecode::chrono_now_string();
-
-        // 7. Publish state
-        current.generation += 1;
+        // 6. Publish state
         state.store(Arc::new(current.clone()));
 
-        // 8. Sleep until next tick
+        // 7. Sleep until next tick
         let next_tick = last_tick + TICK_INTERVAL;
         if let Some(sleep_dur) = next_tick.checked_duration_since(Instant::now()) {
             std::thread::sleep(sleep_dur);
@@ -900,6 +883,7 @@ fn bridge_decode_progress(
 fn process_command(
     cmd: GuiCommand,
     core: &AudioCore,
+    use_libltc: bool,
     state: &mut AppStateSnapshot,
     recovery_attempts: &mut u8,
     log_id_counter: &mut u64,
@@ -936,7 +920,6 @@ fn process_command(
         GuiCommand::StopLtc => {
             let _ = core.stop_ltc();
             state.is_playing = false;
-            state.wake_lock_active = false;
             state.status_message = "Stopped".to_string();
         }
 
@@ -1118,7 +1101,7 @@ fn process_command(
                 return;
             }
             let total = paths.len();
-            let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
+            let decoder_name = if use_libltc { "libltc" } else { "builtin" };
             info!(
                 "LTC group decode requested: {} clip(s), stream={}, channel={}, decoder={}, fps={}",
                 total, stream_index, channel_index, decoder_name, state.decode_fps,
@@ -1142,7 +1125,6 @@ fn process_command(
             state.status_message = format!("Decoding LTC group: 0/{} clips", total);
 
             let capture_gen = state.ltc_group_decode_generation;
-            let use_libltc = state.use_libltc;
             let decode_fps = state.decode_fps;
             let decode_drop_frame = state.decode_drop_frame;
 
@@ -1200,7 +1182,6 @@ fn process_command(
             state.ltc_decode_result = None;
             state.ltc_decode_error = None;
             state.ltc_probe = None;
-            state.ltc_decode_is_video = false;
             supervisor.cancel(JobKind::LtcDecode);
             state.jobs.insert(JobKind::LtcDecode, job::JobStatus::idle());
             state.ltc_decode_generation = state.ltc_decode_generation.wrapping_add(1);
@@ -1223,7 +1204,7 @@ fn process_command(
                 info!("LTC decode already in progress — ignoring duplicate ParseLtcVideo");
                 return;
             }
-            let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
+            let decoder_name = if use_libltc { "libltc" } else { "builtin" };
             info!(
                 "LTC video decode requested: {} (stream={}, channel={}, decoder={}, fps={})",
                 path, stream_index, channel_index, decoder_name, state.decode_fps,
@@ -1248,7 +1229,6 @@ fn process_command(
             });
 
             let capture_gen = state.ltc_decode_generation;
-            let use_libltc = state.use_libltc;
             let decode_fps = state.decode_fps;
             let decode_drop_frame = state.decode_drop_frame;
 
@@ -1332,7 +1312,7 @@ fn process_command(
                 info!("LTC decode already in progress — ignoring duplicate ParseLtcWavFile");
                 return;
             }
-            let decoder_name = if state.use_libltc { "libltc" } else { "builtin" };
+            let decoder_name = if use_libltc { "libltc" } else { "builtin" };
             info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps);
 
             // Quick open to calculate chunk count
@@ -1369,7 +1349,6 @@ fn process_command(
                 error: None,
             });
 
-            let use_libltc = state.use_libltc;
             let decode_fps = state.decode_fps;
             let decode_drop_frame = state.decode_drop_frame;
 
@@ -1862,21 +1841,20 @@ fn recompute_converter_derived(state: &mut AppStateSnapshot) {
     // Readiness — no mutable borrow of converter yet
     let blockers = evaluate_readiness(has_group, prefix_empty, output_empty, caps.as_ref()).blockers;
 
-    // Compute preview / collision / encoder desc via a temporary settings assembly
+    // Compute warnings via a temporary settings assembly. The output preview
+    // is only needed here (as input to the duplicate-name warning); the GUIs
+    // compute their own previews from their local edit buffers.
     let settings = assemble_converter_settings(state);
-    let (collision_warning, output_preview, encoder_chain_desc, duplicate_warning) = if let Some(ref s) = settings {
+    let (collision_warning, duplicate_warning) = if let Some(ref s) = settings {
         let probe = state.converter.probes.first().and_then(|p| p.as_ref());
         let collision = output_collision_warning(s);
         let preview = preview_output_files(s, probe);
-        let chain = caps.as_ref()
-            .map(|c| describe_chain(&s.video_encoder, c))
-            .unwrap_or_default();
         let dupe_paths: Vec<std::path::PathBuf> = preview.iter().map(|p| p.path.clone()).collect();
         let dupe_names = duplicate_output_names(&dupe_paths);
         let dupe_warning = duplicate_output_warning(&dupe_names);
-        (collision, preview, chain, dupe_warning)
+        (collision, dupe_warning)
     } else {
-        (None, Vec::new(), String::new(), None)
+        (None, None)
     };
 
     // Now borrow converter mutably to publish all derived fields at once
@@ -1884,8 +1862,6 @@ fn recompute_converter_derived(state: &mut AppStateSnapshot) {
     c.readiness = blockers;
     c.collision_warning = collision_warning;
     c.duplicate_output_warning = duplicate_warning;
-    c.output_preview = output_preview;
-    c.encoder_chain_desc = encoder_chain_desc;
 }
 
 /// Assemble a `ConverterSettings` from the engine's current state snapshot.
@@ -2100,7 +2076,6 @@ fn apply_recording_selection(
     state.ltc_probe = None;
     state.ltc_selected_stream = 0;
     state.ltc_selected_channel = 0;
-    state.ltc_decode_is_video = false;
     state.ltc_decode_result = None;
     state.ltc_decode_error = None;
     state.ltc_group_results.clear();
@@ -2296,7 +2271,6 @@ mod tests {
         state.converter.groups = vec![MatchedGroup {
             prefix: "TEST".into(),
             rel_dir: String::new(),
-            pattern_name: "TASCAM",
             recording_type: crate::converter::RecordingType::MultiTrackAudio,
             files: files.clone(),
         }];
@@ -2322,7 +2296,6 @@ mod tests {
         state.converter.groups = vec![MatchedGroup {
             prefix: "TEST".into(),
             rel_dir: String::new(),
-            pattern_name: "TASCAM",
             recording_type: crate::converter::RecordingType::MultiTrackAudio,
             files: files.clone(),
         }];
@@ -2342,7 +2315,6 @@ mod tests {
         state.converter.groups = vec![MatchedGroup {
             prefix: "CLIP".into(),
             rel_dir: String::new(),
-            pattern_name: "GoPro",
             recording_type: crate::converter::RecordingType::VideoClipSequence,
             files: vec![
                 PathBuf::from("GOPR0001.MP4"),
@@ -2541,7 +2513,7 @@ mod tests {
 
         // ToggleLock on: false → true
         process_command(
-            GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
+            GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
             &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor,
         );
         assert!(state.is_locked);
@@ -2557,9 +2529,9 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
+        process_command(GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
             &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
-        process_command(GuiCommand::ToggleLock, &core, &mut state, &mut recovery,
+        process_command(GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
             &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!(!state.is_locked);
     }
@@ -2574,7 +2546,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetFpsIndex(4), &core, &mut state,
+        process_command(GuiCommand::SetFpsIndex(4), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.fps_index, 4);
         assert_eq!(state.fps, 30.0);
@@ -2591,7 +2563,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetFpsIndex(3), &core, &mut state,
+        process_command(GuiCommand::SetFpsIndex(3), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.fps_index, 3);
         assert!((state.fps - 29.97).abs() < 0.01);
@@ -2608,7 +2580,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetFpsIndex(99), &core, &mut state,
+        process_command(GuiCommand::SetFpsIndex(99), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.fps_index, 1);
         assert_eq!(state.fps, 25.0);
@@ -2624,11 +2596,11 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetTheme(true), &core, &mut state,
+        process_command(GuiCommand::SetTheme(true), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!(state.is_dark_theme);
 
-        process_command(GuiCommand::SetTheme(false), &core, &mut state,
+        process_command(GuiCommand::SetTheme(false), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!(!state.is_dark_theme);
     }
@@ -2643,11 +2615,11 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::ToggleTheme, &core, &mut state,
+        process_command(GuiCommand::ToggleTheme, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!(state.is_dark_theme, "toggle from initial false → true");
 
-        process_command(GuiCommand::ToggleTheme, &core, &mut state,
+        process_command(GuiCommand::ToggleTheme, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!(!state.is_dark_theme, "toggle again true → false");
     }
@@ -2670,7 +2642,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::ClearLogs, &core, &mut state,
+        process_command(GuiCommand::ClearLogs, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!(state.logs.is_empty());
     }
@@ -2685,7 +2657,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetLtcChannel("both".into()), &core, &mut state,
+        process_command(GuiCommand::SetLtcChannel("both".into()), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.ltc_channel, "both");
     }
@@ -2700,7 +2672,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetBeepVolume(0.75), &core, &mut state,
+        process_command(GuiCommand::SetBeepVolume(0.75), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!((state.beep_volume - 0.75).abs() < 1e-6);
     }
@@ -2716,7 +2688,7 @@ mod tests {
         let mut supervisor = JobSupervisor::new();
         let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
 
-        process_command(GuiCommand::SetStartTimecode(tc), &core, &mut state,
+        process_command(GuiCommand::SetStartTimecode(tc), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.start_timecode, tc);
     }
@@ -2731,15 +2703,15 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetScene(42), &core, &mut state,
+        process_command(GuiCommand::SetScene(42), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.scene, 42);
 
-        process_command(GuiCommand::SetTake(7), &core, &mut state,
+        process_command(GuiCommand::SetTake(7), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.take, 7);
 
-        process_command(GuiCommand::SetRoll("B002".into()), &core, &mut state,
+        process_command(GuiCommand::SetRoll("B002".into()), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.roll, "B002");
     }
@@ -2755,11 +2727,11 @@ mod tests {
         let mut supervisor = JobSupervisor::new();
 
         state.scene = 5;
-        process_command(GuiCommand::SceneUp, &core, &mut state,
+        process_command(GuiCommand::SceneUp, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.scene, 6);
 
-        process_command(GuiCommand::SceneDown, &core, &mut state,
+        process_command(GuiCommand::SceneDown, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.scene, 5);
     }
@@ -2775,11 +2747,11 @@ mod tests {
         let mut supervisor = JobSupervisor::new();
 
         state.take = 3;
-        process_command(GuiCommand::TakeUp, &core, &mut state,
+        process_command(GuiCommand::TakeUp, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.take, 4);
 
-        process_command(GuiCommand::TakeDown, &core, &mut state,
+        process_command(GuiCommand::TakeDown, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.take, 3);
     }
@@ -2795,7 +2767,7 @@ mod tests {
         let mut supervisor = JobSupervisor::new();
 
         state.scene = 0;
-        process_command(GuiCommand::SceneDown, &core, &mut state,
+        process_command(GuiCommand::SceneDown, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.scene, 0, "scene should not go below 0");
     }
@@ -2811,7 +2783,7 @@ mod tests {
         let mut supervisor = JobSupervisor::new();
 
         state.take = 0;
-        process_command(GuiCommand::TakeDown, &core, &mut state,
+        process_command(GuiCommand::TakeDown, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.take, 0, "take should not go below 0");
     }
@@ -2826,7 +2798,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetSampleRate(48000), &core, &mut state,
+        process_command(GuiCommand::SetSampleRate(48000), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.sample_rate, 48000);
     }
@@ -2841,11 +2813,11 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetAutoIncrement(false), &core, &mut state,
+        process_command(GuiCommand::SetAutoIncrement(false), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!(!state.auto_increment_take);
 
-        process_command(GuiCommand::SetAutoIncrement(true), &core, &mut state,
+        process_command(GuiCommand::SetAutoIncrement(true), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!(state.auto_increment_take);
     }
@@ -2860,7 +2832,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetDecodeFpsIndex(4), &core, &mut state,
+        process_command(GuiCommand::SetDecodeFpsIndex(4), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert_eq!(state.decode_fps_index, 4);
         assert_eq!(state.decode_fps, 30.0);
@@ -2877,7 +2849,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetDecodeFpsIndex(3), &core, &mut state,
+        process_command(GuiCommand::SetDecodeFpsIndex(3), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         assert!((state.decode_fps - 29.97).abs() < 0.01);
         assert!(state.decode_drop_frame);
@@ -2893,7 +2865,7 @@ mod tests {
         let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
 
-        process_command(GuiCommand::SetDecodeFpsIndex(99), &core, &mut state,
+        process_command(GuiCommand::SetDecodeFpsIndex(99), &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor);
         // Should not change since index is out of range
         assert_eq!(state.decode_fps_index, 1);
@@ -2946,7 +2918,6 @@ mod tests {
             streams: vec![],
             is_video_file: true,
         });
-        s.ltc_decode_is_video = true;
         s.ltc_group_paths = vec![std::path::PathBuf::from("clip.mp4")];
         s.ltc_group_results = vec![None];
         s.ltc_group_errors = vec![None];
@@ -2966,14 +2937,13 @@ mod tests {
         let mut supervisor = JobSupervisor::new();
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, &mut state,
+            GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor,
         );
 
         assert!(state.ltc_decode_result.is_none(), "single result cleared");
         assert!(state.ltc_decode_error.is_none(), "error cleared");
         assert!(state.ltc_probe.is_none(), "probe cleared");
-        assert!(!state.ltc_decode_is_video, "is_video cleared");
         assert_eq!(state.job(JobKind::LtcDecode).phase, JobPhase::Idle, "LtcDecode job reset to Idle");
         assert_eq!(state.ltc_decode_generation, 43, "decode gen bumped from 42");
     }
@@ -2989,7 +2959,7 @@ mod tests {
         let mut supervisor = JobSupervisor::new();
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, &mut state,
+            GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor,
         );
 
@@ -3011,7 +2981,7 @@ mod tests {
         let mut supervisor = JobSupervisor::new();
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, &mut state,
+            GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
             &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor,
         );
 
@@ -3027,7 +2997,6 @@ mod tests {
             prefix: "TASCAM_0097".to_string(),
             rel_dir: String::new(),
             files,
-            pattern_name: "TASCAM Portacapture X8",
             recording_type: crate::converter::RecordingType::MultiTrackAudio,
         }
     }
@@ -3074,7 +3043,6 @@ mod tests {
             prefix: "C0001".to_string(),
             rel_dir: String::new(),
             files: vec![PathBuf::from("/tmp/clip1.mp4")],
-            pattern_name: "Sony Handycam",
             recording_type: crate::converter::RecordingType::VideoClipSequence,
         }];
         state.converter.selected_group_idx = Some(0);
@@ -3111,7 +3079,6 @@ mod tests {
             prefix: "C0001".to_string(),
             rel_dir: parent.file_name().unwrap().to_string_lossy().to_string(),
             files: vec![parent.join("C0001.MP4")],
-            pattern_name: "Sony Handycam",
             recording_type: crate::converter::RecordingType::VideoClipSequence,
         }
     }
@@ -3144,7 +3111,6 @@ mod tests {
             prefix: "C0001".to_string(),
             rel_dir: String::new(),
             files: vec![root.join("C0001.MP4")],
-            pattern_name: "Sony Handycam",
             recording_type: crate::converter::RecordingType::VideoClipSequence,
         }];
         state.converter.settings.output_folder = PathBuf::new();

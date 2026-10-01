@@ -385,7 +385,7 @@ impl std::fmt::Display for JobError {
 
 #[derive(Debug, Clone)]
 pub enum JobOutcome {
-    Succeeded { summary: String, log: String },
+    Succeeded { log: String },
     Cancelled { log: String },
     Failed { error: String, log: String },
 }
@@ -652,7 +652,6 @@ where
                 Ok(Ok(result)) => {
                     let payload: JobFinal = result.into();
                     (JobOutcome::Succeeded {
-                        summary: String::new(),
                         log: String::new(),
                     }, payload)
                 }

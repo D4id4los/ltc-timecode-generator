@@ -191,7 +191,6 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             // 11. Transport state
             ui.set_is_playing(s.is_playing);
             ui.set_is_locked(s.is_locked);
-            ui.set_wake_lock_active(s.wake_lock_active);
             ui.set_status_message(SharedString::from(&s.status_message));
 
             // 12. FPS name
@@ -346,6 +345,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                             }).collect::<Vec<_>>()
                         )),
                         channel_count: g.files.len() as i32,
+                        is_audio_recording: matches!(g.recording_type, RecordingType::MultiTrackAudio),
                         duration_text: SharedString::from(dur_text),
                     }
                 }).collect();
@@ -544,7 +544,6 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                         files: ModelRc::new(VecModel::<crate::OffloadFileInfo>::from(files)),
                         selected_count: card.selected_count as i32,
                         selected_bytes: SharedString::from(format_bytes(card.selected_bytes)),
-                        durations_version: off.durations_version as i32,
                     }
                 }).collect();
                 ui.set_off_cards(ModelRc::new(VecModel::<crate::OffloadCardInfo>::from(card_infos)));

@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::camera_meta::CameraInfo;
-use crate::converter::{
-    FfmpegCapabilities, RecordingType, ChannelMap, ConvertBlocker, PreviewOutput,
-};
+use crate::converter::{FfmpegCapabilities, RecordingType, ChannelMap, ConvertBlocker};
 use crate::ffprobe::VideoAudioProbe;
 use crate::file_pattern::MatchedGroup;
 use crate::job::{JobKind, JobStatus};
@@ -21,9 +19,6 @@ use audio_core::{AudioDeviceInfo, AudioEvent, LtcDetectionResult, Timecode};
 /// config persistence) in the command handler.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConverterUserSettings {
-    /// Pattern filter for folder scanning: `None` = auto (all patterns,
-    /// used by egui), `Some(0)` = TASCAM, `Some(1)` = any/video (Slint).
-    pub naming_pattern: Option<usize>,
     /// "Metadata only — tag + rename, extract audio" mode.
     pub metadata_only: bool,
     /// Audio-only pipeline: generate a synthetic black+silence video.
@@ -40,8 +35,6 @@ pub struct ConverterUserSettings {
     pub set_start_from_ltc: bool,
     /// Embed camera metadata (make/model, bext originator) in output files.
     pub embed_camera_metadata: bool,
-    /// Trim each file to its first LTC frame.
-    pub trim_enabled: bool,
     /// Index of the file/channel carrying LTC (audio groups).
     pub ltc_file_idx: usize,
     /// Input→output channel permutation matrix.
@@ -69,7 +62,6 @@ pub struct ConverterUserSettings {
 impl ConverterUserSettings {
     pub fn initial() -> Self {
         Self {
-            naming_pattern: None,
             metadata_only: false,
             generate_synthetic_video: false,
             copy_video: false,
@@ -78,7 +70,6 @@ impl ConverterUserSettings {
             concat_audio: false,
             set_start_from_ltc: false,
             embed_camera_metadata: true,
-            trim_enabled: true,
             ltc_file_idx: 0,
             channel_map: ChannelMap::identity(0),
             container: "mov".to_string(),
@@ -128,10 +119,6 @@ pub struct ConverterSnapshot {
     pub collision_warning: Option<String>,
     /// Warning when two or more planned output files share the same name.
     pub duplicate_output_warning: Option<String>,
-    /// Preview of output files — recomputed by the engine on changes.
-    pub output_preview: Vec<PreviewOutput>,
-    /// Human-readable description of the resolved encoder chain.
-    pub encoder_chain_desc: String,
 }
 
 impl ConverterSnapshot {
@@ -161,8 +148,6 @@ pub struct ClapLogItem {
 
 #[derive(Clone, Debug)]
 pub struct AppStateSnapshot {
-    pub generation: u64,
-
     // Transport
     pub is_playing: bool,
     pub is_locked: bool,
@@ -180,6 +165,7 @@ pub struct AppStateSnapshot {
     pub ltc_volume: f32,
     pub beep_volume: f32,
     pub beep_frequency: f32,
+    /// Beep tone duration in seconds.
     pub beep_duration: f32,
 
     // Audio device
@@ -188,7 +174,6 @@ pub struct AppStateSnapshot {
     pub audio_initialized: bool,
     pub sample_rate: u32,
     pub sample_format_name: String,
-    pub wake_lock_active: bool,
 
     // Clapper metadata
     pub scene: u32,
@@ -207,7 +192,6 @@ pub struct AppStateSnapshot {
 
     // Status
     pub status_message: String,
-    pub system_time: String,
 
     // Events drained from AudioCore (to be surfaced as toasts by the GUI)
     pub events: Vec<AudioEvent>,
@@ -218,7 +202,6 @@ pub struct AppStateSnapshot {
     pub decode_drop_frame: bool,
 
     // LTC file decode
-    pub use_libltc: bool,   // decoder selection (set from CLI --decoder flag; false = builtin, true = libltc)
     pub ltc_decode_result: Option<LtcDetectionResult>,
     pub ltc_decode_error: Option<String>,
     pub ltc_decode_generation: u64,
@@ -227,7 +210,6 @@ pub struct AppStateSnapshot {
     pub ltc_probe: Option<VideoAudioProbe>,
     pub ltc_selected_stream: usize,
     pub ltc_selected_channel: usize,
-    pub ltc_decode_is_video: bool,
     // LTC group (batch) decode — decode every clip in a video recording group
     pub ltc_group_decode_generation: u64,
     /// Paths of the group being decoded, index-aligned with results.
@@ -257,13 +239,8 @@ pub struct AppStateSnapshot {
 impl AppStateSnapshot {
     pub fn initial() -> Self {
         let suggest_sr = audio_core::suggest_sample_rate();
-        let _suggest_sr_index = audio_core::SAMPLE_RATE_OPTIONS
-            .iter()
-            .position(|&r| r == suggest_sr)
-            .unwrap_or(0);
 
         AppStateSnapshot {
-            generation: 0,
             is_playing: false,
             is_locked: false,
             current_timecode: Timecode {
@@ -292,7 +269,6 @@ impl AppStateSnapshot {
             audio_initialized: false,
             sample_rate: suggest_sr,
             sample_format_name: String::new(),
-            wake_lock_active: false,
             scene: 1,
             take: 1,
             roll: "A001".to_string(),
@@ -303,19 +279,16 @@ impl AppStateSnapshot {
             clap_animating: false,
             is_dark_theme: false,
             status_message: "Ready".to_string(),
-            system_time: String::new(),
             events: Vec::new(),
             decode_fps_index: 1,
             decode_fps: 25.0,
             decode_drop_frame: false,
-            use_libltc: false,
             ltc_decode_result: None,
             ltc_decode_error: None,
             ltc_decode_generation: 0,
             ltc_probe: None,
             ltc_selected_stream: 0,
             ltc_selected_channel: 0,
-            ltc_decode_is_video: false,
             ltc_group_decode_generation: 0,
             ltc_group_paths: Vec::new(),
             ltc_group_results: Vec::new(),
@@ -336,8 +309,6 @@ impl AppStateSnapshot {
                 readiness: Vec::new(),
                 collision_warning: None,
                 duplicate_output_warning: None,
-                output_preview: Vec::new(),
-                encoder_chain_desc: String::new(),
             },
             offload: OffloadSnapshot::initial(),
         }
@@ -420,7 +391,6 @@ mod tests {
         assert_eq!(s.selected_device, 0);
         assert!(!s.audio_initialized);
         assert!(s.sample_format_name.is_empty());
-        assert!(!s.wake_lock_active);
     }
 
     #[test]
@@ -487,17 +457,9 @@ mod tests {
         assert_eq!(s.decode_fps_index, 1);
         assert_eq!(s.decode_fps, 25.0);
         assert!(!s.decode_drop_frame);
-        assert!(!s.use_libltc);
         assert!(s.ltc_decode_result.is_none());
         assert!(s.ltc_decode_error.is_none());
         assert_eq!(s.ltc_decode_generation, 0);
-    }
-
-    // ── Generation field ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_initial_generation_zero() {
-        assert_eq!(initial_state().generation, 0);
     }
 
     // ── LTC group decode defaults ──────────────────────────────────────────

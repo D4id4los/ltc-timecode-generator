@@ -24,11 +24,6 @@ pub fn render(ui: &mut Ui, state: &AppState) {
                 if !s.sample_format_name.is_empty() {
                     dot_label(ui, &format!("SAMPLE: {}", s.sample_format_name.to_uppercase()), Color32::from_rgb(0x22, 0xC5, 0x5E), &colors);
                 }
-                if s.wake_lock_active {
-                    dot_label(ui, "WAKE LOCK: ACTIVE", Color32::from_rgb(0x22, 0xC5, 0x5E), &colors);
-                } else {
-                    dot_label(ui, "WAKE LOCK: STANDBY", Color32::from_rgb(0x8E, 0x92, 0x99), &colors);
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new("POWER: AC").font(FontId::monospace(10.0)).color(colors.text_muted).strong());
                 });

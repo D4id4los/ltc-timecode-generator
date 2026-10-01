@@ -782,7 +782,6 @@ fn test_select_recording_probe_failure_publishes_error() {
         "ltc_probe must remain None when clip probe fails",
     );
     assert!(snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running);
-    assert!(!snapshot.ltc_decode_is_video);
 
     drop(tx);
     handle.join().expect("engine thread panicked");
@@ -841,7 +840,6 @@ if snapshot.converter.probes_generation > initial_probe_gen
     );
     assert!(snapshot.ltc_decode_error.is_none(), "ltc_decode_error must be None when at least one clip succeeds: {:?}", snapshot.ltc_decode_error);
     assert!(snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running);
-    assert!(snapshot.ltc_decode_is_video);
 
     drop(tx);
     handle.join().expect("engine thread panicked");
@@ -901,10 +899,6 @@ fn test_select_recording_preserves_ltc_probe() {
         snapshot.ltc_probe.is_some(),
         "ltc_probe must be populated after converter clip probe completes"
     );
-    assert!(
-        snapshot.ltc_decode_is_video,
-        "ltc_decode_is_video must be true for a video-clip group"
-    );
     assert!(snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running);
 
     drop(tx);
@@ -959,7 +953,6 @@ fn test_select_recording_without_folder_does_not_probe() {
         "ltc_probe must remain None when no folder was selected (no group to probe)",
     );
     assert!(snapshot.job(JobKind::ClipProbe).phase != JobPhase::Running);
-    assert!(!snapshot.ltc_decode_is_video);
 
     drop(tx);
     handle.join().expect("engine thread panicked");

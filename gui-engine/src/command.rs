@@ -124,8 +124,6 @@ pub enum ConverterCommand {
     SetStartFromLtc(bool),
     /// Toggle embedding camera metadata (make/model, bext originator) in outputs.
     SetEmbedCameraMetadata(bool),
-    /// Toggle trimming files to first LTC frame.
-    SetTrimEnabled(bool),
     /// Set which file/channel carries LTC (audio groups).
     SetLtcFileIndex(usize),
     /// Swap two cells in the channel map.
@@ -148,9 +146,6 @@ pub enum ConverterCommand {
     SetAudioSuffixTemplate(String),
     /// Set the video suffix template.
     SetVideoSuffixTemplate(String),
-
-    // ── Naming pattern (Slint) ─────────────────────────────────────────
-    SetNamingPattern(Option<usize>),
 
     // ── Conversion lifecycle ───────────────────────────────────────────
     /// Start conversion with current settings.

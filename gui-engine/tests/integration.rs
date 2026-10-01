@@ -101,8 +101,8 @@ where
         }
         if Instant::now() > deadline {
             panic!(
-                "Timeout waiting for predicate (generation={}, ltc_job={:?}, status={})",
-                snapshot.generation, snapshot.job(JobKind::LtcDecode), snapshot.status_message
+                "Timeout waiting for predicate (ltc_job={:?}, status={})",
+                snapshot.job(JobKind::LtcDecode), snapshot.status_message
             );
         }
         std::thread::sleep(POLL_INTERVAL);
