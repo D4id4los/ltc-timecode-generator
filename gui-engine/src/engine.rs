@@ -74,6 +74,11 @@ pub fn engine_main_with_probe<F>(
     // Job supervisor — single channel for all async task result events
     let mut supervisor = JobSupervisor::new();
 
+    // Publish-gating: last snapshot stored into the ArcSwap.  Idle ticks
+    // produce a byte-identical snapshot, so the deep clone + store is
+    // skipped until something actually changes.
+    let mut last_published: Option<Arc<AppStateSnapshot>> = None;
+
     // Spawn the ffmpeg capability probe on a background thread (via job supervisor)
     {
         let spec = job::JobSpec {
@@ -712,8 +717,12 @@ pub fn engine_main_with_probe<F>(
         current.clapper.animating = current.clapper.flash_alpha > 0.0
             || (current.clapper.arm_angle - TARGET_ARM_ANGLE).abs() > ARM_SETTLE_EPS;
 
-        // 6. Publish state
-        state.store(Arc::new(current.clone()));
+        // 6. Publish state — only when the snapshot actually changed
+        let next = Arc::new(current.clone());
+        if last_published.as_ref().map_or(true, |p| next.as_ref() != p.as_ref()) {
+            state.store(next.clone());
+            last_published = Some(next);
+        }
 
         // 7. Sleep until next tick
         let next_tick = last_tick + TICK_INTERVAL;

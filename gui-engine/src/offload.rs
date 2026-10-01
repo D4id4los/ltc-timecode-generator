@@ -96,7 +96,7 @@ const CARD_SCAN_BUDGET: Duration = Duration::from_secs(120);
 // ── Public types ────────────────────────────────────────────────────────
 
 /// Information about a single media file found on a card.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OffloadFileInfo {
     /// Full filesystem path.
     pub path: PathBuf,
@@ -109,7 +109,7 @@ pub struct OffloadFileInfo {
 }
 
 /// Information about a detected media card.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SdCardInfo {
     /// Mount point of the card (e.g. `/run/media/viktoria/EOS_DIGITAL`).
     pub mount: PathBuf,
@@ -134,7 +134,7 @@ pub struct SdCardInfo {
 }
 
 /// Per-device copy totals captured from the plans at `StartOffload`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OffloadDeviceTotals {
     pub name: String,
     pub files_total: usize,
@@ -142,7 +142,7 @@ pub struct OffloadDeviceTotals {
 }
 
 /// Published snapshot of the entire offload subsystem.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OffloadSnapshot {
     /// Detected cards from the most recent scan.
     pub cards: Vec<SdCardInfo>,

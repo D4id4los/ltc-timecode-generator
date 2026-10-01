@@ -24,14 +24,14 @@ pub enum LtcDecodeStatus {
     Error { message: String },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FrameTimecode {
     pub frame_index: u32,
     pub timecode: Timecode,
     pub timecode_secs: f64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LtcDetectionResult {
     pub status: LtcDecodeStatus,
     pub detected_fps: f32,
@@ -91,7 +91,7 @@ impl QualityGrade {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LtcQualityReport {
     /// Overall quality score 0.0–1.0
     pub score: f64,

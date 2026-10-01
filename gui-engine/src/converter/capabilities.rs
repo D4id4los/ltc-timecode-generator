@@ -41,13 +41,13 @@ pub struct HwDeviceContext {
     pub vulkan_available: bool,
 }
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct HwDeviceCapabilities {
     pub vaapi_device: Option<String>,
     pub vulkan_available: bool,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct FfmpegCapabilities {
     pub has_ffmpeg: bool,
     pub available_encoders: BTreeSet<String>,

@@ -904,3 +904,59 @@ fn test_multi_chunk_decode_shows_intermediate_progress() {
     drop(tx);
     handle.join().expect("engine thread panicked");
 }
+// ── Publish gating ──────────────────────────────────────────────────────
+
+#[test]
+fn test_idle_engine_does_not_republish() {
+    init_test_config();
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("publish-gate-test".into())
+        .spawn(move || {
+            engine_main_with_probe(rx, state_clone, false, fake_probe);
+        })
+        .expect("failed to spawn engine thread");
+
+    // Wait until the engine has published at least once (non-initial snapshot).
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        if Instant::now() > deadline {
+            panic!("Timeout waiting for first publish");
+        }
+        // The FfmpegCapProbe finish (fake_probe) changes the snapshot, so a
+        // published arc distinct from the initial one appears within a few
+        // ticks. Detect "has published something" via the probe result.
+        if state.load().ffmpeg_caps.is_some() {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Snapshot is now idle/static — several ticks must NOT store a new Arc.
+    let before = state.load_full();
+    std::thread::sleep(Duration::from_millis(150));
+    let after = state.load_full();
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "idle engine must skip stores when the snapshot is unchanged",
+    );
+
+    // A state change must publish again.
+    tx.send(GuiCommand::Clap).unwrap();
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        if Instant::now() > deadline {
+            panic!("Timeout waiting for republish after Clap");
+        }
+        if !Arc::ptr_eq(&before, &state.load_full()) {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}

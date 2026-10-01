@@ -10,7 +10,7 @@ use crate::subprocess::{watch_stderr_lines, FFMPEG_STALL_TIMEOUT};
 
 use log::{error, info, warn};
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct AudioStreamInfo {
     pub stream_index: usize,
     pub channels: usize,
@@ -18,7 +18,7 @@ pub struct AudioStreamInfo {
     pub sample_rate: u32,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct VideoAudioProbe {
     pub streams: Vec<AudioStreamInfo>,
     pub total_audio_channels: usize,

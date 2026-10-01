@@ -64,7 +64,7 @@ impl ChannelSel {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AudioEvent {
     StreamError(String),
     StreamDied,
@@ -75,7 +75,7 @@ pub enum AudioEvent {
     FramesDropped { total: u64 },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AudioDeviceInfo {
     pub id: String,
     pub name: String,

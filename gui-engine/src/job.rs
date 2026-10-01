@@ -242,7 +242,7 @@ impl UnitProgress {
 
 // ── Progress snapshot (read by engine each tick) ────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UnitSnapshot {
     pub label: String,
     pub message: String,
@@ -250,7 +250,7 @@ pub struct UnitSnapshot {
     pub state: UnitState,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProgressSnapshot {
     pub phase: JobPhase,
     pub fraction: f32,
@@ -265,7 +265,7 @@ pub struct ProgressSnapshot {
 /// Published status of one job kind: a `ProgressSnapshot` plus the final
 /// error, if the job failed.  Progress data is accessed through the
 /// delegate methods (`phase()`, `fraction()`, …).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JobStatus {
     pub progress: ProgressSnapshot,
     pub error: Option<String>,

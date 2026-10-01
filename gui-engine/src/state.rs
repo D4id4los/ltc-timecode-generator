@@ -89,7 +89,7 @@ impl ConverterUserSettings {
 
 /// Engine-managed converter state: groups, probes, conversion status,
 /// user settings (single source of truth), and derived UI data.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConverterSnapshot {
     /// File groups discovered in the current converter folder.
     /// Empty when no folder has been selected.
@@ -139,7 +139,7 @@ impl ConverterSnapshot {
 /// Per-clip state of a batch LTC group decode; index-aligned with
 /// `AppStateSnapshot::ltc_group_paths`.  The decode result is boxed to keep
 /// the pending variant cheap (the Vec is republished every engine tick).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ClipDecodeState {
     /// Decode still in flight for this clip.
     Pending,
@@ -164,7 +164,7 @@ impl ClipDecodeState {
 
 // ── Clap log entry ──────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClapLogItem {
     /// Monotonic clap counter (presentation fields are pre-formatted strings
     /// so both GUIs share a single formatting site in the engine).
@@ -181,7 +181,7 @@ pub struct ClapLogItem {
 /// and batch group-decode results.  `generation` counters are engine
 /// latches (also used by integration tests as progress handles); no GUI
 /// renders them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DecodeSnapshot {
     /// Index into `FPS_OPTIONS` used when decoding.
     pub fps_index: usize,
@@ -212,7 +212,7 @@ pub struct DecodeSnapshot {
 /// Engine-managed clapper-board state and clap animation.  The animation
 /// fields are engine-computed each tick (decay curves) and consumed for
 /// rendering/repaint pacing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ClapperSnapshot {
     pub scene: u32,
     pub take: u32,
@@ -307,7 +307,7 @@ impl StatusChannels {
 
 // ── Application state snapshot ─────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AppStateSnapshot {
     // Transport
     pub is_playing: bool,

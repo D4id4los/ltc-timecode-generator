@@ -265,7 +265,7 @@ pub fn wrap_user_selected_files(files: Vec<PathBuf>) -> BTreeMap<String, Vec<Pat
 }
 
 /// Matched group from scanning a folder with all applicable patterns.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MatchedGroup {
     pub prefix: String,
     /// Relative directory under the scanned root (empty for root-level files).
