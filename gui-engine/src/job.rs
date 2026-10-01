@@ -461,6 +461,9 @@ pub enum JobFinal {
 
 // ── Events ──────────────────────────────────────────────────────────────
 
+// JobFinal is deliberately unboxed: events are short-lived on an internal
+// channel, and boxing would force a deref-match rewrite of every handler.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum JobEvent {
     Item {
