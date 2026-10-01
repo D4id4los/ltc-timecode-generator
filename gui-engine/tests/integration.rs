@@ -102,7 +102,7 @@ where
         if Instant::now() > deadline {
             panic!(
                 "Timeout waiting for predicate (ltc_job={:?}, status={})",
-                snapshot.job(JobKind::LtcDecode), snapshot.status_message
+                snapshot.job(JobKind::LtcDecode), snapshot.status.message()
             );
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -380,8 +380,8 @@ fn test_engine_mpsc_parse_invalid_file() {
         |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.error.is_some(),
     );
 
-    assert!(snapshot.status_message.contains("Parse failed"),
-        "expected 'Parse failed', got: {}", snapshot.status_message);
+    assert!(snapshot.status.decode.contains("Parse failed"),
+        "expected 'Parse failed', got: {}", snapshot.status.decode);
     assert!(snapshot.decode.result.is_none());
     assert!(snapshot.decode.error.is_some());
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
@@ -410,9 +410,9 @@ fn test_engine_clap_auto_increments_take() {
 
 #[test]
 fn test_engine_clap_status_message() {
-    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.status_message == "Clap!");
+    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.status.audio == "Clap!");
 
-    assert_eq!(snapshot.status_message, "Clap!");
+    assert_eq!(snapshot.status.audio, "Clap!");
 }
 
 #[test]
@@ -683,9 +683,9 @@ fn test_engine_toggle_lock() {
 
 #[test]
 fn test_engine_reset_current_timecode() {
-    let snapshot = run_engine(vec![GuiCommand::Reset], false, |s| s.status_message == "Reset");
+    let snapshot = run_engine(vec![GuiCommand::Reset], false, |s| s.status.audio == "Reset");
     assert_eq!(snapshot.current_timecode, snapshot.start_timecode);
-    assert_eq!(snapshot.status_message, "Reset");
+    assert_eq!(snapshot.status.audio, "Reset");
 }
 
 // ── LTC decode stream/channel selection ──────────────────────────────────
@@ -783,12 +783,12 @@ fn cancel_decode_clears_is_detecting_and_sets_status() {
             GuiCommand::CancelDecode,
         ],
         false,
-        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.status_message == "Decode canceled by user",
+        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.status.decode == "Decode canceled by user",
     );
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcDecode job phase");
-    assert_eq!(snapshot.status_message, "Decode canceled by user",
-        "CancelDecode should update status_message");
+    assert_eq!(snapshot.status.decode, "Decode canceled by user",
+        "CancelDecode should update status.decode");
 }
 
 #[test]
@@ -803,13 +803,13 @@ fn cancel_decode_also_clears_group_detecting() {
             GuiCommand::CancelDecode,
         ],
         false,
-        |s| s.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running && s.status_message == "Decode canceled by user",
+        |s| s.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running && s.status.decode == "Decode canceled by user",
     );
     assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcGroupDecode job phase");
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcDecode job phase");
-    assert_eq!(snapshot.status_message, "Decode canceled by user");
+    assert_eq!(snapshot.status.decode, "Decode canceled by user");
 }
 
 #[test]

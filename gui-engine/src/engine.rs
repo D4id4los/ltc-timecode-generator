@@ -274,11 +274,11 @@ pub fn engine_main_with_probe<F>(
                         status.progress.phase = job::JobPhase::Running;
                         status.progress.message = "Conversion started…".to_string();
                         current.jobs.insert(JobKind::Conversion, status);
-                        current.status_message = "Conversion started…".to_string();
+                        current.status.set_converter("Conversion started…");
                         info!("Conversion started via engine StartConversion command (job-based)");
                     } else {
                         let msg = "Cannot start conversion — no recording group selected or settings incomplete".to_string();
-                        current.status_message = msg.clone();
+                        current.status.set_converter(msg.clone());
                         warn!("{}", msg);
                     }
                 }
@@ -288,7 +288,7 @@ pub fn engine_main_with_probe<F>(
                         status.progress.phase = job::JobPhase::Cancelled;
                         status.error = Some("Cancelled by user".to_string());
                     }
-                    current.status_message = "Conversion canceled".to_string();
+                    current.status.set_converter("Conversion canceled");
                     info!("Conversion cancel signaled via engine CancelConversion command (job-based)");
                 }
                 Ok(GuiCommand::ProbeVideo(path)) => {
@@ -299,7 +299,7 @@ pub fn engine_main_with_probe<F>(
                     info!("Probing video file for audio streams (async via job): {}", path);
                     current.decode.probe = None;
                     current.decode.error = None;
-                    current.status_message = format!("Probing video: {}", path);
+                    current.status.set_decode(format!("Probing video: {}", path));
                     let path_clone = path.clone();
                     let spec = job::JobSpec {
                         kind: JobKind::VideoProbe,
@@ -350,9 +350,6 @@ pub fn engine_main_with_probe<F>(
                 .unwrap_or(false);
             if !is_terminal {
                 current.jobs.insert(*kind, JobStatus::from_progress(snap));
-                if *kind == JobKind::Conversion && !snap.message.is_empty() {
-                    current.status_message = snap.message.clone();
-                }
             }
         }
         for event in supervisor.drain() {
@@ -374,12 +371,12 @@ pub fn engine_main_with_probe<F>(
                     match outcome {
                         JobOutcome::Succeeded { .. } => {
                             recompute_converter_derived(&mut current);
-                            current.status_message = "Conversion completed".to_string();
+                            current.status.set_converter("Conversion completed");
                             info!("Engine-owned conversion completed successfully (job)");
                         }
                         JobOutcome::Cancelled { .. } => {
                             recompute_converter_derived(&mut current);
-                            current.status_message = "Conversion canceled".to_string();
+                            current.status.set_converter("Conversion canceled");
                             info!("Engine-owned conversion cancelled (job)");
                         }
                         JobOutcome::Failed { error, .. } => {
@@ -387,7 +384,7 @@ pub fn engine_main_with_probe<F>(
                                 status.error = Some(error.clone());
                             }
                             recompute_converter_derived(&mut current);
-                            current.status_message = format!("Conversion failed: {}", error);
+                            current.status.set_converter(format!("Conversion failed: {}", error));
                             warn!("Engine-owned conversion failed: {}", error);
                         }
                     }
@@ -433,17 +430,17 @@ pub fn engine_main_with_probe<F>(
                             current.decode.selected_stream = 0;
                             current.decode.selected_channel = 0;
                             current.decode.error = None;
-                            current.status_message = format!(
+                            current.status.set_decode(format!(
                                 "Video probed: {} audio stream(s), {} total channel(s)",
                                 probe.streams.len(),
                                 probe.total_audio_channels,
-                            );
+                            ));
                             info!("Video probe succeeded (job): {} streams, {} channels", probe.streams.len(), probe.total_audio_channels);
                         }
                         Err(e) => {
                             current.decode.probe = None;
                             current.decode.error = Some(e.clone());
-                            current.status_message = format!("Video probe failed: {}", e);
+                            current.status.set_decode(format!("Video probe failed: {}", e));
                             error!("Video probe failed (job): {}", e);
                         }
                     }
@@ -520,7 +517,7 @@ pub fn engine_main_with_probe<F>(
                             completed_devices.len(),
                         );
                         current.offload.error = Some("Canceled by user".to_string());
-                        current.status_message = "Offload canceled".to_string();
+                        current.status.set_offload("Offload canceled");
                     } else {
                         info!(
                             "Offload copy complete: {} device(s) offloaded of {}",
@@ -537,10 +534,10 @@ pub fn engine_main_with_probe<F>(
                         current.offload.last_offload_parent = target;
                         current.offload.last_offload_version =
                             current.offload.last_offload_version.wrapping_add(1);
-                        current.status_message = format!(
+                        current.status.set_offload(format!(
                             "Offload complete: {} device(s) copied",
                             completed_devices.len(),
-                        );
+                        ));
                     }
                 }
                 JobEvent::Finished { kind: JobKind::LtcDecode, payload: JobFinal::Decode { result, path }, outcome, .. } => {
@@ -564,7 +561,7 @@ pub fn engine_main_with_probe<F>(
                                 r.valid_frames, r.avg_confidence * 100.0,
                                 r.detected_fps, if r.drop_frame { " DF" } else { "" },
                             );
-                            current.status_message = summary;
+                            current.status.set_decode(summary);
                             if generation > last_auto_applied_ltc_gen {
                                 auto_apply_ltc_to_settings(&mut current, &path.to_string_lossy());
                                 last_auto_applied_ltc_gen = generation;
@@ -575,11 +572,11 @@ pub fn engine_main_with_probe<F>(
                             let is_cancel = e == "Decode canceled by user";
                             current.decode.result = None;
                             current.decode.error = if is_cancel { None } else { Some(e.clone()) };
-                            current.status_message = if is_cancel {
+                            current.status.set_decode(if is_cancel {
                                 "Decode canceled".to_string()
                             } else {
                                 format!("Parse failed: {}", e)
-                            };
+                            });
                             if !is_cancel {
                                 error!("LTC decode failed: {} — {}", path.display(), e);
                             }
@@ -590,10 +587,10 @@ pub fn engine_main_with_probe<F>(
                     if current.decode.group_results.len() > index {
                         current.decode.group_results[index] = ClipDecodeState::Done(result);
                         let done = current.decode.group_results.iter().filter(|r| r.is_done()).count();
-                        current.status_message = format!(
+                        current.status.set_decode(format!(
                             "Decoding group: {}/{} clips",
                             done, current.decode.group_results.len(),
-                        );
+                        ));
                         if let ClipDecodeState::Done(Ok(r)) = &current.decode.group_results[index] {
                             info!(
                                 "LTC group decode [{}/{}]: {} frames (confidence {:.1}%)",
@@ -629,7 +626,7 @@ pub fn engine_main_with_probe<F>(
                     } else {
                         format!("Group decode complete (all {} clips failed)", failures)
                     };
-                    current.status_message = tc_info;
+                    current.status.set_decode(tc_info);
                     info!("LTC group decode complete: {}/{} ok, {}/{} failed",
                         successes, total, failures, total);
                     if gen > last_auto_applied_group_ltc_gen {
@@ -657,7 +654,7 @@ pub fn engine_main_with_probe<F>(
                                             if let Err(ref e) = r { Some(e.clone()) } else { None }
                                         }).unwrap_or_else(|| "No audio streams detected.".to_string());
                                         current.decode.error = Some(format!("LTC source probe failed: {}", err));
-                                        current.status_message = format!("Video probe failed: {}", err);
+                                        current.status.set_decode(format!("Video probe failed: {}", err));
                                     }
                                 }
                             }
@@ -887,7 +884,7 @@ fn process_command(
         GuiCommand::StartLtc => {
             ensure_audio_init(core, state, last_device_id, recovery_attempts);
             if !state.audio_initialized {
-                state.status_message = "Cannot start — audio not initialized".to_string();
+                state.status.set_audio("Cannot start — audio not initialized");
                 return;
             }
             match core.start_ltc(
@@ -899,12 +896,12 @@ fn process_command(
             ) {
                 Ok(()) => {
                     state.is_playing = true;
-                    state.status_message = "Streaming LTC".to_string();
+                    state.status.set_audio("Streaming LTC");
                     state.current_timecode = state.start_timecode;
                 }
                 Err(e) => {
                     error!("Failed to start LTC: {}", e);
-                    state.status_message = format!("Start failed: {}", e);
+                    state.status.set_audio(format!("Start failed: {}", e));
                 }
             }
         }
@@ -912,13 +909,13 @@ fn process_command(
         GuiCommand::StopLtc => {
             let _ = core.stop_ltc();
             state.is_playing = false;
-            state.status_message = "Stopped".to_string();
+            state.status.set_audio("Stopped");
         }
 
         GuiCommand::Reset => {
             let _ = core.reset_ltc(state.start_timecode);
             state.current_timecode = state.start_timecode;
-            state.status_message = "Reset".to_string();
+            state.status.set_audio("Reset");
         }
 
         GuiCommand::ToggleLock => {
@@ -957,7 +954,7 @@ fn process_command(
             if state.clapper.auto_increment_take {
                 state.clapper.take = state.clapper.take.saturating_add(1);
             }
-            state.status_message = "Clap!".to_string();
+            state.status.set_audio("Clap!");
         }
 
         GuiCommand::SetStartTimecode(tc) => {
@@ -990,8 +987,7 @@ fn process_command(
                 // Revert to previous device
                 state.selected_device = previous_device.take();
                 if try_init_device(core, state, last_device_id, recovery_attempts) {
-                    state.status_message =
-                        "Device selection reverted to previous".to_string();
+                    state.status.set_audio("Device selection reverted to previous");
                 } else {
                     // Previous selection may have been automatic (None);
                     // fall back to the default/first device.
@@ -1011,12 +1007,11 @@ fn process_command(
                             state.selected_device = None;
                         }
                     }
-                    state.status_message =
-                        format!("{} devices found", state.devices.len());
+                    state.status.set_audio(format!("{} devices found", state.devices.len()));
                 }
                 Err(e) => {
                     error!("Failed to list devices: {}", e);
-                    state.status_message = format!("Device scan failed: {}", e);
+                    state.status.set_audio(format!("Device scan failed: {}", e));
                 }
             }
         }
@@ -1083,7 +1078,7 @@ fn process_command(
                 status.progress.phase = job::JobPhase::Cancelled;
                 status.progress.message = "Canceled by user".to_string();
             }
-            state.status_message = "Decode canceled by user".to_string();
+            state.status.set_decode("Decode canceled by user");
         }
 
         GuiCommand::DecodeLtcVideoGroup { paths, stream_index, channel_index } => {
@@ -1117,7 +1112,7 @@ fn process_command(
                 },
                 error: None,
             });
-            state.status_message = format!("Decoding LTC group: 0/{} clips", total);
+            state.status.set_decode(format!("Decoding LTC group: 0/{} clips", total));
 
             let capture_gen = state.decode.group_generation;
             let decode_fps = state.decode_fps();
@@ -1211,7 +1206,7 @@ fn process_command(
                 "Extracting audio from: {} stream={} ch={}",
                 path, stream_index, channel_index,
             );
-            state.status_message = msg.clone();
+            state.status.set_decode(msg.clone());
             state.jobs.insert(JobKind::LtcDecode, job::JobStatus {
                 progress: ProgressSnapshot {
                     phase: job::JobPhase::Running,
@@ -1256,7 +1251,7 @@ fn process_command(
                         status.error = Some(e.clone());
                     }
                     state.decode.error = Some(e.clone());
-                    state.status_message = format!("Parse failed: {}", e);
+                    state.status.set_decode(format!("Parse failed: {}", e));
                     return;
                 }
             }
@@ -1318,7 +1313,7 @@ fn process_command(
                 Err(e) => {
                     error!("Failed to open WAV for chunked decode: {}", e);
                     state.decode.error = Some(e.clone());
-                    state.status_message = format!("Parse failed: {}", e);
+                    state.status.set_decode(format!("Parse failed: {}", e));
                     if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
                         status.progress.phase = job::JobPhase::Failed;
                         status.error = Some(e.clone());
@@ -1334,7 +1329,7 @@ fn process_command(
                 "Decoding LTC from: {} [{}] at {:.2} fps ({} chunks)",
                 path, decoder_name, state.decode_fps(), chunk_count
             );
-            state.status_message = msg.clone();
+            state.status.set_decode(msg.clone());
             state.jobs.insert(JobKind::LtcDecode, job::JobStatus {
                 progress: ProgressSnapshot {
                     phase: job::JobPhase::Running,
@@ -1523,7 +1518,7 @@ fn ensure_audio_init(
     }
 
     error!("Audio init failed after {} attempts: {}", max_attempts, last_error);
-    state.status_message = format!("Audio init failed: {}", last_error);
+    state.status.set_audio(format!("Audio init failed: {}", last_error));
     state.events.push(AudioEvent::StreamError(last_error.clone()));
     false
 }
@@ -1588,18 +1583,17 @@ fn handle_event(
             // wait for OS driver cleanup, then re-init and restart if playing.
             // The scheduler watchdog already exhausted 3 soft-recovery attempts
             // before emitting StreamDead, so this is the final hard reset.
-            state.status_message = "Stream dead — performing hard reset".to_string();
+            state.status.set_audio("Stream dead — performing hard reset");
             attempt_recovery(core, state, recovery_attempts, last_device_id);
         }
         AudioEvent::RecoveryNeeded { .. } | AudioEvent::StreamDied => {
             if *recovery_attempts < MAX_RECOVERY_ATTEMPTS {
                 *recovery_attempts += 1;
-                state.status_message =
-                    format!("Recovery attempt {}/{}", recovery_attempts, MAX_RECOVERY_ATTEMPTS);
+                state.status.set_audio(format!("Recovery attempt {}/{}", recovery_attempts, MAX_RECOVERY_ATTEMPTS));
                 attempt_recovery(core, state, recovery_attempts, last_device_id);
             } else {
                 state.is_playing = false;
-                state.status_message = "Recovery exhausted".to_string();
+                state.status.set_audio("Recovery exhausted");
             }
         }
         _ => {}
@@ -2088,7 +2082,7 @@ fn apply_recording_selection(
     // Reset auto-apply latches so next decode re-applies defaults
     *last_auto_applied_ltc_gen = 0;
     *last_auto_applied_group_ltc_gen = 0;
-    state.status_message = "Recording selected — probing…".to_string();
+    state.status.set_converter("Recording selected — probing…");
 
     // Spawn background probing of all files in the group via unified job infrastructure
     if let Some(group) = state.converter.groups.get(idx) {

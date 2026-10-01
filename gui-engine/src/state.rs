@@ -228,6 +228,83 @@ pub struct ClapperSnapshot {
     pub animating: bool,
 }
 
+// ── Status channels ─────────────────────────────────────────────────────
+
+/// Which subsystem last wrote to [`StatusChannels`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusChannel {
+    Audio,
+    Decode,
+    Converter,
+    Offload,
+}
+
+/// Per-subsystem status messages, replacing the former single
+/// `status_message` string that every subsystem wrote to (last writer
+/// won, so a conversion progress note could clobber a device error).
+/// Each channel is owned by the subsystem that produces it; a footer
+/// wanting "the last thing that happened" renders [`StatusChannels::message`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatusChannels {
+    /// Last audio/transport event ("Streaming LTC", "Device scan failed", …).
+    pub audio: String,
+    /// Last decode event ("Parse failed: …", decode summaries).  Overlaps
+    /// `DecodeSnapshot.error` only in that both are human-readable; the
+    /// error field stays as typed per-decode state.
+    pub decode: String,
+    /// Last converter event.  During a conversion the job's own
+    /// `jobs[Conversion].message` carries progress; this only records
+    /// lifecycle events (started/completed/failed/canceled).
+    pub converter: String,
+    /// Last offload event (completed/canceled summaries).
+    pub offload: String,
+    /// Channel written most recently — drives [`StatusChannels::message`].
+    pub last: StatusChannel,
+}
+
+impl StatusChannels {
+    pub fn initial() -> Self {
+        Self {
+            audio: "Ready".to_string(),
+            decode: String::new(),
+            converter: String::new(),
+            offload: String::new(),
+            last: StatusChannel::Audio,
+        }
+    }
+
+    pub fn set_audio(&mut self, msg: impl Into<String>) {
+        self.audio = msg.into();
+        self.last = StatusChannel::Audio;
+    }
+
+    pub fn set_decode(&mut self, msg: impl Into<String>) {
+        self.decode = msg.into();
+        self.last = StatusChannel::Decode;
+    }
+
+    pub fn set_converter(&mut self, msg: impl Into<String>) {
+        self.converter = msg.into();
+        self.last = StatusChannel::Converter;
+    }
+
+    pub fn set_offload(&mut self, msg: impl Into<String>) {
+        self.offload = msg.into();
+        self.last = StatusChannel::Offload;
+    }
+
+    /// The most recently written channel's message — the footer's
+    /// "last thing that happened" view.
+    pub fn message(&self) -> &str {
+        match self.last {
+            StatusChannel::Audio => &self.audio,
+            StatusChannel::Decode => &self.decode,
+            StatusChannel::Converter => &self.converter,
+            StatusChannel::Offload => &self.offload,
+        }
+    }
+}
+
 // ── Application state snapshot ─────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -267,8 +344,8 @@ pub struct AppStateSnapshot {
     // Theme
     pub is_dark_theme: bool,
 
-    // Status
-    pub status_message: String,
+    // Status (per-subsystem channels; see `StatusChannels`)
+    pub status: StatusChannels,
 
     // Events drained from AudioCore (to be surfaced as toasts by the GUI)
     pub events: Vec<AudioEvent>,
@@ -340,7 +417,7 @@ impl AppStateSnapshot {
                 animating: false,
             },
             is_dark_theme: false,
-            status_message: "Ready".to_string(),
+            status: StatusChannels::initial(),
             events: Vec::new(),
             decode: DecodeSnapshot {
                 fps_index: 1,
@@ -541,7 +618,27 @@ mod tests {
 
     #[test]
     fn test_initial_status() {
-        assert_eq!(initial_state().status_message, "Ready");
+        let s = initial_state();
+        assert_eq!(s.status.audio, "Ready");
+        assert_eq!(s.status.message(), "Ready");
+        assert!(s.status.decode.is_empty());
+        assert!(s.status.converter.is_empty());
+        assert!(s.status.offload.is_empty());
+    }
+
+    #[test]
+    fn test_status_message_follows_last_writer() {
+        let mut s = StatusChannels::initial();
+        s.set_decode("Parse failed: x");
+        assert_eq!(s.message(), "Parse failed: x");
+        s.set_audio("Clap!");
+        assert_eq!(s.message(), "Clap!");
+        s.set_converter("Conversion completed");
+        assert_eq!(s.message(), "Conversion completed");
+        s.set_offload("Offload complete");
+        assert_eq!(s.message(), "Offload complete");
+        // Channels are independent — an audio write never clobbers decode.
+        assert_eq!(s.decode, "Parse failed: x");
     }
 
     // ── LTC decode defaults ───────────────────────────────────────────────

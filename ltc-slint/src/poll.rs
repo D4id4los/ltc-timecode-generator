@@ -191,7 +191,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             // 11. Transport state
             ui.set_is_playing(s.is_playing);
             ui.set_is_locked(s.is_locked);
-            ui.set_status_message(SharedString::from(&s.status_message));
+            ui.set_status_message(SharedString::from(s.status.message().to_string()));
 
             // 12. FPS name
             let fps_name = SharedString::from(gui_engine::timecode::FPS_OPTIONS[s.fps_index].name);
