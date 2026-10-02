@@ -18,15 +18,15 @@ jobs:
       # token is mapped here and the scan step checks this variable instead
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # Sonar needs full history for blame-based new-code analysis
           fetch-depth: 0
 
-      - name: Install system dependencies (libltc, libclang, ffmpeg)
+      - name: Install system dependencies (pipewire, libltc, libclang, ffmpeg)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libltc-dev libclang-dev ffmpeg
+          sudo apt-get install -y libpipewire-0.3-dev libpulse-dev libltc-dev libclang-dev ffmpeg
 
       - name: Install Rust toolchain (stable, clippy, llvm-tools)
         uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,7 @@ jobs:
           tool: cargo-nextest,cargo-llvm-cov
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
