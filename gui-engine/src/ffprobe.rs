@@ -25,13 +25,8 @@ pub struct VideoAudioProbe {
     pub is_video_file: bool,
 }
 
-const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "mts", "m2ts", "mxf", "avi", "webm"];
-
 pub fn path_is_video(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.as_str()))
+    crate::media_ext::is_video(path)
 }
 
 pub fn probe_video_audio(path: &Path) -> Result<VideoAudioProbe, String> {
@@ -623,6 +618,20 @@ mod tests {
         assert!(!path_is_video(&p("tone.wav")));
         assert!(!path_is_video(&p("notes.txt")));
         assert!(!path_is_video(&p("noext")));
+    }
+
+    /// The video-extension registry must be consistent across subsystems:
+    /// `.m4v` is ingested by offload and probed for device naming, so decode
+    /// auto-detection and the other routing sites must agree.
+    #[test]
+    fn test_path_is_video_registry_agreement() {
+        for ext in ["m4v", "ts", "m2t"] {
+            assert!(
+                path_is_video(&p(&format!("clip.{}", ext))),
+                "path_is_video must recognise .{} like the rest of the registry",
+                ext
+            );
+        }
     }
 
     #[test]

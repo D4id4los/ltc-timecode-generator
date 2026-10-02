@@ -64,9 +64,6 @@ mod win_driver {
     }
 }
 
-/// Audio file extensions recognised as media.
-const AUDIO_EXTS: &[&str] = &["wav"];
-
 /// Buffer size for file copy (1 MiB).
 const COPY_BUF_SIZE: usize = 1 << 20;
 
@@ -265,13 +262,7 @@ pub fn default_parent_name() -> String {
 
 /// Returns true if `path` has a recognised media extension.
 pub fn is_media_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = e.to_ascii_lowercase();
-            crate::device_name::VIDEO_EXTS.contains(&e.as_str()) || AUDIO_EXTS.contains(&e.as_str())
-        })
-        .unwrap_or(false)
+    crate::media_ext::is_video(path) || crate::media_ext::is_audio(path)
 }
 
 // ── Card detection ──────────────────────────────────────────────────────

@@ -133,14 +133,7 @@ pub fn copy_mode_container_for_input(path: &Path) -> &'static str {
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
-    match ext.as_str() {
-        "mp4" | "m4v" => "mp4",
-        "mov" => "mov",
-        "mkv" => "mkv",
-        "mxf" => "mxf",
-        "mts" | "m2ts" | "m2t" | "ts" => "mp4",
-        _ => "mkv",
-    }
+    crate::media_ext::container_for_input(&ext)
 }
 
 pub fn extension_for_container(container: &str) -> &str {

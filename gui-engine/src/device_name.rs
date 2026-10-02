@@ -18,9 +18,6 @@ use log::{debug, info, warn};
 
 use crate::camera_meta;
 
-/// Video file extensions recognised as media (same list as `ffprobe::VIDEO_EXTENSIONS`).
-pub(crate) const VIDEO_EXTS: &[&str] = &["mp4", "mov", "mkv", "mts", "m2ts", "mxf", "avi", "webm", "m4v"];
-
 /// Maximum video files to probe during device-name resolution.
 /// One clip is usually sufficient; the cap provides corrupt-file resilience.
 pub(crate) const DEVICE_NAME_PROBE_SAMPLE: usize = 3;
@@ -371,10 +368,7 @@ fn normalize_model_name(raw: &str) -> String {
 }
 
 fn is_video_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| VIDEO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+    crate::media_ext::is_video(path)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

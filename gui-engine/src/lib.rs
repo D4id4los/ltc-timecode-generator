@@ -13,6 +13,7 @@ pub mod job;
 pub mod naming;
 pub mod hw_device;
 pub mod log_buffer;
+pub mod media_ext;
 pub mod offload;
 pub mod state;
 pub mod subprocess;
@@ -62,6 +63,9 @@ pub use video_codecs::{
 
 // Re-export ffprobe types
 pub use ffprobe::{extract_audio_channel, extract_audio_channel_with_progress, parse_out_time_us, path_is_video, probe_stream_duration_secs, probe_video_audio, AudioStreamInfo, VideoAudioProbe};
+
+// Re-export media-extension registry
+pub use media_ext::{container_for_input, is_audio, is_video, AUDIO_EXTENSIONS, VIDEO_EXTENSIONS};
 
 // Re-export duration helpers
 pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs};

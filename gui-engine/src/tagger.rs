@@ -902,14 +902,11 @@ fn tag_via_ffmpeg_with(
         .and_then(|e| e.to_str())
         .unwrap_or("bin");
 
-    // Determine output container (match input)
-    let container = match ext {
-        "mov" => "mov",
-        "mp4" | "m4v" => "mp4",
+    // Determine output container (match input); mkv maps to ffmpeg's
+    // "matroska" name for the -f flag.
+    let container = match crate::media_ext::container_for_input(ext) {
         "mkv" => "matroska",
-        "mxf" => "mxf",
-        "wav" => "wav",
-        _ => "matroska",
+        other => other,
     };
 
     // Temp file in same directory
