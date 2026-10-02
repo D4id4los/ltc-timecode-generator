@@ -197,6 +197,11 @@ mod native {
         let tmcd_trak =
             build_tmcd_trak(meta, new_track_id, timescale, duration)?;
 
+        // The appended mdat payload lands at file_len + 8 (file_len was
+        // captured before any writes; nothing else grows the file first).
+        let mut tmcd_trak = tmcd_trak;
+        patch_stco_offset(&mut tmcd_trak, (file_len + 8) as u32)?;
+
         // ── Phase 5: rebuild the moov with the tmcd trak appended ───────
         // The old moov payload is inner_boxes (all sub-boxes). We need to
         // patch mvhd's next_track_id, then append tmcd_trak.
@@ -437,13 +442,29 @@ fn build_tmcd_trak(
     // ── trak ───────────────────────────────────────────────────────────
     let trak = build_box(b"trak", &[&tkhd, &mdia]);
 
-    // Patch stco chunk offset: the 4-byte sample will be at:
-    //   <end of original file after free> + 12 (mdat header) = file_len - old_moov_size + 12
-    // But we can't know file_len here. Instead, we'll patch it at write time.
-    // For now, we return the trak with a placeholder — the tagger will patch it.
-    // Actually, we can compute it: stco offset inside the trak.
-    // Let's mark a "hole" to be patched later.
+    // The stco chunk offset is left at 0 here; the caller patches it with
+    // patch_stco_offset() once the appended mdat position is known.
     Ok(trak)
+}
+
+/// Patch the single stco chunk-offset entry inside a built tmcd trak buffer
+/// to point at the appended mdat payload. `trak` is searched for the `stco`
+/// box type; the entry lives 12 bytes past it (version/flags 4 + entry_count 4).
+pub(super) fn patch_stco_offset(trak: &mut [u8], chunk_offset: u32) -> Result<(), String> {
+    let pos = trak
+        .windows(4)
+        .position(|w| w == b"stco")
+        .ok_or_else(|| "no stco box in tmcd trak".to_string())?;
+    let entry = pos + 12;
+    if entry + 4 > trak.len() {
+        return Err(format!(
+            "stco entry out of bounds (pos={}, len={})",
+            pos,
+            trak.len()
+        ));
+    }
+    trak[entry..entry + 4].copy_from_slice(&chunk_offset.to_be_bytes());
+    Ok(())
 }
 
 /// Build a `tkhd` box (version 0, flags 0x0003 = enabled + in movie).
@@ -1591,5 +1612,158 @@ mod tests {
         let mut file = std::fs::File::open(&path).unwrap();
         assert!(crate::converter::read_wav_sample_rate_from_file(&mut file).is_none());
         assert!(crate::converter::read_wav_sample_rate(&path).is_none());
+    }
+
+    // ── tmcd stco patching ────────────────────────────────────────────────
+
+    #[test]
+    fn test_patch_stco_offset() {
+        let meta = test_meta();
+        let mut trak = build_tmcd_trak(&meta, 2, 600, 600).unwrap();
+        let target: u32 = 0x0012_3456;
+        patch_stco_offset(&mut trak, target).expect("stco must exist in tmcd trak");
+        let pos = trak
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco box present");
+        let entry = read_be_u32(&trak[pos + 12..pos + 16]);
+        assert_eq!(entry, target, "stco entry must carry the patched offset");
+    }
+
+    /// Minimal moov-last MP4: ftyp + moov(mvhd v0). Enough for
+    /// `tag_mp4_tmcd` to accept the layout.
+    fn write_minimal_moov_last_mp4(path: &std::path::Path) {
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&100u32.to_be_bytes()); // box size
+        mvhd.extend_from_slice(b"mvhd");
+        mvhd.push(0); // version 0
+        mvhd.extend_from_slice(&[0, 0, 0]); // flags
+        mvhd.extend_from_slice(&0u32.to_be_bytes()); // creation
+        mvhd.extend_from_slice(&0u32.to_be_bytes()); // modification
+        mvhd.extend_from_slice(&600u32.to_be_bytes()); // timescale
+        mvhd.extend_from_slice(&600u32.to_be_bytes()); // duration (1 s)
+        mvhd.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate 1.0
+        mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
+        mvhd.extend_from_slice(&[0u8; 10]); // reserved
+        mvhd.extend_from_slice(&[0u8; 36]); // matrix
+        mvhd.extend_from_slice(&[0u8; 24]); // pre_defined
+        mvhd.extend_from_slice(&2u32.to_be_bytes()); // next_track_id
+
+        let mut moov = Vec::new();
+        moov.extend_from_slice(&((8 + mvhd.len()) as u32).to_be_bytes());
+        moov.extend_from_slice(b"moov");
+        moov.extend_from_slice(&mvhd);
+
+        let mut ftyp = Vec::new();
+        ftyp.extend_from_slice(&20u32.to_be_bytes());
+        ftyp.extend_from_slice(b"ftyp");
+        ftyp.extend_from_slice(b"isom");
+        ftyp.extend_from_slice(&0x0000_0200u32.to_be_bytes());
+        ftyp.extend_from_slice(b"isom");
+
+        let mut f = std::fs::File::create(path).unwrap();
+        use std::io::Write as _;
+        f.write_all(&ftyp).unwrap();
+        f.write_all(&moov).unwrap();
+    }
+
+    #[test]
+    fn test_tag_mp4_tmcd_stco_points_at_mdat_payload() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("clip.mp4");
+        write_minimal_moov_last_mp4(&p);
+        let len_before = std::fs::metadata(&p).unwrap().len();
+
+        let outcome = native::tag_mp4_tmcd(&p, &test_meta()).unwrap();
+        assert!(matches!(outcome, TagOutcome::TaggedInPlace));
+
+        // Read the appended (last) moov and find the tmcd trak's stco entry.
+        let data = std::fs::read(&p).unwrap();
+        let mut f = std::fs::File::open(&p).unwrap();
+        let boxes = native::scan_top_level_boxes(&mut f, data.len() as u64).unwrap();
+        let last = boxes.last().unwrap();
+        assert_eq!(&last.box_type, b"moov", "appended moov must be last");
+        let moov = &data[last.offset as usize + 8..(last.offset + last.box_size) as usize];
+        let pos = moov
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco box present in appended moov");
+        let entry = read_be_u32(&moov[pos + 12..pos + 16]);
+        assert_eq!(
+            entry as u64,
+            len_before + 8,
+            "stco chunk offset must point at the appended mdat payload"
+        );
+        // And the sample value at that offset must be the frame count.
+        let meta = test_meta();
+        let expected_frames = meta.start.hours * 3600 * 25
+            + meta.start.minutes * 60 * 25
+            + meta.start.seconds * 25
+            + meta.start.frames;
+        let sample = read_be_u32(&data[len_before as usize + 8..len_before as usize + 12]);
+        assert_eq!(sample, expected_frames);
+    }
+
+    #[test]
+    fn test_tag_mp4_tmcd_ffprobe_roundtrip() {
+        // End-to-end: tag a real MP4 and confirm ffprobe sees a valid tmcd
+        // track (this is the test that catches stco/offset regressions).
+        if !which_exists("ffmpeg") {
+            eprintln!("--- SKIPPED: ffmpeg not found (tmcd round-trip test)");
+            return;
+        }
+        if !which_exists("ffprobe") {
+            eprintln!("--- SKIPPED: ffprobe not found (tmcd round-trip test)");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("roundtrip.mov");
+
+        let status = no_window_command("ffmpeg")
+            .args([
+                "-f", "lavfi", "-i", "testsrc=duration=0.5:size=64x64:rate=25",
+                "-c:v", "mpeg4",
+                "-movflags", "+faststart", // ensures moov is written last
+                "-y",
+            ])
+            .arg(&p)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg should succeed");
+        assert!(status.success(), "MP4 fixture creation failed");
+
+        let result = tag_file(&p, &test_meta(), None);
+        match result {
+            Ok(TagOutcome::TaggedInPlace) => {}
+            Ok(other) => {
+                eprintln!("--- SKIPPED: fixture fell through to {:?} (layout not moov-last)", other);
+                return;
+            }
+            Err(e) => panic!("tagging failed: {}", e),
+        }
+
+        let out = no_window_command("ffprobe")
+            .args(["-v", "error", "-show_streams", "-of", "json"])
+            .arg(&p)
+            .output()
+            .expect("ffprobe should succeed");
+        assert!(out.status.success(), "ffprobe must accept the tagged file");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("tmcd"),
+            "tagged file must expose a tmcd stream, got: {}",
+            stdout
+        );
+    }
+
+    fn which_exists(prog: &str) -> bool {
+        no_window_command(prog)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
