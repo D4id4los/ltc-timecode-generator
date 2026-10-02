@@ -958,6 +958,143 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 
 // ── LTC scheduler thread ───────────────────────────────────────────────────
 
+/// Callback-stall watchdog state machine, extracted from
+/// `ltc_scheduler_thread` so the recovery ladder is testable without a
+/// device. The event push and any sleeping stay in the thread.
+mod watchdog {
+    use std::time::{Duration, Instant};
+
+    /// Decision for one scheduler iteration.
+    #[derive(Debug)]
+    pub(crate) enum WatchdogAction {
+        /// Callback healthy, or stall not yet confirmed — generate the next frame.
+        Continue,
+        /// Stall confirmed: emit `AudioEvent::RecoveryNeeded { reason }`, then
+        /// wait `backoff` before the next check.
+        Recover { attempt: u8, reason: String, backoff: Duration },
+        /// Recovery budget exhausted: emit `AudioEvent::StreamDead`, stop the thread.
+        Dead,
+    }
+
+    pub(crate) struct CallbackWatchdog {
+        stall_timeout: Duration,
+        max_attempts: u8,
+        window: Duration,
+        backoff: Duration,
+        last_callback_value: u64,
+        last_check: Instant,
+        recovery_attempts: u8,
+        first_failure: Option<Instant>,
+    }
+
+    impl CallbackWatchdog {
+        /// Production constants: 500 ms stall timeout, 3 recovery attempts,
+        /// 10 s sliding reset window, 100 ms recovery backoff.
+        pub(crate) fn new() -> Self {
+            Self::with_constants(
+                Duration::from_millis(500),
+                3,
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+            )
+        }
+
+        pub(crate) fn with_constants(
+            stall_timeout: Duration,
+            max_attempts: u8,
+            window: Duration,
+            backoff: Duration,
+        ) -> Self {
+            Self {
+                stall_timeout,
+                max_attempts,
+                window,
+                backoff,
+                last_callback_value: 0,
+                last_check: Instant::now(),
+                recovery_attempts: 0,
+                first_failure: None,
+            }
+        }
+
+        /// `now` injected — tests drive a virtual clock.
+        pub(crate) fn tick(&mut self, now: Instant, current_callback: u64) -> WatchdogAction {
+            if current_callback != self.last_callback_value {
+                // Callback is alive — reset recovery state.
+                self.last_callback_value = current_callback;
+                self.last_check = now;
+                self.recovery_attempts = 0;
+                self.first_failure = None;
+                return WatchdogAction::Continue;
+            }
+            if now.duration_since(self.last_check) <= self.stall_timeout {
+                // Stall not yet confirmed.
+                return WatchdogAction::Continue;
+            }
+            // Stall confirmed. Sliding window: reset the attempt counter if
+            // the first failure is older than the window.
+            if let Some(first) = self.first_failure {
+                if now.duration_since(first) > self.window {
+                    self.recovery_attempts = 0;
+                    self.first_failure = None;
+                }
+            }
+            if self.recovery_attempts < self.max_attempts {
+                self.recovery_attempts += 1;
+                if self.first_failure.is_none() {
+                    self.first_failure = Some(now);
+                }
+                let attempt = self.recovery_attempts;
+                let reason = format!(
+                    "callback stalled for {}ms (attempt {}/{})",
+                    self.stall_timeout.as_millis(),
+                    attempt,
+                    self.max_attempts
+                );
+                // Reset the stall timer so we don't immediately re-trigger.
+                self.last_callback_value = current_callback;
+                self.last_check = now;
+                WatchdogAction::Recover { attempt, reason, backoff: self.backoff }
+            } else {
+                WatchdogAction::Dead
+            }
+        }
+    }
+}
+
+use watchdog::{CallbackWatchdog, WatchdogAction};
+
+/// Scheduler push bookkeeping (drop counting + event cadence).
+struct FramePushStats {
+    frame_count: u64,
+    drop_count: u64,
+    last_drop_event: u64,
+}
+
+/// Push one generated stereo frame into the ring; returns the event to emit,
+/// if any (`FramesDropped { total }` every 100 cumulative drops). Works on a
+/// plain `HeapRb` — no device needed.
+fn push_frame(
+    producer: &mut HeapProducer<f32>,
+    frame: &[f32],
+    stats: &mut FramePushStats,
+) -> Option<AudioEvent> {
+    let needed = frame.len();
+    let pushed = producer.push_slice(frame);
+    if pushed < needed {
+        stats.drop_count += 1;
+        if stats.drop_count <= 1 || stats.drop_count % 100 == 0 {
+            warn!("LTC scheduler: ring buffer full, dropped frame #{} (pushed {}/{}, total drops: {})",
+                stats.frame_count, pushed, needed, stats.drop_count);
+        }
+        if stats.drop_count - stats.last_drop_event >= 100 {
+            stats.last_drop_event = stats.drop_count;
+            return Some(AudioEvent::FramesDropped { total: stats.drop_count });
+        }
+    }
+    None
+}
+
 fn ltc_scheduler_thread(
     ltc_producer: Arc<Mutex<HeapProducer<f32>>>,
     ltc: Arc<Mutex<LtcStreamState>>,
@@ -978,16 +1115,9 @@ fn ltc_scheduler_thread(
     info!("LTC scheduler thread priority not elevated (macOS)");
 
     let mut frame_buf: Vec<f32> = Vec::new();
-    let mut frame_count: u64 = 0;
-    let mut drop_count: u64 = 0;
-    let mut last_drop_event: u64 = 0;
-    let mut last_callback_value: u64 = 0;
-    let mut last_callback_check: Instant = Instant::now();
     let mut last_underrun_value: u64 = 0;
-
-    // ── Watchdog recovery state (event-driven sliding window) ──
-    let mut recovery_attempts: u8 = 0;
-    let mut first_failure: Option<Instant> = None;
+    let mut wd = CallbackWatchdog::new();
+    let mut push_stats = FramePushStats { frame_count: 0, drop_count: 0, last_drop_event: 0 };
 
     loop {
         if stop_signal.load(Ordering::Relaxed) {
@@ -1044,50 +1174,26 @@ fn ltc_scheduler_thread(
 
         // ── Watchdog: check if audio callback is still alive ──
         let current_callback = callback_counter.load(Ordering::Relaxed);
-        if current_callback == last_callback_value {
-            if last_callback_check.elapsed() > Duration::from_millis(500) {
+        match wd.tick(Instant::now(), current_callback) {
+            WatchdogAction::Continue => {}
+            WatchdogAction::Recover { attempt, reason, backoff } => {
                 error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
-
-                // Sliding window: reset counter if last failure was >10s ago
-                let now = Instant::now();
-                if let Some(first) = first_failure {
-                    if now.duration_since(first) > Duration::from_secs(10) {
-                        recovery_attempts = 0;
-                        first_failure = None;
-                    }
+                warn!("LTC scheduler: recovery attempt {}/3", attempt);
+                if let Ok(mut ev) = events.lock() {
+                    ev.push(AudioEvent::RecoveryNeeded { reason });
                 }
-
-                if recovery_attempts < 3 {
-                    recovery_attempts += 1;
-                    if first_failure.is_none() {
-                        first_failure = Some(now);
-                    }
-                    warn!("LTC scheduler: recovery attempt {}/3", recovery_attempts);
-                    if let Ok(mut ev) = events.lock() {
-                        ev.push(AudioEvent::RecoveryNeeded {
-                            reason: format!("callback stalled for 500ms (attempt {}/3)", recovery_attempts),
-                        });
-                    }
-                    // Reset watchdog timer so we don't immediately re-trigger
-                    last_callback_value = current_callback;
-                    last_callback_check = Instant::now();
-                    // Sleep a short time before checking again so the main thread can act
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                } else {
-                    error!("LTC scheduler: 3 recovery attempts exhausted — stream permanently dead");
-                    if let Ok(mut ev) = events.lock() {
-                        ev.push(AudioEvent::StreamDead);
-                    }
-                    return;
-                }
+                // Sleep a short time before checking again so the main thread can act
+                std::thread::sleep(backoff);
+                continue;
             }
-        } else {
-            // Callback is alive — reset recovery state
-            last_callback_value = current_callback;
-            last_callback_check = Instant::now();
-            recovery_attempts = 0;
-            first_failure = None;
+            WatchdogAction::Dead => {
+                error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
+                error!("LTC scheduler: 3 recovery attempts exhausted — stream permanently dead");
+                if let Ok(mut ev) = events.lock() {
+                    ev.push(AudioEvent::StreamDead);
+                }
+                return;
+            }
         }
 
         // ── Watchdog: check for underruns ──
@@ -1125,26 +1231,17 @@ fn ltc_scheduler_thread(
                     return;
                 }
             };
-            let pushed = producer.push_slice(&frame_buf[..needed]);
-            if pushed < needed {
-                drop_count += 1;
-                if drop_count <= 1 || drop_count % 100 == 0 {
-                    warn!("LTC scheduler: ring buffer full, dropped frame #{} (pushed {}/{}, total drops: {})",
-                        frame_count, pushed, needed, drop_count);
-                }
-                if drop_count - last_drop_event >= 100 {
-                    if let Ok(mut ev) = events.lock() {
-                        ev.push(AudioEvent::FramesDropped { total: drop_count });
-                    }
-                    last_drop_event = drop_count;
+            if let Some(ev) = push_frame(&mut producer, &frame_buf[..needed], &mut push_stats) {
+                if let Ok(mut evq) = events.lock() {
+                    evq.push(ev);
                 }
             }
         }
 
-        frame_count += 1;
-        if frame_count % 1000 == 0 {
+        push_stats.frame_count += 1;
+        if push_stats.frame_count % 1000 == 0 {
             info!("LTC scheduler: frame={}, drops={}, channel={}, fps={}, tc={:02}:{:02}:{:02}:{:02}",
-                frame_count, drop_count, ltc_channel.as_str(),
+                push_stats.frame_count, push_stats.drop_count, ltc_channel.as_str(),
                 fps, tc.hours, tc.minutes, tc.seconds, tc.frames);
         }
 
@@ -1167,6 +1264,181 @@ fn ltc_scheduler_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use watchdog::{CallbackWatchdog, WatchdogAction};
+
+    // ── CallbackWatchdog (virtual clock, device-free) ─────────────────────
+
+    fn wd_fast() -> CallbackWatchdog {
+        // Accelerated constants for the recovery-ladder walk; behavior is
+        // identical to the production constants under the virtual clock.
+        CallbackWatchdog::with_constants(Duration::from_millis(500), 3, Duration::from_secs(10), Duration::from_millis(100))
+    }
+
+    #[test]
+    fn test_watchdog_healthy_counter_continues_and_resets() {
+        let mut wd = wd_fast();
+        let t0 = Instant::now();
+        assert!(matches!(wd.tick(t0, 0), WatchdogAction::Continue));
+        // Counter advances → healthy; internal state resets.
+        assert!(matches!(wd.tick(t0 + Duration::from_millis(1), 10), WatchdogAction::Continue));
+        // Now a long stall: because the counter advanced at t0+1ms, the
+        // stall clock restarted there.
+        assert!(matches!(wd.tick(t0 + Duration::from_millis(400), 10), WatchdogAction::Continue));
+        match wd.tick(t0 + Duration::from_millis(901), 10) {
+            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected Recover, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_watchdog_stall_not_confirmed_before_timeout() {
+        let mut wd = wd_fast();
+        let t0 = Instant::now();
+        assert!(matches!(wd.tick(t0, 0), WatchdogAction::Continue));
+        assert!(matches!(wd.tick(t0 + Duration::from_millis(499), 0), WatchdogAction::Continue));
+    }
+
+    #[test]
+    fn test_watchdog_exactly_500ms_is_not_a_stall() {
+        // Pin the strict `>`: a stall of exactly the timeout is not confirmed.
+        let mut wd = wd_fast();
+        let t0 = Instant::now();
+        // Advance the counter once so the stall clock baseline is t0+1ms.
+        assert!(matches!(wd.tick(t0, 0), WatchdogAction::Continue));
+        assert!(matches!(wd.tick(t0 + Duration::from_millis(1), 1), WatchdogAction::Continue));
+        assert!(matches!(wd.tick(t0 + Duration::from_millis(501), 1), WatchdogAction::Continue));
+        // One microsecond past the timeout → confirmed.
+        match wd.tick(t0 + Duration::from_millis(501_001), 1) {
+            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected Recover, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_watchdog_recovery_ladder_then_dead() {
+        let mut wd = wd_fast();
+        let t0 = Instant::now();
+        wd.tick(t0, 0);
+        let t1 = t0 + Duration::from_millis(600);
+        match wd.tick(t1, 0) {
+            WatchdogAction::Recover { attempt, backoff, .. } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(backoff, Duration::from_millis(100));
+            }
+            other => panic!("expected Recover, got {:?}", other),
+        }
+        // Each Recover resets the stall clock, so a fresh 500 ms wait is
+        // needed before the next confirmation.
+        match wd.tick(t1 + Duration::from_millis(501), 0) {
+            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 2),
+            other => panic!("expected Recover, got {:?}", other),
+        }
+        match wd.tick(t1 + Duration::from_millis(1002), 0) {
+            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 3),
+            other => panic!("expected Recover, got {:?}", other),
+        }
+        assert!(matches!(wd.tick(t1 + Duration::from_millis(1503), 0), WatchdogAction::Dead));
+    }
+
+    #[test]
+    fn test_watchdog_recovery_resets_when_callback_resumes() {
+        let mut wd = wd_fast();
+        let t0 = Instant::now();
+        wd.tick(t0, 0);
+        match wd.tick(t0 + Duration::from_millis(600), 0) {
+            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected Recover, got {:?}", other),
+        }
+        // Callback resumes → attempts and first_failure reset.
+        assert!(matches!(wd.tick(t0 + Duration::from_millis(700), 5), WatchdogAction::Continue));
+        // Counter stalls again → ladder restarts at attempt 1.
+        match wd.tick(t0 + Duration::from_millis(1300), 5) {
+            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected Recover(1) after resume, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_watchdog_sliding_window_resets_attempts() {
+        let mut wd = wd_fast();
+        let t0 = Instant::now();
+        wd.tick(t0, 0);
+        match wd.tick(t0 + Duration::from_millis(600), 0) {
+            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected Recover, got {:?}", other),
+        }
+        // No progress; next stall check happens just past the 10 s window
+        // from the first failure → the attempt counter was reset to 0.
+        match wd.tick(t0 + Duration::from_millis(10_601), 0) {
+            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1, "window reset must restart the ladder"),
+            other => panic!("expected Recover, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_watchdog_reason_string_byte_exact() {
+        let mut wd = CallbackWatchdog::with_constants(
+            Duration::from_millis(500), 3, Duration::from_secs(10), Duration::from_millis(100),
+        );
+        let t0 = Instant::now();
+        wd.tick(t0, 0);
+        match wd.tick(t0 + Duration::from_millis(600), 0) {
+            WatchdogAction::Recover { reason, .. } => {
+                assert_eq!(reason, "callback stalled for 500ms (attempt 1/3)");
+            }
+            other => panic!("expected Recover, got {:?}", other),
+        }
+    }
+
+    // ── push_frame ────────────────────────────────────────────────────────
+
+    fn stats() -> FramePushStats {
+        FramePushStats { frame_count: 0, drop_count: 0, last_drop_event: 0 }
+    }
+
+    #[test]
+    fn test_push_frame_non_full_ring_returns_none() {
+        let rb = HeapRb::<f32>::new(1024);
+        let (mut prod, _cons) = rb.split();
+        let mut st = stats();
+        let frame = vec![0.0f32; 64];
+        for i in 0..10 {
+            assert!(push_frame(&mut prod, &frame, &mut st).is_none());
+            st.frame_count += 1;
+            assert_eq!(st.frame_count, i + 1);
+        }
+        assert_eq!(st.drop_count, 0);
+    }
+
+    #[test]
+    fn test_push_frame_full_ring_counts_drop_without_event() {
+        let rb = HeapRb::<f32>::new(8);
+        let (mut prod, _cons) = rb.split();
+        let mut st = stats();
+        let frame = vec![0.0f32; 64]; // bigger than the ring
+        assert!(push_frame(&mut prod, &frame, &mut st).is_none(), "first drop emits no event");
+        assert_eq!(st.drop_count, 1);
+    }
+
+    #[test]
+    fn test_push_frame_drop_event_cadence_every_100() {
+        let rb = HeapRb::<f32>::new(2);
+        let (mut prod, _cons) = rb.split();
+        let mut st = stats();
+        let frame = vec![0.0f32; 64];
+        let mut events = Vec::new();
+        for _ in 0..200 {
+            if let Some(ev) = push_frame(&mut prod, &frame, &mut st) {
+                events.push(ev);
+            }
+        }
+        assert_eq!(st.drop_count, 200);
+        let totals: Vec<u64> = events
+            .iter()
+            .map(|e| match e { AudioEvent::FramesDropped { total } => *total, other => panic!("unexpected event {:?}", other) })
+            .collect();
+        assert_eq!(totals, vec![100, 200], "FramesDropped every 100 cumulative drops");
+    }
 
     // ── AudioDeviceInfo::from_summary ─────────────────────────────────────
 
