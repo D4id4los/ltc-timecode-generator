@@ -852,12 +852,20 @@ fn fit_segment_drift(
     (slope, max_residual)
 }
 
-/// Compute a quality report for a decoded LTC sequence.
-///
-/// Returns `None` when there are no decoded timecodes to analyze.
-/// Otherwise compares LTC timecode values against audio positions to detect
-/// gaps, glitches, edit points, and clock drift.
-pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityReport> {
+// ── Quality analysis: pure sub-analyzers ────────────────────────────────────
+// compute_ltc_quality orchestrates these; each stage is directly testable.
+// It compares LTC timecode values against audio positions to detect gaps,
+// glitches, edit points, and clock drift, returning None when there are no
+// decoded timecodes to analyze.
+
+struct QualityInputs {
+    ltc_secs: Vec<f64>,
+    audio_secs: Vec<f64>,
+    drift: Vec<f64>,
+    fps: f64,
+}
+
+fn quality_inputs(result: &LtcDetectionResult) -> Option<QualityInputs> {
     let timecodes = &result.timecodes;
     if timecodes.is_empty() || result.detected_fps <= 0.0 {
         return None;
@@ -885,46 +893,64 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         .map(|i| (audio_secs[i] - first_audio) - (ltc_secs[i] - first_ltc))
         .collect();
 
-    // Find contiguous segments by comparing LTC timecode values,
-    // NOT frame_index (which gets re-indexed by chunked merge).
+    Some(QualityInputs { ltc_secs, audio_secs, drift, fps })
+}
+
+/// Find contiguous segments by comparing LTC timecode values,
+/// NOT frame_index (which gets re-indexed by chunked merge).
+fn split_segments(ltc_secs: &[f64], fps: f64) -> Vec<std::ops::Range<usize>> {
     let frame_duration = 1.0 / fps;
     let gap_threshold = frame_duration * 2.0;
 
     let mut segments: Vec<std::ops::Range<usize>> = Vec::new();
     let mut seg_start = 0;
-    for i in 1..n {
+    for i in 1..ltc_secs.len() {
         let expected = ltc_secs[i - 1] + frame_duration;
         if (ltc_secs[i] - expected).abs() > gap_threshold {
             segments.push(seg_start..i);
             seg_start = i;
         }
     }
-    segments.push(seg_start..n);
+    segments.push(seg_start..ltc_secs.len());
+    segments
+}
 
-    // Largest contiguous block
-    let largest_block = segments.iter().map(|s| (s.end - s.start) as u32).max().unwrap_or(0);
+pub(crate) struct BlockDrift {
+    slope: f64,
+    accum_frames: f64,
+    frames: usize,
+    duration: f64,
+}
 
-    // ── Per-block clock drift (least-squares fit) ─────────────────────────
-    // Drift is fitted per block so that TC jumps between blocks cannot
-    // contaminate the measurement: each block gets its own linear model
-    // and only its own clock error counts against it.
-    struct BlockDrift {
-        slope: f64,
-        accum_frames: f64,
-        frames: usize,
-        duration: f64,
-    }
+struct DriftStats {
+    blocks: Vec<BlockDrift>,
+    usable_coverage: f64,
+    worst_block_drift_frames: f64,
+    worst_slope: f64,
+    drift_penalty: f64,
+}
+
+/// Per-block clock drift (least-squares fit) plus block usability.
+/// Drift is fitted per block so that TC jumps between blocks cannot
+/// contaminate the measurement: each block gets its own linear model
+/// and only its own clock error counts against it.
+fn analyze_drift(
+    audio_secs: &[f64],
+    drift: &[f64],
+    segments: &[std::ops::Range<usize>],
+    fps: f64,
+) -> DriftStats {
+    let n = audio_secs.len();
     let blocks: Vec<BlockDrift> = segments
         .iter()
         .map(|seg| {
-            let (slope, _residual) = fit_segment_drift(&audio_secs, &drift, seg.start..seg.end);
+            let (slope, _residual) = fit_segment_drift(audio_secs, drift, seg.start..seg.end);
             let duration = audio_secs[seg.end - 1] - audio_secs[seg.start];
             let accum_frames = (slope * duration).abs() * fps;
             BlockDrift { slope, accum_frames, frames: seg.end - seg.start, duration }
         })
         .collect();
 
-    // ── Block usability ───────────────────────────────────────────────────
     // A block is usable for syncing when it is long enough to align against
     // (>= 2s; for very short recordings 90% of the span so a short clean
     // clip still counts) and its drift accumulates at most 1 frame over its
@@ -952,10 +978,32 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
             }
         }
     }
-    let usable_coverage = usable_frames as f64 / n as f64;
+    DriftStats {
+        usable_coverage: usable_frames as f64 / n as f64,
+        blocks,
+        worst_block_drift_frames,
+        worst_slope,
+        drift_penalty,
+    }
+}
 
-    // Analyze gaps between segments and detect edits
-    // An edit is: a large LTC jump (>=10 frames) where audio elapsed doesn't match ltc elapsed
+struct GapStats {
+    gap_count: u32,
+    edit_count: u32,
+    backward_jump_count: u32,
+    gap_edges: Vec<(usize, usize)>,
+    backward_affected_frames: usize,
+}
+
+/// Gaps between segments, edit detection (large LTC jump where audio elapsed
+/// doesn't match LTC elapsed), and backward jumps (TC resets).
+fn analyze_gaps(
+    audio_secs: &[f64],
+    ltc_secs: &[f64],
+    segments: &[std::ops::Range<usize>],
+    fps: f64,
+) -> GapStats {
+    let frame_duration = 1.0 / fps;
     let mut gap_count: u32 = 0;
     let mut edit_count: u32 = 0;
     let mut backward_jump_count: u32 = 0;
@@ -998,15 +1046,28 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         None => 0,
     };
 
-    // Detect glitch frames within contiguous segments.
-    // Threshold 1.5 frames: a single frame deviating by 2 frames stays
-    // inside its segment (segment splits need > 2 frames deviation) but is
-    // caught here; deviations >= 3 frames split segments and count as gaps.
+    GapStats { gap_count, edit_count, backward_jump_count, gap_edges, backward_affected_frames }
+}
+
+struct GlitchStats {
+    glitch_count: u32,
+    glitch_indices: Vec<usize>,
+}
+
+/// Isolated glitch frames within contiguous segments.
+/// Threshold 1.5 frames: a single frame deviating by 2 frames stays
+/// inside its segment (segment splits need > 2 frames deviation) but is
+/// caught here; deviations >= 3 frames split segments and count as gaps.
+fn analyze_glitches(
+    ltc_secs: &[f64],
+    segments: &[std::ops::Range<usize>],
+    fps: f64,
+) -> GlitchStats {
+    let glitch_threshold = 1.5 / fps;
     let mut glitch_count: u32 = 0;
     let mut glitch_indices: Vec<usize> = Vec::new();
-    let glitch_threshold = 1.5 / fps;
 
-    for seg in &segments {
+    for seg in segments {
         let seg_len = seg.end - seg.start;
         if seg_len < 3 {
             continue;
@@ -1019,11 +1080,15 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
             }
         }
     }
+    GlitchStats { glitch_count, glitch_indices }
+}
 
-    // ── Missing frames within the decoded LTC span ────────────────────────
-    // Only frames between the first and last decoded frame can be missing.
-    // Silent lead-in/out and pre-LTC silence at the edges of the recording
-    // are normal, not defects.
+/// Missing frames within the decoded LTC span. Only frames between the first
+/// and last decoded frame can be missing: silent lead-in/out and pre-LTC
+/// silence at the edges of the recording are normal, not defects.
+/// Returns (missing_frames, missing_ratio).
+fn missing_in_span(audio_secs: &[f64], fps: f64) -> (u32, f64) {
+    let n = audio_secs.len();
     let expected_in_span = ((audio_secs[n - 1] - audio_secs[0]) * fps).round() as i64 + 1;
     let missing_frames = (expected_in_span - n as i64).max(0) as u32;
     let missing_ratio = if expected_in_span > 0 {
@@ -1031,8 +1096,21 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
     } else {
         0.0
     };
+    (missing_frames, missing_ratio)
+}
 
-    // ── Score (0.0 – 1.0), anchored on usable coverage ────────────────────
+/// THE scoring formula (0.0–1.0), anchored on usable coverage:
+/// score = usable_coverage − 0.02·min(edits,10) − 0.30·backward_ratio
+///         − glitch ramp (0.15 above 0.1%) − drift_penalty
+///         − missing ramp (0.15 above 5%), clamped [0,1].
+fn quality_score(
+    usable_coverage: f64,
+    edit_count: u32,
+    backward_ratio: f64,
+    glitch_ratio: f64,
+    drift_penalty: f64,
+    missing_ratio: f64,
+) -> f64 {
     let mut score = usable_coverage;
 
     // Forward TC jumps are normal in the field (generator restarts, re-jams)
@@ -1041,10 +1119,9 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
 
     // Backward jumps (TC reset) make TC values recur: penalize by the
     // fraction of the recording that becomes ambiguous.
-    score -= 0.30 * (backward_affected_frames as f64 / n as f64);
+    score -= 0.30 * backward_ratio;
 
     // Glitches only matter once they exceed 0.1% of frames, then scale up.
-    let glitch_ratio = glitch_count as f64 / n as f64;
     if glitch_ratio > 0.001 {
         score -= 0.15 * ((glitch_ratio - 0.001) / 0.009).min(1.0);
     }
@@ -1057,12 +1134,22 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
         score -= 0.15 * (missing_ratio / 0.5).min(1.0);
     }
 
-    score = score.clamp(0.0, 1.0);
+    score.clamp(0.0, 1.0)
+}
 
-    // Grade
-    let grade = QualityGrade::from_score(score);
-
-    // Build summary
+/// Human-readable summary of issues found.
+#[allow(clippy::too_many_arguments)]
+fn quality_summary(
+    usable_coverage: f64,
+    block_count: usize,
+    edit_count: u32,
+    backward_jump_count: u32,
+    glitch_count: u32,
+    missing_frames: u32,
+    worst_block_drift_frames: f64,
+    worst_slope: f64,
+    fps: f64,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if edit_count > 0 || backward_jump_count > 0 {
         parts.push(format!("{} TC jump(s) ({} backward)", edit_count, backward_jump_count));
@@ -1083,31 +1170,73 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
     let coverage_part = format!(
         "{:.1}% usable ({} block(s))",
         usable_coverage * 100.0,
-        blocks.len()
+        block_count
     );
-    let summary = if parts.is_empty() {
+    if parts.is_empty() {
         format!("{} — all frames contiguous and in sync", coverage_part)
     } else {
         format!("{}; {}", coverage_part, parts.join(", "))
-    };
+    }
+}
+
+pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityReport> {
+    let inputs = quality_inputs(result)?;
+    let fps = inputs.fps;
+    let n = inputs.audio_secs.len();
+
+    let segments = split_segments(&inputs.ltc_secs, fps);
+
+    // Largest contiguous block
+    let largest_block = segments.iter().map(|s| (s.end - s.start) as u32).max().unwrap_or(0);
+
+    let drift = analyze_drift(&inputs.audio_secs, &inputs.drift, &segments, fps);
+    let gaps = analyze_gaps(&inputs.audio_secs, &inputs.ltc_secs, &segments, fps);
+    let glitches = analyze_glitches(&inputs.ltc_secs, &segments, fps);
+    let (missing_frames, missing_ratio) = missing_in_span(&inputs.audio_secs, fps);
+
+    let backward_ratio = gaps.backward_affected_frames as f64 / n as f64;
+    let glitch_ratio = glitches.glitch_count as f64 / n as f64;
+    let score = quality_score(
+        drift.usable_coverage,
+        gaps.edit_count,
+        backward_ratio,
+        glitch_ratio,
+        drift.drift_penalty,
+        missing_ratio,
+    );
+
+    // Grade
+    let grade = QualityGrade::from_score(score);
+
+    let summary = quality_summary(
+        drift.usable_coverage,
+        drift.blocks.len(),
+        gaps.edit_count,
+        gaps.backward_jump_count,
+        glitches.glitch_count,
+        missing_frames,
+        drift.worst_block_drift_frames,
+        drift.worst_slope,
+        fps,
+    );
 
     Some(LtcQualityReport {
         score,
         grade,
         missing_frames,
-        gap_count,
-        glitch_count,
-        edit_count,
-        max_drift_secs: worst_block_drift_frames / fps,
-        drift_rate: worst_slope,
+        gap_count: gaps.gap_count,
+        glitch_count: glitches.glitch_count,
+        edit_count: gaps.edit_count,
+        max_drift_secs: drift.worst_block_drift_frames / fps,
+        drift_rate: drift.worst_slope,
         largest_block,
-        usable_coverage,
-        block_count: blocks.len() as u32,
-        worst_block_drift_frames,
-        backward_jump_count,
+        usable_coverage: drift.usable_coverage,
+        block_count: drift.blocks.len() as u32,
+        worst_block_drift_frames: drift.worst_block_drift_frames,
+        backward_jump_count: gaps.backward_jump_count,
         summary,
-        gap_edges,
-        glitch_indices,
+        gap_edges: gaps.gap_edges,
+        glitch_indices: glitches.glitch_indices,
     })
 }
 
@@ -4471,5 +4600,143 @@ mod tests {
             ScoredCandidate::TooShort => {}
             other => panic!("expected TooShort, got {:?}", other),
         }
+    }
+
+    // ── compute_ltc_quality sub-analyzers ─────────────────────────────
+
+    #[test]
+    fn test_quality_score_penalty_table() {
+        // Clean input: score == usable_coverage.
+        assert!((quality_score(1.0, 0, 0.0, 0.0, 0.0, 0.0) - 1.0).abs() < 1e-12);
+        assert!((quality_score(0.8, 0, 0.0, 0.0, 0.0, 0.0) - 0.8).abs() < 1e-12);
+
+        // Edit term: 0.02 per edit, capped at 10 edits.
+        assert!((quality_score(1.0, 1, 0.0, 0.0, 0.0, 0.0) - 0.98).abs() < 1e-12);
+        assert!((quality_score(1.0, 10, 0.0, 0.0, 0.0, 0.0) - 0.80).abs() < 1e-12);
+        assert!((quality_score(1.0, 25, 0.0, 0.0, 0.0, 0.0) - 0.80).abs() < 1e-12, "edits cap at 10");
+
+        // Backward term: 0.30 × affected ratio.
+        assert!((quality_score(1.0, 0, 0.5, 0.0, 0.0, 0.0) - 0.85).abs() < 1e-12);
+
+        // Glitch ramp: none below 0.1%; full 0.15 by 1%.
+        assert!((quality_score(1.0, 0, 0.0, 0.001, 0.0, 0.0) - 1.0).abs() < 1e-12);
+        assert!((quality_score(1.0, 0, 0.0, 0.01, 0.0, 0.0) - 0.85).abs() < 1e-12);
+
+        // Drift penalty passes through.
+        assert!((quality_score(1.0, 0, 0.0, 0.0, 0.05, 0.0) - 0.95).abs() < 1e-12);
+
+        // Missing ramp: none below 5%; 0.15 at 50%.
+        assert!((quality_score(1.0, 0, 0.0, 0.0, 0.0, 0.05) - 1.0).abs() < 1e-12);
+        assert!((quality_score(1.0, 0, 0.0, 0.0, 0.0, 0.5) - 0.85).abs() < 1e-12);
+
+        // Clamped at both ends.
+        assert_eq!(quality_score(0.1, 10, 1.0, 0.01, 0.1, 0.5), 0.0);
+        assert_eq!(quality_score(1.0, 0, 0.0, 0.0, 0.0, 0.0), 1.0);
+
+        // Grade boundaries via QualityGrade::from_score.
+        assert_eq!(QualityGrade::from_score(0.95), QualityGrade::Excellent);
+        assert_eq!(QualityGrade::from_score(0.80), QualityGrade::Good);
+        assert_eq!(QualityGrade::from_score(0.60), QualityGrade::Fair);
+        assert_eq!(QualityGrade::from_score(0.30), QualityGrade::Poor);
+        assert_eq!(QualityGrade::from_score(0.29), QualityGrade::Bad);
+    }
+
+    #[test]
+    fn test_split_segments_contiguous_and_gaps() {
+        let fd = 1.0 / 25.0;
+        // Contiguous frames → one segment.
+        let contig: Vec<f64> = (0..10).map(|i| i as f64 * fd).collect();
+        assert_eq!(split_segments(&contig, 25.0), vec![0..10]);
+
+        // A jump of 3.5 frames (deviation 2.5 frames > the 2-frame gap
+        // threshold) → split. Exact-threshold values are float-fragile and
+        // deliberately avoided.
+        let mut with_jump = contig.clone();
+        with_jump.push(contig[9] + fd * 4.5);
+        let segs = split_segments(&with_jump, 25.0);
+        assert_eq!(segs, vec![0..10, 10..11]);
+
+        // 1.5-frame jump (deviation 0.5 frames, within threshold) → no split.
+        let mut jitter = contig.clone();
+        jitter.push(contig[9] + fd * 2.5);
+        assert_eq!(split_segments(&jitter, 25.0), vec![0..11]);
+    }
+
+    #[test]
+    fn test_analyze_glitches() {
+        let fd = 1.0 / 25.0;
+        let mut ltc: Vec<f64> = (0..10).map(|i| i as f64 * fd).collect();
+        // Isolated glitch at index 5: deviates 1.8 frames from the midpoint
+        // of its neighbours (above the 1.5-frame glitch threshold) while the
+        // segment split deviations stay at 1.8 frames, under the 2-frame bar.
+        ltc[5] = ltc[4] + fd * 2.8;
+        let segments = split_segments(&ltc, 25.0);
+        let stats = analyze_glitches(&ltc, &segments, 25.0);
+        assert_eq!(stats.glitch_count, 1);
+        assert_eq!(stats.glitch_indices, vec![5]);
+
+        // Segments shorter than 3 frames are skipped entirely.
+        let short: Vec<f64> = (0..2).map(|i| i as f64 * fd).collect();
+        let segs = split_segments(&short, 25.0);
+        let stats = analyze_glitches(&short, &segs, 25.0);
+        assert_eq!(stats.glitch_count, 0);
+        assert!(stats.glitch_indices.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_gaps_edit_and_backward() {
+        let fd = 1.0 / 25.0;
+        // Two blocks: audio continues, LTC jumps forward by 20 frames →
+        // edit (jump >= 10 frames AND audio/ltc mismatch > 0.1 s).
+        let audio: Vec<f64> = (0..20).map(|i| i as f64 * fd).collect();
+
+        // Forward jump of 21 frames (> the 10-frame edit threshold) with an
+        // audio/LTC mismatch → gap + edit.
+        let mut ltc: Vec<f64> = (0..10).map(|i| i as f64 * fd).collect();
+        ltc.extend((10..20).map(|i| i as f64 * fd + 20.0 * fd));
+        let segments = split_segments(&ltc, 25.0);
+        let stats = analyze_gaps(&audio, &ltc, &segments, 25.0);
+        assert_eq!(stats.gap_count, 1);
+        assert_eq!(stats.edit_count, 1);
+        assert_eq!(stats.backward_jump_count, 0);
+        assert_eq!(stats.gap_edges, vec![(9, 10)]);
+
+        // Small forward jump (6 frames < 10-frame threshold) is a gap but
+        // not an edit, even though the audio/LTC mismatch exceeds 0.1 s.
+        let mut ltc2: Vec<f64> = (0..10).map(|i| i as f64 * fd).collect();
+        ltc2.extend((10..20).map(|i| i as f64 * fd + 5.0 * fd));
+        let segs2 = split_segments(&ltc2, 25.0);
+        let stats2 = analyze_gaps(&audio, &ltc2, &segs2, 25.0);
+        assert_eq!(stats2.gap_count, 1);
+        assert_eq!(stats2.edit_count, 0);
+
+        // Backward jump (TC reset): LTC value goes back by 3 frames
+        // (> the 0.5-frame backward threshold).
+        let mut ltc3: Vec<f64> = (0..10).map(|i| i as f64 * fd).collect();
+        ltc3.extend((10..20).map(|i| i as f64 * fd - 4.0 * fd));
+        let segs3 = split_segments(&ltc3, 25.0);
+        let stats3 = analyze_gaps(&audio, &ltc3, &segs3, 25.0);
+        assert_eq!(stats3.backward_jump_count, 1);
+        assert_eq!(stats3.backward_affected_frames, 10, "frames from the backward block onward are ambiguous");
+    }
+
+    #[test]
+    fn test_missing_in_span_excludes_silent_edges() {
+        let fd = 1.0 / 25.0;
+        // Full contiguous span → nothing missing.
+        let full: Vec<f64> = (0..50).map(|i| i as f64 * fd).collect();
+        assert_eq!(missing_in_span(&full, 25.0), (0, 0.0));
+
+        // A leading silent edge is not an interior hole: the span is
+        // measured from the first decoded frame.
+        let lead_in: Vec<f64> = (0..50).map(|i| 10.0 + i as f64 * fd).collect();
+        assert_eq!(missing_in_span(&lead_in, 25.0), (0, 0.0));
+
+        // An interior hole: 50 frames span, one frame absent in the middle.
+        let mut hole: Vec<f64> = (0..25).map(|i| i as f64 * fd).collect();
+        hole.extend((26..50).map(|i| i as f64 * fd));
+        let (missing, ratio) = missing_in_span(&hole, 25.0);
+        assert_eq!(missing, 1);
+        assert!(ratio > 0.0 && ratio < 0.05, "1 missing of ~50 is {:.3}", ratio);
     }
 }

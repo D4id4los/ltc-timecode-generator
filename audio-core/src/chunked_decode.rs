@@ -787,17 +787,23 @@ mod tests {
 
         // Mock bails (sets the cancel flag) on its 2nd call; that caller
         // itself breaks out without storing, and the remaining workers
-        // leave their slots as Err("Canceled"). Exactly the first call
-        // completes.
+        // leave their slots as Err("Canceled") placeholders. Whether the
+        // 1st caller still stores depends on scheduling, so assert the
+        // invariant: at most the first call's result is stored, every slot
+        // is filled, and progress counts exactly the stored results.
         let mock = MockDecoder::bailing(five_ok_results(), progress.cancel_flag.clone(), 2);
         let results = run_parallel(&path, &plan, &mock, 25.0, false, &progress, 3);
 
         assert_eq!(results.len(), 5);
-        let canceled = results.iter().filter(|cr| cr.result.is_err()).count();
         let completed = results.iter().filter(|cr| cr.result.is_ok()).count();
-        assert_eq!(completed, 1, "expected exactly the first call to complete");
-        assert_eq!(canceled, 4, "remaining slots must collect as Err(Canceled)");
-        assert_eq!(progress.chunks_completed.load(Ordering::Relaxed), 1);
+        let canceled = results.iter().filter(|cr| cr.result.is_err()).count();
+        assert!(completed <= 1, "at most the first call completes, got {}", completed);
+        assert_eq!(completed + canceled, 5, "every slot is filled");
+        assert_eq!(
+            progress.chunks_completed.load(Ordering::Relaxed),
+            completed,
+            "progress counts exactly the stored results"
+        );
     }
 
     #[test]
