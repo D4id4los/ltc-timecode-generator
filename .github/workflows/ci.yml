@@ -50,8 +50,11 @@ jobs:
       - name: Clippy (JSON report for Sonar)
         run: cargo clippy --workspace --all-targets --message-format=json > clippy-report.json
 
-      - name: Rust tests + coverage (nextest, LCOV for Sonar)
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --nextest
+      - name: Rust tests (nextest, ci retry profile, coverage instrumentation)
+        run: cargo llvm-cov nextest --workspace --profile ci
+
+      - name: Generate LCOV coverage report for Sonar
+        run: cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: npm install
         run: npm ci
