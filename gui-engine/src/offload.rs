@@ -815,10 +815,15 @@ pub fn plan_copies_for_files_with_sizes(
 ) -> Vec<CopyPlanItem> {
     let dest_dir = dest_parent.join(device_name);
 
+    // Collision suffixes must be reproducible: assign them in sorted src
+    // order, never in the (filesystem-dependent) order the files arrived.
+    let mut sorted: Vec<(PathBuf, u64)> = files.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut used_names: HashMap<String, u32> = HashMap::new();
     let mut plans = Vec::new();
 
-    for (src, size) in files {
+    for (src, size) in &sorted {
         let name = src
             .file_name()
             .and_then(|n| n.to_str())
@@ -834,7 +839,6 @@ pub fn plan_copies_for_files_with_sizes(
         });
     }
 
-    plans.sort_by(|a, b| a.src.cmp(&b.src));
     plans
 }
 
@@ -1263,6 +1267,30 @@ mod tests {
             plans[1].dst.file_name().unwrap(),
             "C0002.MP4"
         );
+    }
+
+    #[test]
+    fn test_plan_copies_numbering_independent_of_input_order() {
+        // Regression test: collision suffixes used to be assigned in the
+        // order the files arrived (raw readdir order), so the "(2)" landed
+        // on a different file depending on the filesystem.  Numbering must
+        // follow the sorted src order regardless of input order.
+        let files = vec![
+            PathBuf::from("/card/DCIM/101MSDCF/C0001.MP4"),
+            PathBuf::from("/card/C0001.MP4"),
+            PathBuf::from("/card/DCIM/100MSDCF/C0001.MP4"),
+        ];
+        let dest = TempDir::new().unwrap();
+        let plans = plan_copies_for_files(&files, "A6100", dest.path());
+
+        assert_eq!(plans.len(), 3);
+        // Sorted src order: root, DCIM/100MSDCF, DCIM/101MSDCF.
+        assert_eq!(plans[0].src, PathBuf::from("/card/C0001.MP4"));
+        assert_eq!(plans[1].src, PathBuf::from("/card/DCIM/100MSDCF/C0001.MP4"));
+        assert_eq!(plans[2].src, PathBuf::from("/card/DCIM/101MSDCF/C0001.MP4"));
+        assert!(plans[0].dst.to_string_lossy().ends_with("C0001.MP4"));
+        assert!(plans[1].dst.to_string_lossy().ends_with("C0001 (2).MP4"));
+        assert!(plans[2].dst.to_string_lossy().ends_with("C0001 (3).MP4"));
     }
 
     #[test]
