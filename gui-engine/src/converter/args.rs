@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::bext_meta;
 use crate::camera_meta::CameraInfo;
 use crate::converter::formats::{container_to_ffmpeg_format};
 use crate::converter::planning::{AudioKeep, VideoOutputStep};
@@ -7,9 +8,6 @@ use crate::converter::settings::ConverterSettings;
 use crate::converter::timecode::{format_ffmpeg_timecode, time_reference_samples, TimecodeMetadata};
 use crate::ffprobe::VideoAudioProbe;
 use crate::video_codecs;
-
-/// Originator string for WAV bext when no camera is detected.
-const BEXT_DEFAULT_ORIGINATOR: &str = "LTC Timecode Generator";
 
 pub fn build_audio_to_audio_args(
     settings: &ConverterSettings,
@@ -390,54 +388,12 @@ pub fn push_metadata_args(
         .or_else(|| settings.camera_meta_per_file.first())
         .and_then(|c| c.as_ref());
 
-    let originator = camera
-        .map(|c| {
-            let make = c.make.as_deref().unwrap_or("");
-            let model = c.model.as_deref().unwrap_or("");
-            match (make.is_empty(), model.is_empty()) {
-                (true, true) => BEXT_DEFAULT_ORIGINATOR.to_string(),
-                (true, false) => model.to_string(),
-                (false, true) => make.to_string(),
-                (false, false) => format!("{} {}", make, model),
-            }
-        })
-        .unwrap_or_else(|| BEXT_DEFAULT_ORIGINATOR.to_string());
-
-    let origination_date = camera
-        .and_then(|c| c.creation_date.clone())
-        .or_else(|| {
-            let file_path = file_idx
-                .and_then(|i| settings.input_files.get(i))
-                .or_else(|| settings.input_files.first())?;
-            let meta = std::fs::metadata(file_path).ok()?;
-            let mtime = meta.modified().ok()?;
-            let dt: chrono::DateTime<chrono::Local> = mtime.into();
-            Some(dt.format("%Y-%m-%d").to_string())
-        });
+    let file_path = file_idx
+        .and_then(|i| settings.input_files.get(i))
+        .or_else(|| settings.input_files.first());
 
     if format == "wav" || format == "rf64" {
-        args.push("-write_bext".to_string());
-        args.push("1".to_string());
-        args.push("-metadata".to_string());
-        args.push(format!("originator={}", originator));
-        if let Some(ref date) = origination_date {
-            args.push("-metadata".to_string());
-            args.push(format!("origination_date={}", date));
-        }
-        if let Some(c) = camera {
-            // Only write description when lens is present (model alone is
-            // already covered by the originator field).
-            if let Some(ref lens) = c.lens {
-                let model = c.model.as_deref().unwrap_or("");
-                if !model.is_empty() {
-                    args.push("-metadata".to_string());
-                    args.push(format!("description={} / {}", model, lens));
-                } else {
-                    args.push("-metadata".to_string());
-                    args.push(format!("description={}", lens));
-                }
-            }
-        }
+        bext_meta::push_wav_bext_args(args, camera, file_path.map(|p| p.as_path()));
     } else {
         let is_mov_like = matches!(format, "mov" | "mp4" | "m4v" | "ipod");
         push_camera_metadata(args, camera, is_mov_like, format);

@@ -8,9 +8,6 @@ use crate::camera_meta::CameraInfo;
 use crate::converter::{TimecodeMetadata, format_ffmpeg_timecode};
 use crate::subprocess::{no_window_command, run_output_with_timeout, SubprocessFailure};
 
-/// Originator string for WAV bext when no camera is detected.
-const BEXT_DEFAULT_ORIGINATOR: &str = "LTC Timecode Generator";
-
 /// Total timeout for the ffmpeg stream-copy tagging fallback.
 /// Stream copying a full-length recording (e.g. 100 GB on slow storage) can
 /// take many minutes, but should never hang indefinitely.
@@ -650,32 +647,6 @@ fn bext_padded_string(s: &str, len: usize) -> Vec<u8> {
     buf
 }
 
-fn bext_originator(camera: Option<&CameraInfo>) -> String {
-    let c = match camera {
-        Some(c) => c,
-        None => return BEXT_DEFAULT_ORIGINATOR.to_string(),
-    };
-    let make = c.make.as_deref().unwrap_or("");
-    let model = c.model.as_deref().unwrap_or("");
-    match (make.is_empty(), model.is_empty()) {
-        (true, true) => BEXT_DEFAULT_ORIGINATOR.to_string(),
-        (true, false) => model.to_string(),
-        (false, true) => make.to_string(),
-        (false, false) => format!("{} {}", make, model),
-    }
-}
-
-/// Build the bext `description` field (model / lens) when lens is available.
-fn build_bext_description(camera: Option<&CameraInfo>) -> Option<String> {
-    let c = camera?;
-    let lens = c.lens.as_ref()?;
-    let model = c.model.as_deref().unwrap_or("");
-    if !model.is_empty() {
-        Some(format!("{} / {}", model, lens))
-    } else {
-        Some(lens.clone())
-    }
-}
 
 /// Build a 602-byte BWF `bext` chunk payload (BWF v1 fixed-size fields).
 ///
@@ -691,11 +662,11 @@ fn build_bext_payload(
     let mut buf = Vec::with_capacity(602);
 
     // description (256)
-    let desc = build_bext_description(camera).unwrap_or_default();
+    let desc = crate::bext_meta::bext_description(camera).unwrap_or_default();
     buf.extend_from_slice(&bext_padded_string(&desc, 256));
 
     // originator (32)
-    let originator = bext_originator(camera);
+    let originator = crate::bext_meta::bext_originator(camera);
     buf.extend_from_slice(&bext_padded_string(&originator, 32));
 
     // originator_ref (32) — empty
@@ -780,7 +751,7 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
             }
 
             // Write description (256 bytes) if lens is available
-            if let Some(ref desc) = build_bext_description(camera) {
+            if let Some(ref desc) = crate::bext_meta::bext_description(camera) {
                 let desc_bytes = bext_padded_string(desc, 256);
                 file.seek(SeekFrom::Start(payload_off))
                     .map_err(|e| format!("seek to description: {}", e))?;
@@ -789,7 +760,7 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
             }
 
             // Write originator (32 bytes, NUL-padded)
-            let originator = bext_originator(camera);
+            let originator = crate::bext_meta::bext_originator(camera);
             let originator_bytes = bext_padded_string(&originator, 32);
             file.seek(SeekFrom::Start(payload_off + 256))
                 .map_err(|e| format!("seek to originator: {}", e))?;
@@ -857,7 +828,7 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
 
     file.sync_all().map_err(|e| format!("fsync: {}", e))?;
 
-    let originator = bext_originator(camera);
+    let originator = crate::bext_meta::bext_originator(camera);
     log::info!(
         "Created bext originator={} in {}",
         originator,
@@ -936,30 +907,13 @@ fn tag_via_ffmpeg_with(
     }
 
     // Camera metadata (via shared helper from args.rs, plus WAV bext extras)
-    if let Some(c) = camera {
-        if container == "wav" {
-            args.push("-write_bext".to_string());
-            args.push("1".to_string());
-            args.push("-metadata".to_string());
-            args.push(format!("originator={}", bext_originator(Some(c))));
-            if let Some(ref date) = c.creation_date {
-                args.push("-metadata".to_string());
-                args.push(format!("origination_date={}", date));
-            }
-            if let Some(ref lens) = c.lens {
-                let model = c.model.as_deref().unwrap_or("");
-                if !model.is_empty() {
-                    args.push("-metadata".to_string());
-                    args.push(format!("description={} / {}", model, lens));
-                } else {
-                    args.push("-metadata".to_string());
-                    args.push(format!("description={}", lens));
-                }
-            }
-        } else {
-            let is_mov_like = matches!(container, "mov" | "mp4");
-            crate::converter::args::push_camera_metadata(&mut args, Some(c), is_mov_like, container);
-        }
+    if container == "wav" {
+        // Shared bext block: also covers the no-camera case (default
+        // originator) and adds the mtime origination_date fallback.
+        crate::bext_meta::push_wav_bext_args(&mut args, camera, Some(path));
+    } else if let Some(c) = camera {
+        let is_mov_like = matches!(container, "mov" | "mp4");
+        crate::converter::args::push_camera_metadata(&mut args, Some(c), is_mov_like, container);
     }
 
     args.push("-f".to_string());

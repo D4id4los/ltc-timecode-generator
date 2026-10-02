@@ -1,3 +1,4 @@
+pub mod bext_meta;
 pub mod camera_meta;
 pub mod cli;
 pub mod clip_probe;
