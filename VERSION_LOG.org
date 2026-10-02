@@ -1,6 +1,83 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — WP-2 audio-core restructuring
+
+Implementation of work package WP-2 from the code-quality report
+(`reports/code-quality-2026-10-02.md`, plan in
+`reports/wp2-audio-core-restructuring-plan.md`): `lib.rs` becomes a
+thin front door, the chunked decoder's merge logic and the scheduler's
+watchdog state machine become directly unit-testable, the decoder's
+strategy ladder and quality analyzer are decomposed into pure units,
+backend selection becomes a trait, and the dead API surface is gone —
+all behavior-preserving except where noted.
+
+List of Changes:
+- `lib.rs` split (PR-1): the 1 761-line god-module is now a ~70-line
+  front door; shared types moved to `types.rs`, the byte-level WAV
+  reader to `wav_chunk_reader.rs` (with `read_raw_bytes` /
+  `decode_le_int_sample` deduplicating the per-reader byte work), and
+  the chunked decode to `chunked_decode.rs`. The chunk-boundary loop
+  exists once as `plan_chunk_boundaries`; `count_chunks` is
+  `plan(..).len()` by construction. Two intentional prediction fixes:
+  `count_chunks` no longer short-circuits to 1 in the
+  `(chunk_mono, chunk_mono+overlap]` window (gui-engine progress
+  totals were ±1 off the real decode there), and the degenerate
+  `bytes_per_mono == 0` fallback unifies on 1 chunk.
+- `trait LtcDecoder` (PR-2): backend selection collapses into
+  `decoder.rs::decoder_for(use_libltc)` — the single `if use_libltc`
+  in the crate; `decode_one_chunk`/`decode_ltc_with_decoder` delegate.
+  The byte-identical `error_result` clone in the libltc decoder is
+  deleted in favour of `LtcDetectionResult::error`.
+- `decode_ltc_chunked` decomposition (PR-3): CC 77 → a ~70-line
+  orchestrator over `ChunkPlan`, `run_sequential`/`run_parallel`
+  (taking `&dyn LtcDecoder`, mockable), and `merge_results` (offset/
+  dedup/reindex/confidence/status). Twelve new synthetic unit tests
+  including MockDecoder sequential/parallel parity, pre-cancelled slot
+  filling, and worker-bail collection.
+- `list_audio_devices` (PR-4): one `AudioDeviceInfo` construction site
+  (`from_summary`), one config-aggregation loop (`DeviceConfigSummary`),
+  and a shared `probe_device` path for the default device and the
+  enumeration loop; the duplicated second walk of
+  `supported_output_configs` is gone.
+- Scheduler reliability (PR-5): the callback-stall recovery state
+  machine is extracted as a pure `CallbackWatchdog` (500 ms stall /
+  3 attempts / 10 s sliding window / 100 ms backoff) tested on a
+  virtual clock — recovery ladder, strict-`>` stall confirmation,
+  resume reset, sliding-window restart, byte-exact reason string —
+  plus a device-free `push_frame` helper pinning the
+  `FramesDropped`-every-100 cadence. `ltc_scheduler_thread` is
+  delegation + glue.
+- Decoder strategy ladder (PR-6a): the 3x compare-ZC-vs-detailed
+  epilogue is `prefer_zc_or_detailed`; the sliding-window loop is
+  `scan_windows` returning `HighConf`/`Best`/`NoCandidate`; per-attempt
+  scoring is `score_candidate`; all four `ScoredResult` construction
+  sites funnel through `from_frame_starts` (single home of the
+  `(phase + start·spb)/sample_rate` formula) with `canceled()` for the
+  zeroed cancel stubs; four inline cancel checks become `cancelled()`.
+  The real-world fixture decode output is byte-identical before/after.
+- `compute_ltc_quality` (PR-6b): the ~250-line CC-48 function becomes
+  a ~45-line orchestrator over pure sub-analyzers (`split_segments`,
+  `analyze_drift`, `analyze_gaps`, `analyze_glitches`,
+  `missing_in_span`, `quality_score`, `quality_summary`) — the scoring
+  formula is now directly unit-tested. No threshold or formula changes.
+- API pruning (PR-7): deleted `quick_check_ltc`,
+  `is_transient_audio_error`, and the never-writable
+  `OVERRIDE_SYNC_TOLERANCE` hook (the sync-word path now uses
+  `SYNC_MATCH_TOLERANCE` directly, removing the inconsistent mix);
+  `apply_coherent_first_timecode`, `decode_ltc_samples`,
+  `decode_ltc_samples_libltc` demoted to `pub(crate)`; gui-engine's
+  re-export block drops the dead names. The valid/invalid round-trip
+  coverage formerly pinned by `quick_check_ltc` is retargeted onto
+  `decode_ltc_from_wav`.
+
+Verification: 390 audio-core tests (352 before, 46 new, 10 removed
+with their API), full workspace suite green, clippy 0 warnings, both
+GUIs compile untouched, `nextest --profile ci` green on the touched
+areas, `--list-devices` and `--headless` smoke runs OK, and the
+real-world 20 s fixture decode output is byte-identical across the
+decoder refactors.
+
 * Unreleased — WP-1 engine decomposition (`gui-engine`)
 
 Implementation of work package WP-1 from the code-quality report

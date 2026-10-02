@@ -731,11 +731,6 @@ where
 
 // ── Error classification helpers ────────────────────────────────────────────
 
-pub fn is_transient_audio_error(err: &str) -> bool {
-    let keywords = ["temporarily busy", "already in use", "resource busy"];
-    keywords.iter().any(|kw| err.contains(kw))
-}
-
 pub fn is_permanent_device_error(err: &str) -> bool {
     let keywords = ["Permission denied", "Access denied"];
     keywords.iter().any(|kw| err.contains(kw))
@@ -1554,51 +1549,6 @@ mod tests {
     fn test_choose_buffer_size_never_returns_fixed_1024_for_zero() {
         // This test documents the fix: zero param must NOT force Fixed(1024)
         assert!(matches!(choose_buffer_size(0), cpal::BufferSize::Default));
-    }
-
-    // ── is_transient_audio_error ──────────────────────────────────────────
-
-    #[test]
-    fn test_is_transient_audio_error_temporarily_busy() {
-        assert!(is_transient_audio_error("device temporarily busy"));
-    }
-
-    #[test]
-    fn test_is_transient_audio_error_already_in_use() {
-        assert!(is_transient_audio_error("device already in use"));
-    }
-
-    #[test]
-    fn test_is_transient_audio_error_resource_busy() {
-        assert!(is_transient_audio_error("resource busy"));
-    }
-
-    #[test]
-    fn test_is_transient_audio_error_permission_denied() {
-        assert!(!is_transient_audio_error("Permission denied"));
-    }
-
-    #[test]
-    fn test_is_transient_audio_error_empty_string() {
-        assert!(!is_transient_audio_error(""));
-    }
-
-    #[test]
-    fn test_is_transient_audio_error_unrelated() {
-        assert!(!is_transient_audio_error("device not found"));
-        assert!(!is_transient_audio_error("unknown error"));
-    }
-
-    #[test]
-    fn test_is_transient_audio_error_partial_match() {
-        assert!(is_transient_audio_error("The device is temporarily busy"));
-        assert!(is_transient_audio_error("Stream error: already in use"));
-    }
-
-    #[test]
-    fn test_is_transient_audio_error_case_sensitivity() {
-        assert!(is_transient_audio_error("temporarily busy"));
-        assert!(!is_transient_audio_error("TEMPORARILY BUSY"));
     }
 
     // ── is_permanent_device_error ─────────────────────────────────────────

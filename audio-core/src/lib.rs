@@ -35,19 +35,18 @@ pub use ltc_encoder::{generate_ltc_frame_stereo, get_ltc_bits, increment_timecod
 // ── Audio output ──────────────────────────────────────────────────────────
 
 pub use audio_output::{
-    is_permanent_device_error, is_transient_audio_error, list_audio_devices, suggest_sample_rate,
-    AudioCore, SAMPLE_RATE_OPTIONS,
+    is_permanent_device_error, list_audio_devices, suggest_sample_rate, AudioCore,
+    SAMPLE_RATE_OPTIONS,
 };
 
 // ── LTC decoder re-exports ────────────────────────────────────────────────
 
 pub use ltc_decoder::{
-    apply_coherent_first_timecode, compute_ltc_quality, decode_ltc_from_wav, decode_ltc_samples,
-    find_first_coherent_index, quick_check_ltc, CONFIDENCE_LOW_THRESHOLD,
-    CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus, LtcDetectionResult,
-    LtcQualityReport,
+    compute_ltc_quality, decode_ltc_from_wav, find_first_coherent_index,
+    CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus,
+    LtcDetectionResult, LtcQualityReport,
 };
-pub use ltc_decoder_libltc::{decode_ltc_from_wav_libltc, decode_ltc_samples_libltc};
+pub use ltc_decoder_libltc::decode_ltc_from_wav_libltc;
 
 /// Decode LTC from a WAV file, selecting the decoder implementation.
 pub fn decode_ltc_with_decoder(

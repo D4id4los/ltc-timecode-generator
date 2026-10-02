@@ -103,10 +103,14 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   └── ui/                       # app.slint (root) + clapper/clock/converter/offload/settings/status/theme/types/widgets.slint
 ├── audio-core/                   # Shared Rust audio crate (LTC generation + cpal output + decoders)
 │   └── src/
-│       ├── audio_output.rs       # AudioCore, device/stream lifecycle, config selection, error classification, scheduler thread
-│       ├── lib.rs                # Types + re-exports + WavChunkReader + chunked decode
+│       ├── lib.rs                # Thin front door: module decls + re-exports + decode_ltc_with_decoder
+│       ├── types.rs              # Timecode, ChannelSel, AudioEvent, AudioDeviceInfo, DecodeConfig, DecodeProgress
+│       ├── wav_chunk_reader.rs   # WavChunkReader: byte-level WAV chunk reading (data-section offsets)
+│       ├── chunked_decode.rs     # plan_chunk_boundaries, count_chunks* , decode_ltc_chunked (plan → run → merge)
+│       ├── decoder.rs            # trait LtcDecoder + BuiltinDecoder/LibltcDecoder + decoder_for() backend seam
+│       ├── audio_output.rs       # AudioCore, device/stream lifecycle, config selection, error classification, scheduler + watchdog
 │       ├── ltc_encoder.rs        # get_ltc_bits, increment_timecode, generate_ltc_frame_stereo
-│       ├── ltc_decoder.rs        # Builtin decoder + quality report
+│       ├── ltc_decoder.rs        # Builtin decoder (strategy ladder) + quality sub-analyzers
 │       └── ltc_decoder_libltc.rs # libltc-binding decoder
 ├── src-tauri/                    # Tauri v2 (legacy, 64-bit) Rust backend: commands + Builder setup
 ├── src-tauri-32bit/              # Legacy Tauri v1 (Docker cross-compile for i686)
@@ -367,12 +371,16 @@ The Slint GUI follows the same pattern as ltc-gui — thin shell over `gui-engin
 ## audio-core Crate
 
 The `audio-core` crate provides the raw audio engine, split by concern:
-- **`audio_output.rs`** — `AudioCore` (cpal output stream, ring buffers 128K LTC + 32K beep, scheduler thread, wake lock, event queue); `list_audio_devices()` / `AudioDeviceInfo`; config selection, stream building, device enumeration; error classification (`is_transient_audio_error`, `is_permanent_device_error`); `suggest_sample_rate()`; `SAMPLE_RATE_OPTIONS = &[44100, 48000]`. Extracted from `lib.rs` to isolate all device/stream lifecycle logic.
-- **`lib.rs`** — public types (`Timecode`, `AudioEvent`, `AudioDeviceInfo`) + re-exports from `audio_output` + chunked parallel WAV decode (`WavChunkReader`, `DecodeConfig`, `DecodeProgress`, `decode_ltc_chunked`); `decode_ltc_with_decoder()`.
+- **`lib.rs`** — thin front door (~70 lines): module declarations, re-exports, and `decode_ltc_with_decoder()` (one-line delegation to the decoder seam).
+- **`types.rs`** — shared types: `Timecode`, `ChannelSel`, `AudioEvent`, `AudioDeviceInfo`, plus the chunked-decode `DecodeConfig`/`DecodeProgress`.
+- **`wav_chunk_reader.rs`** — `WavChunkReader`: low-level WAV reading from data-section offsets (byte-level `read_raw_bytes` + `decode_le_int_sample` helpers, f32/i16 mono extraction, 8/16/24/32-bit int + float).
+- **`chunked_decode.rs`** — chunked parallel decode: `chunk_geometry()` + `plan_chunk_boundaries()` (the single home of the chunk-boundary math — `count_chunks` is `plan(..).len()` by construction), `count_chunks_in_wav`, `decode_ltc_chunked` decomposed into `plan_chunks` → `run_sequential`/`run_parallel` (over `&dyn LtcDecoder`) → `merge_results` (offset/dedup/reindex/confidence aggregation, unit-tested with a `MockDecoder`).
+- **`decoder.rs`** — backend-selection seam: `trait LtcDecoder` (`name`/`decode_wav`/`decode_chunk`), `BuiltinDecoder`/`LibltcDecoder` unit structs, and `decoder_for(use_libltc)` — the only `if use_libltc` in the crate.
+- **`audio_output.rs`** — `AudioCore` (cpal output stream, ring buffers 128K LTC + 32K beep, scheduler thread, wake lock, event queue); `list_audio_devices()` / `AudioDeviceInfo` (built via `DeviceConfigSummary` + `from_summary`); config selection, stream building, device enumeration; error classification (`is_permanent_device_error`); `suggest_sample_rate()`; `SAMPLE_RATE_OPTIONS = &[44100, 48000]`. The scheduler's callback-stall recovery is a pure `CallbackWatchdog` state machine (virtual-clock tested) plus a device-free `push_frame` helper.
 - **`ltc_encoder.rs`** — `get_ltc_bits()` (80-bit bi-phase mark frame), `increment_timecode()`, `compute_frame_sample_count()`, `generate_ltc_frame_stereo()`.
-- **`ltc_decoder.rs`** — builtin pure-Rust decoder: `decode_ltc_samples()` / `decode_ltc_from_wav()`, first-coherent-frame alignment, `compute_ltc_quality()` (confidence, gaps, glitches), `quick_check_ltc()`; types `LtcDetectionResult`, `FrameTimecode`, `LtcQualityReport`, `LtcDecodeStatus`.
-- **`ltc_decoder_libltc.rs`** — `decode_ltc_from_wav_libltc()` / `decode_ltc_samples_libltc()` via the `libltc-rs` binding (requires system `libltc`).
-- Common types defined in `lib.rs`: `Timecode {hours, minutes, seconds, frames}`, `AudioEvent` (StreamError/StreamDied/StreamRecovering/StreamDead/RecoveryNeeded/Underrun/FramesDropped).
+- **`ltc_decoder.rs`** — builtin pure-Rust decoder: `decode_ltc_samples()` (crate-private; the strategy ladder — ZC-interval attempt, `scan_windows`, `score_candidate`, `prefer_zc_or_detailed` epilogue, `decode_full_file` — with all `ScoredResult` construction funneled through `from_frame_starts`), `decode_ltc_from_wav()`, first-coherent-frame alignment (`find_first_coherent_index`, `apply_coherent_first_timecode` — crate-private), and `compute_ltc_quality()` as an orchestrator over pure sub-analyzers (`split_segments`, `analyze_drift`, `analyze_gaps`, `analyze_glitches`, `missing_in_span`, `quality_score`); types `LtcDetectionResult`, `FrameTimecode`, `LtcQualityReport`, `LtcDecodeStatus`.
+- **`ltc_decoder_libltc.rs`** — `decode_ltc_from_wav_libltc()` via the `libltc-rs` binding (requires system `libltc`); the sample-level entry is crate-private.
+- Common `AudioEvent` variants: StreamError/StreamDied/StreamRecovering/StreamDead/RecoveryNeeded/Underrun/FramesDropped.
 
 ## Legacy Frontends
 

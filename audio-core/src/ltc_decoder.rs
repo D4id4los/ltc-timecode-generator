@@ -1,15 +1,8 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-
-static OVERRIDE_SYNC_TOLERANCE: AtomicU32 = AtomicU32::new(0);
-
-fn effective_sync_tolerance() -> u32 {
-    let ov = OVERRIDE_SYNC_TOLERANCE.load(Ordering::Relaxed);
-    if ov > 0 { ov } else { SYNC_MATCH_TOLERANCE }
-}
 
 use crate::Timecode;
 
@@ -387,7 +380,7 @@ fn prefer_zc_or_detailed(
 }
 
 /// Public entry point for LTC decode. Wraps the inner decoder.
-pub fn decode_ltc_samples(
+pub(crate) fn decode_ltc_samples(
     samples: &[f32],
     sample_rate: u32,
     channels: usize,
@@ -783,7 +776,7 @@ pub fn find_first_coherent_index(
 /// Post-process a `LtcDetectionResult` to find the first coherent timecode
 /// and trim any non-coherent frames from the start of the `timecodes` vector.
 /// Updates `first_ltc_timecode_secs` to match the first coherent frame.
-pub fn apply_coherent_first_timecode(result: &mut LtcDetectionResult) {
+pub(crate) fn apply_coherent_first_timecode(result: &mut LtcDetectionResult) {
     if result.timecodes.is_empty() || result.detected_fps <= 0.0 {
         return;
     }
@@ -1240,11 +1233,6 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
     })
 }
 
-pub fn quick_check_ltc(path: &Path) -> Result<bool, String> {
-    let result = decode_ltc_from_wav(path, 25.0, false, None)?;
-    Ok(matches!(result.status, LtcDecodeStatus::Success))
-}
-
 // ── Reading ──────────────────────────────────────────────────────────────────
 
 fn read_mono_samples<R: std::io::Read>(
@@ -1580,7 +1568,7 @@ fn extract_bits_adaptive(
 const SYNC_MATCH_TOLERANCE: u32 = 2;
 
 fn bits_hamming_distance_16(a: &[u8]) -> u32 {
-    let tolerance = effective_sync_tolerance();
+    let tolerance = SYNC_MATCH_TOLERANCE;
     let mut dist = 0u32;
     for (i, &bit) in a.iter().enumerate() {
         if bit != SYNC_WORD[i] {
@@ -1647,7 +1635,7 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         }
         let sync_start = frame_start + SYNC_OFFSET;
         if sync_start + 16 <= bits.len()
-            && bits_hamming_distance_16(&bits[sync_start..sync_start + 16]) <= effective_sync_tolerance()
+            && bits_hamming_distance_16(&bits[sync_start..sync_start + 16]) <= SYNC_MATCH_TOLERANCE
         {
             frame_starts.push(frame_start);
         }
@@ -2713,10 +2701,11 @@ mod tests {
             result.valid_frames, result.total_possible_frames);
     }
 
-    // ── quick_check_ltc ──────────────────────────────────────────────────
+    // ── decode_ltc_from_wav valid/invalid round-trip ─────────────────────
+    // (Formerly pinned via the deleted quick_check_ltc wrapper.)
 
     #[test]
-    fn test_quick_check_ltc_valid() {
+    fn test_decode_ltc_from_wav_valid_status() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("valid_check.wav");
         generate_test_wav(
@@ -2724,12 +2713,16 @@ mod tests {
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
             25.0, false, ChannelSel::Both, 0.5, 48000, 1.0,
         );
-        let result = quick_check_ltc(&path).unwrap();
-        assert!(result, "quick_check_ltc should return true for valid LTC");
+        let result = decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "valid LTC should decode to Success, got {:?}",
+            result.status
+        );
     }
 
     #[test]
-    fn test_quick_check_ltc_invalid() {
+    fn test_decode_ltc_from_wav_silent_file_not_success() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("invalid_check.wav");
         let spec = hound::WavSpec {
@@ -2743,8 +2736,12 @@ mod tests {
             writer.write_sample(0i16).unwrap();
         }
         writer.finalize().unwrap();
-        let result = quick_check_ltc(&path).unwrap();
-        assert!(!result, "quick_check_ltc should return false for silent file");
+        let result = decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
+        assert!(
+            !matches!(result.status, LtcDecodeStatus::Success),
+            "silent file must not decode to Success, got {:?}",
+            result.status
+        );
     }
 
     // ── Real-world LTC test ──────────────────────────────────────────────

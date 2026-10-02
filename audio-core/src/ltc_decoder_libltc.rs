@@ -48,7 +48,7 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cance
     decode_ltc_samples_libltc(&sample_data, channels, sample_rate, fps, drop_frame, start, cancel)
 }
 
-pub fn decode_ltc_samples_libltc(
+pub(crate) fn decode_ltc_samples_libltc(
     sample_data: &[i16],
     channels: usize,
     sample_rate: u32,
