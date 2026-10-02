@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::converter::settings::ConverterSettings;
+use crate::converter::settings::{ConverterSettings, RecordingType};
 use crate::converter::formats::{audio_encoder_to_output_format, copy_mode_container_for_input, extension_for_container};
 use crate::ffprobe::VideoAudioProbe;
 
@@ -46,6 +46,54 @@ impl VideoOutputStep {
     }
 }
 
+/// One surviving output slot of the channel-map iteration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectedChannel {
+    /// Output slot index (0..channel_map.num_channels()).
+    pub output_k: usize,
+    /// Input index resolved through `ChannelMap::input_for_output`.
+    pub input_i: usize,
+    /// Physical (stream_index, channel_index) the slot maps to. Callers
+    /// without a probe pass an empty slice and get `(input_i, 0)`.
+    pub pair: (usize, usize),
+}
+
+/// The channel-map iteration with ALL split/drop semantics in one place:
+/// output-slot order, unmapped slots skipped, inputs beyond
+/// `physical.len()` skipped (unless `physical` is empty — audio-only
+/// callers then get every slot with `pair = (input_i, 0)`), and the LTC
+/// channel dropped when `drop_ltc_track` is set. LTC matching follows the
+/// recording type: `VideoClipSequence` matches `ltc_video_source` against
+/// the physical pair; `MultiTrackAudio` matches via
+/// `ConverterSettings::is_ltc_output_track` (single definition of that rule).
+pub fn selected_channel_pairs(
+    settings: &ConverterSettings,
+    physical: &[(usize, usize)],
+) -> Vec<SelectedChannel> {
+    let mut out = Vec::new();
+    for output_k in 0..settings.channel_map.num_channels() {
+        let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
+            continue;
+        };
+        let pair = match physical.get(input_i) {
+            Some(&p) => p,
+            // Audio-only callers pass no physical layout: every mapped
+            // slot survives with a synthetic (input_i, 0) pair.
+            None if physical.is_empty() => (input_i, 0),
+            None => continue,
+        };
+        let is_ltc = match settings.recording_type {
+            RecordingType::VideoClipSequence => settings.ltc_video_source == Some(pair),
+            RecordingType::MultiTrackAudio => settings.is_ltc_output_track(output_k),
+        };
+        if settings.drop_ltc_track && is_ltc {
+            continue;
+        }
+        out.push(SelectedChannel { output_k, input_i, pair });
+    }
+    out
+}
+
 pub fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize, probe: &VideoAudioProbe) -> Vec<VideoOutputStep> {
     let ext = extension_for_container(&settings.container);
     let mut steps: Vec<VideoOutputStep> = Vec::new();
@@ -57,26 +105,15 @@ pub fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize
         let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
         steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
 
+        let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
         let mut emitted = 0usize;
-        for output_k in 0..map_n {
-            let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
-                continue;
-            };
-            if input_i >= input_n {
-                continue;
-            }
-            let (stream_idx, channel_idx) = channels[input_i];
-            let ltc_match = settings.ltc_video_source == Some((stream_idx, channel_idx));
-            if settings.drop_ltc_track && ltc_match {
-                continue;
-            }
-            let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+        for sel in selected_channel_pairs(settings, &channels) {
             emitted += 1;
             let audio_out = settings.output_path_for_file("audio", file_idx, emitted, aext);
             steps.push(VideoOutputStep::AudioChannel {
                 file_idx,
-                stream_idx,
-                channel_idx,
+                stream_idx: sel.pair.0,
+                channel_idx: sel.pair.1,
                 output: audio_out,
                 format: fmt.to_string(),
             });
@@ -115,21 +152,10 @@ pub fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize
                 }
             }
         } else {
-            let mut ordered: Vec<(usize, usize)> = Vec::new();
-            for output_k in 0..map_n {
-                let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
-                    continue;
-                };
-                if input_i >= input_n {
-                    continue;
-                }
-                let pair = channels[input_i];
-                let ltc_match = settings.ltc_video_source == Some(pair);
-                if settings.drop_ltc_track && ltc_match {
-                    continue;
-                }
-                ordered.push(pair);
-            }
+            let ordered: Vec<(usize, usize)> = selected_channel_pairs(settings, &channels)
+                .into_iter()
+                .map(|sel| sel.pair)
+                .collect();
             if ordered.is_empty() {
                 steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
             } else {
@@ -234,23 +260,19 @@ pub fn plan_concat_outputs(
             .enumerate()
             .filter_map(|(fi, p)| p.as_ref().map(|probe| (fi, probe)))
             .flat_map(|(fi, probe)| {
+                let channels = probe_channel_list(probe).unwrap_or_default();
                 let mut file_steps = Vec::new();
-                for s in &probe.streams {
-                    for ch in 0..s.channels {
-                        let ltc_match = settings.ltc_video_source == Some((s.stream_index, ch));
-                        if settings.drop_ltc_track && ltc_match {
-                            continue;
-                        }
-                        let audio_idx = file_steps.len() + 1;
-                        let audio_out = settings.output_path_for_file("audio", fi, audio_idx, aext);
-                        file_steps.push(VideoOutputStep::AudioChannel {
-                            file_idx: fi,
-                            stream_idx: s.stream_index,
-                            channel_idx: ch,
-                            output: audio_out,
-                            format: fmt.to_string(),
-                        });
-                    }
+                let mut emitted = 0usize;
+                for sel in selected_channel_pairs(settings, &channels) {
+                    emitted += 1;
+                    let audio_out = settings.output_path_for_file("audio", fi, emitted, aext);
+                    file_steps.push(VideoOutputStep::AudioChannel {
+                        file_idx: fi,
+                        stream_idx: sel.pair.0,
+                        channel_idx: sel.pair.1,
+                        output: audio_out,
+                        format: fmt.to_string(),
+                    });
                 }
                 file_steps
             })
@@ -258,22 +280,9 @@ pub fn plan_concat_outputs(
         return (fallback, warnings);
     }
 
-    let map_n = settings.channel_map.num_channels();
     let mut emitted = 0usize;
-    for output_k in 0..map_n {
-        let Some(input_i) = settings.channel_map.input_for_output(output_k) else {
-            continue;
-        };
-        if input_i >= num_tracks {
-            continue;
-        }
-        if settings.drop_ltc_track {
-            let (ref_stream, ref_ch) = reference[input_i];
-            if settings.ltc_video_source == Some((ref_stream, ref_ch)) {
-                continue;
-            }
-        }
-        let segments: Vec<(usize, usize, usize)> = tracks_segments[input_i].to_vec();
+    for sel in selected_channel_pairs(settings, &reference) {
+        let segments: Vec<(usize, usize, usize)> = tracks_segments[sel.input_i].to_vec();
         if segments.is_empty() {
             continue;
         }
@@ -874,5 +883,143 @@ mod tests {
             .filter(|p| matches!(p.kind, OutputKind::Audio))
             .count();
         assert_eq!(audio_count, 2, "MetadataOnly+split+concat should show one audio per track");
+    }
+
+    // ── selected_channel_pairs ────────────────────────────────────────────
+
+    use crate::converter::settings::RecordingType as RT;
+
+    fn stereo_pairs() -> Vec<(usize, usize)> {
+        vec![(1, 0), (1, 1)]
+    }
+
+    #[test]
+    fn test_selected_pairs_identity_drop_video_ltc() {
+        let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
+        s.drop_ltc_track = true;
+        s.ltc_video_source = Some((1, 0));
+        s.recording_type = RT::VideoClipSequence;
+        let sel = selected_channel_pairs(&s, &stereo_pairs());
+        assert_eq!(sel.len(), 1, "only slot 1 survives; slot 0 is the LTC pair");
+        assert_eq!(sel[0].output_k, 1);
+        assert_eq!(sel[0].input_i, 1);
+        assert_eq!(sel[0].pair, (1, 1));
+    }
+
+    #[test]
+    fn test_selected_pairs_identity_no_drop() {
+        let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
+        s.ltc_video_source = Some((1, 0));
+        s.recording_type = RT::VideoClipSequence;
+        let sel = selected_channel_pairs(&s, &stereo_pairs());
+        assert_eq!(sel.len(), 2);
+        assert_eq!(sel[0].pair, (1, 0));
+        assert_eq!(sel[1].pair, (1, 1));
+    }
+
+    #[test]
+    fn test_selected_pairs_permuted_audio_drop() {
+        // mapping [1, 0]: input 1 feeds output 0, input 0 feeds output 1.
+        // MultiTrackAudio drop rule: input == ltc_track_channel_index.
+        let mut s = make_settings_audio_only();
+        s.channel_map = ChannelMap::from_mapping(vec![1, 0]);
+        s.drop_ltc_track = true;
+        s.ltc_track_channel_index = 1;
+        s.recording_type = RT::MultiTrackAudio;
+        let sel = selected_channel_pairs(&s, &stereo_pairs());
+        assert_eq!(sel.len(), 1, "slot whose input is 1 (LTC) is dropped through the permutation");
+        assert_eq!(sel[0].output_k, 1);
+        assert_eq!(sel[0].input_i, 0);
+        assert_eq!(sel[0].pair, (1, 0));
+    }
+
+    #[test]
+    fn test_selected_pairs_skips_unmapped_and_out_of_bounds() {
+        // mapping [-, 0] is impossible; use from_mapping with a duplicate:
+        // mapping [1, 1] → output 1 has no unique input (input_for_output(1)
+        // resolves to 0), output 0 resolves to input 1.
+        let mut s = make_settings_audio_only();
+        s.channel_map = ChannelMap::from_mapping(vec![1, 1]);
+        s.recording_type = RT::MultiTrackAudio;
+        let sel = selected_channel_pairs(&s, &[(1, 0)]);
+        // output 0 → input_for_output(0) = None (unmapped) → skipped;
+        // output 1 → input 0 → pair (1,0) survives
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].output_k, 1);
+        assert_eq!(sel[0].input_i, 0);
+    }
+
+    #[test]
+    fn test_selected_pairs_no_video_source_drops_nothing() {
+        // VideoClipSequence + drop on but ltc_video_source = None:
+        // no fallback to ltc_track_channel_index (today's video behavior).
+        let mut s = make_video_settings();
+        s.channel_map = ChannelMap::identity(2);
+        s.drop_ltc_track = true;
+        s.ltc_track_channel_index = 0;
+        s.ltc_video_source = None;
+        s.recording_type = RT::VideoClipSequence;
+        let sel = selected_channel_pairs(&s, &stereo_pairs());
+        assert_eq!(sel.len(), 2, "video rule never falls back to the audio track index");
+    }
+
+    #[test]
+    fn test_selected_pairs_empty_physical_audio_only() {
+        // Audio-only callers pass an empty physical list and still get
+        // every mapped slot with pair = (input_i, 0).
+        let mut s = make_settings_audio_only();
+        s.channel_map = ChannelMap::identity(3);
+        s.recording_type = RT::MultiTrackAudio;
+        let sel = selected_channel_pairs(&s, &[]);
+        assert_eq!(sel.len(), 3);
+        assert_eq!(sel[2], super::SelectedChannel { output_k: 2, input_i: 2, pair: (2, 0) });
+    }
+
+    /// Characterization of the concat-fallback branch: with layouts that
+    /// differ across clips, the fallback currently iterates raw probe
+    /// streams and ignores the channel map. Documents current behavior.
+    #[test]
+    fn test_concat_fallback_ignores_channel_map_current_behavior() {
+        let mut s = make_video_settings();
+        s.input_files = vec![PathBuf::from("/tmp/clip1.mp4"), PathBuf::from("/tmp/clip2.mp4")];
+        s.channel_map = ChannelMap::from_mapping(vec![1, 0]);
+        s.split_tracks = true;
+        s.concat_audio = true;
+        s.recording_type = RT::VideoClipSequence;
+
+        // Two probes with mismatched layouts → inconsistent → fallback.
+        let p1 = make_stereo_probe(); // stream 1, 2 channels
+        let p2 = VideoAudioProbe {
+            streams: vec![
+                crate::ffprobe::AudioStreamInfo {
+                    stream_index: 1,
+                    channels: 2,
+                    codec_name: "aac".to_string(),
+                    sample_rate: 44100,
+                },
+                crate::ffprobe::AudioStreamInfo {
+                    stream_index: 2,
+                    channels: 1,
+                    codec_name: "aac".to_string(),
+                    sample_rate: 44100,
+                },
+            ],
+            total_audio_channels: 3,
+            is_video_file: true,
+        };
+        let probes = vec![Some(p1), Some(p2)];
+        let (steps, warnings) = plan_concat_outputs(&s, &probes);
+        assert!(warnings.contains("layouts differ"));
+        // Behavior change (WP-3.1): the fallback previously iterated raw
+        // probe streams (5 outputs here), ignoring the channel map. It now
+        // routes through `selected_channel_pairs` like every other site:
+        // mapping [1, 0] maps 2 slots per clip → 4 outputs total.
+        let audio_count = steps
+            .iter()
+            .filter(|st| matches!(st, VideoOutputStep::AudioChannel { .. }))
+            .count();
+        assert_eq!(audio_count, 4, "fallback now respects the channel map");
     }
 }

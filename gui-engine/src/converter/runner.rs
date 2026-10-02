@@ -15,7 +15,7 @@ use crate::converter::formats::{
     audio_encoder_to_output_format, container_to_ffmpeg_format, extension_for_container,
 };
 use crate::converter::planning::{
-    plan_concat_outputs, plan_video_outputs_for_file, VideoOutputStep,
+    plan_concat_outputs, plan_video_outputs_for_file, selected_channel_pairs, VideoOutputStep,
 };
 use crate::converter::process::{
     run_ffmpeg_process, StepFailure,
@@ -612,21 +612,18 @@ fn run_audio_to_audio(
         .unwrap_or(48000);
 
     if settings.split_tracks {
+        let map_n = settings.channel_map.num_channels();
+        let physical: Vec<(usize, usize)> = (0..map_n).map(|i| (i, 0)).collect();
         let mut emitted = 0usize;
-        for track_idx in 0..settings.channel_map.num_channels() {
-            if settings.is_ltc_output_track(track_idx) {
-                continue;
-            }
+        for sel in selected_channel_pairs(settings, &physical) {
             if report.is_cancelled() { break; }
 
-            let output_path = settings.output_path_for_index("audio", track_idx + 1, extension);
-            let mapping = settings.channel_map.mapping();
-            let input_idx = mapping.iter().position(|&o| o == track_idx).unwrap_or(track_idx);
+            let output_path = settings.output_path_for_index("audio", sel.output_k + 1, extension);
             let tc = settings
                 .timecode_meta_per_file
-                .get(input_idx)
+                .get(sel.input_i)
                 .and_then(|m| m.as_ref());
-            let step_args = build_split_track_args(settings, format, track_idx, tc, sample_rate);
+            let step_args = build_split_track_args(settings, format, sel.output_k, tc, sample_rate);
             let total_tracks = settings.channel_map.num_channels();
             let current = emitted + 1;
             report.set_step_weight(1.0 / total_tracks as f32);
@@ -998,24 +995,11 @@ fn run_metadata_only(
 
                 if use_split {
                     let mut emitted = 0usize;
-                    for output_k in 0..map_n {
+                    for sel in selected_channel_pairs(settings, &channels) {
                         if report.is_cancelled() {
                             break;
                         }
-                        let Some(input_i) =
-                            settings.channel_map.input_for_output(output_k)
-                        else {
-                            continue;
-                        };
-                        if input_i >= channels.len() {
-                            continue;
-                        }
-                        let (stream_idx, ch_idx) = channels[input_i];
-                        let is_ltc =
-                            settings.ltc_video_source == Some((stream_idx, ch_idx));
-                        if settings.drop_ltc_track && is_ltc {
-                            continue;
-                        }
+                        let (stream_idx, ch_idx) = sel.pair;
                         emitted += 1;
                         let output_path =
                             settings.output_path_for_file("audio", file_idx, emitted, aext);
