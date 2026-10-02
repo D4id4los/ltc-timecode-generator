@@ -1280,4 +1280,182 @@ mod tests {
         let s = make_video_settings();
         assert!(!s.effective_video_encoder().is_empty());
     }
+
+    // ── PR-2 characterization tests (real ffmpeg; loud-skip) ─────────────
+
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn skip_if_no_ffmpeg() -> bool {
+        if !ffmpeg_available() {
+            eprintln!("--- SKIPPED: ffmpeg not available");
+            return true;
+        }
+        false
+    }
+
+    fn tc_meta() -> Option<crate::converter::timecode::TimecodeMetadata> {
+        Some(crate::converter::timecode::TimecodeMetadata {
+            start: audio_core::Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            fps: 25.0,
+            drop_frame: false,
+        })
+    }
+
+    #[test]
+    fn test_run_metadata_only_wav_happy_path() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav1 = create_test_wav(dir.path(), "take1.wav", 48000, 0.25);
+        let wav2 = create_test_wav(dir.path(), "take2.wav", 48000, 0.25);
+
+        let mut settings = make_settings_audio_only();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![wav1.clone(), wav2.clone()];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.timecode_meta_per_file = vec![tc_meta(), tc_meta()];
+
+        let report = TestReport::new();
+        run_conversion(&report, settings, None);
+
+        assert!(!*report.failed.lock().unwrap(), "metadata-only wav run should not fail; log: {}",
+            report.log.lock().unwrap());
+        assert!(*report.completed.lock().unwrap(), "should complete");
+        // Originals were tagged in place and renamed (prefix "output" is
+        // non-empty), so the original names must be gone.
+        assert!(!wav1.exists() && !wav2.exists(), "originals should have been renamed");
+    }
+
+    #[test]
+    fn test_run_metadata_only_video_extraction() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let clip = dir.path().join("clip1.mp4");
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip, 1.0);
+
+        let mut settings = make_video_settings();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![clip.clone()];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.timecode_meta_per_file = vec![tc_meta()];
+
+        let report = TestReport::new();
+        run_conversion(&report, settings, None);
+
+        assert!(!*report.failed.lock().unwrap(), "metadata-only video run should not fail; log: {}",
+            report.log.lock().unwrap());
+        // Extracted merged audio must exist in the output folder.
+        let wavs: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
+            .collect();
+        assert!(!wavs.is_empty(), "expected an extracted wav in {}", dir.path().display());
+    }
+
+    /// Pins current best-effort semantics: a probe failure logs "✗ … probe
+    /// failed" but the run still completes (failed == false). PR-3 changes
+    /// the all-steps-failed accounting deliberately.
+    #[test]
+    fn test_run_metadata_only_probe_failure_is_best_effort() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let clip = dir.path().join("clip1.mp4");
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip, 1.0);
+
+        let mut settings = make_video_settings();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![clip, PathBuf::from("/nonexistent/clip2.mp4")];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.timecode_meta_per_file = vec![tc_meta(), tc_meta()];
+
+        let report = TestReport::new();
+        let total = settings.input_files.len() * 3;
+        run_metadata_only(&settings, &report, total);
+
+        assert!(!*report.failed.lock().unwrap(),
+            "probe failure is best-effort; run should not be marked failed");
+        // Note: the run_ffmpeg_process log overwrites the buffer per step
+        // (set_log), so the earlier "✗ … probe failed" line is not retained
+        // here. The pinned behavior is: the run continues past the failed
+        // probe (clip1 still extracted) and completes unfailed.
+        let log = report.log.lock().unwrap().clone();
+        assert!(log.contains("clip1.mp4"), "clip1 should still be processed: {}", log);
+    }
+
+    #[test]
+    fn test_run_metadata_only_cancelled_before_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut settings = make_settings_audio_only();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![dir.path().join("a.wav")];
+        settings.output_folder = dir.path().to_path_buf();
+
+        let report = TestReport::new();
+        report.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        run_metadata_only(&settings, &report, 2);
+
+        assert!(*report.failed.lock().unwrap(), "cancelled run must be failed");
+        // TestReport.mark_failed discards its log argument; the visible
+        // trace is the appended CANCELLED block from the phase guard.
+        assert!(report.log.lock().unwrap().contains("CANCELLED"));
+        assert!(std::fs::read_dir(dir.path()).unwrap().count() == 0, "no output files");
+    }
+
+    #[test]
+    fn test_run_video_to_video_copy_mode_missing_input_fails() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut settings = make_copy_settings();
+        settings.input_files = vec![PathBuf::from("/nonexistent/clip.mp4")];
+        settings.output_folder = dir.path().to_path_buf();
+
+        let report = TestReport::new();
+        let mut fallback = EncoderFallback::new_with_hw(
+            vec!["libx264".into()],
+            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+        );
+        let mut total = 1;
+        run_video_to_video(&mut settings, "mp4", &mut fallback, &report, &mut total);
+
+        assert!(*report.failed.lock().unwrap(),
+            "copy-mode run on a missing input must fail; log: {}",
+            report.log.lock().unwrap());
+    }
+
+    #[test]
+    fn test_run_video_to_video_happy_path() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let clip = dir.path().join("clip1.mp4");
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip, 1.0);
+
+        let mut settings = make_video_settings();
+        settings.input_files = vec![clip];
+        settings.output_folder = dir.path().to_path_buf();
+
+        let report = TestReport::new();
+        let mut fallback = EncoderFallback::new_with_hw(
+            video_codecs::static_encoder_chain("h264"),
+            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+        );
+        let mut total = 1;
+        run_video_to_video(&mut settings, "mkv", &mut fallback, &report, &mut total);
+
+        assert!(!*report.failed.lock().unwrap(), "video passthrough should succeed; log: {}",
+            report.log.lock().unwrap());
+        let outs: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "mkv").unwrap_or(false))
+            .collect();
+        assert!(!outs.is_empty(), "expected an .mkv output in {}", dir.path().display());
+    }
 }

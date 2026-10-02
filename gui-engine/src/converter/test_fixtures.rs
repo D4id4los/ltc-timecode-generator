@@ -139,3 +139,23 @@ pub fn make_copy_settings() -> ConverterSettings {
     s.copy_video = true;
     s
 }
+/// Create a tiny test video with a sine tone using the cheapest encoders
+/// (mpeg4 video + aac audio). Requires a real `ffmpeg` binary; callers in
+/// ffmpeg-optional suites must apply the loud-skip rule before using it.
+pub fn create_test_video_with_tone(path: &std::path::Path, duration_secs: f64) {
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", &format!("color=c=blue:s=320x240:r=25:duration={}", duration_secs),
+            "-f", "lavfi", "-i", &format!("sine=frequency=440:duration={}:sample_rate=48000", duration_secs),
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "mpeg4", "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-shortest",
+            "-t", &format!("{}", duration_secs),
+            &path.to_string_lossy(),
+        ])
+        .status()
+        .expect("failed to spawn ffmpeg for test video");
+    assert!(status.success(), "ffmpeg fixture creation failed for {}", path.display());
+}
