@@ -10,6 +10,7 @@ use chrono::{DateTime, Local, NaiveDate};
 use log::{debug, info, warn};
 
 use crate::device_name;
+use crate::subprocess::no_window_command;
 pub use crate::device_name::DeviceNameSource;
 
 // ── Windows drive enumeration helper ─────────────────────────────────
@@ -411,15 +412,33 @@ fn find_unmounted_card_partitions(
     result
 }
 
+/// Per-mount timeout — a single hung `udisksctl` must not stall the scan
+/// thread past this (the outer `CARD_SCAN_BUDGET` is only checked between
+/// mounts).
+const UDISKS_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Try to mount a block device via `udisksctl mount`.
 /// Returns the mount point on success, `Ok(None)` if the device was already
 /// mounted (so we shouldn't retry), or `Err` on failure.
+#[cfg(target_os = "linux")]
 fn udisks_mount(dev_path: &str) -> std::io::Result<Option<PathBuf>> {
-    let output = std::process::Command::new("udisksctl")
-        .arg("mount")
-        .arg("-b")
-        .arg(dev_path)
-        .output()?;
+    udisks_mount_with(dev_path, &mut |args| {
+        let mut cmd = no_window_command("udisksctl");
+        cmd.args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        crate::subprocess::run_output_with_timeout(&mut cmd, UDISKS_MOUNT_TIMEOUT)
+    })
+}
+
+/// Injectable-runner variant of [`udisks_mount`] for testability; also holds
+/// the shared exit-status/mountpoint parsing.
+fn udisks_mount_with(
+    dev_path: &str,
+    runner: &mut dyn FnMut(&[String]) -> Result<std::process::Output, crate::subprocess::SubprocessFailure>,
+) -> std::io::Result<Option<PathBuf>> {
+    let args = ["mount".to_string(), "-b".to_string(), dev_path.to_string()];
+    let output = runner(&args).map_err(|e| Error::other(e.to_string()))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2167,5 +2186,70 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
             combined.contains("Scanning"),
             "forwarded messages should mention scanning, got: {combined}"
         );
+    }
+
+    // ── udisks_mount_with runner tests ────────────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    fn fake_output(status: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    fn mount_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("udisks-test-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_udisks_mount_with_success() {
+        let mp = mount_dir("success");
+        let mp_str = mp.to_string_lossy().to_string();
+        let mut runner = |_: &[String]| {
+            Ok(fake_output(0, &format!("Mounted /dev/sdb1 at {}\n", mp_str), ""))
+        };
+        let result = udisks_mount_with("/dev/sdb1", &mut runner).unwrap();
+        assert_eq!(result, Some(mp));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_udisks_mount_with_failure_surfaces_stderr() {
+        let mut runner = |_: &[String]| {
+            Ok(fake_output(1, "", "Error mounting(/dev/sdb1): not authorized\n"))
+        };
+        let err = udisks_mount_with("/dev/sdb1", &mut runner).unwrap_err();
+        assert!(
+            err.to_string().contains("not authorized"),
+            "stderr must surface in the error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_udisks_mount_with_timeout() {
+        let mut runner =
+            |_: &[String]| Err(crate::subprocess::SubprocessFailure::TimedOut);
+        let result = udisks_mount_with("/dev/sdb1", &mut runner);
+        assert!(result.is_err(), "a timed-out mount must not be reported as success");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_udisks_mount_with_mountpoint_not_a_dir() {
+        // udisksctl reported success but the printed path is not a directory —
+        // treat as "already mounted / nothing to return" rather than an error.
+        let mut runner = |_: &[String]| {
+            Ok(fake_output(0, "Mounted /dev/sdb1 at /nonexistent/nope\n", ""))
+        };
+        let result = udisks_mount_with("/dev/sdb1", &mut runner).unwrap();
+        assert_eq!(result, None);
     }
 }

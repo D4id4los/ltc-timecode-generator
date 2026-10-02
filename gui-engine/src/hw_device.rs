@@ -57,29 +57,80 @@ pub fn list_vaapi_render_nodes(dir: &Path) -> Vec<PathBuf> {
 
 // ── Probe helpers ────────────────────────────────────────────────────────
 
+/// Timeout for a single hardware-device probe invocation. A hung ffmpeg
+/// `-init_hw_device` (broken driver) must not stall capability discovery.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Run `ffmpeg -v error -init_hw_device vaapi=<device> -h` and check exit
 /// status. Returns `true` when the device initialises successfully.
 pub fn probe_vaapi(ffmpeg: &str, device: &Path) -> bool {
     let dev_str = device.to_string_lossy();
-    no_window_command(ffmpeg)
-        .args(["-v", "error", "-init_hw_device", &format!("vaapi={}", dev_str), "-h"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    probe_with(
+        &[
+            "-v".into(),
+            "error".into(),
+            "-init_hw_device".into(),
+            format!("vaapi={}", dev_str),
+            "-h".into(),
+        ],
+        ffmpeg,
+    )
+}
+
+/// Injectable variant of [`probe_vaapi`] for unit testing.
+pub fn probe_vaapi_with(
+    _ffmpeg: &str,
+    device: &Path,
+    runner: &mut dyn FnMut(&[String]) -> bool,
+) -> bool {
+    let dev_str = device.to_string_lossy();
+    runner(&[
+        "-v".into(),
+        "error".into(),
+        "-init_hw_device".into(),
+        format!("vaapi={}", dev_str),
+        "-h".into(),
+    ])
 }
 
 /// Run `ffmpeg -v error -init_hw_device vulkan -h` and check exit status.
 /// Returns `true` when a Vulkan device initialises successfully.
 pub fn probe_vulkan(ffmpeg: &str) -> bool {
-    no_window_command(ffmpeg)
-        .args(["-v", "error", "-init_hw_device", "vulkan", "-h"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    probe_with(
+        &[
+            "-v".into(),
+            "error".into(),
+            "-init_hw_device".into(),
+            "vulkan".into(),
+            "-h".into(),
+        ],
+        ffmpeg,
+    )
+}
+
+/// Injectable variant of [`probe_vulkan`] for unit testing.
+pub fn probe_vulkan_with(_ffmpeg: &str, runner: &mut dyn FnMut(&[String]) -> bool) -> bool {
+    runner(&[
+        "-v".into(),
+        "error".into(),
+        "-init_hw_device".into(),
+        "vulkan".into(),
+        "-h".into(),
+    ])
+}
+
+/// Shared probe driver: spawn ffmpeg with the given args under
+/// [`PROBE_TIMEOUT`]; any failure (non-zero exit, spawn error, timeout)
+/// counts as "device not available".
+fn probe_with(args: &[String], ffmpeg: &str) -> bool {
+    let mut cmd = no_window_command(ffmpeg);
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    match crate::subprocess::run_output_with_timeout(&mut cmd, PROBE_TIMEOUT) {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
 }
 
 /// Run all applicable hardware probes and return discovered capabilities.
@@ -328,6 +379,40 @@ mod tests {
         let caps = discover("ffmpeg", &encoders);
         assert!(caps.vaapi_device.is_none());
         assert!(!caps.vulkan_available);
+    }
+
+    // ── probe timeouts + injectable runners ──────────────────────────────
+
+    #[test]
+    fn test_probe_vaapi_with_success() {
+        let mut runner = |args: &[String]| {
+            assert!(args.contains(&"-init_hw_device".to_string()));
+            assert!(args.iter().any(|a| a.starts_with("vaapi=")));
+            true
+        };
+        assert!(probe_vaapi_with("ffmpeg", Path::new("/dev/dri/renderD128"), &mut runner));
+    }
+
+    #[test]
+    fn test_probe_vaapi_with_failure() {
+        let mut runner = |_: &[String]| false;
+        assert!(!probe_vaapi_with("ffmpeg", Path::new("/dev/dri/renderD128"), &mut runner));
+    }
+
+    #[test]
+    fn test_probe_vulkan_with_success() {
+        let mut runner = |args: &[String]| {
+            assert!(args.contains(&"-init_hw_device".to_string()));
+            assert!(args.contains(&"vulkan".to_string()));
+            true
+        };
+        assert!(probe_vulkan_with("ffmpeg", &mut runner));
+    }
+
+    #[test]
+    fn test_probe_vulkan_with_failure() {
+        let mut runner = |_: &[String]| false;
+        assert!(!probe_vulkan_with("ffmpeg", &mut runner));
     }
 
     #[test]
