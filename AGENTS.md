@@ -483,7 +483,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on push to `main` and on PRs: c
 
 - **Sonar project**: `D4id4los_ltc-timecode-generator` in organization `d4id4los` (sonarcloud.io). Analysis config lives in `sonar-project.properties` (sources = the four workspace crates + `src/`, exclusions = `src-tauri*`, `*.slint` — Slint markup has no Sonar analyzer).
 - **Rust analysis** uses the official SonarSource Rust analyzer (CI-based only — no automatic analysis for Rust). Clippy findings are imported as external issues from `clippy-report.json` (`cargo clippy --message-format=json`), coverage from `lcov.info` + `coverage/lcov.info` (both gitignored).
-- **CI environment**: `libltc-dev` + `libclang-dev` + `ffmpeg` via apt, `PKG_CONFIG_PATH` set, Rust stable with `clippy` + `llvm-tools-preview`, cargo build cache via `Swatinem/rust-cache`, nextest + cargo-llvm-cov via `taiki-e/install-action`, Node 22 with npm cache, SonarScanner CLI binaries cached in `~/.sonar/cache` via `actions/cache`.
+- **CI environment**: `libasound2-dev` + `libpipewire-0.3-dev` + `libpulse-dev` + `libfontconfig1-dev` + `libltc-dev` + `libclang-dev` + `ffmpeg` via apt (every pkg-config probe in the dependency graph: cpal→alsa, pipewire/pulse backends, slint/fontique→fontconfig, libltc-sys, bindgen→libclang), `PKG_CONFIG_PATH` set, Rust stable with `clippy` + `llvm-tools-preview`, cargo build cache via `Swatinem/rust-cache`, nextest + cargo-llvm-cov via `taiki-e/install-action`, Node 22 with npm cache, SonarScanner CLI binaries cached in `~/.sonar/cache` via `actions/cache`.
 - **Local parity**: `npm run test:coverage` runs vitest with the LCOV reporter configured in `vite.config.ts`.
 
 ## Build & Run

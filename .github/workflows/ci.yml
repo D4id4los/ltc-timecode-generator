@@ -23,10 +23,10 @@ jobs:
           # Sonar needs full history for blame-based new-code analysis
           fetch-depth: 0
 
-      - name: Install system dependencies (pipewire, libltc, libclang, ffmpeg)
+      - name: Install system dependencies (alsa, pipewire, pulse, fontconfig, libltc, libclang, ffmpeg)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libpulse-dev libltc-dev libclang-dev ffmpeg
+          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libltc-dev libclang-dev ffmpeg
 
       - name: Install Rust toolchain (stable, clippy, llvm-tools)
         uses: dtolnay/rust-toolchain@stable
