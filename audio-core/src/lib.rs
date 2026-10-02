@@ -8,6 +8,7 @@
 
 pub mod audio_output;
 pub mod chunked_decode;
+pub mod decoder;
 pub mod ltc_decoder;
 pub mod ltc_decoder_libltc;
 pub mod ltc_encoder;
@@ -56,9 +57,5 @@ pub fn decode_ltc_with_decoder(
     drop_frame: bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<LtcDetectionResult, String> {
-    if use_libltc {
-        decode_ltc_from_wav_libltc(path, fps, drop_frame, cancel)
-    } else {
-        decode_ltc_from_wav(path, fps, drop_frame, cancel)
-    }
+    decoder::decoder_for(use_libltc).decode_wav(path, fps, drop_frame, cancel)
 }

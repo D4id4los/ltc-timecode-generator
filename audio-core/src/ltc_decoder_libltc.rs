@@ -42,7 +42,7 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cance
 
     if total_samples == 0 {
         warn!("LTC decode (libltc): audio file contains no samples: {}", path.display());
-        return Ok(error_result("Audio file contains no samples"));
+        return Ok(LtcDetectionResult::error("Audio file contains no samples"));
     }
 
     decode_ltc_samples_libltc(&sample_data, channels, sample_rate, fps, drop_frame, start, cancel)
@@ -59,7 +59,7 @@ pub fn decode_ltc_samples_libltc(
 ) -> Result<LtcDetectionResult, String> {
     let total_samples = sample_data.len() / channels;
     if total_samples == 0 {
-        return Ok(error_result("Audio buffer contains no samples"));
+        return Ok(LtcDetectionResult::error("Audio buffer contains no samples"));
     }
 
     let initial_apv = (sample_rate as f64 / 25.0).ceil() as i32;
@@ -219,26 +219,6 @@ pub fn decode_ltc_samples_libltc(
     Ok(result)
 }
 
-fn error_result(msg: impl Into<String>) -> LtcDetectionResult {
-    LtcDetectionResult {
-        status: LtcDecodeStatus::Error {
-            message: msg.into(),
-        },
-        detected_fps: 0.0,
-        drop_frame: false,
-        total_possible_frames: 0,
-        valid_frames: 0,
-        timecodes: Vec::new(),
-        avg_confidence: 0.0,
-        details: Vec::new(),
-        total_audio_duration_secs: 0.0,
-        sample_rate: 0,
-        processing_time_ms: 0.0,
-        first_ltc_timecode_secs: 0.0,
-        quality: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::ChannelSel;
@@ -282,23 +262,23 @@ mod tests {
         samples
     }
 
-    // ── error_result tests ──────────────────────────────────────────────
+    // ── LtcDetectionResult::error tests ─────────────────────────────────
 
     #[test]
     fn test_error_result_contains_message() {
-        let r = error_result("test error");
+        let r = LtcDetectionResult::error("test error");
         assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message == "test error"));
     }
 
     #[test]
     fn test_error_result_empty_message() {
-        let r = error_result("");
+        let r = LtcDetectionResult::error("");
         assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message.is_empty()));
     }
 
     #[test]
     fn test_error_result_zeroed_fields() {
-        let r = error_result("err");
+        let r = LtcDetectionResult::error("err");
         assert_eq!(r.detected_fps, 0.0);
         assert!(!r.drop_frame);
         assert_eq!(r.total_possible_frames, 0);
@@ -314,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_error_result_from_string() {
-        let r = error_result("permission denied".to_string());
+        let r = LtcDetectionResult::error("permission denied".to_string());
         assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message == "permission denied"));
     }
 

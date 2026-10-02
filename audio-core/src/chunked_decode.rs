@@ -7,11 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::ltc_decoder::{
-    apply_coherent_first_timecode, compute_ltc_quality, decode_ltc_samples,
+    apply_coherent_first_timecode, compute_ltc_quality,
     CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus,
     LtcDetectionResult,
 };
-use crate::ltc_decoder_libltc::decode_ltc_samples_libltc;
 use crate::types::{DecodeConfig, DecodeProgress};
 use crate::wav_chunk_reader::WavChunkReader;
 
@@ -319,6 +318,8 @@ fn decode_one_chunk(
         return ChunkResult { chunk_idx, result: Err("Canceled".to_string()) };
     }
 
+    let chunk_start = Instant::now();
+
     let mut local_reader = match WavChunkReader::open(path) {
         Ok((r, _)) => r,
         Err(e) => return ChunkResult {
@@ -327,26 +328,13 @@ fn decode_one_chunk(
         },
     };
 
-    let chunk_start = Instant::now();
-
-    let result = if use_libltc {
-        match local_reader.read_mono_samples_i16(start_sample, num_samples) {
-            Ok(samples) => decode_ltc_samples_libltc(
-                &samples, 1, sample_rate, fps, drop_frame, chunk_start, Some(cancel_flag),
-            ),
-            Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
-        }
-    } else {
-        match local_reader.read_mono_samples_f32(start_sample, num_samples) {
-            Ok(samples) => decode_ltc_samples(
-                &samples, sample_rate, 1, fps, drop_frame, chunk_start, Some(cancel_flag),
-            ),
-            Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
-        }
-    };
+    let decoder = crate::decoder::decoder_for(use_libltc);
+    let result = decoder.decode_chunk(
+        path, &mut local_reader, chunk_idx, start_sample, num_samples,
+        sample_rate, fps, drop_frame, chunk_start, cancel_flag,
+    );
     let elapsed = chunk_start.elapsed();
-    let decoder_name = if use_libltc { "libltc" } else { "builtin" };
-    debug!("Chunk {} decoded ({}): {:.1}ms", chunk_idx + 1, decoder_name, elapsed.as_secs_f64() * 1000.0);
+    debug!("Chunk {} decoded ({}): {:.1}ms", chunk_idx + 1, decoder.name(), elapsed.as_secs_f64() * 1000.0);
     ChunkResult { chunk_idx, result }
 }
 
