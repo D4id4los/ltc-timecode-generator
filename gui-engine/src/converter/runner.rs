@@ -128,6 +128,11 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
         self.ctx.progress.unit(0).set_fraction(0.0);
         let log_text = self.overall_log.lock().unwrap().clone();
         let full = if log.is_empty() { log_text } else { format!("{}\n{}", log_text, log) };
+        // Also record the failure in the tracker's rolling log so the
+        // failure context rides along in JobStatus.log and JobOutcome.log.
+        if !log.is_empty() {
+            self.ctx.progress.push_log(log);
+        }
         self.ctx.progress.set_message(full.clone());
         self.ctx.progress.unit(0).set_fraction(0.0);
     }

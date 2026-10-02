@@ -852,6 +852,94 @@ pub fn plan_copies_for_files_with_sizes(
     plans
 }
 
+// ── Copy-plan aggregation (engine-facing) ───────────────────────────────
+
+/// Everything the engine needs to spawn an `OffloadCopy` job, precomputed
+/// from the current card selection state.
+#[derive(Debug, Clone)]
+pub struct OffloadCopyPlan {
+    pub device_names: Vec<String>,
+    pub device_plans: Vec<Vec<CopyPlanItem>>,
+    pub dest_parent: PathBuf,
+    pub device_totals: Vec<OffloadDeviceTotals>,
+    pub total_bytes: u64,
+}
+
+impl OffloadCopyPlan {
+    pub fn total_files(&self) -> usize {
+        self.device_plans.iter().map(|p| p.len()).sum()
+    }
+}
+
+/// Why a copy plan could not be built from the current selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffloadPlanError {
+    NoCards,
+    NoFilesSelected,
+}
+
+impl OffloadPlanError {
+    pub fn user_message(&self) -> &'static str {
+        match self {
+            OffloadPlanError::NoCards => "No media cards detected.",
+            OffloadPlanError::NoFilesSelected => "No files selected.",
+        }
+    }
+}
+
+/// Build per-device copy plans from the selected files of `cards`, destined
+/// for `<parent_folder>/<parent_name>/<device>/`. Returns a typed error so
+/// the engine can map it to a user-facing message.
+pub fn build_copy_plan(
+    cards: &[SdCardInfo],
+    parent_folder: &Path,
+    parent_name: &str,
+) -> Result<OffloadCopyPlan, OffloadPlanError> {
+    if cards.is_empty() {
+        return Err(OffloadPlanError::NoCards);
+    }
+    let dest_parent = parent_folder.join(parent_name);
+
+    let device_names: Vec<String> = cards.iter().map(|c| c.device_name.clone()).collect();
+    let device_plans: Vec<Vec<CopyPlanItem>> = cards
+        .iter()
+        .map(|card| {
+            let selected_with_sizes: Vec<(PathBuf, u64)> = card.files.iter()
+                .zip(card.selected.iter())
+                .filter(|(_, &sel)| sel)
+                .map(|(f, _)| (f.path.clone(), f.size_bytes))
+                .collect();
+            plan_copies_for_files_with_sizes(
+                &selected_with_sizes,
+                &card.device_name,
+                &dest_parent,
+            )
+        })
+        .collect();
+
+    if device_plans.iter().all(|p| p.is_empty()) {
+        return Err(OffloadPlanError::NoFilesSelected);
+    }
+
+    let device_totals: Vec<OffloadDeviceTotals> = device_names.iter()
+        .zip(device_plans.iter())
+        .map(|(name, plans)| OffloadDeviceTotals {
+            name: name.clone(),
+            files_total: plans.len(),
+            bytes_total: plans.iter().map(|p| p.size).sum(),
+        })
+        .collect();
+    let total_bytes = device_plans.iter().flat_map(|p| p.iter().map(|i| i.size)).sum();
+
+    Ok(OffloadCopyPlan {
+        device_names,
+        device_plans,
+        dest_parent,
+        device_totals,
+        total_bytes,
+    })
+}
+
 // ── Selection helpers ────────────────────────────────────────────────────
 
 /// Find the latest date (in local time) for which any file has a recording.
@@ -1195,6 +1283,65 @@ pub fn run_offload_copy_job(
 
 #[cfg(test)]
 mod tests {
+    // ── build_copy_plan ──────────────────────────────────────────────────
+
+    fn card(name: &str, files: Vec<(&str, u64)>, select: Vec<bool>) -> SdCardInfo {
+        SdCardInfo {
+            mount: PathBuf::from("/mnt/card"),
+            volume_label: String::new(),
+            device_name: name.to_string(),
+            name_source: DeviceNameSource::VolumeLabel,
+            media_file_count: files.len(),
+            total_bytes: files.iter().map(|f| f.1).sum(),
+            files: files.iter().map(|(n, sz)| OffloadFileInfo {
+                path: PathBuf::from(n),
+                name: (*n).to_string(),
+                size_bytes: *sz,
+                modified: None,
+            }).collect(),
+            selected_count: select.iter().filter(|&&s| s).count(),
+            selected_bytes: files.iter().zip(select.iter()).filter(|(_, &s)| s).map(|(f, _)| f.1).sum(),
+            selected: select,
+        }
+    }
+
+    #[test]
+    fn build_copy_plan_rejects_empty_cards() {
+        let err = build_copy_plan(&[], Path::new("/parent"), "2026-01-01").unwrap_err();
+        assert_eq!(err, OffloadPlanError::NoCards);
+        assert_eq!(err.user_message(), "No media cards detected.");
+    }
+
+    #[test]
+    fn build_copy_plan_rejects_no_selection() {
+        let cards = vec![card("CAM_A", vec![("/a/clip1.mp4", 100)], vec![false])];
+        let err = build_copy_plan(&cards, Path::new("/parent"), "2026-01-01").unwrap_err();
+        assert_eq!(err, OffloadPlanError::NoFilesSelected);
+    }
+
+    #[test]
+    fn build_copy_plan_aggregates_selected_files_per_device() {
+        let cards = vec![
+            card("CAM_A", vec![("/a/c1.mp4", 100), ("/a/c2.mp4", 200)], vec![true, false]),
+            card("CAM_B", vec![("/b/c1.mp4", 50)], vec![true]),
+        ];
+        let plan = build_copy_plan(&cards, Path::new("/parent"), "2026-01-01").unwrap();
+        assert_eq!(plan.device_names, vec!["CAM_A", "CAM_B"]);
+        assert_eq!(plan.device_plans.len(), 2);
+        assert_eq!(plan.device_plans[0].len(), 1, "only the selected file is planned");
+        assert_eq!(plan.device_plans[0][0].src, PathBuf::from("/a/c1.mp4"));
+        assert_eq!(plan.device_plans[1].len(), 1);
+        assert_eq!(plan.total_files(), 2);
+        assert_eq!(plan.total_bytes, 150);
+        assert_eq!(plan.dest_parent, PathBuf::from("/parent/2026-01-01"));
+        assert_eq!(plan.device_totals.len(), 2);
+        assert_eq!(plan.device_totals[0].name, "CAM_A");
+        assert_eq!(plan.device_totals[0].files_total, 1);
+        assert_eq!(plan.device_totals[0].bytes_total, 100);
+        // Destination layout: dest_parent/<device>/<filename>
+        assert_eq!(plan.device_plans[0][0].dst, PathBuf::from("/parent/2026-01-01/CAM_A/c1.mp4"));
+    }
+
     use super::*;
     use crate::job::{CancelToken, ProgressTracker, UnitSpec};
     use std::fs;

@@ -144,6 +144,28 @@ impl ProgressTracker {
         *self.0.message.lock().unwrap() = msg.into();
     }
 
+    /// Append a line to the tracker's rolling log. The log rides along in
+    /// every `ProgressSnapshot` (→ `JobStatus.log`) and is captured into the
+    /// final `JobOutcome`, so failures carry their step context to the UI.
+    /// Capped so a chatty job cannot grow the published snapshot.
+    pub fn push_log(&self, line: impl AsRef<str>) {
+        const MAX_LOG_BYTES: usize = 4 * 1024;
+        let mut log = self.0.log.lock().unwrap();
+        if log.len() + line.as_ref().len() + 1 > MAX_LOG_BYTES {
+            let keep = MAX_LOG_BYTES.saturating_sub(line.as_ref().len() + 1);
+            // Drop the oldest lines, snapping forward past a partial one.
+            let cut = log[log.len().saturating_sub(keep)..]
+                .find('\n')
+                .map(|i| log.len() - keep + i + 1)
+                .unwrap_or(log.len());
+            log.drain(..cut);
+        }
+        if !log.is_empty() {
+            log.push('\n');
+        }
+        log.push_str(line.as_ref());
+    }
+
     pub fn set_indeterminate(&self, b: bool) {
         self.0.indeterminate.store(b, Ordering::Relaxed);
     }
@@ -278,6 +300,22 @@ impl JobStatus {
                 phase: JobPhase::Idle,
                 fraction: 0.0,
                 message: String::new(),
+                speed: None,
+                units: Vec::new(),
+                log: String::new(),
+            },
+            error: None,
+        }
+    }
+
+    /// A Running status with zero progress and no units — the shape every
+    /// job-spawning command handler publishes before the first poll().
+    pub fn running(message: impl Into<String>) -> Self {
+        JobStatus {
+            progress: ProgressSnapshot {
+                phase: JobPhase::Running,
+                fraction: 0.0,
+                message: message.into(),
                 speed: None,
                 units: Vec::new(),
                 log: String::new(),
@@ -509,7 +547,6 @@ struct ActiveJob {
     tracker: ProgressTracker,
     cancel: CancelToken,
     handle: Option<JoinHandle<()>>,
-    _started: Instant,
 }
 
 // ── Job supervisor ──────────────────────────────────────────────────────
@@ -710,7 +747,6 @@ where
         tracker,
         cancel,
         handle: Some(handle),
-        _started: Instant::now(),
     });
 }
 
@@ -804,6 +840,38 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn job_status_running_has_running_phase_and_message() {
+        let st = JobStatus::running("Decoding LTC group: 0/3 clips");
+        assert_eq!(st.phase(), JobPhase::Running);
+        assert_eq!(st.fraction(), 0.0);
+        assert_eq!(st.message(), "Decoding LTC group: 0/3 clips");
+        assert_eq!(st.error, None);
+        assert!(st.units().is_empty());
+        assert_ne!(st, JobStatus::idle());
+    }
+
+    #[test]
+    fn push_log_appends_lines() {
+        let t = ProgressTracker::new(Vec::<UnitSpec>::new());
+        t.push_log("step a failed: boom");
+        t.push_log("step b ok");
+        assert_eq!(t.snapshot().log, "step a failed: boom\nstep b ok");
+    }
+
+    #[test]
+    fn push_log_is_capped() {
+        let t = ProgressTracker::new(Vec::<UnitSpec>::new());
+        for i in 0..200 {
+            t.push_log(format!("line-{:03} 012345678901234567890123456789", i));
+        }
+        let log = t.snapshot().log;
+        assert!(log.len() <= 4 * 1024, "log grew to {} bytes", log.len());
+        // Only the newest lines survive the cap.
+        assert!(!log.contains("line-000"));
+        assert!(log.contains("line-199"));
+    }
 
     fn empty_spec() -> JobSpec<'static> {
         JobSpec {

@@ -1,8 +1,10 @@
 pub mod camera_meta;
 pub mod cli;
+pub mod clip_probe;
 pub mod command;
 pub mod config;
 pub mod converter;
+pub mod decode;
 pub mod device_name;
 pub mod duration;
 pub mod edit_state;

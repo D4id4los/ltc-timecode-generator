@@ -743,68 +743,22 @@ fn run_decode_video(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         if cli.decode_drop_frame { " DF" } else { "" },
     );
 
-    // Probe the video file to validate it has audio streams
-    let probe = ffprobe::probe_video_audio(path)
-        .map_err(|e| format!("Failed to probe video: {}", e))?;
-
-    let stream_pos = cli.audio_stream;
-    let channel_idx = cli.audio_channel;
-
-    // Validate stream/channel indices. `--audio-stream` is a 0-based position
-    // among the audio streams; extraction itself needs the absolute stream
-    // index (ffprobe `index` numbering).
-    if stream_pos >= probe.streams.len() {
-        return Err(format!(
-            "Audio stream index {} out of range ({} streams available). Use --audio-stream to select.",
-            stream_pos,
-            probe.streams.len(),
-        ).into());
-    }
-    let stream = &probe.streams[stream_pos];
-    if channel_idx >= stream.channels {
-        return Err(format!(
-            "Channel index {} out of range for stream {} ({} channels available). Use --audio-channel to select.",
-            channel_idx,
-            stream_pos,
-            stream.channels,
-        ).into());
-    }
-    let stream_idx = stream.stream_index;
-
-    info!(
-        "Probed video: {} streams, audio #{} = absolute stream {} ({} ch), decoding channel {} ({})",
-        probe.streams.len(),
-        stream_pos,
-        stream_idx,
-        stream.channels,
-        channel_idx,
-        stream.codec_name,
-    );
-
-    // Extract audio channel to temp WAV
-    let tmp_dir = std::env::temp_dir();
-    let tmp_wav = tmp_dir.join(format!(
-        "ltc_extract_{}_{}_{}.wav",
-        std::process::id(),
-        stream_idx,
-        channel_idx,
-    ));
-
-    info!("Extracting audio stream {} channel {} to temp WAV...", stream_idx, channel_idx);
     eprint!("Extracting audio from video...");
-    ffprobe::extract_audio_channel(path, stream_idx, channel_idx, &tmp_wav)
-        .map_err(|e| format!("Audio extraction failed: {}", e))?;
+    let mut result = crate::decode::decode_video_file(
+        path,
+        cli.audio_stream,
+        cli.audio_channel,
+        use_libltc,
+        cli.decode_fps,
+        cli.decode_drop_frame,
+        None,
+    )?;
     eprintln!(" done.");
 
-    let mut result = run_decode_on_wav(
-        &tmp_wav, use_libltc, cli.single_pass, cli.decode_fps, cli.decode_drop_frame,
-    )?;
     result.processing_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
     print_decode_results(
         path, &result, use_libltc, cli.verbose, cli.context_frames, cli.list_timecodes,
     );
-
-    let _ = std::fs::remove_file(&tmp_wav);
 
     Ok(())
 }

@@ -60,6 +60,8 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── log_buffer.rs         # LogBuffer ring buffer + init_logger (canonical logger)
 │   │   ├── theme.rs              # Shared dark/light ThemeColors palettes used by both Rust GUIs
 │   │   ├── device_name.rs        # Device-name resolution chain (XAVC sniff → camera meta → filename → volume → "unknown")
+│   │   ├── decode.rs             # Shared video→extract→decode pipeline (engine + CLI), temp-WAV management, progress bridge
+│   │   ├── clip_probe.rs         # Converter clip-probe policy: ffprobe + camera-meta sample cap + device-name resolution
 │   │   ├── duration.rs           # File-duration helpers (WAV header / ffprobe), group aggregation, H:MM:SS formatting
 │   │   ├── naming.rs             # Named-placeholder output-filename template engine ({filename}/{device}/{clip}/{track})
 │   │   ├── subprocess.rs         # Shared process runner: Windows console suppression, timeout-kill, stderr watchdog
@@ -159,11 +161,14 @@ counters, and individual `catch_unwind` handling.
     `Cancelled` / `Failed`.
   - **`JobStatus`** — published in snapshot: `phase`, `fraction`, `message`,
     `speed`, `units` (per-step/device detail), `log`, `error`. Constructed via
-    `JobStatus::idle()`, `JobStatus::from_progress(&ProgressSnapshot)`, and
+    `JobStatus::idle()`, `JobStatus::running(msg)` (eager pre-poll status),
+    `JobStatus::from_progress(&ProgressSnapshot)`, and
     `apply_outcome(&JobOutcome)` for terminal phase transitions.
   - **`ProgressTracker`** — weighted per-unit progress with `ProgressSnapshot`,
     message, speed, log, and unit state machine (`Pending` / `Running` / `Done` /
-    `Failed` / `Skipped`). Supports `set_log()` and `resize()` (weight-preserving).
+    `Failed` / `Skipped`). Supports `push_log()` (capped rolling log, published
+    in `ProgressSnapshot.log` and captured into `JobOutcome`) and `resize()`
+    (weight-preserving).
   - **`UnitProgress`** — per-unit handle: `set_fraction()`, `set_message()`,
     `set_label()`, `set_state()`, `finish()`.
   - **`CancelToken`** — `Arc<AtomicBool>` wrapper; `check()` returns
@@ -185,8 +190,11 @@ One `mpsc` channel carries all `JobEvent` values:
     `JobOutcome` (Succeeded/Cancelled/Failed) and `JobFinal` payload.
 
 #### Closed payload enums (`JobItem`, `JobFinal`):
-All possible result payloads enumerated as closed Rust enums, providing
-compile-checked dispatch in the engine's unified event handler.
+All possible result payloads enumerated as closed Rust enums. The engine's
+dispatcher (`engine.rs::handle_job_event`) matches exhaustively on `JobKind`
+(no wildcard arm — a new `JobKind` without a handler is a compile error) and
+routes each kind to a named `on_*_finished`/`on_*_result` handler; a payload
+that does not match its kind is logged and dropped, never silently ignored.
 
 #### Stale-result gating:
 The engine tracks the currently-active `JobId` per kind. When a `Finished`
@@ -226,8 +234,8 @@ Field groups (see `state.rs` for the full struct): generation counter; transport
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 0. **Spawn ffmpeg capability probe** — before the loop starts, a `spawn_job` with `JobKind::FfmpegCapProbe` runs `query_ffmpeg_capabilities()`.
-1. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop (calling `supervisor.shutdown()` to cancel+join active jobs first). Converter commands are handled inline (selectors, setters, side-effects, config persistence, deferred `SelectRecording` while a folder scan is in flight) or dispatched to `process_command`. Offload commands are handled by `handle_offload_command()`.
-2. **Poll supervisor + drain events** — `supervisor.poll()` returns progress snapshots for all active job types; progress is published into `state.jobs[kind]`. Then `supervisor.drain()` dispatches `JobEvent::Finished` and `JobEvent::Item` events — the unified dispatcher handles all 10 `JobKind` variants (Conversion, FfmpegCapProbe, FolderScan, VideoProbe, OffloadScan, DurationProbe, OffloadCopy, LtcDecode, LtcGroupDecode, ClipProbe), replacing the previous per-kind legacy mpsc channels and generation-gated result drains:
+1. **Drain commands** — non-blocking `try_recv()`; `Shutdown` or channel disconnect exits the loop (calling `supervisor.shutdown()` to cancel+join active jobs first). Every other command is dispatched through the single dispatch site `process_command()` (`engine.rs`), which owns the full `GuiCommand` match: heavy arms are delegated to named `cmd_*` handlers (`cmd_select_folder`, `cmd_start_conversion`, `cmd_probe_video`, `cmd_decode_ltc_video_group`, `cmd_parse_ltc_video`, `cmd_parse_ltc_wav_file`, …), simple converter setters collapse into `apply_simple_converter_setting()`, and converter/offload commands route through `handle_converter_command()`/`handle_offload_command()`. Loop-carried mutable state lives in the `EngineLoopState` struct (snapshot, recovery attempts, auto-apply latches, deferred recording selection, publish gate, ack counter) rather than separate locals.
+2. **Poll supervisor + drain events** — `supervisor.poll()` returns progress snapshots for all active job types; progress is published into `state.jobs[kind]`. Then `supervisor.drain()` dispatches `JobEvent::Finished` and `JobEvent::Item` events through `handle_job_event()`, which matches exhaustively on all 10 `JobKind` variants (Conversion, FfmpegCapProbe, FolderScan, VideoProbe, OffloadScan, DurationProbe, OffloadCopy, LtcDecode, LtcGroupDecode, ClipProbe) and calls a named per-kind handler (`on_conversion_finished`, `on_ffmpeg_caps_finished`, `on_folder_scan_finished`, `on_video_probe_finished`, `on_offload_scan_finished`, `on_offload_copy_finished`, `on_ltc_decode_finished`, `on_group_decode_finished`, `on_clip_probes_finished`, `on_duration_result`/`on_group_clip_result` items):
     - Conversion → updates `state.jobs[Conversion]`, manages status transitions
     - FfmpegCapProbe → `apply_ffmpeg_probe_result()`
     - FolderScan → updates `converter.groups`, applies deferred `SelectRecording`
@@ -243,7 +251,7 @@ The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 5. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s); determines if clap animation is still visibly in progress.
 6. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
 7. **Update system time**
-8. **Publish** — increments generation and stores the snapshot only when it differs from the last published one (structural `PartialEq` compare against the cached `Arc`; idle ticks skip the deep clone)
+8. **Publish** — stores the snapshot only when it differs from the last published one; the structural `PartialEq` compare happens *before* the clone, so idle ticks skip the deep clone entirely (regression-pinned by `test_idle_engine_does_not_republish_snapshot`)
 9. **Sleep** until next tick
 
 ### Audio Lifecycle

@@ -1,6 +1,75 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — WP-1 engine decomposition (`gui-engine`)
+
+Implementation of work package WP-1 from the code-quality report
+(`reports/code-quality-2026-10-02.md`, plan in
+`reports/wp1-engine-decomposition-plan.md`): decompose the engine
+god-module so `engine_main_with_probe` is a readable tick loop, make
+job-event dispatch genuinely exhaustive, and remove the dead plumbing
+— all behavior-preserving except where noted.
+
+List of Changes:
+- `EngineLoopState` (`gui-engine/src/engine.rs`): the twelve
+  loop-carried mutable locals (snapshot, tick clock, recovery
+  attempts, clap-log counter, device bookkeeping, auto-apply latches,
+  deferred recording selection, publish gate, command ack counter)
+  are absorbed into one struct; `process_command`,
+  `handle_event`, `ensure_audio_init`, `try_init_device` and
+  `attempt_recovery` take it instead of separate `&mut` arguments.
+  The `#[allow(clippy::too_many_arguments)]` is gone.
+- Job-event dispatch: the 330-line wildcard-tailed match is replaced
+  by `handle_job_event`, which matches exhaustively on `JobKind` (a
+  new kind without a handler is now a compile error) and routes to
+  named per-kind handlers (`on_conversion_finished`,
+  `on_ltc_decode_finished`, ...).  Payload/kind mismatches are logged,
+  never silently dropped.  `JobFinal::Conversion` is now consumed: a
+  successful conversion publishes "Conversion completed — video
+  encoder: <enc>" to the status line, the information the encoder
+  fallback machinery produced but the engine previously discarded.
+- Single command dispatch site: the drain loop's inline arms moved
+  into `process_command` (via `cmd_select_folder`,
+  `cmd_start_conversion`, `cmd_probe_file_durations`,
+  `cmd_probe_video`, `handle_converter_command`), which now owns the
+  full `GuiCommand` match.  All five vestigial arms are gone,
+  including the `unreachable!()` on the `ProbeVideo` arm.  Heavy
+  decode arms extracted as `cmd_decode_ltc_video_group`,
+  `cmd_parse_ltc_video`, `cmd_parse_ltc_wav_file`, with the probe
+  validation pulled out as the unit-tested
+  `validate_stream_channel_selection`.
+- Converter setters: fourteen "assign one field" arms collapsed into
+  `apply_simple_converter_setting` (table-tested); the four arms with
+  real side effects keep dedicated handling.
+- `JobStatus::running(msg)` constructor replaces four copy-pasted
+  Running `JobStatus` literals.
+- Publish gate: the structural `PartialEq` compare against the
+  last-published snapshot now happens *before* the clone, so idle
+  40 ms ticks no longer deep-clone the entire snapshot; regression
+  pinned by `test_idle_engine_does_not_republish_snapshot`
+  (Arc-pointer stability across idle ticks).
+- Shared decode pipeline: new `gui-engine/src/decode.rs` hosts
+  `decode_video_channel` / `decode_video_file`, the collision-proof
+  temp-WAV naming, and the decode progress bridge.  The CLI
+  (`cli.rs::run_decode_video`) and the GUI decode commands share one
+  implementation instead of two ~100-line near-copies; the CLI video
+  decode additionally gains the engine's chunked-decode path (the old
+  `--single-pass` video shortcut is subsumed by the chunk-size
+  heuristic).  WAV-mode `--decode` is unchanged.
+- Offload: per-device copy-plan aggregation moved out of the engine's
+  `StartOffload` arm into `offload::build_copy_plan` returning a
+  typed `Result<OffloadCopyPlan, OffloadPlanError>`; display strings
+  stay in the engine.  The clip-probe worker closure became
+  `clip_probe::probe_clip_set`, making the
+  `DEVICE_NAME_PROBE_SAMPLE` camera-probe cap unit-testable.
+- Dead plumbing: `ActiveJob._started` deleted; `TrackerInner.log` is
+  no longer dead — `ProgressTracker::push_log()` (4 KiB capped) is
+  implemented and conversion step failures are recorded into it, so
+  `JobStatus.log` / `JobOutcome` carry failure context.
+- Docs: AGENTS.md synced with the new dispatch/handler structure, the
+  `EngineLoopState` loop, `push_log()`, and the new `decode.rs` /
+  `clip_probe.rs` modules.
+
 * Unreleased — WP-0 correctness bundle (five verified defects fixed)
 
 Landing of the five small correctness fixes from the code-quality

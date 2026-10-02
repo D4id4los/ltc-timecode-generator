@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetectionResult, WavChunkReader};
+use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetectionResult};
 use log::{error, info, warn};
 
 use crate::command::{ConverterCommand, GuiCommand};
@@ -17,9 +17,9 @@ use crate::converter::{
     output_collision_warning, preview_output_files, apply_available_defaults,
     spawn_conversion_job,
 };
-use crate::ffprobe::{self, VideoAudioProbe};
-use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor, ProgressSnapshot, spawn_job};
-use crate::offload::{DeviceNameSource, OffloadDeviceTotals, run_offload_copy_job, run_offload_scan_job};
+use crate::ffprobe::VideoAudioProbe;
+use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor, spawn_job};
+use crate::offload::{DeviceNameSource, run_offload_copy_job, run_offload_scan_job};
 use crate::state::{AppStateSnapshot, ClapLogItem, ClipDecodeState};
 use crate::timecode;
 
@@ -41,6 +41,54 @@ pub fn engine_main(
     engine_main_with_probe(cmd_rx, state, use_libltc, event_tx, query_ffmpeg_capabilities)
 }
 
+/// Loop-carried mutable state of the engine thread. Owned by
+/// [`engine_main_with_probe`] and passed as `&mut` to command/event
+/// handlers. The job supervisor deliberately stays outside: many handlers
+/// need `&mut` access to both it and `self.current`, which is only possible
+/// through disjoint field borrows of separate bindings.
+struct EngineLoopState {
+    current: AppStateSnapshot,
+    last_tick: Instant,
+    recovery_attempts: u8,
+    log_id_counter: u64,
+    last_device_id: Option<String>,
+    previous_device: Option<String>,
+    /// Engine-internal auto-apply latches — user un-ticks survive decode re-runs
+    last_auto_applied_ltc_gen: u64,
+    last_auto_applied_group_ltc_gen: u64,
+    /// Deferred SelectRecording while a folder scan is still in flight
+    /// (set by SelectRecording, cleared by SelectFolder, applied when the
+    /// scan result arrives).
+    pending_recording: Option<usize>,
+    /// Publish-gating: last snapshot stored into the ArcSwap.  Idle ticks
+    /// produce a byte-identical snapshot, so the clone + store is
+    /// skipped until something actually changes.
+    last_published: Option<Arc<AppStateSnapshot>>,
+    /// Command ack counter — bumped once per drained command and mirrored
+    /// into the published snapshot so GUIs can confirm their edits landed
+    /// (see `AppStateSnapshot.applied_command_seq`).  The GUI is the sole
+    /// producer on the channel, so this matches the sender's seq 1:1.
+    applied_command_seq: u64,
+}
+
+impl EngineLoopState {
+    fn new(initial: AppStateSnapshot) -> Self {
+        EngineLoopState {
+            current: initial,
+            last_tick: Instant::now(),
+            recovery_attempts: 0,
+            log_id_counter: 0,
+            last_device_id: None,
+            previous_device: None,
+            last_auto_applied_ltc_gen: 0,
+            last_auto_applied_group_ltc_gen: 0,
+            pending_recording: None,
+            last_published: None,
+            applied_command_seq: 0,
+        }
+    }
+}
+
 /// Like [`engine_main`] but accepts an injectable capability-probe function
 /// for testing.
 pub fn engine_main_with_probe<F>(
@@ -52,44 +100,19 @@ pub fn engine_main_with_probe<F>(
 ) where
     F: FnOnce() -> FfmpegCapabilities + Send + 'static,
 {
-    let mut current = AppStateSnapshot::initial();
+    let mut initial = AppStateSnapshot::initial();
 
     // Seed persisted paths into the engine snapshot (output folder,
     // offload parent dir). Input folder is restored by the GUI sending
     // SelectFolder during startup.
     let saved_cfg = config::load();
-    config::seed_snapshot_from_config(&mut current, &saved_cfg);
+    config::seed_snapshot_from_config(&mut initial, &saved_cfg);
 
     let core = AudioCore::new();
-    let mut last_tick = Instant::now();
-
-    let mut recovery_attempts: u8 = 0;
-    let mut log_id_counter: u64 = 0;
-    let mut last_device_id: Option<String> = None;
-    let mut previous_device: Option<String> = None;
-
-    // Engine-internal auto-apply latches — user un-ticks survive decode re-runs
-    let mut last_auto_applied_ltc_gen: u64 = 0;
-    let mut last_auto_applied_group_ltc_gen: u64 = 0;
-
-    // Deferred SelectRecording while a folder scan is still in flight
-    // (set by SelectRecording, cleared by SelectFolder, applied in step 0
-    // when the scan result arrives).
-    let mut pending_recording: Option<usize> = None;
+    let mut els = EngineLoopState::new(initial);
 
     // Job supervisor — single channel for all async task result events
     let mut supervisor = JobSupervisor::new();
-
-    // Publish-gating: last snapshot stored into the ArcSwap.  Idle ticks
-    // produce a byte-identical snapshot, so the deep clone + store is
-    // skipped until something actually changes.
-    let mut last_published: Option<Arc<AppStateSnapshot>> = None;
-
-    // Command ack counter — bumped once per drained command and mirrored
-    // into the published snapshot so GUIs can confirm their edits landed
-    // (see `AppStateSnapshot.applied_command_seq`).  The GUI is the sole
-    // producer on the channel, so this matches the sender's seq 1:1.
-    let mut applied_command_seq: u64 = 0;
 
     // Spawn the ffmpeg capability probe on a background thread (via job supervisor)
     {
@@ -107,253 +130,26 @@ pub fn engine_main_with_probe<F>(
 
     'engine: loop {
         let now = Instant::now();
-        let dt = (now - last_tick).as_secs_f32();
-        last_tick = now;
+        let dt = (now - els.last_tick).as_secs_f32();
+        els.last_tick = now;
 
         // 1. Drain all pending commands.  Every successfully received
-        //    command bumps the ack counter before the match so the
+        //    command bumps the ack counter before dispatch so the
         //    snapshot published at the end of this tick carries it.
+        //    `process_command` is the single dispatch site for every
+        //    command except Shutdown (which must break this loop).
         loop {
-            let received = cmd_rx.try_recv();
-            let received = match received {
-                Ok(cmd) => {
-                    applied_command_seq += 1;
-                    current.applied_command_seq = applied_command_seq;
-                    Ok(cmd)
-                }
-                err => err,
-            };
-            match received {
+            match cmd_rx.try_recv() {
                 Ok(GuiCommand::Shutdown) => {
                     let _ = core.stop_ltc();
                     let _ = core.stop_output();
                     info!("Engine shutdown via Shutdown command");
                     break 'engine;
                 }
-                Ok(GuiCommand::ProbeFileDurations(paths)) => {
-                    if supervisor.is_running(JobKind::DurationProbe) {
-                        info!("Duration probe already in progress — ignoring duplicate ProbeFileDurations");
-                        continue;
-                    }
-                    current.file_durations.clear();
-                    let spec = job::JobSpec {
-                        kind: JobKind::DurationProbe,
-                        name: "duration-probe",
-                        units: vec![job::UnitSpec { weight: 1.0, label: "duration probe".into() }],
-                    };
-                    spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
-                        ctx.progress.set_indeterminate(true);
-                        for path in paths {
-                            if ctx.cancel.is_cancelled() {
-                                return Ok(JobFinal::DurationsDone);
-                            }
-                            let secs = crate::duration::file_duration_secs(&path);
-                            ctx.emit(JobItem::DurationResult { path, secs });
-                        }
-                        Ok(JobFinal::DurationsDone)
-                    });
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SelectFolder(path))) => {
-                    current.converter.groups.clear();
-                    current.converter.groups_folder = Some(path.clone());
-                    pending_recording = None; // new scan invalidates any deferred selection
-                    current.converter.selected_group_idx = None;
-                    current.converter.probes.clear();
-                    current.converter.probes_generation = 0;
-                    current.jobs.entry(JobKind::Conversion).or_insert_with(JobStatus::idle);
-                    current.jobs.entry(JobKind::FolderScan).or_insert_with(JobStatus::idle);
-                    current.jobs.entry(JobKind::ClipProbe).or_insert_with(JobStatus::idle);
-                    // Fresh scan — reset user-set flag so the next recording
-                    // selection re-defaults output_folder to the record's
-                    // parent dir.
-                    current.converter.settings.output_folder_user_set = false;
-                    // Persist input folder
-                    config::save_input_folder(&path);
-                    let scan_path = path.clone();
-                    let spec = job::JobSpec {
-                        kind: JobKind::FolderScan,
-                        name: "folder-scan",
-                        units: Vec::new(),
-                    };
-                    spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
-                        ctx.progress.set_indeterminate(true);
-                        let groups = crate::file_pattern::match_files_all_patterns(&scan_path);
-                        info!(
-                            "Folder scan complete: {} — {} group(s) matched",
-                            scan_path.display(),
-                            groups.len(),
-                        );
-                        Ok(JobFinal::FolderScan { path: scan_path, groups })
-                    });
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SelectRecording(idx))) => {
-                    if supervisor.is_running(JobKind::FolderScan) {
-                        info!(
-                            "SelectRecording({}) deferred — folder scan still in progress",
-                            idx,
-                        );
-                        pending_recording = Some(idx);
-                    } else {
-                        apply_recording_selection(
-                            &mut current, idx,
-                            &mut supervisor,
-                            &mut last_auto_applied_ltc_gen,
-                            &mut last_auto_applied_group_ltc_gen,
-                        );
-                    }
-                }
-                Ok(GuiCommand::Offload(cmd)) => {
-                    handle_offload_command(cmd, &mut current, &mut supervisor);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetMetadataOnly(val)))=> {
-                    current.converter.settings.metadata_only = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(val)))=> {
-                    current.converter.settings.generate_synthetic_video = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetCopyVideo(val)))=> {
-                    current.converter.settings.copy_video = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetSplitTracks(val)))=> {
-                    current.converter.settings.split_tracks = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(val)))=> {
-                    current.converter.settings.drop_ltc_track = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetConcatAudio(val)))=> {
-                    current.converter.settings.concat_audio = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetStartFromLtc(val)))=> {
-                    current.converter.settings.set_start_from_ltc = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetEmbedCameraMetadata(val)))=> {
-                    current.converter.settings.embed_camera_metadata = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(val)))=> {
-                    current.converter.settings.ltc_file_idx = val;
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SwapChannelMapCells(row, col)))=> {
-                    current.converter.settings.channel_map.swap(row, col);
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetContainer(container))) => {
-                    current.converter.settings.container = container.clone();
-                    // Re-select best defaults for the new container
-                    if let Some(ref caps) = current.ffmpeg_caps {
-                        apply_available_defaults(
-                            &mut current.converter.settings.container,
-                            &mut current.converter.settings.video_encoder,
-                            &mut current.converter.settings.audio_encoder,
-                            caps,
-                        );
-                    }
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetVideoCodec(codec))) => {
-                    current.converter.settings.video_encoder = codec.clone();
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetAudioEncoder(encoder))) => {
-                    current.converter.settings.audio_encoder = encoder.clone();
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetOutputFolder(folder))) => {
-                    apply_set_output_folder(&mut current, folder);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(prefix))) => {
-                    current.converter.settings.filename_prefix = prefix.clone();
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(tmpl))) => {
-                    current.converter.settings.audio_suffix_template = tmpl.clone();
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(tmpl))) => {
-                    current.converter.settings.video_suffix_template = tmpl.clone();
-                    recompute_converter_derived(&mut current);
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::StartConversion)) => {
-                    if current.job(JobKind::Conversion).phase() == job::JobPhase::Running {
-                        warn!("Conversion already in progress — ignoring duplicate StartConversion");
-                    } else if let Some(settings) = assemble_converter_settings(&current) {
-                        let caps = current.ffmpeg_caps.clone();
-                        // Cancel any previous conversion job first
-                        supervisor.cancel(JobKind::Conversion);
-                        let spec = job::JobSpec {
-                            kind: JobKind::Conversion,
-                            name: "conversion",
-                            units: vec![job::UnitSpec { weight: 1.0, label: "conversion".into() }],
-                        };
-                        spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
-                            spawn_conversion_job(ctx, settings, caps)
-                        });
-                        // Immediately reflect running state in snapshot
-                        let mut status = JobStatus::idle();
-                        status.progress.phase = job::JobPhase::Running;
-                        status.progress.message = "Conversion started…".to_string();
-                        current.jobs.insert(JobKind::Conversion, status);
-                        current.status.set_converter("Conversion started…");
-                        info!("Conversion started via engine StartConversion command (job-based)");
-                    } else {
-                        let msg = "Cannot start conversion — no recording group selected or settings incomplete".to_string();
-                        current.status.set_converter(msg.clone());
-                        warn!("{}", msg);
-                    }
-                }
-                Ok(GuiCommand::Converter(ConverterCommand::CancelConversion)) => {
-                    supervisor.cancel(JobKind::Conversion);
-                    if let Some(status) = current.jobs.get_mut(&JobKind::Conversion) {
-                        status.progress.phase = job::JobPhase::Cancelled;
-                        status.error = Some("Cancelled by user".to_string());
-                    }
-                    current.status.set_converter("Conversion canceled");
-                    info!("Conversion cancel signaled via engine CancelConversion command (job-based)");
-                }
-                Ok(GuiCommand::ProbeVideo(path)) => {
-                    if supervisor.is_running(JobKind::VideoProbe) {
-                        info!("Video probe already in progress — ignoring duplicate ProbeVideo");
-                        continue;
-                    }
-                    info!("Probing video file for audio streams (async via job): {}", path);
-                    current.decode.probe = None;
-                    current.decode.error = None;
-                    current.status.set_decode(format!("Probing video: {}", path));
-                    let path_clone = path.clone();
-                    let spec = job::JobSpec {
-                        kind: JobKind::VideoProbe,
-                        name: "video-probe",
-                        units: Vec::new(),
-                    };
-                    spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
-                        ctx.progress.set_indeterminate(true);
-                        let result = crate::ffprobe::probe_video_audio(Path::new(&path_clone))
-                            .map_err(|e| e.to_string());
-                        Ok(JobFinal::VideoProbe { result })
-                    });
-                }
                 Ok(cmd) => {
-                    process_command(
-                        cmd,
-                        &core,
-                        use_libltc,
-                        &mut current,
-                        &mut recovery_attempts,
-                        &mut log_id_counter,
-                        &mut last_device_id,
-                        &mut previous_device,
-                        &mut supervisor,
-                        &event_tx,
-                    );
+                    els.applied_command_seq += 1;
+                    els.current.applied_command_seq = els.applied_command_seq;
+                    process_command(cmd, &core, use_libltc, &event_tx, &mut els, &mut supervisor);
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     info!("Engine shutdown via channel disconnect");
@@ -374,11 +170,11 @@ pub fn engine_main_with_probe<F>(
             // always shows Running; the terminal phase comes from the Finished
             // event which apply_outcome sets, and must not be clobbered if the
             // thread hasn't finished yet but the event already arrived.
-            let is_terminal = current.jobs.get(kind)
+            let is_terminal = els.current.jobs.get(kind)
                 .map(|s| matches!(s.phase(), job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
                 .unwrap_or(false);
             if !is_terminal {
-                current.jobs.insert(*kind, JobStatus::from_progress(snap));
+                els.current.jobs.insert(*kind, JobStatus::from_progress(snap));
             }
         }
         for event in supervisor.drain() {
@@ -392,331 +188,12 @@ pub fn engine_main_with_probe<F>(
             if supervisor.latest_job.get(&event_kind) != Some(&event_job) {
                 continue;
             }
-            match event {
-                JobEvent::Finished { kind: JobKind::Conversion, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::Conversion) {
-                        status.apply_outcome(&outcome);
-                    }
-                    match outcome {
-                        JobOutcome::Succeeded { .. } => {
-                            recompute_converter_derived(&mut current);
-                            current.status.set_converter("Conversion completed");
-                            info!("Engine-owned conversion completed successfully (job)");
-                        }
-                        JobOutcome::Cancelled { .. } => {
-                            recompute_converter_derived(&mut current);
-                            current.status.set_converter("Conversion canceled");
-                            info!("Engine-owned conversion cancelled (job)");
-                        }
-                        JobOutcome::Failed { error, .. } => {
-                            if let Some(status) = current.jobs.get_mut(&JobKind::Conversion) {
-                                status.error = Some(error.clone());
-                            }
-                            recompute_converter_derived(&mut current);
-                            current.status.set_converter(format!("Conversion failed: {}", error));
-                            warn!("Engine-owned conversion failed: {}", error);
-                        }
-                    }
-                }
-                JobEvent::Finished { kind: JobKind::FfmpegCapProbe, payload: JobFinal::FfmpegCaps { caps }, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::FfmpegCapProbe) {
-                        status.apply_outcome(&outcome);
-                    }
-                    if let Some(caps) = caps {
-                        apply_ffmpeg_probe_result(&mut current, caps);
-                    } else {
-                        warn!("FFmpeg capability probe returned no caps");
-                        recompute_converter_derived(&mut current);
-                    }
-                }
-                JobEvent::Finished { kind: JobKind::FolderScan, payload: JobFinal::FolderScan { path, groups }, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::FolderScan) {
-                        status.apply_outcome(&outcome);
-                    }
-                    if Some(&path) == current.converter.groups_folder.as_ref() {
-                        current.converter.groups = groups;
-                        info!("Folder scan complete: {} group(s)", current.converter.groups.len());
-                        if let Some(idx) = pending_recording.take() {
-                            info!("Applying deferred SelectRecording({}) after folder scan", idx);
-                            apply_recording_selection(
-                                &mut current, idx,
-                                &mut supervisor,
-                                &mut last_auto_applied_ltc_gen,
-                                &mut last_auto_applied_group_ltc_gen,
-                            );
-                        }
-                    } else {
-                        warn!("Discarding stale supervisor folder scan result (path mismatch)");
-                    }
-                }
-                JobEvent::Finished { kind: JobKind::VideoProbe, payload: JobFinal::VideoProbe { result }, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::VideoProbe) {
-                        status.apply_outcome(&outcome);
-                    }
-                    match result {
-                        Ok(probe) => {
-                            current.decode.probe = Some(probe.clone());
-                            current.decode.selected_stream = 0;
-                            current.decode.selected_channel = 0;
-                            current.decode.error = None;
-                            current.status.set_decode(format!(
-                                "Video probed: {} audio stream(s), {} total channel(s)",
-                                probe.streams.len(),
-                                probe.total_audio_channels,
-                            ));
-                            info!("Video probe succeeded (job): {} streams, {} channels", probe.streams.len(), probe.total_audio_channels);
-                        }
-                        Err(e) => {
-                            current.decode.probe = None;
-                            current.decode.error = Some(e.clone());
-                            current.status.set_decode(format!("Video probe failed: {}", e));
-                            error!("Video probe failed (job): {}", e);
-                        }
-                    }
-                }
-                JobEvent::Finished { kind: JobKind::OffloadScan, payload: JobFinal::OffloadScan { mut cards }, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::OffloadScan) {
-                        status.apply_outcome(&outcome);
-                    }
-                    // Apply default selection (latest recording day) to each card.
-                    let file_paths: Vec<PathBuf> = cards.iter()
-                        .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
-                        .collect();
-                    for card in &mut cards {
-                        let sel = crate::offload::default_selection(&card.files);
-                        crate::offload::apply_selection(card, sel);
-                    }
-                    current.offload.cards = cards;
-                    current.offload.file_durations.clear();
-                    current.offload.durations_version =
-                        current.offload.durations_version.wrapping_add(1);
-
-                    if current.offload.cards.is_empty() {
-                        info!(
-                            "Offload card scan complete: 0 cards — if your card reader \
-                             is connected, check that the card is mounted and has \
-                             video/audio files"
-                        );
-                    } else {
-                        info!(
-                            "Offload card scan complete: {} card(s)",
-                            current.offload.cards.len()
-                        );
-                        // Spawn async duration probe for all scanned files
-                        let spec = job::JobSpec {
-                            kind: JobKind::DurationProbe,
-                            name: "offload-dur-probe",
-                            units: Vec::new(),
-                        };
-                        spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
-                            ctx.progress.set_indeterminate(true);
-                            for path in file_paths {
-                                if ctx.cancel.is_cancelled() {
-                                    break;
-                                }
-                                let secs = crate::duration::file_duration_secs(&path);
-                                ctx.emit(job::JobItem::DurationResult { path, secs });
-                            }
-                            Ok(JobFinal::DurationsDone)
-                        });
-                    }
-                }
-                JobEvent::Item { kind: JobKind::DurationProbe, item: JobItem::DurationResult { path, secs }, .. } => {
-                    // Write to converter file_durations
-                    current.file_durations.insert(path.clone(), secs);
-                    // Write to offload file_durations
-                    current.offload.file_durations.insert(path, secs);
-                    current.offload.durations_version =
-                        current.offload.durations_version.wrapping_add(1);
-                }
-                JobEvent::Finished { kind: JobKind::DurationProbe, payload: JobFinal::DurationsDone, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::DurationProbe) {
-                        status.apply_outcome(&outcome);
-                    }
-                    info!("Duration probe complete");
-                }
-                JobEvent::Finished { kind: JobKind::OffloadCopy, payload: JobFinal::OffloadCopy { completed_devices }, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::OffloadCopy) {
-                        status.apply_outcome(&outcome);
-                    }
-                    let was_cancelled = matches!(&outcome, JobOutcome::Cancelled { .. });
-                    if was_cancelled {
-                        info!(
-                            "Offload copy was cancelled by user: {} device(s) completed",
-                            completed_devices.len(),
-                        );
-                        current.offload.error = Some("Canceled by user".to_string());
-                        current.status.set_offload("Offload canceled");
-                    } else {
-                        info!(
-                            "Offload copy complete: {} device(s) offloaded of {}",
-                            completed_devices.len(),
-                            current.offload.device_totals.len(),
-                        );
-                        let parent = current.offload.parent_folder.clone();
-                        for name in &completed_devices {
-                            if !current.offload.completed_devices.contains(name) {
-                                current.offload.completed_devices.push(name.clone());
-                            }
-                        }
-                        let target = parent.map(|p| p.join(&current.offload.parent_name));
-                        current.offload.last_offload_parent = target;
-                        current.offload.last_offload_version =
-                            current.offload.last_offload_version.wrapping_add(1);
-                        current.status.set_offload(format!(
-                            "Offload complete: {} device(s) copied",
-                            completed_devices.len(),
-                        ));
-                    }
-                }
-                JobEvent::Finished { kind: JobKind::LtcDecode, payload: JobFinal::Decode { result, path }, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::LtcDecode) {
-                        status.apply_outcome(&outcome);
-                    }
-                    let generation = current.decode.generation;
-                    match result {
-                        Ok(r) => {
-                            let first_offset = r.first_ltc_timecode_secs;
-                            info!(
-                                "LTC decode result: path={}, fps={:.2}, valid={}/{}, \
-                                 confidence={:.1}%, first_ltc_timecode_secs={:.3}s",
-                                path.display(), r.detected_fps, r.valid_frames, r.total_possible_frames,
-                                r.avg_confidence * 100.0, first_offset,
-                            );
-                            current.decode.result = Some(r.clone());
-                            current.decode.error = None;
-                            let summary = format!(
-                                "LTC decode: {} frames (confidence {:.1}%, {} fps{})",
-                                r.valid_frames, r.avg_confidence * 100.0,
-                                r.detected_fps, if r.drop_frame { " DF" } else { "" },
-                            );
-                            current.status.set_decode(summary);
-                            if generation > last_auto_applied_ltc_gen {
-                                auto_apply_ltc_to_settings(&mut current, &path.to_string_lossy());
-                                last_auto_applied_ltc_gen = generation;
-                                recompute_converter_derived(&mut current);
-                            }
-                        }
-                        Err(e) => {
-                            let is_cancel = e == "Decode canceled by user";
-                            current.decode.result = None;
-                            current.decode.error = if is_cancel { None } else { Some(e.clone()) };
-                            current.status.set_decode(if is_cancel {
-                                "Decode canceled".to_string()
-                            } else {
-                                format!("Parse failed: {}", e)
-                            });
-                            if !is_cancel {
-                                error!("LTC decode failed: {} — {}", path.display(), e);
-                            }
-                        }
-                    }
-                }
-                JobEvent::Item { kind: JobKind::LtcGroupDecode, item: JobItem::ClipLtcResult { index, result }, .. } => {
-                    if current.decode.group_results.len() > index {
-                        current.decode.group_results[index] = ClipDecodeState::Done(result);
-                        let done = current.decode.group_results.iter().filter(|r| r.is_done()).count();
-                        current.status.set_decode(format!(
-                            "Decoding group: {}/{} clips",
-                            done, current.decode.group_results.len(),
-                        ));
-                        if let ClipDecodeState::Done(Ok(r)) = &current.decode.group_results[index] {
-                            info!(
-                                "LTC group decode [{}/{}]: {} frames (confidence {:.1}%)",
-                                done, current.decode.group_results.len(),
-                                r.valid_frames, r.avg_confidence * 100.0,
-                            );
-                        } else if let ClipDecodeState::Done(Err(e)) = &current.decode.group_results[index] {
-                            warn!("LTC group decode [{}/{}]: failed: {}",
-                                done, current.decode.group_results.len(), e);
-                        }
-                    }
-                }
-                JobEvent::Finished { kind: JobKind::LtcGroupDecode, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::LtcGroupDecode) {
-                        status.apply_outcome(&outcome);
-                    }
-                    // When the user cancelled and a new decode was spawned,
-                    // this event is already rejected by the latest_job gate above.
-                    let total = current.decode.group_results.len();
-                    let successes = current.decode.group_results.iter().filter(|r| r.ok().is_some()).count();
-                    let failures = total - successes;
-                    let gen = current.decode.group_generation;
-                    let tc_info = if successes > 0 {
-                        if let Some(ClipDecodeState::Done(Ok(r))) = current.decode.group_results.first() {
-                            format!(
-                                "{} clips decoded ({} ok, {} fail) — {} fps{}",
-                                total, successes, failures,
-                                r.detected_fps, if r.drop_frame { " DF" } else { "" },
-                            )
-                        } else {
-                            format!("{} clips decoded ({} ok, {} fail)", total, successes, failures)
-                        }
-                    } else {
-                        format!("Group decode complete (all {} clips failed)", failures)
-                    };
-                    current.status.set_decode(tc_info);
-                    info!("LTC group decode complete: {}/{} ok, {}/{} failed",
-                        successes, total, failures, total);
-                    if gen > last_auto_applied_group_ltc_gen {
-                        auto_apply_group_ltc_to_settings(&mut current);
-                        last_auto_applied_group_ltc_gen = gen;
-                        recompute_converter_derived(&mut current);
-                    }
-                }
-                JobEvent::Finished { kind: JobKind::ClipProbe, payload: JobFinal::ClipProbes { probes, cameras, device_name }, outcome, .. } => {
-                    if let Some(status) = current.jobs.get_mut(&JobKind::ClipProbe) {
-                        status.apply_outcome(&outcome);
-                    }
-                    let probe_generation = current.converter.probes_generation;
-                    if probe_generation > 0 {
-                        if let Some(ref idx) = current.converter.selected_group_idx {
-                            if let Some(group) = current.converter.groups.get(*idx) {
-                                if group.recording_type == RecordingType::VideoClipSequence {
-                                    if let Some(Ok(ref probe)) = probes.iter().find(|r| r.is_ok()) {
-                                        current.decode.probe = Some(probe.clone());
-                                        current.decode.selected_stream = 0;
-                                        current.decode.selected_channel = 0;
-                                        current.decode.error = None;
-                                    } else {
-                                        let err = probes.iter().find_map(|r| {
-                                            if let Err(ref e) = r { Some(e.clone()) } else { None }
-                                        }).unwrap_or_else(|| "No audio streams detected.".to_string());
-                                        current.decode.error = Some(format!("LTC source probe failed: {}", err));
-                                        current.status.set_decode(format!("Video probe failed: {}", err));
-                                    }
-                                }
-                            }
-                        }
-                        current.converter.probes = probes.iter().map(|r| r.as_ref().ok().cloned()).collect();
-                        current.converter.camera_meta = cameras;
-                        current.converter.device_name = device_name;
-                        info!("Converter clip probe complete: {} files", current.converter.probes.len());
-                        let is_video_group = current.converter.selected_group_idx
-                            .and_then(|i| current.converter.groups.get(i))
-                            .map(|g| g.recording_type == RecordingType::VideoClipSequence)
-                            .unwrap_or(false);
-                        if is_video_group {
-                            let probe_channels = current.converter.probes.first()
-                                .and_then(|p| p.as_ref())
-                                .map(|p| p.total_audio_channels);
-                            let map_channels = current.converter.settings.channel_map.num_channels();
-                            if let Some(ch) = probe_channels {
-                                if ch > 0 && ch != map_channels {
-                                    current.converter.settings.channel_map = ChannelMap::identity(ch);
-                                }
-                            }
-                        }
-                        recompute_converter_derived(&mut current);
-                    }
-                }
-                _ => {}
-            }
+            handle_job_event(&mut els, &mut supervisor, event);
         }
 
         // 2. Poll current timecode if playing
-        if current.is_playing {
-            current.current_timecode = core.current_timecode();
+        if els.current.is_playing {
+            els.current.current_timecode = core.current_timecode();
         }
 
         // 3. Drain events from AudioCore and deliver them to the GUI
@@ -724,40 +201,38 @@ pub fn engine_main_with_probe<F>(
         // not state — they must not ride in the snapshot (which is also
         // publish-gated: an empty-events tick must compare equal).
         for event in core.drain_events() {
-            handle_event(
-                event,
-                &core,
-                &mut current,
-                &mut recovery_attempts,
-                &mut last_device_id,
-                &event_tx,
-            );
+            handle_event(event, &core, &event_tx, &mut els);
         }
 
         // 4. Animation: flash alpha decays at 2.0/s
-        if current.clapper.flash_alpha > 0.0 {
-            current.clapper.flash_alpha = (current.clapper.flash_alpha - dt * 2.0).max(0.0);
+        if els.current.clapper.flash_alpha > 0.0 {
+            els.current.clapper.flash_alpha = (els.current.clapper.flash_alpha - dt * 2.0).max(0.0);
         }
 
         // 5. Animation: arm angle exponential decay toward rest position at 4.0/s
-        current.clapper.arm_angle += (TARGET_ARM_ANGLE - current.clapper.arm_angle)
+        els.current.clapper.arm_angle += (TARGET_ARM_ANGLE - els.current.clapper.arm_angle)
             * (1.0 - (-4.0 * dt).exp());
 
         // 5.5 Determine whether clap animation is still visibly in progress.
         // The GUI uses this flag to decide whether to render at 60 fps
         // (for smooth animation) or to throttle to a lower rate.
-        current.clapper.animating = current.clapper.flash_alpha > 0.0
-            || (current.clapper.arm_angle - TARGET_ARM_ANGLE).abs() > ARM_SETTLE_EPS;
+        els.current.clapper.animating = els.current.clapper.flash_alpha > 0.0
+            || (els.current.clapper.arm_angle - TARGET_ARM_ANGLE).abs() > ARM_SETTLE_EPS;
 
-        // 6. Publish state — only when the snapshot actually changed
-        let next = Arc::new(current.clone());
-        if last_published.as_ref().map_or(true, |p| next.as_ref() != p.as_ref()) {
+        // 6. Publish state — only when the snapshot actually changed.
+        //    Compare against the last-published snapshot *before* cloning:
+        //    the common idle tick then costs one structural PartialEq and
+        //    no allocation/deep clone at all.
+        let changed = els.last_published.as_ref()
+            .map_or(true, |p| p.as_ref() != &els.current);
+        if changed {
+            let next = Arc::new(els.current.clone());
             state.store(next.clone());
-            last_published = Some(next);
+            els.last_published = Some(next);
         }
 
         // 7. Sleep until next tick
-        let next_tick = last_tick + TICK_INTERVAL;
+        let next_tick = els.last_tick + TICK_INTERVAL;
         if let Some(sleep_dur) = next_tick.checked_duration_since(Instant::now()) {
             std::thread::sleep(sleep_dur);
         }
@@ -766,169 +241,22 @@ pub fn engine_main_with_probe<F>(
     supervisor.shutdown(Duration::from_secs(2));
 }
 
-/// Extract a single audio channel from a video file and decode LTC from it.
-/// Returns the LTC detection result or an error string.
-///
-/// `cancel` — shared atomic bool checked during extraction and decode.
-/// `on_extract_progress` — called during extraction with fraction 0.0..1.0.
-/// `decode_unit` — if `Some`, a progress bridge thread is spawned during the
-/// chunked decode phase to report "Chunk {done}/{total}" progress into this
-/// unit. Pass `None` to skip bridging (e.g. when the caller has no unit, or
-/// when the caller will bridge externally).
-fn decode_one_video_clip<F: Fn(f32)>(
-    path: &str,
-    stream_index: usize,
-    channel_index: usize,
-    use_libltc: bool,
-    decode_fps: f64,
-    decode_drop_frame: bool,
-    capture_gen: u64,
-    cancel: &Arc<AtomicBool>,
-    on_extract_progress: &F,
-    decode_unit: Option<job::UnitProgress>,
-) -> Result<LtcDetectionResult, String> {
-    static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pipeline_start = Instant::now();
-
-    let tmp_dir = std::env::temp_dir();
-    let tmp_wav = tmp_dir.join(format!(
-        "ltc_extract_{}_{}_{}_{}_{}.wav",
-        std::process::id(),
-        capture_gen,
-        stream_index,
-        channel_index,
-        counter,
-    ));
-
-    // Phase 1: audio extraction via ffmpeg
-    let duration = ffprobe::probe_stream_duration_secs(Path::new(&path), stream_index);
-
-    ffprobe::extract_audio_channel_with_progress(
-        Path::new(&path),
-        stream_index,
-        channel_index,
-        &tmp_wav,
-        duration,
-        Some(Arc::as_ref(cancel)),
-        on_extract_progress,
-    ).map_err(|e| format!("Audio extraction failed: {}", e))?;
-
-    // Check cancel after extraction, before decode
-    if cancel.load(Ordering::Relaxed) {
-        let _ = std::fs::remove_file(&tmp_wav);
-        return Err("Decode canceled by user".to_string());
-    }
-
-    let wav_path = tmp_wav.clone();
-
-    // Phase 2: chunked LTC decode from extracted WAV
-    let chunks_done = Arc::new(AtomicUsize::new(0));
-    let result = match WavChunkReader::open(&wav_path) {
-        Ok((reader, _start)) => {
-            let total_mono = reader.total_mono_samples();
-            let sr = reader.sample_rate();
-            let ch = reader.channels() as u16;
-            let bps = reader.spec().bits_per_sample;
-            drop(reader);
-
-            let config = DecodeConfig::default();
-            let chunk_count = audio_core::count_chunks(total_mono, sr, ch, bps, &config);
-
-            if chunk_count <= 1 || total_mono == 0 {
-                let result = audio_core::decode_ltc_with_decoder(
-                    &wav_path, use_libltc, decode_fps, decode_drop_frame, Some(Arc::as_ref(cancel)),
-                );
-                chunks_done.store(1, Ordering::Relaxed);
-                result
-            } else {
-                let decode_progress = DecodeProgress {
-                    chunks_total: chunk_count,
-                    chunks_completed: chunks_done.clone(),
-                    cancel_flag: cancel.clone(),
-                };
-
-                let bridge = decode_unit.as_ref().map(|unit| {
-                    bridge_decode_progress(decode_progress.clone(), unit.clone(), None)
-                });
-
-                let result = audio_core::decode_ltc_chunked(
-                    &wav_path, use_libltc, decode_fps, decode_drop_frame,
-                    config, &decode_progress,
-                );
-
-                if let Some(h) = bridge {
-                    let _ = h.join();
-                }
-
-                result
-            }
-        }
-        Err(e) => Err(format!("Failed to open extracted WAV: {}", e)),
-    };
-
-    // Stamp total pipeline time (extraction + decode) onto the result
-    let result = result.map(|mut r| {
-        r.processing_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
-        r
-    });
-
-    let _ = std::fs::remove_file(&tmp_wav);
-    result
-}
-
-/// Bridge a `DecodeProgress` (from audio-core chunked decode) to a
-/// `UnitProgress` by polling `chunks_completed` on a short-lived helper
-/// thread.  Returns a `JoinHandle` the caller should join before the unit
-/// finishes.
-fn bridge_decode_progress(
-    dp: DecodeProgress,
-    unit: job::UnitProgress,
-    msg_prefix: Option<String>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("dp-bridge".into())
-        .spawn(move || {
-            loop {
-                let done = dp.chunks_completed.load(Ordering::Relaxed);
-                let total = dp.chunks_total;
-                if total > 0 {
-                    unit.set_fraction(done as f32 / total as f32);
-                    let msg = match &msg_prefix {
-                        Some(prefix) => format!("{} — Chunk {}/{}", prefix, done.min(total), total),
-                        None => format!("Chunk {}/{}", done.min(total), total),
-                    };
-                    unit.set_message(msg);
-                }
-                if done >= total || dp.cancel_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        })
-        .expect("failed to spawn decode-progress bridge thread")
-}
-
-#[allow(clippy::too_many_arguments)]
 fn process_command(
     cmd: GuiCommand,
     core: &AudioCore,
     use_libltc: bool,
-    state: &mut AppStateSnapshot,
-    recovery_attempts: &mut u8,
-    log_id_counter: &mut u64,
-    last_device_id: &mut Option<String>,
-    previous_device: &mut Option<String>,
-    supervisor: &mut JobSupervisor,
     event_tx: &Sender<AudioEvent>,
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
 ) {
     match cmd {
         GuiCommand::StartLtc => {
-            ensure_audio_init(core, state, last_device_id, recovery_attempts, event_tx);
-            if !state.audio_initialized {
-                state.status.set_audio("Cannot start — audio not initialized");
+            ensure_audio_init(core, els, event_tx);
+            if !els.current.audio_initialized {
+                els.current.status.set_audio("Cannot start — audio not initialized");
                 return;
             }
+            let state = &mut els.current;
             match core.start_ltc(
                 state.start_timecode,
                 state.fps(),
@@ -950,21 +278,22 @@ fn process_command(
 
         GuiCommand::StopLtc => {
             let _ = core.stop_ltc();
-            state.is_playing = false;
-            state.status.set_audio("Stopped");
+            els.current.is_playing = false;
+            els.current.status.set_audio("Stopped");
         }
 
         GuiCommand::Reset => {
-            let _ = core.reset_ltc(state.start_timecode);
-            state.current_timecode = state.start_timecode;
-            state.status.set_audio("Reset");
+            let _ = core.reset_ltc(els.current.start_timecode);
+            els.current.current_timecode = els.current.start_timecode;
+            els.current.status.set_audio("Reset");
         }
 
         GuiCommand::ToggleLock => {
-            state.is_locked = !state.is_locked;
+            els.current.is_locked = !els.current.is_locked;
         }
 
         GuiCommand::Clap => {
+            let state = &mut els.current;
             let _ = core.play_beep(
                 state.sample_rate,
                 state.beep_frequency,
@@ -978,12 +307,12 @@ fn process_command(
             let tc_str = timecode::timecode_to_string(state.current_timecode, state.drop_frame());
             let ms_str =
                 timecode::timecode_to_ms_string(state.current_timecode, state.fps());
-            *log_id_counter += 1;
+            els.log_id_counter += 1;
             let ts = timecode::chrono_now_string();
             let note = format!("Scene {}", state.clapper.scene);
 
             state.clapper.logs.push(ClapLogItem {
-                id: *log_id_counter,
+                id: els.log_id_counter,
                 timestamp: ts,
                 timecode: tc_str,
                 milliseconds: ms_str,
@@ -1000,40 +329,40 @@ fn process_command(
         }
 
         GuiCommand::SetStartTimecode(tc) => {
-            state.start_timecode = tc;
+            els.current.start_timecode = tc;
         }
 
         GuiCommand::SetFpsIndex(index) => {
             if index < timecode::FPS_OPTIONS.len() {
-                state.fps_index = index;
+                els.current.fps_index = index;
             }
         }
 
         GuiCommand::SetSampleRate(rate) => {
-            state.sample_rate = rate;
+            els.current.sample_rate = rate;
         }
 
         GuiCommand::SetDevice(device_id) => {
-            if state.is_playing {
+            if els.current.is_playing {
                 let _ = core.stop_ltc();
-                state.is_playing = false;
+                els.current.is_playing = false;
             }
 
             let _ = core.stop_output();
-            state.audio_initialized = false;
+            els.current.audio_initialized = false;
 
-            *previous_device = state.selected_device.clone();
-            state.selected_device = Some(device_id);
+            els.previous_device = els.current.selected_device.clone();
+            els.current.selected_device = Some(device_id);
 
-            if !try_init_device(core, state, last_device_id, recovery_attempts) {
+            if !try_init_device(core, els) {
                 // Revert to previous device
-                state.selected_device = previous_device.take();
-                if try_init_device(core, state, last_device_id, recovery_attempts) {
-                    state.status.set_audio("Device selection reverted to previous");
+                els.current.selected_device = els.previous_device.take();
+                if try_init_device(core, els) {
+                    els.current.status.set_audio("Device selection reverted to previous");
                 } else {
                     // Previous selection may have been automatic (None);
                     // fall back to the default/first device.
-                    ensure_audio_init(core, state, last_device_id, recovery_attempts, event_tx);
+                    ensure_audio_init(core, els, event_tx);
                 }
             }
         }
@@ -1041,75 +370,76 @@ fn process_command(
         GuiCommand::RefreshDevices => {
             match audio_core::list_audio_devices() {
                 Ok(devices) => {
-                    state.devices = devices;
+                    els.current.devices = devices;
                     // Drop the selection if the chosen device vanished;
                     // the next init falls back to the default/first device.
-                    if let Some(ref id) = state.selected_device {
-                        if !state.devices.iter().any(|d| &d.id == id) {
-                            state.selected_device = None;
+                    if let Some(ref id) = els.current.selected_device {
+                        if !els.current.devices.iter().any(|d| &d.id == id) {
+                            els.current.selected_device = None;
                         }
                     }
-                    state.status.set_audio(format!("{} devices found", state.devices.len()));
+                    els.current.status.set_audio(format!("{} devices found", els.current.devices.len()));
                 }
                 Err(e) => {
                     error!("Failed to list devices: {}", e);
-                    state.status.set_audio(format!("Device scan failed: {}", e));
+                    els.current.status.set_audio(format!("Device scan failed: {}", e));
                 }
             }
         }
 
         GuiCommand::InitAudio => {
-            ensure_audio_init(core, state, last_device_id, recovery_attempts, event_tx);
+            ensure_audio_init(core, els, event_tx);
         }
 
         GuiCommand::SetLtcChannel(ch) => {
-            state.ltc_channel = ch;
+            els.current.ltc_channel = ch;
         }
         GuiCommand::SetBeepChannel(ch) => {
-            state.beep_channel = ch;
+            els.current.beep_channel = ch;
         }
         GuiCommand::SetLtcVolume(vol) => {
-            state.ltc_volume = vol;
+            els.current.ltc_volume = vol;
         }
         GuiCommand::SetBeepVolume(vol) => {
-            state.beep_volume = vol;
+            els.current.beep_volume = vol;
         }
         GuiCommand::SetBeepFrequency(freq) => {
-            state.beep_frequency = freq;
+            els.current.beep_frequency = freq;
         }
         GuiCommand::SetBeepDuration(dur) => {
-            state.beep_duration = dur;
+            els.current.beep_duration = dur;
         }
         GuiCommand::SetScene(scene) => {
-            state.clapper.scene = scene;
+            els.current.clapper.scene = scene;
         }
         GuiCommand::SetTake(take) => {
-            state.clapper.take = take;
+            els.current.clapper.take = take;
         }
         GuiCommand::SetRoll(roll) => {
-            state.clapper.roll = roll;
+            els.current.clapper.roll = roll;
         }
         GuiCommand::SetAutoIncrement(val) => {
-            state.clapper.auto_increment_take = val;
+            els.current.clapper.auto_increment_take = val;
         }
         GuiCommand::SetTheme(dark) => {
-            state.is_dark_theme = dark;
+            els.current.is_dark_theme = dark;
         }
         GuiCommand::ToggleTheme => {
-            state.is_dark_theme = !state.is_dark_theme;
+            els.current.is_dark_theme = !els.current.is_dark_theme;
         }
         GuiCommand::ClearLogs => {
-            state.clapper.logs.clear();
+            els.current.clapper.logs.clear();
         }
 
         GuiCommand::SetDecodeFpsIndex(index) => {
             if let Some(opt) = timecode::FPS_OPTIONS.get(index) {
-                state.decode.fps_index = index;
+                els.current.decode.fps_index = index;
                 info!("Decode FPS set to: {} (index={})", opt.name, index);
             }
         }
 
         GuiCommand::CancelDecode => {
+            let state = &mut els.current;
             supervisor.cancel(JobKind::LtcDecode);
             supervisor.cancel(JobKind::LtcGroupDecode);
             if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
@@ -1124,93 +454,11 @@ fn process_command(
         }
 
         GuiCommand::DecodeLtcVideoGroup { paths, stream_index, channel_index } => {
-            if paths.is_empty() {
-                return;
-            }
-            if supervisor.is_running(JobKind::LtcGroupDecode) {
-                info!("LTC group decode already in progress — ignoring duplicate DecodeLtcVideoGroup");
-                return;
-            }
-            let total = paths.len();
-            let decoder_name = if use_libltc { "libltc" } else { "builtin" };
-            info!(
-                "LTC group decode requested: {} clip(s), stream={}, channel={}, decoder={}, fps={}",
-                total, stream_index, channel_index, decoder_name, state.decode_fps(),
-            );
-
-            // Reset group decode state with new generation
-            state.decode.group_generation = state.decode.group_generation.wrapping_add(1);
-            state.decode.group_paths = paths.iter().map(std::path::PathBuf::from).collect();
-            state.decode.group_results = vec![ClipDecodeState::Pending; total];
-            // Pre-populate job status so CancelDecode can eager-cancel before poll()
-            state.jobs.insert(JobKind::LtcGroupDecode, job::JobStatus {
-                progress: ProgressSnapshot {
-                    phase: job::JobPhase::Running,
-                    fraction: 0.0,
-                    message: format!("Decoding LTC group: 0/{} clips", total),
-                    speed: None,
-                    units: Vec::new(),
-                    log: String::new(),
-                },
-                error: None,
-            });
-            state.status.set_decode(format!("Decoding LTC group: 0/{} clips", total));
-
-            let capture_gen = state.decode.group_generation;
-            let decode_fps = state.decode_fps();
-            let decode_drop_frame = state.decode_drop_frame();
-
-            let spec = job::JobSpec {
-                kind: JobKind::LtcGroupDecode,
-                name: "ltc-group-decode",
-                units: (0..total).map(|_| job::UnitSpec {
-                    weight: 1.0 / total as f32,
-                    label: "clip".into(),
-                }).collect(),
-            };
-            spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
-                let cancel = ctx.cancel.inner().clone();
-                for (idx, path) in paths.iter().enumerate() {
-                    if cancel.load(Ordering::Relaxed) {
-                        info!("LTC group decode canceled at clip {}/{}", idx, total);
-                        return Err(job::JobError::Cancelled);
-                    }
-
-                    let clip_unit = ctx.progress.unit(idx);
-                    let clip_name = path.rsplit('/').next()
-                        .or_else(|| path.rsplit('\\').next())
-                        .unwrap_or(path);
-                    clip_unit.set_label(clip_name.to_string());
-                    clip_unit.set_message(format!("Clip {}/{}", idx + 1, total));
-
-                    info!("LTC group decode clip {}/{} started: {}", idx + 1, total, path);
-                    let result = decode_one_video_clip(
-                        path, stream_index, channel_index,
-                        use_libltc, decode_fps, decode_drop_frame, capture_gen,
-                        &cancel, &|_| {},
-                        Some(clip_unit),
-                    ).map(Box::new);
-                    if ctx.cancel.is_cancelled() {
-                        return Err(job::JobError::Cancelled);
-                    }
-                    ctx.progress.unit(idx).finish();
-
-                    info!("LTC group decode clip {}/{} finished: {} — {}",
-                        idx + 1, total, path,
-                        if result.is_ok() { "OK" } else { "FAILED" },
-                    );
-
-                    ctx.emit(JobItem::ClipLtcResult {
-                        index: idx,
-                        result,
-                    });
-                }
-                info!("LTC group decode thread finished — all {} clips processed", total);
-                Ok(JobFinal::NoPayload)
-            });
+            cmd_decode_ltc_video_group(els, supervisor, &paths, stream_index, channel_index, use_libltc);
         }
 
         GuiCommand::ClearRecordingDecodeState => {
+            let state = &mut els.current;
             state.decode.result = None;
             state.decode.error = None;
             state.decode.probe = None;
@@ -1224,258 +472,585 @@ fn process_command(
             state.decode.group_generation = state.decode.group_generation.wrapping_add(1);
         }
 
-        GuiCommand::ProbeVideo(_path) => {
-            // Handled inline in engine_main's command drain — this arm is
-            // never reached in practice; kept for match exhaustiveness.
-            unreachable!("ProbeVideo is handled in the main loop, not here");
+        GuiCommand::ProbeVideo(path) => {
+            cmd_probe_video(els, supervisor, path);
         }
 
         GuiCommand::ParseLtcVideo(path, stream_index, channel_index) => {
-            if supervisor.is_running(JobKind::LtcDecode) {
-                info!("LTC decode already in progress — ignoring duplicate ParseLtcVideo");
-                return;
-            }
-            let decoder_name = if use_libltc { "libltc" } else { "builtin" };
-            info!(
-                "LTC video decode requested: {} (stream={}, channel={}, decoder={}, fps={})",
-                path, stream_index, channel_index, decoder_name, state.decode_fps(),
-            );
-
-            state.decode.result = None;
-            state.decode.error = None;
-            state.decode.generation = state.decode.generation.wrapping_add(1);
-            let msg = format!(
-                "Extracting audio from: {} stream={} ch={}",
-                path, stream_index, channel_index,
-            );
-            state.status.set_decode(msg.clone());
-            state.jobs.insert(JobKind::LtcDecode, job::JobStatus {
-                progress: ProgressSnapshot {
-                    phase: job::JobPhase::Running,
-                    fraction: 0.0,
-                    message: msg,
-                    speed: None,
-                    units: Vec::new(),
-                    log: String::new(),
-                },
-                error: None,
-            });
-
-            let capture_gen = state.decode.generation;
-            let decode_fps = state.decode_fps();
-            let decode_drop_frame = state.decode_drop_frame();
-
-            // Hardening: validate the selection against the probe data so a
-            // stale or out-of-range GUI state fails fast with a clear message
-            // instead of invoking ffmpeg on a nonexistent stream.
-            if let Some(ref probe) = state.decode.probe {
-                let available: Vec<usize> =
-                    probe.streams.iter().map(|s| s.stream_index).collect();
-                let validation_error = match probe
-                    .streams
-                    .iter()
-                    .find(|s| s.stream_index == stream_index)
-                {
-                    None => Some(format!(
-                        "Stream {} not found in '{}' (available audio streams: {:?})",
-                        stream_index, path, available
-                    )),
-                    Some(s) if channel_index >= s.channels => Some(format!(
-                        "Channel {} out of range for stream {} in '{}' ({} channels available)",
-                        channel_index, stream_index, path, s.channels
-                    )),
-                    Some(_) => None,
-                };
-                if let Some(e) = validation_error {
-                    error!("LTC video decode rejected: {}", e);
-                    if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
-                        status.progress.phase = job::JobPhase::Failed;
-                        status.error = Some(e.clone());
-                    }
-                    state.decode.error = Some(e.clone());
-                    state.status.set_decode(format!("Parse failed: {}", e));
-                    return;
-                }
-            }
-
-            let path_job = path.clone();
-            let spec = job::JobSpec {
-                kind: JobKind::LtcDecode,
-                name: "ltc-video-decode",
-                units: vec![
-                    job::UnitSpec { weight: 0.5, label: "extract".into() },
-                    job::UnitSpec { weight: 0.5, label: "decode".into() },
-                ],
-            };
-            spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
-                let cancel = ctx.cancel.inner().clone();
-                let extract_unit = ctx.progress.unit(0);
-                extract_unit.set_message("extracting audio…");
-                let on_extract = |frac: f32| {
-                    extract_unit.set_fraction(frac);
-                };
-
-                let decode_unit = ctx.progress.unit(1);
-                decode_unit.set_message("decoding LTC…");
-
-                let result = decode_one_video_clip(
-                    &path_job, stream_index, channel_index,
-                    use_libltc, decode_fps, decode_drop_frame, capture_gen,
-                    &cancel, &on_extract,
-                    Some(decode_unit),
-                );
-                extract_unit.set_fraction(1.0);
-
-                Ok(result
-                    .map(|r| JobFinal::Decode { result: Ok(r), path: PathBuf::from(path_job.clone()) })
-                    .unwrap_or_else(|e| JobFinal::Decode { result: Err(e), path: PathBuf::from(path_job) }))
-            });
+            cmd_parse_ltc_video(els, supervisor, &path, stream_index, channel_index, use_libltc);
         }
 
         GuiCommand::SetLtcDecodeStream(idx) => {
-            state.decode.selected_stream = idx;
+            els.current.decode.selected_stream = idx;
         }
 
         GuiCommand::SetLtcDecodeChannel(idx) => {
-            state.decode.selected_channel = idx;
+            els.current.decode.selected_channel = idx;
         }
 
         GuiCommand::ParseLtcWavFile(path) => {
-            if supervisor.is_running(JobKind::LtcDecode) {
-                info!("LTC decode already in progress — ignoring duplicate ParseLtcWavFile");
-                return;
-            }
-            let decoder_name = if use_libltc { "libltc" } else { "builtin" };
-            info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, state.decode_fps());
-
-            // Quick open to calculate chunk count
-            let config = DecodeConfig::default();
-            let chunk_count = match audio_core::count_chunks_in_wav(Path::new(&path), &config) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to open WAV for chunked decode: {}", e);
-                    state.decode.error = Some(e.clone());
-                    state.status.set_decode(format!("Parse failed: {}", e));
-                    if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
-                        status.progress.phase = job::JobPhase::Failed;
-                        status.error = Some(e.clone());
-                    }
-                    return;
-                }
-            };
-
-            state.decode.result = None;
-            state.decode.error = None;
-            state.decode.generation = state.decode.generation.wrapping_add(1);
-            let msg = format!(
-                "Decoding LTC from: {} [{}] at {:.2} fps ({} chunks)",
-                path, decoder_name, state.decode_fps(), chunk_count
-            );
-            state.status.set_decode(msg.clone());
-            state.jobs.insert(JobKind::LtcDecode, job::JobStatus {
-                progress: ProgressSnapshot {
-                    phase: job::JobPhase::Running,
-                    fraction: 0.0,
-                    message: msg,
-                    speed: None,
-                    units: Vec::new(),
-                    log: String::new(),
-                },
-                error: None,
-            });
-
-            let decode_fps = state.decode_fps();
-            let decode_drop_frame = state.decode_drop_frame();
-
-            info!("Spawning chunked decode ({} chunks, decoder={}, fps={})",
-                chunk_count, decoder_name, decode_fps);
-
-            let path_job = path.clone();
-            let spec = job::JobSpec {
-                kind: JobKind::LtcDecode,
-                name: "ltc-wav-decode",
-                units: vec![job::UnitSpec { weight: 1.0, label: "decode".into() }],
-            };
-            spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
-                let cancel = ctx.cancel.inner().clone();
-                let unit = ctx.progress.unit(0);
-                unit.set_message("decoding LTC…");
-
-                // Share chunks_done and cancel_flag atomics so the bridge thread
-                // can update UnitProgress while decode_ltc_chunked runs.
-                let chunks_done = Arc::new(AtomicUsize::new(0));
-                let dp = DecodeProgress {
-                    chunks_total: chunk_count,
-                    chunks_completed: chunks_done.clone(),
-                    cancel_flag: cancel.clone(),
-                };
-
-                let dp_bridge = bridge_decode_progress(dp.clone(), unit, None);
-
-                let result = if chunk_count <= 1 {
-                    let r = audio_core::decode_ltc_with_decoder(
-                        Path::new(&path_job), use_libltc, decode_fps, decode_drop_frame,
-                        Some(&cancel),
-                    );
-                    chunks_done.store(1, Ordering::Relaxed);
-                    r
-                } else {
-                    let config = DecodeConfig::default();
-                    audio_core::decode_ltc_chunked(
-                        Path::new(&path_job), use_libltc, decode_fps, decode_drop_frame,
-                        config, &dp,
-                    )
-                };
-
-                let _ = dp_bridge.join();
-
-                let path_final = path_job;
-                Ok(JobFinal::Decode {
-                    result,
-                    path: PathBuf::from(path_final),
-                })
-            });
+            cmd_parse_ltc_wav_file(els, supervisor, &path, use_libltc);
         }
 
         GuiCommand::SceneUp => {
-            state.clapper.scene = state.clapper.scene.saturating_add(1);
+            els.current.clapper.scene = els.current.clapper.scene.saturating_add(1);
         }
         GuiCommand::SceneDown => {
-            state.clapper.scene = state.clapper.scene.saturating_sub(1);
+            els.current.clapper.scene = els.current.clapper.scene.saturating_sub(1);
         }
         GuiCommand::TakeUp => {
-            state.clapper.take = state.clapper.take.saturating_add(1);
+            els.current.clapper.take = els.current.clapper.take.saturating_add(1);
         }
         GuiCommand::TakeDown => {
-            state.clapper.take = state.clapper.take.saturating_sub(1);
+            els.current.clapper.take = els.current.clapper.take.saturating_sub(1);
         }
-        GuiCommand::HourUp => { stepper_hour(state, 1); }
-        GuiCommand::HourDown => { stepper_hour(state, -1); }
-        GuiCommand::MinuteUp => { stepper_minute(state, 1); }
-        GuiCommand::MinuteDown => { stepper_minute(state, -1); }
-        GuiCommand::SecondUp => { stepper_second(state, 1); }
-        GuiCommand::SecondDown => { stepper_second(state, -1); }
-        GuiCommand::FrameUp => { stepper_frame(state, 1); }
-        GuiCommand::FrameDown => { stepper_frame(state, -1); }
+        GuiCommand::HourUp => { stepper_hour(&mut els.current, 1); }
+        GuiCommand::HourDown => { stepper_hour(&mut els.current, -1); }
+        GuiCommand::MinuteUp => { stepper_minute(&mut els.current, 1); }
+        GuiCommand::MinuteDown => { stepper_minute(&mut els.current, -1); }
+        GuiCommand::SecondUp => { stepper_second(&mut els.current, 1); }
+        GuiCommand::SecondDown => { stepper_second(&mut els.current, -1); }
+        GuiCommand::FrameUp => { stepper_frame(&mut els.current, 1); }
+        GuiCommand::FrameDown => { stepper_frame(&mut els.current, -1); }
 
-        GuiCommand::ProbeFileDurations(_) => {
-            // Handled in the command drain loop (engine_main) before reaching process_command
+        GuiCommand::ProbeFileDurations(paths) => {
+            cmd_probe_file_durations(els, supervisor, paths);
         }
 
-        GuiCommand::Converter(_) => {
-            // All ConverterCommand variants are handled in the main engine
-            // command drain loop (before process_command).
-        },
+        GuiCommand::Converter(cmd) => {
+            handle_converter_command(cmd, els, supervisor);
+        }
 
-        GuiCommand::Offload(_) => {
-            // All Offload commands are handled in the drain loop before
-            // reaching process_command.
+        GuiCommand::Offload(cmd) => {
+            handle_offload_command(cmd, els, supervisor);
         }
 
         GuiCommand::Shutdown => {
-            // Handled in the command drain loop before reaching process_command
+            // Handled in the engine loop's command drain (it must break the
+            // tick loop, which a handler function cannot do). Reaching this
+            // arm would mean the drain loop's early dispatch was bypassed.
+            warn!("GuiCommand::Shutdown reached process_command — ignored");
         }
     }
+}
+
+// ── Converter command handling ─────────────────────────────────────────
+
+/// Apply a converter command. Commands that are simple field assignments go
+/// through [`apply_simple_converter_setting`]; commands with additional
+/// side-effects get their own handler.
+fn handle_converter_command(
+    cmd: ConverterCommand,
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+) {
+    use ConverterCommand as C;
+    match cmd {
+        C::SelectFolder(path) => cmd_select_folder(els, supervisor, path),
+        C::SelectRecording(idx) => {
+            if supervisor.is_running(JobKind::FolderScan) {
+                info!(
+                    "SelectRecording({}) deferred — folder scan still in progress",
+                    idx,
+                );
+                els.pending_recording = Some(idx);
+            } else {
+                apply_recording_selection(els, supervisor, idx);
+            }
+        }
+        C::SetContainer(container) => {
+            els.current.converter.settings.container = container;
+            // Re-select best defaults for the new container
+            if let Some(ref caps) = els.current.ffmpeg_caps {
+                apply_available_defaults(
+                    &mut els.current.converter.settings.container,
+                    &mut els.current.converter.settings.video_encoder,
+                    &mut els.current.converter.settings.audio_encoder,
+                    caps,
+                );
+            }
+            recompute_converter_derived(&mut els.current);
+        }
+        C::SwapChannelMapCells(row, col) => {
+            els.current.converter.settings.channel_map.swap(row, col);
+            recompute_converter_derived(&mut els.current);
+        }
+        C::SetOutputFolder(folder) => apply_set_output_folder(&mut els.current, folder),
+        C::StartConversion => cmd_start_conversion(els, supervisor),
+        C::CancelConversion => cmd_cancel_conversion(els, supervisor),
+        other => {
+            if apply_simple_converter_setting(&mut els.current.converter.settings, &other) {
+                recompute_converter_derived(&mut els.current);
+            } else {
+                warn!("Unhandled converter command: {:?}", other);
+            }
+        }
+    }
+}
+
+/// Try to apply `cmd` as a simple "assign one settings field" converter
+/// command. Returns false for commands with side-effects beyond a field
+/// assignment (`SetContainer`, `SwapChannelMapCells`, `SetOutputFolder`,
+/// `SelectFolder`, `SelectRecording`, `StartConversion`, `CancelConversion`)
+/// — those have dedicated arms in [`handle_converter_command`].
+fn apply_simple_converter_setting(
+    settings: &mut crate::state::ConverterUserSettings,
+    cmd: &ConverterCommand,
+) -> bool {
+    use ConverterCommand as C;
+    match cmd {
+        C::SetMetadataOnly(v)           => settings.metadata_only = *v,
+        C::SetGenerateSyntheticVideo(v) => settings.generate_synthetic_video = *v,
+        C::SetCopyVideo(v)              => settings.copy_video = *v,
+        C::SetSplitTracks(v)            => settings.split_tracks = *v,
+        C::SetDropLtcTrack(v)           => settings.drop_ltc_track = *v,
+        C::SetConcatAudio(v)            => settings.concat_audio = *v,
+        C::SetStartFromLtc(v)           => settings.set_start_from_ltc = *v,
+        C::SetEmbedCameraMetadata(v)    => settings.embed_camera_metadata = *v,
+        C::SetLtcFileIndex(v)           => settings.ltc_file_idx = *v,
+        C::SetVideoCodec(c)             => settings.video_encoder = c.clone(),
+        C::SetAudioEncoder(e)           => settings.audio_encoder = e.clone(),
+        C::SetFilenamePrefix(p)         => settings.filename_prefix = p.clone(),
+        C::SetAudioSuffixTemplate(t)    => settings.audio_suffix_template = t.clone(),
+        C::SetVideoSuffixTemplate(t)    => settings.video_suffix_template = t.clone(),
+        _ => return false,
+    }
+    true
+}
+
+fn cmd_select_folder(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    path: PathBuf,
+) {
+    let current = &mut els.current;
+    current.converter.groups.clear();
+    current.converter.groups_folder = Some(path.clone());
+    els.pending_recording = None; // new scan invalidates any deferred selection
+    current.converter.selected_group_idx = None;
+    current.converter.probes.clear();
+    current.converter.probes_generation = 0;
+    current.jobs.entry(JobKind::Conversion).or_insert_with(JobStatus::idle);
+    current.jobs.entry(JobKind::FolderScan).or_insert_with(JobStatus::idle);
+    current.jobs.entry(JobKind::ClipProbe).or_insert_with(JobStatus::idle);
+    // Fresh scan — reset user-set flag so the next recording
+    // selection re-defaults output_folder to the record's
+    // parent dir.
+    current.converter.settings.output_folder_user_set = false;
+    // Persist input folder
+    config::save_input_folder(&path);
+    let scan_path = path.clone();
+    let spec = job::JobSpec {
+        kind: JobKind::FolderScan,
+        name: "folder-scan",
+        units: Vec::new(),
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        ctx.progress.set_indeterminate(true);
+        let groups = crate::file_pattern::match_files_all_patterns(&scan_path);
+        info!(
+            "Folder scan complete: {} — {} group(s) matched",
+            scan_path.display(),
+            groups.len(),
+        );
+        Ok(JobFinal::FolderScan { path: scan_path, groups })
+    });
+    recompute_converter_derived(current);
+}
+
+fn cmd_start_conversion(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
+    if els.current.job(JobKind::Conversion).phase() == job::JobPhase::Running {
+        warn!("Conversion already in progress — ignoring duplicate StartConversion");
+        return;
+    }
+    let Some(settings) = assemble_converter_settings(&els.current) else {
+        let msg = "Cannot start conversion — no recording group selected or settings incomplete".to_string();
+        els.current.status.set_converter(msg.clone());
+        warn!("{}", msg);
+        return;
+    };
+    let caps = els.current.ffmpeg_caps.clone();
+    // Cancel any previous conversion job first
+    supervisor.cancel(JobKind::Conversion);
+    let spec = job::JobSpec {
+        kind: JobKind::Conversion,
+        name: "conversion",
+        units: vec![job::UnitSpec { weight: 1.0, label: "conversion".into() }],
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        spawn_conversion_job(ctx, settings, caps)
+    });
+    // Immediately reflect running state in snapshot
+    els.current.jobs.insert(JobKind::Conversion, JobStatus::running("Conversion started…"));
+    els.current.status.set_converter("Conversion started…");
+    info!("Conversion started via engine StartConversion command (job-based)");
+}
+
+fn cmd_cancel_conversion(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
+    supervisor.cancel(JobKind::Conversion);
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::Conversion) {
+        status.progress.phase = job::JobPhase::Cancelled;
+        status.error = Some("Cancelled by user".to_string());
+    }
+    els.current.status.set_converter("Conversion canceled");
+    info!("Conversion cancel signaled via engine CancelConversion command (job-based)");
+}
+
+fn cmd_probe_file_durations(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    paths: Vec<PathBuf>,
+) {
+    if supervisor.is_running(JobKind::DurationProbe) {
+        info!("Duration probe already in progress — ignoring duplicate ProbeFileDurations");
+        return;
+    }
+    els.current.file_durations.clear();
+    let spec = job::JobSpec {
+        kind: JobKind::DurationProbe,
+        name: "duration-probe",
+        units: vec![job::UnitSpec { weight: 1.0, label: "duration probe".into() }],
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        ctx.progress.set_indeterminate(true);
+        for path in paths {
+            if ctx.cancel.is_cancelled() {
+                return Ok(JobFinal::DurationsDone);
+            }
+            let secs = crate::duration::file_duration_secs(&path);
+            ctx.emit(JobItem::DurationResult { path, secs });
+        }
+        Ok(JobFinal::DurationsDone)
+    });
+}
+
+fn cmd_probe_video(els: &mut EngineLoopState, supervisor: &mut JobSupervisor, path: String) {
+    if supervisor.is_running(JobKind::VideoProbe) {
+        info!("Video probe already in progress — ignoring duplicate ProbeVideo");
+        return;
+    }
+    info!("Probing video file for audio streams (async via job): {}", path);
+    els.current.decode.probe = None;
+    els.current.decode.error = None;
+    els.current.status.set_decode(format!("Probing video: {}", path));
+    let path_clone = path.clone();
+    let spec = job::JobSpec {
+        kind: JobKind::VideoProbe,
+        name: "video-probe",
+        units: Vec::new(),
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        ctx.progress.set_indeterminate(true);
+        let result = crate::ffprobe::probe_video_audio(Path::new(&path_clone))
+            .map_err(|e| e.to_string());
+        Ok(JobFinal::VideoProbe { result })
+    });
+}
+
+// ── Decode command handlers ────────────────────────────────────────────
+
+fn cmd_decode_ltc_video_group(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    paths: &[String],
+    stream_index: usize,
+    channel_index: usize,
+    use_libltc: bool,
+) {
+    if paths.is_empty() {
+        return;
+    }
+    if supervisor.is_running(JobKind::LtcGroupDecode) {
+        info!("LTC group decode already in progress — ignoring duplicate DecodeLtcVideoGroup");
+        return;
+    }
+    let total = paths.len();
+    let decoder_name = if use_libltc { "libltc" } else { "builtin" };
+    info!(
+        "LTC group decode requested: {} clip(s), stream={}, channel={}, decoder={}, fps={}",
+        total, stream_index, channel_index, decoder_name, els.current.decode_fps(),
+    );
+
+    // Reset group decode state with new generation
+    let state = &mut els.current;
+    state.decode.group_generation = state.decode.group_generation.wrapping_add(1);
+    state.decode.group_paths = paths.iter().map(PathBuf::from).collect();
+    state.decode.group_results = vec![ClipDecodeState::Pending; total];
+    // Pre-populate job status so CancelDecode can eager-cancel before poll()
+    state.jobs.insert(
+        JobKind::LtcGroupDecode,
+        JobStatus::running(format!("Decoding LTC group: 0/{} clips", total)),
+    );
+    state.status.set_decode(format!("Decoding LTC group: 0/{} clips", total));
+
+    let capture_gen = state.decode.group_generation;
+    let decode_fps = state.decode_fps();
+    let decode_drop_frame = state.decode_drop_frame();
+
+    let paths: Vec<String> = paths.to_vec();
+    let spec = job::JobSpec {
+        kind: JobKind::LtcGroupDecode,
+        name: "ltc-group-decode",
+        units: (0..total).map(|_| job::UnitSpec {
+            weight: 1.0 / total as f32,
+            label: "clip".into(),
+        }).collect(),
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        let cancel = ctx.cancel.inner().clone();
+        for (idx, path) in paths.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                info!("LTC group decode canceled at clip {}/{}", idx, total);
+                return Err(job::JobError::Cancelled);
+            }
+
+            let clip_unit = ctx.progress.unit(idx);
+            let clip_name = path.rsplit('/').next()
+                .or_else(|| path.rsplit('\\').next())
+                .unwrap_or(path);
+            clip_unit.set_label(clip_name.to_string());
+            clip_unit.set_message(format!("Clip {}/{}", idx + 1, total));
+
+            info!("LTC group decode clip {}/{} started: {}", idx + 1, total, path);
+            let result = crate::decode::decode_video_channel(
+                crate::decode::VideoDecodeRequest {
+                    path: Path::new(path),
+                    stream_index,
+                    channel_index,
+                    use_libltc,
+                    decode_fps,
+                    decode_drop_frame,
+                    cancel: Some(&cancel),
+                },
+                capture_gen,
+                &|_| {},
+                Some(clip_unit),
+            ).map(Box::new);
+            if ctx.cancel.is_cancelled() {
+                return Err(job::JobError::Cancelled);
+            }
+            ctx.progress.unit(idx).finish();
+
+            info!("LTC group decode clip {}/{} finished: {} — {}",
+                idx + 1, total, path,
+                if result.is_ok() { "OK" } else { "FAILED" },
+            );
+
+            ctx.emit(JobItem::ClipLtcResult {
+                index: idx,
+                result,
+            });
+        }
+        info!("LTC group decode thread finished — all {} clips processed", total);
+        Ok(JobFinal::NoPayload)
+    });
+}
+
+fn cmd_parse_ltc_video(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    path: &str,
+    stream_index: usize,
+    channel_index: usize,
+    use_libltc: bool,
+) {
+    if supervisor.is_running(JobKind::LtcDecode) {
+        info!("LTC decode already in progress — ignoring duplicate ParseLtcVideo");
+        return;
+    }
+    let decoder_name = if use_libltc { "libltc" } else { "builtin" };
+    info!(
+        "LTC video decode requested: {} (stream={}, channel={}, decoder={}, fps={})",
+        path, stream_index, channel_index, decoder_name, els.current.decode_fps(),
+    );
+
+    let state = &mut els.current;
+    state.decode.result = None;
+    state.decode.error = None;
+    state.decode.generation = state.decode.generation.wrapping_add(1);
+    let msg = format!(
+        "Extracting audio from: {} stream={} ch={}",
+        path, stream_index, channel_index,
+    );
+    state.status.set_decode(msg.clone());
+    state.jobs.insert(JobKind::LtcDecode, JobStatus::running(msg));
+
+    let capture_gen = state.decode.generation;
+    let decode_fps = state.decode_fps();
+    let decode_drop_frame = state.decode_drop_frame();
+
+    // Hardening: validate the selection against the probe data so a
+    // stale or out-of-range GUI state fails fast with a clear message
+    // instead of invoking ffmpeg on a nonexistent stream.
+    if let Some(ref probe) = state.decode.probe {
+        if let Some(e) = validate_stream_channel_selection(probe, stream_index, channel_index, path) {
+            error!("LTC video decode rejected: {}", e);
+            if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
+                status.progress.phase = job::JobPhase::Failed;
+                status.error = Some(e.clone());
+            }
+            state.decode.error = Some(e.clone());
+            state.status.set_decode(format!("Parse failed: {}", e));
+            return;
+        }
+    }
+
+    let path_job = path.to_string();
+    let spec = job::JobSpec {
+        kind: JobKind::LtcDecode,
+        name: "ltc-video-decode",
+        units: vec![
+            job::UnitSpec { weight: 0.5, label: "extract".into() },
+            job::UnitSpec { weight: 0.5, label: "decode".into() },
+        ],
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        let cancel = ctx.cancel.inner().clone();
+        let extract_unit = ctx.progress.unit(0);
+        extract_unit.set_message("extracting audio…");
+        let on_extract = |frac: f32| {
+            extract_unit.set_fraction(frac);
+        };
+
+        let decode_unit = ctx.progress.unit(1);
+        decode_unit.set_message("decoding LTC…");
+
+        let result = crate::decode::decode_video_channel(
+            crate::decode::VideoDecodeRequest {
+                path: Path::new(&path_job),
+                stream_index,
+                channel_index,
+                use_libltc,
+                decode_fps,
+                decode_drop_frame,
+                cancel: Some(&cancel),
+            },
+            capture_gen,
+            &on_extract,
+            Some(decode_unit),
+        );
+        extract_unit.set_fraction(1.0);
+
+        Ok(result
+            .map(|r| JobFinal::Decode { result: Ok(r), path: PathBuf::from(&path_job) })
+            .unwrap_or_else(|e| JobFinal::Decode { result: Err(e), path: PathBuf::from(&path_job) }))
+    });
+}
+
+/// Validate a stream/channel selection against a video probe. Returns a
+/// human-readable error when the selection cannot be decoded, `None` when
+/// the selection is valid.
+fn validate_stream_channel_selection(
+    probe: &VideoAudioProbe,
+    stream_index: usize,
+    channel_index: usize,
+    path: &str,
+) -> Option<String> {
+    let available: Vec<usize> = probe.streams.iter().map(|s| s.stream_index).collect();
+    match probe.streams.iter().find(|s| s.stream_index == stream_index) {
+        None => Some(format!(
+            "Stream {} not found in '{}' (available audio streams: {:?})",
+            stream_index, path, available
+        )),
+        Some(s) if channel_index >= s.channels => Some(format!(
+            "Channel {} out of range for stream {} in '{}' ({} channels available)",
+            channel_index, stream_index, path, s.channels
+        )),
+        Some(_) => None,
+    }
+}
+
+fn cmd_parse_ltc_wav_file(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    path: &str,
+    use_libltc: bool,
+) {
+    if supervisor.is_running(JobKind::LtcDecode) {
+        info!("LTC decode already in progress — ignoring duplicate ParseLtcWavFile");
+        return;
+    }
+    let decoder_name = if use_libltc { "libltc" } else { "builtin" };
+    info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, els.current.decode_fps());
+
+    // Quick open to calculate chunk count
+    let config = DecodeConfig::default();
+    let chunk_count = match audio_core::count_chunks_in_wav(Path::new(path), &config) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to open WAV for chunked decode: {}", e);
+            let state = &mut els.current;
+            state.decode.error = Some(e.clone());
+            state.status.set_decode(format!("Parse failed: {}", e));
+            if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
+                status.progress.phase = job::JobPhase::Failed;
+                status.error = Some(e.clone());
+            }
+            return;
+        }
+    };
+
+    let state = &mut els.current;
+    state.decode.result = None;
+    state.decode.error = None;
+    state.decode.generation = state.decode.generation.wrapping_add(1);
+    let msg = format!(
+        "Decoding LTC from: {} [{}] at {:.2} fps ({} chunks)",
+        path, decoder_name, state.decode_fps(), chunk_count
+    );
+    state.status.set_decode(msg.clone());
+    state.jobs.insert(JobKind::LtcDecode, JobStatus::running(msg));
+
+    let decode_fps = state.decode_fps();
+    let decode_drop_frame = state.decode_drop_frame();
+
+    info!("Spawning chunked decode ({} chunks, decoder={}, fps={})",
+        chunk_count, decoder_name, decode_fps);
+
+    let path_job = path.to_string();
+    let spec = job::JobSpec {
+        kind: JobKind::LtcDecode,
+        name: "ltc-wav-decode",
+        units: vec![job::UnitSpec { weight: 1.0, label: "decode".into() }],
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        let cancel = ctx.cancel.inner().clone();
+        let unit = ctx.progress.unit(0);
+        unit.set_message("decoding LTC…");
+
+        // Share chunks_done and cancel_flag atomics so the bridge thread
+        // can update UnitProgress while decode_ltc_chunked runs.
+        let chunks_done = Arc::new(AtomicUsize::new(0));
+        let dp = DecodeProgress {
+            chunks_total: chunk_count,
+            chunks_completed: chunks_done.clone(),
+            cancel_flag: cancel.clone(),
+        };
+
+        let dp_bridge = crate::decode::bridge_decode_progress(dp.clone(), unit, None);
+
+        let result = if chunk_count <= 1 {
+            let r = audio_core::decode_ltc_with_decoder(
+                Path::new(&path_job), use_libltc, decode_fps, decode_drop_frame,
+                Some(&cancel),
+            );
+            chunks_done.store(1, Ordering::Relaxed);
+            r
+        } else {
+            let config = DecodeConfig::default();
+            audio_core::decode_ltc_chunked(
+                Path::new(&path_job), use_libltc, decode_fps, decode_drop_frame,
+                config, &dp,
+            )
+        };
+
+        let _ = dp_bridge.join();
+
+        Ok(JobFinal::Decode {
+            result,
+            path: PathBuf::from(path_job),
+        })
+    });
 }
 
 // ── Stepper helpers ─────────────────────────────────────────────────────
@@ -1509,11 +1084,10 @@ fn stepper_frame(state: &mut AppStateSnapshot, delta: i32) {
 
 fn ensure_audio_init(
     core: &AudioCore,
-    state: &mut AppStateSnapshot,
-    last_device_id: &mut Option<String>,
-    recovery_attempts: &mut u8,
+    els: &mut EngineLoopState,
     event_tx: &Sender<AudioEvent>,
 ) -> bool {
+    let state = &mut els.current;
     if state.audio_initialized {
         return true;
     }
@@ -1537,8 +1111,8 @@ fn ensure_audio_init(
                 state.sample_rate = actual_rate;
                 state.audio_initialized = true;
                 state.sample_format_name = core.sample_format_name();
-                *last_device_id = Some(device_id.clone());
-                *recovery_attempts = 0;
+                els.last_device_id = Some(device_id.clone());
+                els.recovery_attempts = 0;
                 info!("Audio initialized at {} Hz on device {}", actual_rate, device_id);
                 return true;
             }
@@ -1568,10 +1142,9 @@ fn ensure_audio_init(
 
 fn try_init_device(
     core: &AudioCore,
-    state: &mut AppStateSnapshot,
-    last_device_id: &mut Option<String>,
-    recovery_attempts: &mut u8,
+    els: &mut EngineLoopState,
 ) -> bool {
+    let state = &mut els.current;
     let device_id = match &state.selected_device {
         Some(id) if state.devices.iter().any(|d| &d.id == id) => id.clone(),
         _ => return false,
@@ -1582,8 +1155,8 @@ fn try_init_device(
             state.sample_rate = actual_rate;
             state.audio_initialized = true;
             state.sample_format_name = core.sample_format_name();
-            *last_device_id = Some(device_id);
-            *recovery_attempts = 0;
+            els.last_device_id = Some(device_id);
+            els.recovery_attempts = 0;
             info!("Device switched, audio at {} Hz", actual_rate);
             true
         }
@@ -1600,10 +1173,8 @@ fn try_init_device(
 fn handle_event(
     event: AudioEvent,
     core: &AudioCore,
-    state: &mut AppStateSnapshot,
-    recovery_attempts: &mut u8,
-    last_device_id: &mut Option<String>,
     event_tx: &Sender<AudioEvent>,
+    els: &mut EngineLoopState,
 ) {
     let event_str = match &event {
         AudioEvent::StreamError(msg) => format!("Audio stream error: {}", msg),
@@ -1627,17 +1198,17 @@ fn handle_event(
             // wait for OS driver cleanup, then re-init and restart if playing.
             // The scheduler watchdog already exhausted 3 soft-recovery attempts
             // before emitting StreamDead, so this is the final hard reset.
-            state.status.set_audio("Stream dead — performing hard reset");
-            attempt_recovery(core, state, recovery_attempts, last_device_id, event_tx);
+            els.current.status.set_audio("Stream dead — performing hard reset");
+            attempt_recovery(core, els, event_tx);
         }
         AudioEvent::RecoveryNeeded { .. } | AudioEvent::StreamDied => {
-            if *recovery_attempts < MAX_RECOVERY_ATTEMPTS {
-                *recovery_attempts += 1;
-                state.status.set_audio(format!("Recovery attempt {}/{}", recovery_attempts, MAX_RECOVERY_ATTEMPTS));
-                attempt_recovery(core, state, recovery_attempts, last_device_id, event_tx);
+            if els.recovery_attempts < MAX_RECOVERY_ATTEMPTS {
+                els.recovery_attempts += 1;
+                els.current.status.set_audio(format!("Recovery attempt {}/{}", els.recovery_attempts, MAX_RECOVERY_ATTEMPTS));
+                attempt_recovery(core, els, event_tx);
             } else {
-                state.is_playing = false;
-                state.status.set_audio("Recovery exhausted");
+                els.current.is_playing = false;
+                els.current.status.set_audio("Recovery exhausted");
             }
         }
         _ => {}
@@ -1648,37 +1219,33 @@ fn handle_event(
 
 fn attempt_recovery(
     core: &AudioCore,
-    state: &mut AppStateSnapshot,
-    recovery_attempts: &mut u8,
-    last_device_id: &mut Option<String>,
+    els: &mut EngineLoopState,
     event_tx: &Sender<AudioEvent>,
 ) {
-    let was_playing = state.is_playing;
-    let stored_tc = state.current_timecode;
+    let was_playing = els.current.is_playing;
+    let stored_tc = els.current.current_timecode;
 
     let _ = core.stop_ltc();
     let _ = core.stop_output();
-    state.audio_initialized = false;
-    state.is_playing = false;
+    els.current.audio_initialized = false;
+    els.current.is_playing = false;
 
     // Allow 150ms for the OS audio driver to release the hardware lock
     // (ALSA/PulseAudio/PipeWire cleanup after dropping the cpal::Stream)
     std::thread::sleep(Duration::from_millis(150));
 
-    if ensure_audio_init(core, state, last_device_id, recovery_attempts, event_tx)
-        && was_playing
-    {
+    if ensure_audio_init(core, els, event_tx) && was_playing {
         let _ = core.reset_ltc(stored_tc);
         match core.start_ltc(
             stored_tc,
-            state.fps(),
-            state.drop_frame(),
-            state.ltc_channel,
-            state.ltc_volume,
+            els.current.fps(),
+            els.current.drop_frame(),
+            els.current.ltc_channel,
+            els.current.ltc_volume,
         ) {
             Ok(()) => {
-                state.is_playing = true;
-                state.current_timecode = stored_tc;
+                els.current.is_playing = true;
+                els.current.current_timecode = stored_tc;
                 info!("Recovery succeeded");
             }
             Err(e) => {
@@ -1708,12 +1275,453 @@ fn apply_ffmpeg_probe_result(current: &mut AppStateSnapshot, caps: FfmpegCapabil
     recompute_converter_derived(current);
 }
 
+// ── Job-event dispatch ──────────────────────────────────────────────────
+
+/// Dispatch a (non-stale) job event to its per-kind handler. The outer
+/// match is on `JobKind` — a closed enum with no wildcard arm, so adding a
+/// new `JobKind` without a handler is a compile error. Payload mismatches
+/// within a kind are logged, never silently dropped.
+fn handle_job_event(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    event: JobEvent,
+) {
+    match event {
+        JobEvent::Finished { kind, outcome, payload, .. } => match kind {
+            JobKind::Conversion => on_conversion_finished(els, outcome, payload),
+            JobKind::FfmpegCapProbe => on_ffmpeg_caps_finished(els, outcome, payload),
+            JobKind::FolderScan => on_folder_scan_finished(els, supervisor, outcome, payload),
+            JobKind::VideoProbe => on_video_probe_finished(els, outcome, payload),
+            JobKind::OffloadScan => on_offload_scan_finished(els, supervisor, outcome, payload),
+            JobKind::DurationProbe => on_duration_probe_finished(els, outcome, payload),
+            JobKind::OffloadCopy => on_offload_copy_finished(els, outcome, payload),
+            JobKind::LtcDecode => on_ltc_decode_finished(els, outcome, payload),
+            JobKind::LtcGroupDecode => on_group_decode_finished(els, outcome, payload),
+            JobKind::ClipProbe => on_clip_probes_finished(els, outcome, payload),
+        },
+        JobEvent::Item { kind, item, .. } => match (kind, item) {
+            (JobKind::DurationProbe, JobItem::DurationResult { path, secs }) => {
+                on_duration_result(els, path, secs);
+            }
+            (JobKind::LtcGroupDecode, JobItem::ClipLtcResult { index, result }) => {
+                on_group_clip_result(els, index, result);
+            }
+            (kind, item) => {
+                warn!("Unhandled job item event for kind {:?}: {:?}", kind, item);
+            }
+        },
+    }
+}
+
+fn on_conversion_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::Conversion) {
+        status.apply_outcome(&outcome);
+    }
+    let payload = match payload {
+        JobFinal::Conversion { encoder_used, steps_attempted } => {
+            info!(
+                "Conversion finished: encoder_used={:?}, steps_attempted={}",
+                encoder_used, steps_attempted,
+            );
+            Some(encoder_used)
+        }
+        other => {
+            warn!("JobKind::Conversion finished with unexpected payload: {:?}", other);
+            None
+        }
+    };
+    match (payload, outcome) {
+        (Some(encoder_used), JobOutcome::Succeeded { .. }) => {
+            recompute_converter_derived(&mut els.current);
+            match encoder_used {
+                Some(enc) => els.current.status.set_converter(
+                    format!("Conversion completed — video encoder: {}", enc),
+                ),
+                None => els.current.status.set_converter("Conversion completed"),
+            }
+            info!("Engine-owned conversion completed successfully (job)");
+        }
+        (None, JobOutcome::Succeeded { .. }) => {
+            // Outcome applied, but the payload was not the expected one —
+            // do not fabricate a completion message.
+            recompute_converter_derived(&mut els.current);
+        }
+        (_, JobOutcome::Cancelled { .. }) => {
+            recompute_converter_derived(&mut els.current);
+            els.current.status.set_converter("Conversion canceled");
+            info!("Engine-owned conversion cancelled (job)");
+        }
+        (_, JobOutcome::Failed { error, .. }) => {
+            if let Some(status) = els.current.jobs.get_mut(&JobKind::Conversion) {
+                status.error = Some(error.clone());
+            }
+            recompute_converter_derived(&mut els.current);
+            els.current.status.set_converter(format!("Conversion failed: {}", error));
+            warn!("Engine-owned conversion failed: {}", error);
+        }
+    }
+}
+
+fn on_ffmpeg_caps_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::FfmpegCapProbe) {
+        status.apply_outcome(&outcome);
+    }
+    match payload {
+        JobFinal::FfmpegCaps { caps: Some(caps) } => {
+            apply_ffmpeg_probe_result(&mut els.current, caps);
+        }
+        JobFinal::FfmpegCaps { caps: None } => {
+            warn!("FFmpeg capability probe returned no caps");
+            recompute_converter_derived(&mut els.current);
+        }
+        other => warn!("JobKind::FfmpegCapProbe finished with unexpected payload: {:?}", other),
+    }
+}
+
+fn on_folder_scan_finished(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    outcome: JobOutcome,
+    payload: JobFinal,
+) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::FolderScan) {
+        status.apply_outcome(&outcome);
+    }
+    match payload {
+        JobFinal::FolderScan { path, groups } => {
+            if Some(&path) == els.current.converter.groups_folder.as_ref() {
+                els.current.converter.groups = groups;
+                info!("Folder scan complete: {} group(s)", els.current.converter.groups.len());
+                if let Some(idx) = els.pending_recording.take() {
+                    info!("Applying deferred SelectRecording({}) after folder scan", idx);
+                    apply_recording_selection(els, supervisor, idx);
+                }
+            } else {
+                warn!("Discarding stale supervisor folder scan result (path mismatch)");
+            }
+        }
+        other => warn!("JobKind::FolderScan finished with unexpected payload: {:?}", other),
+    }
+}
+
+fn on_video_probe_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::VideoProbe) {
+        status.apply_outcome(&outcome);
+    }
+    match payload {
+        JobFinal::VideoProbe { result } => match result {
+            Ok(probe) => {
+                els.current.decode.probe = Some(probe.clone());
+                els.current.decode.selected_stream = 0;
+                els.current.decode.selected_channel = 0;
+                els.current.decode.error = None;
+                els.current.status.set_decode(format!(
+                    "Video probed: {} audio stream(s), {} total channel(s)",
+                    probe.streams.len(),
+                    probe.total_audio_channels,
+                ));
+                info!("Video probe succeeded (job): {} streams, {} channels", probe.streams.len(), probe.total_audio_channels);
+            }
+            Err(e) => {
+                els.current.decode.probe = None;
+                els.current.decode.error = Some(e.clone());
+                els.current.status.set_decode(format!("Video probe failed: {}", e));
+                error!("Video probe failed (job): {}", e);
+            }
+        },
+        other => warn!("JobKind::VideoProbe finished with unexpected payload: {:?}", other),
+    }
+}
+
+fn on_offload_scan_finished(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    outcome: JobOutcome,
+    payload: JobFinal,
+) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::OffloadScan) {
+        status.apply_outcome(&outcome);
+    }
+    let mut cards = match payload {
+        JobFinal::OffloadScan { cards } => cards,
+        other => {
+            warn!("JobKind::OffloadScan finished with unexpected payload: {:?}", other);
+            return;
+        }
+    };
+    // Apply default selection (latest recording day) to each card.
+    let file_paths: Vec<PathBuf> = cards.iter()
+        .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
+        .collect();
+    for card in &mut cards {
+        let sel = crate::offload::default_selection(&card.files);
+        crate::offload::apply_selection(card, sel);
+    }
+    els.current.offload.cards = cards;
+    els.current.offload.file_durations.clear();
+    els.current.offload.durations_version =
+        els.current.offload.durations_version.wrapping_add(1);
+
+    if els.current.offload.cards.is_empty() {
+        info!(
+            "Offload card scan complete: 0 cards — if your card reader \
+             is connected, check that the card is mounted and has \
+             video/audio files"
+        );
+    } else {
+        info!(
+            "Offload card scan complete: {} card(s)",
+            els.current.offload.cards.len()
+        );
+        // Spawn async duration probe for all scanned files
+        let spec = job::JobSpec {
+            kind: JobKind::DurationProbe,
+            name: "offload-dur-probe",
+            units: Vec::new(),
+        };
+        spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+            ctx.progress.set_indeterminate(true);
+            for path in file_paths {
+                if ctx.cancel.is_cancelled() {
+                    break;
+                }
+                let secs = crate::duration::file_duration_secs(&path);
+                ctx.emit(job::JobItem::DurationResult { path, secs });
+            }
+            Ok(JobFinal::DurationsDone)
+        });
+    }
+}
+
+fn on_duration_result(els: &mut EngineLoopState, path: PathBuf, secs: Option<f64>) {
+    // Write to converter file_durations
+    els.current.file_durations.insert(path.clone(), secs);
+    // Write to offload file_durations
+    els.current.offload.file_durations.insert(path, secs);
+    els.current.offload.durations_version =
+        els.current.offload.durations_version.wrapping_add(1);
+}
+
+fn on_duration_probe_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::DurationProbe) {
+        status.apply_outcome(&outcome);
+    }
+    match payload {
+        JobFinal::DurationsDone => info!("Duration probe complete"),
+        other => warn!("JobKind::DurationProbe finished with unexpected payload: {:?}", other),
+    }
+}
+
+fn on_offload_copy_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::OffloadCopy) {
+        status.apply_outcome(&outcome);
+    }
+    let completed_devices = match payload {
+        JobFinal::OffloadCopy { completed_devices } => completed_devices,
+        other => {
+            warn!("JobKind::OffloadCopy finished with unexpected payload: {:?}", other);
+            return;
+        }
+    };
+    if matches!(outcome, JobOutcome::Cancelled { .. }) {
+        info!(
+            "Offload copy was cancelled by user: {} device(s) completed",
+            completed_devices.len(),
+        );
+        els.current.offload.error = Some("Canceled by user".to_string());
+        els.current.status.set_offload("Offload canceled");
+    } else {
+        info!(
+            "Offload copy complete: {} device(s) offloaded of {}",
+            completed_devices.len(),
+            els.current.offload.device_totals.len(),
+        );
+        let parent = els.current.offload.parent_folder.clone();
+        for name in &completed_devices {
+            if !els.current.offload.completed_devices.contains(name) {
+                els.current.offload.completed_devices.push(name.clone());
+            }
+        }
+        let target = parent.map(|p| p.join(&els.current.offload.parent_name));
+        els.current.offload.last_offload_parent = target;
+        els.current.offload.last_offload_version =
+            els.current.offload.last_offload_version.wrapping_add(1);
+        els.current.status.set_offload(format!(
+            "Offload complete: {} device(s) copied",
+            completed_devices.len(),
+        ));
+    }
+}
+
+fn on_ltc_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::LtcDecode) {
+        status.apply_outcome(&outcome);
+    }
+    let (result, path) = match payload {
+        JobFinal::Decode { result, path } => (result, path),
+        other => {
+            warn!("JobKind::LtcDecode finished with unexpected payload: {:?}", other);
+            return;
+        }
+    };
+    let generation = els.current.decode.generation;
+    match result {
+        Ok(r) => {
+            let first_offset = r.first_ltc_timecode_secs;
+            info!(
+                "LTC decode result: path={}, fps={:.2}, valid={}/{}, \
+                 confidence={:.1}%, first_ltc_timecode_secs={:.3}s",
+                path.display(), r.detected_fps, r.valid_frames, r.total_possible_frames,
+                r.avg_confidence * 100.0, first_offset,
+            );
+            els.current.decode.result = Some(r.clone());
+            els.current.decode.error = None;
+            let summary = format!(
+                "LTC decode: {} frames (confidence {:.1}%, {} fps{})",
+                r.valid_frames, r.avg_confidence * 100.0,
+                r.detected_fps, if r.drop_frame { " DF" } else { "" },
+            );
+            els.current.status.set_decode(summary);
+            if generation > els.last_auto_applied_ltc_gen {
+                auto_apply_ltc_to_settings(&mut els.current, &path.to_string_lossy());
+                els.last_auto_applied_ltc_gen = generation;
+                recompute_converter_derived(&mut els.current);
+            }
+        }
+        Err(e) => {
+            let is_cancel = e == "Decode canceled by user";
+            els.current.decode.result = None;
+            els.current.decode.error = if is_cancel { None } else { Some(e.clone()) };
+            els.current.status.set_decode(if is_cancel {
+                "Decode canceled".to_string()
+            } else {
+                format!("Parse failed: {}", e)
+            });
+            if !is_cancel {
+                error!("LTC decode failed: {} — {}", path.display(), e);
+            }
+        }
+    }
+}
+
+fn on_group_clip_result(els: &mut EngineLoopState, index: usize, result: Result<Box<LtcDetectionResult>, String>) {
+    if els.current.decode.group_results.len() > index {
+        els.current.decode.group_results[index] = ClipDecodeState::Done(result);
+        let done = els.current.decode.group_results.iter().filter(|r| r.is_done()).count();
+        els.current.status.set_decode(format!(
+            "Decoding group: {}/{} clips",
+            done, els.current.decode.group_results.len(),
+        ));
+        if let ClipDecodeState::Done(Ok(r)) = &els.current.decode.group_results[index] {
+            info!(
+                "LTC group decode [{}/{}]: {} frames (confidence {:.1}%)",
+                done, els.current.decode.group_results.len(),
+                r.valid_frames, r.avg_confidence * 100.0,
+            );
+        } else if let ClipDecodeState::Done(Err(e)) = &els.current.decode.group_results[index] {
+            warn!("LTC group decode [{}/{}]: failed: {}",
+                done, els.current.decode.group_results.len(), e);
+        }
+    }
+}
+
+fn on_group_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::LtcGroupDecode) {
+        status.apply_outcome(&outcome);
+    }
+    if !matches!(payload, JobFinal::NoPayload) {
+        warn!("JobKind::LtcGroupDecode finished with unexpected payload: {:?}", payload);
+    }
+    // When the user cancelled and a new decode was spawned,
+    // this event is already rejected by the latest_job gate above.
+    let total = els.current.decode.group_results.len();
+    let successes = els.current.decode.group_results.iter().filter(|r| r.ok().is_some()).count();
+    let failures = total - successes;
+    let gen = els.current.decode.group_generation;
+    let tc_info = if successes > 0 {
+        if let Some(ClipDecodeState::Done(Ok(r))) = els.current.decode.group_results.first() {
+            format!(
+                "{} clips decoded ({} ok, {} fail) — {} fps{}",
+                total, successes, failures,
+                r.detected_fps, if r.drop_frame { " DF" } else { "" },
+            )
+        } else {
+            format!("{} clips decoded ({} ok, {} fail)", total, successes, failures)
+        }
+    } else {
+        format!("Group decode complete (all {} clips failed)", failures)
+    };
+    els.current.status.set_decode(tc_info);
+    info!("LTC group decode complete: {}/{} ok, {}/{} failed",
+        successes, total, failures, total);
+    if gen > els.last_auto_applied_group_ltc_gen {
+        auto_apply_group_ltc_to_settings(&mut els.current);
+        els.last_auto_applied_group_ltc_gen = gen;
+        recompute_converter_derived(&mut els.current);
+    }
+}
+
+fn on_clip_probes_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::ClipProbe) {
+        status.apply_outcome(&outcome);
+    }
+    let (probes, cameras, device_name) = match payload {
+        JobFinal::ClipProbes { probes, cameras, device_name } => (probes, cameras, device_name),
+        other => {
+            warn!("JobKind::ClipProbe finished with unexpected payload: {:?}", other);
+            return;
+        }
+    };
+    let probe_generation = els.current.converter.probes_generation;
+    if probe_generation > 0 {
+        if let Some(ref idx) = els.current.converter.selected_group_idx {
+            if let Some(group) = els.current.converter.groups.get(*idx) {
+                if group.recording_type == RecordingType::VideoClipSequence {
+                    if let Some(Ok(ref probe)) = probes.iter().find(|r| r.is_ok()) {
+                        els.current.decode.probe = Some(probe.clone());
+                        els.current.decode.selected_stream = 0;
+                        els.current.decode.selected_channel = 0;
+                        els.current.decode.error = None;
+                    } else {
+                        let err = probes.iter().find_map(|r| {
+                            if let Err(ref e) = r { Some(e.clone()) } else { None }
+                        }).unwrap_or_else(|| "No audio streams detected.".to_string());
+                        els.current.decode.error = Some(format!("LTC source probe failed: {}", err));
+                        els.current.status.set_decode(format!("Video probe failed: {}", err));
+                    }
+                }
+            }
+        }
+        els.current.converter.probes = probes.iter().map(|r| r.as_ref().ok().cloned()).collect();
+        els.current.converter.camera_meta = cameras;
+        els.current.converter.device_name = device_name;
+        info!("Converter clip probe complete: {} files", els.current.converter.probes.len());
+        let is_video_group = els.current.converter.selected_group_idx
+            .and_then(|i| els.current.converter.groups.get(i))
+            .map(|g| g.recording_type == RecordingType::VideoClipSequence)
+            .unwrap_or(false);
+        if is_video_group {
+            let probe_channels = els.current.converter.probes.first()
+                .and_then(|p| p.as_ref())
+                .map(|p| p.total_audio_channels);
+            let map_channels = els.current.converter.settings.channel_map.num_channels();
+            if let Some(ch) = probe_channels {
+                if ch > 0 && ch != map_channels {
+                    els.current.converter.settings.channel_map = ChannelMap::identity(ch);
+                }
+            }
+        }
+        recompute_converter_derived(&mut els.current);
+    }
+}
+
 /// Handle an offload command from within the engine command drain loop.
 fn handle_offload_command(
     cmd: crate::command::OffloadCommand,
-    state: &mut AppStateSnapshot,
+    els: &mut EngineLoopState,
     supervisor: &mut JobSupervisor,
 ) {
+    let state = &mut els.current;
     match cmd {
         crate::command::OffloadCommand::ScanCards => {
             if supervisor.is_running(JobKind::OffloadScan) {
@@ -1799,62 +1807,37 @@ fn handle_offload_command(
                     return;
                 }
             };
-            let dest_parent = parent_folder.join(&state.offload.parent_name);
-
-            // Build plans per device from selected files only
-            let cards = state.offload.cards.clone();
-            let names: Vec<String> = cards.iter().map(|c| c.device_name.clone()).collect();
-            let device_plans: Vec<Vec<crate::offload::CopyPlanItem>> = cards
-                .iter()
-                .map(|card| {
-                    let selected_with_sizes: Vec<(PathBuf, u64)> = card.files.iter()
-                        .zip(card.selected.iter())
-                        .filter(|(_, &sel)| sel)
-                        .map(|(f, _)| (f.path.clone(), f.size_bytes))
-                        .collect();
-                    crate::offload::plan_copies_for_files_with_sizes(
-                        &selected_with_sizes,
-                        &card.device_name,
-                        &dest_parent,
-                    )
-                })
-                .collect();
-
-            let total_selected: usize = device_plans.iter().map(|p| p.len()).sum();
-            if total_selected == 0 {
-                state.offload.error = Some("No files selected.".to_string());
-                return;
-            }
+            let plan = match crate::offload::build_copy_plan(
+                &state.offload.cards,
+                &parent_folder,
+                &state.offload.parent_name,
+            ) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    state.offload.error = Some(e.user_message().to_string());
+                    return;
+                }
+            };
 
             state.offload.error = None;
-            // Build per-device totals from the copy plans
-            let device_totals: Vec<OffloadDeviceTotals> = names.iter().zip(device_plans.iter()).map(|(name, plans)| {
-                OffloadDeviceTotals {
-                    name: name.clone(),
-                    files_total: plans.len(),
-                    bytes_total: plans.iter().map(|p| p.size).sum(),
-                }
-            }).collect();
-            state.offload.device_totals = device_totals;
-            let total_files: usize = device_plans.iter().map(|p| p.len()).sum();
-            let total_bytes: u64 = device_plans.iter().flat_map(|p| p.iter().map(|i| i.size)).sum();
             info!(
                 "Offload started: {} device(s), {} file(s), {} MB → {:?}",
-                names.len(),
-                total_files,
-                total_bytes / (1024 * 1024),
-                dest_parent,
+                plan.device_names.len(),
+                plan.total_files(),
+                plan.total_bytes / (1024 * 1024),
+                plan.dest_parent,
             );
+            state.offload.device_totals = plan.device_totals;
 
-            let dest_parent_job = dest_parent.clone();
-            let names_job = names.clone();
-            let plans_job = device_plans;
+            let dest_parent_job = plan.dest_parent.clone();
+            let names_job = plan.device_names.clone();
+            let plans_job = plan.device_plans;
 
             let spec = job::JobSpec {
                 kind: JobKind::OffloadCopy,
                 name: "offload-copy",
-                units: names.iter().map(|n| job::UnitSpec {
-                    weight: 1.0 / names.len() as f32,
+                units: names_job.iter().map(|n| job::UnitSpec {
+                    weight: 1.0 / names_job.len() as f32,
                     label: n.clone(),
                 }).collect(),
             };
@@ -2056,9 +2039,6 @@ fn apply_set_output_folder(state: &mut AppStateSnapshot, folder: PathBuf) {
     recompute_converter_derived(state);
 }
 
-/// Auto-apply LTC decode results to converter settings (split tracks,
-/// drop LTC track, set start-from-LTC) once per decode generation.
-/// User manual un-ticks survive until the next decode re-run.
 /// Apply `SelectRecording(idx)` to state: reset per-recording state, clear
 /// LTC decode state, cancel in-flight decodes, and spawn converter clip probe
 /// via the unified job supervisor.
@@ -2067,12 +2047,11 @@ fn apply_set_output_folder(state: &mut AppStateSnapshot, folder: PathBuf) {
 /// groups are ready) and from the folder-scan result drain (when a deferred
 /// `SelectRecording` was queued during a pending folder scan).
 fn apply_recording_selection(
-    state: &mut AppStateSnapshot,
-    idx: usize,
+    els: &mut EngineLoopState,
     supervisor: &mut JobSupervisor,
-    last_auto_applied_ltc_gen: &mut u64,
-    last_auto_applied_group_ltc_gen: &mut u64,
+    idx: usize,
 ) {
+    let state = &mut els.current;
     let group_count = state.converter.groups.len();
     // Reset per-recording state
     state.converter.selected_group_idx = Some(idx);
@@ -2132,8 +2111,8 @@ fn apply_recording_selection(
     state.decode.generation = state.decode.generation.wrapping_add(1);
     state.decode.group_generation = state.decode.group_generation.wrapping_add(1);
     // Reset auto-apply latches so next decode re-applies defaults
-    *last_auto_applied_ltc_gen = 0;
-    *last_auto_applied_group_ltc_gen = 0;
+    els.last_auto_applied_ltc_gen = 0;
+    els.last_auto_applied_group_ltc_gen = 0;
     state.status.set_converter("Recording selected — probing…");
 
     // Spawn background probing of all files in the group via unified job infrastructure
@@ -2154,21 +2133,7 @@ fn apply_recording_selection(
         };
         spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
             ctx.progress.set_indeterminate(true);
-            info!("Converter clip probe started: {} file(s)", files.len());
-            let probes: Vec<Result<VideoAudioProbe, String>> = files.iter()
-                .map(|f| crate::ffprobe::probe_video_audio(f).map_err(|e| e.to_string()))
-                .collect();
-            let cameras: Vec<Option<crate::CameraInfo>> = files.iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    if i < crate::device_name::DEVICE_NAME_PROBE_SAMPLE {
-                        crate::camera_meta::probe_camera_info(f)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let (device_name, _, _) = crate::device_name::resolve_device_name(&files, "", Some(&cameras));
+            let (probes, cameras, device_name) = crate::clip_probe::probe_clip_set(&files);
             Ok(JobFinal::ClipProbes { probes, cameras, device_name: Some(device_name) })
         });
     } else {
@@ -2216,6 +2181,255 @@ mod tests {
     use super::*;
     use crate::converter::HwDeviceCapabilities;
     use crate::file_pattern::MatchedGroup;
+    use crate::ffprobe::AudioStreamInfo;
+
+    // ── EngineLoopState ───────────────────────────────────────────────────
+
+    #[test]
+    fn engine_loop_state_defaults() {
+        let els = EngineLoopState::new(AppStateSnapshot::initial());
+        assert_eq!(els.recovery_attempts, 0);
+        assert_eq!(els.log_id_counter, 0);
+        assert_eq!(els.last_device_id, None);
+        assert_eq!(els.previous_device, None);
+        assert_eq!(els.last_auto_applied_ltc_gen, 0);
+        assert_eq!(els.last_auto_applied_group_ltc_gen, 0);
+        assert_eq!(els.pending_recording, None);
+        assert_eq!(els.last_published, None);
+        assert_eq!(els.applied_command_seq, 0);
+    }
+
+    // ── apply_simple_converter_setting ──────────────────────────────────
+
+    #[test]
+    fn simple_converter_setters_map_one_field_each() {
+        use crate::command::ConverterCommand;
+        let mut s = crate::state::ConverterUserSettings::initial();
+
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetMetadataOnly(true)));
+        assert!(s.metadata_only);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetGenerateSyntheticVideo(true)));
+        assert!(s.generate_synthetic_video);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetCopyVideo(true)));
+        assert!(s.copy_video);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetSplitTracks(true)));
+        assert!(s.split_tracks);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetDropLtcTrack(true)));
+        assert!(s.drop_ltc_track);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetConcatAudio(true)));
+        assert!(s.concat_audio);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetStartFromLtc(true)));
+        assert!(s.set_start_from_ltc);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetEmbedCameraMetadata(false)));
+        assert!(!s.embed_camera_metadata);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetLtcFileIndex(3)));
+        assert_eq!(s.ltc_file_idx, 3);
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetVideoCodec("av1".into())));
+        assert_eq!(s.video_encoder, "av1");
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetAudioEncoder("aac".into())));
+        assert_eq!(s.audio_encoder, "aac");
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetFilenamePrefix("pre".into())));
+        assert_eq!(s.filename_prefix, "pre");
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetAudioSuffixTemplate("_a".into())));
+        assert_eq!(s.audio_suffix_template, "_a");
+        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetVideoSuffixTemplate("_v".into())));
+        assert_eq!(s.video_suffix_template, "_v");
+    }
+
+    #[test]
+    fn special_converter_commands_are_not_simple_setters() {
+        use crate::command::ConverterCommand;
+        let mut s = crate::state::ConverterUserSettings::initial();
+        let before = s.clone();
+
+        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SetContainer("mkv".into())));
+        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SwapChannelMapCells(0, 1)));
+        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SetOutputFolder(PathBuf::from("/x"))));
+        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SelectFolder(PathBuf::from("/x"))));
+        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SelectRecording(0)));
+        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::StartConversion));
+        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::CancelConversion));
+        assert_eq!(s, before, "special commands must not mutate settings in the simple setter");
+    }
+
+    // ── job-event handlers ───────────────────────────────────────────────
+
+    fn make_ltc_result() -> audio_core::LtcDetectionResult {
+        audio_core::LtcDetectionResult {
+            status: audio_core::LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            total_possible_frames: 100,
+            valid_frames: 100,
+            timecodes: vec![],
+            avg_confidence: 0.95,
+            details: vec![],
+            total_audio_duration_secs: 4.0,
+            sample_rate: 48000,
+            processing_time_ms: 10.0,
+            first_ltc_timecode_secs: 0.0,
+            quality: None,
+        }
+    }
+
+    #[test]
+    fn on_conversion_finished_consumes_encoder_used() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
+        on_conversion_finished(
+            &mut els,
+            JobOutcome::Succeeded { log: String::new() },
+            JobFinal::Conversion { encoder_used: Some("av1_nvenc".into()), steps_attempted: 2 },
+        );
+        assert_eq!(els.current.status.converter, "Conversion completed — video encoder: av1_nvenc");
+        assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Succeeded);
+    }
+
+    #[test]
+    fn on_conversion_finished_encoder_none_keeps_plain_message() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
+        on_conversion_finished(
+            &mut els,
+            JobOutcome::Succeeded { log: String::new() },
+            JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
+        );
+        assert_eq!(els.current.status.converter, "Conversion completed");
+    }
+
+    #[test]
+    fn on_conversion_finished_failed_sets_error() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
+        on_conversion_finished(
+            &mut els,
+            JobOutcome::Failed { error: "boom".into(), log: String::new() },
+            JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
+        );
+        assert_eq!(els.current.job(JobKind::Conversion).error.as_deref(), Some("boom"));
+        assert_eq!(els.current.status.converter, "Conversion failed: boom");
+    }
+
+    #[test]
+    fn on_ltc_decode_finished_applies_once_per_generation() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.converter.groups = vec![MatchedGroup {
+            prefix: "T".into(),
+            rel_dir: String::new(),
+            recording_type: crate::converter::RecordingType::MultiTrackAudio,
+            files: vec![PathBuf::from("/tmp/T_S01.wav")],
+        }];
+        els.current.converter.selected_group_idx = Some(0);
+        els.current.decode.generation = 5;
+        els.current.decode.generation = 5;
+
+        let payload = || JobFinal::Decode {
+            result: Ok(make_ltc_result()),
+            path: PathBuf::from("/tmp/T_S01.wav"),
+        };
+        let outcome = || JobOutcome::Succeeded { log: String::new() };
+
+        on_ltc_decode_finished(&mut els, outcome(), payload());
+        assert!(els.current.converter.settings.split_tracks, "first finish auto-applies");
+        assert!(els.current.converter.settings.set_start_from_ltc);
+
+        // User un-ticks, then a duplicate event for the same generation arrives.
+        els.current.converter.settings.split_tracks = false;
+        on_ltc_decode_finished(&mut els, outcome(), payload());
+        assert!(!els.current.converter.settings.split_tracks, "latch must prevent re-apply within a generation");
+
+        // New generation → auto-apply again.
+        els.current.decode.generation = 6;
+        on_ltc_decode_finished(&mut els, outcome(), payload());
+        assert!(els.current.converter.settings.split_tracks, "new generation re-applies");
+    }
+
+    #[test]
+    fn on_ltc_decode_finished_cancel_error_clears_result() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.decode.result = Some(make_ltc_result());
+        on_ltc_decode_finished(
+            &mut els,
+            JobOutcome::Failed { error: "Decode canceled by user".into(), log: String::new() },
+            JobFinal::Decode { result: Err("Decode canceled by user".into()), path: PathBuf::from("/tmp/x.wav") },
+        );
+        assert!(els.current.decode.result.is_none());
+        assert!(els.current.decode.error.is_none(), "cancel must not surface as an error");
+        assert_eq!(els.current.status.decode, "Decode canceled");
+    }
+
+    #[test]
+    fn handle_job_event_ignores_wrong_payload_without_panicking() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
+        handle_job_event(
+            &mut els,
+            &mut JobSupervisor::new(),
+            JobEvent::Finished {
+                job: job::JobId(1),
+                kind: JobKind::Conversion,
+                outcome: JobOutcome::Succeeded { log: String::new() },
+                payload: JobFinal::DurationsDone, // wrong payload for Conversion
+            },
+        );
+        // Outcome is still applied, but the (missing) encoder payload must
+        // not produce the completion message.
+        assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Succeeded);
+        assert!(!els.current.status.converter.contains("Conversion completed"));
+    }
+
+    #[test]
+    fn handle_job_event_item_mismatch_is_ignored_safely() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        handle_job_event(
+            &mut els,
+            &mut JobSupervisor::new(),
+            JobEvent::Item {
+                job: job::JobId(1),
+                kind: JobKind::Conversion, // wrong kind for a DurationResult item
+                item: JobItem::DurationResult { path: PathBuf::from("/x.wav"), secs: Some(1.0) },
+            },
+        );
+        assert!(els.current.file_durations.is_empty(), "mismatched item must not be applied");
+    }
+
+    // ── validate_stream_channel_selection ────────────────────────────────
+
+    fn probe_with_streams(streams: Vec<AudioStreamInfo>) -> VideoAudioProbe {
+        VideoAudioProbe {
+            total_audio_channels: streams.iter().map(|s| s.channels).sum(),
+            streams,
+            is_video_file: true,
+        }
+    }
+
+    #[test]
+    fn validate_stream_selection_accepts_valid_pair() {
+        let probe = probe_with_streams(vec![AudioStreamInfo {
+            stream_index: 2, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
+        }]);
+        assert_eq!(validate_stream_channel_selection(&probe, 2, 1, "/x.mp4"), None);
+    }
+
+    #[test]
+    fn validate_stream_selection_rejects_missing_stream() {
+        let probe = probe_with_streams(vec![AudioStreamInfo {
+            stream_index: 2, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
+        }]);
+        let err = validate_stream_channel_selection(&probe, 0, 0, "/x.mp4").unwrap();
+        assert!(err.contains("Stream 0 not found"), "{}", err);
+        assert!(err.contains("[2]"), "{}", err);
+    }
+
+    #[test]
+    fn validate_stream_selection_rejects_out_of_range_channel() {
+        let probe = probe_with_streams(vec![AudioStreamInfo {
+            stream_index: 1, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
+        }]);
+        let err = validate_stream_channel_selection(&probe, 1, 2, "/x.mp4").unwrap();
+        assert!(err.contains("Channel 2 out of range"), "{}", err);
+    }
+
     use crate::job::JobPhase;
     use crate::state::AppStateSnapshot;
     use audio_core::Timecode;
@@ -2547,132 +2761,101 @@ mod tests {
 
     #[test]
     fn test_process_command_toggle_lock() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
         // ToggleLock on: false → true
         process_command(
-            GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
-            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx,
+            GuiCommand::ToggleLock, &core, true, &event_tx, &mut els, &mut supervisor,
         );
-        assert!(state.is_locked);
+        assert!(els.current.is_locked);
     }
 
     #[test]
     fn test_process_command_toggle_lock_twice() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
-            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        process_command(GuiCommand::ToggleLock, &core, true, &mut state, &mut recovery,
-            &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!(!state.is_locked);
+        process_command(GuiCommand::ToggleLock, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(GuiCommand::ToggleLock, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!(!els.current.is_locked);
     }
 
     #[test]
     fn test_process_command_set_fps_index_valid() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetFpsIndex(4), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.fps_index, 4);
-        assert_eq!(state.fps(), 30.0);
-        assert!(!state.drop_frame());
+        process_command(GuiCommand::SetFpsIndex(4), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.fps_index, 4);
+        assert_eq!(els.current.fps(), 30.0);
+        assert!(!els.current.drop_frame());
     }
 
     #[test]
     fn test_process_command_set_fps_index_drop_frame() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetFpsIndex(3), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.fps_index, 3);
-        assert!((state.fps() - 29.97).abs() < 0.01);
-        assert!(state.drop_frame());
+        process_command(GuiCommand::SetFpsIndex(3), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.fps_index, 3);
+        assert!((els.current.fps() - 29.97).abs() < 0.01);
+        assert!(els.current.drop_frame());
     }
 
     #[test]
     fn test_process_command_set_fps_index_out_of_range() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetFpsIndex(99), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.fps_index, 1);
-        assert_eq!(state.fps(), 25.0);
+        process_command(GuiCommand::SetFpsIndex(99), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.fps_index, 1);
+        assert_eq!(els.current.fps(), 25.0);
     }
 
     #[test]
     fn test_process_command_set_theme() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetTheme(true), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!(state.is_dark_theme);
+        process_command(GuiCommand::SetTheme(true), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!(els.current.is_dark_theme);
 
-        process_command(GuiCommand::SetTheme(false), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!(!state.is_dark_theme);
+        process_command(GuiCommand::SetTheme(false), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!(!els.current.is_dark_theme);
     }
 
     #[test]
     fn test_process_command_toggle_theme() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::ToggleTheme, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!(state.is_dark_theme, "toggle from initial false → true");
+        process_command(GuiCommand::ToggleTheme, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!(els.current.is_dark_theme, "toggle from initial false → true");
 
-        process_command(GuiCommand::ToggleTheme, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!(!state.is_dark_theme, "toggle again true → false");
+        process_command(GuiCommand::ToggleTheme, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!(!els.current.is_dark_theme, "toggle again true → false");
     }
 
     #[test]
@@ -2687,253 +2870,192 @@ mod tests {
             timecode: "01:00:00:01".into(), milliseconds: "0".into(), note: "test2".into(),
         });
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::ClearLogs, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!(state.clapper.logs.is_empty());
+        process_command(GuiCommand::ClearLogs, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!(els.current.clapper.logs.is_empty());
     }
 
     #[test]
     fn test_process_command_set_ltc_channel() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetLtcChannel(ChannelSel::Both), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.ltc_channel, ChannelSel::Both);
+        process_command(GuiCommand::SetLtcChannel(ChannelSel::Both), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.ltc_channel, ChannelSel::Both);
     }
 
     #[test]
     fn test_process_command_set_beep_volume() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetBeepVolume(0.75), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!((state.beep_volume - 0.75).abs() < 1e-6);
+        process_command(GuiCommand::SetBeepVolume(0.75), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!((els.current.beep_volume - 0.75).abs() < 1e-6);
     }
 
     #[test]
     fn test_process_command_set_start_timecode() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
         let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
 
-        process_command(GuiCommand::SetStartTimecode(tc), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.start_timecode, tc);
+        process_command(GuiCommand::SetStartTimecode(tc), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.start_timecode, tc);
     }
 
     #[test]
     fn test_process_command_set_scene_take_roll() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetScene(42), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.scene, 42);
+        process_command(GuiCommand::SetScene(42), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.scene, 42);
 
-        process_command(GuiCommand::SetTake(7), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.take, 7);
+        process_command(GuiCommand::SetTake(7), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.take, 7);
 
-        process_command(GuiCommand::SetRoll("B002".into()), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.roll, "B002");
+        process_command(GuiCommand::SetRoll("B002".into()), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.roll, "B002");
     }
 
     #[test]
     fn test_process_command_scene_up_down() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        state.clapper.scene = 5;
-        process_command(GuiCommand::SceneUp, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.scene, 6);
+        els.current.clapper.scene = 5;
+        process_command(GuiCommand::SceneUp, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.scene, 6);
 
-        process_command(GuiCommand::SceneDown, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.scene, 5);
+        process_command(GuiCommand::SceneDown, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.scene, 5);
     }
 
     #[test]
     fn test_process_command_take_up_down() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        state.clapper.take = 3;
-        process_command(GuiCommand::TakeUp, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.take, 4);
+        els.current.clapper.take = 3;
+        process_command(GuiCommand::TakeUp, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.take, 4);
 
-        process_command(GuiCommand::TakeDown, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.take, 3);
+        process_command(GuiCommand::TakeDown, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.take, 3);
     }
 
     #[test]
     fn test_process_command_scene_down_at_zero() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        state.clapper.scene = 0;
-        process_command(GuiCommand::SceneDown, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.scene, 0, "scene should not go below 0");
+        els.current.clapper.scene = 0;
+        process_command(GuiCommand::SceneDown, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.scene, 0, "scene should not go below 0");
     }
 
     #[test]
     fn test_process_command_take_down_at_zero() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        state.clapper.take = 0;
-        process_command(GuiCommand::TakeDown, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.clapper.take, 0, "take should not go below 0");
+        els.current.clapper.take = 0;
+        process_command(GuiCommand::TakeDown, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.take, 0, "take should not go below 0");
     }
 
     #[test]
     fn test_process_command_set_sample_rate() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetSampleRate(48000), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.sample_rate, 48000);
+        process_command(GuiCommand::SetSampleRate(48000), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.sample_rate, 48000);
     }
 
     #[test]
     fn test_process_command_set_auto_increment() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetAutoIncrement(false), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!(!state.clapper.auto_increment_take);
+        process_command(GuiCommand::SetAutoIncrement(false), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!(!els.current.clapper.auto_increment_take);
 
-        process_command(GuiCommand::SetAutoIncrement(true), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!(state.clapper.auto_increment_take);
+        process_command(GuiCommand::SetAutoIncrement(true), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!(els.current.clapper.auto_increment_take);
     }
 
     #[test]
     fn test_process_command_set_decode_fps_index() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetDecodeFpsIndex(4), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert_eq!(state.decode.fps_index, 4);
-        assert_eq!(state.decode_fps(), 30.0);
-        assert!(!state.decode_drop_frame());
+        process_command(GuiCommand::SetDecodeFpsIndex(4), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.decode.fps_index, 4);
+        assert_eq!(els.current.decode_fps(), 30.0);
+        assert!(!els.current.decode_drop_frame());
     }
 
     #[test]
     fn test_process_command_set_decode_fps_index_drop_frame() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetDecodeFpsIndex(3), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
-        assert!((state.decode_fps() - 29.97).abs() < 0.01);
-        assert!(state.decode_drop_frame());
+        process_command(GuiCommand::SetDecodeFpsIndex(3), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!((els.current.decode_fps() - 29.97).abs() < 0.01);
+        assert!(els.current.decode_drop_frame());
     }
 
     #[test]
     fn test_process_command_set_decode_fps_index_out_of_range() {
-        let mut state = setup_state();
+        let state = setup_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetDecodeFpsIndex(99), &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx);
+        process_command(GuiCommand::SetDecodeFpsIndex(99), &core, true, &event_tx, &mut els, &mut supervisor);
         // Should not change since index is out of range
-        assert_eq!(state.decode.fps_index, 1);
+        assert_eq!(els.current.decode.fps_index, 1);
     }
 
     // ── drain_ffmpeg_probe_result ─────────────────────────────────────────
@@ -2992,68 +3114,56 @@ mod tests {
 
     #[test]
     fn test_clear_recording_decode_state_clears_single_state() {
-        let mut state = setup_decode_state();
+        let state = setup_decode_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx,
+            GuiCommand::ClearRecordingDecodeState, &core, true, &event_tx, &mut els, &mut supervisor,
         );
 
-        assert!(state.decode.result.is_none(), "single result cleared");
-        assert!(state.decode.error.is_none(), "error cleared");
-        assert!(state.decode.probe.is_none(), "probe cleared");
-        assert_eq!(state.job(JobKind::LtcDecode).phase(), JobPhase::Idle, "LtcDecode job reset to Idle");
-        assert_eq!(state.decode.generation, 43, "decode gen bumped from 42");
+        assert!(els.current.decode.result.is_none(), "single result cleared");
+        assert!(els.current.decode.error.is_none(), "error cleared");
+        assert!(els.current.decode.probe.is_none(), "probe cleared");
+        assert_eq!(els.current.job(JobKind::LtcDecode).phase(), JobPhase::Idle, "LtcDecode job reset to Idle");
+        assert_eq!(els.current.decode.generation, 43, "decode gen bumped from 42");
     }
 
     #[test]
     fn test_clear_recording_decode_state_clears_group_state() {
-        let mut state = setup_decode_state();
+        let state = setup_decode_state();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx,
+            GuiCommand::ClearRecordingDecodeState, &core, true, &event_tx, &mut els, &mut supervisor,
         );
 
-        assert!(state.decode.group_paths.is_empty(), "group paths cleared");
-        assert!(state.decode.group_results.is_empty(), "group results cleared");
-        assert_eq!(state.job(JobKind::LtcGroupDecode).phase(), JobPhase::Idle, "LtcGroupDecode job reset to Idle");
-        assert_eq!(state.decode.group_generation, 100, "group decode gen bumped from 99");
+        assert!(els.current.decode.group_paths.is_empty(), "group paths cleared");
+        assert!(els.current.decode.group_results.is_empty(), "group results cleared");
+        assert_eq!(els.current.job(JobKind::LtcGroupDecode).phase(), JobPhase::Idle, "LtcGroupDecode job reset to Idle");
+        assert_eq!(els.current.decode.group_generation, 100, "group decode gen bumped from 99");
     }
 
     #[test]
     fn test_clear_recording_decode_state_generation_noop_when_empty() {
-        let mut state = AppStateSnapshot::initial();
+        let state = AppStateSnapshot::initial();
         let core = audio_core::AudioCore::new();
-        let mut recovery = 0;
-        let mut log_id = 0;
-        let mut last_dev = None;
-        let mut prev_dev = None;
         let mut supervisor = JobSupervisor::new();
         let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, true, &mut state,
-            &mut recovery, &mut log_id, &mut last_dev, &mut prev_dev, &mut supervisor, &event_tx,
+            GuiCommand::ClearRecordingDecodeState, &core, true, &event_tx, &mut els, &mut supervisor,
         );
 
         // Should not panic on empty state, just bump generations
-        assert_eq!(state.decode.generation, 1, "decode gen bumped from 0");
-        assert_eq!(state.decode.group_generation, 1, "group decode gen bumped from 0");
+        assert_eq!(els.current.decode.generation, 1, "decode gen bumped from 0");
+        assert_eq!(els.current.decode.group_generation, 1, "group decode gen bumped from 0");
     }
 
     // ── assemble_converter_settings ─────────────────────────────────────
@@ -3132,10 +3242,11 @@ mod tests {
     /// Helper: call `apply_recording_selection` with minimal argument
     /// plumbing.
     fn apply_sel(state: &mut AppStateSnapshot, idx: usize) {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        std::mem::swap(&mut els.current, state);
         let mut supervisor = JobSupervisor::new();
-        apply_recording_selection(
-            state, idx, &mut supervisor, &mut 0, &mut 0,
-        );
+        apply_recording_selection(&mut els, &mut supervisor, idx);
+        std::mem::swap(state, &mut els.current);
     }
 
     /// Helper: a video group in a subdirectory (one that would be found by

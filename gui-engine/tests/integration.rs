@@ -1018,3 +1018,64 @@ fn test_applied_command_seq_stays_zero_when_idle() {
     drop(tx);
     handle.join().expect("engine thread panicked");
 }
+
+// ── Publish-gate regression: idle ticks must not re-publish ────────────
+
+/// The engine's publish gate must store a new snapshot into the ArcSwap only
+/// when the snapshot actually changed. If the gate ever degrades to an
+/// unconditional store, the Arc pointer held by ArcSwap changes on every
+/// 40 ms tick — which this test detects via `Arc::ptr_eq` between two
+/// back-to-back loads during an idle phase.
+#[test]
+fn test_idle_engine_does_not_republish_snapshot() {
+    init_test_config();
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+
+    let handle = std::thread::Builder::new()
+        .name("publish-gate-test".into())
+        .spawn(move || {
+            let (event_tx, _event_rx) = mpsc::channel();
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
+        })
+        .expect("failed to spawn engine thread");
+
+    // Wait for the first publish (generation counter appears in the snapshot).
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        if state.load().applied_command_seq == 0 && !state.load().status.audio.is_empty() {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("engine never published an initial snapshot");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    // Let a few idle ticks pass so any spurious re-publish would have happened.
+    std::thread::sleep(Duration::from_millis(150));
+
+    let first = state.load();
+    let second = state.load();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "idle ticks must not replace the published Arc snapshot",
+    );
+
+    // A state-changing command must still open the gate.
+    tx.send(GuiCommand::ToggleLock).unwrap();
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let snap = state.load();
+        if snap.is_locked {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("engine never published the ToggleLock change");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    drop(tx);
+    handle.join().expect("engine thread panicked");
+}
