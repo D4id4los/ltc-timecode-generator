@@ -477,6 +477,15 @@ In-module `#[cfg(test)]` unit tests cover offload (46 tests), naming (38), durat
 
 Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 
+## CI & SonarQube Cloud
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on push to `main` and on PRs: clippy (JSON report), Rust tests + coverage via `cargo llvm-cov --nextest` (LCOV), TypeScript typecheck, vitest tests + coverage (LCOV), and a SonarQube Cloud scan. The Sonar step is skipped when the `SONAR_TOKEN` repo secret is absent, so the workflow works in forks without setup.
+
+- **Sonar project**: `D4id4los_ltc-timecode-generator` in organization `d4id4los` (sonarcloud.io). Analysis config lives in `sonar-project.properties` (sources = the four workspace crates + `src/`, exclusions = `src-tauri*`, `*.slint` — Slint markup has no Sonar analyzer).
+- **Rust analysis** uses the official SonarSource Rust analyzer (CI-based only — no automatic analysis for Rust). Clippy findings are imported as external issues from `clippy-report.json` (`cargo clippy --message-format=json`), coverage from `lcov.info` + `coverage/lcov.info` (both gitignored).
+- **CI environment**: `libltc-dev` + `libclang-dev` + `ffmpeg` via apt, `PKG_CONFIG_PATH` set, Rust stable with `clippy` + `llvm-tools-preview`, cargo build cache via `Swatinem/rust-cache`, nextest + cargo-llvm-cov via `taiki-e/install-action`, Node 22 with npm cache, SonarScanner CLI binaries cached in `~/.sonar/cache` via `actions/cache`.
+- **Local parity**: `npm run test:coverage` runs vitest with the LCOV reporter configured in `vite.config.ts`.
+
 ## Build & Run
 
 **Important:** `libltc-rs` requires the system `libltc` library. Install it and set `PKG_CONFIG_PATH`:

@@ -26,3 +26,8 @@ perf-test/results/
 /.cargo/
 /target/
 /deploy-to-onedrive.sh
+
+# CI/Sonar report artifacts
+clippy-report.json
+lcov.info
+

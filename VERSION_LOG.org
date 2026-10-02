@@ -1,6 +1,38 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — CI pipeline and SonarQube Cloud code-quality analysis
+
+Introduction of continuous integration and automated code-quality metrics
+via GitHub Actions and SonarQube Cloud (official SonarSource Rust
+analyzer).
+
+List of Changes:
+- GitHub Actions workflow (`.github/workflows/ci.yml`): runs on push to
+  `main` and on pull requests.  Installs the build prerequisites
+  (`libltc-dev`, `libclang-dev`, `ffmpeg`, `PKG_CONFIG_PATH`), runs
+  clippy across the workspace with a JSON report, executes the Rust
+  test suite with coverage via `cargo llvm-cov --nextest` (LCOV,
+  benefiting from the existing nextest `ci` retry profile for the
+  timing-sensitive integration suites), runs the TypeScript typecheck
+  and the vitest suite with coverage, and finishes with the SonarQube
+  Cloud scan.  Cargo and npm build caches keep repeat runs fast.
+- SonarQube Cloud integration (`sonar-project.properties`): project
+  key `D4id4los_ltc-timecode-generator`, organization `d4id4los`.
+  Analyzes the four workspace Rust crates plus the legacy web app;
+  the legacy `src-tauri`/`src-tauri-32bit` crates and Slint UI markup
+  (no Sonar analyzer exists for Slint) are excluded.  Clippy findings
+  are imported as external issues and LCOV coverage from both the Rust
+  and web test suites is published.  The scan step is skipped when the
+  `SONAR_TOKEN` repository secret is absent, so forks run plain CI.
+- Web test coverage tooling: `@vitest/coverage-v8` dev-dependency, a
+  `npm run test:coverage` script, and an LCOV coverage reporter
+  configured in `vite.config.ts`.
+- Documentation: new "CI & SonarQube Cloud" sections in AGENTS.md and
+  README.org; report artifacts (`clippy-report.json`, `lcov.info`)
+  added to `.gitignore`.
+
+
 * Unreleased — unified shadow-state interaction architecture
 
 Rework of how the GUIs communicate with the engine around interactive
