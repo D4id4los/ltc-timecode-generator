@@ -912,8 +912,21 @@ fn run_metadata_only(
     report: &impl ConversionReport,
     total_steps: usize,
 ) {
+    run_metadata_only_with(settings, report, total_steps, &mut |p: &Path| {
+        crate::ffprobe::probe_video_audio(p)
+    })
+}
+
+/// Injectable-prober variant of [`run_metadata_only`] so logic-level tests
+/// can drive the phases without ffprobe.
+fn run_metadata_only_with(
+    settings: &ConverterSettings,
+    report: &impl ConversionReport,
+    total_steps: usize,
+    prober: &mut dyn FnMut(&Path) -> Result<crate::ffprobe::VideoAudioProbe, String>,
+) {
     let mut ledger = FailureLedger::default();
-    let Some(probes) = probe_all_metadata_files(settings, report, &mut ledger) else {
+    let Some(probes) = probe_all_metadata_files_with(settings, report, &mut ledger, prober) else {
         return;
     };
     let Some(()) = extract_metadata_audio(settings, &probes, report, total_steps, &mut ledger) else {
@@ -927,10 +940,11 @@ fn run_metadata_only(
 
 /// Phase P — probe every input up front (video inputs only) so
 /// `plan_concat_outputs` can see every clip. Returns `None` on cancel.
-fn probe_all_metadata_files(
+fn probe_all_metadata_files_with(
     settings: &ConverterSettings,
     report: &impl ConversionReport,
     ledger: &mut FailureLedger,
+    prober: &mut dyn FnMut(&Path) -> Result<crate::ffprobe::VideoAudioProbe, String>,
 ) -> Option<Vec<Option<crate::ffprobe::VideoAudioProbe>>> {
     let is_video = settings.recording_type == RecordingType::VideoClipSequence;
     let mut probes = Vec::with_capacity(settings.input_files.len());
@@ -939,7 +953,7 @@ fn probe_all_metadata_files(
             return None;
         }
         let probed: Option<crate::ffprobe::VideoAudioProbe> = if is_video {
-            match crate::ffprobe::probe_video_audio(input_path) {
+            match prober(input_path) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     let msg = format!(
@@ -1656,6 +1670,167 @@ mod tests {
         let msg = report.message.lock().unwrap().clone();
         assert!(msg.contains("STEP(S) FAILED"), "summary in failure message: {}", msg);
         assert!(msg.contains("probe failed"), "typed details present: {}", msg);
+    }
+
+    // ── PR-7: logic-level tests via the prober seam ──────────────────────
+
+    use crate::converter::test_fixtures::{make_stereo_probe, make_video_settings as fixture_video};
+
+    #[test]
+    fn test_metadata_only_with_probe_failure_branch() {
+        // Every probe fails (fake prober) → nothing succeeds → run fails
+        // with the per-file details, without spawning any ffmpeg process.
+        let mut settings = fixture_video();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![
+            PathBuf::from("/nonexistent/clip1.mp4"),
+            PathBuf::from("/nonexistent/clip2.mp4"),
+        ];
+        settings.timecode_meta_per_file = vec![tc_meta(), tc_meta()];
+
+        let report = TestReport::new();
+        let mut prober = |_p: &Path| Err("no such file".to_string());
+        run_metadata_only_with(&settings, &report, 6, &mut prober);
+
+        assert!(*report.failed.lock().unwrap(), "all probes failed → run failed");
+        let msg = report.message.lock().unwrap().clone();
+        assert!(msg.contains("probe failed"), "details present: {}", msg);
+    }
+
+    #[test]
+    fn test_metadata_only_cancel_between_phases() {
+        // The prober flips the cancel flag, so the run cancels at the start
+        // of the extraction phase — before any ffmpeg spawn.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut settings = fixture_video();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![dir.path().join("clip1.mp4")];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.timecode_meta_per_file = vec![tc_meta()];
+
+        let report = TestReport::new();
+        let cancelled = report.cancelled.clone();
+        let mut prober = move |_p: &Path| {
+            cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(make_stereo_probe())
+        };
+        run_metadata_only_with(&settings, &report, 3, &mut prober);
+
+        assert!(*report.failed.lock().unwrap(), "cancel between phases fails the run");
+        assert!(report.log.lock().unwrap().contains("CANCELLED"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "no outputs produced");
+    }
+
+    #[test]
+    fn test_metadata_only_concat_planning_path() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut settings = fixture_video();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![
+            dir.path().join("clip1.mp4"),
+            dir.path().join("clip2.mp4"),
+        ];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.split_tracks = true;
+        settings.concat_audio = true;
+        settings.channel_map = crate::ChannelMap::identity(2);
+        settings.timecode_meta_per_file = vec![tc_meta(), tc_meta()];
+
+        let report = TestReport::new();
+        let mut prober = |_p: &Path| Ok(make_stereo_probe());
+        run_metadata_only_with(&settings, &report, 8, &mut prober);
+
+        // The concat plan was built (one concat step per surviving track).
+        let log = report.log.lock().unwrap().clone();
+        assert!(log.contains("concat"), "concat args expected in log");
+    }
+
+    #[test]
+    fn test_metadata_only_extraction_failure_accounting() {
+        if skip_if_no_ffmpeg() { return; }
+        // Probe succeeds (fake), but extraction fails on the nonexistent
+        // input → typed ffmpeg failure recorded; nothing succeeds → run
+        // marked failed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut settings = fixture_video();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![PathBuf::from("/nonexistent/clip1.mp4")];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.timecode_meta_per_file = vec![tc_meta()];
+
+        let report = TestReport::new();
+        let mut prober = |_p: &Path| Ok(make_stereo_probe());
+        run_metadata_only_with(&settings, &report, 3, &mut prober);
+
+        assert!(*report.failed.lock().unwrap(), "all steps failed → failed");
+        let msg = report.message.lock().unwrap().clone();
+        assert!(
+            msg.contains("audio extraction failed"),
+            "typed extraction detail present: {}", msg
+        );
+    }
+
+    #[test]
+    fn test_video_to_video_concat_path_multi_clip() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let clip1 = dir.path().join("clip1.mp4");
+        let clip2 = dir.path().join("clip2.mp4");
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip1, 0.5);
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip2, 0.5);
+
+        let mut settings = fixture_video();
+        settings.input_files = vec![clip1, clip2];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.split_tracks = true;
+        settings.concat_audio = true;
+        settings.channel_map = crate::ChannelMap::identity(2);
+
+        let report = TestReport::new();
+        let mut fallback = EncoderFallback::new_with_hw(
+            video_codecs::static_encoder_chain("h264"),
+            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+        );
+        let mut total = 0;
+        run_video_to_video(&mut settings, "mkv", &mut fallback, &report, &mut total);
+
+        assert!(!*report.failed.lock().unwrap(), "concat run should succeed; log: {}",
+            report.log.lock().unwrap());
+        // Per-step weight must be exactly 1.0 / steps.len() (steps.len()
+        // is published via the total out-param).
+        assert!(total > 0);
+        assert!((report.step_weight() - 1.0 / total as f32).abs() < 1e-6,
+            "set_step_weight = 1.0 / steps.len(); got {} for {} steps",
+            report.step_weight(), total);
+    }
+
+    #[test]
+    fn test_video_to_video_bogus_codec_falls_through_and_fails() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let clip = dir.path().join("clip1.mp4");
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip, 0.5);
+
+        let mut settings = fixture_video();
+        settings.input_files = vec![clip];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.video_encoder = "no-such-codec".to_string();
+
+        let report = TestReport::new();
+        let mut fallback = EncoderFallback::new_with_hw(
+            video_codecs::static_encoder_chain("no-such-codec"),
+            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+        );
+        let mut total = 0;
+        run_video_to_video(&mut settings, "mkv", &mut fallback, &report, &mut total);
+
+        assert!(*report.failed.lock().unwrap(), "bogus codec must fail the run");
+        let msg = report.message.lock().unwrap().clone();
+        assert!(
+            msg.contains("failed to initialize") || msg.contains("all encoder candidates"),
+            "encoder-fallback failure text present: {}", msg
+        );
     }
 
     /// Partial failure still completes, but the log carries a visible

@@ -1,6 +1,47 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — WP-3 converter consolidation
+
+Implementation of work package WP-3 from the code-quality report
+(`reports/code-quality-2026-10-02.md`, plan in
+`reports/wp3-converter-consolidation-plan.md`), landed as a sequence of
+behavior-preserving refactors with a handful of deliberate, tested
+behavior fixes:
+
+- One channel-map/drop iteration: `planning::selected_channel_pairs`
+  replaces six drifted copies across planning and the runner. The concat
+  inconsistent-layout fallback now respects the channel map like every
+  other path (previously it silently iterated raw probe streams).
+- `preview_output_files` and `output_collision_warning` become
+  projections of the new `plan_output_paths` (cognitive complexity 74/58
+  down to single digits). Preview and execution now agree on which LTC
+  track is dropped with permuted channel maps, and the collision warning
+  covers concat, synthetic-video, and VideoPassthrough audio outputs it
+  previously never saw.
+- `run_metadata_only` is decomposed into probe / extract / tag+rename /
+  summarize phases with one `check_cancelled` helper and a monotonic
+  step cursor (replacing the broken `file_idx * 3 + 1` labels). Failure
+  accounting is real: a run in which nothing succeeded now ends in
+  `mark_failed` carrying the typed `StepFailure` details, and partial
+  failures surface a `--- N STEP(S) FAILED ---` block — a 100% failed
+  metadata-only run no longer reports COMPLETED SUCCESSFULLY. All five
+  `mark_failed("")` sites now pass the ffmpeg exit reason through to the
+  UI.
+- One ffmpeg watchdog: `subprocess::run_ffmpeg_collect_stderr`
+  (+ `FfmpegRunError`) replaces the twin epilogues in the converter step
+  runner and audio extraction; `ffprobe::run_ffprobe_json_with` is the
+  single spawn/timeout/exit/JSON-parse helper behind all ffprobe JSON
+  calls (duration probing switched to `-of json`, behavior-equivalent).
+- `bext_meta` is the one camera→bext mapping module: the default
+  originator constant (was declared twice), originator/description
+  mapping (was triplicated), and origination date with mtime fallback.
+  The tagger's ffmpeg fallback now writes bext for camera-less files and
+  gains the mtime date fallback, consistent with the converter path.
+- `run_metadata_only` / `run_video_to_video` gain direct test coverage
+  (characterization net, prober seam for logic-level tests, concat /
+  fallback / step-weight paths) — previously zero direct tests.
+
 * Unreleased — WP-2 audio-core restructuring
 
 Implementation of work package WP-2 from the code-quality report
