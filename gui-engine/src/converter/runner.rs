@@ -730,7 +730,7 @@ fn run_video_to_video(
             if report.is_cancelled() { break; }
             let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
             steps.push(StepEntry {
-                step: VideoOutputStep::VideoOnly { file_idx, output: video_out },
+                step: VideoOutputStep::VideoOnly { file_idx, output: video_out, naming_index: file_idx + 1 },
                 is_audio_only: false,
             });
         }
@@ -1037,6 +1037,7 @@ fn extract_concat_audio(
                 channel_idx,
                 output,
                 format,
+                ..
             } => {
                 let sr = probes[*file_idx]
                     .as_ref()

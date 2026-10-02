@@ -21,11 +21,18 @@ pub enum AudioKeep {
 #[derive(Clone, Debug, PartialEq)]
 pub enum VideoOutputStep {
     /// Split mode: video with no audio.
-    VideoOnly { file_idx: usize, output: PathBuf },
+    VideoOnly { file_idx: usize, output: PathBuf, naming_index: usize },
     /// Mux mode: video with audio (possibly filtered).
-    VideoMux { file_idx: usize, output: PathBuf, keep: AudioKeep },
+    VideoMux { file_idx: usize, output: PathBuf, keep: AudioKeep, naming_index: usize },
     /// Extract a single audio channel to a separate file.
-    AudioChannel { file_idx: usize, stream_idx: usize, channel_idx: usize, output: PathBuf, format: String },
+    AudioChannel {
+        file_idx: usize,
+        stream_idx: usize,
+        channel_idx: usize,
+        output: PathBuf,
+        format: String,
+        naming_index: usize,
+    },
     /// Concatenate a single audio track across multiple video clips (one output per track).
     AudioChannelConcat {
         segments: Vec<(usize, usize, usize)>,  // (file_idx, stream_idx, channel_idx) per clip
@@ -103,7 +110,7 @@ pub fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize
 
     if settings.split_tracks {
         let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
-        steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
+        steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out, naming_index: file_idx + 1 });
 
         let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
         let mut emitted = 0usize;
@@ -116,6 +123,7 @@ pub fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize
                 channel_idx: sel.pair.1,
                 output: audio_out,
                 format: fmt.to_string(),
+                naming_index: emitted,
             });
         }
     } else {
@@ -135,6 +143,7 @@ pub fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize
                     file_idx,
                     output: video_out,
                     keep: AudioKeep::AllAudio,
+                    naming_index: file_idx + 1,
                 });
             } else {
                 let total_channels: usize = probe.streams.iter().map(|s| s.channels).sum();
@@ -142,12 +151,13 @@ pub fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize
                     probe.streams.iter().any(|st| st.stream_index == *s && *c < st.channels)
                 }).count();
                 if dropped_count == total_channels {
-                    steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
+                    steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out, naming_index: file_idx + 1 });
                 } else {
                     steps.push(VideoOutputStep::VideoMux {
                         file_idx,
                         output: video_out,
                         keep: AudioKeep::ChannelsExcept(drop_pairs),
+                        naming_index: file_idx + 1,
                     });
                 }
             }
@@ -157,12 +167,13 @@ pub fn plan_video_outputs_for_file(settings: &ConverterSettings, file_idx: usize
                 .map(|sel| sel.pair)
                 .collect();
             if ordered.is_empty() {
-                steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out });
+                steps.push(VideoOutputStep::VideoOnly { file_idx, output: video_out, naming_index: file_idx + 1 });
             } else {
                 steps.push(VideoOutputStep::VideoMux {
                     file_idx,
                     output: video_out,
                     keep: AudioKeep::Reordered(ordered),
+                    naming_index: file_idx + 1,
                 });
             }
         }
@@ -272,6 +283,7 @@ pub fn plan_concat_outputs(
                         channel_idx: sel.pair.1,
                         output: audio_out,
                         format: fmt.to_string(),
+                        naming_index: emitted,
                     });
                 }
                 file_steps
@@ -311,7 +323,24 @@ pub struct PreviewOutput {
     pub path: PathBuf,
 }
 
-pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAudioProbe>) -> Vec<PreviewOutput> {
+/// One planned output file with both its final (collision-guarded) path
+/// and the unguarded path the naming templates produce. `path` is what
+/// the converter writes; `unguarded_path != path` iff the guard renamed
+/// the output because it would overwrite an input file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannedOutput {
+    pub kind: OutputKind,
+    pub path: PathBuf,
+    pub unguarded_path: PathBuf,
+}
+
+/// The single enumeration of "what files will this conversion produce",
+/// for all three pipelines. `preview_output_files` and
+/// `output_collision_warning` are both projections of this.
+pub fn plan_output_paths(
+    settings: &ConverterSettings,
+    probe: Option<&VideoAudioProbe>,
+) -> Vec<PlannedOutput> {
     match settings.pipeline {
         super::settings::ConversionPipeline::VideoPassthrough => {
             let mut settings = settings.clone();
@@ -324,216 +353,147 @@ pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAu
             let use_concat = settings.concat_audio
                 && settings.split_tracks
                 && settings.recording_type == super::settings::RecordingType::VideoClipSequence;
-            let mut previews = Vec::new();
+            let mut out = Vec::new();
 
             if use_concat {
                 for file_idx in 0..settings.input_files.len() {
-                    let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
-                    previews.push(PreviewOutput { kind: OutputKind::Video, path: video_out });
+                    push_planned_video(&mut out, &settings, file_idx, ext);
                 }
-
                 let probe_cloned = probe.cloned();
                 let probes: Vec<Option<VideoAudioProbe>> = (0..settings.input_files.len())
                     .map(|_| probe_cloned.clone())
                     .collect();
                 let (concat_steps, _warning) = plan_concat_outputs(&settings, &probes);
-                for step in &concat_steps {
-                    if let VideoOutputStep::AudioChannelConcat { output, .. } = step {
-                        previews.push(PreviewOutput { kind: OutputKind::Audio, path: output.clone() });
-                    }
+                for i in 0..concat_steps.len() {
+                    push_planned_audio(&mut out, &settings, i + 1);
                 }
             } else if let Some(probe) = probe {
                 for file_idx in 0..settings.input_files.len() {
                     for step in plan_video_outputs_for_file(&settings, file_idx, probe) {
-                        previews.push(PreviewOutput {
-                            kind: match step {
-                                VideoOutputStep::AudioChannel { .. }
-                                | VideoOutputStep::AudioChannelConcat { .. } => OutputKind::Audio,
-                                _ => OutputKind::Video,
-                            },
-                            path: step.output().to_path_buf(),
-                        });
+                        out.push(planned_from_step(&settings, &step, ext));
                     }
                 }
             } else {
                 for file_idx in 0..settings.input_files.len() {
-                    let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
-                    previews.push(PreviewOutput { kind: OutputKind::Video, path: video_out });
+                    push_planned_video(&mut out, &settings, file_idx, ext);
                 }
             }
 
-            previews
+            out
         }
         super::settings::ConversionPipeline::AudioOnly { generate_synthetic_video } => {
-            let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
-            let mut previews = Vec::new();
-
-            if settings.split_tracks {
-                for i in 0..settings.channel_map.num_channels() {
-                    if settings.is_ltc_output_track(i) {
-                        continue;
-                    }
-                    previews.push(PreviewOutput {
-                        kind: OutputKind::Audio,
-                        path: settings.output_path_for_index("audio", i + 1, aext),
-                    });
-                }
-            } else {
-                previews.push(PreviewOutput {
-                    kind: OutputKind::Audio,
-                    path: settings.merged_audio_output_path(aext),
-                });
-            }
-
-            if generate_synthetic_video {
-                let ext = extension_for_container(&settings.container);
-                previews.push(PreviewOutput {
-                    kind: OutputKind::Video,
-                    path: settings.output_path_for_index("video", 1, ext),
-                });
-            }
-
-            previews
+            plan_audio_only_paths(settings, probe, generate_synthetic_video, false)
         }
         super::settings::ConversionPipeline::MetadataOnly => {
-            let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
-            let mut previews = Vec::new();
-            if settings.recording_type == super::settings::RecordingType::VideoClipSequence {
-                let use_concat = settings.concat_audio && settings.split_tracks;
-                if use_concat {
-                    let probes: Vec<Option<VideoAudioProbe>> =
-                        (0..settings.input_files.len()).map(|_| probe.cloned()).collect();
-                    let (concat_steps, _warning) = plan_concat_outputs(settings, &probes);
-                    for step in &concat_steps {
-                        if let VideoOutputStep::AudioChannelConcat { output, .. } = step {
-                            previews.push(PreviewOutput { kind: OutputKind::Audio, path: output.clone() });
-                        }
-                    }
-                } else if settings.split_tracks {
-                    let num_channels = settings.channel_map.num_channels();
-                    for i in 0..num_channels {
-                        if settings.is_ltc_output_track(i) {
-                            continue;
-                        }
-                        previews.push(PreviewOutput {
-                            kind: OutputKind::Audio,
-                            path: settings.output_path_for_index("audio", i + 1, aext),
-                        });
-                    }
-                } else {
-                    previews.push(PreviewOutput {
-                        kind: OutputKind::Audio,
-                        path: settings.merged_audio_output_path(aext),
-                    });
-                }
-            }
-            previews
+            plan_audio_only_paths(settings, probe, false, true)
         }
     }
 }
 
-pub fn output_collision_warning(settings: &ConverterSettings) -> Option<String> {
-    let input_files = &settings.input_files;
-    let mut colliding: Vec<(String, String)> = Vec::new();
+/// Shared AudioOnly / MetadataOnly arm: audio slots from
+/// `selected_channel_pairs` (split), a merged slot, or concat outputs,
+/// plus the synthetic video output for AudioOnly when requested.
+/// MetadataOnly gates the audio slots on `recording_type ==
+/// VideoClipSequence` and uses the concat planning when concatenation
+/// is enabled (matching the old preview behavior).
+fn plan_audio_only_paths(
+    settings: &ConverterSettings,
+    probe: Option<&VideoAudioProbe>,
+    generate_synthetic_video: bool,
+    metadata_only: bool,
+) -> Vec<PlannedOutput> {
+    let mut out = Vec::new();
 
-    match settings.pipeline {
-        super::settings::ConversionPipeline::VideoPassthrough => {
-            for i in 0..input_files.len() {
-                let ext = if settings.copy_video {
-                    copy_mode_container_for_input(&settings.input_files[i])
-                } else {
-                    extension_for_container(&settings.container)
-                };
-                let (guarded, unguarded) = settings.output_path_for_file_checked("video", i, i + 1, ext);
-                if guarded != unguarded {
-                    colliding.push((
-                        unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                        guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                    ));
-                }
+    if !metadata_only
+        || settings.recording_type == super::settings::RecordingType::VideoClipSequence
+    {
+        let use_concat = metadata_only && settings.concat_audio && settings.split_tracks;
+        if use_concat {
+            let probes: Vec<Option<VideoAudioProbe>> =
+                (0..settings.input_files.len()).map(|_| probe.cloned()).collect();
+            let (concat_steps, _warning) = plan_concat_outputs(settings, &probes);
+            for i in 0..concat_steps.len() {
+                push_planned_audio(&mut out, settings, i + 1);
             }
-        }
-        super::settings::ConversionPipeline::AudioOnly { generate_synthetic_video } => {
-            let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
-            if settings.split_tracks {
-                for i in 0..settings.channel_map.num_channels() {
-                    if settings.is_ltc_output_track(i) {
-                        continue;
-                    }
-                    let (guarded, unguarded) = settings.output_path_for_file_checked("audio", 0, i + 1, aext);
-                    if guarded != unguarded {
-                        colliding.push((
-                            unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                            guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                        ));
-                    }
-                }
-            } else {
-                let (guarded, unguarded) = settings.output_path_for_file_checked("audio", 0, 0, aext);
-                if guarded != unguarded {
-                    colliding.push((
-                        unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                        guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                    ));
-                }
+        } else if settings.split_tracks {
+            for sel in selected_channel_pairs(settings, &[]) {
+                push_planned_audio(&mut out, settings, sel.output_k + 1);
             }
-            if generate_synthetic_video {
-                let ext = extension_for_container(&settings.container);
-                let (guarded, unguarded) = settings.output_path_for_file_checked("video", 0, 1, ext);
-                if guarded != unguarded {
-                    colliding.push((
-                        unguarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                        guarded.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
-                    ));
-                }
-            }
-        }
-        super::settings::ConversionPipeline::MetadataOnly => {
-            let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
-            if settings.recording_type == super::settings::RecordingType::VideoClipSequence {
-                if settings.split_tracks {
-                    for i in 0..settings.channel_map.num_channels() {
-                        if settings.is_ltc_output_track(i) {
-                            continue;
-                        }
-                        let (guarded, unguarded) =
-                            settings.output_path_for_file_checked("audio", 0, i + 1, aext);
-                        if guarded != unguarded {
-                            colliding.push((
-                                unguarded
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("?")
-                                    .to_string(),
-                                guarded
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("?")
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                } else {
-                    let (guarded, unguarded) =
-                        settings.output_path_for_file_checked("audio", 0, 0, aext);
-                    if guarded != unguarded {
-                        colliding.push((
-                            unguarded
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("?")
-                                .to_string(),
-                            guarded
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("?")
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
+        } else {
+            push_planned_audio(&mut out, settings, 0);
         }
     }
+
+    if generate_synthetic_video {
+        let ext = extension_for_container(&settings.container);
+        let (guarded, unguarded) =
+            settings.output_path_for_file_checked("video", 0, 1, ext);
+        out.push(PlannedOutput {
+            kind: OutputKind::Video,
+            path: guarded,
+            unguarded_path: unguarded,
+        });
+    }
+
+    out
+}
+
+fn push_planned_video(out: &mut Vec<PlannedOutput>, settings: &ConverterSettings, file_idx: usize, ext: &str) {
+    let (guarded, unguarded) =
+        settings.output_path_for_file_checked("video", file_idx, file_idx + 1, ext);
+    out.push(PlannedOutput { kind: OutputKind::Video, path: guarded, unguarded_path: unguarded });
+}
+
+fn push_planned_audio(out: &mut Vec<PlannedOutput>, settings: &ConverterSettings, index: usize) {
+    let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+    let (guarded, unguarded) =
+        settings.output_path_for_file_checked("audio", 0, index, aext);
+    out.push(PlannedOutput { kind: OutputKind::Audio, path: guarded, unguarded_path: unguarded });
+}
+
+/// Map a planned step to its collision-checked output path.
+/// `video_ext` is the container extension for video steps; audio steps
+/// derive their extension from the audio encoder.
+fn planned_from_step(
+    settings: &ConverterSettings,
+    step: &VideoOutputStep,
+    video_ext: &str,
+) -> PlannedOutput {
+    match step {
+        VideoOutputStep::VideoOnly { file_idx, naming_index, .. }
+        | VideoOutputStep::VideoMux { file_idx, naming_index, .. } => {
+            let (guarded, unguarded) =
+                settings.output_path_for_file_checked("video", *file_idx, *naming_index, video_ext);
+            PlannedOutput { kind: OutputKind::Video, path: guarded, unguarded_path: unguarded }
+        }
+        VideoOutputStep::AudioChannel { file_idx, naming_index, .. } => {
+            let (_fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+            let (guarded, unguarded) =
+                settings.output_path_for_file_checked("audio", *file_idx, *naming_index, aext);
+            PlannedOutput { kind: OutputKind::Audio, path: guarded, unguarded_path: unguarded }
+        }
+        VideoOutputStep::AudioChannelConcat { .. } => {
+            unreachable!("concat steps are handled by the concat arms")
+        }
+    }
+}
+
+pub fn preview_output_files(settings: &ConverterSettings, probe: Option<&VideoAudioProbe>) -> Vec<PreviewOutput> {
+    plan_output_paths(settings, probe)
+        .into_iter()
+        .map(|p| PreviewOutput { kind: p.kind, path: p.path })
+        .collect()
+}
+
+pub fn output_collision_warning(settings: &ConverterSettings) -> Option<String> {
+    let colliding: Vec<(String, String)> = plan_output_paths(settings, None)
+        .into_iter()
+        .filter(|p| p.path != p.unguarded_path)
+        .map(|p| (
+            p.unguarded_path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+            p.path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string(),
+        ))
+        .collect();
 
     if colliding.is_empty() {
         None
@@ -1021,5 +981,130 @@ mod tests {
             .filter(|st| matches!(st, VideoOutputStep::AudioChannel { .. }))
             .count();
         assert_eq!(audio_count, 4, "fallback now respects the channel map");
+    }
+
+    // ── plan_output_paths (PR-4) ─────────────────────────────────────────
+
+    #[test]
+    fn test_plan_output_paths_audio_only_split_and_merged() {
+        let mut s = make_settings_audio_only();
+        s.output_folder = PathBuf::from("/out");
+        s.split_tracks = true;
+        let paths = plan_output_paths(&s, None);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|p| matches!(p.kind, OutputKind::Audio)));
+        // unguarded == guarded (no collision with /tmp inputs)
+        assert!(paths.iter().all(|p| p.path == p.unguarded_path));
+
+        s.split_tracks = false;
+        let paths = plan_output_paths(&s, None);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].path.to_string_lossy().ends_with(".wav"));
+    }
+
+    #[test]
+    fn test_plan_output_paths_audio_only_synthetic_video() {
+        let mut s = make_settings_synthetic_video(0.0);
+        s.output_folder = PathBuf::from("/out");
+        let paths = plan_output_paths(&s, None);
+        assert_eq!(paths.len(), 2, "merged audio + synthetic video");
+        assert!(matches!(paths[1].kind, OutputKind::Video));
+    }
+
+    #[test]
+    fn test_plan_output_paths_collision_guard() {
+        let s = ConverterSettings {
+            input_files: vec![PathBuf::from("/out/input1.wav")],
+            output_folder: PathBuf::from("/out"),
+            filename_prefix: "{filename}".to_string(),
+            audio_suffix_template: String::new(),
+            video_suffix_template: String::new(),
+            ..make_settings_audio_only()
+        };
+        let paths = plan_output_paths(&s, None);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].path.to_string_lossy().contains("_conv"));
+        assert!(!paths[0].unguarded_path.to_string_lossy().contains("_conv"));
+    }
+
+    #[test]
+    fn test_plan_output_paths_video_passthrough_matches_plan_steps() {
+        let s = make_video_settings();
+        let probe = make_stereo_probe();
+        let steps = plan_video_outputs_for_file(&s, 0, &probe);
+        let paths = plan_output_paths(&s, Some(&probe));
+        assert_eq!(paths.len(), steps.len());
+        for (p, st) in paths.iter().zip(steps.iter()) {
+            assert_eq!(p.path, st.output().to_path_buf(),
+                "guarded path must equal the step's planned output");
+        }
+    }
+
+    /// WP-3.2 fix: with a permuted map and a decoded LTC source, the
+    /// preview now drops the same track execution drops (previously the
+    /// preview used the audio-track rule and kept the wrong slot).
+    #[test]
+    fn test_preview_permuted_map_video_ltc_drop_matches_execution() {
+        let mut s = make_video_settings();
+        s.split_tracks = true;
+        s.drop_ltc_track = true;
+        s.ltc_video_source = Some((1, 0));
+        s.channel_map = ChannelMap::from_mapping(vec![1, 0]);
+        s.recording_type = RecordingType::VideoClipSequence;
+        let probe = make_stereo_probe();
+
+        // Execution: 1 audio output survives (slot for input 1 → pair (1,1)).
+        let steps = plan_video_outputs_for_file(&s, 0, &probe);
+        let audio_in_steps = steps.iter()
+            .filter(|st| matches!(st, VideoOutputStep::AudioChannel { .. }))
+            .count();
+        let paths = plan_output_paths(&s, Some(&probe));
+        let audio_in_preview = paths.iter()
+            .filter(|p| matches!(p.kind, OutputKind::Audio))
+            .count();
+        assert_eq!(audio_in_preview, audio_in_steps, "preview must match execution");
+        assert_eq!(audio_in_preview, 1);
+    }
+
+    /// WP-3.2 completeness change: concat outputs now participate in the
+    /// collision check (they never did before).
+    #[test]
+    fn test_collision_warning_covers_concat_outputs() {
+        let mut s = make_video_settings();
+        s.input_files = vec![PathBuf::from("/out/clip1.mkv")];
+        s.output_folder = PathBuf::from("/out");
+        s.split_tracks = true;
+        s.concat_audio = true;
+        s.recording_type = RecordingType::VideoClipSequence;
+        s.channel_map = ChannelMap::identity(1);
+        // Naming collides with the input file: {filename} + no suffix.
+        s.filename_prefix = "{filename}".to_string();
+        s.audio_suffix_template = String::new();
+        s.video_suffix_template = String::new();
+        let probe = make_stereo_probe();
+
+        let paths = plan_output_paths(&s, Some(&probe));
+        // Sanity: at least one output collides with the input.
+        assert!(paths.iter().any(|p| p.path != p.unguarded_path),
+            "fixture must produce a guarded rename; paths: {:?}", paths);
+        assert!(output_collision_warning(&s).is_some(),
+            "collision warning must now fire for concat outputs");
+    }
+
+    /// The two projections must never drift: preview paths == guarded
+    /// paths of plan_output_paths, and collision entries == guarded
+    /// != unguarded pairs.
+    #[test]
+    fn test_preview_and_collision_are_projections_of_plan() {
+        let mut s = make_settings_audio_only();
+        s.output_folder = PathBuf::from("/out");
+        let probe = Some(&make_stereo_probe());
+
+        let planned = plan_output_paths(&s, probe);
+        let preview = preview_output_files(&s, probe);
+        assert_eq!(planned.len(), preview.len());
+        for (p, pv) in planned.iter().zip(preview.iter()) {
+            assert_eq!(p.path, pv.path);
+        }
     }
 }

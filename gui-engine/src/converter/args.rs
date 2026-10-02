@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_build_video_to_video_args_dispatch_video_only() {
-        let step = VideoOutputStep::VideoOnly { file_idx: 0, output: Path::new("/tmp/out.mkv").to_path_buf() };
+        let step = VideoOutputStep::VideoOnly { file_idx: 0, output: Path::new("/tmp/out.mkv").to_path_buf(), naming_index: 1 };
         let s = make_video_settings();
         let probe = make_probe(1, 2, 48000);
         let args = build_video_to_video_args(&s, &step, &probe);
