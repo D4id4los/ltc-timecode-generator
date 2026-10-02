@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::decoder::LtcDecoder;
 use crate::ltc_decoder::{
     apply_coherent_first_timecode, compute_ltc_quality,
     CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus,
@@ -42,6 +43,33 @@ fn plan_chunk_boundaries(total_mono: usize, chunk_mono: usize, overlap: usize) -
         pos = next;
     }
     chunks
+}
+
+/// Everything the chunked decode needs to know about the WAV being decoded:
+/// the exact chunk boundaries plus the stream geometry the merge uses.
+pub(crate) struct ChunkPlan {
+    /// `[start, end)` mono-sample ranges, ascending.
+    pub boundaries: Vec<(usize, usize)>,
+    pub sample_rate: u32,
+    pub total_mono: usize,
+    pub total_duration: f64,
+    pub overlap_seconds: f64,
+}
+
+/// Build the chunk plan from an open reader: chunk geometry + boundaries.
+fn plan_chunks(reader: &WavChunkReader, config: &DecodeConfig) -> ChunkPlan {
+    let sample_rate = reader.sample_rate();
+    let total_mono = reader.total_mono_samples();
+    let bytes_per_mono_sample =
+        (reader.channels() as u64) * (reader.spec().bits_per_sample as u64 / 8);
+    let (chunk_mono, overlap) = chunk_geometry(config, bytes_per_mono_sample, sample_rate);
+    ChunkPlan {
+        boundaries: plan_chunk_boundaries(total_mono, chunk_mono, overlap),
+        sample_rate,
+        total_mono,
+        total_duration: total_mono as f64 / sample_rate as f64,
+        overlap_seconds: config.overlap_seconds,
+    }
 }
 
 /// Count how many chunks `decode_ltc_chunked` would split a WAV into,
@@ -88,116 +116,187 @@ pub fn decode_ltc_chunked(
     progress: &DecodeProgress,
 ) -> Result<LtcDetectionResult, String> {
     let (chunk_reader, overall_start) = WavChunkReader::open(path)?;
-    let sample_rate = chunk_reader.sample_rate();
-    let channels = chunk_reader.channels();
-    let total_mono = chunk_reader.total_mono_samples();
-    let total_duration = total_mono as f64 / sample_rate as f64;
+    let plan = plan_chunks(&chunk_reader, &config);
 
-    debug!("decode_ltc_chunked: {} samples @ {} Hz, {} ch, config chunk={} bytes, overlap={}s",
-        total_mono, sample_rate, channels, config.chunk_size_bytes, config.overlap_seconds);
+    debug!("decode_ltc_chunked: {} samples @ {} Hz, config chunk={} bytes, overlap={}s",
+        plan.total_mono, plan.sample_rate, config.chunk_size_bytes, config.overlap_seconds);
 
-    if total_mono == 0 {
+    if plan.total_mono == 0 {
         warn!("decode_ltc_chunked: WAV file contains no samples");
         return Ok(LtcDetectionResult::error("Audio file contains no samples"));
     }
 
-    let bytes_per_mono_sample = (channels as u64) * (chunk_reader.spec().bits_per_sample as u64 / 8);
-    let (chunk_mono_samples, overlap_samples) = chunk_geometry(&config, bytes_per_mono_sample, sample_rate);
-    let chunks = plan_chunk_boundaries(total_mono, chunk_mono_samples, overlap_samples);
-
-    let num_chunks = chunks.len();
-    info!("decode_ltc_chunked: split into {} chunks ({} mono samples each, overlap={} samples)",
-        num_chunks, chunk_mono_samples, overlap_samples);
+    let num_chunks = plan.boundaries.len();
+    info!("decode_ltc_chunked: split into {} chunks, overlap={}s",
+        num_chunks, plan.overlap_seconds);
 
     if num_chunks == 0 {
         return Ok(LtcDetectionResult::error("No audio data to decode"));
     }
 
-    let cancel_flag = progress.cancel_flag.clone();
-    let progress_completed = progress.chunks_completed.clone();
-    let chunks = Arc::new(chunks);
-
+    let decoder = crate::decoder::decoder_for(use_libltc);
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
         .min(num_chunks);
 
-    let mut chunk_results: Vec<ChunkResult> = if num_workers <= 1 {
-        let mut results = Vec::with_capacity(num_chunks);
-        for (chunk_idx, &(start_sample, end_sample)) in chunks.iter().enumerate() {
-            if cancel_flag.load(Ordering::Relaxed) {
-                info!("decode_ltc_chunked: cancel requested, stopping at chunk {}", chunk_idx);
-                break;
-            }
-            let r = decode_one_chunk(path, chunk_idx, start_sample, end_sample, sample_rate, fps, drop_frame, use_libltc, &cancel_flag);
-            progress_completed.fetch_add(1, Ordering::Relaxed);
-            results.push(r);
-        }
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err("Decode canceled by user".to_string());
-        }
-        results
+    let mut chunk_results = if num_workers <= 1 {
+        run_sequential(path, &plan, decoder, fps, drop_frame, progress)
     } else {
-        let results: Arc<[Mutex<Option<ChunkResult>>]> = (0..num_chunks)
-            .map(|_| Mutex::new(None))
-            .collect::<Vec<_>>()
-            .into();
-        let next_chunk = Arc::new(AtomicUsize::new(0));
-
-        std::thread::scope(|s| {
-            for _ in 0..num_workers {
-                let results = Arc::clone(&results);
-                let next_chunk = Arc::clone(&next_chunk);
-                let chunks = Arc::clone(&chunks);
-                let cancel_flag = cancel_flag.clone();
-                let progress_completed = progress_completed.clone();
-                s.spawn(move || loop {
-                    let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    if idx >= num_chunks { break; }
-                    if cancel_flag.load(Ordering::Relaxed) { break; }
-                    let (start_sample, end_sample) = chunks[idx];
-                    let result = decode_one_chunk(
-                        path, idx, start_sample, end_sample,
-                        sample_rate, fps, drop_frame, use_libltc, &cancel_flag,
-                    );
-                    if cancel_flag.load(Ordering::Relaxed) { break; }
-                    progress_completed.fetch_add(1, Ordering::Relaxed);
-                    *results[idx].lock().unwrap() = Some(result);
-                });
-            }
-        });
-
-        let mut collected: Vec<ChunkResult> = Vec::with_capacity(num_chunks);
-        for (idx, mutex) in results.iter().enumerate() {
-            match mutex.lock().unwrap().take() {
-                Some(r) => collected.push(r),
-                None => collected.push(ChunkResult {
-                    chunk_idx: idx,
-                    result: Err("Canceled".to_string()),
-                }),
-            }
-        }
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err("Decode canceled by user".to_string());
-        }
-        collected
+        run_parallel(path, &plan, decoder, fps, drop_frame, progress, num_workers)
     };
 
     chunk_results.sort_by_key(|cr| cr.chunk_idx);
+    if progress.cancel_flag.load(Ordering::Relaxed) {
+        return Err("Decode canceled by user".to_string());
+    }
 
+    let merged = merge_results(&chunk_results, &plan, fps);
+
+    let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
+    let mut result = LtcDetectionResult {
+        status: merged.status,
+        detected_fps: fps as f32,
+        drop_frame,
+        total_possible_frames: merged.total_possible,
+        valid_frames: merged.valid_frames,
+        timecodes: merged.timecodes,
+        avg_confidence: merged.avg_confidence,
+        details: merged.details,
+        total_audio_duration_secs: plan.total_duration,
+        sample_rate: plan.sample_rate,
+        processing_time_ms,
+        first_ltc_timecode_secs: merged.first_ltc_timecode_secs,
+        quality: None,
+    };
+
+    apply_coherent_first_timecode(&mut result);
+    result.quality = compute_ltc_quality(&result);
+    let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
+    result.processing_time_ms = processing_time_ms;
+
+    info!("decode_ltc_chunked complete: {} valid / {} possible ({:.1}%) in {:.1}ms",
+        result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0, processing_time_ms);
+
+    Ok(result)
+}
+
+/// Result produced by decoding one chunk.
+struct ChunkResult {
+    chunk_idx: usize,
+    result: Result<LtcDetectionResult, String>,
+}
+
+/// Decode chunks strictly in order, honoring cancellation between chunks.
+fn run_sequential(
+    path: &Path,
+    plan: &ChunkPlan,
+    decoder: &dyn LtcDecoder,
+    fps: f64,
+    drop_frame: bool,
+    progress: &DecodeProgress,
+) -> Vec<ChunkResult> {
+    let cancel_flag = &progress.cancel_flag;
+    let mut results = Vec::with_capacity(plan.boundaries.len());
+    for (chunk_idx, &(start_sample, end_sample)) in plan.boundaries.iter().enumerate() {
+        if cancel_flag.load(Ordering::Relaxed) {
+            info!("decode_ltc_chunked: cancel requested, stopping at chunk {}", chunk_idx);
+            break;
+        }
+        let r = decode_one_chunk(
+            path, decoder, chunk_idx, start_sample, end_sample,
+            plan.sample_rate, fps, drop_frame, cancel_flag,
+        );
+        progress.chunks_completed.fetch_add(1, Ordering::Relaxed);
+        results.push(r);
+    }
+    results
+}
+
+/// Decode chunks across `num_workers` threads; every chunk slot is filled —
+/// workers bail on cancellation, leaving `Err("Canceled")` placeholders.
+fn run_parallel(
+    path: &Path,
+    plan: &ChunkPlan,
+    decoder: &dyn LtcDecoder,
+    fps: f64,
+    drop_frame: bool,
+    progress: &DecodeProgress,
+    num_workers: usize,
+) -> Vec<ChunkResult> {
+    let num_chunks = plan.boundaries.len();
+    let cancel_flag = progress.cancel_flag.clone();
+    let progress_completed = progress.chunks_completed.clone();
+    let chunks = Arc::new(plan.boundaries.clone());
+    let results: Arc<[Mutex<Option<ChunkResult>>]> = (0..num_chunks)
+        .map(|_| Mutex::new(None))
+        .collect::<Vec<_>>()
+        .into();
+    let next_chunk = Arc::new(AtomicUsize::new(0));
+
+    std::thread::scope(|s| {
+        for _ in 0..num_workers {
+            let results = Arc::clone(&results);
+            let next_chunk = Arc::clone(&next_chunk);
+            let chunks = Arc::clone(&chunks);
+            let cancel_flag = cancel_flag.clone();
+            let progress_completed = progress_completed.clone();
+            s.spawn(move || loop {
+                let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                if idx >= num_chunks { break; }
+                if cancel_flag.load(Ordering::Relaxed) { break; }
+                let (start_sample, end_sample) = chunks[idx];
+                let result = decode_one_chunk(
+                    path, decoder, idx, start_sample, end_sample,
+                    plan.sample_rate, fps, drop_frame, &cancel_flag,
+                );
+                if cancel_flag.load(Ordering::Relaxed) { break; }
+                progress_completed.fetch_add(1, Ordering::Relaxed);
+                *results[idx].lock().unwrap() = Some(result);
+            });
+        }
+    });
+
+    let mut collected: Vec<ChunkResult> = Vec::with_capacity(num_chunks);
+    for (idx, mutex) in results.iter().enumerate() {
+        match mutex.lock().unwrap().take() {
+            Some(r) => collected.push(r),
+            None => collected.push(ChunkResult {
+                chunk_idx: idx,
+                result: Err("Canceled".to_string()),
+            }),
+        }
+    }
+    collected
+}
+
+/// Stream-level outcome of merging all per-chunk results.
+struct MergedDecode {
+    timecodes: Vec<FrameTimecode>,
+    details: Vec<String>,
+    first_ltc_timecode_secs: f64,
+    avg_confidence: f32,
+    total_possible: u32,
+    valid_frames: u32,
+    status: LtcDecodeStatus,
+}
+
+/// Merge per-chunk results into one stream-level decode: offset each chunk's
+/// timecodes by its start sample, sort, dedup within
+/// `min(frame_dur·0.5, overlap·0.5)`, reindex, aggregate confidence on the
+/// 0.0–1.0 fraction scale, classify status via the shared CONFIDENCE_* thresholds.
+fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> MergedDecode {
+    let sample_rate = plan.sample_rate;
     let mut all_timecodes: Vec<(usize, FrameTimecode)> = Vec::new();
     let mut merged_details: Vec<String> = Vec::new();
     let mut first_tc_secs: f64 = f64::MAX;
-    let last_sample_rate: u32 = sample_rate;
-    let mut max_conf: f32 = 0.0;
 
-    for cr in &chunk_results {
+    for cr in chunk_results {
         match &cr.result {
             Ok(r) => {
                 merged_details.push(format!("Chunk {}: {} valid / {} possible (conf {:.1}%)",
                     cr.chunk_idx, r.valid_frames, r.total_possible_frames, r.avg_confidence * 100.0));
-                max_conf = max_conf.max(r.avg_confidence);
-                let chunk_start_sample = chunks.get(cr.chunk_idx).map(|&(s, _)| s).unwrap_or(0);
+                let chunk_start_sample = plan.boundaries.get(cr.chunk_idx).map(|&(s, _)| s).unwrap_or(0);
                 let chunk_start_secs = chunk_start_sample as f64 / sample_rate as f64;
                 let chunk_first_secs = if r.first_ltc_timecode_secs > 0.0 {
                     r.first_ltc_timecode_secs + chunk_start_secs
@@ -227,7 +326,7 @@ pub fn decode_ltc_chunked(
     });
 
     let frame_duration = 1.0 / fps;
-    let dedup_threshold = (frame_duration * 0.5).min(config.overlap_seconds * 0.5);
+    let dedup_threshold = (frame_duration * 0.5).min(plan.overlap_seconds * 0.5);
     let mut deduped: Vec<FrameTimecode> = Vec::with_capacity(all_timecodes.len());
     let mut last_secs: f64 = -dedup_threshold;
     for (_, ftc) in all_timecodes {
@@ -242,7 +341,7 @@ pub fn decode_ltc_chunked(
     }
 
     let valid_frames = deduped.len() as u32;
-    let true_total_possible = (total_duration * fps).round() as u32;
+    let true_total_possible = (plan.total_duration * fps).round() as u32;
     let avg_confidence = if true_total_possible > 0 {
         valid_frames as f32 / true_total_possible as f32
     } else {
@@ -263,53 +362,30 @@ pub fn decode_ltc_chunked(
 
     merged_details.push(format!(
         "Chunked decode: {} chunks, {} valid / {} possible after merge",
-        num_chunks, valid_frames, true_total_possible,
+        plan.boundaries.len(), valid_frames, true_total_possible,
     ));
 
-    let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
-    let mut result = LtcDetectionResult {
-        status,
-        detected_fps: fps as f32,
-        drop_frame,
-        total_possible_frames: true_total_possible,
-        valid_frames,
+    MergedDecode {
         timecodes: deduped,
-        avg_confidence,
         details: merged_details,
-        total_audio_duration_secs: total_duration,
-        sample_rate: last_sample_rate,
-        processing_time_ms,
         first_ltc_timecode_secs: if first_tc_secs < f64::MAX { first_tc_secs } else { 0.0 },
-        quality: None,
-    };
-
-    apply_coherent_first_timecode(&mut result);
-    result.quality = compute_ltc_quality(&result);
-    let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
-    result.processing_time_ms = processing_time_ms;
-
-    info!("decode_ltc_chunked complete: {} valid / {} possible ({:.1}%) in {:.1}ms",
-        result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0, processing_time_ms);
-
-    Ok(result)
-}
-
-/// Result produced by decoding one chunk.
-struct ChunkResult {
-    chunk_idx: usize,
-    result: Result<LtcDetectionResult, String>,
+        avg_confidence,
+        total_possible: true_total_possible,
+        valid_frames,
+        status,
+    }
 }
 
 /// Decode a single chunk of a WAV file in a worker thread.
 fn decode_one_chunk(
     path: &Path,
+    decoder: &dyn LtcDecoder,
     chunk_idx: usize,
     start_sample: usize,
     end_sample: usize,
     sample_rate: u32,
     fps: f64,
     drop_frame: bool,
-    use_libltc: bool,
     cancel_flag: &AtomicBool,
 ) -> ChunkResult {
     let num_samples = end_sample - start_sample;
@@ -317,8 +393,6 @@ fn decode_one_chunk(
     if cancel_flag.load(Ordering::Relaxed) {
         return ChunkResult { chunk_idx, result: Err("Canceled".to_string()) };
     }
-
-    let chunk_start = Instant::now();
 
     let mut local_reader = match WavChunkReader::open(path) {
         Ok((r, _)) => r,
@@ -328,7 +402,7 @@ fn decode_one_chunk(
         },
     };
 
-    let decoder = crate::decoder::decoder_for(use_libltc);
+    let chunk_start = Instant::now();
     let result = decoder.decode_chunk(
         path, &mut local_reader, chunk_idx, start_sample, num_samples,
         sample_rate, fps, drop_frame, chunk_start, cancel_flag,
@@ -400,6 +474,345 @@ mod tests {
         // chunk_mono + overlap must predict 2 chunks (what decode does).
         let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
         assert_eq!(count_chunks(60_000, 48000, 2, 16, &config), 2);
+    }
+
+    // ── merge_results unit tests (synthetic, no WAV files) ────────────
+
+    fn test_plan(boundaries: Vec<(usize, usize)>, total_duration: f64, overlap: f64) -> ChunkPlan {
+        ChunkPlan {
+            boundaries,
+            sample_rate: 48000,
+            total_mono: (total_duration * 48000.0) as usize,
+            total_duration,
+            overlap_seconds: overlap,
+        }
+    }
+
+    fn ftc(index: u32, secs: f64) -> FrameTimecode {
+        FrameTimecode {
+            frame_index: index,
+            timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: index },
+            timecode_secs: secs,
+        }
+    }
+
+    fn chunk_ok(first_secs: f64, frame_count: u32) -> LtcDetectionResult {
+        LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            total_possible_frames: frame_count,
+            valid_frames: frame_count,
+            timecodes: (0..frame_count)
+                .map(|i| ftc(i, first_secs + i as f64 / 25.0))
+                .collect(),
+            avg_confidence: 1.0,
+            details: vec![],
+            total_audio_duration_secs: 0.0,
+            sample_rate: 48000,
+            processing_time_ms: 0.0,
+            first_ltc_timecode_secs: first_secs,
+            quality: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_offsets_timecodes_by_chunk_start() {
+        // Chunk starting at 5.0 s (240 000 mono samples @48 kHz); a frame
+        // decoded at chunk-local 1.0 s must land at 6.0 s.
+        let plan = test_plan(vec![(240_000, 480_000)], 10.0, 2.0);
+        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(1.0, 2)) }];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert_eq!(merged.timecodes.len(), 2);
+        assert!((merged.timecodes[0].timecode_secs - 6.0).abs() < 1e-9,
+            "expected 6.0, got {}", merged.timecodes[0].timecode_secs);
+        assert!((merged.timecodes[1].timecode_secs - 6.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_merge_dedups_overlap_and_renumbers() {
+        // fps 25 → frame duration 0.04 s; overlap 2.0 s → dedup threshold
+        // min(0.02, 1.0) = 0.02 s. Chunk 1 starts at 0.5 s: its frames are
+        // given in chunk-local seconds and must be offset by +0.5 before
+        // dedup (0.045 → 0.545, 0.53 → 1.03).
+        let plan = test_plan(vec![(0, 24_000), (24_000, 48_000)], 2.0, 2.0);
+        let mut chunk0 = chunk_ok(0.0, 1);
+        chunk0.timecodes = vec![ftc(0, 0.001), ftc(1, 0.541)];
+        let mut chunk1 = chunk_ok(0.0, 1);
+        chunk1.timecodes = vec![ftc(0, 0.046), ftc(1, 0.531)];
+        let results = vec![
+            ChunkResult { chunk_idx: 0, result: Ok(chunk0) },
+            ChunkResult { chunk_idx: 1, result: Ok(chunk1) },
+        ];
+        let merged = merge_results(&results, &plan, 25.0);
+        let secs: Vec<f64> = merged.timecodes.iter().map(|t| t.timecode_secs).collect();
+        // 0.001 kept (0.0 would sit exactly on the initial -threshold gate);
+        // 0.546 dropped (diff 0.005 <= 0.02 vs 0.541); 1.031 kept.
+        assert_eq!(secs.len(), 3, "got {:?}", secs);
+        for (got, want) in secs.iter().zip([0.001, 0.541, 1.031]) {
+            assert!((got - want).abs() < 1e-9, "got {} want {}", got, want);
+        }
+        for (i, t) in merged.timecodes.iter().enumerate() {
+            assert_eq!(t.frame_index, i as u32, "frame_index must be renumbered 0..n");
+        }
+    }
+
+    #[test]
+    fn test_merge_keeps_frame_just_beyond_dedup_threshold() {
+        // fps 25 → frame duration 0.04 s; overlap 2.0 s → dedup threshold
+        // min(0.02, 1.0) = 0.02 s. The keep condition is a strict `>` on
+        // the gap from the last kept frame.
+        let plan = test_plan(vec![(0, 24_000)], 0.5, 2.0);
+        let results = vec![
+            ChunkResult { chunk_idx: 0, result: Ok(two_frames_at(0.50, 0.5201)) },
+        ];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert_eq!(merged.timecodes.len(), 2, "frame just beyond threshold must be kept");
+        assert!((merged.timecodes[1].timecode_secs - 0.5201).abs() < 1e-9);
+
+        // Gap below the threshold → dropped (strict >; an "exactly equal"
+        // case is not stable under float rounding, so pin just-below).
+        let results = vec![
+            ChunkResult { chunk_idx: 0, result: Ok(two_frames_at(0.50, 0.519)) },
+        ];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert_eq!(merged.timecodes.len(), 1, "frame below the threshold must be dropped");
+    }
+
+    fn two_frames_at(secs0: f64, secs1: f64) -> LtcDetectionResult {
+        let mut r = chunk_ok(secs0, 2);
+        r.timecodes = vec![ftc(0, secs0), ftc(1, secs1)];
+        r
+    }
+
+    #[test]
+    fn test_merge_first_tc_is_min_over_chunks() {
+        let plan = test_plan(vec![(0, 240_000), (240_000, 480_000)], 20.0, 2.0);
+        let results = vec![
+            ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(1.0, 1)) },   // 1.0 + 0.0
+            ChunkResult { chunk_idx: 1, result: Ok(chunk_ok(0.5, 1)) },   // 0.5 + 5.0 = 5.5
+        ];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert!((merged.first_ltc_timecode_secs - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_merge_all_error_chunks_zeroed() {
+        let plan = test_plan(vec![(0, 24_000), (24_000, 48_000)], 2.0, 2.0);
+        let results = vec![
+            ChunkResult { chunk_idx: 0, result: Err("boom 0".to_string()) },
+            ChunkResult { chunk_idx: 1, result: Err("boom 1".to_string()) },
+        ];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert_eq!(merged.valid_frames, 0);
+        assert_eq!(merged.first_ltc_timecode_secs, 0.0);
+        assert!(matches!(merged.status, LtcDecodeStatus::NoSyncWord));
+        assert!(merged.details.iter().any(|d| d.contains("Chunk 0: error - boom 0")));
+        assert!(merged.details.iter().any(|d| d.contains("Chunk 1: error - boom 1")));
+    }
+
+    #[test]
+    fn test_merge_error_chunks_do_not_abort_merge() {
+        let plan = test_plan(vec![(0, 24_000), (24_000, 48_000)], 2.0, 2.0);
+        let results = vec![
+            ChunkResult { chunk_idx: 0, result: Err("read failure".to_string()) },
+            ChunkResult { chunk_idx: 1, result: Ok(chunk_ok(0.0, 1)) },
+        ];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert_eq!(merged.valid_frames, 1);
+        assert!(merged.details.iter().any(|d| d.contains("Chunk 0: error - read failure")));
+    }
+
+    #[test]
+    fn test_merge_confidence_status_boundaries() {
+        // 10 s * 25 fps = 250 possible frames.
+        let plan_for = || test_plan(vec![(0, 480_000)], 10.0, 2.0);
+
+        // 175/250 = 0.70 → Success (>= CONFIDENCE_SUCCESS_THRESHOLD).
+        // First frame at 0.001 s: 0.0 would sit exactly on the initial
+        // -threshold gate of the dedup loop and be dropped.
+        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(0.001, 175)) }];
+        let merged = merge_results(&results, &plan_for(), 25.0);
+        assert_eq!(merged.total_possible, 250);
+        assert!((merged.avg_confidence - 0.70).abs() < 1e-6, "got {}", merged.avg_confidence);
+        assert!(matches!(merged.status, LtcDecodeStatus::Success));
+
+        // 75/250 = 0.30 → LowConfidence (>= CONFIDENCE_LOW_THRESHOLD, < success)
+        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(0.001, 75)) }];
+        let merged = merge_results(&results, &plan_for(), 25.0);
+        assert!((merged.avg_confidence - 0.30).abs() < 1e-6, "got {}", merged.avg_confidence);
+        assert!(matches!(merged.status, LtcDecodeStatus::LowConfidence));
+
+        // 74/250 = 0.296 → NoSyncWord
+        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(0.001, 74)) }];
+        let merged = merge_results(&results, &plan_for(), 25.0);
+        assert!(matches!(merged.status, LtcDecodeStatus::NoSyncWord));
+    }
+
+    // ── run_sequential / run_parallel with MockDecoder ────────────────
+
+    /// Canned per-chunk decoder: `results[chunk_idx]` is returned verbatim
+    /// (index-addressed, so parallel and sequential runs are deterministic).
+    struct MockDecoder {
+        results: Vec<Result<LtcDetectionResult, String>>,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        cancel_after_calls: Option<usize>,
+        calls: AtomicUsize,
+    }
+
+    impl MockDecoder {
+        fn new(results: Vec<Result<LtcDetectionResult, String>>) -> Self {
+            Self { results, cancel_flag: None, cancel_after_calls: None, calls: AtomicUsize::new(0) }
+        }
+
+        fn bailing(results: Vec<Result<LtcDetectionResult, String>>,
+                   cancel_flag: Arc<AtomicBool>, after: usize) -> Self {
+            Self { results, cancel_flag: Some(cancel_flag), cancel_after_calls: Some(after), calls: AtomicUsize::new(0) }
+        }
+    }
+
+    impl LtcDecoder for MockDecoder {
+        fn name(&self) -> &'static str { "mock" }
+
+        fn decode_wav(&self, _path: &Path, _fps: f64, _drop: bool,
+                      _cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, String> {
+            Err("mock: decode_wav not supported".to_string())
+        }
+
+        fn decode_chunk(&self, _path: &Path, _reader: &mut WavChunkReader, chunk_idx: usize,
+                        _start: usize, _len: usize, _sample_rate: u32, _fps: f64, _drop: bool,
+                        _start_time: Instant, _cancel: &AtomicBool) -> Result<LtcDetectionResult, String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if let (Some(flag), Some(after)) = (&self.cancel_flag, self.cancel_after_calls) {
+                if n + 1 >= after {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            self.results[chunk_idx].clone()
+        }
+    }
+
+    fn five_chunk_plan() -> ChunkPlan {
+        test_plan(
+            vec![(0, 48_000), (43_200, 91_200), (86_400, 134_400), (129_600, 177_600), (172_800, 220_800)],
+            4.6, 1.0,
+        )
+    }
+
+    fn five_ok_results() -> Vec<Result<LtcDetectionResult, String>> {
+        (0..5)
+            .map(|i| Ok(chunk_ok(i as f64 * 0.9, 2)))
+            .collect()
+    }
+
+    /// `decode_one_chunk` opens a real WavChunkReader before reaching the
+    /// decoder, so the run_* tests need a real (tiny) WAV on disk.
+    fn write_mock_wav() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(dir.path().join("mock.wav"), spec).unwrap();
+        for i in 0..100i16 {
+            writer.write_sample(i).unwrap();
+        }
+        writer.finalize().unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_run_parallel_matches_run_sequential() {
+        let plan = five_chunk_plan();
+        let dir = write_mock_wav();
+        let path = dir.path().join("mock.wav");
+
+        let seq_results = run_sequential(
+            &path, &plan, &MockDecoder::new(five_ok_results()), 25.0, false, &DecodeProgress::new(5),
+        );
+        let par_results = run_parallel(
+            &path, &plan, &MockDecoder::new(five_ok_results()), 25.0, false, &DecodeProgress::new(5), 3,
+        );
+
+        let mut seq = seq_results;
+        seq.sort_by_key(|cr| cr.chunk_idx);
+        let mut par = par_results;
+        par.sort_by_key(|cr| cr.chunk_idx);
+
+        assert_eq!(seq.len(), 5);
+        assert_eq!(par.len(), 5);
+        for (s, p) in seq.iter().zip(par.iter()) {
+            assert_eq!(s.chunk_idx, p.chunk_idx);
+            let s_res = s.result.as_ref().unwrap();
+            let p_res = p.result.as_ref().unwrap();
+            let s_secs: Vec<f64> = s_res.timecodes.iter().map(|t| t.timecode_secs).collect();
+            let p_secs: Vec<f64> = p_res.timecodes.iter().map(|t| t.timecode_secs).collect();
+            assert_eq!(s_secs, p_secs, "chunk {} mismatch", s.chunk_idx);
+        }
+
+        let merged_seq = merge_results(&seq, &plan, 25.0);
+        let merged_par = merge_results(&par, &plan, 25.0);
+        let seq_secs: Vec<f64> = merged_seq.timecodes.iter().map(|t| t.timecode_secs).collect();
+        let par_secs: Vec<f64> = merged_par.timecodes.iter().map(|t| t.timecode_secs).collect();
+        assert_eq!(seq_secs, par_secs);
+        assert_eq!(merged_seq.valid_frames, merged_par.valid_frames);
+    }
+
+    #[test]
+    fn test_run_parallel_pre_cancelled_fills_all_slots_canceled() {
+        let plan = five_chunk_plan();
+        let dir = write_mock_wav();
+        let path = dir.path().join("mock.wav");
+        let progress = DecodeProgress::new(5);
+        progress.cancel();
+
+        let results = run_parallel(
+            &path, &plan, &MockDecoder::new(five_ok_results()), 25.0, false, &progress, 3,
+        );
+        assert_eq!(results.len(), 5);
+        for cr in &results {
+            assert_eq!(cr.result.as_ref().unwrap_err(), "Canceled");
+        }
+        assert_eq!(progress.chunks_completed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_run_parallel_worker_bail_leaves_canceled_slots() {
+        let plan = five_chunk_plan();
+        let dir = write_mock_wav();
+        let path = dir.path().join("mock.wav");
+        let progress = DecodeProgress::new(5);
+
+        // Mock bails (sets the cancel flag) on its 2nd call; that caller
+        // itself breaks out without storing, and the remaining workers
+        // leave their slots as Err("Canceled"). Exactly the first call
+        // completes.
+        let mock = MockDecoder::bailing(five_ok_results(), progress.cancel_flag.clone(), 2);
+        let results = run_parallel(&path, &plan, &mock, 25.0, false, &progress, 3);
+
+        assert_eq!(results.len(), 5);
+        let canceled = results.iter().filter(|cr| cr.result.is_err()).count();
+        let completed = results.iter().filter(|cr| cr.result.is_ok()).count();
+        assert_eq!(completed, 1, "expected exactly the first call to complete");
+        assert_eq!(canceled, 4, "remaining slots must collect as Err(Canceled)");
+        assert_eq!(progress.chunks_completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_run_sequential_pre_cancelled_returns_empty() {
+        let plan = five_chunk_plan();
+        let dir = write_mock_wav();
+        let path = dir.path().join("mock.wav");
+        let progress = DecodeProgress::new(5);
+        progress.cancel();
+
+        let results = run_sequential(
+            &path, &plan, &MockDecoder::new(five_ok_results()), 25.0, false, &progress,
+        );
+        assert!(results.is_empty());
+        assert_eq!(progress.chunks_completed.load(Ordering::Relaxed), 0);
     }
 
     // ── count_chunks ──────────────────────────────────────────────────────
