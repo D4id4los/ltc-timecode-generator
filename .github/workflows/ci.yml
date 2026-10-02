@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+      # secrets are not readable in step-level `if:` expressions, so the
+      # token is mapped here and the scan step checks this variable instead
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,7 +70,5 @@ jobs:
           restore-keys: ${{ runner.os }}-sonar
 
       - name: SonarQube Cloud Scan
-        if: ${{ secrets.SONAR_TOKEN != '' }}
+        if: ${{ env.SONAR_TOKEN != '' }}
         uses: SonarSource/sonarqube-scan-action@v8
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
