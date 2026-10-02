@@ -40,6 +40,73 @@ pub enum SubprocessFailure {
     TimedOut,
 }
 
+/// Terminal outcome of a watchdog-driven ffmpeg run
+/// ([`run_ffmpeg_collect_stderr`]).
+#[derive(Debug)]
+pub enum FfmpegRunError {
+    /// The child could not be spawned, or its stderr pipe was unavailable.
+    Spawn(io::Error),
+    /// Cancel flag observed — child killed and reaped.
+    Cancelled,
+    /// No stderr output for the stall timeout — child killed and reaped.
+    Stalled,
+    /// wait()/try_wait() failed.
+    Wait(String),
+    /// Non-zero exit; carries the exit code string and the collected
+    /// stderr tail (last ~400 chars, trimmed).
+    Exit { code: String, stderr_tail: String },
+}
+
+/// Return the last `max_chars` characters of a string (trimmed), for
+/// including the tail of a subprocess's stderr in error messages.
+pub fn stderr_tail(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    let len = s.chars().count();
+    if len <= max_chars {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(len - max_chars).collect();
+    format!("…{}", tail)
+}
+
+/// Spawn via `spawner`, drain stderr line-by-line through `on_line`,
+/// enforce `stall` + `cancel`, and classify the terminal state.
+/// Returns the full collected stderr on success.
+pub fn run_ffmpeg_collect_stderr(
+    spawner: &mut dyn FnMut(&[String]) -> std::io::Result<Child>,
+    args: &[String],
+    stall: Duration,
+    cancel: Option<&AtomicBool>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<String, FfmpegRunError> {
+    let mut child = spawner(args).map_err(FfmpegRunError::Spawn)?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        FfmpegRunError::Spawn(io::Error::other("failed to capture ffmpeg stderr"))
+    })?;
+
+    let mut collected = String::new();
+    let result = watch_stderr_lines(&mut child, stderr, stall, cancel, &mut |line| {
+        collected.push_str(line);
+        collected.push('\n');
+        on_line(line);
+    });
+
+    match result {
+        Ok(status) if status.success() => Ok(collected),
+        Ok(status) => {
+            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+            Err(FfmpegRunError::Exit {
+                code,
+                stderr_tail: stderr_tail(&collected, 400),
+            })
+        }
+        Err(WatchdogStop::Cancelled) => Err(FfmpegRunError::Cancelled),
+        Err(WatchdogStop::Stalled) => Err(FfmpegRunError::Stalled),
+        Err(WatchdogStop::Wait(e)) => Err(FfmpegRunError::Wait(e)),
+    }
+}
+
+
 impl std::fmt::Display for SubprocessFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -502,4 +569,82 @@ mod tests {
     fn sleep_prog() -> &'static str { "sleep" }
     #[cfg(not(windows))]
     fn sleep_args(secs: u32) -> Vec<String> { vec![secs.to_string()] }
+
+    // ── run_ffmpeg_collect_stderr tests ─────────────────────────────────
+
+    fn spawn_sh(script: &'static str) -> impl FnMut(&[String]) -> std::io::Result<Child> {
+        move |_args: &[String]| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        }
+    }
+
+    #[test]
+    fn test_collect_stderr_success_collects_lines() {
+        let mut spawner = spawn_sh("echo line1 >&2; echo line2 >&2");
+        let mut seen = Vec::new();
+        let result = run_ffmpeg_collect_stderr(
+            &mut spawner, &[], Duration::from_secs(5), None, &mut |l| seen.push(l.to_string()),
+        );
+        let stderr = result.expect("should succeed");
+        assert!(stderr.contains("line1") && stderr.contains("line2"));
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_stderr_exit_code_with_tail() {
+        let mut spawner = spawn_sh("echo boom >&2; exit 1");
+        let result = run_ffmpeg_collect_stderr(
+            &mut spawner, &[], Duration::from_secs(5), None, &mut |_| {},
+        );
+        match result {
+            Err(FfmpegRunError::Exit { code, stderr_tail }) => {
+                assert_eq!(code, "1");
+                assert!(stderr_tail.contains("boom"), "tail: {}", stderr_tail);
+            }
+            other => panic!("expected Exit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_collect_stderr_silent_child_stalls() {
+        let mut spawner = spawn_sh("sleep 5");
+        let start = std::time::Instant::now();
+        let result = run_ffmpeg_collect_stderr(
+            &mut spawner, &[], Duration::from_millis(200), None, &mut |_| {},
+        );
+        assert!(matches!(result, Err(FfmpegRunError::Stalled)), "got {:?}", result);
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_collect_stderr_precancelled() {
+        let cancel = AtomicBool::new(true);
+        let mut spawner = spawn_sh("sleep 5");
+        let result = run_ffmpeg_collect_stderr(
+            &mut spawner, &[], Duration::from_secs(5), Some(&cancel), &mut |_| {},
+        );
+        assert!(matches!(result, Err(FfmpegRunError::Cancelled)), "got {:?}", result);
+    }
+
+    #[test]
+    fn test_collect_stderr_spawn_failure() {
+        let mut spawner = |_args: &[String]| {
+            std::process::Command::new("no-such-binary-99999").spawn()
+        };
+        let result = run_ffmpeg_collect_stderr(
+            &mut spawner, &[], Duration::from_secs(5), None, &mut |_| {},
+        );
+        assert!(matches!(result, Err(FfmpegRunError::Spawn(_))), "got {:?}", result);
+    }
+
+    #[test]
+    fn test_stderr_tail_shared_helper() {
+        assert_eq!(stderr_tail("  hello\n", 400), "hello");
+        let long = "0123456789".repeat(100);
+        assert_eq!(stderr_tail(&long, 10), "…0123456789");
+    }
 }

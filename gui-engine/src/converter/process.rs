@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use log::{info, warn};
 
-use crate::subprocess::{no_window_command, watch_stderr_lines, WatchdogStop, FFMPEG_STALL_TIMEOUT};
+use crate::subprocess::{no_window_command, run_ffmpeg_collect_stderr, FFMPEG_STALL_TIMEOUT};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StepFailure {
@@ -132,35 +132,15 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
         return Err(StepFailure::Fatal("cancelled by user".to_string()));
     }
 
-    let mut child = match spawner(full_args) {
-        Ok(c) => c,
-        Err(e) => {
-            let err_msg = format!("{} Failed to spawn ffmpeg: {}", step_label, e);
-            warn!("{}", err_msg);
-            report.append_log(&format!("\n\n--- {} ---", err_msg));
-            return Err(StepFailure::Fatal(err_msg));
-        }
-    };
-
-    let stderr = match child.stderr.take() {
-        Some(s) => s,
-        None => {
-            let err_msg = format!("{} Failed to capture ffmpeg stderr", step_label);
-            warn!("{}", err_msg);
-            report.append_log(&format!("\n\n--- {} ---", err_msg));
-            return Err(StepFailure::Fatal(err_msg));
-        }
-    };
-
     let mut local_log = String::new();
     let mut step_progress: f32 = 0.0;
     let mut produced_output = false;
     let duration_re = regex::Regex::new(r"Duration: (\d+):(\d+):(\d+)\.(\d+)").unwrap();
     let mut total_duration_secs: Option<f64> = None;
 
-    let watchdog_result = watch_stderr_lines(
-        &mut child,
-        stderr,
+    let watchdog_result = run_ffmpeg_collect_stderr(
+        spawner,
+        full_args,
         stall,
         report.cancel_atomic(),
         &mut |line: &str| {
@@ -205,13 +185,18 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
     report.append_log(&local_log);
 
     match watchdog_result {
-        Ok(status) if status.success() => {
+        Ok(_) => {
             report.advance_step();
             info!("{} Step completed: {}", step_label, output.display());
             Ok(())
         }
-        Ok(status) => {
-            let code = status.code().map(|c| c.to_string()).unwrap_or("unknown".into());
+        Err(crate::subprocess::FfmpegRunError::Spawn(e)) => {
+            let err_msg = format!("{} Failed to spawn ffmpeg: {}", step_label, e);
+            warn!("{}", err_msg);
+            report.append_log(&format!("\n\n--- {} ---", err_msg));
+            Err(StepFailure::Fatal(err_msg))
+        }
+        Err(crate::subprocess::FfmpegRunError::Exit { code, .. }) => {
             warn!("{} ffmpeg exited with code {}: {}", step_label, code, output.display());
             report.append_log(&format!("\n\n--- FFMPEG EXITED WITH CODE {} ---", code));
             let classification = classify_step_failure(produced_output, output, &code);
@@ -220,12 +205,12 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
             }
             Err(classification)
         }
-        Err(WatchdogStop::Cancelled) => {
+        Err(crate::subprocess::FfmpegRunError::Cancelled) => {
             report.append_log(&format!("{} --- CANCELLED ---\n", step_label));
             report.append_log("\n\n--- CANCELLED BY USER ---");
             Err(StepFailure::Fatal("cancelled by user".to_string()))
         }
-        Err(WatchdogStop::Stalled) => {
+        Err(crate::subprocess::FfmpegRunError::Stalled) => {
             let msg = format!(
                 "ffmpeg stalled — no stderr output for {}s",
                 stall.as_secs()
@@ -234,7 +219,7 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
             report.append_log(&format!("\n\n--- {} ---", msg));
             Err(StepFailure::Fatal(msg))
         }
-        Err(WatchdogStop::Wait(e)) => {
+        Err(crate::subprocess::FfmpegRunError::Wait(e)) => {
             let msg = format!("ffmpeg process wait error: {}", e);
             warn!("{} {}", step_label, msg);
             report.append_log(&format!("\n\n--- {} ---", msg));

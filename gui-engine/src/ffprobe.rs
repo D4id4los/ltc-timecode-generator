@@ -4,9 +4,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::subprocess::{
-    no_window_command, run_output_with_timeout, SubprocessFailure, WatchdogStop, PROBE_TIMEOUT,
+    no_window_command, run_ffmpeg_collect_stderr, run_output_with_timeout, SubprocessFailure,
+    FFMPEG_STALL_TIMEOUT, PROBE_TIMEOUT,
 };
-use crate::subprocess::{watch_stderr_lines, FFMPEG_STALL_TIMEOUT};
 
 use log::{error, info, warn};
 
@@ -27,6 +27,26 @@ pub struct VideoAudioProbe {
 
 pub fn path_is_video(path: &Path) -> bool {
     crate::media_ext::is_video(path)
+}
+
+/// Run ffprobe with `args` and parse stdout as JSON. Spawn/timeout/exit
+/// handling is uniform; the typed failure is returned so callers keep
+/// their own message policy (error string / Option / fallback value).
+pub fn run_ffprobe_json_with(
+    args: &[String],
+    _timeout: Duration,
+    runner: &mut dyn FnMut(&[String]) -> Result<Output, SubprocessFailure>,
+) -> Result<serde_json::Value, SubprocessFailure> {
+    let output = runner(args)?;
+    if !output.status.success() {
+        return Err(SubprocessFailure::Io(format!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout)
+        .map_err(|e| SubprocessFailure::Io(format!("Failed to parse ffprobe JSON: {}", e)))
 }
 
 pub fn probe_video_audio(path: &Path) -> Result<VideoAudioProbe, String> {
@@ -61,25 +81,17 @@ pub fn probe_video_audio_with(
         path.to_string_lossy().into(),
     ];
 
-    let output = runner(&args).map_err(|e| {
-        let msg = match e {
-            SubprocessFailure::Io(_) => format!("ffprobe probe failed: {}", e),
-            SubprocessFailure::TimedOut => {
-                format!("ffprobe timed out after {:.0}s — file may be corrupt", PROBE_TIMEOUT.as_secs_f64())
-            }
-        };
-        error!("{} for '{}'", msg, path.display());
-        msg
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffprobe failed: {}", stderr.trim()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse ffprobe JSON: {}", e))?;
+        run_ffprobe_json_with(&args, PROBE_TIMEOUT, runner).map_err(|e| {
+            let msg = match e {
+                SubprocessFailure::Io(_) => format!("ffprobe probe failed: {}", e),
+                SubprocessFailure::TimedOut => {
+                    format!("ffprobe timed out after {:.0}s — file may be corrupt", PROBE_TIMEOUT.as_secs_f64())
+                }
+            };
+            error!("{} for '{}'", msg, path.display());
+            msg
+        })?;
 
     let streams_val = parsed
         .get("streams")
@@ -313,9 +325,8 @@ pub fn probe_stream_duration_secs_with(
         path.to_string_lossy().into(),
     ];
 
-    let output = match runner(&args) {
-        Ok(o) if o.status.success() => o,
-        Ok(_) => return None,
+    let parsed: serde_json::Value = match run_ffprobe_json_with(&args, PROBE_TIMEOUT, runner) {
+        Ok(v) => v,
         Err(SubprocessFailure::TimedOut) => {
             warn!(
                 "ffprobe duration probe timed out after {:.0}s for '{}'",
@@ -324,11 +335,8 @@ pub fn probe_stream_duration_secs_with(
             );
             return None;
         }
-        Err(SubprocessFailure::Io(_)) => return None,
+        Err(_) => return None,
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).ok()?;
 
     // Try per-stream duration first
     if let Some(streams) = parsed.get("streams").and_then(|v| v.as_array()) {
@@ -416,18 +424,12 @@ pub fn extract_audio_channel_with_progress_with(
     args.push("-progress".to_string());
     args.push("pipe:2".to_string());
 
-    let mut child = spawner(&args).map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
-
-    let stderr = child.stderr.take().ok_or("Failed to capture ffmpeg stderr")?;
-    let mut stderr_lines: Vec<String> = Vec::new();
-
-    let result = watch_stderr_lines(
-        &mut child,
-        stderr,
+    let run = run_ffmpeg_collect_stderr(
+        spawner,
+        &args,
         stall,
         cancel,
         &mut |line| {
-            stderr_lines.push(line.to_string());
             if let Some(secs) = parse_out_time_us(line) {
                 if let Some(duration) = total_duration_secs {
                     if duration > 0.0 {
@@ -439,44 +441,44 @@ pub fn extract_audio_channel_with_progress_with(
         },
     );
 
-    match result {
-        Ok(status) if status.success() => {
+    match run {
+        Ok(_) => {
             info!("Audio extraction (with progress) successful: {}", output_wav.display());
             Ok(())
         }
-        Ok(_status) => {
+        Err(e) => {
             let _ = std::fs::remove_file(output_wav);
-            let stderr = stderr_lines.join("\n");
-            let tail = stderr_tail(&stderr, 400);
-            error!(
-                "ffmpeg audio extraction failed for '{}' (stream {} channel {}): {}",
-                path.display(),
-                absolute_stream_index,
-                channel_index,
-                tail
-            );
-            Err(format!(
-                "ffmpeg audio extraction failed: stream {} channel {} in '{}': {}",
-                absolute_stream_index,
-                channel_index,
-                path.display(),
-                tail
-            ))
-        }
-        Err(WatchdogStop::Cancelled) => {
-            let _ = std::fs::remove_file(output_wav);
-            Err("Audio extraction canceled".to_string())
-        }
-        Err(WatchdogStop::Stalled) => {
-            let _ = std::fs::remove_file(output_wav);
-            Err(format!(
-                "Audio extraction stalled: ffmpeg produced no output for {}s — input may be corrupt",
-                stall.as_secs()
-            ))
-        }
-        Err(WatchdogStop::Wait(e)) => {
-            let _ = std::fs::remove_file(output_wav);
-            Err(format!("Audio extraction wait error: {}", e))
+            Err(match e {
+                crate::subprocess::FfmpegRunError::Spawn(err) => {
+                    format!("Failed to spawn ffmpeg: {}", err)
+                }
+                crate::subprocess::FfmpegRunError::Exit { stderr_tail, .. } => {
+                    error!(
+                        "ffmpeg audio extraction failed for '{}' (stream {} channel {}): {}",
+                        path.display(),
+                        absolute_stream_index,
+                        channel_index,
+                        stderr_tail
+                    );
+                    format!(
+                        "ffmpeg audio extraction failed: stream {} channel {} in '{}': {}",
+                        absolute_stream_index,
+                        channel_index,
+                        path.display(),
+                        stderr_tail
+                    )
+                }
+                crate::subprocess::FfmpegRunError::Cancelled => {
+                    "Audio extraction canceled".to_string()
+                }
+                crate::subprocess::FfmpegRunError::Stalled => format!(
+                    "Audio extraction stalled: ffmpeg produced no output for {}s — input may be corrupt",
+                    stall.as_secs()
+                ),
+                crate::subprocess::FfmpegRunError::Wait(err) => {
+                    format!("Audio extraction wait error: {}", err)
+                }
+            })
         }
     }
 }
@@ -542,23 +544,22 @@ pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
         path.to_string_lossy().into(),
     ];
 
-    let output = match run_output_with_timeout(
-        no_window_command("ffprobe")
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+    let parsed: serde_json::Value = match run_ffprobe_json_with(
+        &args,
         PROBE_TIMEOUT,
-    )
-    {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            warn!(
-                "Keyframe probe failed for '{}' (offset {:.3}s): {}",
-                path.display(),
-                offset_secs,
-                stderr_tail(stderr.trim(), 200)
-            );
+        &mut |a: &[String]| {
+            run_output_with_timeout(
+                no_window_command("ffprobe")
+                    .args(a)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+                PROBE_TIMEOUT,
+            )
+        },
+    ) {
+        Ok(v) => v,
+        Err(SubprocessFailure::Io(e)) => {
+            warn!("Failed to run ffprobe for keyframe lookup: {}", e);
             return offset_secs;
         }
         Err(SubprocessFailure::TimedOut) => {
@@ -570,13 +571,9 @@ pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
             );
             return offset_secs;
         }
-        Err(SubprocessFailure::Io(e)) => {
-            warn!("Failed to run ffprobe for keyframe lookup: {}", e);
-            return offset_secs;
-        }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = serde_json::to_string(&parsed).unwrap_or_default();
     match parse_last_keyframe(&stdout, offset_secs) {
         Some(kf) => {
             if (kf - offset_secs).abs() > 0.001 {
@@ -887,6 +884,71 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(msg.contains("Failed to parse"), "error should mention parse failure: {}", msg);
+    }
+
+    // ── run_ffprobe_json_with ──────────────────────────────────────────────
+
+    fn json_output(json: &str) -> Result<Output, SubprocessFailure> {
+        Ok(Output {
+            status: std::process::ExitStatus::default(),
+            stdout: json.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn test_run_ffprobe_json_with_success() {
+        let mut runner = |_: &[String]| json_output(r#"{"streams":[{"index":1}]}"#);
+        let v = run_ffprobe_json_with(&[], PROBE_TIMEOUT, &mut runner).unwrap();
+        assert_eq!(v["streams"][0]["index"], 1);
+    }
+
+    #[test]
+    fn test_run_ffprobe_json_with_nonzero_exit() {
+        let failed = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .status()
+            .unwrap();
+        let mut runner = move |_: &[String]| {
+            Ok(Output {
+                status: failed,
+                stdout: Vec::new(),
+                stderr: b"some error".to_vec(),
+            })
+        };
+        let err = run_ffprobe_json_with(&[], PROBE_TIMEOUT, &mut runner).unwrap_err();
+        match err {
+            SubprocessFailure::Io(msg) => assert!(msg.contains("ffprobe failed"), "msg: {}", msg),
+            other => panic!("expected Io, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_run_ffprobe_json_with_timed_out() {
+        let mut runner = |_: &[String]| Err(SubprocessFailure::TimedOut);
+        assert!(matches!(
+            run_ffprobe_json_with(&[], PROBE_TIMEOUT, &mut runner),
+            Err(SubprocessFailure::TimedOut)
+        ));
+    }
+
+    #[test]
+    fn test_run_ffprobe_json_with_io() {
+        let mut runner = |_: &[String]| Err(SubprocessFailure::Io("no binary".into()));
+        assert!(matches!(
+            run_ffprobe_json_with(&[], PROBE_TIMEOUT, &mut runner),
+            Err(SubprocessFailure::Io(_))
+        ));
+    }
+
+    #[test]
+    fn test_run_ffprobe_json_with_invalid_json() {
+        let mut runner = |_: &[String]| json_output("not json");
+        let err = run_ffprobe_json_with(&[], PROBE_TIMEOUT, &mut runner).unwrap_err();
+        match err {
+            SubprocessFailure::Io(msg) => assert!(msg.contains("Failed to parse"), "msg: {}", msg),
+            other => panic!("expected Io, got {:?}", other),
+        }
     }
 
     // ── probe_stream_duration_secs_with timeout ─────────────────────────────
