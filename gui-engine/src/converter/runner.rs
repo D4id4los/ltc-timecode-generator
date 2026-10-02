@@ -236,8 +236,13 @@ impl ConversionReport for TestReport {
         *self.message.lock().unwrap() = msg.to_string();
     }
 
-    fn mark_failed(&self, _log: &str) {
+    fn mark_failed(&self, log: &str) {
         *self.failed.lock().unwrap() = true;
+        // Mirror the production report: the failure text rides in the
+        // message (the log buffer is owned by append_log).
+        if !log.is_empty() {
+            self.message.lock().unwrap().push_str(log);
+        }
     }
 
     fn is_failed(&self) -> bool {
@@ -365,8 +370,8 @@ fn run_video_step_with_fallback(
                 fallback.note_success(&encoder);
                 return true;
             }
-            Err(StepFailure::Fatal(_)) => {
-                report.mark_failed("");
+            Err(f @ StepFailure::Fatal(_)) => {
+                report.mark_failed(&f.to_string());
                 return false;
             }
             Err(StepFailure::EncoderInit(_)) => {
@@ -627,8 +632,10 @@ fn run_audio_to_audio(
             let total_tracks = settings.channel_map.num_channels();
             let current = emitted + 1;
             report.set_step_weight(1.0 / total_tracks as f32);
-            if run_ffmpeg_process(&step_args, &output_path, report, total_tracks, current).is_err() {
-                report.mark_failed("");
+            if let Err(e) =
+                run_ffmpeg_process(&step_args, &output_path, report, total_tracks, current)
+            {
+                report.mark_failed(&e.to_string());
                 return;
             }
             emitted += 1;
@@ -656,8 +663,8 @@ fn run_audio_to_audio(
         let base_args = build_audio_to_audio_args(settings, format, tc, sample_rate);
         let output_path = settings.output_path_for_index("audio", 0, extension);
         report.set_step_weight(1.0);
-        if run_ffmpeg_process(&base_args, &output_path, report, 1, 1).is_err() {
-            report.mark_failed("");
+        if let Err(e) = run_ffmpeg_process(&base_args, &output_path, report, 1, 1) {
+            report.mark_failed(&e.to_string());
         }
     }
 }
@@ -761,11 +768,11 @@ fn run_video_to_video(
 
         if entry.is_audio_only {
             if let VideoOutputStep::AudioChannelConcat { segments, output, format, sample_rate } = &entry.step {
-                if run_ffmpeg_process(
+                if let Err(e) = run_ffmpeg_process(
                     &build_concat_audio_args(settings, segments, format, *sample_rate),
                     output, report, steps.len(), step_idx + 1,
-                ).is_err() {
-                    report.mark_failed("");
+                ) {
+                    report.mark_failed(&e.to_string());
                     break;
                 }
             }
@@ -788,7 +795,10 @@ fn run_video_to_video(
                     step_idx + 1,
                 ) {
                     Ok(()) => true,
-                    Err(_) => false,
+                    Err(e) => {
+                        report.mark_failed(&e.to_string());
+                        false
+                    }
                 }
             } else {
                 run_video_step_with_fallback(
@@ -802,9 +812,6 @@ fn run_video_to_video(
                 )
             };
             if !ok {
-                if settings.copy_video {
-                    report.mark_failed("");
-                }
                 break;
             }
         }
@@ -847,26 +854,90 @@ fn rename_target_in_source_dir(settings: &ConverterSettings, file_idx: usize, ex
     source_dir.join(&new_filename)
 }
 
+/// Appends the CANCELLED log block and marks the run failed. Returns
+/// `true` when the caller should return immediately.
+fn check_cancelled(report: &impl ConversionReport) -> bool {
+    if !report.is_cancelled() {
+        return false;
+    }
+    report.append_log("\n--- CANCELLED ---\n");
+    report.mark_failed("Cancelled by user");
+    true
+}
+
+/// Failure ledger shared by the metadata-only phases: counts attempted
+/// vs. successful steps and records one detail line per failure.
+#[derive(Default)]
+struct FailureLedger {
+    attempted: usize,
+    succeeded: usize,
+    details: Vec<String>,
+}
+
+impl FailureLedger {
+    fn note_success(&mut self) {
+        self.attempted += 1;
+        self.succeeded += 1;
+    }
+}
+
+/// Record a step failure with its typed payload: appends `msg` plus the
+/// `StepFailure` detail to the log and tracks it in the ledger.
+fn note_step_failure(
+    ledger: &mut FailureLedger,
+    report: &impl ConversionReport,
+    msg: &str,
+    failure: &StepFailure,
+) {
+    ledger.attempted += 1;
+    let detail = format!("{} ({})", msg.trim_end(), failure);
+    ledger.details.push(detail.clone());
+    report.append_log(&format!("✗ {}\n", detail));
+}
+
+/// Record a best-effort failure without a typed payload (probe / tag /
+/// rename errors).
+fn note_plaintext_failure(ledger: &mut FailureLedger, detail: String) {
+    ledger.attempted += 1;
+    ledger.details.push(detail);
+}
+
+/// Monotonic step label replacing the old `file_idx * 3 + 1` math.
+fn step_label(cursor: usize, total: usize) -> String {
+    format!("[{}/{}]", cursor, total)
+}
+
 fn run_metadata_only(
     settings: &ConverterSettings,
     report: &impl ConversionReport,
     total_steps: usize,
 ) {
-    let input_files = &settings.input_files;
-    let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+    let mut ledger = FailureLedger::default();
+    let Some(probes) = probe_all_metadata_files(settings, report, &mut ledger) else {
+        return;
+    };
+    let Some(()) = extract_metadata_audio(settings, &probes, report, total_steps, &mut ledger) else {
+        return;
+    };
+    let Some(()) = tag_and_rename_files(settings, &probes, report, &mut ledger) else {
+        return;
+    };
+    summarize_metadata_failures(report, &ledger);
+}
+
+/// Phase P — probe every input up front (video inputs only) so
+/// `plan_concat_outputs` can see every clip. Returns `None` on cancel.
+fn probe_all_metadata_files(
+    settings: &ConverterSettings,
+    report: &impl ConversionReport,
+    ledger: &mut FailureLedger,
+) -> Option<Vec<Option<crate::ffprobe::VideoAudioProbe>>> {
     let is_video = settings.recording_type == RecordingType::VideoClipSequence;
-    let use_concat = is_video && settings.concat_audio && settings.split_tracks;
-
-    // Phase A: probe all files upfront so plan_concat_outputs can see every clip
-    let mut probes: Vec<Option<crate::ffprobe::VideoAudioProbe>> =
-        Vec::with_capacity(input_files.len());
-    for input_path in input_files.iter() {
-        if report.is_cancelled() {
-            report.append_log("\n--- CANCELLED ---\n");
-            report.mark_failed("Cancelled by user");
-            return;
+    let mut probes = Vec::with_capacity(settings.input_files.len());
+    for input_path in settings.input_files.iter() {
+        if check_cancelled(report) {
+            return None;
         }
-
         let probed: Option<crate::ffprobe::VideoAudioProbe> = if is_video {
             match crate::ffprobe::probe_video_audio(input_path) {
                 Ok(p) => Some(p),
@@ -878,6 +949,10 @@ fn run_metadata_only(
                     );
                     log::warn!("{}", msg.trim());
                     report.append_log(&msg);
+                    note_plaintext_failure(
+                        ledger,
+                        format!("{} — probe failed: {}", input_path.display(), e),
+                    );
                     None
                 }
             }
@@ -886,194 +961,237 @@ fn run_metadata_only(
         };
         probes.push(probed);
     }
+    Some(probes)
+}
 
-    // Phase B: audio extraction
-    let total_actual;
+/// Phase E — audio extraction, dispatching to the concat or per-file
+/// strategy. Returns `None` on cancel.
+fn extract_metadata_audio(
+    settings: &ConverterSettings,
+    probes: &[Option<crate::ffprobe::VideoAudioProbe>],
+    report: &impl ConversionReport,
+    total_steps: usize,
+    ledger: &mut FailureLedger,
+) -> Option<()> {
+    let is_video = settings.recording_type == RecordingType::VideoClipSequence;
+    let use_concat = is_video && settings.concat_audio && settings.split_tracks;
     if use_concat {
-        let (concat_steps, warning) = plan_concat_outputs(settings, &probes);
-        if !warning.is_empty() {
-            let w = warning.trim().to_string();
-            warn!("{}", w);
-            report.append_log(&format!("\n--- {}\n", w));
-        }
-        let extraction_count = concat_steps.len();
-        total_actual = extraction_count + input_files.len();
-        let step_weight = if total_actual > 0 {
-            1.0 / total_actual as f32
-        } else {
-            0.0
-        };
-
-        report.set_step_weight(step_weight);
-
-        for (step_idx, step) in concat_steps.iter().enumerate() {
-            if report.is_cancelled() {
-                report.append_log("\n--- CANCELLED ---\n");
-                report.mark_failed("Cancelled by user");
-                return;
-            }
-            match step {
-                VideoOutputStep::AudioChannelConcat {
-                    segments,
-                    output,
-                    format,
-                    sample_rate,
-                } => {
-                    if run_ffmpeg_process(
-                        &build_concat_audio_args(settings, segments, format, *sample_rate),
-                        output,
-                        report,
-                        total_actual,
-                        step_idx + 1,
-                    )
-                    .is_err()
-                    {
-                        let msg = format!(
-                            "✗ audio concatenation step {} failed\n",
-                            step_idx + 1
-                        );
-                        report.append_log(&msg);
-                    }
-                }
-                VideoOutputStep::AudioChannel {
-                    file_idx,
-                    stream_idx,
-                    channel_idx,
-                    output,
-                    format,
-                } => {
-                    let sr = probes[*file_idx]
-                        .as_ref()
-                        .and_then(|p| {
-                            p.streams.iter().find(|s| s.stream_index == *stream_idx)
-                        })
-                        .map(|s| s.sample_rate)
-                        .unwrap_or(48000);
-                    if run_ffmpeg_process(
-                        &build_video_track_extract_args(
-                            settings, *file_idx, *stream_idx, *channel_idx, format, sr,
-                        ),
-                        output,
-                        report,
-                        total_actual,
-                        step_idx + 1,
-                    )
-                    .is_err()
-                    {
-                        let msg = format!(
-                            "✗ {} — audio extraction failed\n",
-                            input_files[*file_idx].display()
-                        );
-                        report.append_log(&msg);
-                    }
-                }
-                _ => {}
-            }
-        }
+        extract_concat_audio(settings, probes, report, ledger)
     } else {
-        total_actual = total_steps;
-        report.set_step_weight(1.0 / total_actual.max(1) as f32);
-        for (file_idx, probed) in probes.iter().enumerate() {
-            if report.is_cancelled() {
-                report.append_log("\n--- CANCELLED ---\n");
-                report.mark_failed("Cancelled by user");
-                return;
-            }
+        extract_per_file_audio(settings, probes, report, total_steps, ledger, is_video)
+    }
+}
 
-            let input_path = &input_files[file_idx];
+/// Phase E (concat) — one concatenated audio output per surviving track.
+fn extract_concat_audio(
+    settings: &ConverterSettings,
+    probes: &[Option<crate::ffprobe::VideoAudioProbe>],
+    report: &impl ConversionReport,
+    ledger: &mut FailureLedger,
+) -> Option<()> {
+    let (concat_steps, warning) = plan_concat_outputs(settings, probes);
+    if !warning.is_empty() {
+        let w = warning.trim().to_string();
+        log::warn!("{}", w);
+        report.append_log(&format!("\n--- {}\n", w));
+    }
+    let total_actual = concat_steps.len() + settings.input_files.len();
+    let step_weight = if total_actual > 0 {
+        1.0 / total_actual as f32
+    } else {
+        0.0
+    };
+    report.set_step_weight(step_weight);
 
-            if let Some(ref probe) = probed {
-                let channels: Vec<(usize, usize)> = probe
-                    .streams
-                    .iter()
-                    .flat_map(|s| (0..s.channels).map(move |ch| (s.stream_index, ch)))
-                    .collect();
-                let map_n = settings.channel_map.num_channels();
-                let use_split = settings.split_tracks && map_n > 0;
-                let step_weight = 1.0 / total_steps as f32;
-                report.set_step_weight(step_weight);
-
-                if use_split {
-                    let mut emitted = 0usize;
-                    for sel in selected_channel_pairs(settings, &channels) {
-                        if report.is_cancelled() {
-                            break;
-                        }
-                        let (stream_idx, ch_idx) = sel.pair;
-                        emitted += 1;
-                        let output_path =
-                            settings.output_path_for_file("audio", file_idx, emitted, aext);
-                        let sample_rate = probe
-                            .streams
-                            .iter()
-                            .find(|s| s.stream_index == stream_idx)
-                            .map(|s| s.sample_rate)
-                            .unwrap_or(48000);
-                        let args = build_video_track_extract_args(
-                            settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
-                        );
-                        if run_ffmpeg_process(
-                            &args,
-                            &output_path,
-                            report,
-                            total_steps,
-                            file_idx * 3 + 1,
-                        )
-                        .is_err()
-                        {
-                            let msg = format!(
-                                "✗ {} — audio extraction failed\n",
-                                input_path.display()
-                            );
-                            report.append_log(&msg);
-                        }
-                    }
-                    if emitted == 0 {
-                        report.advance_step();
-                    }
+    for (cursor, step) in (1usize..).zip(concat_steps.iter()) {
+        if check_cancelled(report) {
+            return None;
+        }
+        match step {
+            VideoOutputStep::AudioChannelConcat {
+                segments,
+                output,
+                format,
+                sample_rate,
+            } => {
+                if let Err(e) = run_ffmpeg_process(
+                    &build_concat_audio_args(settings, segments, format, *sample_rate),
+                    output,
+                    report,
+                    total_actual,
+                    cursor,
+                ) {
+                    note_step_failure(
+                        ledger,
+                        report,
+                        &format!("audio concatenation step {} failed", step_label(cursor, total_actual)),
+                        &e,
+                    );
                 } else {
-                    let output_path = settings.merged_audio_output_path(aext);
-                    let (stream_idx, ch_idx) =
-                        channels.first().copied().unwrap_or((0, 0));
+                    ledger.note_success();
+                }
+            }
+            VideoOutputStep::AudioChannel {
+                file_idx,
+                stream_idx,
+                channel_idx,
+                output,
+                format,
+            } => {
+                let sr = probes[*file_idx]
+                    .as_ref()
+                    .and_then(|p| {
+                        p.streams.iter().find(|s| s.stream_index == *stream_idx)
+                    })
+                    .map(|s| s.sample_rate)
+                    .unwrap_or(48000);
+                if let Err(e) = run_ffmpeg_process(
+                    &build_video_track_extract_args(
+                        settings, *file_idx, *stream_idx, *channel_idx, format, sr,
+                    ),
+                    output,
+                    report,
+                    total_actual,
+                    cursor,
+                ) {
+                    note_step_failure(
+                        ledger,
+                        report,
+                        &format!(
+                            "{} — audio extraction failed",
+                            settings.input_files[*file_idx].display()
+                        ),
+                        &e,
+                    );
+                } else {
+                    ledger.note_success();
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(())
+}
+
+/// Phase E (per-file) — split or merged extraction for each probed clip.
+fn extract_per_file_audio(
+    settings: &ConverterSettings,
+    probes: &[Option<crate::ffprobe::VideoAudioProbe>],
+    report: &impl ConversionReport,
+    total_steps: usize,
+    ledger: &mut FailureLedger,
+    is_video: bool,
+) -> Option<()> {
+    let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
+    let total_actual = total_steps;
+    report.set_step_weight(1.0 / total_actual.max(1) as f32);
+    let mut cursor = 1usize;
+
+    for (file_idx, probed) in probes.iter().enumerate() {
+        if check_cancelled(report) {
+            return None;
+        }
+        let input_path = &settings.input_files[file_idx];
+
+        if let Some(ref probe) = probed {
+            let channels: Vec<(usize, usize)> = probe
+                .streams
+                .iter()
+                .flat_map(|s| (0..s.channels).map(move |ch| (s.stream_index, ch)))
+                .collect();
+            let use_split =
+                settings.split_tracks && settings.channel_map.num_channels() > 0;
+
+            if use_split {
+                let mut emitted = 0usize;
+                for sel in selected_channel_pairs(settings, &channels) {
+                    if check_cancelled(report) {
+                        return None;
+                    }
+                    let (stream_idx, ch_idx) = sel.pair;
+                    emitted += 1;
+                    let output_path =
+                        settings.output_path_for_file("audio", file_idx, emitted, aext);
                     let sample_rate = probe
                         .streams
-                        .first()
+                        .iter()
+                        .find(|s| s.stream_index == stream_idx)
                         .map(|s| s.sample_rate)
                         .unwrap_or(48000);
                     let args = build_video_track_extract_args(
                         settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
                     );
-                    if run_ffmpeg_process(
+                    if let Err(e) = run_ffmpeg_process(
                         &args,
                         &output_path,
                         report,
-                        total_steps,
-                        file_idx * 3 + 1,
-                    )
-                    .is_err()
-                    {
-                        let msg = format!(
-                            "✗ {} — audio extraction failed\n",
-                            input_path.display()
+                        total_actual,
+                        cursor,
+                    ) {
+                        note_step_failure(
+                            ledger,
+                            report,
+                            &format!("{} — audio extraction failed", input_path.display()),
+                            &e,
                         );
-                        report.append_log(&msg);
+                    } else {
+                        ledger.note_success();
                     }
+                    cursor += 1;
                 }
-            } else if !is_video {
-                report.advance_step();
+                if emitted == 0 {
+                    report.advance_step();
+                }
+            } else {
+                let output_path = settings.merged_audio_output_path(aext);
+                let (stream_idx, ch_idx) =
+                    channels.first().copied().unwrap_or((0, 0));
+                let sample_rate = probe
+                    .streams
+                    .first()
+                    .map(|s| s.sample_rate)
+                    .unwrap_or(48000);
+                let args = build_video_track_extract_args(
+                    settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
+                );
+                if let Err(e) = run_ffmpeg_process(
+                    &args,
+                    &output_path,
+                    report,
+                    total_actual,
+                    cursor,
+                ) {
+                    note_step_failure(
+                        ledger,
+                        report,
+                        &format!("{} — audio extraction failed", input_path.display()),
+                        &e,
+                    );
+                } else {
+                    ledger.note_success();
+                }
+                cursor += 1;
             }
+        } else if !is_video {
+            report.advance_step();
         }
     }
+    Some(())
+}
 
-    // Phase C: per-file tagging + rename
+/// Phases T+R — per-file tagging and rename into the source directory.
+fn tag_and_rename_files(
+    settings: &ConverterSettings,
+    probes: &[Option<crate::ffprobe::VideoAudioProbe>],
+    report: &impl ConversionReport,
+    ledger: &mut FailureLedger,
+) -> Option<()> {
     for (file_idx, _probed) in probes.iter().enumerate() {
-        if report.is_cancelled() {
-            report.append_log("\n--- CANCELLED ---\n");
-            report.mark_failed("Cancelled by user");
-            return;
+        if check_cancelled(report) {
+            return None;
         }
 
-        let input_path = &input_files[file_idx];
+        let input_path = &settings.input_files[file_idx];
         let tc = settings
             .timecode_meta_per_file
             .get(file_idx)
@@ -1104,13 +1222,11 @@ fn run_metadata_only(
                     report.append_log(&msg);
                 }
                 Err(e) => {
-                    let msg = format!(
-                        "✗ {} — tagging failed: {}\n",
-                        input_path.display(),
-                        e
-                    );
-                    log::error!("{}", msg.trim());
-                    report.append_log(&msg);
+                    let detail =
+                        format!("{} — tagging failed: {}", input_path.display(), e);
+                    log::error!("{}", detail);
+                    report.append_log(&format!("✗ {}\n", detail));
+                    note_plaintext_failure(ledger, detail);
                 }
             }
         } else {
@@ -1148,13 +1264,14 @@ fn run_metadata_only(
                             report.append_log(&msg);
                         }
                         Err(e) => {
-                            let msg = format!(
-                                "✗ {} — rename failed: {}\n",
+                            let detail = format!(
+                                "{} — rename failed: {}",
                                 input_path.display(),
                                 e
                             );
-                            log::error!("{}", msg.trim());
-                            report.append_log(&msg);
+                            log::error!("{}", detail);
+                            report.append_log(&format!("✗ {}\n", detail));
+                            note_plaintext_failure(ledger, detail);
                         }
                     }
                 }
@@ -1162,6 +1279,27 @@ fn run_metadata_only(
         }
 
         report.advance_step();
+    }
+    Some(())
+}
+
+/// Epilogue — a run in which work was attempted but nothing succeeded is a
+/// failure carrying the typed details; a partial failure completes with a
+/// visible STEP(S) FAILED block in the log.
+fn summarize_metadata_failures(report: &impl ConversionReport, ledger: &FailureLedger) {
+    if ledger.details.is_empty() {
+        return;
+    }
+    let summary = format!(
+        "\n--- {} STEP(S) FAILED ---\n{}",
+        ledger.details.len(),
+        ledger.details.join("\n")
+    );
+    if ledger.attempted > 0 && ledger.succeeded == 0 {
+        report.append_log(&summary);
+        report.mark_failed(&summary);
+    } else {
+        report.append_log(&summary);
     }
 }
 
@@ -1457,5 +1595,91 @@ mod tests {
             .filter(|p| p.extension().map(|e| e == "mkv").unwrap_or(false))
             .collect();
         assert!(!outs.is_empty(), "expected an .mkv output in {}", dir.path().display());
+    }
+
+    // ── PR-3: phase helpers + failure accounting ─────────────────────────
+
+    #[test]
+    fn test_check_cancelled_marks_failed_and_logs() {
+        let report = TestReport::new();
+        assert!(!check_cancelled(&report), "no mutation when not cancelled");
+        assert!(!*report.failed.lock().unwrap());
+        assert!(report.log.lock().unwrap().is_empty());
+
+        report.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(check_cancelled(&report));
+        assert!(*report.failed.lock().unwrap());
+        assert!(report.log.lock().unwrap().contains("CANCELLED"));
+    }
+
+    #[test]
+    fn test_note_step_failure_carries_typed_payload() {
+        let report = TestReport::new();
+        let mut ledger = FailureLedger::default();
+        let failure = StepFailure::Fatal("ffmpeg exited with code 1".to_string());
+        note_step_failure(&mut ledger, &report, "extract failed", &failure);
+
+        assert!(report.log.lock().unwrap().contains("ffmpeg exited with code 1"),
+            "typed payload must appear verbatim in the log");
+        assert_eq!(ledger.attempted, 1);
+        assert_eq!(ledger.succeeded, 0);
+        assert!(ledger.details[0].contains("ffmpeg exited with code 1"));
+    }
+
+    #[test]
+    fn test_step_label_monotonic() {
+        assert_eq!(step_label(1, 5), "[1/5]");
+        assert_eq!(step_label(3, 5), "[3/5]");
+    }
+
+    /// WP-3.3 intended change: a metadata-only run in which every attempted
+    /// step failed now ends in failure with the typed details (previously it
+    /// completed "successfully").
+    #[test]
+    fn test_run_metadata_only_all_steps_failed_marks_failed() {
+        if skip_if_no_ffmpeg() { return; }
+        let mut settings = make_video_settings();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![
+            PathBuf::from("/nonexistent/clip1.mp4"),
+            PathBuf::from("/nonexistent/clip2.mp4"),
+        ];
+        settings.timecode_meta_per_file = vec![tc_meta(), tc_meta()];
+
+        let report = TestReport::new();
+        let total = settings.input_files.len() * 3;
+        run_metadata_only(&settings, &report, total);
+
+        assert!(*report.failed.lock().unwrap(),
+            "a 100%% failed run must not report success");
+        let msg = report.message.lock().unwrap().clone();
+        assert!(msg.contains("STEP(S) FAILED"), "summary in failure message: {}", msg);
+        assert!(msg.contains("probe failed"), "typed details present: {}", msg);
+    }
+
+    /// Partial failure still completes, but the log carries a visible
+    /// "--- N STEP(S) FAILED ---" block.
+    #[test]
+    fn test_run_metadata_only_partial_failure_completes_with_warning() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let clip = dir.path().join("clip1.mp4");
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip, 1.0);
+
+        let mut settings = make_video_settings();
+        settings.pipeline = ConversionPipeline::MetadataOnly;
+        settings.input_files = vec![clip, PathBuf::from("/nonexistent/clip2.mp4")];
+        settings.output_folder = dir.path().to_path_buf();
+        settings.timecode_meta_per_file = vec![tc_meta(), tc_meta()];
+
+        let report = TestReport::new();
+        let total = settings.input_files.len() * 3;
+        run_metadata_only(&settings, &report, total);
+
+        assert!(!*report.failed.lock().unwrap(), "partial failure completes");
+        let log = report.log.lock().unwrap().clone();
+        // Probe, tag, and rename all fail for the nonexistent clip → 3 steps.
+        assert!(log.contains("--- 3 STEP(S) FAILED ---"), "partial summary present: {}", log);
+        assert!(log.contains("probe failed"), "detail names the failed probe: {}", log);
     }
 }

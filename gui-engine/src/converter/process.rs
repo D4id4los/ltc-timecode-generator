@@ -18,6 +18,15 @@ pub enum StepFailure {
     Fatal(String),
 }
 
+impl std::fmt::Display for StepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StepFailure::EncoderInit(d) => write!(f, "encoder init failed: {}", d),
+            StepFailure::Fatal(d) => write!(f, "{}", d),
+        }
+    }
+}
+
 /// Minimum output file size (in bytes) that suggests ffmpeg actually produced
 /// real encoded/copied content (not just a muxer header).
 pub const MIN_PRODUCED_OUTPUT_BYTES: u64 = 4096;
