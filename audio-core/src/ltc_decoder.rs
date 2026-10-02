@@ -24,6 +24,11 @@ pub enum LtcDecodeStatus {
     Error { message: String },
 }
 
+/// Status thresholds shared by both decoders (builtin and libltc).
+/// `avg_confidence` is a 0.0–1.0 fraction of expected frames decoded.
+pub const CONFIDENCE_SUCCESS_THRESHOLD: f32 = 0.70;
+pub const CONFIDENCE_LOW_THRESHOLD: f32 = 0.30;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FrameTimecode {
     pub frame_index: u32,
@@ -39,6 +44,9 @@ pub struct LtcDetectionResult {
     pub total_possible_frames: u32,
     pub valid_frames: u32,
     pub timecodes: Vec<FrameTimecode>,
+    /// Fraction of expected frames successfully decoded (0.0–1.0).
+    /// Both decoders publish this on the same scale; multiply by 100 for
+    /// display.
     pub avg_confidence: f32,
     pub details: Vec<String>,
     pub total_audio_duration_secs: f64,
@@ -568,9 +576,9 @@ let mut result = match best_result {
                 0.0
             };
 
-            let status = if confidence >= 0.70 {
+            let status = if confidence >= CONFIDENCE_SUCCESS_THRESHOLD {
                 LtcDecodeStatus::Success
-            } else if confidence >= 0.30 {
+            } else if confidence >= CONFIDENCE_LOW_THRESHOLD {
                 LtcDecodeStatus::LowConfidence
             } else {
                 LtcDecodeStatus::NoSyncWord
@@ -2609,6 +2617,54 @@ mod tests {
             secs_spanned > 15.0,
             "Real-world LTC should span >15s of timecode, got {:.2}s ({} possible frames @ {:.2}fps)",
             secs_spanned, result.total_possible_frames, result.detected_fps,
+        );
+    }
+
+    // ── Cross-decoder confidence contract ────────────────────────────────
+
+    /// Both decoders must publish `avg_confidence` on the same 0.0–1.0
+    /// fraction scale and classify status with the same thresholds — every
+    /// consumer multiplies by 100 for display and gates on status.
+    #[test]
+    fn test_decoder_contract_confidence_scale() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let wav_path = manifest_dir
+            .parent()
+            .expect("CARGO_MANIFEST_DIR parent")
+            .join("test-data")
+            .join("ltc-real-world-test-20sec.wav");
+
+        if !wav_path.exists() {
+            eprintln!("--- SKIPPED: real-world fixture missing at {}", wav_path.display());
+            return;
+        }
+
+        let builtin = decode_ltc_from_wav(&wav_path, 25.0, false, None).expect("builtin decode");
+        let libltc = crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(
+            &wav_path, 25.0, false, None,
+        )
+        .expect("libltc decode");
+
+        for (name, r) in [("builtin", &builtin), ("libltc", &libltc)] {
+            assert!(
+                (0.0..=1.0).contains(&r.avg_confidence),
+                "{} decoder avg_confidence must be a 0.0–1.0 fraction, got {}",
+                name,
+                r.avg_confidence
+            );
+            assert!(
+                matches!(r.status, LtcDecodeStatus::Success),
+                "{} decoder should classify the clean fixture as Success, got {:?}",
+                name,
+                r.status
+            );
+        }
+
+        assert!(
+            (builtin.avg_confidence - libltc.avg_confidence).abs() < 0.25,
+            "decoders disagree on frame coverage: builtin {:.3} vs libltc {:.3}",
+            builtin.avg_confidence,
+            libltc.avg_confidence
         );
     }
 

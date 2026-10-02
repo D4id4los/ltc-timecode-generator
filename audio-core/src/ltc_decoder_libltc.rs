@@ -5,7 +5,7 @@ use std::time::Instant;
 use libltc_rs::prelude::*;
 use log::{debug, info, warn};
 
-use crate::ltc_decoder::{apply_coherent_first_timecode, compute_ltc_quality, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
+use crate::ltc_decoder::{apply_coherent_first_timecode, compute_ltc_quality, CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
 use crate::Timecode;
 
 pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, String> {
@@ -161,14 +161,18 @@ pub fn decode_ltc_samples_libltc(
         start.elapsed().as_secs_f64(), fps, drop_frame);
 
     let total_possible_frames = (total_duration * fps).round() as u32;
+    // Same 0.0–1.0 fraction scale as the builtin decoder (see
+    // LtcDetectionResult::avg_confidence); consumers multiply by 100.
     let avg_confidence = if total_possible_frames > 0 {
-        (valid_count as f32 / total_possible_frames as f32 * 100.0).min(100.0)
+        (valid_count as f32 / total_possible_frames as f32).min(1.0)
     } else {
         0.0
     };
 
-    let status = if valid_count > 0 {
+    let status = if avg_confidence >= CONFIDENCE_SUCCESS_THRESHOLD {
         LtcDecodeStatus::Success
+    } else if avg_confidence >= CONFIDENCE_LOW_THRESHOLD {
+        LtcDecodeStatus::LowConfidence
     } else {
         LtcDecodeStatus::NoSyncWord
     };
@@ -207,7 +211,7 @@ pub fn decode_ltc_samples_libltc(
         "libltc decode complete: {} valid / {} possible ({:.1}%) in {:.1}ms, first_ltc_timecode_secs={:.3}s",
         result.valid_frames,
         result.total_possible_frames,
-        result.avg_confidence,
+        result.avg_confidence * 100.0,
         result.processing_time_ms,
         result.first_ltc_timecode_secs,
     );

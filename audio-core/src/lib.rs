@@ -545,9 +545,9 @@ let cancel_flag = progress.cancel_flag.clone();
     };
 
     let status = if valid_frames > 0 {
-        if avg_confidence >= 0.70 {
+        if avg_confidence >= CONFIDENCE_SUCCESS_THRESHOLD {
             LtcDecodeStatus::Success
-        } else if avg_confidence >= 0.30 {
+        } else if avg_confidence >= CONFIDENCE_LOW_THRESHOLD {
             LtcDecodeStatus::LowConfidence
         } else {
             LtcDecodeStatus::NoSyncWord
@@ -648,8 +648,9 @@ fn decode_one_chunk(
 // Re-export LTC decoder types for convenience
 pub use ltc_decoder::{
     apply_coherent_first_timecode, compute_ltc_quality, decode_ltc_from_wav, decode_ltc_samples,
-    find_first_coherent_index, quick_check_ltc, FrameTimecode, LtcDecodeStatus,
-    LtcDetectionResult, LtcQualityReport,
+    find_first_coherent_index, quick_check_ltc, CONFIDENCE_LOW_THRESHOLD,
+    CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus, LtcDetectionResult,
+    LtcQualityReport,
 };
 pub use ltc_decoder_libltc::{decode_ltc_from_wav_libltc, decode_ltc_samples_libltc};
 
