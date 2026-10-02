@@ -690,7 +690,8 @@ fn build_bext_payload(
     buf.extend_from_slice(&bext_padded_string("", 8));
 
     // time_reference (8 bytes)
-    let sample_rate = read_wav_sample_rate_internal(file)?;
+    let sample_rate = crate::converter::read_wav_sample_rate_from_file(file)
+        .ok_or_else(|| "no fmt chunk found".to_string())?;
     let time_reference = crate::converter::time_reference_samples(meta, sample_rate);
     buf.extend_from_slice(&time_reference.to_le_bytes());
 
@@ -786,7 +787,8 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
             }
 
             // Write time_reference (8 bytes)
-            let sample_rate = read_wav_sample_rate_internal(&mut file)?;
+            let sample_rate = crate::converter::read_wav_sample_rate_from_file(&mut file)
+                .ok_or_else(|| "no fmt chunk found".to_string())?;
             let time_reference = crate::converter::time_reference_samples(meta, sample_rate);
             let time_ref_bytes = time_reference.to_le_bytes();
             file.seek(SeekFrom::Start(payload_off + 338))
@@ -843,44 +845,6 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
     Ok(TagOutcome::TaggedInPlace)
 }
 
-fn read_wav_sample_rate_internal(file: &mut std::fs::File) -> Result<u32, String> {
-    let mut fmt_data = [0u8; 6];
-    file.stream_position()
-        .map_err(|e| format!("seek current: {}", e))?;
-    // We need to find fmt chunk.  Simpler: read at offset 24 (WAV format's
-    // fmt follows RIFF+WAVE header at fixed offset for standard RIFF layout).
-    // Actually fmt might not be at 24 if other chunks precede it.
-    // Let's just scan for "fmt " chunk.
-    let file_len = file
-        .seek(SeekFrom::End(0))
-        .map_err(|e| format!("seek end: {}", e))?;
-    file.seek(SeekFrom::Start(12))
-        .map_err(|e| format!("seek: {}", e))?;
-    let mut offset: u64 = 12;
-    while offset + 8 <= file_len {
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| format!("seek: {}", e))?;
-        let mut hdr = [0u8; 8];
-        file.read_exact(&mut hdr)
-            .map_err(|e| format!("read: {}", e))?;
-        let chunk_size = read_be_u32(&hdr[4..8]) as u64;
-        if &hdr[0..4] == b"fmt " {
-            if chunk_size < 16 {
-                return Err("invalid fmt chunk".to_string());
-            }
-            file.read_exact(&mut fmt_data[0..6])
-                .map_err(|e| format!("read fmt: {}", e))?;
-            let sample_rate =
-                u32::from_le_bytes([fmt_data[0], fmt_data[1], fmt_data[2], fmt_data[3]]);
-            return Ok(sample_rate);
-        }
-        offset += 8 + chunk_size;
-        if chunk_size % 2 != 0 {
-            offset += 1;
-        }
-    }
-    Err("no fmt chunk found".to_string())
-}
 
 // ── ffmpeg fallback ────────────────────────────────────────────────────
 
@@ -1530,5 +1494,102 @@ mod tests {
         assert!(result.is_err(), "expected Io error, got {:?}", result);
         let msg = result.unwrap_err();
         assert!(msg.contains("failed to spawn ffmpeg"), "msg: {}", msg);
+    }
+
+    // ── WAV fmt-chunk scanning ────────────────────────────────────────────
+
+    fn write_wav_with_leading_junk(dir: &TempDir, sample_rate: u32) -> std::path::PathBuf {
+        let path = dir.path().join("junk_first.wav");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let junk_payload = [0u8; 32];
+        let data_payload = [0u8; 8];
+        let riff_size = 4u32
+            + (8 + junk_payload.len() as u32)
+            + (8 + 16)
+            + (8 + data_payload.len() as u32);
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&riff_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        // JUNK chunk before fmt — recorders (e.g. TASCAM) emit these.
+        f.write_all(b"JUNK").unwrap();
+        f.write_all(&(junk_payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&junk_payload).unwrap();
+        // fmt chunk
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // mono
+        f.write_all(&sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&(sample_rate * 2).to_le_bytes()).unwrap(); // byte rate
+        f.write_all(&2u16.to_le_bytes()).unwrap(); // block align
+        f.write_all(&16u16.to_le_bytes()).unwrap(); // bits per sample
+        // data chunk
+        f.write_all(b"data").unwrap();
+        f.write_all(&(data_payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&data_payload).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_read_wav_sample_rate_junk_chunk_before_fmt() {
+        let dir = TempDir::new().unwrap();
+        let path = write_wav_with_leading_junk(&dir, 48000);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let rate = crate::converter::read_wav_sample_rate_from_file(&mut file)
+            .expect("fmt chunk after a preceding JUNK chunk must be found");
+        assert_eq!(rate, 48000);
+    }
+
+    #[test]
+    fn test_read_wav_sample_rate_via_path_junk_chunk_before_fmt() {
+        let dir = TempDir::new().unwrap();
+        let path = write_wav_with_leading_junk(&dir, 44100);
+        let rate = crate::converter::read_wav_sample_rate(&path)
+            .expect("path-based reader must scan past preceding chunks");
+        assert_eq!(rate, 44100);
+    }
+
+    #[test]
+    fn test_read_wav_sample_rate_odd_sized_chunk_padding() {
+        // A chunk with an odd size carries one padding byte that must be
+        // skipped; otherwise the scan lands inside the payload.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("odd_chunk.wav");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let odd_payload = [0u8; 7]; // odd size → 1 pad byte
+        let riff_size = 4u32 + (8 + odd_payload.len() as u32 + 1) + (8 + 16) + (8 + 8);
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&riff_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"JUNK").unwrap();
+        f.write_all(&(odd_payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&odd_payload).unwrap();
+        f.write_all(&[0u8]).unwrap(); // pad byte
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();
+        f.write_all(&22050u32.to_le_bytes()).unwrap();
+        f.write_all(&44100u32.to_le_bytes()).unwrap();
+        f.write_all(&2u16.to_le_bytes()).unwrap();
+        f.write_all(&16u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&8u32.to_le_bytes()).unwrap();
+        f.write_all(&[0u8; 8]).unwrap();
+        drop(f);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let rate = crate::converter::read_wav_sample_rate_from_file(&mut file)
+            .expect("fmt after odd-sized chunk must be found");
+        assert_eq!(rate, 22050);
+    }
+
+    #[test]
+    fn test_read_wav_sample_rate_no_fmt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("no_fmt.wav");
+        std::fs::write(&path, b"RIFF\x04\x00\x00\x00WAVE").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert!(crate::converter::read_wav_sample_rate_from_file(&mut file).is_none());
+        assert!(crate::converter::read_wav_sample_rate(&path).is_none());
     }
 }

@@ -8,8 +8,9 @@ pub use channel_map::ChannelMap;
 pub(crate) mod timecode;
 pub use timecode::{
     build_per_file_start_timecodes, build_per_file_trim_and_timecode,
-    find_timecode_at_offset, format_ffmpeg_timecode, start_timecode_from_ltc,
-    time_reference_samples, TimecodeMetadata,
+    find_timecode_at_offset, format_ffmpeg_timecode, read_wav_sample_rate,
+    read_wav_sample_rate_from_file, start_timecode_from_ltc, time_reference_samples,
+    TimecodeMetadata,
 };
 
 pub(crate) mod capabilities;

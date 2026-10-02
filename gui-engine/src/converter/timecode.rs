@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use log::warn;
@@ -12,14 +12,43 @@ pub struct TimecodeMetadata {
     pub drop_frame: bool,
 }
 
-pub fn read_wav_sample_rate(path: &Path) -> Option<u32> {
-    let mut buf = [0u8; 28];
-    let mut file = std::fs::File::open(path).ok()?;
-    file.read_exact(&mut buf).ok()?;
-    if &buf[0..4] != b"RIFF" || &buf[8..12] != b"WAVE" || &buf[12..16] != b"fmt " {
-        return None;
+/// Scan RIFF chunks (starting after the `RIFF`/`WAVE` header) for the `fmt `
+/// chunk and return its sample rate.
+///
+/// Chunk sizes are little-endian per the RIFF spec; odd-sized chunks carry one
+/// padding byte that must be skipped, so WAVs with `JUNK`/`LIST`/`bext` chunks
+/// before `fmt ` (as written by many recorders) are handled correctly.
+pub fn read_wav_sample_rate_from_file(file: &mut std::fs::File) -> Option<u32> {
+    let file_len = file.seek(SeekFrom::End(0)).ok()?;
+    file.seek(SeekFrom::Start(12)).ok()?;
+    let mut offset: u64 = 12;
+    while offset + 8 <= file_len {
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut hdr = [0u8; 8];
+        file.read_exact(&mut hdr).ok()?;
+        let chunk_size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
+        if &hdr[0..4] == b"fmt " {
+            if chunk_size < 16 {
+                return None;
+            }
+            // fmt payload: format_tag(2) | channels(2) | sample_rate(4) | ...
+            let mut fmt_data = [0u8; 8];
+            file.read_exact(&mut fmt_data).ok()?;
+            return Some(u32::from_le_bytes([
+                fmt_data[4], fmt_data[5], fmt_data[6], fmt_data[7],
+            ]));
+        }
+        offset += 8 + chunk_size;
+        if chunk_size % 2 != 0 {
+            offset += 1;
+        }
     }
-    Some(u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]))
+    None
+}
+
+pub fn read_wav_sample_rate(path: &Path) -> Option<u32> {
+    let mut file = std::fs::File::open(path).ok()?;
+    read_wav_sample_rate_from_file(&mut file)
 }
 
 pub fn format_ffmpeg_timecode(tc: &Timecode, drop_frame: bool) -> String {
