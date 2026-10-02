@@ -30,4 +30,5 @@ perf-test/results/
 # CI/Sonar report artifacts
 clippy-report.json
 lcov.info
+reports/
 

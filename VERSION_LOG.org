@@ -31,6 +31,11 @@ List of Changes:
 - Documentation: new "CI & SonarQube Cloud" sections in AGENTS.md and
   README.org; report artifacts (`clippy-report.json`, `lcov.info`)
   added to `.gitignore`.
+- Local report exporter: `npm run sonar:report`
+  (`scripts/sonar-report.mjs`) fetches quality-gate status, measures,
+  open issues and security hotspots from the SonarQube Cloud Web API
+  and writes deterministic JSON + Markdown reports to
+  `reports/sonar/` for offline analysis or AI-agent consumption.
 
 
 * Unreleased — unified shadow-state interaction architecture

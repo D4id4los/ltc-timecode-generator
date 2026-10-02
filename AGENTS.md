@@ -485,6 +485,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on push to `main` and on PRs: c
 - **Rust analysis** uses the official SonarSource Rust analyzer (CI-based only — no automatic analysis for Rust). Clippy findings are imported as external issues from `clippy-report.json` (`cargo clippy --message-format=json`), coverage from `lcov.info` + `coverage/lcov.info` (both gitignored).
 - **CI environment**: `libasound2-dev` + `libpipewire-0.3-dev` + `libpulse-dev` + `libfontconfig1-dev` + `libltc-dev` + `libclang-dev` + `ffmpeg` via apt (every pkg-config probe in the dependency graph: cpal→alsa, pipewire/pulse backends, slint/fontique→fontconfig, libltc-sys, bindgen→libclang), `PKG_CONFIG_PATH` set, Rust stable with `clippy` + `llvm-tools-preview`, cargo build cache via `Swatinem/rust-cache`, nextest + cargo-llvm-cov via `taiki-e/install-action`, Node 22 with npm cache, SonarScanner CLI binaries cached in `~/.sonar/cache` via `actions/cache`.
 - **Local parity**: `npm run test:coverage` runs vitest with the LCOV reporter configured in `vite.config.ts`.
+- **Local reports**: `SONAR_TOKEN=<token> npm run sonar:report` pulls quality-gate status, measures, open issues, and security hotspots from the SonarQube Cloud Web API into fixed-name JSON + `summary.md` under `reports/sonar/` (gitignored) — deterministic textual reports for AI agents or diffing.
 
 ## Build & Run
 
