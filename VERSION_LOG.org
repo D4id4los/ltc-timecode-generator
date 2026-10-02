@@ -1,6 +1,54 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — WP-0 correctness bundle (five verified defects fixed)
+
+Landing of the five small correctness fixes from the code-quality
+report's WP-0 work package (`reports/code-quality-2026-10-02.md`),
+each developed with the project TDD loop (failing test first).
+
+List of Changes:
+- WAV fmt-scan endianness (`gui-engine/src/tagger.rs`): the bext
+  tagger's fmt-chunk scanner read RIFF chunk sizes big-endian, so any
+  WAV with a chunk preceding `fmt ` (LIST/JUNK from recorders) failed
+  with "no fmt chunk found"; it also read the sample rate from the
+  wrong fmt payload offset (format tag + channels instead of the rate
+  bytes).  Consolidated on a single little-endian, padding-aware
+  scanner `converter::read_wav_sample_rate_from_file`; the path-based
+  `read_wav_sample_rate` now delegates to it instead of assuming
+  `fmt ` is the first chunk.
+- MP4 `tmcd` `stco` patch (`gui-engine/src/tagger.rs`): the native
+  in-place MP4 timecode tagger shipped the tmcd track's `stco` chunk
+  offset as 0 (comments promised a write-time patch that never
+  existed), so spec-strict tools resolving the timecode sample read
+  garbage.  The offset is now patched to the deterministic appended
+  mdat payload position before the new moov is written, verified by
+  an end-to-end ffmpeg+ffprobe round-trip fixture test.
+- Cross-decoder confidence contract (`audio-core`): the libltc
+  decoder stored `avg_confidence` as a 0–100 percentage while the
+  builtin decoder used a 0.0–1.0 fraction, and libltc classified
+  status as "any valid frames" (never `LowConfidence`) — libltc
+  results displayed 100× too high and marginal recordings were
+  classified differently per backend.  Both decoders now publish the
+  same 0.0–1.0 fraction with shared `CONFIDENCE_SUCCESS_THRESHOLD` /
+  `CONFIDENCE_LOW_THRESHOLD` constants; a contract test runs both
+  decoders over the real-world fixture.
+- Video-extension registry (`gui-engine/src/media_ext.rs`): the
+  video-extension list had drifted across five sites (ffprobe,
+  device_name, offload, converter/formats, tagger) — an `.m4v` file
+  was ingested by offload but rejected by `path_is_video()`.  A new
+  single-source registry (`VIDEO_EXTENSIONS`, `AUDIO_EXTENSIONS`,
+  `is_video`/`is_audio`, `container_for_input`) now backs all
+  classification and stream-copy container mapping; the duplicated
+  lists are deleted.
+- Subprocess hygiene (`offload.rs`, `hw_device.rs`): `udisks_mount`
+  (the only production `Command::new` outside `subprocess.rs`) now
+  spawns via `no_window_command` + `run_output_with_timeout` under a
+  15 s timeout instead of hanging the card scan; the VAAPI/Vulkan
+  hardware probes no longer call `.status()` unbounded — both run
+  under a 10 s timeout, with injectable-runner seams and unit tests
+  for each.
+
 * Unreleased — CI pipeline and SonarQube Cloud code-quality analysis
 
 Introduction of continuous integration and automated code-quality metrics
