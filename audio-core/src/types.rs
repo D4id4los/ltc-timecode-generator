@@ -1,0 +1,222 @@
+//! Shared audio/LTC types: timecode, channel routing, audio events, device
+//! info, and the chunked-decode configuration/progress types.
+
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Timecode {
+    pub hours: u32,
+    pub minutes: u32,
+    pub seconds: u32,
+    pub frames: u32,
+}
+
+/// Stereo channel routing for generated LTC/beep tones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelSel {
+    Left,
+    Right,
+    Both,
+}
+
+impl ChannelSel {
+    /// Canonical lowercase name (used by the CLI and UI labels).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChannelSel::Left => "left",
+            ChannelSel::Right => "right",
+            ChannelSel::Both => "both",
+        }
+    }
+
+    /// Parse a channel name; case-insensitive. `None` for unknown names.
+    pub fn parse(s: &str) -> Option<ChannelSel> {
+        match s.to_ascii_lowercase().as_str() {
+            "left" => Some(ChannelSel::Left),
+            "right" => Some(ChannelSel::Right),
+            "both" => Some(ChannelSel::Both),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AudioEvent {
+    StreamError(String),
+    StreamDied,
+    StreamRecovering { attempt: u8 },
+    StreamDead,
+    RecoveryNeeded { reason: String },
+    Underrun,
+    FramesDropped { total: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AudioDeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    pub formats: Vec<String>,
+    pub channels_min: u16,
+    pub channels_max: u16,
+    pub sample_rate_min: u32,
+    pub sample_rate_max: u32,
+    pub buffer_min: u32,
+    pub buffer_max: u32,
+}
+
+/// Configuration for chunked WAV reading.
+pub struct DecodeConfig {
+    /// Target raw-audio chunk size in bytes (~50MB).
+    pub chunk_size_bytes: u64,
+    /// Overlap between adjacent chunks in seconds (~2 seconds).
+    pub overlap_seconds: f64,
+}
+
+impl Default for DecodeConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size_bytes: 50_000_000,  // 50 MB
+            overlap_seconds: 2.0,
+        }
+    }
+}
+
+/// Shared progress state for a chunked decode operation.
+#[derive(Clone)]
+pub struct DecodeProgress {
+    pub chunks_total: usize,
+    pub chunks_completed: Arc<AtomicUsize>,
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+impl DecodeProgress {
+    pub fn new(chunks_total: usize) -> Self {
+        Self {
+            chunks_total,
+            chunks_completed: Arc::new(AtomicUsize::new(0)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn percent(&self) -> f32 {
+        if self.chunks_total == 0 {
+            return 1.0;
+        }
+        self.chunks_completed.load(Ordering::Relaxed) as f32 / self.chunks_total as f32
+    }
+
+    pub fn cancel(&self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Timecode ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_timecode_clone_copy() {
+        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
+        let copied = tc;
+        assert_eq!(copied, tc);
+    }
+
+    #[test]
+    fn test_timecode_debug() {
+        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
+        let d = format!("{:?}", tc);
+        assert!(d.contains("1") || d.contains("hours"));
+    }
+
+    #[test]
+    fn test_timecode_serialize_deserialize() {
+        let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
+        let json = serde_json::to_string(&tc).unwrap();
+        let deserialized: Timecode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, tc);
+    }
+
+    // ── DecodeConfig default ───────────────────────────────────────────
+
+    #[test]
+    fn test_decode_config_default() {
+        let config = DecodeConfig::default();
+        assert_eq!(config.chunk_size_bytes, 50_000_000);
+        assert!((config.overlap_seconds - 2.0).abs() < 1e-9);
+    }
+
+    // ── DecodeProgress ────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_progress_new() {
+        let p = DecodeProgress::new(10);
+        assert_eq!(p.chunks_total, 10);
+        assert!((p.percent() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_decode_progress_partial() {
+        let p = DecodeProgress::new(4);
+        p.chunks_completed.store(2, Ordering::Relaxed);
+        assert!((p.percent() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_decode_progress_complete() {
+        let p = DecodeProgress::new(5);
+        p.chunks_completed.store(5, Ordering::Relaxed);
+        assert!((p.percent() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_decode_progress_zero_total() {
+        let p = DecodeProgress::new(0);
+        assert!((p.percent() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_decode_progress_cancel() {
+        let p = DecodeProgress::new(5);
+        assert!(!p.cancel_flag.load(Ordering::Relaxed));
+        p.cancel();
+        assert!(p.cancel_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_decode_progress_double_cancel() {
+        let p = DecodeProgress::new(5);
+        p.cancel();
+        p.cancel();
+        assert!(p.cancel_flag.load(Ordering::Relaxed));
+    }
+
+    // ── ChannelSel ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_channel_sel_parse_valid() {
+        assert_eq!(ChannelSel::parse("left"), Some(ChannelSel::Left));
+        assert_eq!(ChannelSel::parse("right"), Some(ChannelSel::Right));
+        assert_eq!(ChannelSel::parse("both"), Some(ChannelSel::Both));
+        assert_eq!(ChannelSel::parse("LEFT"), Some(ChannelSel::Left));
+        assert_eq!(ChannelSel::parse("Both"), Some(ChannelSel::Both));
+    }
+
+    #[test]
+    fn test_channel_sel_parse_invalid() {
+        assert_eq!(ChannelSel::parse(""), None);
+        assert_eq!(ChannelSel::parse("centre"), None);
+        assert_eq!(ChannelSel::parse("lefft"), None);
+    }
+
+    #[test]
+    fn test_channel_sel_as_str_roundtrip() {
+        for sel in [ChannelSel::Left, ChannelSel::Right, ChannelSel::Both] {
+            assert_eq!(ChannelSel::parse(sel.as_str()), Some(sel));
+        }
+    }
+}
