@@ -776,10 +776,22 @@ mod tests {
     }
 
     // ── Camera pattern regex tests ──────────────────────────────────────────
+    //
+    // These compile the *production* regexes from CAMERA_PATTERNS (selected
+    // by pattern name) so any drift between the tests and the shipped
+    // patterns is a compile/naming error, not silent test rot.
+
+    fn camera_regex(name: &str) -> Regex {
+        let p = CAMERA_PATTERNS
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("CAMERA_PATTERNS must contain {name:?}"));
+        Regex::new(p.regex).expect("production pattern regex must compile")
+    }
 
     #[test]
     fn test_sony_handycam_pattern_matches() {
-        let re = Regex::new(r"^(?P<prefix>C\d{4})\.(?:mp4|MP4|MTS|mts)$").unwrap();
+        let re = camera_regex("Sony Handycam");
         assert!(re.is_match("C0001.MP4"));
         assert!(re.is_match("C0002.mp4"));
         assert!(re.is_match("C0123.MTS"));
@@ -790,49 +802,53 @@ mod tests {
 
     #[test]
     fn test_sony_handycam_pattern_rejects() {
-        let re = Regex::new(r"^(?P<prefix>C\d{4})\.(?:mp4|MP4|MTS|mts)$").unwrap();
-        assert!(!re.is_match("C00001.MP4"));   // 5 digits
-        assert!(!re.is_match("C001.MP4"));      // 3 digits
-        assert!(!re.is_match("D0001.MP4"));     // wrong prefix
-        assert!(!re.is_match("C0001.AVI"));     // wrong extension
+        let re = camera_regex("Sony Handycam");
+        // The production pattern is *C\\d{4}* — 5-digit names like
+        // C00001.MP4 DO match it (with surrounding .* slack); negatives are
+        // re-derived from the real regex: wrong prefix letter, too few
+        // digits, wrong extension.
+        assert!(re.is_match("C00001.MP4"), "5 digits with .* slack must match");
+        assert!(!re.is_match("C001.MP4"));   // 3 digits — no C + 4 digits
+        assert!(!re.is_match("D0001.MP4"));  // wrong prefix letter
+        assert!(!re.is_match("C0001.AVI"));  // wrong extension
     }
 
     #[test]
     fn test_sony_fs100_pattern_matches() {
-        let re = Regex::new(r"^(?P<prefix>\d{5})\.(?:MTS|mts)$").unwrap();
+        let re = camera_regex("Sony FS100");
         assert!(re.is_match("00001.MTS"));
         assert!(re.is_match("12345.mts"));
         assert!(re.is_match("99999.MTS"));
-        assert!(!re.is_match("00001.mp4"));
-        assert!(!re.is_match("0001.MTS"));
+        assert!(!re.is_match("00001.mp4"));  // mp4 not in the extension set
+        assert!(!re.is_match("0001.MTS"));   // too few digits
     }
 
     #[test]
     fn test_canon_pattern_matches() {
-        let re = Regex::new(r"^(?P<prefix>MVI_\d{4})\.(?:mp4|MP4)$").unwrap();
+        let re = camera_regex("Canon");
         assert!(re.is_match("MVI_0001.mp4"));
         assert!(re.is_match("MVI_9999.MP4"));
         let caps = re.captures("MVI_0123.mp4").unwrap();
         assert_eq!(caps.name("prefix").unwrap().as_str(), "MVI_0123");
-        assert!(!re.is_match("MVI_00001.mp4"));
-        assert!(!re.is_match("MVI_000.MP4"));
-        assert!(!re.is_match("MVX_0001.mp4"));
+        assert!(re.is_match("MVI_00001.mp4"), "5 digits with .* slack must match");
+        assert!(!re.is_match("MVI_000.MP4"));    // 3 digits — no MVI_ + 4
+        assert!(!re.is_match("MVX_0001.mp4"));   // wrong prefix
     }
 
     #[test]
     fn test_panasonic_pattern_matches() {
-        let re = Regex::new(r"^(?P<prefix>GH\d{5})\.(?:mp4|MP4)$").unwrap();
+        let re = camera_regex("Panasonic");
         assert!(re.is_match("GH00001.mp4"));
         assert!(re.is_match("GH12345.MP4"));
         let caps = re.captures("GH00001.mp4").unwrap();
         assert_eq!(caps.name("prefix").unwrap().as_str(), "GH00001");
-        assert!(!re.is_match("GH0001.mp4"));
-        assert!(!re.is_match("GH00001.mov"));
+        assert!(!re.is_match("GH0001.mp4"));   // too few digits
+        assert!(!re.is_match("GH00001.mov"));  // wrong extension
     }
 
     #[test]
     fn test_gopro_pattern_matches() {
-        let re = Regex::new(r"^(?P<prefix>(?:GOPR\d{4}|GP\d{6}))\.(?:mp4|MP4)$").unwrap();
+        let re = camera_regex("GoPro");
         assert!(re.is_match("GOPR0001.mp4"));
         assert!(re.is_match("GOPR9999.MP4"));
         assert!(re.is_match("GP000001.mp4"));
@@ -841,8 +857,8 @@ mod tests {
         assert_eq!(caps.name("prefix").unwrap().as_str(), "GOPR0042");
         let caps = re.captures("GP000042.mp4").unwrap();
         assert_eq!(caps.name("prefix").unwrap().as_str(), "GP000042");
-        assert!(!re.is_match("GOPR00001.mp4"));
-        assert!(!re.is_match("GP00001.mp4"));
+        assert!(re.is_match("GOPR00001.mp4"), "5 digits with .* slack must match");
+        assert!(!re.is_match("GP00001.mp4"));    // 5 digits — GP needs 6
     }
 
     // ── match_files_all_patterns tests ──────────────────────────────────────

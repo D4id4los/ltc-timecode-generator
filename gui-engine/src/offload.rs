@@ -15,6 +15,7 @@ pub use crate::device_name::DeviceNameSource;
 
 /// Extract drive letters from a `GetLogicalDrives` bitmask (bit 0 = 'A').
 /// Platform-independent so the parsing logic is unit-testable off-Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn drive_letters_from_mask(mask: u32) -> Vec<char> {
     (0..26u32)
         .filter(|i| (mask >> i) & 1 == 1)
@@ -1823,22 +1824,18 @@ proc /proc proc rw 0 0
 
     #[test]
     fn test_drive_bitmask_parsing_logic() {
-        // Simulate what win_driver::enumerate would parse from GetLogicalDrives.
-        // Bit 0 = A:, bit 2 = C:, bit 25 = Z:
+        // The production helper win_driver::enumerate iterates; test it
+        // against known GetLogicalDrives masks. Bit 0 = A:, bit 2 = C:,
+        // bit 25 = Z:.
         let mask: u32 = (1u32 << 0) | (1u32 << 2) | (1u32 << 25);
+        assert_eq!(drive_letters_from_mask(mask), vec!['A', 'C', 'Z']);
 
-        let mut letters: Vec<char> = Vec::new();
-        for i in 0..26u32 {
-            if (mask >> i) & 1 == 1 {
-                letters.push(char::from_u32(b'A' as u32 + i).unwrap());
-            }
-        }
+        assert!(drive_letters_from_mask(0).is_empty(), "empty mask -> no drives");
+        assert_eq!(drive_letters_from_mask(1u32 << 2), vec!['C']);
 
-        assert_eq!(letters.len(), 3);
-        assert!(letters.contains(&'A'));
-        assert!(letters.contains(&'C'));
-        assert!(letters.contains(&'Z'));
-        assert!(!letters.contains(&'B'));
+        // High bits beyond 'Z' (>= 26) must be ignored.
+        let mask = (1u32 << 25) | (1u32 << 26) | (1u32 << 31);
+        assert_eq!(drive_letters_from_mask(mask), vec!['Z']);
     }
 
     // ── base_device_name ──────────────────────────────────────────────────

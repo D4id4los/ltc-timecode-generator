@@ -54,23 +54,36 @@ mod tests {
     use super::*;
     /// Camera metadata must be probed only for the first
     /// DEVICE_NAME_PROBE_SAMPLE files — files beyond the cap must get
-    /// `None` without spawning a probe. Uses a nonexistent dir so probes
-    /// fail fast; the cap policy is what's under test.
+    /// `None` without spawning a probe. Uses the injectable runner to
+    /// count actual probe attempts (all of which fail fast).
     #[test]
     fn camera_probe_is_capped_to_sample_limit() {
         let files: Vec<PathBuf> = (0..(device_name::DEVICE_NAME_PROBE_SAMPLE + 3))
             .map(|i| PathBuf::from(format!("/nonexistent/clip{}.MP4", i)))
             .collect();
 
-        let (_, cameras, _) = probe_clip_set(&files);
+        // Each per-file probe may spawn several subprocesses (exiftool,
+        // ffprobe fallback) — count the distinct files probed.
+        let probed = std::cell::RefCell::new(std::collections::HashSet::new());
+        let mut runner = |_prog: &str, args: &[String]| -> std::io::Result<Output> {
+            if let Some(path) = args.last() {
+                probed.borrow_mut().insert(path.clone());
+            }
+            Err(std::io::Error::other("no probe subprocess in test"))
+        };
 
+        let (_, cameras, _) = probe_clip_set_with(&files, &mut runner);
+
+        let probed = probed.into_inner();
+        assert_eq!(
+            probed.len(),
+            device_name::DEVICE_NAME_PROBE_SAMPLE,
+            "camera probe must cover exactly DEVICE_NAME_PROBE_SAMPLE files, probed {:?}",
+            probed
+        );
         assert_eq!(cameras.len(), files.len());
         for (i, cam) in cameras.iter().enumerate() {
-            let within_cap = i < device_name::DEVICE_NAME_PROBE_SAMPLE;
-            // Within the cap a probe attempt is made (may fail → None on
-            // nonexistent files); beyond the cap there must be no attempt
-            // and the value is definitionally None.
-            if !within_cap {
+            if i >= device_name::DEVICE_NAME_PROBE_SAMPLE {
                 assert!(cam.is_none(), "camera probe attempted beyond sample cap (index {})", i);
             }
         }

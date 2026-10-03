@@ -1655,7 +1655,15 @@ mod tests {
     fn test_audio_core_drain_events_idempotent() {
         let core = AudioCore::new();
         assert!(core.drain_events().is_empty());
-        assert!(core.drain_events().is_empty());
+
+        // Inject an event (same-crate test: direct field access) so the
+        // second drain actually has something to observe.
+        core.events.lock().unwrap().push(AudioEvent::Underrun);
+        let drained = core.drain_events();
+        assert_eq!(drained.len(), 1, "injected event must be drained once");
+        assert!(matches!(drained[0], AudioEvent::Underrun));
+
+        assert!(core.drain_events().is_empty(), "drain must be consuming");
     }
 
     #[test]
