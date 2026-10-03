@@ -64,7 +64,7 @@ pub use video_codecs::{
 };
 
 // Re-export ffprobe types
-pub use ffprobe::{extract_audio_channel, extract_audio_channel_with_progress, parse_out_time_us, path_is_video, probe_stream_duration_secs, probe_video_audio, AudioStreamInfo, VideoAudioProbe};
+pub use ffprobe::{extract_audio_channel, extract_audio_channel_with_progress, parse_out_time_us, path_is_video, probe_stream_duration_secs, probe_video_audio, AudioStreamInfo, ExtractError, ProbeError, VideoAudioProbe};
 
 // Re-export media-extension registry
 pub use media_ext::{container_for_input, is_audio, is_video, AUDIO_EXTENSIONS, VIDEO_EXTENSIONS};

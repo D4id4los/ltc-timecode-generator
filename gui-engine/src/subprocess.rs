@@ -32,12 +32,17 @@ pub enum WatchdogStop {
 }
 
 /// Error type for subprocess operations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SubprocessFailure {
     /// The process could not be spawned (bad binary, no such file, etc).
     Io(String),
     /// The process did not exit within the allotted timeout.
     TimedOut,
+    /// The process ran but exited with a non-zero status. Carries the
+    /// trimmed stderr tail for diagnostics.
+    NonZeroExit { stderr_tail: String },
+    /// The process's output could not be parsed (e.g. invalid JSON).
+    Parse(String),
 }
 
 /// Terminal outcome of a watchdog-driven ffmpeg run
@@ -112,6 +117,12 @@ impl std::fmt::Display for SubprocessFailure {
         match self {
             SubprocessFailure::Io(msg) => write!(f, "subprocess I/O error: {}", msg),
             SubprocessFailure::TimedOut => write!(f, "subprocess timed out"),
+            SubprocessFailure::NonZeroExit { stderr_tail } => {
+                write!(f, "subprocess failed: {}", stderr_tail)
+            }
+            SubprocessFailure::Parse(msg) => {
+                write!(f, "failed to parse subprocess output: {}", msg)
+            }
         }
     }
 }

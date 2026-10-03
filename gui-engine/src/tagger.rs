@@ -929,6 +929,12 @@ fn tag_via_ffmpeg_with(
                 TAG_REMUX_TIMEOUT.as_secs(),
                 path.display(),
             ),
+            // run_output_with_timeout never produces these, but the match
+            // must stay exhaustive; treat like a generic failure.
+            SubprocessFailure::NonZeroExit { stderr_tail } => {
+                format!("failed to spawn ffmpeg: {}", stderr_tail)
+            }
+            SubprocessFailure::Parse(msg) => format!("failed to spawn ffmpeg: {}", msg),
         }
     })?;
 

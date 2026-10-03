@@ -66,6 +66,12 @@ pub fn probe_camera_info(path: &Path) -> Option<CameraInfo> {
             crate::subprocess::SubprocessFailure::TimedOut => {
                 io::Error::new(io::ErrorKind::TimedOut, "probe timed out")
             }
+            // run_output_with_timeout never produces these, but the match
+            // must stay exhaustive; treat like a generic failure.
+            crate::subprocess::SubprocessFailure::NonZeroExit { stderr_tail } => {
+                io::Error::other(stderr_tail)
+            }
+            crate::subprocess::SubprocessFailure::Parse(msg) => io::Error::other(msg),
         })
     })
 }

@@ -70,7 +70,15 @@ pub fn decode_video_channel<F: Fn(f32)>(
         duration,
         Some(cancel),
         on_extract_progress,
-    ).map_err(|e| LtcDecodeError::Failed(format!("Audio extraction failed: {}", e)))?;
+    )
+    .map_err(|e| match e {
+        // A cancel observed mid-extraction must classify as cancellation
+        // (not a generic failure) so the engine's decode job phase stays
+        // `Cancelled` — same classification as the post-extraction check
+        // below.
+        ffprobe::ExtractError::Cancelled => LtcDecodeError::Cancelled,
+        other => LtcDecodeError::Failed(format!("Audio extraction failed: {}", other)),
+    })?;
 
     // Check cancel after extraction, before decode
     if cancel.load(Ordering::Relaxed) {

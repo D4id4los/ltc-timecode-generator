@@ -952,7 +952,7 @@ fn run_metadata_only(
     total_steps: usize,
 ) {
     run_metadata_only_with(settings, report, total_steps, &mut |p: &Path| {
-        crate::ffprobe::probe_video_audio(p)
+        crate::ffprobe::probe_video_audio(p).map_err(|e| e.to_string())
     })
 }
 

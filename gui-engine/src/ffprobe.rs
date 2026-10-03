@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -39,17 +39,123 @@ pub fn run_ffprobe_json_with(
 ) -> Result<serde_json::Value, SubprocessFailure> {
     let output = runner(args)?;
     if !output.status.success() {
-        return Err(SubprocessFailure::Io(format!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        return Err(SubprocessFailure::NonZeroExit {
+            stderr_tail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout)
-        .map_err(|e| SubprocessFailure::Io(format!("Failed to parse ffprobe JSON: {}", e)))
+    serde_json::from_str(&stdout).map_err(|e| SubprocessFailure::Parse(e.to_string()))
 }
 
-pub fn probe_video_audio(path: &Path) -> Result<VideoAudioProbe, String> {
+/// Typed error for [`probe_video_audio`] (and its injectable variant).
+///
+/// The `Display` rendering reproduces the exact user-facing strings the
+/// former `String` errors produced — including the historically composed
+/// prefixes for the subprocess sub-cases — so no consumer-visible text
+/// changes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeError {
+    /// ffprobe did not exit within [`PROBE_TIMEOUT`].
+    TimedOut,
+    /// The ffprobe subprocess failed to spawn/run.
+    Subprocess(SubprocessFailure),
+    /// ffprobe reported no (usable) audio streams for the file.
+    NoStreams { path: PathBuf },
+    /// ffprobe's stdout was not valid JSON.
+    Parse(String),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeError::TimedOut => write!(
+                f,
+                "ffprobe timed out after {:.0}s — file may be corrupt",
+                PROBE_TIMEOUT.as_secs_f64()
+            ),
+            // Reproduce the legacy composed messages for the run_ffprobe_json_with
+            // failure modes that used to travel inside `SubprocessFailure::Io`.
+            ProbeError::Subprocess(SubprocessFailure::NonZeroExit { stderr_tail }) => {
+                write!(f, "ffprobe probe failed: ffprobe failed: {}", stderr_tail)
+            }
+            ProbeError::Subprocess(e) => write!(f, "ffprobe probe failed: {}", e),
+            ProbeError::NoStreams { path } => {
+                write!(f, "No audio streams found in '{}'", path.display())
+            }
+            ProbeError::Parse(msg) => {
+                write!(f, "ffprobe probe failed: Failed to parse ffprobe JSON: {}", msg)
+            }
+        }
+    }
+}
+
+/// Typed error for the audio-extraction ffmpeg calls
+/// ([`extract_audio_channel`] and [`extract_audio_channel_with_progress`]).
+///
+/// `Display` renders the exact user-facing strings the former `String`
+/// errors produced; the typed variants let callers classify outcomes
+/// (notably cancellation) without matching on message text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtractError {
+    /// ffmpeg did not exit within [`EXTRACT_TIMEOUT`].
+    TimedOut,
+    /// The ffmpeg subprocess failed to spawn/run.
+    Subprocess(SubprocessFailure),
+    /// The cancel flag was observed — ffmpeg was killed mid-extraction.
+    Cancelled,
+    /// ffmpeg produced no stderr output for the stall timeout and was killed.
+    Stalled { stall_secs: u64 },
+    /// ffmpeg ran but exited with a non-zero status.
+    Exit {
+        stream: usize,
+        channel: usize,
+        path: PathBuf,
+        stderr_tail: String,
+    },
+    /// The ffmpeg child could not be spawned.
+    Spawn(String),
+    /// wait()/try_wait() failed on the ffmpeg child.
+    Wait(String),
+}
+
+impl std::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractError::TimedOut => write!(
+                f,
+                "ffmpeg audio extraction timed out after {}s — file may be corrupt",
+                EXTRACT_TIMEOUT.as_secs()
+            ),
+            ExtractError::Subprocess(SubprocessFailure::Io(msg)) => {
+                write!(f, "Failed to run ffmpeg: {}", msg)
+            }
+            ExtractError::Subprocess(e) => write!(f, "Failed to run ffmpeg: {}", e),
+            ExtractError::Cancelled => write!(f, "Audio extraction canceled"),
+            ExtractError::Stalled { stall_secs } => write!(
+                f,
+                "Audio extraction stalled: ffmpeg produced no output for {}s — input may be corrupt",
+                stall_secs
+            ),
+            ExtractError::Exit {
+                stream,
+                channel,
+                path,
+                stderr_tail,
+            } => write!(
+                f,
+                "ffmpeg audio extraction failed: stream {} channel {} in '{}': {}",
+                stream,
+                channel,
+                path.display(),
+                stderr_tail
+            ),
+            ExtractError::Spawn(err) => write!(f, "Failed to spawn ffmpeg: {}", err),
+            ExtractError::Wait(err) => write!(f, "Audio extraction wait error: {}", err),
+        }
+    }
+}
+
+pub fn probe_video_audio(path: &Path) -> Result<VideoAudioProbe, ProbeError> {
     probe_video_audio_with(path, &mut |args: &[String]| {
         run_output_with_timeout(
             no_window_command("ffprobe")
@@ -69,7 +175,7 @@ pub fn probe_video_audio(path: &Path) -> Result<VideoAudioProbe, String> {
 pub fn probe_video_audio_with(
     path: &Path,
     runner: &mut dyn FnMut(&[String]) -> Result<Output, SubprocessFailure>,
-) -> Result<VideoAudioProbe, String> {
+) -> Result<VideoAudioProbe, ProbeError> {
     let args: Vec<String> = vec![
         "-v".into(),
         "quiet".into(),
@@ -83,20 +189,19 @@ pub fn probe_video_audio_with(
 
     let parsed: serde_json::Value =
         run_ffprobe_json_with(&args, PROBE_TIMEOUT, runner).map_err(|e| {
-            let msg = match e {
-                SubprocessFailure::Io(_) => format!("ffprobe probe failed: {}", e),
-                SubprocessFailure::TimedOut => {
-                    format!("ffprobe timed out after {:.0}s — file may be corrupt", PROBE_TIMEOUT.as_secs_f64())
-                }
+            let typed = match e {
+                SubprocessFailure::TimedOut => ProbeError::TimedOut,
+                SubprocessFailure::Parse(msg) => ProbeError::Parse(msg),
+                other => ProbeError::Subprocess(other),
             };
-            error!("{} for '{}'", msg, path.display());
-            msg
+            error!("{} for '{}'", typed, path.display());
+            typed
         })?;
 
     let streams_val = parsed
         .get("streams")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| "ffprobe returned no streams array".to_string())?;
+        .ok_or_else(|| ProbeError::NoStreams { path: path.to_path_buf() })?;
 
     let mut streams = Vec::new();
     for s in streams_val {
@@ -121,10 +226,9 @@ pub fn probe_video_audio_with(
     }
 
     if streams.is_empty() {
-        return Err(format!(
-            "No audio streams found in '{}'",
-            path.display()
-        ));
+        return Err(ProbeError::NoStreams {
+            path: path.to_path_buf(),
+        });
     }
 
     let total_audio_channels: usize = streams.iter().map(|s| s.channels).sum();
@@ -190,7 +294,7 @@ pub fn extract_audio_channel(
     absolute_stream_index: usize,
     channel_index: usize,
     output_wav: &Path,
-) -> Result<(), String> {
+) -> Result<(), ExtractError> {
     extract_audio_channel_with(
         path,
         absolute_stream_index,
@@ -219,7 +323,7 @@ pub fn extract_audio_channel_with(
     channel_index: usize,
     output_wav: &Path,
     runner: &mut dyn FnMut(&[String]) -> Result<Output, SubprocessFailure>,
-) -> Result<(), String> {
+) -> Result<(), ExtractError> {
     info!(
         "Extracting audio: stream={}, channel={} from '{}' → '{}'",
         absolute_stream_index,
@@ -233,11 +337,8 @@ pub fn extract_audio_channel_with(
     let output = runner(&args).map_err(|e| {
         let _ = std::fs::remove_file(output_wav);
         match e {
-            SubprocessFailure::Io(msg) => format!("Failed to run ffmpeg: {}", msg),
-            SubprocessFailure::TimedOut => format!(
-                "ffmpeg audio extraction timed out after {}s — file may be corrupt",
-                EXTRACT_TIMEOUT.as_secs()
-            ),
+            SubprocessFailure::TimedOut => ExtractError::TimedOut,
+            other => ExtractError::Subprocess(other),
         }
     })?;
 
@@ -252,13 +353,12 @@ pub fn extract_audio_channel_with(
             channel_index,
             tail
         );
-        return Err(format!(
-            "ffmpeg audio extraction failed: stream {} channel {} in '{}': {}",
-            absolute_stream_index,
-            channel_index,
-            path.display(),
-            tail
-        ));
+        return Err(ExtractError::Exit {
+            stream: absolute_stream_index,
+            channel: channel_index,
+            path: path.to_path_buf(),
+            stderr_tail: tail,
+        });
     }
 
     info!("Audio extraction successful: {}", output_wav.display());
@@ -371,7 +471,7 @@ pub fn probe_stream_duration_secs_with(
 /// fraction. When `None`, the function still spawns and parses progress lines
 /// but `on_frac` is only called with 0.0 and 1.0 (at start and end).
 ///
-/// On cancel, ffmpeg is killed and `Err("Audio extraction canceled")` is
+/// On cancel, ffmpeg is killed and [`ExtractError::Cancelled`] is
 /// returned.  If ffmpeg hangs silently for 30 s, it is killed with a stall
 /// error.
 pub fn extract_audio_channel_with_progress(
@@ -382,7 +482,7 @@ pub fn extract_audio_channel_with_progress(
     total_duration_secs: Option<f64>,
     cancel: Option<&AtomicBool>,
     on_frac: &impl Fn(f32),
-) -> Result<(), String> {
+) -> Result<(), ExtractError> {
     extract_audio_channel_with_progress_with(
         path,
         absolute_stream_index,
@@ -419,7 +519,7 @@ pub fn extract_audio_channel_with_progress_with(
     on_frac: &impl Fn(f32),
     spawner: &mut dyn FnMut(&[String]) -> std::io::Result<Child>,
     stall: Duration,
-) -> Result<(), String> {
+) -> Result<(), ExtractError> {
     let mut args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
     args.push("-progress".to_string());
     args.push("pipe:2".to_string());
@@ -450,7 +550,7 @@ pub fn extract_audio_channel_with_progress_with(
             let _ = std::fs::remove_file(output_wav);
             Err(match e {
                 crate::subprocess::FfmpegRunError::Spawn(err) => {
-                    format!("Failed to spawn ffmpeg: {}", err)
+                    ExtractError::Spawn(err.to_string())
                 }
                 crate::subprocess::FfmpegRunError::Exit { stderr_tail, .. } => {
                     error!(
@@ -460,23 +560,19 @@ pub fn extract_audio_channel_with_progress_with(
                         channel_index,
                         stderr_tail
                     );
-                    format!(
-                        "ffmpeg audio extraction failed: stream {} channel {} in '{}': {}",
-                        absolute_stream_index,
-                        channel_index,
-                        path.display(),
-                        stderr_tail
-                    )
+                    ExtractError::Exit {
+                        stream: absolute_stream_index,
+                        channel: channel_index,
+                        path: path.to_path_buf(),
+                        stderr_tail,
+                    }
                 }
-                crate::subprocess::FfmpegRunError::Cancelled => {
-                    "Audio extraction canceled".to_string()
-                }
-                crate::subprocess::FfmpegRunError::Stalled => format!(
-                    "Audio extraction stalled: ffmpeg produced no output for {}s — input may be corrupt",
-                    stall.as_secs()
-                ),
+                crate::subprocess::FfmpegRunError::Cancelled => ExtractError::Cancelled,
+                crate::subprocess::FfmpegRunError::Stalled => ExtractError::Stalled {
+                    stall_secs: stall.as_secs(),
+                },
                 crate::subprocess::FfmpegRunError::Wait(err) => {
-                    format!("Audio extraction wait error: {}", err)
+                    ExtractError::Wait(err)
                 }
             })
         }
@@ -560,6 +656,14 @@ pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
         Ok(v) => v,
         Err(SubprocessFailure::Io(e)) => {
             warn!("Failed to run ffprobe for keyframe lookup: {}", e);
+            return offset_secs;
+        }
+        Err(SubprocessFailure::NonZeroExit { stderr_tail }) => {
+            warn!("Failed to run ffprobe for keyframe lookup: ffprobe failed: {}", stderr_tail);
+            return offset_secs;
+        }
+        Err(SubprocessFailure::Parse(e)) => {
+            warn!("Failed to run ffprobe for keyframe lookup: Failed to parse ffprobe JSON: {}", e);
             return offset_secs;
         }
         Err(SubprocessFailure::TimedOut) => {
@@ -837,19 +941,22 @@ mod tests {
     fn test_probe_video_audio_with_timed_out_returns_error() {
         let path = Path::new("corrupt.mp4");
         let result = probe_video_audio_with(path, &mut probe_timeout_runner);
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(msg.contains("timed out"), "error should mention timeout: {}", msg);
-        assert!(msg.contains("corrupt"), "error should mention file may be corrupt: {}", msg);
+        assert!(
+            matches!(result, Err(ProbeError::TimedOut)),
+            "timeout must map to ProbeError::TimedOut, got {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_probe_video_audio_with_io_error() {
         let path = Path::new("unreadable.mp4");
         let result = probe_video_audio_with(path, &mut probe_io_error_runner);
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(msg.contains("ffprobe"), "error should mention ffprobe: {}", msg);
+        assert!(
+            matches!(result, Err(ProbeError::Subprocess(SubprocessFailure::Io(_)))),
+            "spawn IO failure must map to ProbeError::Subprocess(Io), got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -865,9 +972,11 @@ mod tests {
         };
         let path = Path::new("silent.mp4");
         let result = probe_video_audio_with(path, &mut runner);
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(msg.contains("No audio streams"), "error should mention no streams: {}", msg);
+        assert!(
+            matches!(result, Err(ProbeError::NoStreams { ref path }) if path == Path::new("silent.mp4")),
+            "empty streams must map to ProbeError::NoStreams carrying the probed path, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -881,9 +990,11 @@ mod tests {
         };
         let path = Path::new("garbage.mp4");
         let result = probe_video_audio_with(path, &mut runner);
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(msg.contains("Failed to parse"), "error should mention parse failure: {}", msg);
+        assert!(
+            matches!(result, Err(ProbeError::Parse(_))),
+            "unparseable ffprobe output must map to ProbeError::Parse, got {:?}",
+            result
+        );
     }
 
     // ── run_ffprobe_json_with ──────────────────────────────────────────────
@@ -918,8 +1029,10 @@ mod tests {
         };
         let err = run_ffprobe_json_with(&[], PROBE_TIMEOUT, &mut runner).unwrap_err();
         match err {
-            SubprocessFailure::Io(msg) => assert!(msg.contains("ffprobe failed"), "msg: {}", msg),
-            other => panic!("expected Io, got {:?}", other),
+            SubprocessFailure::NonZeroExit { stderr_tail } => {
+                assert_eq!(stderr_tail, "some error", "stderr tail must carry the child's stderr");
+            }
+            other => panic!("expected NonZeroExit, got {:?}", other),
         }
     }
 
@@ -945,10 +1058,11 @@ mod tests {
     fn test_run_ffprobe_json_with_invalid_json() {
         let mut runner = |_: &[String]| json_output("not json");
         let err = run_ffprobe_json_with(&[], PROBE_TIMEOUT, &mut runner).unwrap_err();
-        match err {
-            SubprocessFailure::Io(msg) => assert!(msg.contains("Failed to parse"), "msg: {}", msg),
-            other => panic!("expected Io, got {:?}", other),
-        }
+        assert!(
+            matches!(err, SubprocessFailure::Parse(_)),
+            "unparseable output must map to SubprocessFailure::Parse, got {:?}",
+            err
+        );
     }
 
     // ── probe_stream_duration_secs_with timeout ─────────────────────────────
@@ -1031,9 +1145,11 @@ mod tests {
         let path = Path::new("corrupt.mp4");
         let out = Path::new("/tmp/_test_extract_timeout.wav");
         let result = extract_audio_channel_with(path, 1, 0, out, &mut runner);
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(msg.contains("timed out"), "msg should mention timeout: {}", msg);
+        assert!(
+            matches!(result, Err(ExtractError::TimedOut)),
+            "timeout must map to ExtractError::TimedOut, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1042,9 +1158,11 @@ mod tests {
         let path = Path::new("missing.mp4");
         let out = Path::new("/tmp/_test_extract_io.wav");
         let result = extract_audio_channel_with(path, 1, 0, out, &mut runner);
-        assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(msg.contains("Failed to run ffmpeg"), "msg: {}", msg);
+        assert!(
+            matches!(result, Err(ExtractError::Subprocess(SubprocessFailure::Io(_)))),
+            "spawn IO failure must map to ExtractError::Subprocess(Io), got {:?}",
+            result
+        );
     }
 
     // ── extract_audio_channel_with_progress_with (spawner-based) ────────
@@ -1086,8 +1204,11 @@ mod tests {
             Duration::from_secs(30),
         );
         let elapsed = start.elapsed();
-        assert!(matches!(result, Err(ref e) if e == "Audio extraction canceled"),
-            "expected cancel error, got {:?}", result);
+        assert!(
+            matches!(result, Err(ExtractError::Cancelled)),
+            "cancel must map to ExtractError::Cancelled, got {:?}",
+            result
+        );
         assert!(elapsed < Duration::from_secs(5),
             "cancel took {:?}", elapsed);
     }
@@ -1109,9 +1230,11 @@ mod tests {
             Duration::from_millis(200),
         );
         let elapsed = start.elapsed();
-        assert!(result.is_err(), "expected stall error, got {:?}", result);
-        let msg = result.unwrap_err();
-        assert!(msg.contains("stalled") || msg.contains("stall"), "msg: {}", msg);
+        assert!(
+            matches!(result, Err(ExtractError::Stalled { .. })),
+            "stall timeout must map to ExtractError::Stalled, got {:?}",
+            result
+        );
         assert!(elapsed < Duration::from_secs(5),
             "stall detection took {:?}", elapsed);
     }

@@ -655,8 +655,9 @@ fn test_extract_invalid_stream_error_includes_ffmpeg_stderr() {
     let err = extract_audio_channel(&mp4, 9, 0, &out)
         .expect_err("extraction of a nonexistent stream must fail");
     assert!(
-        err.contains("matches no streams"),
-        "error must include ffmpeg's stderr excerpt, got: {}",
+        matches!(err, gui_engine::ExtractError::Exit { ref stderr_tail, .. }
+            if stderr_tail.contains("matches no streams")),
+        "ffmpeg's stderr excerpt must be carried in the typed Exit payload, got: {:?}",
         err
     );
     assert!(!out.exists(), "failed extraction must clean up its output file");
