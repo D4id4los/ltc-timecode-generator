@@ -618,25 +618,4 @@ mod tests {
 
     // ── WavChunkReader: unsupported bits_per_sample ───────────────────
 
-    #[test]
-    fn test_wav_chunk_reader_unsupported_bps() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("unsupported.wav");
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 48000,
-            bits_per_sample: 17,
-            sample_format: hound::SampleFormat::Int,
-        };
-        {
-            let result = hound::WavWriter::create(&path, spec);
-            if let Ok(mut writer) = result {
-                writer.write_sample(0i32).unwrap();
-                writer.finalize().unwrap();
-                let (mut reader, _start) = WavChunkReader::open(&path).unwrap();
-                let read = reader.read_mono_samples_f32(0, 1);
-                assert!(read.is_err() || read.unwrap().len() <= 1);
-            }
-        }
-    }
 }

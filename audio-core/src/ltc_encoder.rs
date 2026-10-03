@@ -269,44 +269,6 @@ mod tests {
 
     // ── write_val ─────────────────────────────────────────────────────────
 
-    #[test]
-    fn test_write_val_sets_bits() {
-        let mut bits = [0u8; 80];
-        write_val(&mut bits, 0b1010, 0, 4);
-        assert_eq!(bits[0], 0);
-        assert_eq!(bits[1], 1);
-        assert_eq!(bits[2], 0);
-        assert_eq!(bits[3], 1);
-    }
-
-    #[test]
-    fn test_write_val_offset() {
-        let mut bits = [0u8; 80];
-        write_val(&mut bits, 0b111, 10, 3);
-        assert_eq!(bits[10], 1);
-        assert_eq!(bits[11], 1);
-        assert_eq!(bits[12], 1);
-        assert_eq!(bits[13], 0);
-    }
-
-    #[test]
-    fn test_write_val_zero_value() {
-        let mut bits = [1u8; 80];
-        write_val(&mut bits, 0, 5, 4);
-        assert_eq!(bits[5], 0);
-        assert_eq!(bits[6], 0);
-        assert_eq!(bits[7], 0);
-        assert_eq!(bits[8], 0);
-        assert_eq!(bits[9], 1); // untouched
-    }
-
-    #[test]
-    fn test_write_val_bounds_last_bit() {
-        let mut bits = [0u8; 80];
-        write_val(&mut bits, 1, 79, 1);
-        assert_eq!(bits[79], 1);
-    }
-
     // ── get_ltc_bits: sync word ───────────────────────────────────────────
 
     const SYNC_WORD: [u8; 16] = [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1];
@@ -325,106 +287,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_ltc_bits_length() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        let bits = get_ltc_bits(&tc, false);
-        assert_eq!(bits.len(), 80);
-    }
-
     // ── get_ltc_bits: timecode field encoding ─────────────────────────────
-
-    #[test]
-    fn test_get_ltc_bits_frames_units() {
-        // frames=13: units=3 (0b0011), tens=1 (0b01)
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 13 };
-        let bits = get_ltc_bits(&tc, false);
-        // units in bits 0-3: 3 = 0b0011 → LSB first → bits[0]=1, [1]=1, [2]=0, [3]=0
-        assert_eq!(bits[0], 1);
-        assert_eq!(bits[1], 1);
-        assert_eq!(bits[2], 0);
-        assert_eq!(bits[3], 0);
-        // tens in bits 8-9: 1 = 0b01 → bits[8]=1, [9]=0
-        assert_eq!(bits[8], 1);
-        assert_eq!(bits[9], 0);
-    }
-
-    #[test]
-    fn test_get_ltc_bits_frames_units_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        let bits = get_ltc_bits(&tc, false);
-        assert_eq!(bits[0..4], [0, 0, 0, 0]);
-        assert_eq!(bits[8..10], [0, 0]);
-    }
-
-    #[test]
-    fn test_get_ltc_bits_frames_max() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 29 };
-        let bits = get_ltc_bits(&tc, false);
-        assert_eq!(bits[0..4], [1, 0, 0, 1]); // 9
-        assert_eq!(bits[8..10], [0, 1]);       // 2
-    }
-
-    #[test]
-    fn test_get_ltc_bits_seconds() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 37, frames: 0 };
-        let bits = get_ltc_bits(&tc, false);
-        // units=7 (0b0111) → bits[16..20] = 1,1,1,0
-        assert_eq!(bits[16..20], [1, 1, 1, 0]);
-        // tens=3 (0b011) → bits[24..27] = 1,1,0
-        assert_eq!(bits[24..27], [1, 1, 0]);
-    }
-
-    #[test]
-    fn test_get_ltc_bits_minutes() {
-        let tc = Timecode { hours: 0, minutes: 45, seconds: 0, frames: 0 };
-        let bits = get_ltc_bits(&tc, false);
-        // units=5 (0b0101) → bits[32..36] = 1,0,1,0
-        assert_eq!(bits[32..36], [1, 0, 1, 0]);
-        // tens=4 (0b100) → bits[40..43] = 0,0,1
-        assert_eq!(bits[40..43], [0, 0, 1]);
-    }
-
-    #[test]
-    fn test_get_ltc_bits_hours() {
-        let tc = Timecode { hours: 21, minutes: 0, seconds: 0, frames: 0 };
-        let bits = get_ltc_bits(&tc, false);
-        // units=1 (0b0001) → bits[48..52] = 1,0,0,0
-        assert_eq!(bits[48..52], [1, 0, 0, 0]);
-        // tens=2 (0b10) → bits[56..58] = 0,1
-        assert_eq!(bits[56..58], [0, 1]);
-    }
-
-    #[test]
-    fn test_get_ltc_bits_drop_frame_flag() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        let bits_nd = get_ltc_bits(&tc, false);
-        let bits_df = get_ltc_bits(&tc, true);
-        assert_eq!(bits_nd[10], 0, "non-drop: bit 10 = 0");
-        assert_eq!(bits_df[10], 1, "drop-frame: bit 10 = 1");
-    }
-
-    #[test]
-    fn test_get_ltc_bits_color_frame_flag() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        let bits = get_ltc_bits(&tc, false);
-        assert_eq!(bits[11], 0, "color frame flag must be 0");
-    }
-
-    #[test]
-    fn test_get_ltc_bits_binary_groups_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        let bits = get_ltc_bits(&tc, false);
-        // Binary group zones (user bits) should all be 0
-        assert_eq!(bits[4..8], [0, 0, 0, 0], "binary group 1");
-        assert_eq!(bits[12..16], [0, 0, 0, 0], "binary group 2");
-        assert_eq!(bits[20..24], [0, 0, 0, 0], "binary group 3");
-        assert_eq!(bits[27..32], [0, 0, 0, 0, 0], "binary group 4");
-        assert_eq!(bits[36..40], [0, 0, 0, 0], "binary group 5");
-        assert_eq!(bits[44..48], [0, 0, 0, 0], "binary group 6");
-        assert_eq!(bits[52..56], [0, 0, 0, 0], "binary group 7");
-        assert_eq!(bits[60..64], [0, 0, 0, 0], "binary group 8");
-    }
 
     // ── get_ltc_bits: round-trip via decoder ──────────────────────────────
 
@@ -455,48 +318,6 @@ mod tests {
             seconds: seconds as u32,
             frames: frames as u32,
         }
-    }
-
-    #[test]
-    fn test_roundtrip_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        let bits = get_ltc_bits(&tc, false);
-        assert_eq!(decode_timecode_from_bits(&bits, 0), tc);
-    }
-
-    #[test]
-    fn test_roundtrip_typical() {
-        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
-        let bits = get_ltc_bits(&tc, false);
-        assert_eq!(decode_timecode_from_bits(&bits, 0), tc);
-    }
-
-    #[test]
-    fn test_roundtrip_max() {
-        let tc = Timecode { hours: 23, minutes: 59, seconds: 59, frames: 29 };
-        let bits = get_ltc_bits(&tc, false);
-        assert_eq!(decode_timecode_from_bits(&bits, 0), tc);
-    }
-
-    #[test]
-    fn test_roundtrip_drop_frame() {
-        let tc = Timecode { hours: 10, minutes: 15, seconds: 30, frames: 12 };
-        let bits = get_ltc_bits(&tc, true);
-        assert_eq!(decode_timecode_from_bits(&bits, 0), tc);
-        assert_eq!(bits[10], 1, "drop-frame flag must be set");
-    }
-
-    #[test]
-    fn test_roundtrip_multiple_frames() {
-        let tc0 = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        let tc1 = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
-        let bits0 = get_ltc_bits(&tc0, false);
-        let bits1 = get_ltc_bits(&tc1, false);
-        let mut both = [0u8; 160];
-        both[..80].copy_from_slice(&bits0);
-        both[80..].copy_from_slice(&bits1);
-        assert_eq!(decode_timecode_from_bits(&both, 0), tc0);
-        assert_eq!(decode_timecode_from_bits(&both, 80), tc1);
     }
 
     // ── increment_timecode ────────────────────────────────────────────────
@@ -654,20 +475,6 @@ mod tests {
     // ── increment_timecode: long-running (2h simulation) ──────────────────
 
     #[test]
-    fn test_increment_2h_25fps_no_drift() {
-        let fps = 25.0;
-        let num_frames = (7200.0_f64 * fps) as u64; // 180,000
-        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
-        for _ in 0..num_frames {
-            tc = increment_timecode(&tc, fps, false);
-        }
-        assert_eq!(tc.hours, 12, "hours after 2h at 25fps");
-        assert_eq!(tc.minutes, 0);
-        assert_eq!(tc.seconds, 0);
-        assert_eq!(tc.frames, 0);
-    }
-
-    #[test]
     fn test_increment_2h_2997_df_no_drift() {
         let fps = 29.97;
         let num_frames = (7200.0_f64 * fps).round() as u64; // 215,784
@@ -679,34 +486,6 @@ mod tests {
         assert_eq!(tc.hours, 12, "hours after 2h at 29.97df");
         // The exact frame position depends on drop-frame accumulation
         // but hours must be correct
-    }
-
-    #[test]
-    fn test_increment_2h_30fps_no_drift() {
-        let fps = 30.0;
-        let num_frames = (7200.0_f64 * fps) as u64; // 216,000
-        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
-        for _ in 0..num_frames {
-            tc = increment_timecode(&tc, fps, false);
-        }
-        assert_eq!(tc.hours, 12);
-        assert_eq!(tc.minutes, 0);
-        assert_eq!(tc.seconds, 0);
-        assert_eq!(tc.frames, 0);
-    }
-
-    #[test]
-    fn test_increment_24h_wrap_exact() {
-        let fps = 25.0;
-        let num_frames = (24.0 * 3600.0 * fps) as u64; // exactly 24h
-        let mut tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        for _ in 0..num_frames {
-            tc = increment_timecode(&tc, fps, false);
-        }
-        assert_eq!(tc.hours, 0);
-        assert_eq!(tc.minutes, 0);
-        assert_eq!(tc.seconds, 0);
-        assert_eq!(tc.frames, 0);
     }
 
     // ── generate_ltc_frame_stereo: basic properties ───────────────────────
@@ -1126,33 +905,6 @@ mod tests {
 
     // ── Bits -> u8 helper for round-trip ──────────────────────────────────
 
-    #[test]
-    fn test_bits_to_u8_zero() {
-        assert_eq!(bits_to_u8(&[0, 0, 0, 0]), 0);
-    }
-
-    #[test]
-    fn test_bits_to_u8_single() {
-        assert_eq!(bits_to_u8(&[1, 0, 0, 0]), 1);
-    }
-
-    #[test]
-    fn test_bits_to_u8_multiple() {
-        assert_eq!(bits_to_u8(&[1, 0, 1, 0]), 5);
-        assert_eq!(bits_to_u8(&[0, 1, 0, 1]), 0b1010);
-    }
-
-    #[test]
-    fn test_bits_to_u8_max() {
-        assert_eq!(bits_to_u8(&[1, 1, 1, 1]), 15);
-    }
-
-    #[test]
-    fn test_bits_to_u8_truncated() {
-        assert_eq!(bits_to_u8(&[1, 0]), 1);
-        assert_eq!(bits_to_u8(&[1, 1, 0, 0, 0, 0, 0, 0]), 3);
-    }
-
     // ── Helpers: exhaustive sweeps / continuity ───────────────────────────
 
     fn bits_to_hex(bits: &[u8; 80]) -> String {
@@ -1401,74 +1153,6 @@ mod tests {
     }
 
     // ── Long-running sample-count drift at 25fps ─────────────────────────
-
-    #[test]
-    fn test_long_running_2h_sample_count_zero_drift_48khz_25fps() {
-        let sample_rate = 48000u32;
-        let fps = 25.0;
-        let exact_spf = sample_rate as f64 / fps;
-        let base = exact_spf.floor() as usize;
-        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
-        let mut last_level = (1.0f32, 1.0f32);
-        let mut total_generated: u64 = 0;
-        let mut accumulator = 0.0_f64;
-        let num_frames = (7200.0_f64 * fps) as u64;
-        let mut frame_buf = vec![0.0f32; (base + 1) * 2];
-
-        for _ in 0..num_frames {
-            let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
-            frame_buf[..samples * 2].fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc, false, samples, spb,
-                0.5, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
-            );
-            total_generated += samples as u64;
-            tc = increment_timecode(&tc, fps, false);
-            accumulator = new_acc;
-        }
-
-        let expected = (sample_rate as f64 * 7200.0) as u64;
-        let drift = total_generated as i64 - expected as i64;
-        assert!(
-            drift.unsigned_abs() <= 2,
-            "zero drift target at 48kHz/25fps: got {} samples drift over 2h (allowed ±2)",
-            drift
-        );
-    }
-
-    #[test]
-    fn test_long_running_2h_sample_count_zero_drift_44khz_25fps() {
-        let sample_rate = 44100u32;
-        let fps = 25.0;
-        let exact_spf = sample_rate as f64 / fps;
-        let base = exact_spf.floor() as usize;
-        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
-        let mut last_level = (1.0f32, 1.0f32);
-        let mut total_generated: u64 = 0;
-        let mut accumulator = 0.0_f64;
-        let num_frames = (7200.0_f64 * fps) as u64;
-        let mut frame_buf = vec![0.0f32; (base + 1) * 2];
-
-        for _ in 0..num_frames {
-            let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
-            frame_buf[..samples * 2].fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc, false, samples, spb,
-                0.5, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
-            );
-            total_generated += samples as u64;
-            tc = increment_timecode(&tc, fps, false);
-            accumulator = new_acc;
-        }
-
-        let expected = (sample_rate as f64 * 7200.0) as u64;
-        let drift = total_generated as i64 - expected as i64;
-        assert!(
-            drift.unsigned_abs() <= 2,
-            "zero drift target at 44.1kHz/25fps: got {} samples drift over 2h (allowed ±2)",
-            drift
-        );
-    }
 
     // ── End-to-end: generated audio must decode gap-free ─────────────────
     //

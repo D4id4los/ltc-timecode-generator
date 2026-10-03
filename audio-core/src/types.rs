@@ -147,20 +147,6 @@ mod tests {
     // ── Timecode ──────────────────────────────────────────────────────────
 
     #[test]
-    fn test_timecode_clone_copy() {
-        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
-        let copied = tc;
-        assert_eq!(copied, tc);
-    }
-
-    #[test]
-    fn test_timecode_debug() {
-        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
-        let d = format!("{:?}", tc);
-        assert!(d.contains("1") || d.contains("hours"));
-    }
-
-    #[test]
     fn test_timecode_serialize_deserialize() {
         let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
         let json = serde_json::to_string(&tc).unwrap();

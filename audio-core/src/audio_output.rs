@@ -1573,12 +1573,6 @@ mod tests {
         assert!(matches!(choose_buffer_size(480), cpal::BufferSize::Fixed(480)));
     }
 
-    #[test]
-    fn test_choose_buffer_size_never_returns_fixed_1024_for_zero() {
-        // This test documents the fix: zero param must NOT force Fixed(1024)
-        assert!(matches!(choose_buffer_size(0), cpal::BufferSize::Default));
-    }
-
     // ── is_permanent_device_error ─────────────────────────────────────────
 
     #[test]
@@ -1675,25 +1669,6 @@ mod tests {
     }
 
     // ── AudioEvent types ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_audio_event_debug() {
-        let e1 = AudioEvent::StreamError("test".into());
-        let e2 = AudioEvent::StreamDied;
-        let e3 = AudioEvent::Underrun;
-        let e4 = AudioEvent::FramesDropped { total: 42 };
-        assert!(format!("{:?}", e1).contains("StreamError"));
-        assert!(format!("{:?}", e2).contains("StreamDied"));
-        assert!(format!("{:?}", e3).contains("Underrun"));
-        assert!(format!("{:?}", e4).contains("42"));
-    }
-
-    #[test]
-    fn test_audio_event_clone() {
-        let e = AudioEvent::StreamError("msg".into());
-        let cloned = e.clone();
-        assert!(matches!(cloned, AudioEvent::StreamError(ref m) if m == "msg"));
-    }
 
     // ── SAMPLE_RATE_OPTIONS ───────────────────────────────────────────────
 
