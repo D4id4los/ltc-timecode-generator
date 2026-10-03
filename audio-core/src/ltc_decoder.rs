@@ -393,6 +393,9 @@ pub(crate) fn decode_ltc_samples(
     decode_ltc_samples_inner(samples, sample_rate, channels, fps, drop_frame, start, cancel)
 }
 
+/// Decode LTC from a WAV file (builtin decoder, whole-file path).
+/// If channel 0 is (near-)silent, the channel carrying signal is decoded
+/// instead; a non-silent channel 0 is always kept.
 pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, LtcDecodeError> {
     let start = std::time::Instant::now();
 
@@ -404,8 +407,23 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool, cancel: Opti
 
     info!("Decoding LTC from: {} ({} Hz, {} ch, {} fps)", path.display(), sample_rate, channels, fps);
 
+    // Pass 1: per-channel peak scan — if channel 0 is (near-)silent, the
+    // channel carrying signal is decoded instead (the generator supports
+    // ChannelSel::Right output; WAV decode has no explicit channel override).
+    let peaks = scan_channel_peaks_hound(&mut reader, &spec);
+    let active_channel = pick_active_channel(&peaks);
+    if active_channel != 0 {
+        info!("LTC decode: channel 0 is silent, decoding channel {}", active_channel);
+    }
+
+    // Pass 2: read the selected channel (fresh reader — pass 1 exhausted it).
+    drop(reader);
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| LtcDecodeError::Failed(format!("Failed to open WAV file: {}", e)))?;
+    let spec = reader.spec();
+
     info!("LTC decode (+{:.1}s): reading audio samples from disk...", start.elapsed().as_secs_f64());
-    let samples = read_mono_samples(&mut reader, &spec)
+    let samples = read_mono_samples(&mut reader, &spec, active_channel)
         .map_err(|e| LtcDecodeError::Failed(format!("Failed to read audio samples: {}", e)))?;
 
     drop(reader);
@@ -417,6 +435,58 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool, cancel: Opti
     }
 
     decode_ltc_samples(&samples, sample_rate, channels, fps, drop_frame, start, cancel)
+}
+
+/// Peak amplitude below which a channel counts as silent (~1 LSB of 16-bit).
+pub(crate) const SILENT_CHANNEL_PEAK: f32 = 2.0 / 32768.0;
+
+/// Decode channel 0 unless it is (near-)silent; then the strongest other
+/// channel (ties → lowest index; all-silent → 0). Back-compat: a non-silent
+/// ch0 is always kept, even if another channel is louder.
+pub(crate) fn pick_active_channel(peaks: &[f32]) -> usize {
+    if peaks.is_empty() || peaks[0] > SILENT_CHANNEL_PEAK {
+        return 0;
+    }
+    let mut best = 0usize;
+    let mut best_peak = 0.0f32;
+    for (i, &p) in peaks.iter().enumerate().skip(1) {
+        if p > best_peak {
+            best = i;
+            best_peak = p;
+        }
+    }
+    if best_peak > SILENT_CHANNEL_PEAK { best } else { 0 }
+}
+
+/// One streaming pass over the file computing the absolute peak per channel.
+fn scan_channel_peaks_hound<R: std::io::Read>(
+    reader: &mut hound::WavReader<R>,
+    spec: &hound::WavSpec,
+) -> Vec<f32> {
+    let channels = (spec.channels as usize).max(1);
+    let mut peaks = vec![0f32; channels];
+    match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            for (i, s) in reader.samples::<i32>().filter_map(|s| s.ok()).enumerate() {
+                let v = (s as f32 / max_val).abs();
+                let ch = i % channels;
+                if v > peaks[ch] {
+                    peaks[ch] = v;
+                }
+            }
+        }
+        hound::SampleFormat::Float => {
+            for (i, s) in reader.samples::<f32>().filter_map(|s| s.ok()).enumerate() {
+                let v = s.abs();
+                let ch = i % channels;
+                if v > peaks[ch] {
+                    peaks[ch] = v;
+                }
+            }
+        }
+    }
+    peaks
 }
 
 /// Outcome of one (spb, phase) decode attempt.
@@ -1239,6 +1309,7 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
 fn read_mono_samples<R: std::io::Read>(
     reader: &mut hound::WavReader<R>,
     spec: &hound::WavSpec,
+    channel: usize,
 ) -> Result<Vec<f32>, String> {
     let channels = spec.channels as usize;
     let bits = spec.bits_per_sample;
@@ -1250,7 +1321,7 @@ fn read_mono_samples<R: std::io::Read>(
                 .samples::<i32>()
                 .filter_map(|s| s.ok())
                 .enumerate()
-                .filter(|(i, _)| i % channels == 0)
+                .filter(|(i, _)| i % channels == channel)
                 .map(|(_, s)| s as f32 / max_val)
                 .collect();
             Ok(samples)
@@ -1260,7 +1331,7 @@ fn read_mono_samples<R: std::io::Read>(
                 .samples::<f32>()
                 .filter_map(|s| s.ok())
                 .enumerate()
-                .filter(|(i, _)| i % channels == 0)
+                .filter(|(i, _)| i % channels == channel)
                 .map(|(_, s)| s)
                 .collect();
             Ok(samples)
@@ -2521,13 +2592,95 @@ mod tests {
     }
 
     #[test]
-    fn test_wav_roundtrip_right_channel() {
+    fn test_wav_roundtrip_right_channel_auto_selected() {
+        // The generator supports ChannelSel::Right output; WAV decode has no
+        // channel override (only video files get explicit channel selection
+        // via ffmpeg extraction). If channel 0 is (near-)silent, the channel
+        // carrying signal is decoded instead — the tool can read back its
+        // own right-channel output.
         let result = verify_roundtrip(
             Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
             25.0, false, ChannelSel::Right, 0.5, 48000, 1.0,
         );
+        assert!(matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success on right channel, got {:?}", result.status);
+        assert!(result.valid_frames >= 20,
+            "expected ~25 valid frames on right channel, got {}", result.valid_frames);
+    }
+
+    #[test]
+    fn test_wav_channel0_preferred_when_nonsilent() {        // Policy: files with independent program material on channel 0 keep
+        // today's channel-0 semantics — a louder ch1 never hijacks them.
+        // ch0 = low-level noise (peak ~0.05, well above SILENT_CHANNEL_PEAK
+        // ~= 6e-5), ch1 = valid LTC → decode must NOT succeed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ch0_program.wav");
+        let fps = 25.0f64;
+        let sample_rate = 48000u32;
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
+        let samples_per_bit = samples_per_frame as f32 / 80.0;
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        let mut tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut frame_buf = vec![0.0f32; samples_per_frame * 2];
+        for _ in 0..50 {
+            frame_buf.fill(0.0);
+            generate_ltc_frame_stereo(
+                &tc, false, samples_per_frame, samples_per_bit, 0.5,
+                ChannelSel::Right, &mut last_level, &mut frame_buf,
+            );
+            for (i, &sample) in frame_buf.iter().enumerate() {
+                let s = if i % 2 == 0 {
+                    // ch0: low-level noise, deterministic, peak ~0.05
+                    ((i * 2654435761) as f32).sin() * 0.05
+                } else {
+                    sample
+                };
+                let clamped = s.clamp(-1.0, 1.0);
+                writer.write_sample((clamped * i16::MAX as f32) as i16).unwrap();
+            }
+            tc = increment_timecode(&tc, fps, false);
+        }
+        writer.finalize().unwrap();
+
+        let result = decode_ltc_from_wav(&path, fps, false, None).unwrap();
         assert!(!matches!(result.status, LtcDecodeStatus::Success),
-            "right-only signal should not be decoded (left channel is silent), got {:?}", result.status);
+            "non-silent ch0 must be decoded; a louder ch1 must not hijack, got {:?}",
+            result.status);
+    }
+
+    // ── pick_active_channel ──────────────────────────────────────────────
+
+    #[test]
+    fn test_pick_active_channel_loud_ch0_kept_even_if_ch1_louder() {
+        // Back-compat: a non-silent ch0 is always kept, even when another
+        // channel is louder — program material on ch0 must not be hijacked.
+        assert_eq!(pick_active_channel(&[0.5, 0.9]), 0);
+        assert_eq!(pick_active_channel(&[0.001, 0.9, 0.9]), 0);
+    }
+
+    #[test]
+    fn test_pick_active_channel_silent_ch0_selects_loudest_other() {
+        assert_eq!(pick_active_channel(&[0.0, 0.5]), 1);
+        assert_eq!(pick_active_channel(&[0.0, 0.2, 0.8, 0.3]), 2);
+    }
+
+    #[test]
+    fn test_pick_active_channel_ties_prefer_lowest_index() {
+        assert_eq!(pick_active_channel(&[0.0, 0.5, 0.5]), 1);
+    }
+
+    #[test]
+    fn test_pick_active_channel_all_silent_or_empty_selects_zero() {
+        assert_eq!(pick_active_channel(&[0.0, 0.0]), 0);
+        assert_eq!(pick_active_channel(&[]), 0, "degenerate, defensive");
+        assert_eq!(pick_active_channel(&[1e-9]), 0);
     }
 
     // ── Edge case: mid-signal start ──────────────────────────────────────

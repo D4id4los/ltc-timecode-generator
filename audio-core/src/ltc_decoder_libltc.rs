@@ -9,6 +9,9 @@ use crate::LtcDecodeError;
 use crate::ltc_decoder::{apply_coherent_first_timecode, compute_ltc_quality, CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
 use crate::Timecode;
 
+/// Decode LTC from a WAV file via the libltc binding.
+/// If channel 0 is (near-)silent, the channel carrying signal is decoded
+/// instead; a non-silent channel 0 is always kept.
 pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, LtcDecodeError> {
     let start = Instant::now();
 
@@ -63,6 +66,27 @@ pub(crate) fn decode_ltc_samples_libltc(
         return Ok(LtcDetectionResult::error("Audio buffer contains no samples"));
     }
 
+    // If channel 0 is (near-)silent, the channel carrying signal is decoded
+    // instead (see `pick_active_channel`); the file is already fully
+    // interleaved in memory, so the peak scan is a cheap pass over it.
+    let active_channel = if channels == 1 {
+        0
+    } else {
+        let mut peaks = vec![0f32; channels];
+        for (i, &s) in sample_data.iter().enumerate() {
+            let v = (s as f32 / 32768.0).abs();
+            let ch = i % channels;
+            if v > peaks[ch] {
+                peaks[ch] = v;
+            }
+        }
+        let picked = crate::ltc_decoder::pick_active_channel(&peaks);
+        if picked != 0 {
+            info!("libltc decode: channel 0 is silent, decoding channel {}", picked);
+        }
+        picked
+    };
+
     let initial_apv = (sample_rate as f64 / 25.0).ceil() as i32;
     let config = LTCDecoderConfig {
         initial_apv,
@@ -111,7 +135,7 @@ pub(crate) fn decode_ltc_samples_libltc(
             }
             let chunk_end = (chunk_start + chunk_size * channels).min(sample_data.len());
             let raw_chunk = &sample_data[chunk_start..chunk_end];
-            let left: Vec<i16> = raw_chunk.chunks(channels).map(|ch| ch[0]).collect();
+            let left: Vec<i16> = raw_chunk.chunks(channels).map(|ch| ch[active_channel]).collect();
             decoder.write_i16(&left, sample_pos);
             sample_pos += left.len() as i64;
             while let Some(frame_ext) = decoder.read() {
@@ -365,6 +389,26 @@ mod tests {
             "expected Success for stereo LTC, got {:?}", result.status);
         assert!(result.valid_frames >= 20,
             "expected at least 20 valid frames from stereo, got {}", result.valid_frames);
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_libltc_stereo_extracts_right() {
+        // Mirror of ..._extracts_left: mono LTC on the *right*, silence on
+        // the left — the silent ch0 must not prevent decoding.
+        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
+        }).collect();
+        let mono = synthesize_ltc_samples_i16(&tcs, 25.0, false, 48000, 0.5);
+        let mut stereo = Vec::with_capacity(mono.len() * 2);
+        for &s in &mono {
+            stereo.push(0i16); // left channel silence
+            stereo.push(s);
+        }
+        let result = decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now(), None).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for right-channel LTC, got {:?}", result.status);
+        assert!(result.valid_frames >= 20,
+            "expected at least 20 valid frames from right channel, got {}", result.valid_frames);
     }
 
     #[test]

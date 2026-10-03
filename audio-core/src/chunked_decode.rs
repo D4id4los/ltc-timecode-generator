@@ -55,6 +55,9 @@ pub(crate) struct ChunkPlan {
     pub total_mono: usize,
     pub total_duration: f64,
     pub overlap_seconds: f64,
+    /// Channel the mono-sample readers extract; picked once per file so
+    /// every chunk decodes the same channel.
+    pub active_channel: usize,
 }
 
 /// Build the chunk plan from an open reader: chunk geometry + boundaries.
@@ -70,6 +73,7 @@ fn plan_chunks(reader: &WavChunkReader, config: &DecodeConfig) -> ChunkPlan {
         total_mono,
         total_duration: total_mono as f64 / sample_rate as f64,
         overlap_seconds: config.overlap_seconds,
+        active_channel: 0,
     }
 }
 
@@ -108,6 +112,8 @@ pub fn count_chunks_in_wav(path: &Path, config: &DecodeConfig) -> Result<usize, 
 }
 
 /// Decode LTC from a WAV file in parallel chunks with progress reporting and cancelation.
+/// If channel 0 is (near-)silent, the channel carrying signal is decoded
+/// instead; a non-silent channel 0 is always kept.
 pub fn decode_ltc_chunked(
     path: &Path,
     use_libltc: bool,
@@ -116,8 +122,8 @@ pub fn decode_ltc_chunked(
     config: DecodeConfig,
     progress: &DecodeProgress,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
-    let (chunk_reader, overall_start) = WavChunkReader::open(path).map_err(LtcDecodeError::Failed)?;
-    let plan = plan_chunks(&chunk_reader, &config);
+    let (mut chunk_reader, overall_start) = WavChunkReader::open(path).map_err(LtcDecodeError::Failed)?;
+    let mut plan = plan_chunks(&chunk_reader, &config);
 
     debug!("decode_ltc_chunked: {} samples @ {} Hz, config chunk={} bytes, overlap={}s",
         plan.total_mono, plan.sample_rate, config.chunk_size_bytes, config.overlap_seconds);
@@ -125,6 +131,15 @@ pub fn decode_ltc_chunked(
     if plan.total_mono == 0 {
         warn!("decode_ltc_chunked: WAV file contains no samples");
         return Ok(LtcDetectionResult::error("Audio file contains no samples"));
+    }
+
+    // Pick the decode channel once per file, before chunk planning, so every
+    // chunk decodes the same channel: if channel 0 is (near-)silent, the
+    // channel carrying signal is decoded instead.
+    let peaks = chunk_reader.scan_channel_peaks().map_err(LtcDecodeError::Failed)?;
+    plan.active_channel = crate::ltc_decoder::pick_active_channel(&peaks);
+    if plan.active_channel != 0 {
+        info!("decode_ltc_chunked: channel 0 is silent, decoding channel {}", plan.active_channel);
     }
 
     let num_chunks = plan.boundaries.len();
@@ -206,7 +221,7 @@ fn run_sequential(
         }
         let r = decode_one_chunk(
             path, decoder, chunk_idx, start_sample, end_sample,
-            plan.sample_rate, fps, drop_frame, cancel_flag,
+            plan.sample_rate, fps, drop_frame, cancel_flag, plan.active_channel,
         );
         progress.chunks_completed.fetch_add(1, Ordering::Relaxed);
         results.push(r);
@@ -249,7 +264,7 @@ fn run_parallel(
                 let (start_sample, end_sample) = chunks[idx];
                 let result = decode_one_chunk(
                     path, decoder, idx, start_sample, end_sample,
-                    plan.sample_rate, fps, drop_frame, &cancel_flag,
+                    plan.sample_rate, fps, drop_frame, &cancel_flag, plan.active_channel,
                 );
                 if cancel_flag.load(Ordering::Relaxed) { break; }
                 progress_completed.fetch_add(1, Ordering::Relaxed);
@@ -378,6 +393,7 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
 }
 
 /// Decode a single chunk of a WAV file in a worker thread.
+#[allow(clippy::too_many_arguments)]
 fn decode_one_chunk(
     path: &Path,
     decoder: &dyn LtcDecoder,
@@ -388,6 +404,7 @@ fn decode_one_chunk(
     fps: f64,
     drop_frame: bool,
     cancel_flag: &AtomicBool,
+    active_channel: usize,
 ) -> ChunkResult {
     let num_samples = end_sample - start_sample;
 
@@ -395,7 +412,7 @@ fn decode_one_chunk(
         return ChunkResult { chunk_idx, result: Err(LtcDecodeError::Cancelled) };
     }
 
-    let mut local_reader = match WavChunkReader::open(path) {
+    let mut local_reader = match WavChunkReader::open_with_channel(path, active_channel) {
         Ok((r, _)) => r,
         Err(e) => return ChunkResult {
             chunk_idx,
@@ -486,6 +503,7 @@ mod tests {
             total_mono: (total_duration * 48000.0) as usize,
             total_duration,
             overlap_seconds: overlap,
+            active_channel: 0,
         }
     }
 
@@ -1134,6 +1152,18 @@ mod tests {
         sample_rate: u32,
         num_frames: u32,
     ) {
+        generate_ltc_wav_sel(path, start_tc, fps, drop_frame, sample_rate, num_frames, ChannelSel::Both);
+    }
+
+    fn generate_ltc_wav_sel(
+        path: &Path,
+        start_tc: Timecode,
+        fps: f64,
+        drop_frame: bool,
+        sample_rate: u32,
+        num_frames: u32,
+        channel: ChannelSel,
+    ) {
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate,
@@ -1157,7 +1187,7 @@ mod tests {
                 samples_per_frame,
                 samples_per_bit,
                 0.5,
-                ChannelSel::Both,
+                channel,
                 &mut last_level,
                 &mut frame_buf[..samples_per_frame * 2],
             );
@@ -1222,6 +1252,30 @@ mod tests {
         }
 
         writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn test_chunked_right_channel_wav_decodes() {
+        // The chunked path must pick the decode channel once per file,
+        // before chunk planning: a right-only WAV (silent ch0) decodes via
+        // the auto-selected right channel, exercising the WavChunkReader
+        // plumbing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("right_only.wav");
+        generate_ltc_wav_sel(
+            &path,
+            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            25.0, false, 48000, 50,
+            ChannelSel::Right,
+        );
+
+        let config = DecodeConfig { chunk_size_bytes: 10_000_000, overlap_seconds: 2.0 };
+        let progress = DecodeProgress::new(1);
+        let result = decode_ltc_chunked(&path, false, 25.0, false, config, &progress).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for right-only WAV, got {:?}", result.status);
+        assert!(result.valid_frames >= 40,
+            "should decode at least 40 frames, got {}", result.valid_frames);
     }
 
     #[test]

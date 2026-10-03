@@ -13,6 +13,10 @@ pub struct WavChunkReader {
     total_mono_samples: usize,
     channels: usize,
     bytes_per_sample: u64,
+    /// Channel extracted by the mono-sample readers (stride filter).
+    /// Picked once per file via `scan_channel_peaks` + `pick_active_channel`
+    /// before chunk planning, so every chunk decodes the same channel.
+    active_channel: usize,
 }
 
 /// Sign-extended little-endian integer sample of `bps` bytes at `raw[offset..]`.
@@ -77,13 +81,68 @@ impl WavChunkReader {
             total_mono_samples,
             channels,
             bytes_per_sample,
+            active_channel: 0,
         }, start))
+    }
+
+    /// Like [`WavChunkReader::open`] but extracts `active_channel` in the
+    /// mono-sample readers instead of channel 0.
+    pub fn open_with_channel(path: &Path, active_channel: usize) -> Result<(Self, std::time::Instant), String> {
+        let (mut reader, start) = Self::open(path)?;
+        reader.active_channel = active_channel;
+        Ok((reader, start))
     }
 
     pub fn spec(&self) -> &hound::WavSpec { &self.spec }
     pub fn sample_rate(&self) -> u32 { self.spec.sample_rate }
     pub fn channels(&self) -> usize { self.channels }
     pub fn total_mono_samples(&self) -> usize { self.total_mono_samples }
+
+    /// One sequential pass over the data section computing the absolute
+    /// peak per channel (buffered reads; no storage cost). The caller feeds
+    /// the result to `pick_active_channel` and re-opens with
+    /// `open_with_channel` — the channel choice must be made once per file
+    /// so every chunk decodes the same channel.
+    pub fn scan_channel_peaks(&mut self) -> Result<Vec<f32>, String> {
+        let bps = self.bytes_per_sample as usize;
+        let frame_bytes = self.channels * bps;
+        if frame_bytes == 0 {
+            return Ok(vec![0.0]);
+        }
+        let mut peaks = vec![0f32; self.channels];
+        let is_float = self.spec.sample_format == hound::SampleFormat::Float;
+        let max_val = if is_float {
+            1.0f32
+        } else {
+            (1i64 << (self.spec.bits_per_sample - 1)) as f32
+        };
+
+        self.file.seek(SeekFrom::Start(self.data_start))
+            .map_err(|e| format!("Failed to seek: {}", e))?;
+
+        let mut buf = vec![0u8; frame_bytes * 8192];
+        loop {
+            let n = self.file.read(&mut buf)
+                .map_err(|e| format!("Failed to read samples: {}", e))?;
+            if n == 0 { break; }
+            let frames = n / frame_bytes;
+            for f in 0..frames {
+                let base = f * frame_bytes;
+                for (ch, peak) in peaks.iter_mut().enumerate() {
+                    let v = if is_float {
+                        let o = base + ch * 4;
+                        f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]).abs()
+                    } else {
+                        (decode_le_int_sample(&buf, base + ch * bps, bps)? as f32 / max_val).abs()
+                    };
+                    if v > *peak {
+                        *peak = v;
+                    }
+                }
+            }
+        }
+        Ok(peaks)
+    }
 
     /// Read the raw interleaved bytes covering `start_sample..start_sample+num_samples`
     /// (mono-sample units), clamped to the data section. Single home of the
@@ -109,11 +168,13 @@ impl WavChunkReader {
         Ok(raw)
     }
 
-    /// Read a range of mono samples (first channel) from the file.
-    /// `start_sample` and `num_samples` are in mono (first-channel) sample units.
+    /// Read a range of mono samples (the reader's active channel, channel 0
+    /// unless auto-selected otherwise) from the file.
+    /// `start_sample` and `num_samples` are in mono (per-channel) sample units.
     /// Returns a `Vec<f32>` for the builtin decoder.
     pub fn read_mono_samples_f32(&mut self, start_sample: usize, num_samples: usize) -> Result<Vec<f32>, String> {
         let raw = self.read_raw_bytes(start_sample, num_samples)?;
+        let channel = self.active_channel;
 
         match self.spec.sample_format {
             hound::SampleFormat::Int => {
@@ -121,7 +182,7 @@ impl WavChunkReader {
                 let samples_per_channel = raw.len() / (self.channels * self.bytes_per_sample as usize);
                 let mut result = Vec::with_capacity(samples_per_channel);
                 for i in 0..samples_per_channel {
-                    let byte_ofs = i * self.channels * self.bytes_per_sample as usize;
+                    let byte_ofs = (i * self.channels + channel) * self.bytes_per_sample as usize;
                     let sample = decode_le_int_sample(&raw, byte_ofs, self.bytes_per_sample as usize)?;
                     result.push(sample as f32 / max_val);
                 }
@@ -131,7 +192,7 @@ impl WavChunkReader {
                 let samples_per_channel = raw.len() / (self.channels * 4);
                 let mut result = Vec::with_capacity(samples_per_channel);
                 for i in 0..samples_per_channel {
-                    let byte_ofs = i * self.channels * 4;
+                    let byte_ofs = (i * self.channels + channel) * 4;
                     let sample = f32::from_le_bytes([
                         raw[byte_ofs], raw[byte_ofs + 1],
                         raw[byte_ofs + 2], raw[byte_ofs + 3],
@@ -156,7 +217,7 @@ impl WavChunkReader {
         let num_mono_samples = raw.len() / (self.channels * bps);
         let mut result = Vec::with_capacity(num_mono_samples);
         for i in 0..num_mono_samples {
-            let byte_ofs = i * self.channels * bps;
+            let byte_ofs = (i * self.channels + self.active_channel) * bps;
             let sample = decode_le_int_sample(&raw, byte_ofs, bps)?;
             let s16 = if bits >= 16 { (sample >> (bits - 16)) as i16 } else { sample as i16 };
             result.push(s16);
