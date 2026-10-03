@@ -48,7 +48,7 @@ mod win_driver {
         if mask == 0 {
             return candidates;
         }
-        for letter in drive_letters_from_mask(mask) {
+        for letter in super::drive_letters_from_mask(mask) {
             let root = format!("{}:\\", letter);
             let root_wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
             let kind = unsafe { FileSystem::GetDriveTypeW(root_wide.as_ptr()) };
