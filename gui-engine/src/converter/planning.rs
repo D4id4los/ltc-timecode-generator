@@ -913,8 +913,12 @@ mod tests {
 
     #[test]
     fn test_selected_pairs_no_video_source_drops_nothing() {
-        // VideoClipSequence + drop on but ltc_video_source = None:
-        // no fallback to ltc_track_channel_index (today's video behavior).
+        // VideoClipSequence + drop on but ltc_video_source = None.
+        // Policy: video LTC identity is a (stream, channel) pair — it cannot
+        // be derived from the single `ltc_track_channel_index`. Falling back
+        // to the audio index would guess and could silently drop a dialogue
+        // channel. No fallback is the safe default: if the LTC source is
+        // unidentified, nothing is dropped.
         let mut s = make_video_settings();
         s.channel_map = ChannelMap::identity(2);
         s.drop_ltc_track = true;

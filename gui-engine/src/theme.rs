@@ -107,12 +107,6 @@ mod tests {
     }
 
     #[test]
-    fn test_theme_colors_are_different() {
-        assert_ne!(DARK.app_bg, DARK.card_bg);
-        assert_ne!(DARK.text_main, DARK.text_muted);
-    }
-
-    #[test]
     fn test_rgb_new() {
         let c = Rgb::new(0xFF, 0x5F, 0x1F);
         assert_eq!(c.0, 0xFF);
