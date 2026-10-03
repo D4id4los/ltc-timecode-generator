@@ -1595,8 +1595,13 @@ mod tests {
         settings.output_folder = dir.path().to_path_buf();
 
         let report = TestReport::new();
+        // Software-only chain: the static h264 chain leads with h264_nvenc,
+        // which production filters out via the capability probe's test encode
+        // but which this test bypasses — on GPU-less CI the nvenc attempt
+        // fails after producing no output and the run would not be retried.
+        // Encoder-fallback ordering is covered by video_codecs unit tests.
         let mut fallback = EncoderFallback::new_with_hw(
-            video_codecs::static_encoder_chain("h264"),
+            vec!["libx264".into()],
             HwDeviceContext { vaapi_device: None, vulkan_available: false },
         );
         let mut total = 1;

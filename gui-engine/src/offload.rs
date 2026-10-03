@@ -1882,6 +1882,7 @@ proc /proc proc rw 0 0
     /// - `mmc_devs`: devices on an MMC bus (removable=0, path contains /mmc)
     /// - `partition_devs`: partition names relative to the above groups;
     ///   each gets a `partition` file and no `removable` file.
+    #[cfg(unix)]
     fn make_mock_sys(
         removable_devs: &[&str],
         usb_devs: &[&str],
@@ -1941,36 +1942,42 @@ proc /proc proc rw 0 0
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_dev_removable_found() {
         let sys = make_mock_sys(&["sdb"], &[], &[], &[]);
         assert!(is_dev_removable("sdb", sys.path()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_dev_removable_not_found() {
         let sys = make_mock_sys(&[], &[], &[], &[]);
         assert!(!is_dev_removable("nvme0n1", sys.path()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_card_like_device_removable_flag() {
         let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
         assert!(is_card_like_device("/dev/sdb1", sys.path()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_card_like_device_usb_bus() {
         let sys = make_mock_sys(&[], &["sdc"], &[], &[]);
         assert!(is_card_like_device("/dev/sdc", sys.path()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_card_like_device_mmc_bus() {
         let sys = make_mock_sys(&[], &[], &["mmcblk0"], &[]);
         assert!(is_card_like_device("/dev/mmcblk0", sys.path()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_card_like_device_nvme_excluded() {
         let sys = make_mock_sys(&[], &[], &[], &[]);
@@ -1990,6 +1997,7 @@ proc /proc proc rw 0 0
         (dir, root)
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_cards_udisks2_path_passes_filtering() {
         let mounts = "\
@@ -2003,6 +2011,7 @@ proc /proc proc rw 0 0
         assert!(cards.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_cards_skips_gvfs_snap() {
         let mounts = "\
@@ -2016,6 +2025,7 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
         assert!(cards.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_cards_media_dir_paths_pass_filtering() {
         let mounts = "\
@@ -2027,6 +2037,7 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
         assert!(cards.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_cards_nvme_under_run_media_excluded() {
         let mounts = "\
@@ -2064,6 +2075,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
 
     // ── find_unmounted_card_partitions ───────────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn test_find_unmounted_card_partitions_none_mounted() {
         let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
@@ -2076,6 +2088,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_find_unmounted_card_partitions_already_mounted() {
         let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
@@ -2087,6 +2100,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_find_unmounted_card_partitions_nvme_excluded() {
         let sys = make_mock_sys(&[], &[], &[], &["nvme0n1p3"]);
@@ -2132,6 +2146,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         assert_sync::<ScanProgress>();
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_cards_from_mounts_with_progress_fires_for_each_candidate() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2175,6 +2190,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         assert_eq!(cards[0].media_file_count, 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_cards_with_progress_none_still_works() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2314,6 +2330,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
 
     // ── ProgressTracker message forwarding during scan ──────────────────
 
+    #[cfg(unix)]
     #[test]
     fn test_run_offload_scan_job_forwarding_progress_message() {
         // This test verifies that ScanProgress::with_forward correctly
