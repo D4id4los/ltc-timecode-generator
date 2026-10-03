@@ -1655,66 +1655,8 @@ mod tests {
         assert_eq!(sample, expected_frames);
     }
 
-    #[test]
-    fn test_tag_mp4_tmcd_ffprobe_roundtrip() {
-        // End-to-end: tag a real MP4 and confirm ffprobe sees a valid tmcd
-        // track (this is the test that catches stco/offset regressions).
-        if !which_exists("ffmpeg") {
-            eprintln!("--- SKIPPED: ffmpeg not found (tmcd round-trip test)");
-            return;
-        }
-        if !which_exists("ffprobe") {
-            eprintln!("--- SKIPPED: ffprobe not found (tmcd round-trip test)");
-            return;
-        }
-        let dir = TempDir::new().unwrap();
-        let p = dir.path().join("roundtrip.mov");
-
-        let status = no_window_command("ffmpeg")
-            .args([
-                "-f", "lavfi", "-i", "testsrc=duration=0.5:size=64x64:rate=25",
-                "-c:v", "mpeg4",
-                "-movflags", "+faststart", // ensures moov is written last
-                "-y",
-            ])
-            .arg(&p)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("ffmpeg should succeed");
-        assert!(status.success(), "MP4 fixture creation failed");
-
-        let result = tag_file(&p, &test_meta(), None);
-        match result {
-            Ok(TagOutcome::TaggedInPlace) => {}
-            Ok(other) => {
-                eprintln!("--- SKIPPED: fixture fell through to {:?} (layout not moov-last)", other);
-                return;
-            }
-            Err(e) => panic!("tagging failed: {}", e),
-        }
-
-        let out = no_window_command("ffprobe")
-            .args(["-v", "error", "-show_streams", "-of", "json"])
-            .arg(&p)
-            .output()
-            .expect("ffprobe should succeed");
-        assert!(out.status.success(), "ffprobe must accept the tagged file");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.contains("tmcd"),
-            "tagged file must expose a tmcd stream, got: {}",
-            stdout
-        );
-    }
-
-    fn which_exists(prog: &str) -> bool {
-        no_window_command(prog)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
+    // NOTE: the ffprobe round-trip test that used to live here was promoted
+    // to gui-engine/tests/tagger_mp4.rs (WP-4 PR-6) with a committed fixture,
+    // so the native-path precondition is guaranteed and the old silent-skip
+    // on "fixture fell through" is gone.
 }
