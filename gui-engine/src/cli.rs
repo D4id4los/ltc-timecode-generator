@@ -876,55 +876,100 @@ mod tests {
     #[test]
     fn test_parse_timecode_wrong_segment_count() {
         let err = parse_timecode("01:02:03").unwrap_err();
-        assert!(err.contains("HH:MM:SS:FF"), "error should mention format: {}", err);
+        assert!(
+            matches!(err, TimecodeParseError::BadFormat { .. }),
+            "expected BadFormat, got {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_parse_timecode_too_many_segments() {
         let err = parse_timecode("01:02:03:04:05").unwrap_err();
-        assert!(err.contains("HH:MM:SS:FF"), "error should mention format: {}", err);
+        assert!(
+            matches!(err, TimecodeParseError::BadFormat { .. }),
+            "expected BadFormat, got {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_parse_timecode_non_numeric_hours() {
         let err = parse_timecode("ab:00:00:00").unwrap_err();
-        assert!(err.contains("hours"), "error should mention hours: {}", err);
+        assert!(
+            matches!(
+                err,
+                TimecodeParseError::InvalidComponent { field: TcField::Hours, .. }
+            ),
+            "expected InvalidComponent(Hours), got {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_parse_timecode_non_numeric_frames() {
         let err = parse_timecode("00:00:00:xx").unwrap_err();
-        assert!(err.contains("frames"), "error should mention frames: {}", err);
+        assert!(
+            matches!(
+                err,
+                TimecodeParseError::InvalidComponent { field: TcField::Frames, .. }
+            ),
+            "expected InvalidComponent(Frames), got {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_parse_timecode_hours_overflow() {
         let err = parse_timecode("24:00:00:00").unwrap_err();
-        assert!(err.contains("0-23"), "error should mention 0-23 range: {}", err);
+        assert!(
+            matches!(err, TimecodeParseError::OutOfRange(TcField::Hours)),
+            "expected OutOfRange(Hours), got {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_parse_timecode_minutes_overflow() {
         let err = parse_timecode("00:60:00:00").unwrap_err();
-        assert!(err.contains("0-59"), "error should mention 0-59 range: {}", err);
+        assert!(
+            matches!(err, TimecodeParseError::OutOfRange(TcField::Minutes)),
+            "expected OutOfRange(Minutes), got {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_parse_timecode_seconds_overflow() {
         let err = parse_timecode("00:00:60:00").unwrap_err();
-        assert!(err.contains("0-59"), "error should mention 0-59 range: {}", err);
+        assert!(
+            matches!(err, TimecodeParseError::OutOfRange(TcField::Seconds)),
+            "expected OutOfRange(Seconds), got {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_parse_timecode_empty_string() {
         let err = parse_timecode("").unwrap_err();
-        assert!(err.contains("HH:MM:SS:FF"), "error should mention format: {}", err);
+        assert!(
+            matches!(err, TimecodeParseError::BadFormat { .. }),
+            "expected BadFormat, got {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_parse_timecode_negative_hours() {
         let err = parse_timecode("-1:00:00:00").unwrap_err();
-        assert!(err.contains("hours") || err.contains("Invalid"), "error should mention hours: {}", err);
+        assert!(
+            matches!(
+                err,
+                TimecodeParseError::InvalidComponent { field: TcField::Hours, .. }
+            ),
+            "expected InvalidComponent(Hours), got {:?}",
+            err
+        );
     }
 
     // ── timecode_fmt ──────────────────────────────────────────────────────
@@ -1068,7 +1113,14 @@ mod tests {
         let mut cli = default_resolve_cli();
         cli.device_index = Some(99);
         let err = resolve_device(&devs, &cli).unwrap_err();
-        assert!(err.contains("out of range"), "error should mention out of range: {}", err);
+        assert!(
+            matches!(
+                err,
+                ResolveDeviceError::IndexOutOfRange { index: 99, count: 2 }
+            ),
+            "expected IndexOutOfRange {{ index: 99, count: 2 }}, got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -1077,7 +1129,11 @@ mod tests {
         let mut cli = default_resolve_cli();
         cli.device = Some("NonExistentDevice".into());
         let err = resolve_device(&devs, &cli).unwrap_err();
-        assert!(err.contains("not found"), "error should mention not found: {}", err);
+        assert!(
+            matches!(err, ResolveDeviceError::NotFound { .. }),
+            "expected NotFound, got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -1085,7 +1141,11 @@ mod tests {
         let devs: Vec<AudioDeviceInfo> = vec![];
         let cli = default_resolve_cli();
         let err = resolve_device(&devs, &cli).unwrap_err();
-        assert!(err.contains("No audio devices"), "error should mention no devices: {}", err);
+        assert!(
+            matches!(err, ResolveDeviceError::NoDevices),
+            "expected NoDevices, got {:?}",
+            err
+        );
     }
 
     #[test]
