@@ -38,14 +38,34 @@ code changed.
   (preferring `maintainability_rating` over the deprecated
   `sqale_rating`); and the summary gained a per-condition
   **new-code conditions** table — the numbers gate reviews read first.
-- Portal verification of the first gated scan (coverage import, issue
-  census, before/after measures) is recorded in `reports/sonar/` once
-  the gate is assigned via `sonar:gate` and `main` is pushed — the
-  push is simultaneously the first scan with the
-  `sonar.rust.lcov.reportPaths` fix and the first scan grading the
-  WP-0…4 work as new code. If a new-code condition fails that scan,
-  the plan's honesty rule applies: investigate and itemize, never
-  silently loosen a threshold.
+- Portal verification (first gated scan, 2026-10-03, `main` @
+  `68aa232`): the gate evaluates as **PASSED** with every new-code
+  condition green — new-code coverage 91.8% (overall 74.6%), all three
+  ratings A, duplication 0.0%, hotspots 100% reviewed. Issue census
+  before → after: bugs 11 → **0**, vulnerabilities 1 → **0**, smells
+  167 → **86** (Rust-only: 30 CRITICAL — 29 `S3776` + 1 `S2208` —, 12
+  MAJOR, 44 MINOR; the CRITICAL list is the F-2 burn-down baseline),
+  the 4 stale clippy imports closed as expected, ncloc 36 541 →
+  35 592. The report script renders ratings as letters and the
+  per-condition new-code table — evidence in the local (gitignored)
+  `reports/sonar/` snapshot.
+- Portal reality notes, recorded for the follow-ups: SonarCloud
+  rejected *assigning* the custom gate ("Organization … is not allowed
+  to modify Quality gates" — plan entitlement), so enforcement runs on
+  the built-in **Sonar way** gate, a strict superset of LTC gate's
+  four conditions; `npm run sonar:gate` handles this fallback
+  automatically (and the custom LTC gate exists, ready to assign if
+  the plan allows). The New Code definition is *previous version*
+  (baseline v0.4.7 @ 2026-10-02), the alternative the plan accepted.
+- First-push fallout fixed en route (`68aa232`): the WP-0…4 code had
+  never run on CI, and two latent issues surfaced — `offload.rs`'s
+  `make_mock_sys` cluster created mock sysfs symlinks without a
+  `#[cfg(unix)]` gate (broke the windows-cross-check compile), and
+  `test_run_video_to_video_happy_path` led its encoder chain with
+  `h264_nvenc`, which fails after producing no output on GPU-less
+  runners (the production capability probe normally removes dead hw
+  encoders; the test bypasses it, so it now pins a software-only
+  libx264 chain).
 
 * Unreleased — WP-4 test-gap closure
 
