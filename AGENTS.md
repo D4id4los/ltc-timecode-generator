@@ -52,7 +52,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── lib.rs                # Module decls + re-exports (ArcSwap, decode types, converter/file_pattern/ffprobe API)
 │   │   ├── command.rs            # GuiCommand enum (source of truth for all commands)
 │   │   ├── state.rs              # AppStateSnapshot + ClapLogItem (source of truth for published state)
-│   │   ├── engine.rs             # Threaded engine loop, AudioCore lifecycle, retry/recovery, decode handling, offload handling
+│   │   ├── engine.rs             # Threaded engine loop, AudioCore lifecycle, retry/recovery, decode handling, offload handling; EngineSeams + engine_main_with_seams for test injection
 │   │   ├── job.rs                # Unified async IO job infrastructure: JobSupervisor, ProgressTracker, CancelToken, SpeedMeter, spawn_job
 │   │   ├── camera_meta.rs        # Camera model detection from clips (exiftool/ffprobe probe)
 │   │   ├── cli.rs                # Cli struct, parse_args(), process_cli(); headless/WAV/list-devices/decode modes
@@ -60,7 +60,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── log_buffer.rs         # LogBuffer ring buffer + init_logger (canonical logger)
 │   │   ├── theme.rs              # Shared dark/light ThemeColors palettes used by both Rust GUIs
 │   │   ├── device_name.rs        # Device-name resolution chain (XAVC sniff → camera meta → filename → volume → "unknown")
-│   │   ├── decode.rs             # Shared video→extract→decode pipeline (engine + CLI), temp-WAV management, progress bridge
+│   │   ├── decode.rs             # Shared video→extract→decode + WAV decode pipelines (engine + CLI), temp-WAV management, progress bridge
 │   │   ├── clip_probe.rs         # Converter clip-probe policy: ffprobe + camera-meta sample cap + device-name resolution
 │   │   ├── duration.rs           # File-duration helpers (WAV header / ffprobe), group aggregation, H:MM:SS formatting
 │   │   ├── naming.rs             # Named-placeholder output-filename template engine ({filename}/{device}/{clip}/{track})
@@ -469,7 +469,7 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
    `init_test_config()`, preventing writes to `~/.config/`. All test engine
    spawns must call `init_test_config()` first.
 
-5. **No real ffmpeg probe** — Engine tests use `engine_main_with_probe()` with
+5. **No real ffmpeg probe** — Engine tests use `engine_main_with_probe()` (or `engine_main_with_seams`, which additionally injects the offload card-detection source) with
    `fake_probe()`, skipping the real ffmpeg-capability subprocess probe.
    This removes N concurrent `ffmpeg -encoders` calls per test run and the
    mid-test `apply_available_defaults` mutation. The real probe path is exercised
@@ -487,7 +487,9 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
 
 ### Integration Suites
 
-- `gui-engine/tests/integration.rs` — engine-thread command processing
+- `gui-engine/tests/integration.rs` — engine-thread command processing, incl. offload scan/copy integration tests driven through `EngineSeams.scan_cards` (fake card, real tempdir copies, cancel + guard branches) and the `SetDevice` bogus-id revert test
+- `gui-engine/tests/cli_decode.rs` — CLI dispatch via `process_cli_result` (output-to-file, WAV/video decode, error paths)
+- `gui-engine/tests/tagger_mp4.rs` — native MP4 tmcd in-place tagging against the committed fixture `test-data/tmcd-roundtrip-trailing-moov.mp4` (stco-offset regression net + ffprobe round-trip)
 - `gui-engine/tests/converter_integration.rs` — conversion pipelines (real ffmpeg)
 - `gui-engine/tests/video_extraction.rs` — ffprobe/ffmpeg extraction (real ffmpeg)
 
@@ -497,7 +499,7 @@ Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 
 ## CI & SonarQube Cloud
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on push to `main` and on PRs: clippy (JSON report), Rust tests via `cargo llvm-cov nextest --workspace --profile ci` + LCOV report via `cargo llvm-cov report` (cargo-llvm-cov ≥0.9 split the old `--nextest` flag into a `nextest` subcommand), TypeScript typecheck, vitest tests + coverage (LCOV), and a SonarQube Cloud scan. The Sonar step is skipped when the `SONAR_TOKEN` repo secret is absent, so the workflow works in forks without setup.
+GitHub Actions (`.github/workflows/ci.yml`) runs on push to `main` and on PRs: clippy (JSON report), Rust tests via `cargo llvm-cov nextest --workspace --profile ci` + LCOV report via `cargo llvm-cov report` (cargo-llvm-cov ≥0.9 split the old `--nextest` flag into a `nextest` subcommand), TypeScript typecheck, vitest tests + coverage (LCOV), and a SonarQube Cloud scan. The Sonar step is skipped when the `SONAR_TOKEN` repo secret is absent, so the workflow works in forks without setup. A second job, `windows-cross-check`, runs `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu` on ubuntu-latest (mingw-w64 + host `libltc-dev` headers suffice for bindgen at check time) so the Windows-only `cfg` blocks (`offload::win_driver`, `subprocess` console suppression, unix-only test fixtures being properly gated) compile on every PR — check-only, no link and no tests; a macOS cross-check is deliberately out of scope (SDK sysroot fragility).
 
 - **Sonar project**: `D4id4los_ltc-timecode-generator` in organization `d4id4los` (sonarcloud.io). Analysis config lives in `sonar-project.properties` (sources = the four workspace crates + `src/`, exclusions = `src-tauri*`, `*.slint` — Slint markup has no Sonar analyzer).
 - **Rust analysis** uses the official SonarSource Rust analyzer (CI-based only — no automatic analysis for Rust). Clippy findings are imported as external issues from `clippy-report.json` (`cargo clippy --message-format=json`), coverage from `lcov.info` + `coverage/lcov.info` (both gitignored).

@@ -1,6 +1,53 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — WP-4 test-gap closure
+
+Implementation of work package WP-4 from the code-quality report
+(`reports/code-quality-2026-10-02.md`, plan in
+`reports/wp4-test-gap-closure-plan.md`): close the four structural test
+gaps the earlier WPs did not cover — the engine's offload
+command/event paths, the `SetDevice` revert path, the CLI mode
+runners, the Windows-only `cfg` blocks, and the tagged-MP4 round-trip.
+
+- Offload scan seam: `run_offload_scan_job_with` (project `_with`
+  convention) makes card detection injectable; `EngineSeams` +
+  `engine_main_with_seams` replace ad-hoc seams while
+  `engine_main_with_probe` keeps its signature as a delegate. The new
+  engine integration tests drive the full offload pipeline — fake card
+  scan → selection → real tempdir copy → completion/version bump →
+  `DurationProbe` item flow — plus the copy-failure contract (job ends
+  Succeeded with an empty completed list; a cancelled scan now maps to
+  `JobError::Cancelled`, not `Failed`), cancel-during-scan with clean
+  rescan, and the "No media cards detected." / "No parent folder
+  selected." guards.
+- `SetDevice` revert regression test: a bogus device id is rejected by
+  `try_init_device` before cpal is touched, so the "failed selection
+  never sticks" invariant is pinned deterministically on any host.
+- CLI testability: `process_cli_result` returns `Result<CliOutcome,
+  CliError>` instead of exiting the process on decode/generate errors
+  (`process_cli` keeps byte-identical stderr/exit behavior); the decodable
+  runners return the `LtcDetectionResult`. The WAV chunked-decode core
+  moved into `decode::decode_wav_file`, retiring the last CLI/GUI decode
+  duplication. New `tests/cli_decode.rs` covers output-to-file, WAV and
+  video decode dispatch, and the previously process-killing error paths.
+- Windows cross-compile guard: a `windows-cross-check` CI job runs
+  `cargo check --target x86_64-pc-windows-gnu` so `win_driver` and the
+  subprocess console-suppression blocks compile on every PR. The guard
+  immediately caught two ungated unix-only test fixtures
+  (`make_mock_sys`, a symlink test in `file_pattern.rs`), now `#[cfg(unix)]`.
+- Tagged-MP4 round-trip: committed fixture
+  `test-data/tmcd-roundtrip-trailing-moov.mp4` and a new
+  `tests/tagger_mp4.rs` suite that fails loudly when the native in-place
+  tmcd path breaks — including a stco-offset regression net asserting
+  the chunk offset resolves to `pre_tag_len + 8` with the tagged frame
+  count at that address. The old in-module test's silent "fell through
+  to fallback" skip is gone.
+
+Coverage of the WP-4-named files after the work: `cli.rs` line coverage
+62.96% (baseline 45.9%), `offload.rs` 92.04%, `tagger.rs` 90.11%,
+`engine.rs` 84.05%, `decode.rs` 77.67% (workspace total 71.89% lines).
+
 * Unreleased — WP-3 converter consolidation
 
 Implementation of work package WP-3 from the code-quality report
