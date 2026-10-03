@@ -75,6 +75,12 @@ jobs:
       - name: SonarQube Cloud Scan
         if: ${{ env.SONAR_TOKEN != '' }}
         uses: SonarSource/sonarqube-scan-action@v8
+        # Gate enforcement (WP-5): the step blocks until the "LTC gate"
+        # quality gate is computed, so a gate-failing push/PR reds CI.
+        # The scan is the last step — clippy/tests have fully run by then.
+        # Reverting to advisory-only = delete the args line.
+        with:
+          args: -Dsonar.qualitygate.wait=true
 
   # Compile-check the Windows-only cfg blocks (offload win_driver, subprocess
   # console suppression) that the Linux job never builds. Check-only: no
