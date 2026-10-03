@@ -5,8 +5,10 @@ use crate::{ChannelSel, Timecode};
 /// Maps a linear 0–1 UI value to a perceptually logarithmic volume.
 /// Quadratic curve: 0→0, 0.5→0.25, 0.7→0.49, 1.0→1.0.
 /// Gives finer granularity at low perceived volumes.
+/// Inputs outside 0..=1 are clamped — callers are not all validated.
 fn map_volume(linear: f32) -> f32 {
-    linear * linear
+    let v = linear.clamp(0.0, 1.0);
+    v * v
 }
 
 // ── Bit writing helper ─────────────────────────────────────────────────────
@@ -1113,10 +1115,13 @@ mod tests {
     }
 
     #[test]
-    fn test_map_volume_clamp_edge() {
-        // Should handle values outside 0..1 gracefully
-        let r = map_volume(2.0);
-        assert_eq!(r, 4.0); // no clamping applied
+    fn test_map_volume_clamps_out_of_range() {
+        // Defensive clamp: entry points are not all validated (CLI
+        // --output-to-file, engine Set*Volume), and a negative input would
+        // square to a *positive* gain. Out-of-range input must be safe.
+        assert_eq!(map_volume(2.0), 1.0);
+        assert_eq!(map_volume(-1.0), 0.0);
+        assert_eq!(map_volume(-0.5), 0.0);
     }
 
     // ── Bits -> u8 helper for round-trip ──────────────────────────────────
