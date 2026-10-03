@@ -3,13 +3,15 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, Instant};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use arc_swap::ArcSwap;
 use gui_engine::command::{GuiCommand, OffloadCommand};
-use gui_engine::engine::engine_main_with_probe;
+use gui_engine::engine::{engine_main_with_probe, engine_main_with_seams, EngineSeams, ScanCardsFn};
 use gui_engine::state::AppStateSnapshot;
-use gui_engine::{decode_ltc_from_wav, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities, ChannelSel};
+use gui_engine::job::CancelToken;
+use gui_engine::offload::{OffloadFileInfo, SdCardInfo, ScanProgress};
+use gui_engine::{decode_ltc_from_wav, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities, ChannelSel, DeviceNameSource};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -107,6 +109,106 @@ where
             );
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+// ── Offload engine-test harness (PR-1/PR-2 seam) ─────────────────────────
+
+/// Handle to a running test engine thread with injectable seams.
+struct TestEngine {
+    tx: mpsc::Sender<GuiCommand>,
+    state: Arc<ArcSwap<AppStateSnapshot>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl TestEngine {
+    fn shutdown(self) {
+        let _ = self.tx.send(GuiCommand::Shutdown);
+        self.handle.join().expect("engine thread panicked");
+    }
+}
+
+/// Spawn the engine with the default seams except `scan_cards`.
+fn spawn_engine_with_scan_seam(
+    scan_cards: ScanCardsFn,
+) -> TestEngine {
+    init_test_config();
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-seams-test".into())
+        .spawn(move || {
+            let (event_tx, _event_rx) = mpsc::channel();
+            let seams = EngineSeams {
+                ffmpeg_caps: Box::new(fake_probe),
+                scan_cards,
+            };
+            engine_main_with_seams(rx, state_clone, false, event_tx, seams);
+        })
+        .expect("failed to spawn engine thread");
+    TestEngine { tx, state, handle }
+}
+
+/// Build a one-card seam whose files live in `mount_dir`.
+fn static_scan_seam(card: SdCardInfo) -> ScanCardsFn {
+    Arc::new(move |_cancel, _progress| Ok(vec![card.clone()]))
+}
+
+/// Poll the published snapshot until `predicate` holds; panic on timeout.
+fn wait_for_snapshot<F>(state: &Arc<ArcSwap<AppStateSnapshot>>, what: &str, predicate: F) -> AppStateSnapshot
+where
+    F: Fn(&AppStateSnapshot) -> bool,
+{
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        let snapshot = state.load().as_ref().clone();
+        if predicate(&snapshot) {
+            return state.load().as_ref().clone();
+        }
+        if Instant::now() > deadline {
+            panic!("Timeout waiting for {what}");
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Create a tempdir whose lifetime outlives the engine thread by leaking it,
+/// returning the plain path (tests never clean up; OS does at exit).
+fn make_persistent_dir(tag: &str) -> PathBuf {
+    let dir = tempfile::TempDir::new().unwrap_or_else(|e| panic!("tempdir ({tag}): {e}"));
+    let path = dir.path().to_path_buf();
+    Box::leak(Box::new(dir));
+    path
+}
+
+/// Hand-built card fixture pointing at real files on disk.
+fn make_card(mount: &Path, device_name: &str, file_names: &[&str]) -> SdCardInfo {
+    use std::fs;
+    let mut files = Vec::new();
+    for name in file_names {
+        let path = mount.join(name);
+        let contents = format!("fake-wav-payload:{name}").into_bytes();
+        fs::write(&path, &contents).expect("write card file");
+        files.push(OffloadFileInfo {
+            path: path.clone(),
+            name: (*name).to_string(),
+            size_bytes: contents.len() as u64,
+            modified: Some(chrono::Local::now()),
+        });
+    }
+    let total_bytes = files.iter().map(|f| f.size_bytes).sum();
+    SdCardInfo {
+        mount: mount.to_path_buf(),
+        volume_label: "TESTVOL".to_string(),
+        device_name: device_name.to_string(),
+        name_source: DeviceNameSource::Manual,
+        media_file_count: files.len(),
+        total_bytes,
+        files,
+        selected: Vec::new(),
+        selected_count: 0,
+        selected_bytes: 0,
     }
 }
 
@@ -1078,4 +1180,26 @@ fn test_idle_engine_does_not_republish_snapshot() {
 
     drop(tx);
     handle.join().expect("engine thread panicked");
+}
+
+// ── PR-1 canary: fake scan seam reaches the published snapshot ───────────
+
+#[test]
+fn fake_scan_reaches_snapshot() {
+    let mount = make_persistent_dir("offload-canary-mount");
+    let card = make_card(&mount, "TESTCAM", &["CLIP001.wav", "CLIP002.wav"]);
+    let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
+
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    let snap = wait_for_snapshot(&engine.state, "OffloadScan to succeed", |s| {
+        s.jobs.get(&JobKind::OffloadScan)
+            .map(|j| j.phase() == JobPhase::Succeeded)
+            .unwrap_or(false)
+    });
+
+    assert_eq!(snap.offload.cards.len(), 1, "fake card must reach snapshot");
+    assert_eq!(snap.offload.cards[0].device_name, "TESTCAM");
+    // on_offload_scan_finished applies the default (latest-day) selection.
+    assert_eq!(snap.offload.cards[0].selected_count, 2, "default selection applied on scan finish");
+    engine.shutdown();
 }

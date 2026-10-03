@@ -1160,6 +1160,22 @@ fn whoami_fallback() -> String {
 use crate::job::{JobContext, JobError, JobFinal, UnitState};
 
 pub fn run_offload_scan_job(ctx: &JobContext) -> Result<JobFinal, JobError> {
+    run_offload_scan_job_with(ctx, |_cancel, progress| {
+        Ok(detect_cards_with_progress(progress))
+    })
+}
+
+/// Testable variant of [`run_offload_scan_job`]: the card-detection source is
+/// injectable via the `detect` closure (the project's `_with` seam convention).
+/// Job mechanics — cancel checks, progress units, `JobFinal::OffloadScan`
+/// construction — stay engine/offload-owned; the closure only produces cards.
+/// A detector error becomes a failed job outcome; a cancelled token becomes
+/// [`JobError::Cancelled`]. Long-running detectors can poll `cancel` and
+/// return an error of their choosing to abort.
+pub fn run_offload_scan_job_with(
+    ctx: &JobContext,
+    detect: impl Fn(&crate::job::CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String>,
+) -> Result<JobFinal, JobError> {
     ctx.cancel.check()?;
     ctx.progress.set_indeterminate(true);
     ctx.progress.set_message("Scanning media cards…");
@@ -1169,7 +1185,10 @@ pub fn run_offload_scan_job(ctx: &JobContext) -> Result<JobFinal, JobError> {
         move |msg| tracker.set_message(msg)
     });
 
-    let cards = detect_cards_with_progress(Some(&scan_progress));
+    let cards = detect(&ctx.cancel, Some(&scan_progress)).map_err(|msg| {
+        ctx.progress.set_message(format!("Scan failed: {msg}"));
+        JobError::Failed(msg)
+    })?;
 
     ctx.progress.set_message(format!("Found {} card(s)", cards.len()));
     ctx.progress.set_indeterminate(false);
@@ -1343,7 +1362,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::job::{CancelToken, ProgressTracker, UnitSpec};
+    use crate::job::{CancelToken, JobEvent, JobKind, JobOutcome, JobSpec, ProgressTracker, UnitSpec, spawn_job};
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2336,6 +2355,118 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
     }
 
     // ── udisks_mount_with runner tests ────────────────────────────────────
+
+    // ── run_offload_scan_job_with seam tests (driven via a real spawn_job) ──
+
+    /// Drive `run_offload_scan_job_with` through a real `spawn_job` on a real
+    /// supervisor and return the drained `JobEvent::Finished` event. This is
+    /// the only place the OffloadScan job kind is exercised end-to-end.
+    fn run_scan_job_to_finished(
+        detect: impl Fn(&CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String> + Send + 'static,
+    ) -> JobEvent {
+        let mut supervisor = crate::job::JobSupervisor::new();
+        let spec = JobSpec {
+            kind: JobKind::OffloadScan,
+            name: "offload-scan-test",
+            units: vec![UnitSpec { weight: 1.0, label: "scan".into() }],
+        };
+        spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
+            run_offload_scan_job_with(ctx, detect)
+        });
+
+        // Predicate wait with deadline: poll until a Finished event drains.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            supervisor.poll(); // moves channel events into the events buffer
+            let events = supervisor.drain();
+            let finished = events.into_iter().find(|e| matches!(e, JobEvent::Finished { .. }));
+            if let Some(f) = finished {
+                supervisor.shutdown(std::time::Duration::from_secs(1));
+                return f;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timeout waiting for OffloadScan job to finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn test_run_offload_scan_job_with_ok_produces_offload_scan_final() {
+        let event = run_scan_job_to_finished(|_cancel, _progress| {
+            Ok(vec![card("TESTCAM", vec![("/mnt/a.wav", 10)], vec![true])])
+        });
+        match event {
+            JobEvent::Finished { outcome: JobOutcome::Succeeded { .. }, payload, .. } => {
+                match payload {
+                    JobFinal::OffloadScan { cards } => {
+                        assert_eq!(cards.len(), 1);
+                        assert_eq!(cards[0].device_name, "TESTCAM");
+                    }
+                    other => panic!("expected OffloadScan payload, got {other:?}"),
+                }
+            }
+            other => panic!("expected Succeeded Finished event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_offload_scan_job_with_err_fails_job() {
+        let event = run_scan_job_to_finished(|_cancel, _progress| Err("detector boom".to_string()));
+        match event {
+            JobEvent::Finished { outcome: JobOutcome::Failed { error, .. }, .. } => {
+                assert!(error.contains("detector boom"), "error was: {error}");
+            }
+            other => panic!("expected Failed Finished event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_offload_scan_job_with_cancelled_token_yields_cancelled() {
+        // Pre-cancelled token: the job's first `ctx.cancel.check()` fails
+        // before the detector is even called, mapping to JobError::Cancelled.
+        let pre_cancelled = CancelToken::new();
+        pre_cancelled.cancel();
+        let tracker = ProgressTracker::new(vec![UnitSpec { weight: 1.0, label: "scan".into() }]);
+        let (emit_tx, _emit_rx) = std::sync::mpsc::channel();
+        let ctx = JobContext {
+            progress: tracker,
+            cancel: pre_cancelled,
+            emit: Box::new(move |item| { let _ = emit_tx.send(item); }),
+        };
+        let result = run_offload_scan_job_with(&ctx, |_cancel, _progress| Ok(Vec::new()));
+        assert!(matches!(result, Err(JobError::Cancelled)));
+    }
+
+    #[test]
+    fn test_run_offload_scan_job_with_detector_can_poll_cancel() {
+        // A blocking detector polls the cancel token and returns an error
+        // when cancelled — mirrors the PR-2 integration cancel seam.
+        let cancel_flag = CancelToken::new();
+        let cancel_for_detector = cancel_flag.clone();
+        let tracker = ProgressTracker::new(vec![UnitSpec { weight: 1.0, label: "scan".into() }]);
+        let (emit_tx, _emit_rx) = std::sync::mpsc::channel();
+        let ctx = JobContext {
+            progress: tracker,
+            cancel: cancel_flag,
+            emit: Box::new(move |item| { let _ = emit_tx.send(item); }),
+        };
+        let handle = std::thread::spawn(move || {
+            run_offload_scan_job_with(&ctx, move |cancel, _progress| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !cancel.is_cancelled() {
+                    assert!(std::time::Instant::now() < deadline, "detector never cancelled");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err("cancelled by test".to_string())
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        cancel_for_detector.cancel();
+        let result = handle.join().expect("detector thread panicked");
+        assert!(matches!(result, Err(JobError::Failed(msg)) if msg.contains("cancelled by test")));
+    }
 
     #[cfg(target_os = "linux")]
     fn fake_output(status: i32, stdout: &str, stderr: &str) -> std::process::Output {

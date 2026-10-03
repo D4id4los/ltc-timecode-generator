@@ -19,7 +19,11 @@ use crate::converter::{
 };
 use crate::ffprobe::VideoAudioProbe;
 use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor, spawn_job};
-use crate::offload::{DeviceNameSource, run_offload_copy_job, run_offload_scan_job};
+use crate::job::CancelToken;
+use crate::offload::{
+    DeviceNameSource, SdCardInfo, ScanProgress,
+    run_offload_copy_job, run_offload_scan_job_with,
+};
 use crate::state::{AppStateSnapshot, ClapLogItem, ClipDecodeState};
 use crate::timecode;
 
@@ -39,6 +43,40 @@ pub fn engine_main(
     event_tx: Sender<AudioEvent>,
 ) {
     engine_main_with_probe(cmd_rx, state, use_libltc, event_tx, query_ffmpeg_capabilities)
+}
+
+/// Injectable I/O sources for the engine loop (the project's `_with` seam
+/// convention). Every field has a production default; tests replace only
+/// the seams they exercise.
+pub type ScanCardsFn = Arc<dyn Fn(&CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String> + Send + Sync>;
+
+pub struct EngineSeams {
+    /// ffmpeg capability probe (the `engine_main_with_probe` seam).
+    pub ffmpeg_caps: Box<dyn FnOnce() -> FfmpegCapabilities + Send>,
+    /// Card-detection source for offload `ScanCards` jobs. The real
+    /// implementation walks `/proc/mounts` / `/sys/class/block`; tests
+    /// hand-build `SdCardInfo` values. May block and poll `cancel`.
+    pub scan_cards: ScanCardsFn,
+}
+
+impl Default for EngineSeams {
+    fn default() -> Self {
+        EngineSeams {
+            ffmpeg_caps: Box::new(query_ffmpeg_capabilities),
+            scan_cards: Arc::new(|_cancel, progress| Ok(crate::offload::detect_cards_with_progress(progress))),
+        }
+    }
+}
+
+/// Run the engine loop with injectable I/O seams (testing entry point).
+pub fn engine_main_with_seams(
+    cmd_rx: Receiver<GuiCommand>,
+    state: Arc<ArcSwap<AppStateSnapshot>>,
+    use_libltc: bool,
+    event_tx: Sender<AudioEvent>,
+    seams: EngineSeams,
+) {
+    engine_main_loop(cmd_rx, state, use_libltc, event_tx, seams)
 }
 
 /// Loop-carried mutable state of the engine thread. Owned by
@@ -69,6 +107,9 @@ struct EngineLoopState {
     /// (see `AppStateSnapshot.applied_command_seq`).  The GUI is the sole
     /// producer on the channel, so this matches the sender's seq 1:1.
     applied_command_seq: u64,
+    /// Card-detection seam for offload `ScanCards` jobs (default = real
+    /// detector; tests inject hand-built cards).
+    scan_cards: ScanCardsFn,
 }
 
 impl EngineLoopState {
@@ -85,6 +126,7 @@ impl EngineLoopState {
             pending_recording: None,
             last_published: None,
             applied_command_seq: 0,
+            scan_cards: Arc::new(|_cancel, progress| Ok(crate::offload::detect_cards_with_progress(progress))),
         }
     }
 }
@@ -100,6 +142,20 @@ pub fn engine_main_with_probe<F>(
 ) where
     F: FnOnce() -> FfmpegCapabilities + Send + 'static,
 {
+    engine_main_with_seams(
+        cmd_rx, state, use_libltc, event_tx,
+        EngineSeams { ffmpeg_caps: Box::new(probe_fn), ..EngineSeams::default() },
+    )
+}
+
+/// Shared engine loop body, parameterised on the injectable seams.
+fn engine_main_loop(
+    cmd_rx: Receiver<GuiCommand>,
+    state: Arc<ArcSwap<AppStateSnapshot>>,
+    use_libltc: bool,
+    event_tx: Sender<AudioEvent>,
+    seams: EngineSeams,
+) {
     let mut initial = AppStateSnapshot::initial();
 
     // Seed persisted paths into the engine snapshot (output folder,
@@ -110,6 +166,7 @@ pub fn engine_main_with_probe<F>(
 
     let core = AudioCore::new();
     let mut els = EngineLoopState::new(initial);
+    els.scan_cards = seams.scan_cards;
 
     // Job supervisor — single channel for all async task result events
     let mut supervisor = JobSupervisor::new();
@@ -123,7 +180,7 @@ pub fn engine_main_with_probe<F>(
         };
         spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
             ctx.progress.set_indeterminate(true);
-            let caps = probe_fn();
+            let caps = (seams.ffmpeg_caps)();
             Ok(JobFinal::FfmpegCaps { caps: Some(caps) })
         });
     }
@@ -1729,13 +1786,14 @@ fn handle_offload_command(
                 return;
             }
             state.offload.error = None;
+            let scan_seam = els.scan_cards.clone();
             let spec = job::JobSpec {
                 kind: JobKind::OffloadScan,
                 name: "offload-scan",
                 units: vec![job::UnitSpec { weight: 1.0, label: "scan".into() }],
             };
             spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
-                run_offload_scan_job(ctx)
+                run_offload_scan_job_with(ctx, |cancel, progress| scan_seam(cancel, progress))
             });
         }
 
