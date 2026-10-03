@@ -1426,3 +1426,48 @@ fn test_start_offload_guard_branches() {
     // duplicate can be observed, and the spawn guard (supervisor.is_running)
     // is exercised by the other job kinds' duplicate tests.
 }
+
+// ── PR-3: SetDevice revert path ──────────────────────────────────────────
+
+/// Regression-pin the SetDevice revert path: a selection for an id that is
+/// not in `state.devices` is rejected by `try_init_device` before cpal is
+/// ever touched, so this is deterministic on every host — headless CI and
+/// audio-equipped dev machines alike. The failed selection must never stick.
+///
+/// Non-goal (documented per WP-4 §4/F-2): the deeper `StreamDead`/
+/// `RecoveryNeeded` recovery ladder needs an AudioCore event-injection seam.
+#[test]
+fn test_set_device_bogus_id_does_not_stick() {
+    const BOGUS: &str = "__ltc_test_nonexistent__";
+
+    // RefreshDevices is real but enumeration-only (no stream opened).
+    // The trailing SetFpsIndex is an ack marker: applied_command_seq >= 3
+    // proves the engine fully processed SetDevice before the snapshot.
+    let snapshot = run_engine(
+        vec![
+            GuiCommand::RefreshDevices,
+            GuiCommand::SetDevice(BOGUS.to_string()),
+            GuiCommand::SetFpsIndex(1),
+        ],
+        false,
+        |s| s.applied_command_seq >= 3 && s.fps_index == 1,
+    );
+
+    assert_ne!(
+        snapshot.selected_device.as_deref(),
+        Some(BOGUS),
+        "a bogus device id must never stick in the published state"
+    );
+    assert!(!snapshot.devices.iter().any(|d| d.id == BOGUS));
+
+    // Engine survived the failed switch — proven by run_engine joining the
+    // thread cleanly after the ack predicate (a panicked loop would poison
+    // the join). On a deviceless host (CI) the bogus selection also cannot
+    // have been replaced by anything: the selection stays as it was.
+    if audio_core::list_audio_devices().map(|d| d.is_empty()).unwrap_or(true) {
+        assert_eq!(
+            snapshot.selected_device, None,
+            "on a deviceless host there is nothing to revert/fall back to"
+        );
+    }
+}
