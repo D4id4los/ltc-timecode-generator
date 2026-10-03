@@ -1199,7 +1199,7 @@ pub fn run_offload_scan_job_with(
 
     ctx.progress.set_message(format!("Found {} card(s)", cards.len()));
     ctx.progress.set_indeterminate(false);
-    ctx.progress.resize(1);
+    ctx.progress.grow_to(1);
     ctx.progress.unit(0).finish();
 
     Ok(JobFinal::OffloadScan { cards })
@@ -1223,7 +1223,7 @@ pub fn run_offload_copy_job(
     }
 
     let dev_count = device_names.len();
-    ctx.progress.resize(dev_count);
+    ctx.progress.grow_to(dev_count);
 
     let mut completed: Vec<String> = Vec::new();
     let mut speed_meter = crate::job::SpeedMeter::new();
@@ -1636,8 +1636,12 @@ mod tests {
                 w[1]
             );
         }
-        // For a 3 MiB file we expect at least 3 chunk updates (1 MiB each).
-        assert!(progress_events.len() >= 3, "expected >= 3 progress callbacks, got {}", progress_events.len());
+        // Progress granularity follows the copy buffer size, not a UX
+        // contract: at least one callback per full buffer. Floor, not exact
+        // count (read() may deliver short reads).
+        let expected_min = content.len().div_ceil(COPY_BUF_SIZE);
+        assert!(progress_events.len() >= expected_min,
+            "expected >= {expected_min} progress callbacks, got {}", progress_events.len());
     }
 
     #[test]

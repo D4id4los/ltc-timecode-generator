@@ -113,7 +113,10 @@ impl ProgressTracker {
         }))
     }
 
-    pub fn resize(&self, len: usize) {
+    /// Grows the unit list to `len` units if it is currently shorter;
+    /// never shrinks (worker threads hold `UnitProgress` index handles into
+    /// the shared unit vec — truncation would strand them).
+    pub fn grow_to(&self, len: usize) {
         let mut units = self.0.units.lock().unwrap();
         let old_len = units.len();
         if len > old_len {
@@ -936,18 +939,21 @@ mod tests {
     }
 
     #[test]
-    fn test_progress_tracker_resize() {
+    fn test_progress_tracker_grow_to() {
         let pt = ProgressTracker::new(vec![UnitSpec {
             weight: 1.0,
             label: "initial".into(),
         }]);
         assert_eq!(pt.snapshot().units.len(), 1);
 
-        pt.resize(3);
+        pt.grow_to(3);
         assert_eq!(pt.snapshot().units.len(), 3);
 
-        // resize to smaller: no-op
-        pt.resize(1);
+        // grow_to(1) after growing: shrink is a no-op — worker threads hold
+        // UnitProgress index handles into the shared unit vec, and
+        // truncation would strand them. The grow-only API name is the
+        // contract; no production call site ever shrinks.
+        pt.grow_to(1);
         assert_eq!(pt.snapshot().units.len(), 3);
     }
 
