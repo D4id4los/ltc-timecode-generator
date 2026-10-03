@@ -62,8 +62,11 @@ jobs:
       - name: TypeScript typecheck
         run: npm run lint
 
-      - name: Web tests + coverage (vitest, LCOV for Sonar)
-        run: npm run test:coverage
+      # Coverage LCOV is no longer exported here: src/ is Sonar-frozen
+      # since WP-5 (see reports/wp5-process-hygiene-plan.md); the local
+      # `npm run test:coverage` remains for ad-hoc web-app work.
+      - name: Web tests (vitest) — legacy frontend guard
+        run: npm test
 
       - name: Cache SonarQube packages
         uses: actions/cache@v6

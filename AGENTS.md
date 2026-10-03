@@ -26,7 +26,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 | **gui-engine** | Shared engine: owns AudioCore + state, CLI, decoding, conversion | — |
 | **ltc-gui** | Native desktop GUI (primary target, weak-GPU tablets) | egui/eframe 0.35 (glow) |
 | **ltc-slint** | Alternative desktop GUI | Slint 1.17 |
-| **Web app** (legacy) | Browser frontend | React 19 + TypeScript + Vite 6 + Tailwind CSS 4 |
+| **Web app** (legacy, frozen — not Sonar-analyzed) | Browser frontend | React 19 + TypeScript + Vite 6 + Tailwind CSS 4 |
 | **Tauri v2** (legacy) | Desktop wrapper for web frontend | Tauri 2 + `src-tauri/` |
 | **32-bit legacy** | i686 builds for old tablets | Tauri v1, Docker cross-compile (`build-32bit.sh`) |
 
@@ -35,7 +35,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 
 ## Project Structure
 ```
-├── src/                          # Web frontend (legacy)
+├── src/                          # Web frontend (legacy, frozen — not Sonar-analyzed)
 │   ├── main.tsx                  # React entry point
 │   ├── App.tsx                   # Main component — audio logic, scheduling, converter UI
 │   ├── ltcGenerator.ts           # LTC signal/beep generation, timecode math
