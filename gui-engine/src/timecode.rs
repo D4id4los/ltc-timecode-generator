@@ -183,8 +183,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fps_options_count() {
-        assert_eq!(FPS_OPTIONS.len(), 5);
+    fn test_fps_options_names_unique() {
+        // Growth-friendly property: adding another rate (e.g. 23.976) must
+        // not fail a test. Dropdown order is pinned separately by
+        // test_fps_options_expected_order; positivity by
+        // test_fps_options_all_valid. Names must stay distinct (the UI uses
+        // them as identifiers); two options may legitimately share a rate
+        // (29.97 ND / 29.97 DF differ only by the drop-frame flag).
+        let mut names: Vec<&str> = FPS_OPTIONS.iter().map(|o| o.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), FPS_OPTIONS.len(), "option names must be distinct");
     }
 
     #[test]

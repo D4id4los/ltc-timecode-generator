@@ -1671,8 +1671,13 @@ mod tests {
 
     #[test]
     fn test_sample_rate_options_valid() {
-        assert_eq!(SAMPLE_RATE_OPTIONS.len(), 2);
+        // Policy: the broadcast-standard rates the hardware path is tuned
+        // for must remain offered. The list may grow, but not duplicate.
         assert!(SAMPLE_RATE_OPTIONS.contains(&44100));
         assert!(SAMPLE_RATE_OPTIONS.contains(&48000));
+        let mut rates = SAMPLE_RATE_OPTIONS.to_vec();
+        rates.sort_unstable();
+        rates.dedup();
+        assert_eq!(rates.len(), SAMPLE_RATE_OPTIONS.len(), "rates must be distinct");
     }
 }
