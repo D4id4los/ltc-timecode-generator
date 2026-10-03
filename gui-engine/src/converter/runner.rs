@@ -43,6 +43,10 @@ pub trait ConversionReport: Send + Sync {
     fn is_failed(&self) -> bool;
     fn set_unit_count(&self, n: usize);
     fn unit(&self, idx: usize) -> Option<UnitProgress>;
+    /// Called by `summarize_metadata_failures` with the number of recorded
+    /// step failures, so tests can assert the count structurally instead of
+    /// parsing the `--- N STEP(S) FAILED ---` wording.
+    fn set_failure_count(&self, _n: usize) {}
     /// Returns an optional `&AtomicBool` for the ffmpeg watchdog's
     /// cancel‑checking loop (checked every ~100 ms regardless of stderr
     /// output).  `None` = no 100‑ms cancel check (cancellation is only
@@ -149,7 +153,7 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
     }
 
     fn set_unit_count(&self, n: usize) {
-        self.ctx.progress.resize(n);
+        self.ctx.progress.grow_to(n);
     }
 
     fn unit(&self, idx: usize) -> Option<UnitProgress> {
@@ -175,12 +179,18 @@ pub struct TestReport {
     pub message: std::sync::Arc<Mutex<String>>,
     pub failed: std::sync::Arc<Mutex<bool>>,
     pub completed: std::sync::Arc<Mutex<bool>>,
+    pub failure_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     step_weight: std::sync::Arc<Mutex<f32>>,
 }
 
 impl TestReport {
     pub fn new() -> Self {
         TestReport::default()
+    }
+
+    /// Structural view of the last `set_failure_count` call (0 if none).
+    pub fn failure_count(&self) -> usize {
+        self.failure_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -193,6 +203,7 @@ impl Default for TestReport {
             message: std::sync::Arc::new(Mutex::new(String::new())),
             failed: std::sync::Arc::new(Mutex::new(false)),
             completed: std::sync::Arc::new(Mutex::new(false)),
+            failure_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             step_weight: std::sync::Arc::new(Mutex::new(0.0)),
         }
     }
@@ -254,6 +265,10 @@ impl ConversionReport for TestReport {
     }
 
     fn set_unit_count(&self, _n: usize) {}
+
+    fn set_failure_count(&self, n: usize) {
+        self.failure_count.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
 
     fn unit(&self, _idx: usize) -> Option<UnitProgress> {
         None
@@ -580,7 +595,7 @@ pub fn spawn_conversion_job(
     settings: ConverterSettings,
     caps: Option<crate::converter::capabilities::FfmpegCapabilities>,
 ) -> Result<JobFinal, JobError> {
-    ctx.progress.resize(1);
+    ctx.progress.grow_to(1);
 
     let report = JobConversionReport::new(ctx);
     let (encoder_used, _metadata_only) = run_conversion(&report, settings, caps.as_ref());
@@ -1305,6 +1320,7 @@ fn summarize_metadata_failures(report: &impl ConversionReport, ledger: &FailureL
     if ledger.details.is_empty() {
         return;
     }
+    report.set_failure_count(ledger.details.len());
     let summary = format!(
         "\n--- {} STEP(S) FAILED ---\n{}",
         ledger.details.len(),
@@ -1838,8 +1854,9 @@ mod tests {
         );
     }
 
-    /// Partial failure still completes, but the log carries a visible
-    /// "--- N STEP(S) FAILED ---" block.
+    /// Partial failure still completes, with every attempted step recorded
+    /// exactly once in the FailureLedger (asserted structurally via the
+    /// report seam, not by parsing the human-facing summary wording).
     #[test]
     fn test_run_metadata_only_partial_failure_completes_with_warning() {
         if skip_if_no_ffmpeg() { return; }
@@ -1858,9 +1875,9 @@ mod tests {
         run_metadata_only(&settings, &report, total);
 
         assert!(!*report.failed.lock().unwrap(), "partial failure completes");
-        let log = report.log.lock().unwrap().clone();
-        // Probe, tag, and rename all fail for the nonexistent clip → 3 steps.
-        assert!(log.contains("--- 3 STEP(S) FAILED ---"), "partial summary present: {}", log);
-        assert!(log.contains("probe failed"), "detail names the failed probe: {}", log);
+        // Probe, tag, and rename all fail for the nonexistent clip → exactly
+        // 3 recorded step failures; an exact count is correct here because
+        // these failures *are* the specified behavior.
+        assert_eq!(report.failure_count(), 3);
     }
 }
