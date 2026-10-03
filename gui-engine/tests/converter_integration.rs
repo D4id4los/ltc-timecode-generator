@@ -601,12 +601,7 @@ fn test_copy_mode_streams_video_and_derives_container() {
 }
 
 #[test]
-// NOTE: the runner's weighted progress can saturate at 1.0 before the
-// last step finishes (per-step fraction reporting overshoots the weight
-// sum), so the original "stays below 100%% until all steps done" promise
-// is not what the code does. What holds — and is asserted here — is that
-// the recorded history is non-decreasing and reaches ~1.0 on completion.
-fn test_conversion_progress_history_is_monotonic_and_reaches_full() {
+fn test_progress_stays_below_100_until_all_steps_done() {
     let caps = query_ffmpeg_capabilities();
     if !caps.has_ffmpeg {
         eprintln!("--- SKIPPED: ffmpeg not available");
@@ -663,6 +658,11 @@ fn test_conversion_progress_history_is_monotonic_and_reaches_full() {
     assert!(
         hist.windows(2).all(|w| w[0] <= w[1]),
         "progress must be non-decreasing: {:?}",
+        hist
+    );
+    assert!(
+        hist[..hist.len() - 1].iter().all(|&p| p < 1.0),
+        "progress must stay below 100% until the final step completes: {:?}",
         hist
     );
     assert!(*hist.last().unwrap() >= 0.99, "final progress must reach ~1.0");
