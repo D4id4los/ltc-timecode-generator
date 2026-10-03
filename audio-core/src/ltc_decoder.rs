@@ -4816,7 +4816,6 @@ mod tests {
         assert_eq!(c.total_possible, 0);
         assert!(c.timecodes.is_empty());
         assert!(c.frame_starts.is_empty());
-        assert_eq!(c.details_entry, "Canceled");
         assert_eq!(c.phase, 999);
         assert_eq!(c.spb, params.spb);
         assert_eq!(c.fps, params.fps);
@@ -4873,16 +4872,19 @@ mod tests {
         match score_candidate(&samples, &[], 24.0, 0, threshold, 25.0, false, 48000, false, 0, None) {
             ScoredCandidate::Beat(r) => {
                 assert!(r.valid_frames >= 5, "expected several frames, got {}", r.valid_frames);
-                assert!(r.details_entry.contains("spb=24.00, phase=0"));
-                assert!(!r.details_entry.contains("adaptive"));
+                assert_eq!(r.spb, 24.0);
+                assert_eq!(r.phase, 0);
+                assert!(!r.adaptive, "nominal branch must be flagged non-adaptive");
             }
             other => panic!("expected Beat, got {:?}", other),
         }
 
-        // Adaptive branch: details label flips, still beats 0.
+        // Adaptive branch: flagged adaptive, still beats 0.
         match score_candidate(&samples, &[], 24.0, 0, threshold, 25.0, false, 48000, true, 0, None) {
             ScoredCandidate::Beat(r) => {
-                assert!(r.details_entry.contains("adaptive"));
+                assert!(r.adaptive, "refinement branch must be flagged adaptive");
+                assert_eq!(r.spb, 24.0);
+                assert_eq!(r.phase, 0);
             }
             other => panic!("expected Beat, got {:?}", other),
         }

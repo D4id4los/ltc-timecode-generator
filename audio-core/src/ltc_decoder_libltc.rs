@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn test_error_result_contains_message() {
         let r = LtcDetectionResult::error("test error");
-        assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message == "test error"));
+        assert_eq!(r.status, LtcDecodeStatus::Error { message: "test error".to_string() });
     }
 
     #[test]
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn test_error_result_from_string() {
         let r = LtcDetectionResult::error("permission denied".to_string());
-        assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message == "permission denied"));
+        assert_eq!(r.status, LtcDecodeStatus::Error { message: "permission denied".to_string() });
     }
 
     #[test]
@@ -490,6 +490,6 @@ mod tests {
         let result = decode_ltc_from_wav_libltc(&path, 25.0, false, None);
         assert!(result.is_err(), "expected error for non-16-bit WAV");
         let err = result.unwrap_err();
-        assert!(matches!(&err, LtcDecodeError::Failed(m) if m.contains("32 bit")), "error should mention bit depth: {}", err);
+        assert_eq!(err, LtcDecodeError::UnsupportedBitDepth { bits: 32 });
     }
 }

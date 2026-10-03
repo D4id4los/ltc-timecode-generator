@@ -1371,18 +1371,33 @@ mod tests {
     }
 
     #[test]
-    fn test_watchdog_reason_string_byte_exact() {
+    fn test_watchdog_recover_payload() {
         let mut wd = CallbackWatchdog::with_constants(
             Duration::from_millis(500), 3, Duration::from_secs(10), Duration::from_millis(100),
         );
         let t0 = Instant::now();
         wd.tick(t0, 0);
         match wd.tick(t0 + Duration::from_millis(600), 0) {
-            WatchdogAction::Recover { reason, .. } => {
-                assert_eq!(reason, "callback stalled for 500ms (attempt 1/3)");
+            WatchdogAction::Recover { attempt, backoff, .. } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(backoff, Duration::from_millis(100));
             }
             other => panic!("expected Recover, got {:?}", other),
         }
+    }
+
+    /// The exact event text is a contract: the scheduler formats it into
+    /// `AudioEvent::RecoveryNeeded { reason }` and the engine logs it.
+    #[test]
+    fn test_watchdog_reason_string_byte_exact() {
+        assert_eq!(
+            watchdog_reason(Duration::from_millis(500), 1, 3),
+            "callback stalled for 500ms (attempt 1/3)"
+        );
+        assert_eq!(
+            watchdog_reason(Duration::from_millis(750), 2, 4),
+            "callback stalled for 750ms (attempt 2/4)"
+        );
     }
 
     // ── push_frame ────────────────────────────────────────────────────────

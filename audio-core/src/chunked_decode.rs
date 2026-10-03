@@ -629,8 +629,12 @@ mod tests {
         assert_eq!(merged.valid_frames, 0);
         assert_eq!(merged.first_ltc_timecode_secs, 0.0);
         assert!(matches!(merged.status, LtcDecodeStatus::NoSyncWord));
-        assert!(merged.details.iter().any(|d| d.contains("Chunk 0: error - boom 0")));
-        assert!(merged.details.iter().any(|d| d.contains("Chunk 1: error - boom 1")));
+        assert!(merged.details.iter().any(|d| matches!(d,
+            ChunkDetail::Err { chunk_idx: 0, source: LtcDecodeError::Failed(msg) } if msg == "boom 0")),
+            "expected typed Err detail for chunk 0, got {:?}", merged.details);
+        assert!(merged.details.iter().any(|d| matches!(d,
+            ChunkDetail::Err { chunk_idx: 1, source: LtcDecodeError::Failed(msg) } if msg == "boom 1")),
+            "expected typed Err detail for chunk 1, got {:?}", merged.details);
     }
 
     #[test]
@@ -642,7 +646,9 @@ mod tests {
         ];
         let merged = merge_results(&results, &plan, 25.0);
         assert_eq!(merged.valid_frames, 1);
-        assert!(merged.details.iter().any(|d| d.contains("Chunk 0: error - read failure")));
+        assert!(merged.details.iter().any(|d| matches!(d,
+            ChunkDetail::Err { chunk_idx: 0, source: LtcDecodeError::Failed(msg) } if msg == "read failure")),
+            "expected typed Err detail for chunk 0, got {:?}", merged.details);
     }
 
     #[test]
@@ -885,8 +891,8 @@ mod tests {
 
         let progress = DecodeProgress::new(1);
         let result = decode_ltc_chunked(&path, false, 25.0, false, config, &progress).unwrap();
-        let actual_chunks: usize = result.details.iter()
-            .filter(|d| d.starts_with("Chunk ") && d.contains("valid"))
+        let actual_chunks: usize = result.chunk_summaries.iter()
+            .filter(|c| c.error.is_none())
             .count();
         assert_eq!(predicted, actual_chunks,
             "count_chunks predicted {} actual decode produced {}", predicted, actual_chunks);
@@ -1097,12 +1103,8 @@ mod tests {
         let progress = DecodeProgress::new(nchunks);
         let chunked = decode_ltc_chunked(&path, false, fps, false, config, &progress).unwrap();
 
-        let total_from_chunks: u32 = chunked.details.iter()
-            .filter(|d| d.starts_with("Chunk ") && d.contains("valid"))
-            .filter_map(|d| {
-                let s = d.split_whitespace().nth(2)?;
-                s.parse::<u32>().ok()
-            })
+        let total_from_chunks: u32 = chunked.chunk_summaries.iter()
+            .map(|c| c.valid_frames)
             .sum();
 
         let loss = total_from_chunks.saturating_sub(chunked.valid_frames);
@@ -1514,8 +1516,12 @@ mod tests {
             "float WAV should decode 0 valid frames, got {}", result.valid_frames);
         let total = progress.chunks_completed.load(std::sync::atomic::Ordering::Relaxed);
         assert!(total > 0, "progress should have completed at least 1 chunk");
-        let has_read_error = result.details.iter().any(|d| d.contains("Failed to read"));
-        assert!(has_read_error, "expected detail mentioning 'Failed to read', got: {:?}", result.details);
+        let has_chunk_error = result.chunk_summaries.iter().any(|c| {
+            matches!(c.error, Some(LtcDecodeError::Failed(_)))
+        });
+        assert!(has_chunk_error,
+            "expected at least one chunk summary carrying a Failed error, got: {:?}",
+            result.chunk_summaries);
     }
 }
 
