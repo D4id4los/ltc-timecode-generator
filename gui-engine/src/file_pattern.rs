@@ -748,6 +748,7 @@ mod tests {
         assert!(result.is_empty(), "files in junk dirs must be skipped");
     }
 
+    #[cfg(unix)] // uses std::os::unix symlink; Linux-only semantics
     #[test]
     fn test_recursive_skips_symlinked_dirs() {
         let dir = tempfile::TempDir::new().unwrap();

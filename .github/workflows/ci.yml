@@ -75,3 +75,35 @@ jobs:
       - name: SonarQube Cloud Scan
         if: ${{ env.SONAR_TOKEN != '' }}
         uses: SonarSource/sonarqube-scan-action@v8
+
+  # Compile-check the Windows-only cfg blocks (offload win_driver, subprocess
+  # console suppression) that the Linux job never builds. Check-only: no
+  # link, no tests — a full windows-latest test job is follow-up F-3/F-4 in
+  # reports/wp4-test-gap-closure-plan.md.
+  # Deliberately out of scope: an Apple-target cross-check (CoreAudio SDK
+  # sysroot from Linux is fragile); the macOS /Volumes scan block stays
+  # guarded by review only.
+  windows-cross-check:
+    runs-on: ubuntu-latest
+    env:
+      BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu: -I/usr/include
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install cross toolchain (mingw-w64, libltc headers, libclang)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 libltc-dev libclang-dev
+
+      - name: Install Rust toolchain (stable, windows-gnu target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache cargo build (windows target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-cross-check
+
+      - name: cargo check (x86_64-pc-windows-gnu)
+        run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
