@@ -941,11 +941,12 @@ mod tests {
         assert_eq!(sel[2], super::SelectedChannel { output_k: 2, input_i: 2, pair: (2, 0) });
     }
 
-    /// Characterization of the concat-fallback branch: with layouts that
-    /// differ across clips, the fallback currently iterates raw probe
-    /// streams and ignores the channel map. Documents current behavior.
+    /// Policy: when clip audio layouts differ (inconsistent probes), the
+    /// concat fallback still routes through `selected_channel_pairs` like
+    /// every other site, so the channel map is respected — a [1, 0] mapping
+    /// yields 2 mapped slots per clip regardless of layout mismatch.
     #[test]
-    fn test_concat_fallback_ignores_channel_map_current_behavior() {
+    fn test_concat_fallback_respects_channel_map() {
         let mut s = make_video_settings();
         s.input_files = vec![PathBuf::from("/tmp/clip1.mp4"), PathBuf::from("/tmp/clip2.mp4")];
         s.channel_map = ChannelMap::from_mapping(vec![1, 0]);
@@ -976,15 +977,12 @@ mod tests {
         let probes = vec![Some(p1), Some(p2)];
         let (steps, warnings) = plan_concat_outputs(&s, &probes);
         assert!(warnings.contains("layouts differ"));
-        // Behavior change (WP-3.1): the fallback previously iterated raw
-        // probe streams (5 outputs here), ignoring the channel map. It now
-        // routes through `selected_channel_pairs` like every other site:
-        // mapping [1, 0] maps 2 slots per clip → 4 outputs total.
+        // Mapping [1, 0] maps 2 slots per clip → 4 outputs total.
         let audio_count = steps
             .iter()
             .filter(|st| matches!(st, VideoOutputStep::AudioChannel { .. }))
             .count();
-        assert_eq!(audio_count, 4, "fallback now respects the channel map");
+        assert_eq!(audio_count, 4, "fallback must respect the channel map");
     }
 
     // ── plan_output_paths (PR-4) ─────────────────────────────────────────
