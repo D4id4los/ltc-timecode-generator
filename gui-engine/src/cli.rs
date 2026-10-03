@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use audio_core::{
     generate_ltc_frame_stereo, increment_timecode, list_audio_devices, AudioCore, ChannelSel,
@@ -531,6 +531,8 @@ pub fn parse_args() -> Cli {
 // ── LTC Decode mode ─────────────────────────────────────────────────────
 
 /// Run the actual decode on a WAV file (supports chunked or single-pass).
+/// Thin delegate to [`crate::decode::decode_wav_file`] — the WAV-side
+/// decode pipeline lives in the shared `decode` module.
 fn run_decode_on_wav(
     path: &Path,
     use_libltc: bool,
@@ -538,38 +540,7 @@ fn run_decode_on_wav(
     fps: f64,
     drop_frame: bool,
 ) -> Result<audio_core::LtcDetectionResult, String> {
-    if single_pass {
-        audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame, None)
-    } else {
-        let config = audio_core::DecodeConfig::default();
-        let chunk_count = audio_core::count_chunks_in_wav(path, &config).unwrap_or(1);
-
-        if chunk_count <= 1 {
-            audio_core::decode_ltc_with_decoder(path, use_libltc, fps, drop_frame, None)
-        } else {
-            let progress = audio_core::DecodeProgress::new(chunk_count);
-            let completed_ref = progress.chunks_completed.clone();
-            let total_chunks = chunk_count;
-
-            let progress_handle = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-                loop {
-                    let done = completed_ref.load(std::sync::atomic::Ordering::Relaxed);
-                    let pct = (done.checked_mul(100))
-                        .and_then(|v| v.checked_div(total_chunks))
-                        .unwrap_or(100);
-                    eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
-                    if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline { break; }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-            });
-
-            let result = audio_core::decode_ltc_chunked(path, use_libltc, fps, drop_frame, config, &progress)?;
-            let _ = progress_handle.join();
-            eprintln!("\rDecoding: 100%  (chunk {}/{})", total_chunks, total_chunks);
-            Ok(result)
-        }
-    }
+    crate::decode::decode_wav_file(path, use_libltc, single_pass, fps, drop_frame)
 }
 
 fn print_decode_results(
@@ -691,9 +662,11 @@ fn print_decode_results(
     println!();
 }
 
-fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let path = cli.decode.as_ref().ok_or("--decode path required")?;
-    let path = Path::new(path);
+/// Run the WAV decode; returns the detection result for callers that want
+/// to assert on it (printing happens in `process_cli_result`).
+fn run_decode(cli: Cli) -> Result<audio_core::LtcDetectionResult, CliError> {
+    let path = cli.decode.as_ref().ok_or_else(|| CliError::Decode("--decode path required".to_string()))?;
+    let path = PathBuf::from(path);
     let use_libltc = cli.decoder == "libltc";
 
     if cli.debug { init_logger(); }
@@ -702,10 +675,8 @@ fn run_decode(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         path.display(), if use_libltc { "libltc" } else { "builtin" },
         cli.decode_fps, if cli.decode_drop_frame { " DF" } else { "" });
 
-    let result = run_decode_on_wav(path, use_libltc, cli.single_pass, cli.decode_fps, cli.decode_drop_frame)?;
-    print_decode_results(path, &result, use_libltc, cli.verbose, cli.context_frames, cli.list_timecodes);
-
-    Ok(())
+    run_decode_on_wav(&path, use_libltc, cli.single_pass, cli.decode_fps, cli.decode_drop_frame)
+        .map_err(CliError::Decode)
 }
 
 // ── Outcome enum + dispatch ─────────────────────────────────────────────
@@ -721,11 +692,31 @@ pub enum CliOutcome {
     },
 }
 
-fn run_decode_video(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+/// Errors from the testable [`process_cli_result`] dispatch. The legacy
+/// [`process_cli`] entry point renders these to stderr and exits(1) —
+/// keeping its user-visible behavior byte-identical.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CliError {
+    /// `--decode <PATH>` failed (WAV or video branch).
+    Decode(String),
+    /// `--output-to-file` WAV generation failed.
+    Generate(String),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliError::Decode(msg) => write!(f, "{msg}"),
+            CliError::Generate(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+fn run_decode_video(cli: Cli) -> Result<audio_core::LtcDetectionResult, CliError> {
     let pipeline_start = Instant::now();
 
-    let path = cli.decode.as_ref().ok_or("--decode path required")?;
-    let path = Path::new(path);
+    let path = cli.decode.as_ref().ok_or_else(|| CliError::Decode("--decode path required".to_string()))?;
+    let path = PathBuf::from(path);
 
     let use_libltc = cli.decoder == "libltc";
 
@@ -745,64 +736,73 @@ fn run_decode_video(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     eprint!("Extracting audio from video...");
     let mut result = crate::decode::decode_video_file(
-        path,
+        &path,
         cli.audio_stream,
         cli.audio_channel,
         use_libltc,
         cli.decode_fps,
         cli.decode_drop_frame,
         None,
-    )?;
+    )
+    .map_err(CliError::Decode)?;
     eprintln!(" done.");
 
     result.processing_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;
-    print_decode_results(
-        path, &result, use_libltc, cli.verbose, cli.context_frames, cli.list_timecodes,
-    );
-
-    Ok(())
+    Ok(result)
 }
 
-pub fn process_cli(cli: Cli) -> CliOutcome {
+/// Testable dispatch: identical decision order to [`process_cli`], but
+/// decode/generate failures come back as `Err(CliError)` instead of killing
+/// the process, and the decodable runners return their
+/// [`audio_core::LtcDetectionResult`] (printing happens here, in the Done
+/// arm, so output is unchanged). The `list_devices` and `headless` arms
+/// remain process-bound (`exit`/real audio + infinite loop) — untestable by
+/// design; the `RunGui` arm spawns the real engine and is covered
+/// indirectly by the engine integration tests.
+pub fn process_cli_result(cli: Cli) -> Result<CliOutcome, CliError> {
     if cli.list_devices {
         list_devices_and_exit();
     }
 
-    if let Some(ref path_str) = cli.decode {
-        let path = Path::new(path_str);
+    if let Some(path) = cli.decode.clone() {
+        let path = PathBuf::from(path);
+        // Copy the display flags out before `cli` is moved into a runner.
+        let (verbose, context_frames, list_timecodes, use_libltc) =
+            (cli.verbose, cli.context_frames, cli.list_timecodes, cli.decoder == "libltc");
 
-        if ffprobe::path_is_video(path) {
+        let result = if ffprobe::path_is_video(&path) {
             // Video file: use ffmpeg extraction
-            if let Err(e) = run_decode_video(cli) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
+            run_decode_video(cli)?
         } else {
             // WAV file (or unknown): try WAV decode
-            if let Err(e) = run_decode(cli) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return CliOutcome::Done;
+            run_decode(cli)?
+        };
+        print_decode_results(
+            &path, &result, use_libltc,
+            verbose, context_frames, list_timecodes,
+        );
+        return Ok(CliOutcome::Done);
     }
 
     if let Some(_path) = &cli.output_to_file {
-        if let Err(e) = generate_wav(cli) {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        return CliOutcome::Done;
+        generate_wav(cli).map_err(|e| CliError::Generate(e.to_string()))?;
+        return Ok(CliOutcome::Done);
     }
 
     if cli.headless {
+        // Process-bound by design (real audio + infinite loop).
         if let Err(e) = run_headless(cli) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
-        return CliOutcome::Done;
+        return Ok(CliOutcome::Done);
     }
 
+    Ok(spawn_gui_engine(cli))
+}
+
+/// Spawn the engine thread and return the GUI handle (the `RunGui` arm).
+fn spawn_gui_engine(cli: Cli) -> CliOutcome {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let use_libltc = cli.decoder == "libltc";
     let init_state = AppStateSnapshot::initial();
@@ -825,6 +825,16 @@ pub fn process_cli(cli: Cli) -> CliOutcome {
         cmd_tx,
         state,
         event_rx,
+    }
+}
+
+pub fn process_cli(cli: Cli) -> CliOutcome {
+    match process_cli_result(cli) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 

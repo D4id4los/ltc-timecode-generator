@@ -141,6 +141,51 @@ fn dummy_cancel() -> &'static Arc<AtomicBool> {
     DUMMY_CANCEL.get_or_init(|| Arc::new(AtomicBool::new(false)))
 }
 
+/// Decode LTC directly from a WAV file — the WAV-side shared front door
+/// (mirrors [`decode_video_file`]'s shape). `single_pass` forces the
+/// non-chunked decoder for small files; otherwise the chunked decoder runs
+/// with a stderr progress indicator.
+pub fn decode_wav_file(
+    path: &Path,
+    use_libltc: bool,
+    single_pass: bool,
+    decode_fps: f64,
+    decode_drop_frame: bool,
+) -> Result<LtcDetectionResult, String> {
+    if single_pass {
+        return audio_core::decode_ltc_with_decoder(path, use_libltc, decode_fps, decode_drop_frame, None);
+    }
+
+    let config = DecodeConfig::default();
+    let chunk_count = audio_core::count_chunks_in_wav(path, &config).unwrap_or(1);
+
+    if chunk_count <= 1 {
+        audio_core::decode_ltc_with_decoder(path, use_libltc, decode_fps, decode_drop_frame, None)
+    } else {
+        let progress = DecodeProgress::new(chunk_count);
+        let completed_ref = progress.chunks_completed.clone();
+        let total_chunks = chunk_count;
+
+        let progress_handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let done = completed_ref.load(Ordering::Relaxed);
+                let pct = (done.checked_mul(100))
+                    .and_then(|v| v.checked_div(total_chunks))
+                    .unwrap_or(100);
+                eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
+                if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline { break; }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+
+        let result = audio_core::decode_ltc_chunked(path, use_libltc, decode_fps, decode_drop_frame, config, &progress)?;
+        let _ = progress_handle.join();
+        eprintln!("\rDecoding: 100%  (chunk {}/{})", total_chunks, total_chunks);
+        Ok(result)
+    }
+}
+
 /// Probe → validate → extract → decode, the shared CLI/GUI front door.
 ///
 /// `stream_pos` is the 0-based *position* among the audio streams (the CLI
