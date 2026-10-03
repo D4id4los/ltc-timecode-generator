@@ -43,8 +43,8 @@ pub use audio_output::{
 
 pub use ltc_decoder::{
     compute_ltc_quality, decode_ltc_from_wav, find_first_coherent_index,
-    CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus,
-    LtcDetectionResult, LtcQualityReport,
+    CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, ChunkSummary, FrameTimecode,
+    LtcDecodeStatus, LtcDetectionResult, LtcQualityReport,
 };
 pub use ltc_decoder_libltc::decode_ltc_from_wav_libltc;
 

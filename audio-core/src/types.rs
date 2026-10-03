@@ -69,12 +69,16 @@ pub struct AudioDeviceInfo {
 
 /// Why an LTC decode produced no result. `Cancelled` is a normal,
 /// user-initiated outcome — callers must not surface it as an error.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LtcDecodeError {
     /// The caller's cancel flag was observed; no result was produced.
     Cancelled,
     /// The decode could not run or failed (I/O, format, extraction, …).
     Failed(String),
+    /// The decoder only supports 16-bit integer PCM but the WAV carries a
+    /// different bit depth. Only produced for integer-PCM input; a
+    /// non-integer sample format is reported as `Failed` instead.
+    UnsupportedBitDepth { bits: u16 },
 }
 
 impl std::fmt::Display for LtcDecodeError {
@@ -82,6 +86,10 @@ impl std::fmt::Display for LtcDecodeError {
         match self {
             LtcDecodeError::Cancelled => f.write_str("Decode canceled by user"),
             LtcDecodeError::Failed(msg) => f.write_str(msg),
+            // Byte-identical to the former Failed(...) prose payload.
+            LtcDecodeError::UnsupportedBitDepth { bits } => {
+                write!(f, "libltc decoder requires 16-bit integer PCM WAV (got {bits} bit Int)")
+            }
         }
     }
 }

@@ -48,6 +48,23 @@ pub struct LtcDetectionResult {
     pub processing_time_ms: f64,
     pub first_ltc_timecode_secs: f64,
     pub quality: Option<LtcQualityReport>,
+    /// Structured per-chunk outcome of a chunked decode. Populated only by
+    /// `decode_ltc_chunked`'s merge path; every other constructor leaves it
+    /// empty. The human-rendered `details` lines carry the same information.
+    pub chunk_summaries: Vec<ChunkSummary>,
+}
+
+/// Structured per-chunk outcome of a chunked LTC decode — the typed
+/// counterpart of one `Chunk N: ...` details line.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChunkSummary {
+    pub chunk_idx: usize,
+    pub valid_frames: u32,
+    pub total_possible_frames: u32,
+    pub avg_confidence: f32,
+    /// `Some` when the chunk failed (or was cancelled); the counts are then
+    /// meaningless (zeroed).
+    pub error: Option<LtcDecodeError>,
 }
 
 /// Qualitative grade bucket for a [`LtcQualityReport`], derived from the
@@ -151,6 +168,7 @@ impl LtcDetectionResult {
             processing_time_ms: 0.0,
             first_ltc_timecode_secs: 0.0,
             quality: None,
+            chunk_summaries: Vec::new(),
         }
     }
 }
@@ -547,7 +565,7 @@ fn score_candidate(
     };
 
     ScoredCandidate::Beat(ScoredResult::from_frame_starts(
-        fps, drop_frame, spb, phase, total_possible, &bits, frame_starts, sample_rate, details_entry,
+        fps, drop_frame, spb, phase, total_possible, &bits, frame_starts, sample_rate, details_entry, adaptive,
     ))
 }
 
@@ -735,6 +753,7 @@ let mut result = match best_result {
                 processing_time_ms,
                 first_ltc_timecode_secs,
                 quality: None,
+                chunk_summaries: Vec::new(),
             }
         }
         None => {
@@ -764,6 +783,7 @@ let mut result = match best_result {
                 processing_time_ms: 0.0,
                 first_ltc_timecode_secs: 0.0,
                 quality: None,
+                chunk_summaries: Vec::new(),
             }
         }
     };
@@ -1608,7 +1628,7 @@ fn try_decode_via_zc_intervals(
     );
 
     Some(ScoredResult::from_frame_starts(
-        fps, drop_frame, spb, zc[0], total_possible, &bits, frame_starts, sample_rate, details_entry,
+        fps, drop_frame, spb, zc[0], total_possible, &bits, frame_starts, sample_rate, details_entry, false,
     ))
 }
 
@@ -1849,6 +1869,9 @@ struct ScoredResult {
     details_entry: String,
     spb: f64,
     phase: usize,
+    /// Whether this candidate came from the adaptive (refinement) extraction
+    /// rather than the nominal `extract_bits` path.
+    adaptive: bool,
     /// Frame-start bit indices in the decoded bit array. Back-filled frames
     /// before the array origin carry negative indices (still sample-valid via
     /// `phase + idx·spb`).
@@ -1868,6 +1891,7 @@ impl ScoredResult {
         frame_starts: Vec<usize>,
         sample_rate: u32,
         details_entry: String,
+        adaptive: bool,
     ) -> ScoredResult {
         let valid_frames = frame_starts.len() as u32;
         let timecodes: Vec<FrameTimecode> = frame_starts
@@ -1888,6 +1912,7 @@ impl ScoredResult {
             details_entry,
             spb,
             phase,
+            adaptive,
             frame_starts: frame_starts.into_iter().map(|s| s as i64).collect(),
         }
     }
@@ -1903,6 +1928,7 @@ impl ScoredResult {
             details_entry: "Canceled".to_string(),
             spb: params.spb,
             phase,
+            adaptive: params.adaptive,
             frame_starts: Vec::new(),
         }
     }
@@ -1953,7 +1979,7 @@ fn decode_full_file(
     );
     ScoredResult::from_frame_starts(
         params.fps, params.drop_frame, params.spb, absolute_phase, total_possible,
-        &bits, frame_starts, sample_rate, details_entry,
+        &bits, frame_starts, sample_rate, details_entry, use_adaptive,
     )
 }
 
@@ -3739,6 +3765,7 @@ mod tests {
             details_entry: "test details".to_string(),
             spb: 24.0,
             phase: 12,
+            adaptive: false,
             frame_starts: vec![0],
         };
         let zc = vec![12, 36, 60];
@@ -3770,6 +3797,7 @@ mod tests {
             details_entry: "".to_string(),
             spb: 24.0,
             phase: 0,
+            adaptive: false,
             frame_starts: vec![],
         };
         let zc = vec![];
@@ -3785,6 +3813,7 @@ mod tests {
             details_entry: "".to_string(),
             spb: 24.0,
             phase: 0,
+            adaptive: false,
             frame_starts: vec![],
         };
         let result = build_result(Some(med_conf), &zc, &[], 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
@@ -3799,6 +3828,7 @@ mod tests {
             details_entry: "".to_string(),
             spb: 24.0,
             phase: 0,
+            adaptive: false,
             frame_starts: vec![],
         };
         let result = build_result(Some(high_conf), &zc, &[], 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
@@ -3816,6 +3846,7 @@ mod tests {
             details_entry: "".to_string(),
             spb: 24.0,
             phase: 0,
+            adaptive: false,
             frame_starts: vec![],
         };
         let zc = vec![];
@@ -3851,6 +3882,7 @@ mod tests {
             details_entry: "test".to_string(),
             spb,
             phase: 0, // phase=0 = start of bit boundary
+            adaptive: false,
             frame_starts: vec![],
         };
 
@@ -3876,6 +3908,7 @@ mod tests {
             details_entry: "test".to_string(),
             spb,
             phase: 0,
+            adaptive: false,
             frame_starts: vec![],
         };
 
@@ -3912,6 +3945,7 @@ mod tests {
             details_entry: "test".to_string(),
             spb,
             phase: 0,
+            adaptive: false,
             frame_starts: vec![],
         };
 
@@ -3950,6 +3984,7 @@ mod tests {
             details_entry: "test".to_string(),
             spb: spb_mismatch,
             phase: 0,
+            adaptive: false,
             frame_starts: vec![],
         };
 
@@ -4634,6 +4669,7 @@ mod tests {
             processing_time_ms: 0.0,
             first_ltc_timecode_secs: 0.0,
             quality: None,
+            chunk_summaries: Vec::new(),
         }
     }
 
@@ -4779,6 +4815,7 @@ mod tests {
             details_entry: String::new(),
             spb: 24.0,
             phase: 0,
+            adaptive: false,
             frame_starts: Vec::new(),
         }
     }
@@ -4792,7 +4829,7 @@ mod tests {
 
         let r = ScoredResult::from_frame_starts(
             25.0, false, 24.0, 480, 5, &bits, vec![0, 80], 48000,
-            "details".to_string(),
+            "details".to_string(), false,
         );
 
         assert_eq!(r.valid_frames, 2, "valid_frames == frame_starts.len()");

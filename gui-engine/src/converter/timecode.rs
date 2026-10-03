@@ -237,6 +237,7 @@ mod tests {
             processing_time_ms: 0.0,
             first_ltc_timecode_secs: first_secs,
             quality: None,
+            chunk_summaries: Vec::new(),
         }
     }
 

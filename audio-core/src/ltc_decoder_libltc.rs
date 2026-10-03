@@ -29,10 +29,15 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cance
     );
 
     if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
-        return Err(LtcDecodeError::Failed(format!(
-            "libltc decoder requires 16-bit integer PCM WAV (got {} bit {:?})",
-            spec.bits_per_sample, spec.sample_format
-        )));
+        return if spec.sample_format == hound::SampleFormat::Int {
+            // Typed payload; Display renders the former prose byte-identically.
+            Err(LtcDecodeError::UnsupportedBitDepth { bits: spec.bits_per_sample })
+        } else {
+            Err(LtcDecodeError::Failed(format!(
+                "libltc decoder requires 16-bit integer PCM WAV (got {} bit {:?})",
+                spec.bits_per_sample, spec.sample_format
+            )))
+        };
     }
 
     if let Some(c) = cancel {
@@ -227,6 +232,7 @@ pub(crate) fn decode_ltc_samples_libltc(
         processing_time_ms,
         first_ltc_timecode_secs: first_secs,
         quality: None,
+        chunk_summaries: Vec::new(),
     };
 
     apply_coherent_first_timecode(&mut result);

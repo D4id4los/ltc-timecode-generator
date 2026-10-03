@@ -2168,6 +2168,7 @@ mod tests {
             processing_time_ms: 15.0,
             first_ltc_timecode_secs: first_secs,
             quality: None,
+            chunk_summaries: Vec::new(),
         }
     }
 
@@ -2232,6 +2233,7 @@ mod tests {
             processing_time_ms: 0.0,
             first_ltc_timecode_secs: 0.0,
             quality: None,
+            chunk_summaries: Vec::new(),
         };
         let s = super::format_clip_ltc_summary(&result);
         assert_eq!(s, "Error: permission denied");

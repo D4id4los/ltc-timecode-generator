@@ -10,8 +10,8 @@ use crate::LtcDecodeError;
 use crate::decoder::LtcDecoder;
 use crate::ltc_decoder::{
     apply_coherent_first_timecode, compute_ltc_quality,
-    CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus,
-    LtcDetectionResult,
+    CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, ChunkSummary, FrameTimecode,
+    LtcDecodeStatus, LtcDetectionResult,
 };
 use crate::types::{DecodeConfig, DecodeProgress};
 use crate::wav_chunk_reader::WavChunkReader;
@@ -169,6 +169,13 @@ pub fn decode_ltc_chunked(
 
     let merged = merge_results(&chunk_results, &plan, fps);
 
+    // Stringification of the typed merge carrier happens exactly once, here,
+    // with byte-identical output to the former inline `format!` calls.
+    let mut details: Vec<String> = merged.chunk_details.iter().map(render_chunk_detail).collect();
+    details.push(merged.merge_summary);
+    let chunk_summaries: Vec<ChunkSummary> =
+        merged.chunk_details.iter().map(chunk_summary_of).collect();
+
     let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
     let mut result = LtcDetectionResult {
         status: merged.status,
@@ -178,12 +185,13 @@ pub fn decode_ltc_chunked(
         valid_frames: merged.valid_frames,
         timecodes: merged.timecodes,
         avg_confidence: merged.avg_confidence,
-        details: merged.details,
+        details,
         total_audio_duration_secs: plan.total_duration,
         sample_rate: plan.sample_rate,
         processing_time_ms,
         first_ltc_timecode_secs: merged.first_ltc_timecode_secs,
         quality: None,
+        chunk_summaries,
     };
 
     apply_coherent_first_timecode(&mut result);
@@ -286,10 +294,64 @@ fn run_parallel(
     collected
 }
 
+/// Typed per-chunk merge outcome. `merge_results` builds this carrier; the
+/// human-rendered `LtcDetectionResult.details` strings are produced once, at
+/// result construction, with byte-identical output (see `render_chunk_detail`).
+#[derive(Clone, Debug)]
+enum ChunkDetail {
+    Ok {
+        chunk_idx: usize,
+        valid_frames: u32,
+        total_possible_frames: u32,
+        avg_confidence: f32,
+    },
+    Err {
+        chunk_idx: usize,
+        source: LtcDecodeError,
+    },
+}
+
+/// Single home of the `Chunk N: ...` details-line rendering.
+fn render_chunk_detail(detail: &ChunkDetail) -> String {
+    match detail {
+        ChunkDetail::Ok { chunk_idx, valid_frames, total_possible_frames, avg_confidence } => {
+            format!("Chunk {}: {} valid / {} possible (conf {:.1}%)",
+                chunk_idx, valid_frames, total_possible_frames, avg_confidence * 100.0)
+        }
+        ChunkDetail::Err { chunk_idx, source } => {
+            format!("Chunk {}: error - {}", chunk_idx, source)
+        }
+    }
+}
+
+/// Project a typed chunk detail onto the public [`ChunkSummary`] shape.
+fn chunk_summary_of(detail: &ChunkDetail) -> ChunkSummary {
+    match detail {
+        ChunkDetail::Ok { chunk_idx, valid_frames, total_possible_frames, avg_confidence } => {
+            ChunkSummary {
+                chunk_idx: *chunk_idx,
+                valid_frames: *valid_frames,
+                total_possible_frames: *total_possible_frames,
+                avg_confidence: *avg_confidence,
+                error: None,
+            }
+        }
+        ChunkDetail::Err { chunk_idx, source } => ChunkSummary {
+            chunk_idx: *chunk_idx,
+            valid_frames: 0,
+            total_possible_frames: 0,
+            avg_confidence: 0.0,
+            error: Some(source.clone()),
+        },
+    }
+}
+
 /// Stream-level outcome of merging all per-chunk results.
 struct MergedDecode {
     timecodes: Vec<FrameTimecode>,
-    details: Vec<String>,
+    chunk_details: Vec<ChunkDetail>,
+    /// Rendered `Chunked decode: ...` summary line (display text).
+    merge_summary: String,
     first_ltc_timecode_secs: f64,
     avg_confidence: f32,
     total_possible: u32,
@@ -304,14 +366,18 @@ struct MergedDecode {
 fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> MergedDecode {
     let sample_rate = plan.sample_rate;
     let mut all_timecodes: Vec<(usize, FrameTimecode)> = Vec::new();
-    let mut merged_details: Vec<String> = Vec::new();
+    let mut chunk_details: Vec<ChunkDetail> = Vec::new();
     let mut first_tc_secs: f64 = f64::MAX;
 
     for cr in chunk_results {
         match &cr.result {
             Ok(r) => {
-                merged_details.push(format!("Chunk {}: {} valid / {} possible (conf {:.1}%)",
-                    cr.chunk_idx, r.valid_frames, r.total_possible_frames, r.avg_confidence * 100.0));
+                chunk_details.push(ChunkDetail::Ok {
+                    chunk_idx: cr.chunk_idx,
+                    valid_frames: r.valid_frames,
+                    total_possible_frames: r.total_possible_frames,
+                    avg_confidence: r.avg_confidence,
+                });
                 let chunk_start_sample = plan.boundaries.get(cr.chunk_idx).map(|&(s, _)| s).unwrap_or(0);
                 let chunk_start_secs = chunk_start_sample as f64 / sample_rate as f64;
                 let chunk_first_secs = if r.first_ltc_timecode_secs > 0.0 {
@@ -329,7 +395,7 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
                 }
             }
             Err(e) => {
-                merged_details.push(format!("Chunk {}: error - {}", cr.chunk_idx, e));
+                chunk_details.push(ChunkDetail::Err { chunk_idx: cr.chunk_idx, source: e.clone() });
             }
         }
     }
@@ -379,14 +445,15 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
         LtcDecodeStatus::NoSyncWord
     };
 
-    merged_details.push(format!(
+    let merge_summary = format!(
         "Chunked decode: {} chunks, {} valid / {} possible after merge",
         plan.boundaries.len(), valid_frames, true_total_possible,
-    ));
+    );
 
     MergedDecode {
         timecodes: deduped,
-        details: merged_details,
+        chunk_details,
+        merge_summary,
         first_ltc_timecode_secs: if first_tc_secs < f64::MAX { first_tc_secs } else { 0.0 },
         avg_confidence,
         total_possible: true_total_possible,
@@ -535,6 +602,7 @@ mod tests {
             processing_time_ms: 0.0,
             first_ltc_timecode_secs: first_secs,
             quality: None,
+            chunk_summaries: Vec::new(),
         }
     }
 
@@ -629,12 +697,12 @@ mod tests {
         assert_eq!(merged.valid_frames, 0);
         assert_eq!(merged.first_ltc_timecode_secs, 0.0);
         assert!(matches!(merged.status, LtcDecodeStatus::NoSyncWord));
-        assert!(merged.details.iter().any(|d| matches!(d,
+        assert!(merged.chunk_details.iter().any(|d| matches!(d,
             ChunkDetail::Err { chunk_idx: 0, source: LtcDecodeError::Failed(msg) } if msg == "boom 0")),
-            "expected typed Err detail for chunk 0, got {:?}", merged.details);
-        assert!(merged.details.iter().any(|d| matches!(d,
+            "expected typed Err detail for chunk 0, got {:?}", merged.chunk_details);
+        assert!(merged.chunk_details.iter().any(|d| matches!(d,
             ChunkDetail::Err { chunk_idx: 1, source: LtcDecodeError::Failed(msg) } if msg == "boom 1")),
-            "expected typed Err detail for chunk 1, got {:?}", merged.details);
+            "expected typed Err detail for chunk 1, got {:?}", merged.chunk_details);
     }
 
     #[test]
@@ -646,9 +714,9 @@ mod tests {
         ];
         let merged = merge_results(&results, &plan, 25.0);
         assert_eq!(merged.valid_frames, 1);
-        assert!(merged.details.iter().any(|d| matches!(d,
+        assert!(merged.chunk_details.iter().any(|d| matches!(d,
             ChunkDetail::Err { chunk_idx: 0, source: LtcDecodeError::Failed(msg) } if msg == "read failure")),
-            "expected typed Err detail for chunk 0, got {:?}", merged.details);
+            "expected typed Err detail for chunk 0, got {:?}", merged.chunk_details);
     }
 
     #[test]

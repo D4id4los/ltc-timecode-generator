@@ -2475,6 +2475,7 @@ mod tests {
             processing_time_ms: 10.0,
             first_ltc_timecode_secs: 0.0,
             quality: None,
+            chunk_summaries: Vec::new(),
         }
     }
 
@@ -3330,6 +3331,7 @@ mod tests {
             processing_time_ms: 10.0,
             first_ltc_timecode_secs: 0.0,
             quality: None,
+            chunk_summaries: Vec::new(),
         });
         s.decode.error = Some("old error".into());
         s.decode.probe = Some(crate::ffprobe::VideoAudioProbe {

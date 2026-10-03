@@ -959,6 +959,24 @@ pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
 mod watchdog {
     use std::time::{Duration, Instant};
 
+    /// Production stall timeout (also baked into the recovery-reason text).
+    pub(crate) const STALL_TIMEOUT: Duration = Duration::from_millis(500);
+    /// Production recovery-attempt budget.
+    pub(crate) const MAX_ATTEMPTS: u8 = 3;
+
+    /// Byte-exact recovery-reason text formatted into
+    /// `AudioEvent::RecoveryNeeded { reason }` by the scheduler thread.
+    /// The event text is a contract (engine log line), so it lives here next
+    /// to the payload ingredients it is derived from.
+    pub(crate) fn watchdog_reason(stall_timeout: Duration, attempt: u8, max_attempts: u8) -> String {
+        format!(
+            "callback stalled for {}ms (attempt {}/{})",
+            stall_timeout.as_millis(),
+            attempt,
+            max_attempts
+        )
+    }
+
     /// Decision for one scheduler iteration.
     #[derive(Debug)]
     pub(crate) enum WatchdogAction {
@@ -966,7 +984,7 @@ mod watchdog {
         Continue,
         /// Stall confirmed: emit `AudioEvent::RecoveryNeeded { reason }`, then
         /// wait `backoff` before the next check.
-        Recover { attempt: u8, reason: String, backoff: Duration },
+        Recover { attempt: u8, backoff: Duration },
         /// Recovery budget exhausted: emit `AudioEvent::StreamDead`, stop the thread.
         Dead,
     }
@@ -987,8 +1005,8 @@ mod watchdog {
         /// 10 s sliding reset window, 100 ms recovery backoff.
         pub(crate) fn new() -> Self {
             Self::with_constants(
-                Duration::from_millis(500),
-                3,
+                STALL_TIMEOUT,
+                MAX_ATTEMPTS,
                 Duration::from_secs(10),
                 Duration::from_millis(100),
             )
@@ -1040,16 +1058,10 @@ mod watchdog {
                     self.first_failure = Some(now);
                 }
                 let attempt = self.recovery_attempts;
-                let reason = format!(
-                    "callback stalled for {}ms (attempt {}/{})",
-                    self.stall_timeout.as_millis(),
-                    attempt,
-                    self.max_attempts
-                );
                 // Reset the stall timer so we don't immediately re-trigger.
                 self.last_callback_value = current_callback;
                 self.last_check = now;
-                WatchdogAction::Recover { attempt, reason, backoff: self.backoff }
+                WatchdogAction::Recover { attempt, backoff: self.backoff }
             } else {
                 WatchdogAction::Dead
             }
@@ -1057,7 +1069,7 @@ mod watchdog {
     }
 }
 
-use watchdog::{CallbackWatchdog, WatchdogAction};
+use watchdog::{watchdog_reason, CallbackWatchdog, WatchdogAction, MAX_ATTEMPTS, STALL_TIMEOUT};
 
 /// Scheduler push bookkeeping (drop counting + event cadence).
 struct FramePushStats {
@@ -1171,9 +1183,10 @@ fn ltc_scheduler_thread(
         let current_callback = callback_counter.load(Ordering::Relaxed);
         match wd.tick(Instant::now(), current_callback) {
             WatchdogAction::Continue => {}
-            WatchdogAction::Recover { attempt, reason, backoff } => {
+            WatchdogAction::Recover { attempt, backoff } => {
                 error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
                 warn!("LTC scheduler: recovery attempt {}/3", attempt);
+                let reason = watchdog_reason(STALL_TIMEOUT, attempt, MAX_ATTEMPTS);
                 if let Ok(mut ev) = events.lock() {
                     ev.push(AudioEvent::RecoveryNeeded { reason });
                 }
@@ -1259,7 +1272,7 @@ fn ltc_scheduler_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use watchdog::{CallbackWatchdog, WatchdogAction};
+    use watchdog::{watchdog_reason, CallbackWatchdog, WatchdogAction};
 
     // ── CallbackWatchdog (virtual clock, device-free) ─────────────────────
 
