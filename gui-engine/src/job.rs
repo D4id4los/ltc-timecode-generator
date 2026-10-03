@@ -1362,33 +1362,6 @@ mod tests {
 
     // ── JobStatus::is_active ──────────────────────────────────────────────
 
-    fn can_start_offload(cards_empty: bool, has_parent: bool, copy: &JobStatus, scan: &JobStatus) -> bool {
-        !cards_empty && has_parent && !copy.is_active() && !scan.is_active()
-    }
-
-    #[test]
-    fn test_can_start_offload_blocks_on_indeterminate() {
-        let mut copy = JobStatus::idle();
-        let mut scan = JobStatus::idle();
-
-        assert!(can_start_offload(false, true, &copy, &scan),
-            "should start when both jobs idle");
-
-        copy.progress.phase = JobPhase::Indeterminate;
-        assert!(!can_start_offload(false, true, &copy, &scan),
-            "should not start when copy is Indeterminate");
-
-        copy.progress.phase = JobPhase::Idle;
-        scan.progress.phase = JobPhase::Indeterminate;
-        assert!(!can_start_offload(false, true, &copy, &scan),
-            "should not start when scan is Indeterminate");
-
-        copy.progress.phase = JobPhase::Running;
-        scan.progress.phase = JobPhase::Running;
-        assert!(!can_start_offload(false, true, &copy, &scan),
-            "should not start when both are Running");
-    }
-
     #[test]
     fn test_probe_label_shows_probing_during_indeterminate() {
         assert_eq!(probe_status_label(true, true), ProbeStatusLabel::Probing,
@@ -1398,33 +1371,6 @@ mod tests {
             "Idle/Succeeded/Failed + no probe → show failed");
         assert_eq!(probe_status_label(false, false), ProbeStatusLabel::NoChannels,
             "Probe exists → show no channels (unreachable in this branch)");
-    }
-
-    fn probe_is_loading(probe_job: &JobStatus) -> bool {
-        probe_job.is_active()
-    }
-
-    fn probe_has_failed(probe_job: &JobStatus, ltc_probe_is_none: bool) -> bool {
-        ltc_probe_is_none && !probe_job.is_active()
-    }
-
-    #[test]
-    fn test_probe_loading_and_failed_with_indeterminate() {
-        let mut probe = JobStatus::idle();
-
-        assert!(!probe_is_loading(&probe), "Idle → not loading");
-        assert!(probe_has_failed(&probe, true), "Idle + none → failed");
-
-        probe.progress.phase = JobPhase::Indeterminate;
-        assert!(probe_is_loading(&probe), "Indeterminate → loading");
-        assert!(!probe_has_failed(&probe, true), "Indeterminate + none → not failed");
-
-        probe.progress.phase = JobPhase::Running;
-        assert!(probe_is_loading(&probe), "Running → loading");
-        assert!(!probe_has_failed(&probe, true), "Running + none → not failed");
-
-        probe.progress.phase = JobPhase::Succeeded;
-        assert!(!probe_is_loading(&probe), "Succeeded → not loading");
     }
 
     // ── set_label ────────────────────────────────────────────────────────

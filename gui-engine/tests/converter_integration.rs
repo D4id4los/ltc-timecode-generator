@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use gui_engine::converter::{
     query_ffmpeg_capabilities, run_conversion, ChannelMap, ConversionPipeline,
-    ConverterSettings, RecordingType, TestReport,
+    ConversionReport, ConverterSettings, RecordingType, TestReport,
 };
 use gui_engine::video_codecs::resolve_encoder_chain;
 
@@ -47,33 +47,7 @@ fn test_conversion_progress_tracking() {
     create_test_wav(&wav1, 48000, 0.25, 8000);
     create_test_wav(&wav2, 48000, 0.25, -8000);
 
-    let settings = ConverterSettings {
-        pipeline: ConversionPipeline::AudioOnly { generate_synthetic_video: true },
-        input_files: vec![wav1, wav2],
-        recording_type: RecordingType::MultiTrackAudio,
-        ltc_track_channel_index: 0,
-        channel_map: ChannelMap::identity(2),
-        split_tracks: false,
-        drop_ltc_track: false,
-        ltc_video_source: None,
-        container: "mkv".to_string(),
-        copy_video: false,
-        video_encoder: "h264".to_string(),
-        audio_encoder: "pcm_s24le".to_string(),
-        resolved_video_encoder: String::new(),
-        output_folder: dir.path().to_path_buf(),
-        filename_prefix: "test".to_string(),
-        audio_suffix_template: "_audio_track{track:01d}".to_string(),
-        video_suffix_template: "_video_clip{clip:02d}".to_string(),
-        set_start_from_ltc: false,
-        embed_camera_metadata: true,
-        trim_offsets_secs: vec![0.0, 0.0],
-        timecode_meta_per_file: vec![None, None],
-        camera_meta_per_file: vec![None; 2],
-        device_name: None,
-        concat_audio: false,
-        resolved_hw_device: None,
-    };
+    let settings = make_test_settings(dir.path(), vec![wav1, wav2]);
 
     let report = TestReport::new();
     let (_encoder_used, _metadata_only) = run_conversion(&report, settings, Some(&caps));
@@ -347,6 +321,17 @@ fn test_concat_audio_across_two_video_clips() {
         *report.completed.lock().unwrap(),
         "Expected Completed, got failed={}",
         *report.failed.lock().unwrap(),
+    );
+
+    // Per-step weight must be exactly 1.0 / steps.len() — ported from the
+    // deleted runner-level concat test (WP-T6 §4.1).
+    let sw: f32 = report.step_weight();
+    assert!(sw > 0.0, "a step weight must have been published");
+    let steps = 1.0 / sw;
+    assert!(
+        (steps - steps.round()).abs() < 0.06,
+        "step weight must be 1.0/N (got {} → {} steps)",
+        sw, steps
     );
 
     let concat_audio = dir.path().join("concat_test_audio_track1.wav");

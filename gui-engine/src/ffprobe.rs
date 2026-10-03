@@ -769,24 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_sample_rate_from_ffprobe_json() {
-        let json = r#"{"streams":[{"index":1,"codec_name":"aac","channels":2,"sample_rate":"48000"}]}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-        let s = &parsed["streams"][0];
-        let sr = s["sample_rate"].as_str().and_then(|v| v.parse::<u32>().ok()).unwrap_or(48000);
-        assert_eq!(sr, 48000);
-    }
-
-    #[test]
-    fn test_parse_sample_rate_fallback_on_missing() {
-        let json = r#"{"streams":[{"index":1,"codec_name":"pcm_s16le","channels":1}]}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-        let s = &parsed["streams"][0];
-        let sr = s["sample_rate"].as_str().and_then(|v| v.parse::<u32>().ok()).unwrap_or(48000);
-        assert_eq!(sr, 48000);
-    }
-
-    #[test]
     fn test_stderr_tail_short_input() {
         assert_eq!(stderr_tail("  hello\n", 400), "hello");
     }

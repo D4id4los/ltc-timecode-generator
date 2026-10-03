@@ -3,7 +3,7 @@
 //! the engine's probe policy is testable without the engine thread.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Output;
 
 use crate::camera_meta;

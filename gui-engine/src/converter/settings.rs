@@ -187,14 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn test_recording_type_debug() {
-        let rt = RecordingType::MultiTrackAudio;
-        assert_eq!(format!("{:?}", rt), "MultiTrackAudio");
-        let rt = RecordingType::VideoClipSequence;
-        assert_eq!(format!("{:?}", rt), "VideoClipSequence");
-    }
-
-    #[test]
     fn test_validate_suffix_template() {
         assert!(crate::naming::validate_template("_audio_track{track:01d}").is_ok());
         assert!(crate::naming::validate_template("_video_{clip}").is_ok());

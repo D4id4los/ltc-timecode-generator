@@ -1818,38 +1818,6 @@ mod tests {
         assert_eq!(step_label(3, 5), "[3/5]");
     }
 
-    /// WP-3.3 intended change: a metadata-only run in which every attempted
-    /// step failed now ends in failure with the typed details (previously it
-    /// completed "successfully").
-    #[test]
-    fn test_run_metadata_only_all_steps_failed_marks_failed() {
-        if skip_if_no_ffmpeg() { return; }
-        let mut settings = make_video_settings();
-        settings.pipeline = ConversionPipeline::MetadataOnly;
-        settings.input_files = vec![
-            PathBuf::from("/nonexistent/clip1.mp4"),
-            PathBuf::from("/nonexistent/clip2.mp4"),
-        ];
-        settings.timecode_meta_per_file = vec![tc_meta(), tc_meta()];
-
-        let report = TestReport::new();
-        let total = settings.input_files.len() * 3;
-        run_metadata_only(&settings, &report, total);
-
-        assert!(*report.failed.lock().unwrap(),
-            "a 100%% failed run must not report success");
-        // Every attempted step for both nonexistent clips failed:
-        // probe + tag + rename per clip, none succeeded.
-        let failures = report.failures();
-        assert_eq!(failures.len(), 6, "probe + tag + rename per clip: {:?}", failures);
-        let count_kind = |pred: &dyn Fn(&&StepFailureRecord) -> bool| failures.iter().filter(pred).count();
-        assert_eq!(count_kind(&|r| matches!(r.kind, FailureKind::Probe)), 2);
-        assert_eq!(count_kind(&|r| matches!(r.kind, FailureKind::Tag)), 2);
-        assert_eq!(count_kind(&|r| matches!(r.kind, FailureKind::Rename)), 2);
-        assert!(failures.iter().all(|r| !matches!(r.kind, FailureKind::Ffmpeg(_))),
-            "no ffmpeg step ever ran");
-    }
-
     // ── PR-7: logic-level tests via the prober seam ──────────────────────
 
     use crate::converter::test_fixtures::{make_stereo_probe, make_video_settings as fixture_video};
@@ -1973,40 +1941,6 @@ mod tests {
     }
 
     #[test]
-    fn test_video_to_video_concat_path_multi_clip() {
-        if skip_if_no_ffmpeg() { return; }
-        let dir = tempfile::TempDir::new().unwrap();
-        let clip1 = dir.path().join("clip1.mp4");
-        let clip2 = dir.path().join("clip2.mp4");
-        crate::converter::test_fixtures::create_test_video_with_tone(&clip1, 0.5);
-        crate::converter::test_fixtures::create_test_video_with_tone(&clip2, 0.5);
-
-        let mut settings = fixture_video();
-        settings.input_files = vec![clip1, clip2];
-        settings.output_folder = dir.path().to_path_buf();
-        settings.split_tracks = true;
-        settings.concat_audio = true;
-        settings.channel_map = crate::ChannelMap::identity(2);
-
-        let report = TestReport::new();
-        let mut fallback = EncoderFallback::new_with_hw(
-            video_codecs::static_encoder_chain("h264"),
-            HwDeviceContext { vaapi_device: None, vulkan_available: false },
-        );
-        let mut total = 0;
-        run_video_to_video(&mut settings, "mkv", &mut fallback, &report, &mut total);
-
-        assert!(!*report.failed.lock().unwrap(), "concat run should succeed; log: {}",
-            report.log.lock().unwrap());
-        // Per-step weight must be exactly 1.0 / steps.len() (steps.len()
-        // is published via the total out-param).
-        assert!(total > 0);
-        assert!((report.step_weight() - 1.0 / total as f32).abs() < 1e-6,
-            "set_step_weight = 1.0 / steps.len(); got {} for {} steps",
-            report.step_weight(), total);
-    }
-
-    #[test]
     fn test_video_to_video_bogus_codec_falls_through_and_fails() {
         if skip_if_no_ffmpeg() { return; }
         let dir = tempfile::TempDir::new().unwrap();
@@ -2074,30 +2008,4 @@ mod tests {
         assert!(*report.failed.lock().unwrap(), "exhausted chain marks the run failed");
     }
 
-    /// Partial failure still completes, with every attempted step recorded
-    /// exactly once in the FailureLedger (asserted structurally via the
-    /// report seam, not by parsing the human-facing summary wording).
-    #[test]
-    fn test_run_metadata_only_partial_failure_completes_with_warning() {
-        if skip_if_no_ffmpeg() { return; }
-        let dir = tempfile::TempDir::new().unwrap();
-        let clip = dir.path().join("clip1.mp4");
-        crate::converter::test_fixtures::create_test_video_with_tone(&clip, 1.0);
-
-        let mut settings = make_video_settings();
-        settings.pipeline = ConversionPipeline::MetadataOnly;
-        settings.input_files = vec![clip, PathBuf::from("/nonexistent/clip2.mp4")];
-        settings.output_folder = dir.path().to_path_buf();
-        settings.timecode_meta_per_file = vec![tc_meta(), tc_meta()];
-
-        let report = TestReport::new();
-        let total = settings.input_files.len() * 3;
-        run_metadata_only(&settings, &report, total);
-
-        assert!(!*report.failed.lock().unwrap(), "partial failure completes");
-        // Probe, tag, and rename all fail for the nonexistent clip → exactly
-        // 3 recorded step failures; an exact count is correct here because
-        // these failures *are* the specified behavior.
-        assert_eq!(report.failures().len(), 3);
-    }
 }

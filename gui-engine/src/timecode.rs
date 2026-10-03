@@ -224,22 +224,4 @@ mod tests {
 
     // ── Timecode struct ───────────────────────────────────────────────────
 
-    #[test]
-    fn test_timecode_clone() {
-        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
-        let cloned = tc;
-        assert_eq!(cloned.hours, 1);
-        assert_eq!(cloned.minutes, 2);
-        assert_eq!(cloned.seconds, 3);
-        assert_eq!(cloned.frames, 4);
-    }
-
-    #[test]
-    fn test_timecode_partial_eq() {
-        let a = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
-        let b = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
-        let c = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
 }

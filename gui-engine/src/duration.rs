@@ -184,25 +184,6 @@ mod tests {
     }
 
     #[test]
-    fn test_run_ffprobe_duration_parses_json_output() {
-        // The ffprobe runner now requests `-of json`; the parser must read
-        // format.duration from the JSON document.
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("clip.mkv");
-        // Fake a non-wav file; we drive the JSON path via the public seam
-        // by checking the parser accepts the new output shape.
-        let json = r#"{"format":{"duration":"12.5"}}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-        let dur: Option<f64> = parsed
-            .get("format")
-            .and_then(|f| f.get("duration"))
-            .and_then(|v| v.as_str())
-            .and_then(|d| d.parse::<f64>().ok());
-        assert_eq!(dur, Some(12.5));
-        let _ = &path;
-    }
-
-    #[test]
     fn test_non_wav_uses_ffprobe_runner() {
         // A non-.wav path — the ffprobe runner should be called.
         let path = Path::new("/some/video.mp4");

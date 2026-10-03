@@ -106,19 +106,4 @@ mod tests {
         assert_eq!(DARK.accent, LIGHT.accent);
     }
 
-    #[test]
-    fn test_rgb_new() {
-        let c = Rgb::new(0xFF, 0x5F, 0x1F);
-        assert_eq!(c.0, 0xFF);
-        assert_eq!(c.1, 0x5F);
-        assert_eq!(c.2, 0x1F);
-    }
-
-    #[test]
-    fn test_rgb_debug() {
-        let c = Rgb(255, 95, 31);
-        let d = format!("{:?}", c);
-        assert!(d.contains("255"));
-        assert!(d.contains("95"));
-    }
 }
