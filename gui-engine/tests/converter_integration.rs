@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gui_engine::converter::{
     query_ffmpeg_capabilities, run_conversion, ChannelMap, ConversionPipeline,
@@ -119,14 +121,38 @@ fn test_conversion_cancellation() {
 
     let report = TestReport::new();
 
-    // Spawn a thread that cancels after a short delay
+    // Spawn a canceller thread that first *observes* conversion start —
+    // progress > 0 means the first ffmpeg step is running and streaming
+    // progress (the pre-step "Pipeline:" message alone is too early: a
+    // cancel before the ffmpeg spawn returns without the CANCELLED log
+    // block). Then it raises the cancel flag. On a loaded machine the whole
+    // conversion could otherwise finish inside a fixed delay, so the flag
+    // would rise after the run.
+    let report_for_canceller = report.clone();
     let cancel_flag = report.cancelled.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let started_c = started.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(500));
-        cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if *report_for_canceller.progress.lock().unwrap() > 0.0 {
+                started_c.store(true, Ordering::Relaxed);
+                break;
+            }
+            if Instant::now() > deadline {
+                break; // started stays false → post-hoc assert fails loudly
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cancel_flag.store(true, Ordering::Relaxed);
     });
 
     let (_encoder_used, _metadata_only) = run_conversion(&report, settings, Some(&caps));
+
+    assert!(
+        started.load(Ordering::Relaxed),
+        "conversion never signalled start within 30s — cannot exercise cancellation",
+    );
 
     // The conversion should have been cancelled
     let log_msg = report.log.lock().unwrap().clone();

@@ -458,8 +458,9 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
 
 2. **Deadlines, not fixed sleeps** — Never use `thread::sleep(Duration::from_millis(N))`
    to wait for an async operation. Poll with a deadline and a predicate; this
-   adapts to machine load. Fix examples in `test_conversion_cancellation`:
-   it polls until `Running` before cancelling, never sleeping a fixed 200ms.
+   adapts to machine load. Example: `test_conversion_cancellation` polls the
+   conversion report (progress > 0, i.e. the first step is running) before
+   cancelling, never sleeping a fixed delay.
 
 3. **Decay-tolerant tolerances** — Temporal assertions (e.g. flash-alpha after a
    clap) must account for engine-tick decay. If testing through the state-snapshot
