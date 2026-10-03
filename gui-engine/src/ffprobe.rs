@@ -935,6 +935,7 @@ mod tests {
         assert!(probe.is_video_file);
         assert_eq!(probe.streams.len(), 1);
         assert_eq!(probe.streams[0].codec_name, "aac");
+        assert_eq!(probe.streams[0].sample_rate, 48000);
     }
 
     #[test]

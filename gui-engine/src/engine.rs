@@ -3176,6 +3176,108 @@ mod tests {
     }
 
     #[test]
+    fn test_process_command_set_beep_channel() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(GuiCommand::SetBeepChannel(ChannelSel::Right), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.beep_channel, ChannelSel::Right);
+    }
+
+    #[test]
+    fn test_process_command_set_ltc_volume() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(GuiCommand::SetLtcVolume(0.4), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!((els.current.ltc_volume - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_process_command_set_beep_frequency() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(GuiCommand::SetBeepFrequency(1200.0), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!((els.current.beep_frequency - 1200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_process_command_set_beep_duration() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(GuiCommand::SetBeepDuration(0.8), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert!((els.current.beep_duration - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_process_command_set_ltc_decode_stream() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(GuiCommand::SetLtcDecodeStream(2), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.decode.selected_stream, 2);
+    }
+
+    #[test]
+    fn test_process_command_set_ltc_decode_channel() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(GuiCommand::SetLtcDecodeChannel(1), &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.decode.selected_channel, 1);
+    }
+
+    #[test]
+    fn test_process_command_reset_current_timecode() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        els.current.current_timecode = Timecode { hours: 5, minutes: 4, seconds: 3, frames: 2 };
+        process_command(GuiCommand::Reset, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.current_timecode, els.current.start_timecode);
+    }
+
+    #[test]
+    fn test_process_command_clap_without_auto_increment() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(GuiCommand::SetAutoIncrement(false), &core, true, &event_tx, &mut els, &mut supervisor);
+        let take_before = els.current.clapper.take;
+        process_command(GuiCommand::Clap, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(GuiCommand::Clap, &core, true, &event_tx, &mut els, &mut supervisor);
+
+        assert_eq!(els.current.clapper.logs.len(), 2, "each clap appends one log entry");
+        assert_eq!(els.current.clapper.take, take_before, "take must not move when auto-increment is off");
+    }
+
+    #[test]
     fn test_process_command_set_start_timecode() {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
