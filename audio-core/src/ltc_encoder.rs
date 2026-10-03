@@ -1516,13 +1516,12 @@ mod tests {
         assert!((result.detected_fps - 25.0).abs() < 0.01, "detected fps 25, got {}", result.detected_fps);
 
         let decoded: Vec<Timecode> = result.timecodes.iter().map(|f| f.timecode).collect();
-        assert!(!decoded.is_empty(), "at least one frame must decode");
-        assert!(expected[..3].contains(&decoded[0]),
-            "first decoded frame must be at the start (decoder may skip 1-2 frames before sync lock), got {:?}", decoded[0]);
-        assert!(expected[expected.len() - 3..].contains(decoded.last().unwrap()),
-            "last decoded frame must be at the end, got {:?}", decoded.last().unwrap());
-        assert!(decoded.len() >= expected.len() - 4,
-            "decode coverage: {} of {} frames", decoded.len(), expected.len());
+        assert_eq!(decoded.len(), expected.len(),
+            "every generated frame must decode: {} of {}", decoded.len(), expected.len());
+        assert_eq!(decoded[0], expected[0],
+            "first decoded frame must be the start TC, got {:?}", decoded[0]);
+        assert_eq!(decoded.last().unwrap(), expected.last().unwrap(),
+            "last decoded frame must be the final generated frame, got {:?}", decoded.last().unwrap());
 
         let start_idx = expected.iter().position(|t| *t == decoded[0]).unwrap();
         for (i, frame) in decoded.iter().enumerate() {
@@ -1542,7 +1541,7 @@ mod tests {
             assert_eq!(q.gap_count, 0, "no gaps allowed: {}", q.summary);
             assert_eq!(q.glitch_count, 0, "no glitches allowed: {}", q.summary);
             assert_eq!(q.edit_count, 0, "no edit points allowed: {}", q.summary);
-            assert!(q.missing_frames <= 2, "at most 2 edge frames missing: {}", q.summary);
+            assert_eq!(q.missing_frames, 0, "every frame must be decoded: {}", q.summary);
             assert!(q.max_drift_secs < 0.1, "drift must be negligible: {}", q.max_drift_secs);
         }
     }

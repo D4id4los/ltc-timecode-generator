@@ -1052,10 +1052,14 @@ mod tests {
         let chunked = decode_ltc_chunked(&path, false, fps, false, config, &progress).unwrap();
         let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, fps, false, None).unwrap();
 
-        let diff = chunked.valid_frames.abs_diff(direct.valid_frames);
-        assert!(diff <= 2,
-            "single chunk: chunked={} != direct={} (diff={})",
-            chunked.valid_frames, direct.valid_frames, diff);
+        assert_eq!(chunked.valid_frames, direct.valid_frames,
+            "single-chunk merge is identity: chunked={} != direct={}",
+            chunked.valid_frames, direct.valid_frames);
+        assert_eq!(chunked.total_possible_frames, direct.total_possible_frames,
+            "total_possible must match direct decode");
+        assert_eq!(chunked.timecodes.first().map(|t| t.timecode),
+            direct.timecodes.first().map(|t| t.timecode),
+            "first decoded TC must match direct decode");
         assert!(chunked.total_possible_frames >= chunked.valid_frames,
             "total_possible ({}) < valid_frames ({})",
             chunked.total_possible_frames, chunked.valid_frames);
