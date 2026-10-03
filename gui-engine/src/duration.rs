@@ -26,15 +26,20 @@ where
 
 /// Compute group duration from per-file durations.
 /// MultiTrackAudio → take length (max); VideoClipSequence → total (sum).
-/// Returns `None` when every file's duration is unknown.
+/// Returns `None` when every file's duration is unknown, or when the
+/// aggregate is zero (a zero-length aggregate is treated as unknown, not
+/// as data).
 pub fn group_duration_secs(recording_type: &RecordingType, durations: &[Option<f64>]) -> Option<f64> {
-    match recording_type {
+    let aggregate = match recording_type {
         RecordingType::MultiTrackAudio => durations.iter().filter_map(|&d| d).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
         RecordingType::VideoClipSequence => {
             let sum: f64 = durations.iter().filter_map(|&d| d).sum();
-            if sum == 0.0 { None } else { Some(sum) }
+            Some(sum)
         }
-    }
+    };
+    // A real recording is never 0 s long; an all-zero aggregate means the
+    // probes yielded no usable durations, i.e. "unknown".
+    aggregate.filter(|&d| d != 0.0)
 }
 
 /// Format seconds as `H:MM:SS` (e.g. "1:02:03", "0:00:45").
@@ -265,10 +270,16 @@ mod tests {
     }
 
     #[test]
-    fn test_group_duration_video_zero_from_none() {
-        let durs = [None, Some(0.0)];
-        let result = group_duration_secs(&RecordingType::VideoClipSequence, &durs);
-        assert!(result.is_none(), "sum of zero should be None");
+    fn test_group_duration_zero_aggregates_are_unknown() {
+        // A real recording is never 0 s long — an all-zero aggregate means
+        // the probes yielded no usable durations, i.e. "unknown". The rule
+        // is unified across both recording types.
+        for rt in [RecordingType::MultiTrackAudio, RecordingType::VideoClipSequence] {
+            for durs in [[None, Some(0.0)], [Some(0.0), Some(0.0)]] {
+                let result = group_duration_secs(&rt, &durs);
+                assert!(result.is_none(), "{:?} with {:?} must be unknown", rt, durs);
+            }
+        }
     }
 
     #[test]
