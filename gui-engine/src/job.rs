@@ -840,6 +840,32 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use std::time::Instant;
+
+    /// Poll the supervisor until the job of `kind` has finished (worker thread
+    /// reaped by `poll()`), then return all accumulated events.
+    ///
+    /// Deterministic: the worker sends `JobEvent::Finished` just before it
+    /// exits, so once `is_running(kind)` is false the terminal event is
+    /// guaranteed to be in the drain buffer.
+    fn wait_for_finished(
+        sup: &mut JobSupervisor,
+        kind: JobKind,
+        timeout: Duration,
+    ) -> Vec<JobEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            sup.poll();
+            if !sup.is_running(kind) {
+                return sup.drain();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job {kind:?} still running after {timeout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn job_status_running_has_running_phase_and_message() {
@@ -997,11 +1023,12 @@ mod tests {
         spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
             panic!("deliberate panic");
         });
-        std::thread::sleep(Duration::from_millis(50));
 
-        sup.poll();
-
-        let events = sup.drain();
+        let events = wait_for_finished(
+            &mut sup,
+            JobKind::FfmpegCapProbe,
+            Duration::from_secs(10),
+        );
         let finished = events.iter().find(|e| matches!(e, JobEvent::Finished { .. }));
         assert!(finished.is_some(), "expected a Finished event");
         if let Some(JobEvent::Finished { outcome, .. }) = finished {
@@ -1035,12 +1062,19 @@ mod tests {
 
         sup.cancel_all();
 
-        std::thread::sleep(Duration::from_millis(50));
-        sup.poll();
-
-        let events = sup.drain();
+        let events = wait_for_finished(
+            &mut sup,
+            JobKind::FfmpegCapProbe,
+            Duration::from_secs(10),
+        );
         let finished = events.iter().find(|e| matches!(e, JobEvent::Finished { .. }));
         assert!(finished.is_some(), "expected a Finished event");
+        if let Some(JobEvent::Finished { outcome, .. }) = finished {
+            match outcome {
+                JobOutcome::Cancelled { .. } => {}
+                other => panic!("expected Cancelled, got {:?}", other),
+            }
+        }
     }
 
     // ── emit ordering ──────────────────────────────────────────────────
@@ -1055,21 +1089,26 @@ mod tests {
                 path: path.clone(),
                 secs: Some(10.0),
             });
-            std::thread::sleep(Duration::from_millis(10));
             Ok(JobFinal::DurationsDone)
         });
 
-        std::thread::sleep(Duration::from_millis(50));
-        sup.poll();
-
-        let events: Vec<_> = sup.drain();
+        let events: Vec<_> = wait_for_finished(
+            &mut sup,
+            JobKind::FfmpegCapProbe,
+            Duration::from_secs(10),
+        );
         // Emitted item and Finished should both appear
-        let has_item = events
+        let item_pos = events
             .iter()
-            .any(|e| matches!(e, JobEvent::Item { item: JobItem::DurationResult { .. }, .. }));
-        let has_finished = events.iter().any(|e| matches!(e, JobEvent::Finished { .. }));
-        assert!(has_item, "should have received an Item event");
-        assert!(has_finished, "should have received a Finished event");
+            .position(|e| matches!(e, JobEvent::Item { item: JobItem::DurationResult { .. }, .. }));
+        let fin_pos = events.iter().position(|e| matches!(e, JobEvent::Finished { .. }));
+        assert!(item_pos.is_some(), "should have received an Item event");
+        assert!(fin_pos.is_some(), "should have received a Finished event");
+        // Same worker thread, same channel ⇒ Item strictly precedes Finished
+        assert!(
+            item_pos.unwrap() < fin_pos.unwrap(),
+            "Item event must precede Finished event"
+        );
     }
 
     // ── is_running guard ───────────────────────────────────────────────
@@ -1098,10 +1137,11 @@ mod tests {
         });
 
         // Wait for job to finish
-        std::thread::sleep(Duration::from_millis(50));
-        sup.poll();
-
-        let events = sup.drain();
+        let events = wait_for_finished(
+            &mut sup,
+            JobKind::FfmpegCapProbe,
+            Duration::from_secs(10),
+        );
         assert!(!events.is_empty(), "should have events after drain");
 
         // Second drain should be empty
@@ -1249,10 +1289,11 @@ mod tests {
         assert!(sup.is_running(JobKind::FfmpegCapProbe));
         assert!(sup.cancel(JobKind::FfmpegCapProbe));
 
-        std::thread::sleep(Duration::from_millis(50));
-        sup.poll();
-
-        let events = sup.drain();
+        let events = wait_for_finished(
+            &mut sup,
+            JobKind::FfmpegCapProbe,
+            Duration::from_secs(10),
+        );
         let cancelled = events.iter().any(|e| matches!(e, JobEvent::Finished { outcome: JobOutcome::Cancelled { .. }, .. }));
         assert!(cancelled, "expected Cancelled outcome");
     }
@@ -1431,8 +1472,14 @@ mod tests {
         assert!(second_id.0 > first_id.0, "second spawn should have larger JobId");
     }
 
+    // NOTE: stale-finished-event *gating* lives in the engine
+    // (`engine.rs::handle_job_event` checks `latest_job` per kind); the
+    // supervisor's `drain()` returns everything unfiltered. This test
+    // therefore only proves that re-running a job of the same kind delivers
+    // exactly one Finished event. Engine-level stale-gating coverage is
+    // WP-T4's decision (see plans/TEST_SUITE_WPS.md).
     #[test]
-    fn test_latest_job_gates_stale_finished_events() {
+    fn test_same_kind_rerun_delivers_one_finished_event() {
         let mut sup = JobSupervisor::new();
 
         // Spawn a quick job that finishes immediately
@@ -1440,12 +1487,12 @@ mod tests {
             Ok(JobFinal::NoPayload)
         });
 
-        // Wait for it to finish
-        std::thread::sleep(Duration::from_millis(50));
-        sup.poll();
-
         // The Finished event is in the buffer — drain it so we start clean
-        let first_events = sup.drain();
+        let first_events = wait_for_finished(
+            &mut sup,
+            JobKind::FfmpegCapProbe,
+            Duration::from_secs(10),
+        );
         assert!(
             first_events.iter().any(|e| matches!(e, JobEvent::Finished { .. })),
             "first job should have finished"
@@ -1456,10 +1503,11 @@ mod tests {
             Ok(JobFinal::NoPayload)
         });
 
-        // Wait for second job to finish
-        std::thread::sleep(Duration::from_millis(50));
-        sup.poll();
-        let second_events = sup.drain();
+        let second_events = wait_for_finished(
+            &mut sup,
+            JobKind::FfmpegCapProbe,
+            Duration::from_secs(10),
+        );
 
         // Only events from the second (latest) job should appear;
         // the first job's Finished event was already drained above so it's
