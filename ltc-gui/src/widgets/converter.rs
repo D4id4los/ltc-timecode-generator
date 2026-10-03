@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use egui::{Color32, FontId, RichText, Ui};
-use gui_engine::{JobKind, JobPhase};
+use gui_engine::{JobKind, JobPhase, ProbeStatusLabel};
 use gui_engine::command::{GuiCommand, ConverterCommand};
 use gui_engine::converter::{
     available_audio_encoders_for_container,
@@ -1073,13 +1073,19 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
 
     if n == 0 {
         if is_video && state.latest.decode.probe.is_none() {
-            if state.latest.job(JobKind::ClipProbe).is_active() {
-                ui.label(RichText::new("Probing clip audio…").font(FontId::proportional(10.0)).color(colors.text_muted));
+            let label = gui_engine::job::probe_status_label(
+                state.latest.job(JobKind::ClipProbe).is_active(),
+                true,
+            );
+            let color = if matches!(label, ProbeStatusLabel::ProbeFailed) {
+                colors.error_red
             } else {
-                ui.label(RichText::new("Clip audio probe failed.").font(FontId::proportional(10.0)).color(colors.error_red));
-            }
+                colors.text_muted
+            };
+            ui.label(RichText::new(label.to_string()).font(FontId::proportional(10.0)).color(color));
         } else {
-            ui.label(RichText::new("No channels to map.").font(FontId::proportional(10.0)).color(colors.text_muted));
+            let label = ProbeStatusLabel::NoChannels.to_string();
+            ui.label(RichText::new(label).font(FontId::proportional(10.0)).color(colors.text_muted));
         }
         return;
     }
@@ -1335,6 +1341,16 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
     let cur_container = state.sh.conv.container.value().clone();
     let video_encoders: Vec<(String, String)> = if let Some(ref caps) = caps_opt {
         available_video_codecs(&cur_container, caps)
+            .into_iter()
+            .map(|(id, label, hw)| {
+                let label = if hw {
+                    format!("{label} [HW accel. available]")
+                } else {
+                    label
+                };
+                (id, label)
+            })
+            .collect()
     } else {
         supported_video_codecs().iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };

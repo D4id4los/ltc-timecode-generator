@@ -248,24 +248,20 @@ pub fn codec_has_available_hardware_encoder(
 /// Intersection of supported codecs with (a) container compatibility and
 /// (b) at least one available ffmpeg encoder. This is the dropdown source.
 ///
-/// The description string in each tuple is the human-readable label, with
-/// `" [HW accel. available]"` appended when the codec has a working hardware
-/// encoder.
+/// Each tuple is `(codec_id, label, hw_available)`: the human-readable label
+/// plus a flag telling whether the codec has a working hardware encoder —
+/// UIs may render a `" [HW accel. available]"` suffix from it.
 pub fn available_video_codecs(
     container: &str,
     caps: &FfmpegCapabilities,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, bool)> {
     VIDEO_CODECS
         .iter()
         .filter(|c| c.containers.contains(&container))
         .filter(|c| !resolve_encoder_chain(c.id, caps).is_empty())
         .map(|c| {
-            let label = if codec_has_available_hardware_encoder(c.id, caps) {
-                format!("{} [HW accel. available]", c.label)
-            } else {
-                c.label.to_string()
-            };
-            (c.id.to_string(), label)
+            let hw = codec_has_available_hardware_encoder(c.id, caps);
+            (c.id.to_string(), c.label.to_string(), hw)
         })
         .collect()
 }

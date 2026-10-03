@@ -442,6 +442,39 @@ impl std::fmt::Display for JobError {
     }
 }
 
+// ── Clip-probe status label ─────────────────────────────────────────────
+
+/// Which status label the converter shows when the channel matrix has no
+/// channels: the clip probe is running, it failed, or the probe found no
+/// mappable channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeStatusLabel {
+    Probing,
+    ProbeFailed,
+    NoChannels,
+}
+
+impl std::fmt::Display for ProbeStatusLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeStatusLabel::Probing => write!(f, "Probing clip audio…"),
+            ProbeStatusLabel::ProbeFailed => write!(f, "Clip audio probe failed."),
+            ProbeStatusLabel::NoChannels => write!(f, "No channels to map."),
+        }
+    }
+}
+
+/// Pick the status label for an empty channel matrix from the probe state.
+pub fn probe_status_label(probe_active: bool, probe_is_none: bool) -> ProbeStatusLabel {
+    if probe_active {
+        ProbeStatusLabel::Probing
+    } else if probe_is_none {
+        ProbeStatusLabel::ProbeFailed
+    } else {
+        ProbeStatusLabel::NoChannels
+    }
+}
+
 // ── Job outcome ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1354,16 +1387,6 @@ mod tests {
         scan.progress.phase = JobPhase::Running;
         assert!(!can_start_offload(false, true, &copy, &scan),
             "should not start when both are Running");
-    }
-
-    fn probe_status_label(probe_active: bool, probe_is_none: bool) -> ProbeStatusLabel {
-        if probe_active {
-            ProbeStatusLabel::Probing
-        } else if probe_is_none {
-            ProbeStatusLabel::ProbeFailed
-        } else {
-            ProbeStatusLabel::NoChannels
-        }
     }
 
     #[test]

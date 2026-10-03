@@ -77,8 +77,8 @@ pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs
 // Re-export job types
 pub use job::{
     CancelToken, JobContext, JobError, JobEvent, JobFinal, JobId, JobItem, JobKind, JobOutcome,
-    JobPhase, JobSpec, JobStatus, JobSupervisor, ProgressSnapshot, ProgressTracker, SpeedMeter,
-    UnitProgress, UnitSnapshot, UnitSpec, UnitState, spawn_job,
+    JobPhase, JobSpec, JobStatus, JobSupervisor, ProbeStatusLabel, ProgressSnapshot,
+    ProgressTracker, SpeedMeter, UnitProgress, UnitSnapshot, UnitSpec, UnitState, spawn_job,
 };
 
 // Re-export offload types

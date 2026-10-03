@@ -175,7 +175,7 @@ pub fn apply_available_defaults(
         return;
     }
     let available = video_codecs::available_video_codecs(container, caps);
-    let codecs: Vec<&str> = available.iter().map(|(k, _)| k.as_str()).collect();
+    let codecs: Vec<&str> = available.iter().map(|(k, _, _)| k.as_str()).collect();
     let auds: Vec<&str> =
         available_audio_encoders_for_container(container, caps).iter().map(|(k, _)| *k).collect();
     if !codecs.contains(&video_encoder.as_str()) || !auds.contains(&audio_encoder.as_str()) {

@@ -1,5 +1,6 @@
+use std::fmt;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use std::time::Duration;
@@ -13,13 +14,82 @@ use crate::subprocess::{no_window_command, run_output_with_timeout, SubprocessFa
 /// take many minutes, but should never hang indefinitely.
 const TAG_REMUX_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Why a tagging attempt was skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The container family has no standard timecode metadata to embed.
+    UnsupportedContainer { family: &'static str, ext: String },
+}
+
+impl fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SkipReason::UnsupportedContainer { family, ext } => write!(
+                f,
+                "{family} container '{ext}' has no standard timecode metadata"
+            ),
+        }
+    }
+}
+
 /// Outcome of a tagging attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TagOutcome {
     TaggedInPlace,
     TaggedViaFfmpeg,
-    Skipped { reason: String },
+    Skipped { reason: SkipReason },
 }
+
+/// Typed error from the ffmpeg tagging fallback (and its dispatch).
+#[derive(Debug)]
+pub enum TagError {
+    /// The ffmpeg subprocess could not run or timed out.
+    Subprocess { path: PathBuf, failure: SubprocessFailure },
+    /// ffmpeg ran but exited non-zero; carries the stderr tail.
+    FfmpegFailed { path: PathBuf, stderr_tail: String },
+    /// The temporary remux output could not be stat'ed.
+    MissingOutput { path: PathBuf, source: std::io::Error },
+    /// The temporary remux output was suspiciously small.
+    OutputTooSmall { path: PathBuf, bytes: u64 },
+    /// The atomic rename over the original failed.
+    Rename { path: PathBuf, source: std::io::Error },
+}
+
+impl fmt::Display for TagError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TagError::Subprocess { path, failure } => match failure {
+                SubprocessFailure::Io(msg) => {
+                    write!(f, "failed to spawn ffmpeg: {msg}")
+                }
+                SubprocessFailure::TimedOut => write!(
+                    f,
+                    "ffmpeg timed out after {}s while tagging {} — file may be corrupt",
+                    TAG_REMUX_TIMEOUT.as_secs(),
+                    path.display(),
+                ),
+                // run_output_with_timeout never produces these, but the match
+                // must stay exhaustive; treat like a generic failure.
+                SubprocessFailure::NonZeroExit { stderr_tail } => {
+                    write!(f, "failed to spawn ffmpeg: {stderr_tail}")
+                }
+                SubprocessFailure::Parse(msg) => {
+                    write!(f, "failed to spawn ffmpeg: {msg}")
+                }
+            },
+            TagError::FfmpegFailed { path, stderr_tail } => {
+                write!(f, "ffmpeg failed for {}:\n{}", path.display(), stderr_tail)
+            }
+            TagError::MissingOutput { source, .. } => write!(f, "missing output: {source}"),
+            TagError::OutputTooSmall { bytes, .. } => {
+                write!(f, "output too small ({bytes} bytes) — likely incomplete")
+            }
+            TagError::Rename { source, .. } => write!(f, "rename over original: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for TagError {}
 
 /// Tag a file with start-timecode and (optionally) camera metadata using the
 /// fastest available method:
@@ -40,7 +110,11 @@ pub enum TagOutcome {
 ///
 /// Containers that have no standard timecode metadata (e.g. MPEG-TS / MTS)
 /// are skipped with a `Skipped` outcome.
-pub fn tag_file(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo>) -> Result<TagOutcome, String> {
+pub fn tag_file(
+    path: &Path,
+    meta: &TimecodeMetadata,
+    camera: Option<&CameraInfo>,
+) -> Result<TagOutcome, TagError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -77,10 +151,10 @@ pub fn tag_file(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
         }
         "mts" | "m2ts" | "ts" | "m2t" => {
             return Ok(TagOutcome::Skipped {
-                reason: format!(
-                    "MPEG-TS container '{}' has no standard timecode metadata",
-                    ext
-                ),
+                reason: SkipReason::UnsupportedContainer {
+                    family: "MPEG-TS",
+                    ext: ext.to_string(),
+                },
             });
         }
         _ => {
@@ -842,7 +916,11 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
 
 /// Tag a file via ffmpeg stream-copy remux: write to a temp file in the
 /// same directory, then atomically rename over the original.
-fn tag_via_ffmpeg(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo>) -> Result<TagOutcome, String> {
+fn tag_via_ffmpeg(
+    path: &Path,
+    meta: &TimecodeMetadata,
+    camera: Option<&CameraInfo>,
+) -> Result<TagOutcome, TagError> {
     tag_via_ffmpeg_with(path, meta, camera, &mut |args: &[String], tmp: &Path| {
         run_output_with_timeout(
             no_window_command("ffmpeg")
@@ -867,7 +945,7 @@ fn tag_via_ffmpeg_with(
     meta: &TimecodeMetadata,
     camera: Option<&CameraInfo>,
     runner: &mut dyn FnMut(&[String], &Path) -> Result<Output, SubprocessFailure>,
-) -> Result<TagOutcome, String> {
+) -> Result<TagOutcome, TagError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -920,48 +998,33 @@ fn tag_via_ffmpeg_with(
     args.push(container.to_string());
 
     // Run ffmpeg via the injectable runner
-    let output = runner(&args, &tmp_path).map_err(|e| {
+    let output = runner(&args, &tmp_path).map_err(|failure| {
         let _ = std::fs::remove_file(&tmp_path);
-        match e {
-            SubprocessFailure::Io(msg) => format!("failed to spawn ffmpeg: {}", msg),
-            SubprocessFailure::TimedOut => format!(
-                "ffmpeg timed out after {}s while tagging {} — file may be corrupt",
-                TAG_REMUX_TIMEOUT.as_secs(),
-                path.display(),
-            ),
-            // run_output_with_timeout never produces these, but the match
-            // must stay exhaustive; treat like a generic failure.
-            SubprocessFailure::NonZeroExit { stderr_tail } => {
-                format!("failed to spawn ffmpeg: {}", stderr_tail)
-            }
-            SubprocessFailure::Parse(msg) => format!("failed to spawn ffmpeg: {}", msg),
-        }
+        TagError::Subprocess { path: path.to_path_buf(), failure }
     })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "ffmpeg failed for {}:\n{}",
-            path.display(),
-            stderr.lines().take(10).collect::<Vec<_>>().join("\n")
-        ));
+        return Err(TagError::FfmpegFailed {
+            path: path.to_path_buf(),
+            stderr_tail: stderr.lines().take(10).collect::<Vec<_>>().join("\n"),
+        });
     }
 
     // Validate output exists and is non-trivial
-    let meta_out = std::fs::metadata(&tmp_path)
-        .map_err(|e| format!("missing output: {}", e))?;
+    let meta_out = std::fs::metadata(&tmp_path).map_err(|source| {
+        TagError::MissingOutput { path: path.to_path_buf(), source }
+    })?;
     if meta_out.len() < 256 {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "output too small ({} bytes) — likely incomplete",
-            meta_out.len()
-        ));
+        return Err(TagError::OutputTooSmall { path: path.to_path_buf(), bytes: meta_out.len() });
     }
 
     // Atomic rename over the original
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| format!("rename over original: {}", e))?;
+    std::fs::rename(&tmp_path, path).map_err(|source| {
+        TagError::Rename { path: path.to_path_buf(), source }
+    })?;
 
     log::info!("Tagged {} via ffmpeg (stream copy)", path.display());
     Ok(TagOutcome::TaggedViaFfmpeg)
