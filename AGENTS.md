@@ -491,6 +491,13 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
 
 A test must fail when behavior regresses and pass when behavior improves.
 
+- **Never weaken tests that find actual bugs.** When you write a test
+  that fails and your analysis shows you have found a genuine bug, you
+  may never, under any circumstance, weaken the test to make it
+  pass. If your current implementation plan does not include
+  production code changes, you are to leave the test failing, note it
+  down in your final report, and also provide a prompt for the next
+  agent who will be tasked with fixing the bug you have found.
 - **No quality ceilings.** Never assert upper bounds on success (decode rate ≤ X%,
   "at most N frames") or exact failure/retry/skip counts for things that should
   ideally succeed. Floors ("≥ N frames decoded") and false-positive ceilings on
