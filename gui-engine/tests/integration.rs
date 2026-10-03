@@ -494,8 +494,6 @@ fn test_engine_mpsc_parse_invalid_file() {
         |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.error.is_some(),
     );
 
-    assert!(snapshot.status.decode.contains("Parse failed"),
-        "expected 'Parse failed', got: {}", snapshot.status.decode);
     assert!(snapshot.decode.result.is_none());
     assert!(snapshot.decode.error.is_some());
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
@@ -523,10 +521,13 @@ fn test_engine_clap_auto_increments_take() {
 }
 
 #[test]
-fn test_engine_clap_status_message() {
-    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.status.audio == "Clap!");
+fn test_engine_clap_appends_log() {
+    // Typed postcondition: the clap appends exactly one log entry.
+    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.clapper.logs.len() == 1);
 
-    assert_eq!(snapshot.status.audio, "Clap!");
+    assert_eq!(snapshot.clapper.logs.len(), 1, "expected 1 log entry after Clap");
+    let log = snapshot.clapper.logs.last().unwrap();
+    assert!(log.timecode.contains(':'), "expected timecode in log, got {}", log.timecode);
 }
 
 #[test]
@@ -799,9 +800,13 @@ fn test_engine_toggle_lock() {
 
 #[test]
 fn test_engine_reset_current_timecode() {
-    let snapshot = run_engine(vec![GuiCommand::Reset], false, |s| s.status.audio == "Reset");
+    // Typed postcondition: after Reset the current timecode is back at the
+    // start timecode (the reset effect, not the status wording).
+    let snapshot = run_engine(vec![GuiCommand::Reset], false, |s| {
+        s.current_timecode == s.start_timecode && s.status.last == gui_engine::state::StatusChannel::Audio
+    });
     assert_eq!(snapshot.current_timecode, snapshot.start_timecode);
-    assert_eq!(snapshot.status.audio, "Reset");
+    assert_eq!(snapshot.status.last, gui_engine::state::StatusChannel::Audio);
 }
 
 // ── LTC decode stream/channel selection ──────────────────────────────────
@@ -893,14 +898,17 @@ fn test_engine_probe_file_durations_wav() {
 }
 
 #[test]
-fn cancel_decode_clears_is_detecting_and_sets_status() {
+fn cancel_decode_clears_is_detecting() {
     let snapshot = run_engine(
         vec![
             GuiCommand::ParseLtcWavFile("/nonexistent/bogus_file_for_test.wav".to_string()),
             GuiCommand::CancelDecode,
         ],
         false,
-        |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.status.decode == "Decode canceled by user",
+        |s| {
+            let phase = s.job(JobKind::LtcDecode).phase();
+            phase != JobPhase::Running && s.decode.error.is_some()
+        },
     );
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcDecode job phase");
@@ -908,8 +916,6 @@ fn cancel_decode_clears_is_detecting_and_sets_status() {
         snapshot.job(JobKind::LtcDecode).phase(),
         JobPhase::Idle | JobPhase::Cancelled,
     ), "cancelled single decode must end Idle (failed synchronously before spawning) or Cancelled");
-    assert_eq!(snapshot.status.decode, "Decode canceled by user",
-        "CancelDecode should update status.decode");
 }
 
 #[test]
@@ -924,7 +930,9 @@ fn cancel_decode_also_clears_group_detecting() {
             GuiCommand::CancelDecode,
         ],
         false,
-        |s| s.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running && s.status.decode == "Decode canceled by user",
+        // The group decode pre-populates a Running job status, so the eager
+        // cancel deterministically lands in the Cancelled phase.
+        |s| matches!(s.job(JobKind::LtcGroupDecode).phase(), JobPhase::Cancelled),
     );
     assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcGroupDecode job phase");
@@ -934,7 +942,6 @@ fn cancel_decode_also_clears_group_detecting() {
         snapshot.job(JobKind::LtcGroupDecode).phase(),
         JobPhase::Idle | JobPhase::Cancelled,
     ), "cancelled group decode must end Idle or Cancelled, never Running/Failed/Succeeded");
-    assert_eq!(snapshot.status.decode, "Decode canceled by user");
 }
 
 #[test]
@@ -1377,10 +1384,9 @@ fn test_offload_cancel_during_scan() {
     });
 
     engine.tx.send(GuiCommand::Offload(OffloadCommand::CancelOffload)).unwrap();
-    let snap = wait_for_snapshot(&engine.state, "scan cancelled", |s| {
+    wait_for_snapshot(&engine.state, "scan cancelled", |s| {
         s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Cancelled).unwrap_or(false)
     });
-    assert_eq!(snap.offload.error.as_deref(), Some("Canceled by user"));
 
     // A subsequent scan works again — no stale-supervisor lockout.
     engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
@@ -1394,16 +1400,18 @@ fn test_offload_cancel_during_scan() {
 
 #[test]
 fn test_start_offload_guard_branches() {
-    // (a) No cards → "No media cards detected."
+    use gui_engine::offload::OffloadPlanError;
+
+    // (a) No cards → typed NoCards plan error.
     {
         let engine = spawn_engine_with_scan_seam(Arc::new(|_c, _p| Ok(Vec::new())));
         engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
-        let snap = wait_for_snapshot(&engine.state, "no-cards guard", |s| s.offload.error.is_some());
-        assert_eq!(snap.offload.error.as_deref(), Some("No media cards detected."));
+        let snap = wait_for_snapshot(&engine.state, "no-cards guard", |s| s.offload.plan_error.is_some());
+        assert_eq!(snap.offload.plan_error, Some(OffloadPlanError::NoCards));
         engine.shutdown();
     }
 
-    // (b) Card present but no parent folder → "No parent folder selected."
+    // (b) Card present but no parent folder → typed NoParentFolder plan error.
     {
         let mount = make_persistent_dir("offload-guard-mount");
         let card = make_card(&mount, "TESTCAM", &["a.wav"]);
@@ -1414,9 +1422,9 @@ fn test_start_offload_guard_branches() {
         });
         engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
         let snap = wait_for_snapshot(&engine.state, "no-parent guard", |s| {
-            s.offload.error.as_deref() == Some("No parent folder selected.")
+            s.offload.plan_error == Some(OffloadPlanError::NoParentFolder)
         });
-        assert_eq!(snap.offload.error.as_deref(), Some("No parent folder selected."));
+        assert_eq!(snap.offload.plan_error, Some(OffloadPlanError::NoParentFolder));
         engine.shutdown();
     }
     // (c) Duplicate StartOffload while copy running is deliberately not

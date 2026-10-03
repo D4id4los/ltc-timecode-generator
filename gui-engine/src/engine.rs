@@ -2488,7 +2488,9 @@ mod tests {
             JobOutcome::Succeeded { log: String::new() },
             JobFinal::Conversion { encoder_used: Some("av1_nvenc".into()), steps_attempted: 2 },
         );
-        assert_eq!(els.current.status.converter, "Conversion completed — video encoder: av1_nvenc");
+        // The Some("av1_nvenc") payload above must be consumed: the handler
+        // writes the converter status channel and the job ends Succeeded.
+        assert_eq!(els.current.status.last, crate::state::StatusChannel::Converter);
         assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Succeeded);
     }
 
@@ -2501,7 +2503,10 @@ mod tests {
             JobOutcome::Succeeded { log: String::new() },
             JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
         );
-        assert_eq!(els.current.status.converter, "Conversion completed");
+        // encoder_used: None payload still terminates successfully through
+        // the converter status channel.
+        assert_eq!(els.current.status.last, crate::state::StatusChannel::Converter);
+        assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Succeeded);
     }
 
     #[test]
@@ -2514,7 +2519,7 @@ mod tests {
             JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
         );
         assert_eq!(els.current.job(JobKind::Conversion).error.as_deref(), Some("boom"));
-        assert_eq!(els.current.status.converter, "Conversion failed: boom");
+        assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Failed);
     }
 
     #[test]
@@ -2608,7 +2613,11 @@ mod tests {
         // Outcome is still applied, but the (missing) encoder payload must
         // not produce the completion message.
         assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Succeeded);
-        assert!(!els.current.status.converter.contains("Conversion completed"));
+        assert_ne!(
+            els.current.status.last,
+            crate::state::StatusChannel::Converter,
+            "wrong payload must not write the converter status channel",
+        );
     }
 
     #[test]
@@ -2641,7 +2650,7 @@ mod tests {
         let probe = probe_with_streams(vec![AudioStreamInfo {
             stream_index: 2, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
         }]);
-        assert_eq!(validate_stream_channel_selection(&probe, 2, 1, "/x.mp4"), None);
+        assert!(validate_stream_channel_selection(&probe, 2, 1).is_ok());
     }
 
     #[test]
@@ -2649,9 +2658,8 @@ mod tests {
         let probe = probe_with_streams(vec![AudioStreamInfo {
             stream_index: 2, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
         }]);
-        let err = validate_stream_channel_selection(&probe, 0, 0, "/x.mp4").unwrap();
-        assert!(err.contains("Stream 0 not found"), "{}", err);
-        assert!(err.contains("[2]"), "{}", err);
+        let err = validate_stream_channel_selection(&probe, 0, 0).unwrap_err();
+        assert_eq!(err, StreamSelectionError::MissingStream { stream: 0 });
     }
 
     #[test]
@@ -2659,8 +2667,8 @@ mod tests {
         let probe = probe_with_streams(vec![AudioStreamInfo {
             stream_index: 1, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
         }]);
-        let err = validate_stream_channel_selection(&probe, 1, 2, "/x.mp4").unwrap();
-        assert!(err.contains("Channel 2 out of range"), "{}", err);
+        let err = validate_stream_channel_selection(&probe, 1, 2).unwrap_err();
+        assert_eq!(err, StreamSelectionError::ChannelOutOfRange { channel: 2, channels: 2 });
     }
 
     use crate::job::JobPhase;
