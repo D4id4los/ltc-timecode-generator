@@ -31,6 +31,13 @@ impl std::fmt::Display for StepFailure {
 /// real encoded/copied content (not just a muxer header).
 pub const MIN_PRODUCED_OUTPUT_BYTES: u64 = 4096;
 
+/// Highest step fraction reported while the ffmpeg process is still running.
+/// ffmpeg emits `progress=end` (and `out_time` can reach the container
+/// duration) while it is still finalising the output file, so an in-flight
+/// report must never claim the full step weight — only [`crate::converter::runner::ConversionReport::advance_step`],
+/// called after the process exits successfully, may complete a step.
+const MAX_IN_FLIGHT_STEP_FRACTION: f32 = 0.99;
+
 /// Parse an `out_time=` progress line from `-progress pipe:2` output.
 /// Returns `Some(duration_seconds)` when the line contains a valid
 /// `out_time=HH:MM:SS.ssssss` value (including 0.0), and `None` for
@@ -178,7 +185,7 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
                 step_progress = 1.0;
             }
 
-            report.report_step_fraction(step_progress, line);
+            report.report_step_fraction(step_progress.min(MAX_IN_FLIGHT_STEP_FRACTION), line);
         },
     );
 
@@ -405,6 +412,52 @@ mod tests {
         let progress = *report.progress.lock().unwrap();
         assert!(progress > 0.0, "progress should have advanced: {}", progress);
         assert!(progress <= 1.0, "progress should be <= 1.0: {}", progress);
+    }
+
+    /// An in-flight report must never claim the step is complete: ffmpeg
+    /// emits `progress=end` (and `out_time` can reach the container
+    /// duration) while still finalising the output, so the raw 1.0 must be
+    /// capped below full. Only `advance_step` (successful process exit)
+    /// completes a step.
+    #[test]
+    fn test_run_ffmpeg_in_flight_progress_never_completes_step() {
+        let report = TestReport::new();
+        report.set_step_weight(1.0);
+        let out = Path::new("/tmp/_test_ffmpeg_inflight_cap.mp4");
+
+        let mut spawner = |_args: &[String]| {
+            let mut cmd = if cfg!(windows) {
+                let mut c = std::process::Command::new("cmd");
+                c.args(["/C",
+                    "echo Duration: 00:00:10.00>&2 & echo out_time=00:00:12.000000>&2 & echo progress=end>&2"]);
+                c
+            } else {
+                let mut c = std::process::Command::new("sh");
+                c.args(["-c",
+                    "echo 'Duration: 00:00:10.00' >&2; echo 'out_time=00:00:12.000000' >&2; echo 'progress=end' >&2"]);
+                c
+            };
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.spawn()
+        };
+
+        let result = run_ffmpeg_process_with(
+            &["-i".to_string(), "dummy".to_string()], out, &report, 1, 1,
+            &mut spawner,
+            Duration::from_secs(5),
+        );
+        assert!(result.is_ok(), "expected ok, got {:?}", result);
+
+        let hist = report.progress_history();
+        assert!(hist.len() >= 2, "must have in-flight reports plus advance_step: {:?}", hist);
+        assert!(
+            hist[..hist.len() - 1].iter().all(|&p| p < 1.0),
+            "in-flight progress must stay below the full step weight: {:?}",
+            hist
+        );
+        let last = *hist.last().unwrap();
+        assert!(last >= 0.99, "advance_step must complete the step: {}", last);
     }
 
     #[test]

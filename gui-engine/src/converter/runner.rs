@@ -32,6 +32,11 @@ pub trait ConversionReport: Send + Sync {
     fn is_cancelled(&self) -> bool;
     fn step_weight(&self) -> f32;
     fn set_step_weight(&self, w: f32);
+    /// In-flight progress of the current step as a fraction of that step
+    /// (`0.0..=1.0`). The step runner never sends `1.0` — ffmpeg reports
+    /// `progress=end` / duration-reached `out_time` while still finalising
+    /// the output, so in-flight fractions are capped below full. Step
+    /// completion is signalled exclusively by [`Self::advance_step`].
     fn report_step_fraction(&self, step_fraction: f32, line: &str);
     fn advance_step(&self);
     fn set_log(&self, text: &str);
@@ -182,6 +187,10 @@ pub struct TestReport {
     pub completed: std::sync::Arc<Mutex<bool>>,
     pub failure_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     step_weight: std::sync::Arc<Mutex<f32>>,
+    /// Completed-step weight accumulator, mirroring the production report's
+    /// `overall_progress`: only `advance_step` mutates it. `progress` holds
+    /// the published combined value (overall + in-flight contribution).
+    overall: std::sync::Arc<Mutex<f32>>,
 }
 
 impl TestReport {
@@ -215,6 +224,7 @@ impl Default for TestReport {
             completed: std::sync::Arc::new(Mutex::new(false)),
             failure_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             step_weight: std::sync::Arc::new(Mutex::new(0.0)),
+            overall: std::sync::Arc::new(Mutex::new(0.0)),
         }
     }
 }
@@ -233,7 +243,7 @@ impl ConversionReport for TestReport {
     }
 
     fn report_step_fraction(&self, step_fraction: f32, _line: &str) {
-        let overall = *self.progress.lock().unwrap();
+        let overall = *self.overall.lock().unwrap();
         let sw = *self.step_weight.lock().unwrap();
         let combined = (overall + step_fraction * sw).min(1.0);
         *self.progress.lock().unwrap() = combined;
@@ -241,11 +251,12 @@ impl ConversionReport for TestReport {
     }
 
     fn advance_step(&self) {
-        let overall = *self.progress.lock().unwrap();
+        let overall = *self.overall.lock().unwrap();
         let sw = *self.step_weight.lock().unwrap();
-        let combined = (overall + sw).min(1.0);
-        *self.progress.lock().unwrap() = combined;
-        self.progress_history.lock().unwrap().push(combined);
+        let new_overall = (overall + sw).min(1.0);
+        *self.overall.lock().unwrap() = new_overall;
+        *self.progress.lock().unwrap() = new_overall;
+        self.progress_history.lock().unwrap().push(new_overall);
     }
 
     fn set_log(&self, text: &str) {
