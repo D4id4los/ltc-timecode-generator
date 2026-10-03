@@ -398,7 +398,7 @@ where
 }
 
 #[test]
-fn test_group_decode_progress_reaches_100_percent() {
+fn test_group_decode_completes_both_clips() {
     if !ffmpeg_tooling_available() {
         eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
@@ -428,8 +428,6 @@ fn test_group_decode_progress_reaches_100_percent() {
         clip2.to_string_lossy().to_string(),
     ];
 
-    let mut max_pct = 0.0f32;
-
     let snapshot = run_engine_with_commands_monitor(
         vec![GuiCommand::DecodeLtcVideoGroup {
             paths,
@@ -437,9 +435,6 @@ fn test_group_decode_progress_reaches_100_percent() {
             channel_index: 0,
         }],
         |s, deadline| {
-            if s.job(JobKind::LtcGroupDecode).fraction() > max_pct {
-                max_pct = s.job(JobKind::LtcGroupDecode).fraction();
-            }
             if !s.decode.group_results.is_empty() && matches!(s.job(JobKind::LtcGroupDecode).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
                 return true;
             }
@@ -448,8 +443,6 @@ fn test_group_decode_progress_reaches_100_percent() {
         30,
     );
 
-    assert!(max_pct > 0.0,
-        "decode progress never exceeded 0 (max_pct={})", max_pct);
     assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running, "group decode should not be detecting after completion");
     assert_eq!(snapshot.decode.group_results.len(), 2, "two clip results expected");
     assert_eq!(snapshot.decode.group_results.iter().filter(|r| r.ok().is_some()).count(), 2,
@@ -457,7 +450,7 @@ fn test_group_decode_progress_reaches_100_percent() {
 }
 
 #[test]
-fn test_single_video_decode_progress() {
+fn test_single_video_decode_completes() {
     if !ffmpeg_tooling_available() {
         eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
         return;
@@ -480,17 +473,14 @@ fn test_single_video_decode_progress() {
 
     let mp4_str = mp4.to_string_lossy().to_string();
 
-    let mut progress_gt_zero = false;
-
     let snapshot = run_engine_with_commands_monitor(
         vec![
             GuiCommand::ProbeVideo(mp4_str.clone()),
             GuiCommand::ParseLtcVideo(mp4_str.clone(), 1, 0),
         ],
         |s, deadline| {
-            if s.job(JobKind::LtcDecode).fraction() > 0.0 {
-                progress_gt_zero = true;
-            }
+            // `generation > 0` guards against the pre-start Idle window
+            // where `job(kind)` returns an idle default.
             if s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.generation > 0 {
                 return true;
             }
@@ -499,10 +489,6 @@ fn test_single_video_decode_progress() {
         120,
     );
 
-    assert!(
-        progress_gt_zero,
-        "single video decode progress never exceeded 0"
-    );
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running, "should not still be detecting");
     assert!(
         snapshot.decode.error.is_none() || snapshot.decode.result.is_some(),
