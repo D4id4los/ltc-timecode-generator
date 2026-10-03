@@ -142,34 +142,131 @@ fn timecode_fmt(tc: &Timecode) -> String {
     )
 }
 
-fn parse_timecode(s: &str) -> Result<Timecode, String> {
+/// Field of a [`Timecode`] that failed to parse or was out of range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcField {
+    Hours,
+    Minutes,
+    Seconds,
+    Frames,
+}
+
+impl TcField {
+    fn as_str(self) -> &'static str {
+        match self {
+            TcField::Hours => "hours",
+            TcField::Minutes => "minutes",
+            TcField::Seconds => "seconds",
+            TcField::Frames => "frames",
+        }
+    }
+}
+
+/// Typed error for [`parse_timecode`]. `Display` renders the exact strings
+/// the former `Result<_, String>` implementation produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimecodeParseError {
+    /// Wrong number of `:`-separated segments (or empty input).
+    BadFormat { input: String },
+    /// A segment that is not a valid unsigned integer.
+    InvalidComponent { field: TcField, input: String },
+    /// A segment that parsed but exceeds its valid range.
+    OutOfRange(TcField),
+}
+
+impl std::fmt::Display for TimecodeParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimecodeParseError::BadFormat { input } => {
+                write!(f, "Invalid timecode format '{}' — expected HH:MM:SS:FF", input)
+            }
+            TimecodeParseError::InvalidComponent { field, input } => {
+                write!(f, "Invalid {} in '{}'", field.as_str(), input)
+            }
+            TimecodeParseError::OutOfRange(field) => match field {
+                TcField::Hours => write!(f, "Hours must be 0-23"),
+                TcField::Minutes => write!(f, "Minutes must be 0-59"),
+                TcField::Seconds => write!(f, "Seconds must be 0-59"),
+                // Frames are not range-checked by parse_timecode today; the
+                // variant exists for completeness but is currently
+                // unreachable (matching prior `Result<_, String>` behavior).
+                TcField::Frames => write!(f, "Invalid frames in input"),
+            },
+        }
+    }
+}
+
+impl std::error::Error for TimecodeParseError {}
+
+/// Typed error for [`resolve_device`]. `Display` renders the exact strings
+/// the former `Result<_, String>` implementation produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolveDeviceError {
+    /// Neither a default device nor any device exists.
+    NoDevices,
+    /// `--device <NAME>` matched no device (exact, id, or substring).
+    NotFound { query: String },
+    /// `--device-index <N>` beyond the number of devices found.
+    IndexOutOfRange { index: usize, count: usize },
+}
+
+impl std::fmt::Display for ResolveDeviceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveDeviceError::NoDevices => {
+                write!(f, "No audio devices available")
+            }
+            ResolveDeviceError::NotFound { query } => {
+                write!(
+                    f,
+                    "Device '{}' not found. Use --list-devices to see available devices.",
+                    query
+                )
+            }
+            ResolveDeviceError::IndexOutOfRange { index, count } => {
+                write!(
+                    f,
+                    "Device index {} out of range ({} devices). Use --list-devices to see available devices.",
+                    index, count
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolveDeviceError {}
+
+fn parse_timecode(s: &str) -> Result<Timecode, TimecodeParseError> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 4 {
-        return Err(format!(
-            "Invalid timecode format '{}' — expected HH:MM:SS:FF",
-            s
-        ));
+        return Err(TimecodeParseError::BadFormat {
+            input: s.to_string(),
+        });
     }
-    let hours = parts[0]
-        .parse::<u32>()
-        .map_err(|_| format!("Invalid hours in '{}'", s))?;
-    let minutes = parts[1]
-        .parse::<u32>()
-        .map_err(|_| format!("Invalid minutes in '{}'", s))?;
-    let seconds = parts[2]
-        .parse::<u32>()
-        .map_err(|_| format!("Invalid seconds in '{}'", s))?;
-    let frames = parts[3]
-        .parse::<u32>()
-        .map_err(|_| format!("Invalid frames in '{}'", s))?;
+    let mut parsed = [0u32; 4];
+    let fields = [
+        TcField::Hours,
+        TcField::Minutes,
+        TcField::Seconds,
+        TcField::Frames,
+    ];
+    for (i, field) in fields.iter().enumerate() {
+        parsed[i] = parts[i].parse::<u32>().map_err(|_| {
+            TimecodeParseError::InvalidComponent {
+                field: *field,
+                input: s.to_string(),
+            }
+        })?;
+    }
+    let [hours, minutes, seconds, frames] = parsed;
     if hours >= 24 {
-        return Err("Hours must be 0-23".to_string());
+        return Err(TimecodeParseError::OutOfRange(TcField::Hours));
     }
     if minutes >= 60 {
-        return Err("Minutes must be 0-59".to_string());
+        return Err(TimecodeParseError::OutOfRange(TcField::Minutes));
     }
     if seconds >= 60 {
-        return Err("Seconds must be 0-59".to_string());
+        return Err(TimecodeParseError::OutOfRange(TcField::Seconds));
     }
     Ok(Timecode {
         hours,
@@ -213,7 +310,7 @@ pub fn list_devices_and_exit() -> ! {
 fn resolve_device(
     devices: &[audio_core::AudioDeviceInfo],
     cli: &Cli,
-) -> Result<String, String> {
+) -> Result<String, ResolveDeviceError> {
     if let Some(ref id) = cli.device {
         for dev in devices {
             if dev.name == *id || dev.id == *id {
@@ -225,19 +322,17 @@ fn resolve_device(
                 return Ok(dev.id.clone());
             }
         }
-        return Err(format!(
-            "Device '{}' not found. Use --list-devices to see available devices.",
-            id
-        ));
+        return Err(ResolveDeviceError::NotFound {
+            query: id.clone(),
+        });
     }
 
     if let Some(index) = cli.device_index {
         if index >= devices.len() {
-            return Err(format!(
-                "Device index {} out of range ({} devices). Use --list-devices to see available devices.",
+            return Err(ResolveDeviceError::IndexOutOfRange {
                 index,
-                devices.len()
-            ));
+                count: devices.len(),
+            });
         }
         return Ok(devices[index].id.clone());
     }
@@ -247,10 +342,7 @@ fn resolve_device(
             return Ok(dev.id.clone());
         }
     }
-    devices
-        .first()
-        .map(|d| d.id.clone())
-        .ok_or_else(|| "No audio devices available".to_string())
+    devices.first().map(|d| d.id.clone()).ok_or(ResolveDeviceError::NoDevices)
 }
 
 // ── Headless mode ───────────────────────────────────────────────────────
