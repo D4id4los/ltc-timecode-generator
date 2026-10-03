@@ -2279,6 +2279,21 @@ mod tests {
         assert_eq!(valid, 0, "sync word at wrong offset should not produce valid frames");
     }
 
+    #[test]
+    fn decode_ltc_from_wav_pre_cancelled_returns_cancelled_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("pre-cancelled.wav");
+        generate_test_wav(
+            &path,
+            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            25.0, false, ChannelSel::Both, 0.5, 48000, 1.0,
+        );
+        let cancel = AtomicBool::new(true);
+        let err = decode_ltc_from_wav(&path, 25.0, false, Some(&cancel))
+            .expect_err("pre-cancelled decode must not produce a result");
+        assert_eq!(err, LtcDecodeError::Cancelled);
+    }
+
     // ── WAV generation helper ────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]

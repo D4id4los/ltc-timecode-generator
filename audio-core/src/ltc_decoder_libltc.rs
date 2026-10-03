@@ -299,6 +299,32 @@ mod tests {
         assert!(matches!(r.status, LtcDecodeStatus::Error { ref message } if message == "permission denied"));
     }
 
+    #[test]
+    fn decode_ltc_from_wav_libltc_pre_cancelled_returns_cancelled_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("pre-cancelled.wav");
+        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
+            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
+        }).collect();
+        let samples = synthesize_ltc_samples_i16(&tcs, 25.0, false, 48000, 0.5);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for s in &samples {
+            writer.write_sample(*s).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let err = decode_ltc_from_wav_libltc(&path, 25.0, false, Some(&cancel))
+            .expect_err("pre-cancelled libltc decode must not produce a result");
+        assert_eq!(err, LtcDecodeError::Cancelled);
+    }
+
     // ── decode_ltc_samples_libltc ──────────────────────────────────────
 
     #[test]

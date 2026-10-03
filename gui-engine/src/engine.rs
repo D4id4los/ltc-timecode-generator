@@ -2416,6 +2416,7 @@ mod tests {
     #[test]
     fn on_ltc_decode_finished_cancel_error_clears_result() {
         let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.jobs.insert(JobKind::LtcDecode, JobStatus::running("decoding"));
         els.current.decode.result = Some(make_ltc_result());
         on_ltc_decode_finished(
             &mut els,
@@ -2424,7 +2425,32 @@ mod tests {
         );
         assert!(els.current.decode.result.is_none());
         assert!(els.current.decode.error.is_none(), "cancel must not surface as an error");
-        assert_eq!(els.current.status.decode, "Decode canceled");
+        assert_eq!(
+            els.current.jobs.get(&JobKind::LtcDecode).map(|s| s.progress.phase),
+            Some(job::JobPhase::Cancelled),
+            "a cancelled decode must end in the Cancelled phase",
+        );
+    }
+
+    #[test]
+    fn on_ltc_decode_finished_failed_error_surfaces() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.decode.result = Some(make_ltc_result());
+        on_ltc_decode_finished(
+            &mut els,
+            job::JobOutcome::Failed { error: "boom".into(), log: String::new() },
+            job::JobFinal::Decode {
+                result: Err(LtcDecodeError::Failed("x".into())),
+                path: PathBuf::from("/tmp/x.wav"),
+            },
+        );
+        assert!(els.current.decode.error.is_some(), "failures must surface as an error");
+        assert!(els.current.decode.result.is_none());
+        assert_ne!(
+            els.current.jobs.get(&JobKind::LtcDecode).map(|s| s.progress.phase),
+            Some(job::JobPhase::Cancelled),
+            "a failed decode must not be reported as cancelled",
+        );
     }
 
     #[test]

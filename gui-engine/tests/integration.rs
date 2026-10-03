@@ -893,6 +893,10 @@ fn cancel_decode_clears_is_detecting_and_sets_status() {
     );
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcDecode job phase");
+    assert!(matches!(
+        snapshot.job(JobKind::LtcDecode).phase(),
+        JobPhase::Idle | JobPhase::Cancelled,
+    ), "cancelled single decode must end Idle (failed synchronously before spawning) or Cancelled");
     assert_eq!(snapshot.status.decode, "Decode canceled by user",
         "CancelDecode should update status.decode");
 }
@@ -915,6 +919,10 @@ fn cancel_decode_also_clears_group_detecting() {
         "CancelDecode should clear LtcGroupDecode job phase");
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
         "CancelDecode should clear LtcDecode job phase");
+    assert!(matches!(
+        snapshot.job(JobKind::LtcGroupDecode).phase(),
+        JobPhase::Idle | JobPhase::Cancelled,
+    ), "cancelled group decode must end Idle or Cancelled, never Running/Failed/Succeeded");
     assert_eq!(snapshot.status.decode, "Decode canceled by user");
 }
 

@@ -215,7 +215,7 @@ fn run_sequential(
 }
 
 /// Decode chunks across `num_workers` threads; every chunk slot is filled —
-/// workers bail on cancellation, leaving `Err("Canceled")` placeholders.
+/// workers bail on cancellation, leaving `LtcDecodeError::Cancelled` placeholders.
 fn run_parallel(
     path: &Path,
     plan: &ChunkPlan,
@@ -788,7 +788,7 @@ mod tests {
 
         // Mock bails (sets the cancel flag) on its 2nd call; that caller
         // itself breaks out without storing, and the remaining workers
-        // leave their slots as Err("Canceled") placeholders. Whether the
+        // leave their slots as LtcDecodeError::Cancelled placeholders. Whether the
         // 1st caller still stores depends on scheduling, so assert the
         // invariant: at most the first call's result is stored, every slot
         // is filled, and progress counts exactly the stored results.
