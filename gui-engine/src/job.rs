@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use audio_core::LtcDecodeError;
 use audio_core::LtcDetectionResult;
 use log::{error, warn};
 
@@ -479,7 +480,7 @@ pub enum JobFinal {
         groups: Vec<MatchedGroup>,
     },
     Decode {
-        result: Result<LtcDetectionResult, String>,
+        result: Result<LtcDetectionResult, LtcDecodeError>,
         path: PathBuf,
     },
     VideoProbe {

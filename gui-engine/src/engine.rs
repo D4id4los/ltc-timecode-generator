@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use audio_core::LtcDecodeError;
 use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetectionResult};
 use log::{error, info, warn};
 
@@ -882,7 +883,9 @@ fn cmd_decode_ltc_video_group(
                 capture_gen,
                 &|_| {},
                 Some(clip_unit),
-            ).map(Box::new);
+            )
+            .map(Box::new)
+            .map_err(|e| e.to_string());
             if ctx.cancel.is_cancelled() {
                 return Err(job::JobError::Cancelled);
             }
@@ -988,9 +991,11 @@ fn cmd_parse_ltc_video(
         );
         extract_unit.set_fraction(1.0);
 
-        Ok(result
-            .map(|r| JobFinal::Decode { result: Ok(r), path: PathBuf::from(&path_job) })
-            .unwrap_or_else(|e| JobFinal::Decode { result: Err(e), path: PathBuf::from(&path_job) }))
+        match result {
+            Ok(r) => Ok(JobFinal::Decode { result: Ok(r), path: PathBuf::from(&path_job) }),
+            Err(LtcDecodeError::Cancelled) => Err(job::JobError::Cancelled),
+            Err(e) => Ok(JobFinal::Decode { result: Err(e), path: PathBuf::from(&path_job) }),
+        }
     });
 }
 
@@ -1103,10 +1108,11 @@ fn cmd_parse_ltc_wav_file(
 
         let _ = dp_bridge.join();
 
-        Ok(JobFinal::Decode {
-            result,
-            path: PathBuf::from(path_job),
-        })
+        match result {
+            Ok(r) => Ok(JobFinal::Decode { result: Ok(r), path: PathBuf::from(path_job) }),
+            Err(LtcDecodeError::Cancelled) => Err(job::JobError::Cancelled),
+            Err(e) => Ok(JobFinal::Decode { result: Err(e), path: PathBuf::from(path_job) }),
+        }
     });
 }
 
@@ -1614,6 +1620,12 @@ fn on_ltc_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
     if let Some(status) = els.current.jobs.get_mut(&JobKind::LtcDecode) {
         status.apply_outcome(&outcome);
     }
+    if matches!(outcome, job::JobOutcome::Cancelled { .. }) {
+        els.current.decode.result = None;
+        els.current.decode.error = None;
+        els.current.status.set_decode("Decode canceled");
+        return;
+    }
     let (result, path) = match payload {
         JobFinal::Decode { result, path } => (result, path),
         other => {
@@ -1645,18 +1657,17 @@ fn on_ltc_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
                 recompute_converter_derived(&mut els.current);
             }
         }
-        Err(e) => {
-            let is_cancel = e == "Decode canceled by user";
+        Err(LtcDecodeError::Cancelled) => {
             els.current.decode.result = None;
-            els.current.decode.error = if is_cancel { None } else { Some(e.clone()) };
-            els.current.status.set_decode(if is_cancel {
-                "Decode canceled".to_string()
-            } else {
-                format!("Parse failed: {}", e)
-            });
-            if !is_cancel {
-                error!("LTC decode failed: {} — {}", path.display(), e);
-            }
+            els.current.decode.error = None;
+            els.current.status.set_decode("Decode canceled");
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            els.current.decode.result = None;
+            els.current.decode.error = Some(msg.clone());
+            els.current.status.set_decode(format!("Parse failed: {}", msg));
+            error!("LTC decode failed: {} — {}", path.display(), msg);
         }
     }
 }
@@ -2408,8 +2419,8 @@ mod tests {
         els.current.decode.result = Some(make_ltc_result());
         on_ltc_decode_finished(
             &mut els,
-            JobOutcome::Failed { error: "Decode canceled by user".into(), log: String::new() },
-            JobFinal::Decode { result: Err("Decode canceled by user".into()), path: PathBuf::from("/tmp/x.wav") },
+            job::JobOutcome::Cancelled { log: String::new() },
+            job::JobFinal::NoPayload,
         );
         assert!(els.current.decode.result.is_none());
         assert!(els.current.decode.error.is_none(), "cancel must not surface as an error");

@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicBool;
 // ── Types ──────────────────────────────────────────────────────────────────
 
 pub use types::{
-    AudioDeviceInfo, AudioEvent, ChannelSel, DecodeConfig, DecodeProgress, Timecode,
+    AudioDeviceInfo, AudioEvent, ChannelSel, DecodeConfig, DecodeProgress, LtcDecodeError, Timecode,
 };
 
 // ── Chunked LTC decode ────────────────────────────────────────────────────
@@ -55,6 +55,6 @@ pub fn decode_ltc_with_decoder(
     fps: f64,
     drop_frame: bool,
     cancel: Option<&AtomicBool>,
-) -> Result<LtcDetectionResult, String> {
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     decoder::decoder_for(use_libltc).decode_wav(path, fps, drop_frame, cancel)
 }

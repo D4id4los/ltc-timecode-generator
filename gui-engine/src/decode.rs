@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use audio_core::LtcDecodeError;
 use audio_core::{DecodeConfig, DecodeProgress, LtcDetectionResult, WavChunkReader};
 use log::info;
 
@@ -43,7 +44,7 @@ pub fn decode_video_channel<F: Fn(f32)>(
     capture_gen: u64,
     on_extract_progress: &F,
     decode_unit: Option<job::UnitProgress>,
-) -> Result<LtcDetectionResult, String> {
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     let VideoDecodeRequest {
         path,
         stream_index,
@@ -69,12 +70,12 @@ pub fn decode_video_channel<F: Fn(f32)>(
         duration,
         Some(cancel),
         on_extract_progress,
-    ).map_err(|e| format!("Audio extraction failed: {}", e))?;
+    ).map_err(|e| LtcDecodeError::Failed(format!("Audio extraction failed: {}", e)))?;
 
     // Check cancel after extraction, before decode
     if cancel.load(Ordering::Relaxed) {
         let _ = std::fs::remove_file(&tmp_wav);
-        return Err("Decode canceled by user".to_string());
+        return Err(LtcDecodeError::Cancelled);
     }
 
     let wav_path = tmp_wav.clone();
@@ -121,7 +122,7 @@ pub fn decode_video_channel<F: Fn(f32)>(
                 result
             }
         }
-        Err(e) => Err(format!("Failed to open extracted WAV: {}", e)),
+        Err(e) => Err(LtcDecodeError::Failed(format!("Failed to open extracted WAV: {}", e))),
     };
 
     // Stamp total pipeline time (extraction + decode) onto the result
@@ -151,7 +152,7 @@ pub fn decode_wav_file(
     single_pass: bool,
     decode_fps: f64,
     decode_drop_frame: bool,
-) -> Result<LtcDetectionResult, String> {
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     if single_pass {
         return audio_core::decode_ltc_with_decoder(path, use_libltc, decode_fps, decode_drop_frame, None);
     }
@@ -199,24 +200,24 @@ pub fn decode_video_file(
     decode_fps: f64,
     decode_drop_frame: bool,
     cancel: Option<&Arc<AtomicBool>>,
-) -> Result<LtcDetectionResult, String> {
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     // Probe the video file to validate it has audio streams
     let probe = ffprobe::probe_video_audio(path)
-        .map_err(|e| format!("Failed to probe video: {}", e))?;
+        .map_err(|e| LtcDecodeError::Failed(format!("Failed to probe video: {}", e)))?;
 
     if stream_pos >= probe.streams.len() {
-        return Err(format!(
+        return Err(LtcDecodeError::Failed(format!(
             "Audio stream index {} out of range ({} streams available). Use --audio-stream to select.",
             stream_pos,
             probe.streams.len(),
-        ));
+            )));
     }
     let stream = &probe.streams[stream_pos];
     if channel_idx >= stream.channels {
-        return Err(format!(
+        return Err(LtcDecodeError::Failed(format!(
             "Channel index {} out of range for stream {} ({} channels available). Use --audio-channel to select.",
             channel_idx, stream_pos, stream.channels,
-        ));
+            )));
     }
     let stream_idx = stream.stream_index;
 

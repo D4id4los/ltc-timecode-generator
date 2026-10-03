@@ -541,6 +541,7 @@ fn run_decode_on_wav(
     drop_frame: bool,
 ) -> Result<audio_core::LtcDetectionResult, String> {
     crate::decode::decode_wav_file(path, use_libltc, single_pass, fps, drop_frame)
+        .map_err(|e| e.to_string())
 }
 
 fn print_decode_results(
@@ -744,7 +745,7 @@ fn run_decode_video(cli: Cli) -> Result<audio_core::LtcDetectionResult, CliError
         cli.decode_drop_frame,
         None,
     )
-    .map_err(CliError::Decode)?;
+    .map_err(|e| CliError::Decode(e.to_string()))?;
     eprintln!(" done.");
 
     result.processing_time_ms = pipeline_start.elapsed().as_secs_f64() * 1000.0;

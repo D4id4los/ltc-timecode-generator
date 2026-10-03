@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
+use crate::LtcDecodeError;
 use crate::Timecode;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -170,7 +171,7 @@ fn decode_ltc_samples_inner(
     drop_frame: bool,
     start: std::time::Instant,
     cancel: Option<&AtomicBool>,
-) -> Result<LtcDetectionResult, String> {
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     if samples.is_empty() {
         warn!("LTC decode: audio buffer contains no samples");
         return Ok(LtcDetectionResult::error("Audio buffer contains no samples"));
@@ -206,7 +207,7 @@ fn decode_ltc_samples_inner(
     }
 
     if cancelled(cancel) {
-        return Err("Decode canceled by user".to_string());
+        return Err(LtcDecodeError::Cancelled);
     }
 
     if zc.len() < 8 {
@@ -284,7 +285,7 @@ fn scan_windows(
     fps: f64,
     drop_frame: bool,
     cancel: Option<&AtomicBool>,
-) -> Result<WindowScan, String> {
+) -> Result<WindowScan, LtcDecodeError> {
     const WINDOW_SECS: f64 = 30.0;
     const STRIDE_SECS: f64 = 15.0;
     const HIGH_CONF_THRESHOLD: f32 = 0.70;
@@ -299,7 +300,7 @@ fn scan_windows(
 
     for window_idx in 0..max_windows {
         if cancelled(cancel) {
-            return Err("Decode canceled by user".to_string());
+            return Err(LtcDecodeError::Cancelled);
         }
         let window_start = window_idx * stride;
         let window_end = (window_start + window_len).min(samples.len());
@@ -388,15 +389,15 @@ pub(crate) fn decode_ltc_samples(
     drop_frame: bool,
     start: std::time::Instant,
     cancel: Option<&AtomicBool>,
-) -> Result<LtcDetectionResult, String> {
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     decode_ltc_samples_inner(samples, sample_rate, channels, fps, drop_frame, start, cancel)
 }
 
-pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, String> {
+pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, LtcDecodeError> {
     let start = std::time::Instant::now();
 
     let mut reader = hound::WavReader::open(path)
-        .map_err(|e| format!("Failed to open WAV file: {}", e))?;
+        .map_err(|e| LtcDecodeError::Failed(format!("Failed to open WAV file: {}", e)))?;
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
@@ -405,13 +406,13 @@ pub fn decode_ltc_from_wav(path: &Path, fps: f64, drop_frame: bool, cancel: Opti
 
     info!("LTC decode (+{:.1}s): reading audio samples from disk...", start.elapsed().as_secs_f64());
     let samples = read_mono_samples(&mut reader, &spec)
-        .map_err(|e| format!("Failed to read audio samples: {}", e))?;
+        .map_err(|e| LtcDecodeError::Failed(format!("Failed to read audio samples: {}", e)))?;
 
     drop(reader);
 
     if let Some(c) = cancel {
         if c.load(Ordering::Relaxed) {
-            return Err("Decode canceled by user".to_string());
+            return Err(LtcDecodeError::Cancelled);
         }
     }
 
@@ -598,7 +599,7 @@ fn build_result(
     channels: usize,
     total_duration: f64,
     start: std::time::Instant,
-) -> Result<LtcDetectionResult, String> {
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     let elapsed = start.elapsed();
     let processing_time_ms = elapsed.as_secs_f64() * 1000.0;
 

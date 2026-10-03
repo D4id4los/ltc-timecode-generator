@@ -67,6 +67,25 @@ pub struct AudioDeviceInfo {
     pub buffer_max: u32,
 }
 
+/// Why an LTC decode produced no result. `Cancelled` is a normal,
+/// user-initiated outcome — callers must not surface it as an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LtcDecodeError {
+    /// The caller's cancel flag was observed; no result was produced.
+    Cancelled,
+    /// The decode could not run or failed (I/O, format, extraction, …).
+    Failed(String),
+}
+
+impl std::fmt::Display for LtcDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LtcDecodeError::Cancelled => f.write_str("Decode canceled by user"),
+            LtcDecodeError::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
 /// Configuration for chunked WAV reading.
 pub struct DecodeConfig {
     /// Target raw-audio chunk size in bytes (~50MB).

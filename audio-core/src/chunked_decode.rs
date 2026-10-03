@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::LtcDecodeError;
 use crate::decoder::LtcDecoder;
 use crate::ltc_decoder::{
     apply_coherent_first_timecode, compute_ltc_quality,
@@ -114,8 +115,8 @@ pub fn decode_ltc_chunked(
     drop_frame: bool,
     config: DecodeConfig,
     progress: &DecodeProgress,
-) -> Result<LtcDetectionResult, String> {
-    let (chunk_reader, overall_start) = WavChunkReader::open(path)?;
+) -> Result<LtcDetectionResult, LtcDecodeError> {
+    let (chunk_reader, overall_start) = WavChunkReader::open(path).map_err(LtcDecodeError::Failed)?;
     let plan = plan_chunks(&chunk_reader, &config);
 
     debug!("decode_ltc_chunked: {} samples @ {} Hz, config chunk={} bytes, overlap={}s",
@@ -148,7 +149,7 @@ pub fn decode_ltc_chunked(
 
     chunk_results.sort_by_key(|cr| cr.chunk_idx);
     if progress.cancel_flag.load(Ordering::Relaxed) {
-        return Err("Decode canceled by user".to_string());
+        return Err(LtcDecodeError::Cancelled);
     }
 
     let merged = merge_results(&chunk_results, &plan, fps);
@@ -184,7 +185,7 @@ pub fn decode_ltc_chunked(
 /// Result produced by decoding one chunk.
 struct ChunkResult {
     chunk_idx: usize,
-    result: Result<LtcDetectionResult, String>,
+    result: Result<LtcDetectionResult, LtcDecodeError>,
 }
 
 /// Decode chunks strictly in order, honoring cancellation between chunks.
@@ -263,7 +264,7 @@ fn run_parallel(
             Some(r) => collected.push(r),
             None => collected.push(ChunkResult {
                 chunk_idx: idx,
-                result: Err("Canceled".to_string()),
+                result: Err(LtcDecodeError::Cancelled),
             }),
         }
     }
@@ -391,14 +392,14 @@ fn decode_one_chunk(
     let num_samples = end_sample - start_sample;
 
     if cancel_flag.load(Ordering::Relaxed) {
-        return ChunkResult { chunk_idx, result: Err("Canceled".to_string()) };
+        return ChunkResult { chunk_idx, result: Err(LtcDecodeError::Cancelled) };
     }
 
     let mut local_reader = match WavChunkReader::open(path) {
         Ok((r, _)) => r,
         Err(e) => return ChunkResult {
             chunk_idx,
-            result: Err(format!("Failed to open file for chunk {}: {}", chunk_idx, e)),
+            result: Err(LtcDecodeError::Failed(format!("Failed to open file for chunk {}: {}", chunk_idx, e))),
         },
     };
 
@@ -600,8 +601,8 @@ mod tests {
     fn test_merge_all_error_chunks_zeroed() {
         let plan = test_plan(vec![(0, 24_000), (24_000, 48_000)], 2.0, 2.0);
         let results = vec![
-            ChunkResult { chunk_idx: 0, result: Err("boom 0".to_string()) },
-            ChunkResult { chunk_idx: 1, result: Err("boom 1".to_string()) },
+            ChunkResult { chunk_idx: 0, result: Err(LtcDecodeError::Failed("boom 0".into())) },
+            ChunkResult { chunk_idx: 1, result: Err(LtcDecodeError::Failed("boom 1".into())) },
         ];
         let merged = merge_results(&results, &plan, 25.0);
         assert_eq!(merged.valid_frames, 0);
@@ -615,7 +616,7 @@ mod tests {
     fn test_merge_error_chunks_do_not_abort_merge() {
         let plan = test_plan(vec![(0, 24_000), (24_000, 48_000)], 2.0, 2.0);
         let results = vec![
-            ChunkResult { chunk_idx: 0, result: Err("read failure".to_string()) },
+            ChunkResult { chunk_idx: 0, result: Err(LtcDecodeError::Failed("read failure".into())) },
             ChunkResult { chunk_idx: 1, result: Ok(chunk_ok(0.0, 1)) },
         ];
         let merged = merge_results(&results, &plan, 25.0);
@@ -654,18 +655,18 @@ mod tests {
     /// Canned per-chunk decoder: `results[chunk_idx]` is returned verbatim
     /// (index-addressed, so parallel and sequential runs are deterministic).
     struct MockDecoder {
-        results: Vec<Result<LtcDetectionResult, String>>,
+        results: Vec<Result<LtcDetectionResult, LtcDecodeError>>,
         cancel_flag: Option<Arc<AtomicBool>>,
         cancel_after_calls: Option<usize>,
         calls: AtomicUsize,
     }
 
     impl MockDecoder {
-        fn new(results: Vec<Result<LtcDetectionResult, String>>) -> Self {
+        fn new(results: Vec<Result<LtcDetectionResult, LtcDecodeError>>) -> Self {
             Self { results, cancel_flag: None, cancel_after_calls: None, calls: AtomicUsize::new(0) }
         }
 
-        fn bailing(results: Vec<Result<LtcDetectionResult, String>>,
+        fn bailing(results: Vec<Result<LtcDetectionResult, LtcDecodeError>>,
                    cancel_flag: Arc<AtomicBool>, after: usize) -> Self {
             Self { results, cancel_flag: Some(cancel_flag), cancel_after_calls: Some(after), calls: AtomicUsize::new(0) }
         }
@@ -675,13 +676,13 @@ mod tests {
         fn name(&self) -> &'static str { "mock" }
 
         fn decode_wav(&self, _path: &Path, _fps: f64, _drop: bool,
-                      _cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, String> {
-            Err("mock: decode_wav not supported".to_string())
+                      _cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, LtcDecodeError> {
+            Err(LtcDecodeError::Failed("mock: decode_wav not supported".to_string()))
         }
 
         fn decode_chunk(&self, _path: &Path, _reader: &mut WavChunkReader, chunk_idx: usize,
                         _start: usize, _len: usize, _sample_rate: u32, _fps: f64, _drop: bool,
-                        _start_time: Instant, _cancel: &AtomicBool) -> Result<LtcDetectionResult, String> {
+                        _start_time: Instant, _cancel: &AtomicBool) -> Result<LtcDetectionResult, LtcDecodeError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if let (Some(flag), Some(after)) = (&self.cancel_flag, self.cancel_after_calls) {
                 if n + 1 >= after {
@@ -699,7 +700,7 @@ mod tests {
         )
     }
 
-    fn five_ok_results() -> Vec<Result<LtcDetectionResult, String>> {
+    fn five_ok_results() -> Vec<Result<LtcDetectionResult, LtcDecodeError>> {
         (0..5)
             .map(|i| Ok(chunk_ok(i as f64 * 0.9, 2)))
             .collect()
@@ -773,7 +774,7 @@ mod tests {
         );
         assert_eq!(results.len(), 5);
         for cr in &results {
-            assert_eq!(cr.result.as_ref().unwrap_err(), "Canceled");
+            assert_eq!(cr.result.as_ref().unwrap_err(), &LtcDecodeError::Cancelled);
         }
         assert_eq!(progress.chunks_completed.load(Ordering::Relaxed), 0);
     }
@@ -1355,8 +1356,7 @@ mod tests {
         let result = decode_ltc_chunked(&path, false, 25.0, false, config, &progress);
         assert!(result.is_err(), "canceled decode should return Err");
         let err = result.unwrap_err();
-        assert!(err.contains("Canceled") || err.contains("canceled"),
-            "error should mention cancel: {}", err);
+        assert_eq!(err, LtcDecodeError::Cancelled);
     }
 
     #[test]

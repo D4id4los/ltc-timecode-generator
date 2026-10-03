@@ -5,14 +5,15 @@ use std::time::Instant;
 use libltc_rs::prelude::*;
 use log::{debug, info, warn};
 
+use crate::LtcDecodeError;
 use crate::ltc_decoder::{apply_coherent_first_timecode, compute_ltc_quality, CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
 use crate::Timecode;
 
-pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, String> {
+pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, LtcDecodeError> {
     let start = Instant::now();
 
     let mut reader = hound::WavReader::open(path)
-        .map_err(|e| format!("Failed to open WAV file: {}", e))?;
+        .map_err(|e| LtcDecodeError::Failed(format!("Failed to open WAV file: {}", e)))?;
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
@@ -25,15 +26,15 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cance
     );
 
     if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
-        return Err(format!(
+        return Err(LtcDecodeError::Failed(format!(
             "libltc decoder requires 16-bit integer PCM WAV (got {} bit {:?})",
             spec.bits_per_sample, spec.sample_format
-        ));
+        )));
     }
 
     if let Some(c) = cancel {
         if c.load(Ordering::Relaxed) {
-            return Err("Decode canceled by user".to_string());
+            return Err(LtcDecodeError::Cancelled);
         }
     }
 
@@ -56,7 +57,7 @@ pub(crate) fn decode_ltc_samples_libltc(
     drop_frame: bool,
     start: Instant,
     cancel: Option<&AtomicBool>,
-) -> Result<LtcDetectionResult, String> {
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     let total_samples = sample_data.len() / channels;
     if total_samples == 0 {
         return Ok(LtcDetectionResult::error("Audio buffer contains no samples"));
@@ -69,7 +70,7 @@ pub(crate) fn decode_ltc_samples_libltc(
     };
 
     let mut decoder = LTCDecoder::try_new(&config)
-        .map_err(|e| format!("Failed to create libltc decoder: {:?}", e))?;
+        .map_err(|e| LtcDecodeError::Failed(format!("Failed to create libltc decoder: {:?}", e)))?;
 
     let chunk_size: usize = 8192;
     let mut sample_pos: i64 = 0;
@@ -80,7 +81,7 @@ pub(crate) fn decode_ltc_samples_libltc(
         for chunk in sample_data.chunks(chunk_size) {
             if let Some(c) = cancel {
                 if c.load(Ordering::Relaxed) {
-                    return Err("Decode canceled by user".to_string());
+                    return Err(LtcDecodeError::Cancelled);
                 }
             }
             decoder.write_i16(chunk, sample_pos);
@@ -105,7 +106,7 @@ pub(crate) fn decode_ltc_samples_libltc(
         for chunk_start in (0..sample_data.len()).step_by(chunk_size * channels) {
             if let Some(c) = cancel {
                 if c.load(Ordering::Relaxed) {
-                    return Err("Decode canceled by user".to_string());
+                    return Err(LtcDecodeError::Cancelled);
                 }
             }
             let chunk_end = (chunk_start + chunk_size * channels).min(sample_data.len());
@@ -401,6 +402,6 @@ mod tests {
         let result = decode_ltc_from_wav_libltc(&path, 25.0, false, None);
         assert!(result.is_err(), "expected error for non-16-bit WAV");
         let err = result.unwrap_err();
-        assert!(err.contains("32 bit"), "error should mention bit depth: {}", err);
+        assert!(matches!(&err, LtcDecodeError::Failed(m) if m.contains("32 bit")), "error should mention bit depth: {}", err);
     }
 }

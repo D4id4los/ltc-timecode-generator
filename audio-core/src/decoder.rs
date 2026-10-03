@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use crate::LtcDecodeError;
 use crate::ltc_decoder::{decode_ltc_from_wav, decode_ltc_samples, LtcDetectionResult};
 use crate::ltc_decoder_libltc::{decode_ltc_from_wav_libltc, decode_ltc_samples_libltc};
 use crate::wav_chunk_reader::WavChunkReader;
@@ -21,17 +22,14 @@ pub trait LtcDecoder: Send + Sync {
         fps: f64,
         drop_frame: bool,
         cancel: Option<&AtomicBool>,
-    ) -> Result<LtcDetectionResult, String>;
+    ) -> Result<LtcDetectionResult, LtcDecodeError>;
 
     /// Decode the chunk `[start, start+len)` (mono-sample units) of `path`
     /// via `reader`. Each backend reads its own preferred sample format —
     /// f32 for builtin, i16 for libltc (whose "requires 16-bit int PCM"
     /// failure surfaces as the existing `Failed to read chunk N` error).
-    ///
-    /// `chunk_idx` is passed in so the impls keep producing the exact
-    /// current error strings (`"Failed to read chunk {chunk_idx}: {e}"`);
-    /// it must not be wrapped at the call site, or cancel errors would get
-    /// double-prefixed (`Err("Decode canceled by user")` must stay verbatim).
+    /// `chunk_idx` only formats into that prose message; cancellation is
+    /// carried by `LtcDecodeError::Cancelled`, not by this wrapper.
     #[allow(clippy::too_many_arguments)]
     fn decode_chunk(
         &self,
@@ -45,7 +43,7 @@ pub trait LtcDecoder: Send + Sync {
         drop_frame: bool,
         start_time: Instant,
         cancel: &AtomicBool,
-    ) -> Result<LtcDetectionResult, String>;
+    ) -> Result<LtcDetectionResult, LtcDecodeError>;
 }
 
 /// Pure-Rust builtin decoder (f32 samples, chunked parallel decode support).
@@ -65,7 +63,7 @@ impl LtcDecoder for BuiltinDecoder {
         fps: f64,
         drop_frame: bool,
         cancel: Option<&AtomicBool>,
-    ) -> Result<LtcDetectionResult, String> {
+    ) -> Result<LtcDetectionResult, LtcDecodeError> {
         decode_ltc_from_wav(path, fps, drop_frame, cancel)
     }
 
@@ -81,12 +79,12 @@ impl LtcDecoder for BuiltinDecoder {
         drop_frame: bool,
         start_time: Instant,
         cancel: &AtomicBool,
-    ) -> Result<LtcDetectionResult, String> {
+    ) -> Result<LtcDetectionResult, LtcDecodeError> {
         match reader.read_mono_samples_f32(start, len) {
             Ok(samples) => decode_ltc_samples(
                 &samples, sample_rate, 1, fps, drop_frame, start_time, Some(cancel),
             ),
-            Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
+            Err(e) => Err(LtcDecodeError::Failed(format!("Failed to read chunk {}: {}", chunk_idx, e))),
         }
     }
 }
@@ -102,7 +100,7 @@ impl LtcDecoder for LibltcDecoder {
         fps: f64,
         drop_frame: bool,
         cancel: Option<&AtomicBool>,
-    ) -> Result<LtcDetectionResult, String> {
+    ) -> Result<LtcDetectionResult, LtcDecodeError> {
         decode_ltc_from_wav_libltc(path, fps, drop_frame, cancel)
     }
 
@@ -118,12 +116,12 @@ impl LtcDecoder for LibltcDecoder {
         drop_frame: bool,
         start_time: Instant,
         cancel: &AtomicBool,
-    ) -> Result<LtcDetectionResult, String> {
+    ) -> Result<LtcDetectionResult, LtcDecodeError> {
         match reader.read_mono_samples_i16(start, len) {
             Ok(samples) => decode_ltc_samples_libltc(
                 &samples, 1, sample_rate, fps, drop_frame, start_time, Some(cancel),
             ),
-            Err(e) => Err(format!("Failed to read chunk {}: {}", chunk_idx, e)),
+            Err(e) => Err(LtcDecodeError::Failed(format!("Failed to read chunk {}: {}", chunk_idx, e))),
         }
     }
 }
