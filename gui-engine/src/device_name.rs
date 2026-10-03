@@ -513,33 +513,53 @@ mod tests {
 
     // ── sample cap & budget ───────────────────────────────────────────
 
-    #[test]
-    fn test_try_metadata_sample_cap_skips_fourth_file() {
-        let dir = TempDir::new().unwrap();
-        // First 3 video files have no modelName; only the 4th does.
-        // DEVICE_NAME_PROBE_SAMPLE = 3 → step 1 must NOT find it.
-        // Use `clipNNNN.mp4` suffix — no camera pattern matches `clip*`.
-        for i in 0..3 {
-            let f = dir.path().join(format!("clip{:04}.mp4", i));
-            let content = vec![0u8; 5000];
+    /// Build `DEVICE_NAME_PROBE_SAMPLE + 1` clean-ish video files with the
+    /// model-bearing one at `model_index` (sorted `clipNNNN.mp4` names —
+    /// no camera pattern matches `clip*`, so resolution must come from the
+    /// metadata probe).
+    fn make_model_probe_files(dir: &std::path::Path, model_index: usize) -> Vec<std::path::PathBuf> {
+        for i in 0..DEVICE_NAME_PROBE_SAMPLE + 1 {
+            let f = dir.join(format!("clip{:04}.mp4", i));
+            let mut content = vec![0u8; 5000];
+            if i == model_index {
+                let xml = br#"<Device manufacturer="Sony" modelName="ILCE-6700"/>"#;
+                content[4500..4500 + xml.len()].copy_from_slice(xml);
+            }
             fs::write(&f, &content).unwrap();
         }
-        let f4 = dir.path().join("clip0003.mp4");
-        let mut content4 = vec![0u8; 5000];
-        let xml = br#"<Device manufacturer="Sony" modelName="ILCE-6700"/>"#;
-        content4[4500..4500 + xml.len()].copy_from_slice(xml);
-        fs::write(&f4, &content4).unwrap();
-
-        let mut files: Vec<_> = dir.path().read_dir().unwrap()
+        let mut files: Vec<_> = dir.read_dir().unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .collect();
         files.sort();
+        files
+    }
 
-        // Step 1 only sees first 3 files (no model) → falls to unknown.
+    #[test]
+    fn test_metadata_probe_never_reads_past_sample_cap() {
+        // Policy: DEVICE_NAME_PROBE_SAMPLE is a perf budget on how many
+        // files the metadata probe may read, not a UX contract — the file
+        // count and the out-of-cap position here are derived from the
+        // constant, so resizing the budget cannot break this test.
+        let dir = TempDir::new().unwrap();
+        let files = make_model_probe_files(dir.path(), DEVICE_NAME_PROBE_SAMPLE);
+
         let (name, source, _) = resolve_device_name(&files, "", None);
         assert_eq!(name, "unknown");
         assert_eq!(source, DeviceNameSource::Unknown);
+    }
+
+    #[test]
+    fn test_metadata_probe_finds_model_at_last_sampled_file() {
+        // Boundary-positive twin: a model in the *last* sampled file
+        // (index DEVICE_NAME_PROBE_SAMPLE - 1, i.e. the cap is inclusive)
+        // must be found — until now only index-0 discovery was tested.
+        let dir = TempDir::new().unwrap();
+        let files = make_model_probe_files(dir.path(), DEVICE_NAME_PROBE_SAMPLE - 1);
+
+        let (name, source, _) = resolve_device_name(&files, "", None);
+        assert_eq!(name, "A6700");
+        assert_eq!(source, DeviceNameSource::Metadata);
     }
 
     #[test]
