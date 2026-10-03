@@ -111,7 +111,14 @@ writeFileSync(resolve(OUT_DIR, 'hotspots.json'), JSON.stringify({total: hotspots
 
 // 5. Human-readable summary
 const m = Object.fromEntries(measures.component.measures.map((x) => [x.metric, x.value]));
-const gate = qg.projectStatus.status === 'OK' ? 'PASSED' : `FAILED (${qg.projectStatus.conditions?.filter((c) => c.status === 'ERROR').map((c) => c.metricKey).join(', ')})`;
+// NONE = no gate assigned (cannot fail); OK = passed; else failed, listing
+// the error conditions.
+const gate = qg.projectStatus.status === 'OK'
+  ? 'PASSED'
+  : qg.projectStatus.status === 'NONE'
+    ? 'NO GATE DEFINED'
+    : `FAILED (${qg.projectStatus.conditions?.filter((c) => c.status === 'ERROR').map((c) => c.metricKey).join(', ')})`;
+const rating = (v) => RATING[Number(v)] ?? '?';
 const bySeverity = {};
 for (const i of issues) bySeverity[i.severity] = (bySeverity[i.severity] ?? 0) + 1;
 
@@ -129,7 +136,19 @@ lines.push(`| Duplication | ${m.duplicated_lines_density ?? '?'}% |`);
 lines.push(`| Cyclomatic complexity | ${m.complexity ?? '?'} |`);
 lines.push(`| Cognitive complexity | ${m.cognitive_complexity ?? '?'} |`);
 lines.push(`| Bugs / Code smells / Vulns | ${m.bugs ?? 0} / ${m.code_smells ?? 0} / ${m.vulnerabilities ?? 0} |`);
-lines.push(`| Ratings (Reliability/Security/Maintainability) | ${RATING[m.reliability_rating] ?? '?'} / ${RATING[m.security_rating] ?? '?'} / ${RATING[m.sqale_rating ?? m.maintainability_rating] ?? '?'} |`);
+lines.push(`| Ratings (Reliability/Security/Maintainability) | ${rating(m.reliability_rating)} / ${rating(m.security_rating)} / ${rating(m.maintainability_rating ?? m.sqale_rating)} |`);
+lines.push('\n### New-code conditions');
+const conditions = qg.projectStatus.conditions ?? [];
+if (conditions.length === 0) {
+  lines.push('\n(no gate assigned — the portal cannot fail on anything)');
+} else {
+  lines.push('\n| Metric | Comparator | Error threshold | Status | Actual |');
+  lines.push('|---|---|---|---|---|');
+  for (const c of conditions) {
+    const actual = c.actualValue ?? '-';
+    lines.push(`| ${c.metricKey} | ${c.comparator} | ${c.errorThreshold} | ${c.status} | ${actual} |`);
+  }
+}
 lines.push(`\n## Open issues: ${issues.length}`);
 for (const s of [...SEVERITY_ORDER].reverse()) {
   if (bySeverity[s]) lines.push(`- ${s}: ${bySeverity[s]}`);
