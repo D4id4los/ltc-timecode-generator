@@ -2,7 +2,9 @@
 //! ffprobe, camera metadata, and device-name resolution in one place so
 //! the engine's probe policy is testable without the engine thread.
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Output;
 
 use crate::camera_meta;
 use crate::device_name;
@@ -18,6 +20,17 @@ use crate::ffprobe::VideoAudioProbe;
 pub fn probe_clip_set(
     files: &[PathBuf],
 ) -> (Vec<Result<VideoAudioProbe, String>>, Vec<Option<crate::CameraInfo>>, String) {
+    probe_clip_set_with(files, &mut camera_meta::run_probe_program)
+}
+
+/// Injectable variant of [`probe_clip_set`]: `camera_runner` receives
+/// `(program_name, &[arg_strings])` for every camera-metadata probe
+/// attempt and must return `io::Result<Output>` matching what the real
+/// program would produce.
+pub fn probe_clip_set_with(
+    files: &[PathBuf],
+    camera_runner: &mut dyn FnMut(&str, &[String]) -> io::Result<Output>,
+) -> (Vec<Result<VideoAudioProbe, String>>, Vec<Option<crate::CameraInfo>>, String) {
     log::info!("Converter clip probe started: {} file(s)", files.len());
     let probes: Vec<Result<VideoAudioProbe, String>> = files.iter()
         .map(|f| crate::ffprobe::probe_video_audio(f).map_err(|e| e.to_string()))
@@ -26,7 +39,7 @@ pub fn probe_clip_set(
         .enumerate()
         .map(|(i, f)| {
             if i < device_name::DEVICE_NAME_PROBE_SAMPLE {
-                camera_meta::probe_camera_info(f)
+                camera_meta::probe_camera_info_with(f, camera_runner)
             } else {
                 None
             }

@@ -51,28 +51,32 @@ pub struct CameraInfo {
 /// Convenience wrapper — probes `path` for camera info using real subprocesses
 /// with a 10-second timeout per subprocess.
 pub fn probe_camera_info(path: &Path) -> Option<CameraInfo> {
-    probe_camera_info_with(path, &mut |prog, args| {
-        crate::subprocess::run_output_with_timeout(
-            crate::subprocess::no_window_command(prog)
-                .args(args)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null()),
-            crate::subprocess::PROBE_TIMEOUT,
-        )
-        .map_err(|e| match e {
-            crate::subprocess::SubprocessFailure::Io(msg) => {
-                io::Error::other(msg)
-            }
-            crate::subprocess::SubprocessFailure::TimedOut => {
-                io::Error::new(io::ErrorKind::TimedOut, "probe timed out")
-            }
-            // run_output_with_timeout never produces these, but the match
-            // must stay exhaustive; treat like a generic failure.
-            crate::subprocess::SubprocessFailure::NonZeroExit { stderr_tail } => {
-                io::Error::other(stderr_tail)
-            }
-            crate::subprocess::SubprocessFailure::Parse(msg) => io::Error::other(msg),
-        })
+    probe_camera_info_with(path, &mut run_probe_program)
+}
+
+/// Default probe runner: spawn `prog` with `args` under the probe timeout,
+/// mapping the shared subprocess failure type onto `io::Error`.
+pub(crate) fn run_probe_program(prog: &str, args: &[String]) -> io::Result<Output> {
+    crate::subprocess::run_output_with_timeout(
+        crate::subprocess::no_window_command(prog)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+        crate::subprocess::PROBE_TIMEOUT,
+    )
+    .map_err(|e| match e {
+        crate::subprocess::SubprocessFailure::Io(msg) => {
+            io::Error::other(msg)
+        }
+        crate::subprocess::SubprocessFailure::TimedOut => {
+            io::Error::new(io::ErrorKind::TimedOut, "probe timed out")
+        }
+        // run_output_with_timeout never produces these, but the match
+        // must stay exhaustive; treat like a generic failure.
+        crate::subprocess::SubprocessFailure::NonZeroExit { stderr_tail } => {
+            io::Error::other(stderr_tail)
+        }
+        crate::subprocess::SubprocessFailure::Parse(msg) => io::Error::other(msg),
     })
 }
 

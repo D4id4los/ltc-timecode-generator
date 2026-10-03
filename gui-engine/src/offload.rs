@@ -13,6 +13,16 @@ use crate::device_name;
 use crate::subprocess::no_window_command;
 pub use crate::device_name::DeviceNameSource;
 
+/// Extract drive letters from a `GetLogicalDrives` bitmask (bit 0 = 'A').
+/// Platform-independent so the parsing logic is unit-testable off-Windows.
+pub(crate) fn drive_letters_from_mask(mask: u32) -> Vec<char> {
+    (0..26u32)
+        .filter(|i| (mask >> i) & 1 == 1)
+        .map(|i| char::from_u32(b'A' as u32 + i).unwrap_or('?'))
+        .collect()
+}
+
+
 // ── Windows drive enumeration helper ─────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -37,14 +47,11 @@ mod win_driver {
         if mask == 0 {
             return candidates;
         }
-        for i in 0..26u32 {
-            if (mask >> i) & 1 == 1 {
-                let letter = char::from_u32(b'A' as u32 + i).unwrap_or('?');
-                let root = format!("{}:\\", letter);
-                let root_wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
-                let kind = unsafe { FileSystem::GetDriveTypeW(root_wide.as_ptr()) };
-                candidates.push(DriveCandidate { letter, kind, root: PathBuf::from(root) });
-            }
+        for letter in drive_letters_from_mask(mask) {
+            let root = format!("{}:\\", letter);
+            let root_wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+            let kind = unsafe { FileSystem::GetDriveTypeW(root_wide.as_ptr()) };
+            candidates.push(DriveCandidate { letter, kind, root: PathBuf::from(root) });
         }
         candidates
     }
