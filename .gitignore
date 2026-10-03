@@ -32,3 +32,5 @@ clippy-report.json
 lcov.info
 reports/
 
+# Agent Planning artefacts
+plans/
