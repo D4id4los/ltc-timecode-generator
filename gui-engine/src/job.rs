@@ -1479,12 +1479,11 @@ mod tests {
         assert!(second_id.0 > first_id.0, "second spawn should have larger JobId");
     }
 
-    // NOTE: stale-finished-event *gating* lives in the engine
-    // (`engine.rs::handle_job_event` checks `latest_job` per kind); the
-    // supervisor's `drain()` returns everything unfiltered. This test
-    // therefore only proves that re-running a job of the same kind delivers
-    // exactly one Finished event. Engine-level stale-gating coverage is
-    // WP-T4's decision (see plans/TEST_SUITE_WPS.md).
+    // NOTE: stale-event *gating* lives in the engine's event-drain loop
+    // (`engine.rs::job_event_is_stale`, unit-tested there); the supervisor's
+    // `drain()` returns everything unfiltered. This test therefore only
+    // proves that re-running a job of the same kind delivers exactly one
+    // Finished event.
     #[test]
     fn test_same_kind_rerun_delivers_one_finished_event() {
         let mut sup = JobSupervisor::new();

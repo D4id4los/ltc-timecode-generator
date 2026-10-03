@@ -490,9 +490,11 @@ fn test_single_video_decode_completes() {
     );
 
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running, "should not still be detecting");
+    // The test sends no cancel and feeds a valid video, so a terminal
+    // phase without a result is a failure, not a cancel-shaped pass-through.
     assert!(
-        snapshot.decode.error.is_none() || snapshot.decode.result.is_some(),
-        "should have either result or error, got error={:?}, result={:?}",
+        snapshot.decode.result.is_some(),
+        "a valid video decode must produce a result, got error={:?}, result={:?}",
         snapshot.decode.error, snapshot.decode.result
     );
 }

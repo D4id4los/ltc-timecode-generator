@@ -175,6 +175,7 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
 pub struct TestReport {
     pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub progress: std::sync::Arc<Mutex<f32>>,
+    progress_history: std::sync::Arc<Mutex<Vec<f32>>>,
     pub log: std::sync::Arc<Mutex<String>>,
     pub message: std::sync::Arc<Mutex<String>>,
     pub failed: std::sync::Arc<Mutex<bool>>,
@@ -192,6 +193,14 @@ impl TestReport {
     pub fn failure_count(&self) -> usize {
         self.failure_count.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Every progress value observed after each `report_step_fraction` /
+    /// `advance_step` call, in call order. All report calls happen
+    /// synchronously inside `run_conversion` on the calling thread, so the
+    /// history records the exact sequence deterministically.
+    pub fn progress_history(&self) -> Vec<f32> {
+        self.progress_history.lock().unwrap().clone()
+    }
 }
 
 impl Default for TestReport {
@@ -199,6 +208,7 @@ impl Default for TestReport {
         TestReport {
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             progress: std::sync::Arc::new(Mutex::new(0.0)),
+            progress_history: std::sync::Arc::new(Mutex::new(Vec::new())),
             log: std::sync::Arc::new(Mutex::new(String::new())),
             message: std::sync::Arc::new(Mutex::new(String::new())),
             failed: std::sync::Arc::new(Mutex::new(false)),
@@ -225,14 +235,17 @@ impl ConversionReport for TestReport {
     fn report_step_fraction(&self, step_fraction: f32, _line: &str) {
         let overall = *self.progress.lock().unwrap();
         let sw = *self.step_weight.lock().unwrap();
-        let combined = overall + step_fraction * sw;
-        *self.progress.lock().unwrap() = combined.min(1.0);
+        let combined = (overall + step_fraction * sw).min(1.0);
+        *self.progress.lock().unwrap() = combined;
+        self.progress_history.lock().unwrap().push(combined);
     }
 
     fn advance_step(&self) {
         let overall = *self.progress.lock().unwrap();
         let sw = *self.step_weight.lock().unwrap();
-        *self.progress.lock().unwrap() = (overall + sw).min(1.0);
+        let combined = (overall + sw).min(1.0);
+        *self.progress.lock().unwrap() = combined;
+        self.progress_history.lock().unwrap().push(combined);
     }
 
     fn set_log(&self, text: &str) {

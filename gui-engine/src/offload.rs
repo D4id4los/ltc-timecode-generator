@@ -2271,7 +2271,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
     }
 
     #[test]
-    fn test_copy_job_sets_speed_on_progress() {
+    fn test_copy_job_single_device_completes() {
         let dir = TempDir::new().unwrap();
 
         // Create a 1 MiB source file.
@@ -2292,10 +2292,21 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
 
         let result = run_offload_copy_job(&ctx, plans, names, dest_parent);
         assert!(result.is_ok(), "copy job should succeed");
+        assert!(dst.exists(), "destination must exist after the copy");
+        assert_eq!(
+            fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+            content.len() as u64,
+            "destination must match the source size"
+        );
+        // Speed is deliberately not asserted here: on tmpfs the copy
+        // completes under the EMA's first-update floor, so
+        // `snapshot().speed` (Some only when > 0) is not deterministic.
+        // The speed property is owned by the SpeedMeter unit tests in
+        // job.rs.
     }
 
     #[test]
-    fn test_copy_job_speed_multiple_files() {
+    fn test_copy_job_two_files_complete() {
         let dir = TempDir::new().unwrap();
 
         // Two files of different sizes.
@@ -2306,6 +2317,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
 
         let dst1 = dir.path().join("dst1.bin");
         let dst2 = dir.path().join("dst2.bin");
+        let (dst1_ref, dst2_ref) = (dst1.clone(), dst2.clone());
 
         let (ctx, tracker) = test_job_context();
         let plans = vec![vec![
@@ -2320,16 +2332,18 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         let dest_parent = dir.path().to_path_buf();
 
         let result = run_offload_copy_job(&ctx, plans, names, dest_parent);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "copy job should succeed");
 
-        let snap = tracker.snapshot();
-        // Speed may be 0 if both files copy faster than 1 ms
-        // (no meaningful EMA delta). The SpeedMeter is unit-tested
-        // separately in job.rs; this test only checks that the
-        // speed field is reachable (not panicking).
-        if let Some(s) = snap.speed {
-            assert!(s >= 0.0, "speed should be non-negative, got {s}");
+        for (dst, expected) in [(&dst1_ref, 1u64 << 20), (&dst2_ref, 1u64 << 20)] {
+            assert!(dst.exists(), "destination {} must exist", dst.display());
+            assert_eq!(
+                fs::metadata(dst).map(|m| m.len()).unwrap_or(0),
+                expected,
+                "destination {} must match the source size",
+                dst.display()
+            );
         }
+        let _ = tracker; // progress tracker exercised by other copy tests
     }
 
     // ── ProgressTracker message forwarding during scan ──────────────────

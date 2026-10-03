@@ -211,10 +211,17 @@ fn make_card(mount: &Path, device_name: &str, file_names: &[&str]) -> SdCardInfo
     }
 }
 
-// ── Stale-event gating with latest_job — supervisor unit test ──────────
+// ── Cancel decode → re-decode succeeds (stale-event gating end-to-end) ──
+//
+// The stale-event gate itself is unit-tested as `job_event_is_stale` in
+// `engine.rs` (unreachable end-to-end by design: the spawn guard prevents
+// same-kind job overlap). This test exercises the observable effect of the
+// gate through public commands: after cancelling decode 1 and re-decoding,
+// the second job's success must not be clobbered by the first job's
+// terminal event.
 
 #[test]
-fn test_supervisor_latest_job_gates_stale_events() {
+fn test_cancel_decode_then_redecode_succeeds() {
     init_test_config();
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
@@ -269,28 +276,32 @@ fn test_supervisor_latest_job_gates_stale_events() {
     // Now start decoding file 2
     tx.send(GuiCommand::ParseLtcWavFile(path2.to_string_lossy().to_string())).unwrap();
 
-    // Wait until the second decode finishes (Succeeded or Failed)
+    // Wait until the second decode succeeds
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         let snap = state.load();
-        let job = snap.job(JobKind::LtcDecode);
-        if job.phase() != JobPhase::Running && job.phase() != JobPhase::Indeterminate {
-            if job.phase() == JobPhase::Succeeded {
-                break;
-            }
-            // If it Failed (e.g. count_chunks race), that's fine too
+        if snap.job(JobKind::LtcDecode).phase() == JobPhase::Succeeded {
             break;
         }
         if Instant::now() > deadline {
-            panic!("timeout waiting for second decode to finish");
+            panic!("timeout waiting for second decode to succeed (phase: {:?})",
+                snap.job(JobKind::LtcDecode).phase());
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 
     let snap = state.load();
     assert!(
-        snap.job(JobKind::LtcDecode).phase() != JobPhase::Running,
-        "second decode should have completed"
+        snap.job(JobKind::LtcDecode).phase() == JobPhase::Succeeded,
+        "second decode must succeed"
+    );
+    assert!(
+        snap.decode.result.is_some(),
+        "second decode must have produced a result (not clobbered by the cancelled job's terminal event)"
+    );
+    assert!(
+        snap.decode.error.is_none(),
+        "second decode must not carry the cancelled job's error"
     );
 
     drop(tx);

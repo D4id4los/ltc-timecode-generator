@@ -236,14 +236,7 @@ fn engine_main_loop(
             }
         }
         for event in supervisor.drain() {
-            // Stale-result gating: reject events from superseded jobs by
-            // comparing the event's JobId to the most-recently-spawned one
-            // for that kind (tracked in supervisor.latest_job).
-            let (event_job, event_kind) = match &event {
-                JobEvent::Finished { job, kind, .. } => (*job, *kind),
-                JobEvent::Item { job, kind, .. } => (*job, *kind),
-            };
-            if supervisor.latest_job.get(&event_kind) != Some(&event_job) {
+            if job_event_is_stale(&supervisor.latest_job, &event) {
                 continue;
             }
             handle_job_event(&mut els, &mut supervisor, event);
@@ -1028,7 +1021,18 @@ fn cmd_parse_ltc_wav_file(
     path: &str,
     use_libltc: bool,
 ) {
-    if supervisor.is_running(JobKind::LtcDecode) {
+    // Allow a re-decode once the published phase is terminal: the Finished
+    // event already arrived, but the supervisor reaps the finished thread in
+    // the next tick's poll, so `is_running` stays true for one tick. During
+    // that window a user's cancel-then-redecode command must not be silently
+    // ignored (the stale-event gate discards the old job's late events).
+    let decode_phase_terminal = els
+        .current
+        .jobs
+        .get(&JobKind::LtcDecode)
+        .map(|s| matches!(s.phase(), job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
+        .unwrap_or(false);
+    if supervisor.is_running(JobKind::LtcDecode) && !decode_phase_terminal {
         info!("LTC decode already in progress — ignoring duplicate ParseLtcWavFile");
         return;
     }
@@ -1344,6 +1348,20 @@ fn apply_ffmpeg_probe_result(current: &mut AppStateSnapshot, caps: FfmpegCapabil
 /// match is on `JobKind` — a closed enum with no wildcard arm, so adding a
 /// new `JobKind` without a handler is a compile error. Payload mismatches
 /// within a kind are logged, never silently dropped.
+/// True when `event` belongs to a superseded job: its JobId does not match
+/// the most recently spawned job for that kind (tracked in
+/// `JobSupervisor.latest_job`). Events from jobs whose kind was never
+/// spawned are also stale (defensive). Stale-result gating: without this,
+/// a cancelled job's late Finished event would clobber the state written
+/// by its replacement.
+fn job_event_is_stale(latest_job: &std::collections::HashMap<JobKind, job::JobId>, event: &JobEvent) -> bool {
+    let (event_job, event_kind) = match event {
+        JobEvent::Finished { job, kind, .. } => (*job, *kind),
+        JobEvent::Item { job, kind, .. } => (*job, *kind),
+    };
+    latest_job.get(&event_kind) != Some(&event_job)
+}
+
 fn handle_job_event(
     els: &mut EngineLoopState,
     supervisor: &mut JobSupervisor,
@@ -2256,6 +2274,120 @@ mod tests {
     use crate::converter::HwDeviceCapabilities;
     use crate::file_pattern::MatchedGroup;
     use crate::ffprobe::AudioStreamInfo;
+
+    // ── re-decode after cancel (one-tick reaping window) ─────────────────
+
+    /// Regression test for a flake surfaced by
+    /// `test_cancel_decode_then_redecode_succeeds` under load: the cancel's
+    /// terminal phase is published by the Finished event, but the supervisor
+    /// only reaps the finished thread in the *next* tick's poll. During that
+    /// window `is_running` is still true and a re-decode command was
+    /// silently ignored. A terminal published phase must allow the respawn.
+    #[test]
+    fn parse_ltc_wav_file_respawns_after_terminal_phase_despite_unreaped_job() {
+        use crate::job::{JobPhase, JobSpec, JobStatus};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("tiny.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+        for _ in 0..48000 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut sup = crate::job::JobSupervisor::new();
+        let cancel = crate::job::CancelToken::new();
+        let parked_cancel = cancel.clone();
+        // Register a still-running LtcDecode job so `is_running` stays true
+        // for the whole test (the unreaped-thread window).
+        spawn_job::<JobFinal, _>(
+            &mut sup,
+            JobSpec { kind: crate::job::JobKind::LtcDecode, name: "parked decode", units: vec![] },
+            move |_ctx| {
+                while !parked_cancel.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(JobFinal::NoPayload)
+            },
+        );
+        let parked_id = *sup.latest_job.get(&crate::job::JobKind::LtcDecode).unwrap();
+
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        // The engine published the terminal Cancelled phase for the previous job.
+        let mut status = JobStatus::running("decode");
+        status.progress.phase = JobPhase::Cancelled;
+        els.current.jobs.insert(crate::job::JobKind::LtcDecode, status);
+
+        cmd_parse_ltc_wav_file(&mut els, &mut sup, wav.to_str().unwrap(), false);
+
+        let respawned = *sup.latest_job.get(&crate::job::JobKind::LtcDecode).unwrap();
+        assert_ne!(respawned, parked_id,
+            "a re-decode must spawn a new job once the published phase is terminal");
+        cancel.cancel();
+        sup.shutdown(std::time::Duration::from_secs(5));
+    }
+
+    // ── job_event_is_stale (stale-event gate) ────────────────────────────
+
+    use crate::job::{JobId, JobItem, JobOutcome, JobFinal};
+
+    fn finished(kind: JobKind, job: u64) -> JobEvent {
+        JobEvent::Finished {
+            job: JobId(job),
+            kind,
+            outcome: JobOutcome::Succeeded { log: String::new() },
+            payload: JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
+        }
+    }
+
+    fn item(kind: JobKind, job: u64) -> JobEvent {
+        JobEvent::Item {
+            job: JobId(job),
+            kind,
+            item: JobItem::DurationResult { path: PathBuf::from("x"), secs: Some(1.0) },
+        }
+    }
+
+    #[test]
+    fn stale_finished_event_is_rejected() {
+        let mut latest = std::collections::HashMap::new();
+        latest.insert(JobKind::LtcDecode, JobId(2));
+        assert!(job_event_is_stale(&latest, &finished(JobKind::LtcDecode, 1)));
+    }
+
+    #[test]
+    fn fresh_finished_event_passes() {
+        let mut latest = std::collections::HashMap::new();
+        latest.insert(JobKind::LtcDecode, JobId(2));
+        assert!(!job_event_is_stale(&latest, &finished(JobKind::LtcDecode, 2)));
+    }
+
+    #[test]
+    fn stale_item_event_is_rejected() {
+        let mut latest = std::collections::HashMap::new();
+        latest.insert(JobKind::DurationProbe, JobId(7));
+        assert!(job_event_is_stale(&latest, &item(JobKind::DurationProbe, 6)));
+    }
+
+    #[test]
+    fn fresh_item_event_passes() {
+        let mut latest = std::collections::HashMap::new();
+        latest.insert(JobKind::DurationProbe, JobId(7));
+        assert!(!job_event_is_stale(&latest, &item(JobKind::DurationProbe, 7)));
+    }
+
+    #[test]
+    fn event_for_never_spawned_kind_is_stale() {
+        let latest: std::collections::HashMap<JobKind, JobId> = std::collections::HashMap::new();
+        assert!(job_event_is_stale(&latest, &finished(JobKind::Conversion, 1)));
+        assert!(job_event_is_stale(&latest, &item(JobKind::Conversion, 1)));
+    }
 
     // ── EngineLoopState ───────────────────────────────────────────────────
 
