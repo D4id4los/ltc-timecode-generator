@@ -411,7 +411,10 @@ mod tests {
     fn test_run_ffmpeg_exit_nonzero_no_output_encoder_init() {
         let report = TestReport::new();
         report.set_step_weight(0.5);
-        let out = Path::new("/tmp/_test_ffmpeg_fail.mp4");
+        // Tempdir-backed output path: a stale file >= 4096 B at a fixed
+        // path would flip `classify_step_failure` from EncoderInit to Fatal.
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("_test_ffmpeg_fail.mp4");
 
         let mut spawner = |_args: &[String]| {
             let mut cmd = if cfg!(windows) {
@@ -429,7 +432,7 @@ mod tests {
         };
 
         let result = run_ffmpeg_process_with(
-            &["-i".to_string(), "nonexistent".to_string()], out, &report, 1, 1,
+            &["-i".to_string(), "nonexistent".to_string()], &out, &report, 1, 1,
             &mut spawner,
             Duration::from_secs(5),
         );
