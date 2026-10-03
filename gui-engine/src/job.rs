@@ -872,11 +872,12 @@ mod tests {
     }
 
     #[test]
-    fn job_status_running_has_running_phase_and_message() {
-        let st = JobStatus::running("Decoding LTC group: 0/3 clips");
+    fn job_status_running_has_running_phase() {
+        let st = JobStatus::running("any eager pre-poll message");
         assert_eq!(st.phase(), JobPhase::Running);
         assert_eq!(st.fraction(), 0.0);
-        assert_eq!(st.message(), "Decoding LTC group: 0/3 clips");
+        // The constructor passes the message through verbatim.
+        assert_eq!(st.message(), "any eager pre-poll message");
         assert_eq!(st.error, None);
         assert!(st.units().is_empty());
         assert_ne!(st, JobStatus::idle());
@@ -1355,24 +1356,24 @@ mod tests {
             "should not start when both are Running");
     }
 
-    fn probe_status_label(probe_active: bool, probe_is_none: bool) -> &'static str {
+    fn probe_status_label(probe_active: bool, probe_is_none: bool) -> ProbeStatusLabel {
         if probe_active {
-            "Probing clip audio…"
+            ProbeStatusLabel::Probing
         } else if probe_is_none {
-            "Clip audio probe failed."
+            ProbeStatusLabel::ProbeFailed
         } else {
-            "No channels to map."
+            ProbeStatusLabel::NoChannels
         }
     }
 
     #[test]
     fn test_probe_label_shows_probing_during_indeterminate() {
-        assert_eq!(probe_status_label(true, true), "Probing clip audio…",
+        assert_eq!(probe_status_label(true, true), ProbeStatusLabel::Probing,
             "Indeterminate/Running → show Probing");
-        assert_eq!(probe_status_label(true, false), "Probing clip audio…");
-        assert_eq!(probe_status_label(false, true), "Clip audio probe failed.",
+        assert_eq!(probe_status_label(true, false), ProbeStatusLabel::Probing);
+        assert_eq!(probe_status_label(false, true), ProbeStatusLabel::ProbeFailed,
             "Idle/Succeeded/Failed + no probe → show failed");
-        assert_eq!(probe_status_label(false, false), "No channels to map.",
+        assert_eq!(probe_status_label(false, false), ProbeStatusLabel::NoChannels,
             "Probe exists → show no channels (unreachable in this branch)");
     }
 

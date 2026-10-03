@@ -1415,12 +1415,13 @@ mod tests {
 
         let result = tag_file(&p, &test_meta(), None);
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            TagOutcome::Skipped {
-                reason: "MPEG-TS container 'mts' has no standard timecode metadata".to_string()
-            }
-        );
+        match result.unwrap() {
+            TagOutcome::Skipped { reason } => assert_eq!(
+                reason,
+                SkipReason::UnsupportedContainer { family: "MPEG-TS", ext: "mts".to_string() }
+            ),
+            other => panic!("expected Skipped outcome, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1429,16 +1430,24 @@ mod tests {
         let p = dir.path().join("clip.bin");
         std::fs::write(&p, b"dummy").unwrap();
 
-        // ffmpeg may fail but the file should be handled without panic
+        // ffmpeg may fail but the file should be handled without panic.
+        // Unknown extension must take the ffmpeg fallback path: either it is
+        // tagged via stream copy or it fails with a typed ffmpeg-sourced
+        // error — never a native in-place tag and never a skip.
         let result = tag_file(&p, &test_meta(), None);
-        // Either an error (ffmpeg not available or fails) or success
-        if let Err(err_msg) = result {
-            assert!(
-                err_msg.contains("ffmpeg") || err_msg.contains("output too small") || err_msg.contains("cannot open"),
-                "unexpected error: {}",
-                err_msg
-            );
-        }
+        assert!(
+            matches!(
+                result,
+                Ok(TagOutcome::TaggedViaFfmpeg)
+                    | Err(TagError::Subprocess { .. })
+                    | Err(TagError::FfmpegFailed { .. })
+                    | Err(TagError::MissingOutput { .. })
+                    | Err(TagError::OutputTooSmall { .. })
+                    | Err(TagError::Rename { .. })
+            ),
+            "unexpected outcome: {:?}",
+            result
+        );
     }
 
     // ── tag_via_ffmpeg_with runner tests ──────────────────────────────────
@@ -1453,9 +1462,18 @@ mod tests {
         let mut timeout_runner = |_: &[String], _: &Path| Err(SubprocessFailure::TimedOut);
         let result = tag_via_ffmpeg_with(&p, &meta, None, &mut timeout_runner);
         assert!(result.is_err(), "expected timeout error, got {:?}", result);
-        let msg = result.unwrap_err();
-        assert!(msg.contains("timed out"), "msg should mention timeout: {}", msg);
-        assert!(msg.contains("1800"), "msg should mention 1800s: {}", msg);
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                TagError::Subprocess { failure: SubprocessFailure::TimedOut, .. }
+            ),
+            "timeout must map to TagError::Subprocess(TimedOut)"
+        );
+    }
+
+    #[test]
+    fn tag_remux_timeout_constant() {
+        assert_eq!(TAG_REMUX_TIMEOUT, Duration::from_secs(1800));
     }
 
     #[test]
@@ -1470,8 +1488,16 @@ mod tests {
         };
         let result = tag_via_ffmpeg_with(&p, &meta, None, &mut io_runner);
         assert!(result.is_err(), "expected Io error, got {:?}", result);
-        let msg = result.unwrap_err();
-        assert!(msg.contains("failed to spawn ffmpeg"), "msg: {}", msg);
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                TagError::Subprocess {
+                    failure: SubprocessFailure::Io(ref msg),
+                    ..
+                } if msg == "binary not found"
+            ),
+            "spawn failure must map to TagError::Subprocess(Io) with the source payload"
+        );
     }
 
     // ── WAV fmt-chunk scanning ────────────────────────────────────────────

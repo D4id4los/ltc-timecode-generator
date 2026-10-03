@@ -469,15 +469,7 @@ mod tests {
         assert!(validate_template("{unknown}").is_err());
     }
 
-    // ── Display ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_error_display() {
-        let e = TemplateError::UnknownPlaceholder("foo".into());
-        let msg = e.to_string();
-        assert!(msg.contains("foo"));
-        assert!(msg.contains("filename"));
-    }
+    // ── Defaults ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_defaults() {

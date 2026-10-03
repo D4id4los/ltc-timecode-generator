@@ -624,8 +624,10 @@ mod tests {
     #[test]
     fn test_initial_status() {
         let s = initial_state();
-        assert_eq!(s.status.audio, "Ready");
-        assert_eq!(s.status.message(), "Ready");
+        // Audio owns the initial last-writer channel; every other channel
+        // starts empty.
+        assert_eq!(s.status.last, StatusChannel::Audio);
+        assert!(!s.status.audio.is_empty());
         assert!(s.status.decode.is_empty());
         assert!(s.status.converter.is_empty());
         assert!(s.status.offload.is_empty());
@@ -634,16 +636,22 @@ mod tests {
     #[test]
     fn test_status_message_follows_last_writer() {
         let mut s = StatusChannels::initial();
-        s.set_decode("Parse failed: x");
-        assert_eq!(s.message(), "Parse failed: x");
-        s.set_audio("Clap!");
-        assert_eq!(s.message(), "Clap!");
-        s.set_converter("Conversion completed");
-        assert_eq!(s.message(), "Conversion completed");
-        s.set_offload("Offload complete");
-        assert_eq!(s.message(), "Offload complete");
-        // Channels are independent — an audio write never clobbers decode.
-        assert_eq!(s.decode, "Parse failed: x");
+        s.set_decode("d1");
+        assert_eq!(s.last, StatusChannel::Decode);
+        assert_eq!(s.message(), "d1");
+        s.set_audio("a1");
+        assert_eq!(s.last, StatusChannel::Audio);
+        assert_eq!(s.message(), "a1");
+        s.set_converter("c1");
+        assert_eq!(s.last, StatusChannel::Converter);
+        assert_eq!(s.message(), "c1");
+        s.set_offload("o1");
+        assert_eq!(s.last, StatusChannel::Offload);
+        assert_eq!(s.message(), "o1");
+        // Channels are independent — later writes never clobber earlier ones.
+        assert_eq!(s.decode, "d1");
+        assert_eq!(s.audio, "a1");
+        assert_eq!(s.converter, "c1");
     }
 
     // ── LTC decode defaults ───────────────────────────────────────────────

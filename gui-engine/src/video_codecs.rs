@@ -488,7 +488,7 @@ mod tests {
         // mov: prores, dnxhd, h264, h265, av1 — only h264/h265 have candidates
         let c = caps(["libx264", "libx265", "pcm_s24le"]);
         let available = available_video_codecs("mov", &c);
-        let ids: Vec<&str> = available.iter().map(|(k, _)| k.as_str()).collect();
+        let ids: Vec<&str> = available.iter().map(|(k, _, _)| k.as_str()).collect();
         assert_eq!(ids, vec!["h264", "h265"]);
     }
 
@@ -498,7 +498,7 @@ mod tests {
         let c = caps(["libx264"]);
         let available = available_video_codecs("mkv", &c);
         let ids: Vec<&str> = available.iter()
-            .map(|(k, _)| k.as_str())
+            .map(|(k, _, _)| k.as_str())
             .collect();
         assert!(!ids.contains(&"av1"));
         assert!(ids.contains(&"h264"));
@@ -574,15 +574,15 @@ mod tests {
     }
 
     #[test]
-    fn test_available_video_codecs_hw_annotation() {
+    fn test_available_video_codecs_hw_flag() {
         let c = caps(["av1_nvenc", "libsvtav1", "pcm_s24le", "matroska"]);
         let available = available_video_codecs("mkv", &c);
-        let av1_label = available.iter().find(|(k, _)| k == "av1").map(|(_, l)| l.as_str());
-        assert!(av1_label.unwrap().contains("[HW accel. available]"));
-        // h264 only has libx264 (software) → no HW annotation
+        let av1 = available.iter().find(|(k, _, _)| k == "av1").unwrap();
+        assert!(av1.2, "av1 has a working hardware encoder (av1_nvenc)");
+        // h264 only has libx264 (software) → no HW availability
         let c2 = caps(["libx264", "pcm_s24le"]);
         let available2 = available_video_codecs("mp4", &c2);
-        let h264_label = available2.iter().find(|(k, _)| k == "h264").map(|(_, l)| l.as_str());
-        assert!(!h264_label.unwrap().contains("[HW accel. available]"));
+        let h264 = available2.iter().find(|(k, _, _)| k == "h264").unwrap();
+        assert!(!h264.2, "h264 has only a software encoder here");
     }
 }
