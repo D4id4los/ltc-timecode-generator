@@ -158,6 +158,10 @@ pub struct OffloadSnapshot {
     pub last_offload_version: u64,
     /// Global error message (e.g. no parent folder set).
     pub error: Option<String>,
+    /// Typed counterpart of [`OffloadSnapshot::error`] for the offload
+    /// start-guard branches (no cards / no parent folder / plan failure).
+    /// Cleared wherever `error` is cleared for those branches.
+    pub plan_error: Option<OffloadPlanError>,
     /// Per-file durations (seconds) for offload-scope files (card contents),
     /// probed asynchronously after scan. Keyed by full file path; value is
     /// `None` when probing failed or is pending. Separate from the
@@ -177,8 +181,9 @@ impl OffloadSnapshot {
             device_totals: Vec::new(),
             completed_devices: Vec::new(),
             last_offload_parent: None,
-            last_offload_version: 0,
-            error: None,
+        last_offload_version: 0,
+        error: None,
+        plan_error: None,
             file_durations: HashMap::new(),
             durations_version: 0,
         }
@@ -875,6 +880,7 @@ impl OffloadCopyPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OffloadPlanError {
     NoCards,
+    NoParentFolder,
     NoFilesSelected,
 }
 
@@ -882,6 +888,7 @@ impl OffloadPlanError {
     pub fn user_message(&self) -> &'static str {
         match self {
             OffloadPlanError::NoCards => "No media cards detected.",
+            OffloadPlanError::NoParentFolder => "No parent folder selected.",
             OffloadPlanError::NoFilesSelected => "No files selected.",
         }
     }

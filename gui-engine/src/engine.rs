@@ -936,14 +936,23 @@ fn cmd_parse_ltc_video(
     // stale or out-of-range GUI state fails fast with a clear message
     // instead of invoking ffmpeg on a nonexistent stream.
     if let Some(ref probe) = state.decode.probe {
-        if let Some(e) = validate_stream_channel_selection(probe, stream_index, channel_index, path) {
-            error!("LTC video decode rejected: {}", e);
+        if let Err(e) = validate_stream_channel_selection(probe, stream_index, channel_index) {
+            let available: Vec<usize> = probe.streams.iter().map(|s| s.stream_index).collect();
+            let msg = match &e {
+                StreamSelectionError::MissingStream { stream } => format!(
+                    "Stream {stream} not found in '{path}' (available audio streams: {available:?})"
+                ),
+                StreamSelectionError::ChannelOutOfRange { channel, channels } => format!(
+                    "Channel {channel} out of range for stream {stream_index} in '{path}' ({channels} channels available)"
+                ),
+            };
+            error!("LTC video decode rejected: {}", msg);
             if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
                 status.progress.phase = job::JobPhase::Failed;
-                status.error = Some(e.clone());
+                status.error = Some(msg.clone());
             }
-            state.decode.error = Some(e.clone());
-            state.status.set_decode(format!("Parse failed: {}", e));
+            state.decode.error = Some(msg.clone());
+            state.status.set_decode(format!("Parse failed: {}", msg));
             return;
         }
     }
@@ -992,26 +1001,43 @@ fn cmd_parse_ltc_video(
     });
 }
 
+/// Why a stream/channel selection cannot be decoded from a probed video
+/// file. Internal to the engine; call sites render the user-facing message
+/// (including path and available-stream context) into the snapshot strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamSelectionError {
+    MissingStream { stream: usize },
+    ChannelOutOfRange { channel: usize, channels: usize },
+}
+
+impl std::fmt::Display for StreamSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamSelectionError::MissingStream { stream } => {
+                write!(f, "Stream {stream} not found")
+            }
+            StreamSelectionError::ChannelOutOfRange { channel, channels } => {
+                write!(f, "Channel {channel} out of range ({channels} channels available)")
+            }
+        }
+    }
+}
+
 /// Validate a stream/channel selection against a video probe. Returns a
-/// human-readable error when the selection cannot be decoded, `None` when
-/// the selection is valid.
+/// typed error when the selection cannot be decoded, `Ok(())` when the
+/// selection is valid.
 fn validate_stream_channel_selection(
     probe: &VideoAudioProbe,
     stream_index: usize,
     channel_index: usize,
-    path: &str,
-) -> Option<String> {
-    let available: Vec<usize> = probe.streams.iter().map(|s| s.stream_index).collect();
+) -> Result<(), StreamSelectionError> {
     match probe.streams.iter().find(|s| s.stream_index == stream_index) {
-        None => Some(format!(
-            "Stream {} not found in '{}' (available audio streams: {:?})",
-            stream_index, path, available
-        )),
-        Some(s) if channel_index >= s.channels => Some(format!(
-            "Channel {} out of range for stream {} in '{}' ({} channels available)",
-            channel_index, stream_index, path, s.channels
-        )),
-        Some(_) => None,
+        None => Err(StreamSelectionError::MissingStream { stream: stream_index }),
+        Some(s) if channel_index >= s.channels => Err(StreamSelectionError::ChannelOutOfRange {
+            channel: channel_index,
+            channels: s.channels,
+        }),
+        Some(_) => Ok(()),
     }
 }
 
@@ -1820,6 +1846,7 @@ fn handle_offload_command(
                 return;
             }
             state.offload.error = None;
+            state.offload.plan_error = None;
             let scan_seam = els.scan_cards.clone();
             let spec = job::JobSpec {
                 kind: JobKind::OffloadScan,
@@ -1834,6 +1861,7 @@ fn handle_offload_command(
         crate::command::OffloadCommand::SetParentFolder(path) => {
             state.offload.parent_folder = Some(path.clone());
             state.offload.error = None;
+            state.offload.plan_error = None;
             config::save_offload_parent(&path);
         }
 
@@ -1890,12 +1918,14 @@ fn handle_offload_command(
             }
             if state.offload.cards.is_empty() {
                 state.offload.error = Some("No media cards detected.".to_string());
+                state.offload.plan_error = Some(crate::offload::OffloadPlanError::NoCards);
                 return;
             }
             let parent_folder = match state.offload.parent_folder.clone() {
                 Some(p) => p,
                 None => {
                     state.offload.error = Some("No parent folder selected.".to_string());
+                    state.offload.plan_error = Some(crate::offload::OffloadPlanError::NoParentFolder);
                     return;
                 }
             };
@@ -1907,11 +1937,13 @@ fn handle_offload_command(
                 Ok(plan) => plan,
                 Err(e) => {
                     state.offload.error = Some(e.user_message().to_string());
+                    state.offload.plan_error = Some(e);
                     return;
                 }
             };
 
             state.offload.error = None;
+            state.offload.plan_error = None;
             info!(
                 "Offload started: {} device(s), {} file(s), {} MB → {:?}",
                 plan.device_names.len(),
