@@ -337,8 +337,12 @@ mod tests {
             &files, Path::new("/nonexistent/out"),
             "test", &caps, Some("_audio"), Some("_video"), true,
         );
-        assert!(result.is_err(), "full check should fail on nonexistent paths");
-        assert!(result.unwrap_err().contains("does not exist"));
+        match result {
+            Err(ConversionCheckError::MissingInput(p)) => {
+                assert_eq!(p, PathBuf::from("/nonexistent/file.wav"));
+            }
+            other => panic!("expected MissingInput, got {:?}", other.err()),
+        }
     }
 
     #[test]
@@ -349,8 +353,7 @@ mod tests {
             &[], Path::new("/tmp"),
             "test", &caps, Some("_audio"), Some("_video"), false,
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("No input files"));
+        assert_eq!(result, Err(ConversionCheckError::NoInputFiles));
     }
 
     #[test]
@@ -370,8 +373,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.txt");
         let result = validate_conversion_paths(&[missing], dir.path());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("does not exist"));
+        match result {
+            Err(ConversionCheckError::MissingInput(p)) => assert_eq!(p, missing),
+            other => panic!("expected MissingInput, got {:?}", other.err()),
+        }
     }
 
     #[test]
@@ -383,8 +388,12 @@ mod tests {
             &[file_path],
             Path::new("/nonexistent/output_dir"),
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("does not exist"));
+        match result {
+            Err(ConversionCheckError::MissingOutputFolder(p)) => {
+                assert_eq!(p, PathBuf::from("/nonexistent/output_dir"));
+            }
+            other => panic!("expected MissingOutputFolder, got {:?}", other.err()),
+        }
     }
 
     #[test]
@@ -452,7 +461,16 @@ mod tests {
         let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
         let r = evaluate_readiness(false, true, true, Some(&caps));
         assert!(!r.can_convert);
-        assert_eq!(r.blockers.len(), 3);
+        // Order is deterministic in evaluate_readiness: recording, prefix,
+        // output folder.
+        assert_eq!(
+            r.blockers,
+            vec![
+                ConvertBlocker::NoRecording,
+                ConvertBlocker::NoPrefix,
+                ConvertBlocker::NoOutputFolder,
+            ]
+        );
     }
 
     #[test]

@@ -1575,12 +1575,26 @@ mod tests {
 
         assert!(!*report.failed.lock().unwrap(),
             "probe failure is best-effort; run should not be marked failed");
-        // Note: the run_ffmpeg_process log overwrites the buffer per step
-        // (set_log), so the earlier "✗ … probe failed" line is not retained
-        // here. The pinned behavior is: the run continues past the failed
-        // probe (clip1 still extracted) and completes unfailed.
-        let log = report.log.lock().unwrap().clone();
-        assert!(log.contains("clip1.mp4"), "clip1 should still be processed: {}", log);
+        // clip1 was still processed: its extracted audio exists on disk.
+        let wavs: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
+            .collect();
+        assert!(!wavs.is_empty(), "clip1 should still be extracted: expected a wav in {}",
+            dir.path().display());
+        // The probe failure for clip2 is recorded structurally in the
+        // ledger, together with its best-effort tag/rename failures.
+        let failures = report.failures();
+        assert_eq!(failures.len(), 3, "probe + tag + rename failures for clip2: {:?}",
+            failures);
+        let missing = Path::new("/nonexistent/clip2.mp4");
+        assert!(failures.iter().any(|r| matches!(r.kind, FailureKind::Probe)
+            && r.file.as_deref() == Some(missing)));
+        assert!(failures.iter().any(|r| matches!(r.kind, FailureKind::Tag)
+            && r.file.as_deref() == Some(missing)));
+        assert!(failures.iter().any(|r| matches!(r.kind, FailureKind::Rename)
+            && r.file.as_deref() == Some(missing)));
     }
 
     #[test]
@@ -1596,9 +1610,9 @@ mod tests {
         run_metadata_only(&settings, &report, 2);
 
         assert!(*report.failed.lock().unwrap(), "cancelled run must be failed");
-        // TestReport.mark_failed discards its log argument; the visible
-        // trace is the appended CANCELLED block from the phase guard.
-        assert!(report.log.lock().unwrap().contains("CANCELLED"));
+        assert!(report.cancel_notified(),
+            "cancellation must be signalled through the typed report seam");
+        assert!(report.failures().is_empty(), "no steps were attempted");
         assert!(std::fs::read_dir(dir.path()).unwrap().count() == 0, "no output files");
     }
 
@@ -1669,7 +1683,8 @@ mod tests {
         report.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(check_cancelled(&report));
         assert!(*report.failed.lock().unwrap());
-        assert!(report.log.lock().unwrap().contains("CANCELLED"));
+        assert!(report.cancel_notified(),
+            "check_cancelled must signal cancellation through the typed seam");
     }
 
     #[test]
@@ -1677,13 +1692,22 @@ mod tests {
         let report = TestReport::new();
         let mut ledger = FailureLedger::default();
         let failure = StepFailure::Fatal("ffmpeg exited with code 1".to_string());
-        note_step_failure(&mut ledger, &report, "extract failed", &failure);
+        note_step_failure(
+            &mut ledger,
+            &report,
+            FailureKind::Ffmpeg(failure.clone()),
+            None,
+            "extract failed",
+        );
 
-        assert!(report.log.lock().unwrap().contains("ffmpeg exited with code 1"),
-            "typed payload must appear verbatim in the log");
         assert_eq!(ledger.attempted, 1);
         assert_eq!(ledger.succeeded, 0);
-        assert!(ledger.details[0].contains("ffmpeg exited with code 1"));
+        assert_eq!(ledger.details.len(), 1);
+        assert!(matches!(
+            ledger.details[0].kind,
+            FailureKind::Ffmpeg(StepFailure::Fatal(_))
+        ));
+        assert_eq!(ledger.details[0].file, None);
     }
 
     #[test]
@@ -1712,9 +1736,16 @@ mod tests {
 
         assert!(*report.failed.lock().unwrap(),
             "a 100%% failed run must not report success");
-        let msg = report.message.lock().unwrap().clone();
-        assert!(msg.contains("STEP(S) FAILED"), "summary in failure message: {}", msg);
-        assert!(msg.contains("probe failed"), "typed details present: {}", msg);
+        // Every attempted step for both nonexistent clips failed:
+        // probe + tag + rename per clip, none succeeded.
+        let failures = report.failures();
+        assert_eq!(failures.len(), 6, "probe + tag + rename per clip: {:?}", failures);
+        let count_kind = |pred: &dyn Fn(&&StepFailureRecord) -> bool| failures.iter().filter(pred).count();
+        assert_eq!(count_kind(&|r| matches!(r.kind, FailureKind::Probe)), 2);
+        assert_eq!(count_kind(&|r| matches!(r.kind, FailureKind::Tag)), 2);
+        assert_eq!(count_kind(&|r| matches!(r.kind, FailureKind::Rename)), 2);
+        assert!(failures.iter().all(|r| !matches!(r.kind, FailureKind::Ffmpeg(_))),
+            "no ffmpeg step ever ran");
     }
 
     // ── PR-7: logic-level tests via the prober seam ──────────────────────
@@ -1738,8 +1769,9 @@ mod tests {
         run_metadata_only_with(&settings, &report, 6, &mut prober);
 
         assert!(*report.failed.lock().unwrap(), "all probes failed → run failed");
-        let msg = report.message.lock().unwrap().clone();
-        assert!(msg.contains("probe failed"), "details present: {}", msg);
+        let failures = report.failures();
+        assert_eq!(failures.len(), 2, "one probe failure per clip: {:?}", failures);
+        assert!(failures.iter().all(|r| matches!(r.kind, FailureKind::Probe)));
     }
 
     #[test]
@@ -1762,7 +1794,8 @@ mod tests {
         run_metadata_only_with(&settings, &report, 3, &mut prober);
 
         assert!(*report.failed.lock().unwrap(), "cancel between phases fails the run");
-        assert!(report.log.lock().unwrap().contains("CANCELLED"));
+        assert!(report.cancel_notified(),
+            "cancel between phases must signal through the typed seam");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "no outputs produced");
     }
 
@@ -1770,12 +1803,14 @@ mod tests {
     fn test_metadata_only_concat_planning_path() {
         if skip_if_no_ffmpeg() { return; }
         let dir = tempfile::TempDir::new().unwrap();
+        let clip1 = dir.path().join("clip1.mp4");
+        let clip2 = dir.path().join("clip2.mp4");
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip1, 0.5);
+        crate::converter::test_fixtures::create_test_video_with_tone(&clip2, 0.5);
+
         let mut settings = fixture_video();
         settings.pipeline = ConversionPipeline::MetadataOnly;
-        settings.input_files = vec![
-            dir.path().join("clip1.mp4"),
-            dir.path().join("clip2.mp4"),
-        ];
+        settings.input_files = vec![clip1, clip2];
         settings.output_folder = dir.path().to_path_buf();
         settings.split_tracks = true;
         settings.concat_audio = true;
@@ -1786,9 +1821,17 @@ mod tests {
         let mut prober = |_p: &Path| Ok(make_stereo_probe());
         run_metadata_only_with(&settings, &report, 8, &mut prober);
 
-        // The concat plan was built (one concat step per surviving track).
-        let log = report.log.lock().unwrap().clone();
-        assert!(log.contains("concat"), "concat args expected in log");
+        // The concat plan was built and executed: one concatenated audio
+        // output per surviving track (identity map over 2 channels).
+        assert!(!*report.failed.lock().unwrap(), "concat run should not fail; log: {}",
+            report.log.lock().unwrap());
+        let wavs: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
+            .collect();
+        assert_eq!(wavs.len(), 2, "one concat audio output per surviving track: {:?}",
+            wavs);
     }
 
     #[test]
@@ -1809,11 +1852,9 @@ mod tests {
         run_metadata_only_with(&settings, &report, 3, &mut prober);
 
         assert!(*report.failed.lock().unwrap(), "all steps failed → failed");
-        let msg = report.message.lock().unwrap().clone();
-        assert!(
-            msg.contains("audio extraction failed"),
-            "typed extraction detail present: {}", msg
-        );
+        let failures = report.failures();
+        assert_eq!(failures.len(), 1, "the failed extraction is recorded: {:?}", failures);
+        assert!(matches!(failures[0].kind, FailureKind::Extraction(_)));
     }
 
     #[test]
@@ -1871,11 +1912,51 @@ mod tests {
         run_video_to_video(&mut settings, "mkv", &mut fallback, &report, &mut total);
 
         assert!(*report.failed.lock().unwrap(), "bogus codec must fail the run");
-        let msg = report.message.lock().unwrap().clone();
         assert!(
-            msg.contains("failed to initialize") || msg.contains("all encoder candidates"),
-            "encoder-fallback failure text present: {}", msg
+            fallback.failed().contains("no-such-codec"),
+            "failed-encoder set records the bogus codec: {:?}",
+            fallback.failed()
         );
+    }
+
+    /// Direct StepOutcome check: a chain whose only candidate fails encoder
+    /// init ends in `StepOutcome::Exhausted` with the encoder recorded in
+    /// the fallback's failed set.
+    #[test]
+    fn test_run_video_step_with_fallback_exhausted_reports_outcome() {
+        if skip_if_no_ffmpeg() { return; }
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut settings = fixture_video();
+        settings.output_folder = dir.path().to_path_buf();
+        let output = dir.path().join("out.mkv");
+        let output_str = output.to_string_lossy().to_string();
+
+        let report = TestReport::new();
+        let mut fallback = EncoderFallback::new_with_hw(
+            vec!["no-such-encoder".into()],
+            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+        );
+        let mut build_args = |s: &ConverterSettings| vec![
+            "-f".to_string(), "lavfi".to_string(),
+            "-i".to_string(), "anullsrc=r=48000:cl=mono".to_string(),
+            "-t".to_string(), "0.1".to_string(),
+            "-c:v".to_string(), s.resolved_video_encoder.clone(),
+            output_str.clone(),
+        ];
+
+        let outcome = run_video_step_with_fallback(
+            &mut settings,
+            &mut fallback,
+            &mut build_args,
+            &output,
+            &report,
+            1,
+            1,
+        );
+
+        assert_eq!(outcome, StepOutcome::Exhausted);
+        assert!(fallback.failed().contains("no-such-encoder"));
+        assert!(*report.failed.lock().unwrap(), "exhausted chain marks the run failed");
     }
 
     /// Partial failure still completes, with every attempted step recorded
@@ -1902,6 +1983,6 @@ mod tests {
         // Probe, tag, and rename all fail for the nonexistent clip → exactly
         // 3 recorded step failures; an exact count is correct here because
         // these failures *are* the specified behavior.
-        assert_eq!(report.failure_count(), 3);
+        assert_eq!(report.failures().len(), 3);
     }
 }
