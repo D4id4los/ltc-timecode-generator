@@ -1318,12 +1318,12 @@ fn test_offload_copy_failure_completes_with_no_devices() {
         snap.offload.completed_devices.is_empty(),
         "no device may complete when every file fails to copy"
     );
-    // Pinned current behavior: on_offload_copy_finished's non-cancelled
-    // branch bumps last_offload_version unconditionally — even when zero
-    // devices completed. Questionable (it points the GUI's offload→converter
-    // handoff at an empty destination) but changing it is out of scope for
-    // this test-gap WP.
-    assert_eq!(snap.offload.last_offload_version, version_before + 1, "handler bumps version on any non-cancelled completion");
+    // Desired: the offload→converter handoff only fires when the destination
+    // actually received files. Zero completed devices = no handoff.
+    assert_eq!(snap.offload.last_offload_version, version_before,
+        "no handoff version bump when zero devices completed");
+    assert!(snap.offload.last_offload_parent.is_none(),
+        "handoff must not point at an empty destination");
     let dev_dir = snap.offload.parent_folder.as_ref().unwrap().join(&snap.offload.parent_name).join("VANISH");
     assert!(!dev_dir.join("gone1.wav").exists(), "no partial file may survive as a deliverable");
 

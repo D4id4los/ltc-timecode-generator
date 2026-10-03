@@ -1605,10 +1605,15 @@ fn on_offload_copy_finished(els: &mut EngineLoopState, outcome: JobOutcome, payl
                 els.current.offload.completed_devices.push(name.clone());
             }
         }
-        let target = parent.map(|p| p.join(&els.current.offload.parent_name));
-        els.current.offload.last_offload_parent = target;
-        els.current.offload.last_offload_version =
-            els.current.offload.last_offload_version.wrapping_add(1);
+        // The offload→converter handoff (version + parent) must only fire
+        // when the destination actually received files: a fully-failed or
+        // empty offload must not yank the converter to an empty folder.
+        if !completed_devices.is_empty() {
+            let target = parent.map(|p| p.join(&els.current.offload.parent_name));
+            els.current.offload.last_offload_parent = target;
+            els.current.offload.last_offload_version =
+                els.current.offload.last_offload_version.wrapping_add(1);
+        }
         els.current.status.set_offload(format!(
             "Offload complete: {} device(s) copied",
             completed_devices.len(),
