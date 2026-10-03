@@ -485,6 +485,33 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
    passed only on retry. Locally, `cargo nextest run --retries 10 -E 'test(...)'`
    ruthlessly shakes out timing flakes in a target test.
 
+### Test Quality Rules
+
+A test must fail when behavior regresses and pass when behavior improves.
+
+- **No quality ceilings.** Never assert upper bounds on success (decode rate ≤ X%,
+  "at most N frames") or exact failure/retry/skip counts for things that should
+  ideally succeed. Floors ("≥ N frames decoded") and false-positive ceilings on
+  *garbage* input ("noise must not decode") are fine. Litmus test: if the code
+  got strictly better, would this test still pass?
+- **No text assertions.** Never assert error message, status, log, or UI label
+  text (`assert_eq!`/`contains` on strings meant for humans) — including
+  substrings and disjunctions. Assert typed outcomes (`matches!(err, E::Variant)`)
+  or structural facts instead. Legitimate strings: ffmpeg/ffprobe args, SMPTE
+  timecode format, file/template/config syntax, on-disk naming tokens.
+- **No pins of "today's behavior".** If a comment says "current behavior" or
+  "today's ...", the assertion is probably a limitation, not a contract. Test
+  the *desired* semantics; if undesired behavior must be tolerated temporarily,
+  say so in the test name (`..._currently_pins_...`) so it reads as debt.
+- **One behavior, one test, lowest layer.** Don't duplicate a unit test through
+  the engine thread or the integration suite; higher layers test routing only.
+  Don't test test-helpers, derived trait impls, or inline reimplementations of
+  production code — drive the real function/constant.
+- **Deterministic by construction.** No fixed sleeps waiting for state; poll a
+  predicate with a deadline (see Flaky-Test Methodology), join handles, or
+  inject a clock/runner seam. Never assert on wall-clock elapsed time or on
+  observing a transient intermediate state; assert terminal state instead.
+
 ### Integration Suites
 
 - `gui-engine/tests/integration.rs` — engine-thread command processing, incl. offload scan/copy integration tests driven through `EngineSeams.scan_cards` (fake card, real tempdir copies, cancel + guard branches) and the `SetDevice` bogus-id revert test
