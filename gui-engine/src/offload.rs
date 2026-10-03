@@ -1185,10 +1185,17 @@ pub fn run_offload_scan_job_with(
         move |msg| tracker.set_message(msg)
     });
 
-    let cards = detect(&ctx.cancel, Some(&scan_progress)).map_err(|msg| {
-        ctx.progress.set_message(format!("Scan failed: {msg}"));
-        JobError::Failed(msg)
-    })?;
+    let cards = match detect(&ctx.cancel, Some(&scan_progress)) {
+        Ok(cards) => cards,
+        Err(msg) => {
+            // Cancellation takes precedence over a detector error: a
+            // detector that aborts because its token fired reports
+            // Cancelled, not Failed.
+            ctx.cancel.check()?;
+            ctx.progress.set_message(format!("Scan failed: {msg}"));
+            return Err(JobError::Failed(msg));
+        }
+    };
 
     ctx.progress.set_message(format!("Found {} card(s)", cards.len()));
     ctx.progress.set_indeterminate(false);
@@ -2465,7 +2472,9 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         std::thread::sleep(std::time::Duration::from_millis(30));
         cancel_for_detector.cancel();
         let result = handle.join().expect("detector thread panicked");
-        assert!(matches!(result, Err(JobError::Failed(msg)) if msg.contains("cancelled by test")));
+        // The detector aborted because the token fired — cancellation takes
+        // precedence, so the job maps to Cancelled, not Failed.
+        assert!(matches!(result, Err(JobError::Cancelled)));
     }
 
     #[cfg(target_os = "linux")]

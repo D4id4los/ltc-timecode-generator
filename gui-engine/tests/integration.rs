@@ -9,8 +9,7 @@ use arc_swap::ArcSwap;
 use gui_engine::command::{GuiCommand, OffloadCommand};
 use gui_engine::engine::{engine_main_with_probe, engine_main_with_seams, EngineSeams, ScanCardsFn};
 use gui_engine::state::AppStateSnapshot;
-use gui_engine::job::CancelToken;
-use gui_engine::offload::{OffloadFileInfo, SdCardInfo, ScanProgress};
+use gui_engine::offload::{OffloadFileInfo, SdCardInfo};
 use gui_engine::{decode_ltc_from_wav, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities, ChannelSel, DeviceNameSource};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -1202,4 +1201,228 @@ fn fake_scan_reaches_snapshot() {
     // on_offload_scan_finished applies the default (latest-day) selection.
     assert_eq!(snap.offload.cards[0].selected_count, 2, "default selection applied on scan finish");
     engine.shutdown();
+}
+
+// ── PR-2: engine offload integration tests ───────────────────────────────
+
+/// Build a card from files that already exist on disk (sizes from metadata).
+fn card_for_existing_files(mount: &Path, device_name: &str, file_names: &[&str]) -> SdCardInfo {
+    let mut files = Vec::new();
+    for name in file_names {
+        let path = mount.join(name);
+        let meta = std::fs::metadata(&path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+        files.push(OffloadFileInfo {
+            path: path.clone(),
+            name: (*name).to_string(),
+            size_bytes: meta.len(),
+            modified: meta.modified().ok().map(|t| t.into()),
+        });
+    }
+    let total_bytes = files.iter().map(|f| f.size_bytes).sum();
+    SdCardInfo {
+        mount: mount.to_path_buf(),
+        volume_label: "TESTVOL".to_string(),
+        device_name: device_name.to_string(),
+        name_source: DeviceNameSource::Manual,
+        media_file_count: files.len(),
+        total_bytes,
+        files,
+        selected: Vec::new(),
+        selected_count: 0,
+        selected_bytes: 0,
+    }
+}
+
+#[test]
+fn test_offload_happy_path_scan_select_copy() {
+    let mount = make_persistent_dir("offload-happy-mount");
+    let dest = make_persistent_dir("offload-happy-dest");
+
+    // Real (tiny) WAVs so the post-scan DurationProbe reports actual values.
+    let p1 = mount.join("CLIP001.wav");
+    let p2 = mount.join("CLIP002.wav");
+    generate_wav(&p1, 25.0, false, 0.2, 48000);
+    generate_wav(&p2, 25.0, false, 0.2, 48000);
+    let card = card_for_existing_files(&mount, "TESTCAM", &["CLIP001.wav", "CLIP002.wav"]);
+
+    let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    let snap = wait_for_snapshot(&engine.state, "OffloadScan success", |s| {
+        s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+    });
+    let version_before = snap.offload.last_offload_version;
+
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetParentFolder(dest.clone()))).unwrap();
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetParentName("day1".into()))).unwrap();
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(0, true))).unwrap();
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
+
+    let snap = wait_for_snapshot(&engine.state, "OffloadCopy success", |s| {
+        s.jobs.get(&JobKind::OffloadCopy).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+            && s.offload.completed_devices.contains(&"TESTCAM".to_string())
+    });
+
+    // Destination layout: dest/<parent_name>/<device>/<filename>, byte-identical.
+    let dev_dir = dest.join("day1").join("TESTCAM");
+    for name in ["CLIP001.wav", "CLIP002.wav"] {
+        let copied = dev_dir.join(name);
+        let src = mount.join(name);
+        assert!(copied.is_file(), "missing copy: {}", copied.display());
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            std::fs::read(&src).unwrap(),
+            "copied bytes differ for {name}"
+        );
+    }
+
+    assert_eq!(snap.offload.completed_devices, vec!["TESTCAM".to_string()]);
+    assert_eq!(snap.offload.last_offload_parent, Some(dev_dir.parent().unwrap().to_path_buf()));
+    assert_eq!(snap.offload.last_offload_version, version_before + 1, "completion bumps the handoff version");
+
+    let totals = snap.offload.device_totals.iter().find(|t| t.name == "TESTCAM").expect("device totals for TESTCAM");
+    assert_eq!(totals.files_total, 2);
+    assert_eq!(totals.bytes_total, snap.offload.cards[0].selected_bytes);
+
+    // DurationProbe items (spawned by on_offload_scan_finished) filled durations.
+    wait_for_snapshot(&engine.state, "file durations populated", |s| {
+        s.offload.file_durations.contains_key(&p1) && s.offload.file_durations.contains_key(&p2)
+    });
+    let snap = engine.state.load().as_ref().clone();
+    assert!(snap.offload.file_durations[&p1].is_some(), "WAV duration should probe successfully");
+    assert!(snap.offload.file_durations[&p2].is_some());
+
+    engine.shutdown();
+}
+
+#[test]
+fn test_offload_copy_failure_completes_with_no_devices() {
+    // NOTE: a per-file copy failure does NOT fail the job — the job-level
+    // contract is "Succeeded with the list of completed devices" (per-device
+    // failure lives in the unit state). This test pins that contract: the
+    // copy fails at read time, no device completes, nothing is version-bumped
+    // into a "delivered" state, and the engine stays healthy.
+    let mount = make_persistent_dir("offload-fail-mount");
+    let dest = make_persistent_dir("offload-fail-dest");
+    let card = make_card(&mount, "VANISH", &["gone1.wav", "gone2.wav"]);
+    // The card snapshot retains sizes, so the plan builds fine — but the
+    // sources are deleted before the copy starts.
+    std::fs::remove_file(mount.join("gone1.wav")).unwrap();
+    std::fs::remove_file(mount.join("gone2.wav")).unwrap();
+
+    let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    wait_for_snapshot(&engine.state, "scan success", |s| {
+        s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+    });
+
+    let version_before = engine.state.load().offload.last_offload_version;
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetParentFolder(dest))).unwrap();
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(0, true))).unwrap();
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
+
+    let snap = wait_for_snapshot(&engine.state, "OffloadCopy terminal", |s| {
+        matches!(
+            s.jobs.get(&JobKind::OffloadCopy).map(|j| j.phase()),
+            Some(JobPhase::Succeeded) | Some(JobPhase::Failed) | Some(JobPhase::Cancelled)
+        )
+    });
+
+    assert!(
+        snap.offload.completed_devices.is_empty(),
+        "no device may complete when every file fails to copy"
+    );
+    // Pinned current behavior: on_offload_copy_finished's non-cancelled
+    // branch bumps last_offload_version unconditionally — even when zero
+    // devices completed. Questionable (it points the GUI's offload→converter
+    // handoff at an empty destination) but changing it is out of scope for
+    // this test-gap WP.
+    assert_eq!(snap.offload.last_offload_version, version_before + 1, "handler bumps version on any non-cancelled completion");
+    let dev_dir = snap.offload.parent_folder.as_ref().unwrap().join(&snap.offload.parent_name).join("VANISH");
+    assert!(!dev_dir.join("gone1.wav").exists(), "no partial file may survive as a deliverable");
+
+    // Engine alive and publishable afterwards: a no-op command is acked.
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetParentName("post-fail".into()))).unwrap();
+    wait_for_snapshot(&engine.state, "engine alive after failure", |s| {
+        s.offload.parent_name == "post-fail"
+    });
+
+    engine.shutdown();
+}
+
+#[test]
+fn test_offload_cancel_during_scan() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mount = make_persistent_dir("offload-cancel-mount");
+    let card = make_card(&mount, "TESTCAM", &["a.wav"]);
+
+    // First scan blocks, polling the job's cancel token; the seam returns a
+    // card only on the second scan. Avoids racing a real (too-fast) copy.
+    let first_scan = AtomicBool::new(true);
+    let seam: ScanCardsFn = Arc::new(move |cancel, _progress| {
+        if first_scan.swap(false, Ordering::SeqCst) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !cancel.is_cancelled() {
+                assert!(Instant::now() < deadline, "scan seam never cancelled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err("aborted: cancelled".to_string())
+        } else {
+            Ok(vec![card.clone()])
+        }
+    });
+
+    let engine = spawn_engine_with_scan_seam(seam);
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    wait_for_snapshot(&engine.state, "scan running", |s| {
+        matches!(s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase()), Some(JobPhase::Running) | Some(JobPhase::Indeterminate))
+    });
+
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::CancelOffload)).unwrap();
+    let snap = wait_for_snapshot(&engine.state, "scan cancelled", |s| {
+        s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Cancelled).unwrap_or(false)
+    });
+    assert_eq!(snap.offload.error.as_deref(), Some("Canceled by user"));
+
+    // A subsequent scan works again — no stale-supervisor lockout.
+    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    let snap = wait_for_snapshot(&engine.state, "rescan after cancel succeeds", |s| {
+        s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+    });
+    assert_eq!(snap.offload.cards.len(), 1);
+
+    engine.shutdown();
+}
+
+#[test]
+fn test_start_offload_guard_branches() {
+    // (a) No cards → "No media cards detected."
+    {
+        let engine = spawn_engine_with_scan_seam(Arc::new(|_c, _p| Ok(Vec::new())));
+        engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
+        let snap = wait_for_snapshot(&engine.state, "no-cards guard", |s| s.offload.error.is_some());
+        assert_eq!(snap.offload.error.as_deref(), Some("No media cards detected."));
+        engine.shutdown();
+    }
+
+    // (b) Card present but no parent folder → "No parent folder selected."
+    {
+        let mount = make_persistent_dir("offload-guard-mount");
+        let card = make_card(&mount, "TESTCAM", &["a.wav"]);
+        let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
+        engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+        wait_for_snapshot(&engine.state, "scan success", |s| {
+            s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+        });
+        engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
+        let snap = wait_for_snapshot(&engine.state, "no-parent guard", |s| {
+            s.offload.error.as_deref() == Some("No parent folder selected.")
+        });
+        assert_eq!(snap.offload.error.as_deref(), Some("No parent folder selected."));
+        engine.shutdown();
+    }
+    // (c) Duplicate StartOffload while copy running is deliberately not
+    // engine-tested: real copies of test-sized files finish faster than the
+    // duplicate can be observed, and the spawn guard (supervisor.is_running)
+    // is exercised by the other job kinds' duplicate tests.
 }
