@@ -48,10 +48,14 @@ pub trait ConversionReport: Send + Sync {
     fn is_failed(&self) -> bool;
     fn set_unit_count(&self, n: usize);
     fn unit(&self, idx: usize) -> Option<UnitProgress>;
-    /// Called by `summarize_metadata_failures` with the number of recorded
-    /// step failures, so tests can assert the count structurally instead of
-    /// parsing the `--- N STEP(S) FAILED ---` wording.
-    fn set_failure_count(&self, _n: usize) {}
+    /// Called by `summarize_metadata_failures` with the recorded step
+    /// failures, so tests can assert them structurally instead of parsing
+    /// the `--- N STEP(S) FAILED ---` wording.
+    fn set_failures(&self, _failures: &[StepFailureRecord]) {}
+    /// Called by `check_cancelled` when the pipeline observes a cancellation
+    /// (in addition to the human-readable CANCELLED log block). Tests use
+    /// this to assert cancellation without matching log text.
+    fn note_cancelled(&self) {}
     /// Returns an optional `&AtomicBool` for the ffmpeg watchdog's
     /// cancel‑checking loop (checked every ~100 ms regardless of stderr
     /// output).  `None` = no 100‑ms cancel check (cancellation is only
@@ -185,7 +189,10 @@ pub struct TestReport {
     pub message: std::sync::Arc<Mutex<String>>,
     pub failed: std::sync::Arc<Mutex<bool>>,
     pub completed: std::sync::Arc<Mutex<bool>>,
-    pub failure_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by `set_failures` (the typed failure-ledger seam).
+    failures: std::sync::Arc<Mutex<Vec<StepFailureRecord>>>,
+    /// Set by `note_cancelled`.
+    cancelled_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
     step_weight: std::sync::Arc<Mutex<f32>>,
     /// Completed-step weight accumulator, mirroring the production report's
     /// `overall_progress`: only `advance_step` mutates it. `progress` holds
@@ -198,9 +205,15 @@ impl TestReport {
         TestReport::default()
     }
 
-    /// Structural view of the last `set_failure_count` call (0 if none).
-    pub fn failure_count(&self) -> usize {
-        self.failure_count.load(std::sync::atomic::Ordering::Relaxed)
+    /// Structural view of the recorded step failures (empty if none).
+    pub fn failures(&self) -> Vec<StepFailureRecord> {
+        self.failures.lock().unwrap().clone()
+    }
+
+    /// Whether `note_cancelled` has been called.
+    pub fn cancel_notified(&self) -> bool {
+        self.cancelled_notified
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Every progress value observed after each `report_step_fraction` /
@@ -222,7 +235,8 @@ impl Default for TestReport {
             message: std::sync::Arc::new(Mutex::new(String::new())),
             failed: std::sync::Arc::new(Mutex::new(false)),
             completed: std::sync::Arc::new(Mutex::new(false)),
-            failure_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            failures: std::sync::Arc::new(Mutex::new(Vec::new())),
+            cancelled_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             step_weight: std::sync::Arc::new(Mutex::new(0.0)),
             overall: std::sync::Arc::new(Mutex::new(0.0)),
         }
@@ -290,8 +304,13 @@ impl ConversionReport for TestReport {
 
     fn set_unit_count(&self, _n: usize) {}
 
-    fn set_failure_count(&self, n: usize) {
-        self.failure_count.store(n, std::sync::atomic::Ordering::Relaxed);
+    fn set_failures(&self, failures: &[StepFailureRecord]) {
+        *self.failures.lock().unwrap() = failures.to_vec();
+    }
+
+    fn note_cancelled(&self) {
+        self.cancelled_notified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn unit(&self, _idx: usize) -> Option<UnitProgress> {
@@ -342,6 +361,27 @@ impl EncoderFallback {
     pub fn resolved(&self) -> Option<&str> {
         self.resolved.as_deref()
     }
+
+    /// Encoders that failed initialization during this run (structurally
+    /// recorded, replacing prose pins in tests).
+    #[cfg(test)]
+    pub fn failed(&self) -> &BTreeSet<String> {
+        &self.failed
+    }
+}
+
+/// Typed result of [`run_video_step_with_fallback`], replacing the former
+/// `bool` return.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepOutcome {
+    /// The step completed successfully (some encoder produced output).
+    Succeeded,
+    /// No encoder candidate succeeded — the chain was empty from the start
+    /// or every candidate failed to initialize (or the run was cancelled
+    /// mid-step; the caller distinguishes via `report.is_cancelled()`).
+    Exhausted,
+    /// A non-retryable ffmpeg failure terminated the step.
+    Failed(StepFailure),
 }
 
 fn resolve_device_for_candidate(encoder: &str, ctx: &HwDeviceContext) -> Option<ResolvedHwDevice> {
@@ -364,21 +404,21 @@ fn run_video_step_with_fallback(
     report: &impl ConversionReport,
     total_steps: usize,
     current_step: usize,
-) -> bool {
+) -> StepOutcome {
     let candidates = fallback.remaining();
     if candidates.is_empty() {
         let msg = "no video encoder candidate available".to_string();
         warn!("{}", msg);
         report.append_log(&format!("\n\n--- {} ---", msg));
         report.mark_failed(&msg);
-        return false;
+        return StepOutcome::Exhausted;
     }
 
     let mut attempt = 0;
     while attempt < candidates.len() {
         let encoder = candidates[attempt].clone();
         if report.is_cancelled() {
-            return false;
+            return StepOutcome::Exhausted;
         }
         settings.resolved_video_encoder = encoder.clone();
 
@@ -407,11 +447,11 @@ fn run_video_step_with_fallback(
         ) {
             Ok(()) => {
                 fallback.note_success(&encoder);
-                return true;
+                return StepOutcome::Succeeded;
             }
             Err(f @ StepFailure::Fatal(_)) => {
                 report.mark_failed(&f.to_string());
-                return false;
+                return StepOutcome::Failed(f);
             }
             Err(StepFailure::EncoderInit(_)) => {
                 fallback.note_failure(&encoder);
@@ -436,7 +476,7 @@ fn run_video_step_with_fallback(
     warn!("{}", msg);
     report.append_log(&format!("\n\n--- {} ---", msg));
     report.mark_failed(&msg);
-    false
+    StepOutcome::Exhausted
 }
 
 fn prepare_copy_mode(settings: &mut ConverterSettings) {
@@ -825,7 +865,7 @@ fn run_video_to_video(
             let mut build_args =
                 |s: &ConverterSettings| build_video_to_video_args(s, &entry.step, &probe);
 
-            let ok = if settings.copy_video {
+            let outcome = if settings.copy_video {
                 match run_ffmpeg_process(
                     &build_args(settings),
                     &output,
@@ -833,10 +873,10 @@ fn run_video_to_video(
                     steps.len(),
                     step_idx + 1,
                 ) {
-                    Ok(()) => true,
+                    Ok(()) => StepOutcome::Succeeded,
                     Err(e) => {
                         report.mark_failed(&e.to_string());
-                        false
+                        StepOutcome::Failed(e)
                     }
                 }
             } else {
@@ -850,7 +890,7 @@ fn run_video_to_video(
                     step_idx + 1,
                 )
             };
-            if !ok {
+            if !matches!(outcome, StepOutcome::Succeeded) {
                 break;
             }
         }
@@ -899,18 +939,52 @@ fn check_cancelled(report: &impl ConversionReport) -> bool {
     if !report.is_cancelled() {
         return false;
     }
+    report.note_cancelled();
     report.append_log("\n--- CANCELLED ---\n");
     report.mark_failed("Cancelled by user");
     true
 }
 
+/// Typed record of one failed pipeline step in the metadata-only failure
+/// ledger. `kind` discriminates the phase that failed; `detail` is the
+/// human-readable line rendered in the `--- N STEP(S) FAILED ---` block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepFailureRecord {
+    pub kind: FailureKind,
+    pub file: Option<PathBuf>,
+    pub detail: String,
+}
+
+/// Which pipeline phase produced a [`StepFailureRecord`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum FailureKind {
+    Probe,
+    /// Audio-extraction ffmpeg step; carries the typed step failure.
+    Extraction(StepFailure),
+    Tag,
+    Rename,
+    /// Any other ffmpeg step failure; carries the typed step failure.
+    Ffmpeg(StepFailure),
+}
+
+impl FailureKind {
+    /// Rendering of the embedded step failure, if any (used to compose the
+    /// record's `detail` line).
+    fn failure_detail(&self) -> String {
+        match self {
+            FailureKind::Extraction(f) | FailureKind::Ffmpeg(f) => f.to_string(),
+            FailureKind::Probe | FailureKind::Tag | FailureKind::Rename => String::new(),
+        }
+    }
+}
+
 /// Failure ledger shared by the metadata-only phases: counts attempted
-/// vs. successful steps and records one detail line per failure.
+/// vs. successful steps and records one typed record per failure.
 #[derive(Default)]
 struct FailureLedger {
     attempted: usize,
     succeeded: usize,
-    details: Vec<String>,
+    details: Vec<StepFailureRecord>,
 }
 
 impl FailureLedger {
@@ -920,25 +994,38 @@ impl FailureLedger {
     }
 }
 
-/// Record a step failure with its typed payload: appends `msg` plus the
-/// `StepFailure` detail to the log and tracks it in the ledger.
+/// Record an ffmpeg step failure with its typed payload: appends `msg` plus
+/// the `StepFailure` detail to the log and tracks it in the ledger.
 fn note_step_failure(
     ledger: &mut FailureLedger,
     report: &impl ConversionReport,
+    kind: FailureKind,
+    file: Option<&Path>,
     msg: &str,
-    failure: &StepFailure,
 ) {
     ledger.attempted += 1;
-    let detail = format!("{} ({})", msg.trim_end(), failure);
-    ledger.details.push(detail.clone());
+    let detail = format!("{} ({})", msg.trim_end(), kind.failure_detail());
+    ledger.details.push(StepFailureRecord {
+        kind,
+        file: file.map(Path::to_path_buf),
+        detail: detail.clone(),
+    });
     report.append_log(&format!("✗ {}\n", detail));
 }
 
-/// Record a best-effort failure without a typed payload (probe / tag /
-/// rename errors).
-fn note_plaintext_failure(ledger: &mut FailureLedger, detail: String) {
+/// Record a best-effort failure (probe / tag / rename errors) in the ledger.
+fn note_plaintext_failure(
+    ledger: &mut FailureLedger,
+    kind: FailureKind,
+    file: Option<&Path>,
+    detail: String,
+) {
     ledger.attempted += 1;
-    ledger.details.push(detail);
+    ledger.details.push(StepFailureRecord {
+        kind,
+        file: file.map(Path::to_path_buf),
+        detail,
+    });
 }
 
 /// Monotonic step label replacing the old `file_idx * 3 + 1` math.
@@ -1004,6 +1091,8 @@ fn probe_all_metadata_files_with(
                     report.append_log(&msg);
                     note_plaintext_failure(
                         ledger,
+                        FailureKind::Probe,
+                        Some(input_path),
                         format!("{} — probe failed: {}", input_path.display(), e),
                     );
                     None
@@ -1077,8 +1166,9 @@ fn extract_concat_audio(
                     note_step_failure(
                         ledger,
                         report,
+                        FailureKind::Extraction(e.clone()),
+                        Some(output),
                         &format!("audio concatenation step {} failed", step_label(cursor, total_actual)),
-                        &e,
                     );
                 } else {
                     ledger.note_success();
@@ -1111,11 +1201,12 @@ fn extract_concat_audio(
                     note_step_failure(
                         ledger,
                         report,
+                        FailureKind::Extraction(e.clone()),
+                        Some(settings.input_files[*file_idx].as_path()),
                         &format!(
                             "{} — audio extraction failed",
                             settings.input_files[*file_idx].display()
                         ),
-                        &e,
                     );
                 } else {
                     ledger.note_success();
@@ -1185,8 +1276,9 @@ fn extract_per_file_audio(
                         note_step_failure(
                             ledger,
                             report,
+                            FailureKind::Extraction(e.clone()),
+                            Some(input_path),
                             &format!("{} — audio extraction failed", input_path.display()),
-                            &e,
                         );
                     } else {
                         ledger.note_success();
@@ -1218,8 +1310,9 @@ fn extract_per_file_audio(
                     note_step_failure(
                         ledger,
                         report,
+                        FailureKind::Extraction(e.clone()),
+                        Some(input_path),
                         &format!("{} — audio extraction failed", input_path.display()),
-                        &e,
                     );
                 } else {
                     ledger.note_success();
@@ -1280,7 +1373,7 @@ fn tag_and_rename_files(
                         format!("{} — tagging failed: {}", input_path.display(), e);
                     log::error!("{}", detail);
                     report.append_log(&format!("✗ {}\n", detail));
-                    note_plaintext_failure(ledger, detail);
+                    note_plaintext_failure(ledger, FailureKind::Tag, Some(input_path), detail);
                 }
             }
         } else {
@@ -1325,7 +1418,12 @@ fn tag_and_rename_files(
                             );
                             log::error!("{}", detail);
                             report.append_log(&format!("✗ {}\n", detail));
-                            note_plaintext_failure(ledger, detail);
+                            note_plaintext_failure(
+                                ledger,
+                                FailureKind::Rename,
+                                Some(input_path),
+                                detail,
+                            );
                         }
                     }
                 }
@@ -1344,11 +1442,15 @@ fn summarize_metadata_failures(report: &impl ConversionReport, ledger: &FailureL
     if ledger.details.is_empty() {
         return;
     }
-    report.set_failure_count(ledger.details.len());
+    report.set_failures(&ledger.details);
     let summary = format!(
         "\n--- {} STEP(S) FAILED ---\n{}",
         ledger.details.len(),
-        ledger.details.join("\n")
+        ledger.details
+            .iter()
+            .map(|r| r.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     if ledger.attempted > 0 && ledger.succeeded == 0 {
         report.append_log(&summary);
@@ -1770,8 +1872,15 @@ mod tests {
 
         assert!(*report.failed.lock().unwrap(), "all probes failed → run failed");
         let failures = report.failures();
-        assert_eq!(failures.len(), 2, "one probe failure per clip: {:?}", failures);
-        assert!(failures.iter().all(|r| matches!(r.kind, FailureKind::Probe)));
+        // Probe, tag, and rename all fail per clip (best-effort phases keep
+        // running after the probe failure); no ffmpeg step ever runs.
+        assert_eq!(failures.len(), 6, "probe + tag + rename per clip: {:?}", failures);
+        assert_eq!(
+            failures.iter().filter(|r| matches!(r.kind, FailureKind::Probe)).count(),
+            2,
+            "one probe failure per clip"
+        );
+        assert!(failures.iter().all(|r| !matches!(r.kind, FailureKind::Ffmpeg(_))));
     }
 
     #[test]
@@ -1853,8 +1962,14 @@ mod tests {
 
         assert!(*report.failed.lock().unwrap(), "all steps failed → failed");
         let failures = report.failures();
-        assert_eq!(failures.len(), 1, "the failed extraction is recorded: {:?}", failures);
-        assert!(matches!(failures[0].kind, FailureKind::Extraction(_)));
+        // The extraction ffmpeg step fails (typed Extraction record), and
+        // the best-effort tag/rename phases fail on the nonexistent input.
+        assert_eq!(failures.len(), 3, "extraction + tag + rename: {:?}", failures);
+        assert_eq!(
+            failures.iter().filter(|r| matches!(r.kind, FailureKind::Extraction(_))).count(),
+            1,
+            "the failed extraction is recorded"
+        );
     }
 
     #[test]
@@ -1938,7 +2053,7 @@ mod tests {
         );
         let mut build_args = |s: &ConverterSettings| vec![
             "-f".to_string(), "lavfi".to_string(),
-            "-i".to_string(), "anullsrc=r=48000:cl=mono".to_string(),
+            "-i".to_string(), "testsrc=size=64x64:rate=10".to_string(),
             "-t".to_string(), "0.1".to_string(),
             "-c:v".to_string(), s.resolved_video_encoder.clone(),
             output_str.clone(),

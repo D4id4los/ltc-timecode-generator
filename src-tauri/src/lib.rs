@@ -374,7 +374,7 @@ fn start_convert(
     ) {
         return Ok(ConvertResponse {
             success: false,
-            message: e,
+            message: e.to_string(),
         });
     }
 

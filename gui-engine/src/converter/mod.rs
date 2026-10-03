@@ -38,7 +38,8 @@ pub use checks::{
     conversion_sanity_check, conversion_sanity_check_metadata_only,
     conversion_sanity_check_pure, conversion_sanity_check_metadata_only_pure,
     validate_conversion_paths,
-    ConvertBlocker, ConvertReadiness, evaluate_readiness, format_blockers,
+    ConversionCheckError, ConvertBlocker, ConvertReadiness, evaluate_readiness,
+    format_blockers,
 };
 
 pub(crate) mod args;
@@ -47,7 +48,7 @@ pub(crate) mod process;
 pub use process::StepFailure;
 
 pub(crate) mod runner;
-pub use runner::{spawn_conversion_job, run_conversion, ConversionReport, JobConversionReport, TestReport};
+pub use runner::{spawn_conversion_job, run_conversion, ConversionReport, FailureKind, JobConversionReport, StepFailureRecord, StepOutcome, TestReport};
 
 #[cfg(test)]
 pub(crate) mod test_fixtures;

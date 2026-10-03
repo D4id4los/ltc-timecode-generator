@@ -9,6 +9,7 @@ use gui_engine::converter::{
     available_containers,
     conversion_sanity_check, conversion_sanity_check_metadata_only,
     conversion_sanity_check_pure, conversion_sanity_check_metadata_only_pure,
+    ConversionCheckError,
     evaluate_readiness,
     format_blockers,
     preview_output_files, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
@@ -29,7 +30,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 
     // Pre-compute sanity result once per frame (pure — no filesystem access)
     let caps_opt = state.latest.ffmpeg_caps.clone();
-    let sanity_result: Option<Result<(), String>> = caps_opt.as_ref().and_then(|caps| {
+    let sanity_result: Option<Result<(), ConversionCheckError>> = caps_opt.as_ref().and_then(|caps| {
         let conv = &state.sh.conv;
         let metadata_only = *conv.metadata_only.value();
         let output_folder = conv.output_folder.value().clone();
@@ -1296,7 +1297,7 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
 
 // ── Step 3: Output format (Video / Audio columns) ──────────────────────
 
-fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), String>>) {
+fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), ConversionCheckError>>) {
     let colors = state.theme.colors();
     let caps_opt = state.latest.ffmpeg_caps.clone();
 
@@ -1827,7 +1828,7 @@ fn selected_input_files(state: &AppState) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), String>>) {
+fn render_convert_button(ui: &mut Ui, state: &mut AppState, sanity: Option<&Result<(), ConversionCheckError>>) {
     let colors = state.theme.colors();
     let is_running = state.latest.job(JobKind::Conversion).is_active();
 

@@ -1,9 +1,114 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::converter::capabilities::FfmpegCapabilities;
 use crate::converter::formats::{container_supports_audio_encoder, encoder_available_in_ffmpeg, format_available_in_ffmpeg};
 use crate::naming;
 use crate::video_codecs;
+
+/// Typed sanity-check failure. One variant per distinct message site;
+/// [`Display`](fmt::Display) renders the exact strings that were previously
+/// returned as `Err(String)` (they surface in blockers and log lines shown
+/// to users, so the rendering is a byte-identical contract).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConversionCheckError {
+    /// ffmpeg binary missing. `None` when the capability probe produced no
+    /// detail; `Some(detail)` carries the probe error message.
+    FfmpegUnavailable(Option<String>),
+    NoInputFiles,
+    NoOutputName,
+    UnsupportedContainer { container: String },
+    InvalidAudioSuffixTemplate(String),
+    InvalidVideoSuffixTemplate(String),
+    InvalidPrefixTemplate(String),
+    UnknownVideoCodec { codec: String, supported: String },
+    NoEncoderAvailable { codec: String, candidates: String },
+    UnsupportedAudioEncoder { encoder: String },
+    IncompatibleVideoContainer { codec: String, container: String, hint: String },
+    IncompatibleAudioContainer { encoder: String, container: String, hint: String },
+    MissingInput(PathBuf),
+    MissingOutputFolder(PathBuf),
+}
+
+impl fmt::Display for ConversionCheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConversionCheckError::FfmpegUnavailable(None) => {
+                write!(f, "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.")
+            }
+            ConversionCheckError::FfmpegUnavailable(Some(detail)) => {
+                write!(
+                    f,
+                    "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH. ({})",
+                    detail
+                )
+            }
+            ConversionCheckError::NoInputFiles => {
+                write!(f, "No input files selected.")
+            }
+            ConversionCheckError::NoOutputName => {
+                write!(f, "No output filename prefix or suffix specified.")
+            }
+            ConversionCheckError::UnsupportedContainer { container } => write!(
+                f,
+                "Container format '{}' is not supported by your ffmpeg installation. \
+                 Run `ffmpeg -formats` to see available formats.",
+                container
+            ),
+            ConversionCheckError::InvalidAudioSuffixTemplate(e) => {
+                write!(f, "Invalid audio suffix template: {}", e)
+            }
+            ConversionCheckError::InvalidVideoSuffixTemplate(e) => {
+                write!(f, "Invalid video suffix template: {}", e)
+            }
+            ConversionCheckError::InvalidPrefixTemplate(e) => {
+                write!(f, "Invalid filename prefix: {}", e)
+            }
+            ConversionCheckError::UnknownVideoCodec { codec, supported } => write!(
+                f,
+                "Unknown video codec '{}'. Supported codecs: {}.",
+                codec, supported
+            ),
+            ConversionCheckError::NoEncoderAvailable { codec, candidates } => write!(
+                f,
+                "No {} encoder is available in your ffmpeg installation \
+                 (needs one of: {}). Run `ffmpeg -encoders` to see available encoders.",
+                codec, candidates
+            ),
+            ConversionCheckError::UnsupportedAudioEncoder { encoder } => write!(
+                f,
+                "Audio encoder '{}' is not supported by your ffmpeg installation. \
+                 Run `ffmpeg -encoders` to see available encoders. \
+                 Common alternatives: pcm_s24le (PCM 24-bit), pcm_s16le (PCM 16-bit), aac, libopus.",
+                encoder
+            ),
+            ConversionCheckError::IncompatibleVideoContainer { codec, container, hint } => {
+                write!(
+                    f,
+                    "Video codec '{}' is not compatible with container format '{}'. \
+                     {}",
+                    codec, container, hint
+                )
+            }
+            ConversionCheckError::IncompatibleAudioContainer { encoder, container, hint } => {
+                write!(
+                    f,
+                    "Audio encoder '{}' is not compatible with container format '{}'. \
+                     {}",
+                    encoder, container, hint
+                )
+            }
+            ConversionCheckError::MissingInput(p) => {
+                write!(f, "Input file does not exist: {}", p.display())
+            }
+            ConversionCheckError::MissingOutputFolder(p) => {
+                write!(f, "Output directory does not exist: {}", p.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConversionCheckError {}
 
 /// Pure validation: checks templates, caps, codec/container compatibility.
 /// Does **not** access the filesystem (no `exists()` on files or folders).
@@ -20,40 +125,37 @@ pub fn conversion_sanity_check_pure(
     audio_suffix: Option<&str>,
     video_suffix: Option<&str>,
     copy_video: bool,
-) -> Result<(), String> {
+) -> Result<(), ConversionCheckError> {
     if !caps.has_ffmpeg {
-        return Err("ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH."
-            .to_string());
+        return Err(ConversionCheckError::FfmpegUnavailable(None));
     }
 
     if input_files.is_empty() {
-        return Err("No input files selected.".to_string());
+        return Err(ConversionCheckError::NoInputFiles);
     }
 
     if filename_prefix.is_empty() && audio_suffix.unwrap_or("").is_empty() && video_suffix.unwrap_or("").is_empty() {
-        return Err("No output filename prefix or suffix specified.".to_string());
+        return Err(ConversionCheckError::NoOutputName);
     }
 
     if !format_available_in_ffmpeg(container, caps) {
-        return Err(format!(
-            "Container format '{}' is not supported by your ffmpeg installation. \
-             Run `ffmpeg -formats` to see available formats.",
-            container
-        ));
+        return Err(ConversionCheckError::UnsupportedContainer {
+            container: container.to_string(),
+        });
     }
 
     if let Some(t) = audio_suffix {
         if !t.is_empty() {
-            naming::validate_template(t).map_err(|e| format!("Invalid audio suffix template: {}", e))?;
+            naming::validate_template(t).map_err(|e| ConversionCheckError::InvalidAudioSuffixTemplate(e.to_string()))?;
         }
     }
     if let Some(t) = video_suffix {
         if !t.is_empty() {
-            naming::validate_template(t).map_err(|e| format!("Invalid video suffix template: {}", e))?;
+            naming::validate_template(t).map_err(|e| ConversionCheckError::InvalidVideoSuffixTemplate(e.to_string()))?;
         }
     }
     if !filename_prefix.is_empty() {
-        naming::validate_template(filename_prefix).map_err(|e| format!("Invalid filename prefix: {}", e))?;
+        naming::validate_template(filename_prefix).map_err(|e| ConversionCheckError::InvalidPrefixTemplate(e.to_string()))?;
     }
 
     if !copy_video {
@@ -63,30 +165,24 @@ pub fn conversion_sanity_check_pure(
                 .iter()
                 .map(|(k, _)| *k)
                 .collect();
-            return Err(format!(
-                "Unknown video codec '{}'. Supported codecs: {}.",
-                video_codec,
-                known.join(", ")
-            ));
+            return Err(ConversionCheckError::UnknownVideoCodec {
+                codec: video_codec.to_string(),
+                supported: known.join(", "),
+            });
         }
 
         if video_codecs::resolve_encoder_chain(codec_id, caps).is_empty() {
-            return Err(format!(
-                "No {} encoder is available in your ffmpeg installation \
-                 (needs one of: {}). Run `ffmpeg -encoders` to see available encoders.",
-                codec_id,
-                video_codecs::static_encoder_chain(codec_id).join(", ")
-            ));
+            return Err(ConversionCheckError::NoEncoderAvailable {
+                codec: codec_id.to_string(),
+                candidates: video_codecs::static_encoder_chain(codec_id).join(", "),
+            });
         }
     }
 
     if !encoder_available_in_ffmpeg(audio_encoder, caps) {
-        return Err(format!(
-            "Audio encoder '{}' is not supported by your ffmpeg installation. \
-             Run `ffmpeg -encoders` to see available encoders. \
-             Common alternatives: pcm_s24le (PCM 24-bit), pcm_s16le (PCM 16-bit), aac, libopus.",
-            audio_encoder
-        ));
+        return Err(ConversionCheckError::UnsupportedAudioEncoder {
+            encoder: audio_encoder.to_string(),
+        });
     }
 
     if !copy_video && !video_codecs::codec_supports_container(
@@ -94,34 +190,32 @@ pub fn conversion_sanity_check_pure(
         container,
     ) {
         let codec_id = video_codecs::normalize_video_codec(video_codec);
-        return Err(format!(
-            "Video codec '{}' is not compatible with container format '{}'. \
-             {}",
-            codec_id,
-            container,
-            match codec_id {
+        return Err(ConversionCheckError::IncompatibleVideoContainer {
+            codec: codec_id.to_string(),
+            container: container.to_string(),
+            hint: match codec_id {
                 "prores" => "ProRes typically requires MOV or MKV containers.",
                 "av1" => "AV1 works in MKV, MP4, and MOV containers.",
                 "dnxhd" => "DNxHD requires MXF, MOV, or MKV containers.",
                 "h264" | "h265" => "H.264/HEVC work in all containers.",
                 _ => "",
             }
-        ));
+            .to_string(),
+        });
     }
 
     if !container_supports_audio_encoder(container, audio_encoder) {
-        return Err(format!(
-            "Audio encoder '{}' is not compatible with container format '{}'. \
-             {}",
-            audio_encoder,
-            container,
-            match audio_encoder {
+        return Err(ConversionCheckError::IncompatibleAudioContainer {
+            encoder: audio_encoder.to_string(),
+            container: container.to_string(),
+            hint: match audio_encoder {
                 "libopus" => "Opus is only supported in MKV and MOV containers.",
                 "pcm_s24le" | "pcm_s16le" => "Uncompressed PCM works in all containers.",
                 "aac" => "AAC works in all containers.",
                 _ => "",
             }
-        ));
+            .to_string(),
+        });
     }
 
     Ok(())
@@ -131,17 +225,14 @@ pub fn conversion_sanity_check_pure(
 pub fn validate_conversion_paths(
     input_files: &[PathBuf],
     output_folder: &Path,
-) -> Result<(), String> {
+) -> Result<(), ConversionCheckError> {
     for f in input_files {
         if !f.exists() {
-            return Err(format!("Input file does not exist: {}", f.display()));
+            return Err(ConversionCheckError::MissingInput(f.to_path_buf()));
         }
     }
     if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
-        return Err(format!(
-            "Output directory does not exist: {}",
-            output_folder.display()
-        ));
+        return Err(ConversionCheckError::MissingOutputFolder(output_folder.to_path_buf()));
     }
     Ok(())
 }
@@ -159,7 +250,7 @@ pub fn conversion_sanity_check(
     audio_suffix: Option<&str>,
     video_suffix: Option<&str>,
     copy_video: bool,
-) -> Result<(), String> {
+) -> Result<(), ConversionCheckError> {
     conversion_sanity_check_pure(
         container, video_codec, audio_encoder, input_files, output_folder,
         filename_prefix, caps, audio_suffix, video_suffix, copy_video,
@@ -175,40 +266,37 @@ pub fn conversion_sanity_check_metadata_only_pure(
     caps: &FfmpegCapabilities,
     audio_suffix: Option<&str>,
     video_suffix: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), ConversionCheckError> {
     if !caps.has_ffmpeg {
-        return Err(
-            "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH."
-                .to_string(),
-        );
+        return Err(ConversionCheckError::FfmpegUnavailable(None));
     }
 
     if input_files.is_empty() {
-        return Err("No input files selected.".to_string());
+        return Err(ConversionCheckError::NoInputFiles);
     }
 
     if filename_prefix.is_empty()
         && audio_suffix.unwrap_or("").is_empty()
         && video_suffix.unwrap_or("").is_empty()
     {
-        return Err("No output filename prefix or suffix specified.".to_string());
+        return Err(ConversionCheckError::NoOutputName);
     }
 
     if let Some(t) = audio_suffix {
         if !t.is_empty() {
             naming::validate_template(t)
-                .map_err(|e| format!("Invalid audio suffix template: {}", e))?;
+                .map_err(|e| ConversionCheckError::InvalidAudioSuffixTemplate(e.to_string()))?;
         }
     }
     if let Some(t) = video_suffix {
         if !t.is_empty() {
             naming::validate_template(t)
-                .map_err(|e| format!("Invalid video suffix template: {}", e))?;
+                .map_err(|e| ConversionCheckError::InvalidVideoSuffixTemplate(e.to_string()))?;
         }
     }
     if !filename_prefix.is_empty() {
         naming::validate_template(filename_prefix)
-            .map_err(|e| format!("Invalid filename prefix: {}", e))?;
+            .map_err(|e| ConversionCheckError::InvalidPrefixTemplate(e.to_string()))?;
     }
 
     Ok(())
@@ -222,7 +310,7 @@ pub fn conversion_sanity_check_metadata_only(
     caps: &FfmpegCapabilities,
     audio_suffix: Option<&str>,
     video_suffix: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), ConversionCheckError> {
     conversion_sanity_check_metadata_only_pure(
         input_files, output_folder, filename_prefix, caps, audio_suffix, video_suffix,
     )?;
@@ -276,10 +364,13 @@ pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
         ConvertBlocker::NoRecording => Some("select a recording"),
         ConvertBlocker::NoPrefix => Some("set a filename prefix"),
         ConvertBlocker::NoOutputFolder => Some("choose an output folder"),
-        _ => None,
+        ConvertBlocker::FfmpegNotQueried | ConvertBlocker::FfmpegMissing(_) => None,
     }).collect();
 
     let ffmpeg_messages: Vec<String> = blockers.iter().filter_map(|b| match b {
+        ConvertBlocker::NoRecording
+        | ConvertBlocker::NoPrefix
+        | ConvertBlocker::NoOutputFolder => None,
         ConvertBlocker::FfmpegNotQueried => {
             Some("ffmpeg availability is being checked…".to_string())
         }
@@ -290,7 +381,6 @@ pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
                 _ => Some(base.to_string()),
             }
         }
-        _ => None,
     }).collect();
 
     let mut parts: Vec<String> = Vec::new();
@@ -372,7 +462,7 @@ mod tests {
     fn test_validate_paths_fails_on_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.txt");
-        let result = validate_conversion_paths(&[missing], dir.path());
+        let result = validate_conversion_paths(std::slice::from_ref(&missing), dir.path());
         match result {
             Err(ConversionCheckError::MissingInput(p)) => assert_eq!(p, missing),
             other => panic!("expected MissingInput, got {:?}", other.err()),
