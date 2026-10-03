@@ -344,7 +344,10 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
     let frame_duration = 1.0 / fps;
     let dedup_threshold = (frame_duration * 0.5).min(plan.overlap_seconds * 0.5);
     let mut deduped: Vec<FrameTimecode> = Vec::with_capacity(all_timecodes.len());
-    let mut last_secs: f64 = -dedup_threshold;
+    // NEG_INFINITY (not `-dedup_threshold`): a first frame reported at or
+    // slightly below 0 s (libltc emits frame 0 with a small negative
+    // off_start during warm-up) must survive the dedup.
+    let mut last_secs: f64 = f64::NEG_INFINITY;
     for (_, ftc) in all_timecodes {
         if ftc.timecode_secs - last_secs > dedup_threshold {
             last_secs = ftc.timecode_secs;
@@ -1139,11 +1142,33 @@ mod tests {
         let chunked = decode_ltc_chunked(&path, true, fps, false, config, &progress).unwrap();
         let direct = crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(&path, fps, false, None).unwrap();
 
-        let diff = chunked.valid_frames.abs_diff(direct.valid_frames);
-        assert!(diff <= 2,
-            "chunked libltc merge lost frames: chunked={} vs direct={} (diff={})",
-            chunked.valid_frames, direct.valid_frames, diff);
+        assert_eq!(chunked.valid_frames, direct.valid_frames,
+            "chunked libltc must equal direct libltc exactly: chunked={} vs direct={}",
+            chunked.valid_frames, direct.valid_frames);
+        assert_eq!(chunked.timecodes.first().map(|t| t.timecode),
+            direct.timecodes.first().map(|t| t.timecode),
+            "first decoded TC must match direct libltc");
+        assert_eq!(chunked.timecodes.last().map(|t| t.timecode),
+            direct.timecodes.last().map(|t| t.timecode),
+            "last decoded TC must match direct libltc");
         assert!(chunked.total_possible_frames >= chunked.valid_frames);
+    }
+
+    #[test]
+    fn test_merge_keeps_first_frame_at_or_below_zero_secs() {
+        // libltc reports frame 0's off_start slightly negative (decoder
+        // warm-up). The dedup sentinel must not eat a first frame whose
+        // offset lands at or below 0 — reproduces the chunked-libltc
+        // off-by-one at the merge level.
+        let plan = test_plan(vec![(0, 480_000)], 10.0, 0.3);
+        let mut chunk0 = chunk_ok(0.0, 3);
+        chunk0.timecodes = vec![ftc(0, -0.0005), ftc(1, 0.0400), ftc(2, 0.0800)];
+        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk0) }];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert_eq!(merged.timecodes.len(), 3, "all three frames must survive the merge");
+        assert!((merged.timecodes[0].timecode_secs - (-0.0005)).abs() < 1e-9,
+            "first frame must be the negative-offset frame 0, got {}",
+            merged.timecodes[0].timecode_secs);
     }
 
     // ── decode_ltc_chunked (existing tests) ───────────────────────────
@@ -1493,3 +1518,4 @@ mod tests {
         assert!(has_read_error, "expected detail mentioning 'Failed to read', got: {:?}", result.details);
     }
 }
+

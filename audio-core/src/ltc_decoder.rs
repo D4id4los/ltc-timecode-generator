@@ -2420,6 +2420,11 @@ mod tests {
             *b = (h.finish() & 1) as u8;
         }
         let (valid, _, _) = find_frames(&bits);
+        // False-positive *ceiling* on garbage input: legitimate per the Test
+        // Quality Rules (noise must not decode). `valid <= 2` bounds the sync
+        // word false-match rate over 320 random bits; a decoder that got
+        // *better* at rejecting noise keeps passing, one that got worse fails
+        // here.
         assert!(valid <= 2, "random bits should produce at most 2 false sync word matches, got {}", valid);
     }
 
@@ -4243,14 +4248,18 @@ mod tests {
 
     #[test]
     fn test_decode_ltc_samples_wrong_fps() {
-        // Generate 25fps LTC but decode at 30fps
+        // Decoding 25 fps content as 30 fps: the ZC-adaptive decoder locks
+        // onto the real bit rate and returns "valid" frames whose values are
+        // garbage. The contract is the quality report: an fps mismatch must
+        // never score as a usable decode.
         let tcs: Vec<Timecode> = (0..50).map(|i| Timecode {
             hours: 0, minutes: 0, seconds: 0, frames: i as u32,
         }).collect();
         let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5);
         let result = decode_ltc_samples(&signal, 48000, 1, 30.0, false, std::time::Instant::now(), None).unwrap();
-        // Should get something (maybe low confidence or error)
-        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }) || result.valid_frames > 0);
+        let q = result.quality.as_ref()
+            .expect("quality report must be present on a decoded signal");
+        assert!(q.score < 0.5, "fps mismatch must score badly, got {}", q.score);
     }
 
     // ───ƒ─ decode_ltc_samples drop-frame ──────────────────────────────────

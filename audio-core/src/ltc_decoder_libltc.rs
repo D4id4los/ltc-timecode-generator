@@ -367,8 +367,12 @@ mod tests {
         let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success for 25fps mono, got {:?} (valid={})", result.status, result.valid_frames);
-        assert!(result.valid_frames >= 20,
-            "expected at least 20 valid frames, got {}", result.valid_frames);
+        // 25 synthesized frames; libltc loses only the final frame (tail
+        // validation) → 24 is the measured steady state. Deliberately a
+        // floor, not an equality: a decoder improvement (decoding the tail)
+        // must keep this green.
+        assert!(result.valid_frames >= 24,
+            "expected at least 24 valid frames, got {}", result.valid_frames);
     }
 
     #[test]
@@ -387,8 +391,12 @@ mod tests {
         let result = decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success for stereo LTC, got {:?}", result.status);
-        assert!(result.valid_frames >= 20,
-            "expected at least 20 valid frames from stereo, got {}", result.valid_frames);
+        // 25 synthesized frames; libltc loses only the final frame (tail
+        // validation) → 24 is the measured steady state. Deliberately a
+        // floor, not an equality: a decoder improvement (decoding the tail)
+        // must keep this green.
+        assert!(result.valid_frames >= 24,
+            "expected at least 24 valid frames from stereo, got {}", result.valid_frames);
     }
 
     #[test]
@@ -407,8 +415,12 @@ mod tests {
         let result = decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success for right-channel LTC, got {:?}", result.status);
-        assert!(result.valid_frames >= 20,
-            "expected at least 20 valid frames from right channel, got {}", result.valid_frames);
+        // 25 synthesized frames; libltc loses only the final frame (tail
+        // validation) → 24 is the measured steady state. Deliberately a
+        // floor, not an equality: a decoder improvement (decoding the tail)
+        // must keep this green.
+        assert!(result.valid_frames >= 24,
+            "expected at least 24 valid frames from right channel, got {}", result.valid_frames);
     }
 
     #[test]
@@ -453,6 +465,12 @@ mod tests {
         let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
             "expected Success, got {:?}", result.status);
+        assert!(!result.timecodes.is_empty(), "frames must be decoded");
+        // The fixture repeats one TC ×10; every decoded frame must carry it.
+        for ftc in &result.timecodes {
+            assert_eq!(ftc.timecode, tcs[0],
+                "decoded frame {} must equal the synthesized start TC", ftc.frame_index);
+        }
     }
 
     #[test]
