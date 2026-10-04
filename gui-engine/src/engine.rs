@@ -561,6 +561,7 @@ fn cmd_clap(core: &AudioCore, els: &mut EngineLoopState) {
     );
     state.clapper.flash_alpha = 1.0;
     state.clapper.arm_angle = 0.0;
+    state.clapper.clap_seq = state.clapper.clap_seq.wrapping_add(1);
 
     let tc_str = timecode::timecode_to_string(state.current_timecode, state.drop_frame());
     let ms_str =
@@ -2995,6 +2996,7 @@ mod tests {
             flash_alpha: 0.0,
             arm_angle: TARGET_ARM_ANGLE,
             animating: false,
+            clap_seq: 0,
         }
     }
 
@@ -3680,6 +3682,20 @@ mod tests {
 
         assert_eq!(els.current.clapper.logs.len(), 2, "each clap appends one log entry");
         assert_eq!(els.current.clapper.take, take_before, "take must not move when auto-increment is off");
+    }
+
+    #[test]
+    fn cmd_clap_increments_clap_seq() {
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(setup_state());
+
+        assert_eq!(els.current.clapper.clap_seq, 0, "no clap yet");
+        process_command(GuiCommand::Clap, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.clap_seq, 1);
+        process_command(GuiCommand::Clap, &core, true, &event_tx, &mut els, &mut supervisor);
+        assert_eq!(els.current.clapper.clap_seq, 2, "clap_seq must be monotonic per clap");
     }
 
     #[test]

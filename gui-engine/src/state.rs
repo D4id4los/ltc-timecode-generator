@@ -209,9 +209,11 @@ pub struct DecodeSnapshot {
 
 // ── Clapper snapshot (engine-owned) ────────────────────────────────────
 
-/// Engine-managed clapper-board state and clap animation.  The animation
-/// fields are engine-computed each tick (decay curves) and consumed for
-/// rendering/repaint pacing.
+/// Engine-managed clapper-board state, clap log, and (transitionally) the
+/// engine-decayed animation values.  The animation moves GUI-local in
+/// Phase 5: the engine additionally publishes [`ClapperSnapshot::clap_seq`],
+/// a monotonic event-like counter each GUI watches to start its own
+/// animation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClapperSnapshot {
     pub scene: u32,
@@ -226,6 +228,12 @@ pub struct ClapperSnapshot {
     pub arm_angle: f32,
     /// True while the clap animation is still visibly in progress.
     pub animating: bool,
+    /// Monotonic counter, incremented once per clap. Event-like, not state:
+    /// a GUI that observes a value different from the last one it animated
+    /// starts its local clap animation. If a GUI somehow misses two claps
+    /// between frames it animates once for `seq != last` — acceptable
+    /// because claps are human-paced and the animation is cosmetic.
+    pub clap_seq: u64,
 }
 
 // ── Status channels ─────────────────────────────────────────────────────
@@ -427,6 +435,7 @@ impl AppStateSnapshot {
                 flash_alpha: 0.0,
                 arm_angle: -25.0f32.to_radians(),
                 animating: false,
+                clap_seq: 0,
             },
             is_dark_theme: false,
             status: StatusChannels::initial(),

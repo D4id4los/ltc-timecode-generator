@@ -443,8 +443,9 @@ fn test_engine_mpsc_parse_invalid_file() {
 
 #[test]
 fn test_engine_clap_creates_log_entry() {
-    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.clapper.logs.len() == 1);
+    let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.clapper.clap_seq == 1);
 
+    assert_eq!(snapshot.clapper.clap_seq, 1, "clap_seq must bump once per clap");
     assert_eq!(snapshot.clapper.logs.len(), 1, "expected 1 log entry after Clap");
     let log = &snapshot.clapper.logs[0];
     assert_eq!(log.note, "Scene 1");
@@ -457,9 +458,10 @@ fn test_engine_multiple_claps_accumulate_logs() {
     let snapshot = run_engine(
         vec![GuiCommand::Clap, GuiCommand::Clap, GuiCommand::Clap],
         false,
-        |s| s.clapper.logs.len() == 3,
+        |s| s.clapper.clap_seq == 3,
     );
 
+    assert_eq!(snapshot.clapper.clap_seq, 3, "clap_seq must be monotonic across claps");
     assert_eq!(snapshot.clapper.logs.len(), 3, "expected 3 log entries after 3 Claps");
     // take auto-increments 3 times from 1
     assert_eq!(snapshot.clapper.take, 4, "take should be 4 after 3 Claps starting from 1");
