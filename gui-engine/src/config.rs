@@ -192,12 +192,13 @@ mod tests {
         // config_path() resolves through config_base_dir(), so with the
         // override set the converter config round-trips inside the
         // override dir and never touches the real user config.
-        let mut cfg = ConverterConfig::default();
-        cfg.last_input_folder = Some("/does/not/matter".into());
-        save(&cfg);
+        save(&ConverterConfig {
+            last_input_folder: Some("/does/not/matter".into()),
+            last_offload_parent: None,
+        });
         let expected = dir.path().join(CONFIG_DIR).join(CONFIG_FILE);
         assert!(expected.exists(), "config must be written under the override dir");
-        assert_eq!(load().last_input_folder, cfg.last_input_folder);
+        assert_eq!(load().last_input_folder, Some("/does/not/matter".to_string()));
         std::env::remove_var("LTC_CONFIG_HOME");
     }
 

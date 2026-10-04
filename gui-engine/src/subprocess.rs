@@ -635,18 +635,18 @@ pub(crate) mod tests {
 
     // Two stderr lines, exit 0.
     #[cfg(windows)]
-    const STDERR_TWO_LINES: (&'static str, &[&str]) =
+    const STDERR_TWO_LINES: (&str, &[&str]) =
         ("cmd", &["/C", "echo line1 >&2& echo line2 >&2"]);
     #[cfg(not(windows))]
-    const STDERR_TWO_LINES: (&'static str, &[&str]) =
+    const STDERR_TWO_LINES: (&str, &[&str]) =
         ("sh", &["-c", "echo line1 >&2; echo line2 >&2"]);
 
     // One stderr line, exit code 1.
     #[cfg(windows)]
-    const STDERR_EXIT1: (&'static str, &[&str]) =
+    const STDERR_EXIT1: (&str, &[&str]) =
         ("cmd", &["/C", "echo boom >&2& exit /b 1"]);
     #[cfg(not(windows))]
-    const STDERR_EXIT1: (&'static str, &[&str]) =
+    const STDERR_EXIT1: (&str, &[&str]) =
         ("sh", &["-c", "echo boom >&2; exit 1"]);
 
     #[test]
