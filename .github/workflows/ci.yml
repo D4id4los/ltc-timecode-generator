@@ -160,13 +160,22 @@ jobs:
     env:
       LIBLTC_TAG: v1.3.2
       LIBLTC_PREFIX: ${{ github.workspace }}/libltc-prefix
-      BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu: -I${{ github.workspace }}/libltc-prefix/include
       RUSTFLAGS: -L native=${{ github.workspace }}/libltc-prefix/lib
       # windows-latest images ship LLVM (libclang.dll for bindgen); the
       # verify step falls back to choco if the image ever drops it.
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
     steps:
       - uses: actions/checkout@v5
+
+      - name: Configure bindgen include path (forward slashes)
+        # bindgen splits BINDGEN_EXTRA_CLANG_ARGS with a POSIX shell-word
+        # lexer, which strips backslashes — a `-ID:\a\...\include` value
+        # mangles into `-ID:altc...` and ltc.h is never found (regressed
+        # on windows-latest when a cold rust-cache let the libltc-rs
+        # build script run again). Forward slashes keep the path intact.
+        run: |
+          $inc = "${{ github.workspace }}/libltc-prefix/include" -replace '\\','/'
+          "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=-I$inc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install ffmpeg (converter integration tests)
         run: choco install ffmpeg -y
