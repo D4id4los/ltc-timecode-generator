@@ -27,7 +27,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 
 - **Workspace**: `audio-core`, `gui-engine`, `ltc-gui`, `ltc-slint` (see root `Cargo.toml`). Workspace clippy lints: style/correctness/complexity/perf = warn.
 - **Dependencies**: source of truth is each crate's `Cargo.toml`. Notable: `audio-core` uses cpal 0.18 (pulseaudio always; pipewire on non-32-bit Linux), `hound` (WAV IO), and `libltc-rs` (bindgen binding → requires system `libltc`, see Build & Run).
-- **i686 tablet target**: shipped via `build-all-rust-targets.sh` (Docker cross-compile, `Dockerfile.gui-build`); no Tauri wrapper — ltc-gui itself targets i686.
+- **i686 tablet target**: not in the official release pipeline (Phase 6, D3 — removed from `build-all-rust-targets.sh` and CI; re-introduce only on user demand). Kept as a manual local speciality: `Dockerfile.gui-build` (carrying a pinned static libltc since the Phase 6 fix) still compiles it on demand. No Tauri wrapper — ltc-gui itself targets i686.
 
 ## Project Structure
 ```
@@ -107,8 +107,11 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   └── ltc-real-world-test-20sec.wav  # Real-world LTC sample for decode testing
 ├── VERSION_LOG.org               # Org-mode changelog (newest-first, prose feature summaries)
 ├── Cargo.toml                    # Workspace root (also the version SoT: [workspace.package])
-├── build-all-rust-targets.sh, deploy-to-onedrive.sh
-├── Dockerfile.gui-build
+├── build-all-rust-targets.sh      # Local release build: linux x64 (zigbuild glibc 2.31 floor) + windows x64, both statically linked against libltc (prefixes via scripts/build-libltc-static.sh into gitignored ./libltc-prefix/)
+├── deploy-to-onedrive.sh
+├── scripts/                       # release-notes.sh (VERSION_LOG → GitHub release body, --self-test), build-libltc-static.sh (pinned static libltc prefix builder)
+├── Dockerfile.gui-build           # i686 builder image (manual tablet-build speciality; pinned static libltc)
+├── .github/workflows/release.yml  # Tag-driven release pipeline (strict vX.Y.Z; see CI section)
 ├── README.org, .dockerignore
 └── assets/, logs/
 ```
@@ -592,5 +595,19 @@ cargo test                           # Run all Rust tests
 cargo clippy --all-targets           # Lint all workspace crates
 cd ltc-gui && cargo run --release    # Native Rust GUI (egui/eframe)
 cd ltc-slint && cargo run --release  # Slint-based GUI
-./build-all-rust-targets.sh          # Full ship matrix: linux x64, windows x64, linux i686 (docker cross-compile)
+./build-all-rust-targets.sh          # Local release build: linux x64 + windows x64 (static libltc, glibc 2.31 floor)
 ```
+
+### Release Pipeline (Phase 6)
+
+`.github/workflows/release.yml` publishes official releases on tag pushes:
+
+- **Trigger**: push of tags matching the glob prefilter `v[0-9]*.[0-9]*.[0-9]*` (GHA tag filters are glob-only — the prefilter just rejects non-versions cheaply), plus a `workflow_dispatch` **dry-run** mode (default `dry_run: true`) that rehearses guard + builds + packaging on any branch without publishing.
+- **Guard job**: enforces the authoritative strict regex `^v[0-9]+\.[0-9]+\.[0-9]+$` (multi-digit segments pass; `v1.2.3-rc1`, `v1.2` fail), asserts `[workspace.package]` version == tag, extracts the `VERSION_LOG.org` entry via `scripts/release-notes.sh` (loud failure on missing entry — no fallback body) and uploads it as an artifact. Do NOT "simplify" the trigger to `v*`; the loose-glob + strict-guard pair is deliberate (recorded in the YAML).
+- **Job graph**: `guard → build-linux-x64 + build-windows-x64 → release`.
+- **Static libltc (D1)**: both build jobs provision a static-only prefix via `scripts/build-libltc-static.sh` (pinned `LIBLTC_TAG=v1.3.2`, cached by tag) — never `apt install libltc-dev` in release jobs; only `libltc.a` on the search path forces `-lltc` static. Verification steps fail the release if `ldd` shows `libltc`.
+- **glibc 2.31 floor (D2)**: linux x64 builds with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.31`; the max required `GLIBC_*` symbol version is verified ≤ 2.31.
+- **Release job**: `permissions: contents: write`, concatenates `SHA256SUMS`, and `gh release create`s with the VERSION_LOG entry as the body (`generate_release_notes` unset). Assets: `ltc-gui_<ver>_linux-x86_64.tar.xz`, `ltc-gui.exe` (zip naming handled by GitHub), `SHA256SUMS`.
+- **Hardening (D5)**: one-time repo setting — tag-protection rule `v*` restricted to Maintainers/Owners (glob-only, hence the second regex layer in the guard).
+- **Forward-only (D4)**: no retro-releases for pre-existing tags. Rollback for a failed smoke test: delete the release, delete the tag, fix forward, re-tag.
+- i686 is out of scope (D3); `build-all-rust-targets.sh` ships linux x64 + windows x64 only.
