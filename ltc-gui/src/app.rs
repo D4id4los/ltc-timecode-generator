@@ -10,6 +10,7 @@ use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::FPS_OPTIONS;
 use gui_engine::{ArcSwap, AudioEvent, JobKind};
 
+use crate::clap_anim::{self, ClapAnim};
 use crate::shadows::Shadows;
 use crate::theme::{Theme, ACCENT};
 use crate::widgets;
@@ -106,6 +107,14 @@ pub struct AppState {
     /// next frame forces a fast repaint until the engine publishes
     /// `job(JobKind::OffloadCopy).is_active()`. Resets once active is visible.
     offload_start_pending: Option<Instant>,
+
+    /// GUI-local clap animation, started when `clapper.clap_seq` moves past
+    /// [`Self::clap_last_seen`]. Owns the flash/arm decay so the values are
+    /// sampled at the GUI's frame rate, not the engine's 25 fps tick.
+    pub clap_anim: Option<ClapAnim>,
+    /// Last `clapper.clap_seq` observed (seeded from the snapshot at startup
+    /// so a mid-session GUI start doesn't animate for an old clap).
+    clap_last_seen: u64,
 }
 
 impl AppState {
@@ -161,6 +170,8 @@ impl AppState {
             last_logged_group_decode_gen: 0,
             offload_last_version: 0,
             offload_start_pending: None,
+            clap_anim: None,
+            clap_last_seen: initial.clapper.clap_seq,
         };
 
         // Tell the engine to scan the restored input folder and auto-select
@@ -215,8 +226,6 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     let base = if s.is_playing || ltc_detecting {
         let interval = Duration::from_secs_f64(1.0 / s.fps().max(1.0));
         interval.min(Duration::from_millis(40))
-    } else if s.clapper.animating {
-        Duration::from_secs_f64(1.0 / 60.0)
     } else if offload_running {
         Duration::from_millis(100)
     } else {
@@ -224,6 +233,22 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     };
 
     (base + predicted_dt).max(floor)
+}
+
+/// Combine the snapshot-driven repaint interval with the clap animator's
+/// own request: clap during playback (or a decode/offload job) must take
+/// the min of both delays so neither source stalls the other. `None` from
+/// the animator (settled) leaves the snapshot interval untouched.
+fn combined_repaint_interval(
+    s: &AppStateSnapshot,
+    clap_anim: Option<&ClapAnim>,
+    now: Instant,
+) -> Duration {
+    let base = next_repaint_interval(s);
+    match clap_anim.and_then(|a| clap_anim::animation_repaint_delay(a, now)) {
+        Some(d) => base.min(d),
+        None => base,
+    }
 }
 
 // ── Pure logic helpers (unit-tested below) ───────────────────────────────
@@ -375,8 +400,21 @@ impl eframe::App for AppState {
             }
         }
 
+        // 5a. Clap-seq watch: the engine bumps `clapper.clap_seq` once per
+        //     clap (event-like); a change starts the GUI-local animator.
+        //     Settled animators clear themselves so idle ticks cost nothing.
+        if self.latest.clapper.clap_seq != self.clap_last_seen {
+            self.clap_last_seen = self.latest.clapper.clap_seq;
+            self.clap_anim = Some(ClapAnim::new(self.latest.clapper.clap_seq, now));
+        }
+        if let Some(anim) = self.clap_anim {
+            if anim.is_settled(now) {
+                self.clap_anim = None;
+            }
+        }
+
         // 7. Repaint scheduling
-        ctx.request_repaint_after(next_repaint_interval(&self.latest));
+        ctx.request_repaint_after(combined_repaint_interval(&self.latest, self.clap_anim.as_ref(), now));
 
         // 7a. While commands await the engine ack, keep fast repaints so the
         //     echo round-trip (~40 ms engine tick) is rendered on the next
@@ -476,10 +514,13 @@ impl eframe::App for AppState {
         self.render_app_menu(ui);
         self.render_debug_log_window(ui);
 
-        if self.latest.clapper.flash_alpha > 0.01 {
+        let flash_alpha = self.clap_anim
+            .map(|a| clap_anim::flash_alpha_at(a.elapsed(Instant::now())))
+            .unwrap_or(0.0);
+        if flash_alpha > 0.01 {
             let ctx = ui.ctx();
             let screen = ctx.viewport_rect();
-            let alpha = (self.latest.clapper.flash_alpha * 255.0) as u8;
+            let alpha = (flash_alpha * 255.0) as u8;
             let color = Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
             egui::Area::new(egui::Id::new("clap_flash"))
                 .order(egui::Order::Foreground)
@@ -971,7 +1012,7 @@ mod tests {
     #[test]
     fn repaint_interval_idle_returns_approx_1s() {
         let s = make_snapshot();
-        // Idle: not playing, not detecting, not animating.
+        // Idle: not playing, not detecting.
         let dur = next_repaint_interval(&s);
         assert!(dur > Duration::from_secs(1));
         assert!(dur < Duration::from_secs_f64(1.1)); // 1.0167s is well under 1.1s
@@ -1031,12 +1072,34 @@ mod tests {
     }
 
     #[test]
-    fn repaint_interval_clap_animating_returns_approx_33ms() {
-        let mut s = make_snapshot();
-        s.clapper.animating = true;
-        let dur = next_repaint_interval(&s);
-        // base = 16.67ms → request = 33.33ms
-        assert!(dur > Duration::from_millis(28) && dur < Duration::from_millis(38));
+    fn repaint_interval_combined_with_running_animator_takes_the_min() {
+        let s = make_snapshot();
+        let now = Instant::now();
+        let anim = crate::clap_anim::ClapAnim::new(1, now);
+        // Idle base ~1.0167 s; a running clap animator must shorten it to
+        // the animator's ~33 ms request (clap while idle).
+        let dur = combined_repaint_interval(&s, Some(&anim), now);
+        assert!(dur <= Duration::from_millis(35), "animator delay must win over idle, got {:?}", dur);
+
+        // Clap during playback: the animator delay must not stall the
+        // faster playing interval, and vice versa.
+        let mut playing = make_snapshot();
+        playing.is_playing = true;
+        playing.fps_index = 4; // 30 fps → ~50 ms request
+        let dur = combined_repaint_interval(&playing, Some(&anim), now);
+        assert!(dur <= Duration::from_millis(35), "min(animator, playing) must hold, got {:?}", dur);
+    }
+
+    #[test]
+    fn repaint_interval_combined_with_settled_animator_uses_snapshot_only() {
+        let s = make_snapshot();
+        let now = Instant::now();
+        let anim = crate::clap_anim::ClapAnim::new(1, now - Duration::from_secs(10));
+        assert!(crate::clap_anim::animation_repaint_delay(&anim, now).is_none(),
+            "settled animator must not request repaints (render-storm guard)");
+        let with_anim = combined_repaint_interval(&s, Some(&anim), now);
+        let without = combined_repaint_interval(&s, None, now);
+        assert_eq!(with_anim, without, "a settled animator must not alter the snapshot interval");
     }
 
     #[test]
@@ -1051,10 +1114,10 @@ mod tests {
         let s2 = with_ltc_detecting(make_snapshot());
         // s2.fps defaults to 25.0 from initial(), which is fine for floor test
         assert!(next_repaint_interval(&s2) >= floor);
-        // animating
-        let mut s3 = make_snapshot();
-        s3.clapper.animating = true;
-        assert!(next_repaint_interval(&s3) >= floor);
+        // clap animator running (combined rule, floor applied inside both)
+        let now = Instant::now();
+        let anim = crate::clap_anim::ClapAnim::new(1, now);
+        assert!(combined_repaint_interval(&make_snapshot(), Some(&anim), now) >= floor);
         // offload running
         let s4 = with_offload_running(make_snapshot());
         assert!(next_repaint_interval(&s4) >= floor);

@@ -1,4 +1,5 @@
 use egui::{Color32, FontId, RichText, Ui, Vec2, Sense};
+use std::time::Instant;
 use gui_engine::command::GuiCommand;
 
 use crate::app::AppState;
@@ -111,7 +112,12 @@ fn render_clapper_board_drawing(ui: &mut Ui, state: &mut AppState) {
     }
 
     let pivot = egui::pos2(x_offset + 0.1 * w, y_base);
-    let angle = s.clapper.arm_angle;
+    // GUI-local animation: sample the local animator's arm curve (the
+    // snapshot no longer carries a continuous arm angle). No animator =
+    // arm at rest.
+    let angle = state.clap_anim
+        .map(|a| crate::clap_anim::arm_angle_at(a.elapsed(Instant::now())))
+        .unwrap_or(crate::clap_anim::TARGET_ARM_ANGLE);
     let cos = angle.cos();
     let sin = angle.sin();
     let rotate = |dx: f32, dy: f32| -> egui::Pos2 {
