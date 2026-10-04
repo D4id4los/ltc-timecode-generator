@@ -106,13 +106,16 @@ jobs:
           sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libclang-dev clang autoconf automake libtool
 
       - name: Pin libclang for bindgen (libdir + clang resource include)
-        # Without a pinned LIBCLANG_PATH the runner's multi-LLVM layout can
-        # leave bindgen with a libclang whose builtin headers (stdbool.h…)
-        # are not found (observed as libspa-sys build failure).
+        # Under zigbuild the runner's libclang does not pick up the usual
+        # driver-derived include paths: first symptom was stdbool.h not
+        # found (no resource dir), then the resource inttypes.h wrapper
+        # could not include_next into the system headers. Pin libclang's
+        # libdir and hand bindgen the resource + system include paths
+        # explicitly.
         run: |
           RES=$(clang -print-resource-dir)
           echo "LIBCLANG_PATH=${RES%/lib/clang/*}/lib" >> "$GITHUB_ENV"
-          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$RES/include -I$GITHUB_WORKSPACE/libltc-prefix/include" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$RES/include -isystem /usr/include/x86_64-linux-gnu -isystem /usr/include -I$GITHUB_WORKSPACE/libltc-prefix/include" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain (stable, gnu target)
         uses: dtolnay/rust-toolchain@stable
