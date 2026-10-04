@@ -414,27 +414,22 @@ ltc-gui --decode file.wav --decoder libltc
 
 ## Version Management
 
-The **single source of truth** is `package.json`'s `"version"` field. All other files are derived from it.
+The **single source of truth** is the `version` field under `[workspace.package]` in the root `Cargo.toml`. All four workspace members inherit it via `version.workspace = true` in their manifests; `Cargo.lock` tracks the resolved member versions. Both Rust GUIs read the version from `CARGO_PKG_VERSION` at compile time.
 
 ### How to bump the version
 ```bash
-npm version patch    # 0.3.2 → 0.3.3 (syncs files, creates git commit + tag v0.3.3)
-npm version minor    # 0.3.2 → 0.4.0
-npm version major    # 0.3.2 → 1.0.0
+scripts/bump-version.sh patch    # 0.4.7 → 0.4.8 (creates git commit + tag v0.4.8)
+scripts/bump-version.sh minor    # 0.4.7 → 0.5.0
+scripts/bump-version.sh major    # 0.4.7 → 1.0.0
+scripts/bump-version.sh 0.6.0    # explicit version
+scripts/bump-version.sh patch --dry-run   # print the plan, apply nothing
 ```
 
-The `"version"` npm lifecycle hook runs `scripts/sync-version.js` automatically during `npm version` — after bumping `package.json` but before the git commit and tag. The script:
-1. Propagates the version to `src-tauri/tauri.conf.json`, `src-tauri-32bit/tauri.conf.json`, and the `[package]` version in all six crate manifests: `audio-core/Cargo.toml`, `gui-engine/Cargo.toml`, `ltc-gui/Cargo.toml`, `ltc-slint/Cargo.toml`, `src-tauri/Cargo.toml`, `src-tauri-32bit/Cargo.toml`
-2. Updates `package-lock.json`, workspace `Cargo.lock` (covers all four workspace members), `src-tauri/Cargo.lock`, `src-tauri-32bit/Cargo.lock` — lock files are synced with `cargo update --workspace`, which only re-locks the workspace/path-dep crate versions and never re-resolves third-party dependencies
-3. Stages all affected files with `git add` (they become part of the `npm version` commit)
-
-### Manual sync (without bumping)
-```bash
-node scripts/sync-version.js
-```
-
-### UI Display
-The version is injected at build time via Vite's `define` (`import.meta.env.VITE_APP_VERSION`) and displayed in the app header as `LTC ENGINE v{version}`. The Slint GUI reads it from `CARGO_PKG_VERSION`.
+The script:
+1. Refuses to run on a dirty working tree (npm-version parity)
+2. Rewrites the `[workspace.package]` version in the root `Cargo.toml`
+3. Runs `cargo update --workspace` to refresh `Cargo.lock` member versions (never re-resolves third-party dependencies) and verifies all four members show the new version in the lock
+4. Commits `Cargo.toml` + `Cargo.lock` as `chore(release): bump version to X.Y.Z` and tags `vX.Y.Z`
 
 ## Testing
 

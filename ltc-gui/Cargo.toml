@@ -1,6 +1,6 @@
 [package]
 name = "ltc-gui"
-version = "0.4.7"
+version.workspace = true
 description = "Native Rust GUI for the LTC Timecode Generator"
 authors = ["Daidalos"]
 edition = "2021"
