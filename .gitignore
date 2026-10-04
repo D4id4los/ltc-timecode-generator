@@ -23,3 +23,6 @@ reports/
 
 # Agent Planning artefacts
 plans/
+
+# Local static-libltc prefixes built by build-all-rust-targets.sh
+/libltc-prefix/
