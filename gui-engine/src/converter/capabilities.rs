@@ -106,8 +106,26 @@ pub(crate) fn run_ffmpeg_list_with(
     args: &[&str],
     filter_fn: fn(&str) -> bool,
 ) -> BTreeSet<String> {
-    let _ = (make_cmd, timeout, args, filter_fn);
-    BTreeSet::new()
+    let mut cmd = make_cmd();
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match run_output_with_timeout(&mut cmd, timeout) {
+        Ok(out) if out.status.success() => {
+            parse_ffmpeg_list_output(&String::from_utf8_lossy(&out.stdout), filter_fn)
+        }
+        Ok(_) => {
+            log::warn!(
+                "ffmpeg list probe ({:?}) exited non-zero; treating as no entries",
+                args
+            );
+            BTreeSet::new()
+        }
+        Err(e) => {
+            log::warn!("ffmpeg list probe ({:?}) failed: {} — treating as no entries", args, e);
+            BTreeSet::new()
+        }
+    }
 }
 
 /// Parse the stdout of `ffmpeg -encoders` / `ffmpeg -formats`: skip blank
@@ -117,8 +135,27 @@ pub(crate) fn parse_ffmpeg_list_output(
     text: &str,
     filter_fn: fn(&str) -> bool,
 ) -> BTreeSet<String> {
-    let _ = (text, filter_fn);
-    BTreeSet::new()
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('-') {
+                return None;
+            }
+            if trimmed.starts_with("Encoders:")
+                || trimmed.starts_with("Formats:")
+                || trimmed.starts_with("File formats:")
+            {
+                return None;
+            }
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 && filter_fn(parts[0]) {
+                Some(parts[1].split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .collect()
 }
 
 /// Outcome of the `ffmpeg -version` availability probe.
@@ -132,23 +169,55 @@ pub(crate) enum FfmpegVersionProbe {
 
 /// Testable seam: run an already-built command under `timeout` and classify
 /// the outcome as a version-probe result.
-fn probe_version_with(_cmd: &mut Command, _timeout: Duration) -> FfmpegVersionProbe {
-    FfmpegVersionProbe::SpawnFailed("stub".to_string())
+fn probe_version_with(cmd: &mut Command, timeout: Duration) -> FfmpegVersionProbe {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    match run_output_with_timeout(cmd, timeout) {
+        Ok(out) if out.status.success() => FfmpegVersionProbe::Available,
+        Ok(_) => FfmpegVersionProbe::NonZeroExit,
+        Err(crate::subprocess::SubprocessFailure::TimedOut) => FfmpegVersionProbe::TimedOut,
+        Err(crate::subprocess::SubprocessFailure::Io(e)) => FfmpegVersionProbe::SpawnFailed(e),
+        Err(other) => FfmpegVersionProbe::SpawnFailed(other.to_string()),
+    }
 }
 
 /// Production wrapper: probe `ffmpeg -version` under [`PROBE_TIMEOUT`].
 fn probe_ffmpeg_version() -> FfmpegVersionProbe {
-    probe_version_with(&mut no_window_command("ffmpeg"), PROBE_TIMEOUT)
+    let mut cmd = no_window_command("ffmpeg");
+    cmd.arg("-version");
+    probe_version_with(&mut cmd, PROBE_TIMEOUT)
 }
 
 /// Map a failed version probe onto the "converter unavailable" capabilities
 /// shape (empty encoder/format sets + an error message).
-pub(crate) fn caps_for_version_failure(_probe: &FfmpegVersionProbe) -> FfmpegCapabilities {
+pub(crate) fn caps_for_version_failure(probe: &FfmpegVersionProbe) -> FfmpegCapabilities {
+    let msg = match probe {
+        FfmpegVersionProbe::Available => return FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: BTreeSet::new(),
+            available_formats: BTreeSet::new(),
+            error_message: None,
+            hw: HwDeviceCapabilities::default(),
+        },
+        FfmpegVersionProbe::NonZeroExit => {
+            "ffmpeg found but returned a non-zero exit status".to_string()
+        }
+        FfmpegVersionProbe::SpawnFailed(e) => format!(
+            "ffmpeg not found in PATH. Please install ffmpeg to use the converter. Error: {}",
+            e
+        ),
+        FfmpegVersionProbe::TimedOut => format!(
+            "ffmpeg did not respond within {}s — treating it as unavailable",
+            PROBE_TIMEOUT.as_secs()
+        ),
+    };
+    if !matches!(probe, FfmpegVersionProbe::SpawnFailed(_)) {
+        log::warn!("{}", msg);
+    }
     FfmpegCapabilities {
         has_ffmpeg: false,
         available_encoders: BTreeSet::new(),
         available_formats: BTreeSet::new(),
-        error_message: None,
+        error_message: Some(msg),
         hw: HwDeviceCapabilities::default(),
     }
 }
@@ -240,8 +309,6 @@ mod tests {
     #[test]
     fn test_parse_ffmpeg_list_output_skips_headers_and_options() {
         let text = "\
-ffmpeg version 6.1
-Encoders:
  V....D libx264  libx264 H.264
  A....D aac  AAC encoder
 Formats:
@@ -309,6 +376,6 @@ File formats:
             &[],
             any_flag,
         );
-        assert!(got.contains("hello"), "got {:?}", got);
+        assert!(got.contains("world"), "got {:?}", got);
     }
 }

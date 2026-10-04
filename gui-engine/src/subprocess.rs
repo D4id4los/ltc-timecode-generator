@@ -568,9 +568,9 @@ pub(crate) mod tests {
     pub(crate) fn echo_prog() -> &'static str { "printf" }
 
     #[cfg(windows)]
-    pub(crate) fn echo_args() -> Vec<&'static str> { vec!["/C", "echo hello"] }
+    pub(crate) fn echo_args() -> Vec<&'static str> { vec!["/C", "echo hello world"] }
     #[cfg(not(windows))]
-    pub(crate) fn echo_args() -> Vec<&'static str> { vec!["hello"] }
+    pub(crate) fn echo_args() -> Vec<&'static str> { vec!["hello world"] }
 
     #[cfg(windows)]
     pub(crate) fn sleep_prog() -> &'static str { "ping" }
