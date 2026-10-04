@@ -564,6 +564,7 @@ mod tests {
     }
 
     #[test]
+    // test-lint: allow(text-pin): format_blockers is a human-facing formatter; the wording is its Display contract (WP-T5 plan: KEEP)
     fn test_format_blockers_imperative_only() {
         let blockers = vec![
             ConvertBlocker::NoRecording,
@@ -578,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    // test-lint: allow(text-pin): format_blockers is a human-facing formatter; the wording is its Display contract (WP-T5 plan: KEEP)
     fn test_format_blockers_ffmpeg_not_queried() {
         let blockers = vec![ConvertBlocker::FfmpegNotQueried];
         let msg = format_blockers(&blockers);
@@ -585,6 +587,7 @@ mod tests {
     }
 
     #[test]
+    // test-lint: allow(text-pin): format_blockers is a human-facing formatter; the wording is its Display contract (WP-T5 plan: KEEP)
     fn test_format_blockers_ffmpeg_missing() {
         let blockers = vec![ConvertBlocker::FfmpegMissing(None)];
         let msg = format_blockers(&blockers);
@@ -593,6 +596,7 @@ mod tests {
     }
 
     #[test]
+    // test-lint: allow(text-pin): format_blockers is a human-facing formatter; the wording is its Display contract (WP-T5 plan: KEEP)
     fn test_format_blockers_mixed() {
         let blockers = vec![
             ConvertBlocker::NoRecording,

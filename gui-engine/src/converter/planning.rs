@@ -813,6 +813,7 @@ mod tests {
     }
 
     #[test]
+    // test-lint: allow(text-pin): the warning must echo the colliding output names + naming-template tokens — on-disk naming syntax is a legitimate string per AGENTS.md
     fn test_duplicate_output_warning_some() {
         let dups = vec!["output.mkv".to_string(), "audio.wav".to_string()];
         let warn = duplicate_output_warning(&dups);
