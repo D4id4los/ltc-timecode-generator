@@ -11,9 +11,33 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libasound2-dev \
     git \
+    make \
+    autoconf \
+    automake \
+    libtool \
     libpipewire-0.3-dev \
     libpulse-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Static libltc from a pinned source release (Phase 6, D3 fix): libltc-rs
+# entered the tree after the last i686 image refresh and needs ltc.h +
+# libltc. Installing to /usr/local also satisfies libltc-rs's hardcoded
+# /usr/local/lib search path. Static-only (no .so) so the resulting binary
+# carries no runtime libltc dependency. Must match LIBLTC_TAG in ci.yml /
+# release.yml / scripts/build-libltc-static.sh.
+ENV LIBLTC_TAG=v1.3.2
+RUN git clone --depth 1 --branch "$LIBLTC_TAG" https://github.com/x42/libltc.git /tmp/libltc-src \
+    && cd /tmp/libltc-src \
+    && autoreconf -vfi \
+    && ./configure --prefix=/usr/local --enable-static --disable-shared \
+    && make -j"$(nproc)" \
+    && make install \
+    && cd / \
+    && rm -rf /tmp/libltc-src \
+    && test -f /usr/local/lib/libltc.a && test ! -e /usr/local/lib/libltc.so && test -f /usr/local/include/ltc.h
+
+# bindgen must find the libltc headers
+ENV BINDGEN_EXTRA_CLANG_ARGS=-I/usr/local/include
 
 # Configure global Rust environment paths
 ENV RUSTUP_HOME=/usr/local/rustup \
