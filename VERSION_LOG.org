@@ -1,674 +1,232 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
-* Unreleased — Phase 4 Windows test platform (Part B)
+* v0.5.0
 
-Brings the full workspace test suite to `windows-latest` on the shipped
-`x86_64-pc-windows-gnu` target (plan:
-`plans/PHASE4-overall-gate-and-windows-tests-plan.md`, Part B / G3d).
-
-- New `windows-tests` CI job: `cargo nextest run --workspace --profile
-  ci` with ffmpeg installed, so the converter integration tests
-  execute on Windows instead of loud-skipping. libltc has no Windows
-  package, so it is built from a pinned source release in an MSYS2
-  mingw64 shell (the README.org cross-compile recipe relocated onto
-  the runner) and cached by tag; bindgen/linker env is set at job
-  level for a stable rust-cache key. A test-count summary guard fails
-  the job if suspiciously few tests ran, and `test-lint.sh
-  --self-test` gives platform-independent guardrail parity.
-  `windows-cross-check` remains the fast per-PR compile guard.
-- `LTC_CONFIG_HOME` config seam: `config::config_base_dir()` honors an
-  `LTC_CONFIG_HOME` env override before `dirs::config_dir()` and is now
-  the single resolution point for the converter config path and the
-  HW-encoder cache dir. Needed because `dirs` ignores
-  `XDG_CONFIG_HOME` on Windows — without the seam, engine tests would
-  read/write the real `%APPDATA%` config. `init_test_config()` sets
-  both variables. Also useful for portable installs; no behavior
-  change when the variable is unset or empty.
-- The stderr-watchdog subprocess tests no longer spawn `sh -c`
-  unconditionally: they use cfg-paired native spawners (cmd on
-  Windows, sh on unix), so the stall/cancel coverage runs natively on
-  Windows.
-
-* Unreleased — Phase 4 S3776 burn-down + overall-code gate (Part A)
-
-Removes every CRITICAL code smell from the SonarCloud census (29 ×
-`rust:S3776` cognitive complexity + 1 × `rust:S2208` wildcard import)
-and extends quality-gate enforcement from new-code-only to overall code
-(plan: `plans/PHASE4-overall-gate-and-windows-tests-plan.md`, Part A).
-
-- GUI mega-function decomposition (WP-4.1…4.3, move-verbatim
-  discipline): `ltc-slint` `_run_gui` (176 → orchestration of 12
-  `register_*` functions over a `GuiRuntime` handle struct) and
-  `setup_poll_timer` (148 → per-concern `sync_*` functions over a
-  `PollContext`; the 9-parameter signature — the adjacent `S107` — is
-  gone; the static converter dropdown models are built once instead of
-  every 40 ms tick). `ltc-gui` converter widget hotspots (134/78/80/52/50/32),
-  app `logic()` + clock section, offload cards/progress, settings audio
-  device + the 8-param `stepper_card_col` (`TcField` enum + tested
-  command mapping), and the status bar all split into single-concern
-  render helpers plus pure, unit-tested extractors.
-- Engine-crate pure-core extractions (WP-4.4, tiered by test-pin
-  strength): file-pattern matching, converter runner/planning/args
-  (the unpinned `ChannelsExcept`/`Reordered` mux arms pinned first),
-  card detection mount-candidate filter chain, engine command dispatch
-  + clip-probe handler (characterization tests first) + engine loop,
-  CLI decode-report rendering (10 new characterization tests),
-  subprocess stderr watchdog, audio-core scheduler loop, decode search
-  lattice and libltc assembly. The non-Linux card-scan variant is
-  compile-guarded only (CI windows-cross-check + macos-check).
-- `tagger.rs` native module imports made explicit (S2208).
-- Overall-code gate (WP-4.5): the LTC gate definition gains the five
-  overall-code conditions (ratings ≤ A, duplication < 3 %, hotspots
-  100 % reviewed; overall coverage deliberately excluded — new-code
-  coverage at 80 % already forces tested changes). Because custom-gate
-  assignment 403s on this SonarCloud plan and the assigned "Sonar way"
-  gate is new-code-only, enforcement runs as a CI step:
-  `scripts/sonar-overall-gate.sh` (pure jq evaluator + `--self-test`
-  fixtures + threshold-override flags for live validation) runs on
-  main after the scan and reds the job on any overall-code violation.
-- `scripts/sonar-report.sh`: issue/hotspot payloads are handed to jq
-  via file (`--slurpfile`) instead of argv — the issues array had
-  outgrown ARG_MAX.
-- Test count: +140 unit tests across `ltc-slint` (first tests in the
-  crate), `ltc-gui`, `gui-engine` and `audio-core`; no behavior change
-  intended anywhere — pure extractors move logic verbatim and
-  unpinned handlers got characterization tests before their refactors.
-||||||| parent of 6fe076a (docs: sync AGENTS/VERSION_LOG for windows test platform)
-
-* Unreleased — Phase 3 startup HW-encoder validation latency
-
-Makes the ffmpeg capability probe's worst case bounded and small on
-weak-GPU tablets (plan: `plans/PHASE3-hw-validation-latency-plan.md`,
-measurement record: `reports/phase3-probe-measurement-2026-10-04.md`).
-
-- Probe timing instrumentation + `--probe-caps` CLI mode (WP-3.1):
-  `query_ffmpeg_capabilities()` now runs through a timed variant that
-  records per-stage wall time (version / encoder list / format list /
-  hw-device discovery / HW-encoder validation, plus per-candidate
-  test-encode times) into `ProbeTimings` and logs the stage table at
-  info level. The new `--probe-caps` flag runs the timed probe, prints
-  a machine-readable `key=value` report and exits — the measurement
-  tool behind the phase's decision record.
-- Two-stage startup probe (WP-3.2): the stage-1 caps publication
-  withholds all hardware encoders (an unvalidated encoder is never
-  selectable) and a new background `HwValidate` job runs the full
-  test-encode validation over every HW candidate, then republishes the
-  reconciled caps. No codec loses its encoder chain in the window —
-  every codec keeps a software fallback — so readiness never blocks.
-- Pass-result cache (`hw_encoder_cache.json`): keyed on
-  (ffmpeg version, encoder list, hw devices); a matching cache lets
-  stage 1 publish validated HW encoders immediately on repeat startups.
-  Validation always runs and reconciles: a cache-vouched encoder that
-  fails its stage-2 test encode is pruned from the caps and from the
-  persisted cache within the same session. Failures are never cached —
-  a transient failure costs one re-probe per startup, never a
-  permanently broken encoder list.
-- Untouched-latch default upgrade: when the stage-2 reconciliation
-  makes a hardware encoder available and the user has not touched
-  container/encoder settings this session, the engine re-picks the best
-  default combination (a validated HW encoder can become the default).
-  Any explicit container/encoder command arms the latch and blocks the
-  auto-upgrade for the rest of the session; encoder choices are not
-  persisted, so a flip cannot survive a restart.
-
-* Unreleased — Phase 2 test seams + macOS CI guard
-
-Closes the two largest remaining structural risks from the 2026-10-04
-follow-up triage and adds the macOS compile guard (plan:
-`plans/PHASE2-test-seams-and-macos-ci-plan.md`). No user-visible
-behavior change; no version bump.
-
-- Recovery-ladder testability (WP-2.1): the audio-stream recovery
-  ladder (`StreamDied`/`RecoveryNeeded`/`StreamDead` → recovery →
-  exhaustion) is no longer untestable. `EngineSeams` gained an
-  `audio_events` injection seam (default: AudioCore's own event queue)
-  and an `init_output` initializer seam, the ladder's branch logic was
-  extracted into the pure `recovery_action` decision function, and the
-  previously private attempt counter is now published as
-  `AppStateSnapshot.audio_recovery_attempts`. New tests: a unit
-  decision table plus three engine-loop integration tests pinning the
-  soft ladder counting up to exhaustion, the `StreamDead` hard reset
-  not consuming a soft attempt, and GUI event forwarding — all with
-  typed assertions only (init failure is forced deterministically so
-  the ladder behaves identically on CI and audio-equipped dev
-  machines).
-- WAV-decode dispatch unification (WP-2.2): the
-  single-pass-vs-chunked dispatch that was duplicated between
-  `decode::decode_wav_file` (CLI) and the engine's decode job now
-  lives exactly once in `decode::decode_wav_core` with the pure
-  `wav_dispatch_decision` helper. The CLI keeps its stderr progress
-  printer (moved out of decode.rs, which is display-free), the engine
-  keeps its `ProgressTracker` bridging; `decode_wav_file` is deleted.
-  Decision table, cancel handling on both branches, and the
-  missing-file error are unit-tested on synthetic LTC WAVs.
-- macOS CI guard (WP-2.3): new `macos-check` job — check-only
-  `cargo check --workspace --all-targets` on a native `macos-latest`
-  runner — so the macOS-only `cfg` blocks (offload `/Volumes` card
-  scan, CoreAudio audio-output arm) are compile-guarded on every PR
-  instead of review-only.
-- Test isolation fix: the offload integration tests now serialize
-  access to the persisted offload-parent config (all tests in the
-  binary share one `XDG_CONFIG_HOME`); previously a concurrently
-  written config could seed a parent folder into the no-parent guard
-  test's engine, starting a real copy job instead of firing the
-  guard. Unreachable under nextest's one-process-per-test, reachable
-  under `cargo test`.
-
-* Unreleased — Phase 1 legacy frontend retirement
-
-Removal of the frozen React web app (`src/`), both legacy Tauri
-crates (`src-tauri/`, `src-tauri-32bit/`), and the entire Node/npm
-toolchain that existed only for them (plan:
-`plans/PHASE1-legacy-retirement-plan.md`). Pure subtraction — no Rust
-code changes, no behavior changes, no version bump. The shipped
-matrix (ltc-gui on linux x64, windows x64, linux i686 via
-`build-all-rust-targets.sh` + `Dockerfile.gui-build`) is unaffected.
-
-- Version management re-rooted: the single source of truth moved from
-  `package.json` to the `[workspace.package]` version in the root
-  `Cargo.toml`; all four member manifests now use
-  `version.workspace = true`. New `scripts/bump-version.sh`
-  (patch/minor/major/explicit, `--dry-run`, dirty-tree guard, lock
-  post-check) replaces the `npm version` + `scripts/sync-version.js`
-  flow, keeping the commit+tag behavior.
-- Sonar helpers de-npm'd: `sonar-gate.mjs`/`sonar-report.mjs` ported
-  to bash + curl + jq (`scripts/sonar-gate.sh`, `sonar-report.sh`),
-  same flows and outputs; `jq` is a dev-machine-only dependency.
-- CI slimmed: the Setup Node, npm ci, TypeScript typecheck, and
-  vitest steps are gone; Sonar exclusions reduced to `*.slint`.
-- Docs synced (AGENTS.md, README.org): frontend list 4 → 2, Tauri
-  packaging walkthrough removed, version-bump and testing sections
-  updated to the bare cargo/script commands.
-
-* Unreleased — Phase 0 capability-probe hardening
-
-- The two remaining bare ffmpeg subprocess spawns in production code
-  (`ffmpeg -version` and the `-encoders`/`-formats` list probe in
-  `gui-engine/src/converter/capabilities.rs`) now run through the
-  shared `subprocess::run_output_with_timeout` runner under the
-  standard 10 s probe timeout. A hung `ffmpeg` shim (e.g. a broken
-  driver wrapper on PATH) previously blocked the startup capability
-  probe forever; it now surfaces as "converter unavailable" with an
-  error message within 10 s per probe. List-probe failures are
-  no longer silent (`log::warn!`), and the encoder/format list
-  parsing is extracted into a pure, unit-tested function.
-  `.config/nextest.toml` also dropped three keys nextest ignored
-  with a warning. No user-facing feature change.
-
-* Unreleased — WP-5 process & hygiene
-
-Implementation of work package WP-5 from the code-quality report
-(`reports/code-quality-2026-10-02.md`, plan in
-`reports/wp5-process-hygiene-plan.md`): turn the Sonar portal from
-decoration into enforcement. Config/CI/tooling only — no production
-code changed.
-
-- Quality gate: the project previously had no gate at all (status
-  NONE, zero conditions — the portal could never fail on anything).
-  New idempotent `scripts/sonar-gate.mjs` (`npm run sonar:gate`)
-  creates/assigns the **LTC gate** with four new-code conditions:
-  coverage > 80%, and reliability/security/maintainability ratings on
-  new code better than B (A). Overall-code conditions are deliberately
-  out of scope until the pre-existing CRITICAL `S3776` smells burn down
-  (follow-up F-2). CI's Sonar scan step now passes
-  `-Dsonar.qualitygate.wait=true`, so a gate-failing push/PR reds CI —
-  note a red main now has this third possible cause; reverting is
-  deleting the `args` line. One-time portal check: New Code definition
-  = reference branch `main`.
-- Legacy TS freeze (decision recorded up front in the plan): the
-  React web app `src/` owns 100% of the portal's open bugs (11) and
-  vulnerabilities (1); instead of retiring it (product decision,
-  follow-up F-1) it is frozen — `sonar.sources` drops `src/`, the
-  vitest spec inclusions and the TS coverage property go away, and the
-  issues close as removed on the next scan (expected: 0 bugs,
-  0 vulnerabilities, smells ~167 → ~45 Rust-only). CI keeps
-  `npm ci` + `tsc` as the frozen code's rot guard; the vitest step
-  runs plain `npm test` (no LCOV export — only the Rust lcov feeds
-  portal coverage now). The freeze is fully reversible (re-add `src`
-  to `sonar.sources`).
-- Report-script truthfulness (`scripts/sonar-report.mjs`): a NONE
-  gate no longer renders as `FAILED ()` (now `NO GATE DEFINED`);
-  ratings parse numerically so they render as letters instead of `?`
-  (preferring `maintainability_rating` over the deprecated
-  `sqale_rating`); and the summary gained a per-condition
-  **new-code conditions** table — the numbers gate reviews read first.
-- Portal verification (first gated scan, 2026-10-03, `main` @
-  `68aa232`): the gate evaluates as **PASSED** with every new-code
-  condition green — new-code coverage 91.8% (overall 74.6%), all three
-  ratings A, duplication 0.0%, hotspots 100% reviewed. Issue census
-  before → after: bugs 11 → **0**, vulnerabilities 1 → **0**, smells
-  167 → **86** (Rust-only: 30 CRITICAL — 29 `S3776` + 1 `S2208` —, 12
-  MAJOR, 44 MINOR; the CRITICAL list is the F-2 burn-down baseline),
-  the 4 stale clippy imports closed as expected, ncloc 36 541 →
-  35 592. The report script renders ratings as letters and the
-  per-condition new-code table — evidence in the local (gitignored)
-  `reports/sonar/` snapshot.
-- Portal reality notes, recorded for the follow-ups: SonarCloud
-  rejected *assigning* the custom gate ("Organization … is not allowed
-  to modify Quality gates" — plan entitlement), so enforcement runs on
-  the built-in **Sonar way** gate, a strict superset of LTC gate's
-  four conditions; `npm run sonar:gate` handles this fallback
-  automatically (and the custom LTC gate exists, ready to assign if
-  the plan allows). The New Code definition is *previous version*
-  (baseline v0.4.7 @ 2026-10-02), the alternative the plan accepted.
-- First-push fallout fixed en route (`68aa232`): the WP-0…4 code had
-  never run on CI, and two latent issues surfaced — `offload.rs`'s
-  `make_mock_sys` cluster created mock sysfs symlinks without a
-  `#[cfg(unix)]` gate (broke the windows-cross-check compile), and
-  `test_run_video_to_video_happy_path` led its encoder chain with
-  `h264_nvenc`, which fails after producing no output on GPU-less
-  runners (the production capability probe normally removes dead hw
-  encoders; the test bypasses it, so it now pins a software-only
-  libx264 chain).
-
-* Unreleased — WP-4 test-gap closure
-
-Implementation of work package WP-4 from the code-quality report
-(`reports/code-quality-2026-10-02.md`, plan in
-`reports/wp4-test-gap-closure-plan.md`): close the four structural test
-gaps the earlier WPs did not cover — the engine's offload
-command/event paths, the `SetDevice` revert path, the CLI mode
-runners, the Windows-only `cfg` blocks, and the tagged-MP4 round-trip.
-
-- Offload scan seam: `run_offload_scan_job_with` (project `_with`
-  convention) makes card detection injectable; `EngineSeams` +
-  `engine_main_with_seams` replace ad-hoc seams while
-  `engine_main_with_probe` keeps its signature as a delegate. The new
-  engine integration tests drive the full offload pipeline — fake card
-  scan → selection → real tempdir copy → completion/version bump →
-  `DurationProbe` item flow — plus the copy-failure contract (job ends
-  Succeeded with an empty completed list; a cancelled scan now maps to
-  `JobError::Cancelled`, not `Failed`), cancel-during-scan with clean
-  rescan, and the "No media cards detected." / "No parent folder
-  selected." guards.
-- `SetDevice` revert regression test: a bogus device id is rejected by
-  `try_init_device` before cpal is touched, so the "failed selection
-  never sticks" invariant is pinned deterministically on any host.
-- CLI testability: `process_cli_result` returns `Result<CliOutcome,
-  CliError>` instead of exiting the process on decode/generate errors
-  (`process_cli` keeps byte-identical stderr/exit behavior); the decodable
-  runners return the `LtcDetectionResult`. The WAV chunked-decode core
-  moved into `decode::decode_wav_file`, retiring the last CLI/GUI decode
-  duplication. New `tests/cli_decode.rs` covers output-to-file, WAV and
-  video decode dispatch, and the previously process-killing error paths.
-- Windows cross-compile guard: a `windows-cross-check` CI job runs
-  `cargo check --target x86_64-pc-windows-gnu` so `win_driver` and the
-  subprocess console-suppression blocks compile on every PR. The guard
-  immediately caught two ungated unix-only test fixtures
-  (`make_mock_sys`, a symlink test in `file_pattern.rs`), now `#[cfg(unix)]`.
-- Tagged-MP4 round-trip: committed fixture
-  `test-data/tmcd-roundtrip-trailing-moov.mp4` and a new
-  `tests/tagger_mp4.rs` suite that fails loudly when the native in-place
-  tmcd path breaks — including a stco-offset regression net asserting
-  the chunk offset resolves to `pre_tag_len + 8` with the tagged frame
-  count at that address. The old in-module test's silent "fell through
-  to fallback" skip is gone.
-
-Coverage of the WP-4-named files after the work: `cli.rs` line coverage
-62.96% (baseline 45.9%), `offload.rs` 92.04%, `tagger.rs` 90.11%,
-`engine.rs` 84.05%, `decode.rs` 77.67% (workspace total 71.89% lines).
-
-* Unreleased — WP-3 converter consolidation
-
-Implementation of work package WP-3 from the code-quality report
-(`reports/code-quality-2026-10-02.md`, plan in
-`reports/wp3-converter-consolidation-plan.md`), landed as a sequence of
-behavior-preserving refactors with a handful of deliberate, tested
-behavior fixes:
-
-- One channel-map/drop iteration: `planning::selected_channel_pairs`
-  replaces six drifted copies across planning and the runner. The concat
-  inconsistent-layout fallback now respects the channel map like every
-  other path (previously it silently iterated raw probe streams).
-- `preview_output_files` and `output_collision_warning` become
-  projections of the new `plan_output_paths` (cognitive complexity 74/58
-  down to single digits). Preview and execution now agree on which LTC
-  track is dropped with permuted channel maps, and the collision warning
-  covers concat, synthetic-video, and VideoPassthrough audio outputs it
-  previously never saw.
-- `run_metadata_only` is decomposed into probe / extract / tag+rename /
-  summarize phases with one `check_cancelled` helper and a monotonic
-  step cursor (replacing the broken `file_idx * 3 + 1` labels). Failure
-  accounting is real: a run in which nothing succeeded now ends in
-  `mark_failed` carrying the typed `StepFailure` details, and partial
-  failures surface a `--- N STEP(S) FAILED ---` block — a 100% failed
-  metadata-only run no longer reports COMPLETED SUCCESSFULLY. All five
-  `mark_failed("")` sites now pass the ffmpeg exit reason through to the
-  UI.
-- One ffmpeg watchdog: `subprocess::run_ffmpeg_collect_stderr`
-  (+ `FfmpegRunError`) replaces the twin epilogues in the converter step
-  runner and audio extraction; `ffprobe::run_ffprobe_json_with` is the
-  single spawn/timeout/exit/JSON-parse helper behind all ffprobe JSON
-  calls (duration probing switched to `-of json`, behavior-equivalent).
-- `bext_meta` is the one camera→bext mapping module: the default
-  originator constant (was declared twice), originator/description
-  mapping (was triplicated), and origination date with mtime fallback.
-  The tagger's ffmpeg fallback now writes bext for camera-less files and
-  gains the mtime date fallback, consistent with the converter path.
-- `run_metadata_only` / `run_video_to_video` gain direct test coverage
-  (characterization net, prober seam for logic-level tests, concat /
-  fallback / step-weight paths) — previously zero direct tests.
-
-* Unreleased — WP-2 audio-core restructuring
-
-Implementation of work package WP-2 from the code-quality report
-(`reports/code-quality-2026-10-02.md`, plan in
-`reports/wp2-audio-core-restructuring-plan.md`): `lib.rs` becomes a
-thin front door, the chunked decoder's merge logic and the scheduler's
-watchdog state machine become directly unit-testable, the decoder's
-strategy ladder and quality analyzer are decomposed into pure units,
-backend selection becomes a trait, and the dead API surface is gone —
-all behavior-preserving except where noted.
+Main features are a workspace-wide quality campaign: the engine and
+audio-core were decomposed into small, unit-tested components behind
+typed errors and a unified background-job system; the GUI↔engine
+interaction was reworked onto a shadow-state model with exact command
+acknowledgement, eliminating the class of races where a stale engine
+snapshot overwrote a fresh edit; five verified correctness defects
+were fixed (WAV fmt-scan endianness, MP4 tmcd stco offset, the
+cross-decoder confidence scale, drifted video-extension lists,
+unbounded subprocess probes) along with follow-up fixes to decoding,
+conversion progress and offload behaviour; the startup ffmpeg
+capability probe no longer blocks on hardware-encoder validation; and
+the legacy React web app, both Tauri crates and the entire Node/npm
+toolchain were retired in favour of a Rust-only workspace. The project
+also gained continuous integration (GitHub Actions with clippy,
+coverage and SonarQube Cloud quality-gate enforcement) and
+first-class Windows and macOS CI platforms.
 
 List of Changes:
-- `lib.rs` split (PR-1): the 1 761-line god-module is now a ~70-line
-  front door; shared types moved to `types.rs`, the byte-level WAV
-  reader to `wav_chunk_reader.rs` (with `read_raw_bytes` /
-  `decode_le_int_sample` deduplicating the per-reader byte work), and
-  the chunked decode to `chunked_decode.rs`. The chunk-boundary loop
-  exists once as `plan_chunk_boundaries`; `count_chunks` is
-  `plan(..).len()` by construction. Two intentional prediction fixes:
-  `count_chunks` no longer short-circuits to 1 in the
-  `(chunk_mono, chunk_mono+overlap]` window (gui-engine progress
-  totals were ±1 off the real decode there), and the degenerate
-  `bytes_per_mono == 0` fallback unifies on 1 chunk.
-- `trait LtcDecoder` (PR-2): backend selection collapses into
-  `decoder.rs::decoder_for(use_libltc)` — the single `if use_libltc`
-  in the crate; `decode_one_chunk`/`decode_ltc_with_decoder` delegate.
-  The byte-identical `error_result` clone in the libltc decoder is
-  deleted in favour of `LtcDetectionResult::error`.
-- `decode_ltc_chunked` decomposition (PR-3): CC 77 → a ~70-line
-  orchestrator over `ChunkPlan`, `run_sequential`/`run_parallel`
-  (taking `&dyn LtcDecoder`, mockable), and `merge_results` (offset/
-  dedup/reindex/confidence/status). Twelve new synthetic unit tests
-  including MockDecoder sequential/parallel parity, pre-cancelled slot
-  filling, and worker-bail collection.
-- `list_audio_devices` (PR-4): one `AudioDeviceInfo` construction site
-  (`from_summary`), one config-aggregation loop (`DeviceConfigSummary`),
-  and a shared `probe_device` path for the default device and the
-  enumeration loop; the duplicated second walk of
-  `supported_output_configs` is gone.
-- Scheduler reliability (PR-5): the callback-stall recovery state
-  machine is extracted as a pure `CallbackWatchdog` (500 ms stall /
-  3 attempts / 10 s sliding window / 100 ms backoff) tested on a
-  virtual clock — recovery ladder, strict-`>` stall confirmation,
-  resume reset, sliding-window restart, byte-exact reason string —
-  plus a device-free `push_frame` helper pinning the
-  `FramesDropped`-every-100 cadence. `ltc_scheduler_thread` is
-  delegation + glue.
-- Decoder strategy ladder (PR-6a): the 3x compare-ZC-vs-detailed
-  epilogue is `prefer_zc_or_detailed`; the sliding-window loop is
-  `scan_windows` returning `HighConf`/`Best`/`NoCandidate`; per-attempt
-  scoring is `score_candidate`; all four `ScoredResult` construction
-  sites funnel through `from_frame_starts` (single home of the
-  `(phase + start·spb)/sample_rate` formula) with `canceled()` for the
-  zeroed cancel stubs; four inline cancel checks become `cancelled()`.
-  The real-world fixture decode output is byte-identical before/after.
-- `compute_ltc_quality` (PR-6b): the ~250-line CC-48 function becomes
-  a ~45-line orchestrator over pure sub-analyzers (`split_segments`,
-  `analyze_drift`, `analyze_gaps`, `analyze_glitches`,
-  `missing_in_span`, `quality_score`, `quality_summary`) — the scoring
-  formula is now directly unit-tested. No threshold or formula changes.
-- API pruning (PR-7): deleted `quick_check_ltc`,
-  `is_transient_audio_error`, and the never-writable
-  `OVERRIDE_SYNC_TOLERANCE` hook (the sync-word path now uses
-  `SYNC_MATCH_TOLERANCE` directly, removing the inconsistent mix);
-  `apply_coherent_first_timecode`, `decode_ltc_samples`,
-  `decode_ltc_samples_libltc` demoted to `pub(crate)`; gui-engine's
-  re-export block drops the dead names. The valid/invalid round-trip
-  coverage formerly pinned by `quick_check_ltc` is retargeted onto
-  `decode_ltc_from_wav`.
-
-Verification: 390 audio-core tests (352 before, 46 new, 10 removed
-with their API), full workspace suite green, clippy 0 warnings, both
-GUIs compile untouched, `nextest --profile ci` green on the touched
-areas, `--list-devices` and `--headless` smoke runs OK, and the
-real-world 20 s fixture decode output is byte-identical across the
-decoder refactors.
-
-* Unreleased — WP-1 engine decomposition (`gui-engine`)
-
-Implementation of work package WP-1 from the code-quality report
-(`reports/code-quality-2026-10-02.md`, plan in
-`reports/wp1-engine-decomposition-plan.md`): decompose the engine
-god-module so `engine_main_with_probe` is a readable tick loop, make
-job-event dispatch genuinely exhaustive, and remove the dead plumbing
-— all behavior-preserving except where noted.
-
-List of Changes:
-- `EngineLoopState` (`gui-engine/src/engine.rs`): the twelve
-  loop-carried mutable locals (snapshot, tick clock, recovery
-  attempts, clap-log counter, device bookkeeping, auto-apply latches,
-  deferred recording selection, publish gate, command ack counter)
-  are absorbed into one struct; `process_command`,
-  `handle_event`, `ensure_audio_init`, `try_init_device` and
-  `attempt_recovery` take it instead of separate `&mut` arguments.
-  The `#[allow(clippy::too_many_arguments)]` is gone.
-- Job-event dispatch: the 330-line wildcard-tailed match is replaced
-  by `handle_job_event`, which matches exhaustively on `JobKind` (a
-  new kind without a handler is now a compile error) and routes to
-  named per-kind handlers (`on_conversion_finished`,
-  `on_ltc_decode_finished`, ...).  Payload/kind mismatches are logged,
-  never silently dropped.  `JobFinal::Conversion` is now consumed: a
-  successful conversion publishes "Conversion completed — video
-  encoder: <enc>" to the status line, the information the encoder
-  fallback machinery produced but the engine previously discarded.
-- Single command dispatch site: the drain loop's inline arms moved
-  into `process_command` (via `cmd_select_folder`,
-  `cmd_start_conversion`, `cmd_probe_file_durations`,
-  `cmd_probe_video`, `handle_converter_command`), which now owns the
-  full `GuiCommand` match.  All five vestigial arms are gone,
-  including the `unreachable!()` on the `ProbeVideo` arm.  Heavy
-  decode arms extracted as `cmd_decode_ltc_video_group`,
-  `cmd_parse_ltc_video`, `cmd_parse_ltc_wav_file`, with the probe
-  validation pulled out as the unit-tested
-  `validate_stream_channel_selection`.
-- Converter setters: fourteen "assign one field" arms collapsed into
-  `apply_simple_converter_setting` (table-tested); the four arms with
-  real side effects keep dedicated handling.
-- `JobStatus::running(msg)` constructor replaces four copy-pasted
-  Running `JobStatus` literals.
-- Publish gate: the structural `PartialEq` compare against the
-  last-published snapshot now happens *before* the clone, so idle
-  40 ms ticks no longer deep-clone the entire snapshot; regression
-  pinned by `test_idle_engine_does_not_republish_snapshot`
-  (Arc-pointer stability across idle ticks).
-- Shared decode pipeline: new `gui-engine/src/decode.rs` hosts
-  `decode_video_channel` / `decode_video_file`, the collision-proof
-  temp-WAV naming, and the decode progress bridge.  The CLI
-  (`cli.rs::run_decode_video`) and the GUI decode commands share one
-  implementation instead of two ~100-line near-copies; the CLI video
-  decode additionally gains the engine's chunked-decode path (the old
-  `--single-pass` video shortcut is subsumed by the chunk-size
-  heuristic).  WAV-mode `--decode` is unchanged.
-- Offload: per-device copy-plan aggregation moved out of the engine's
-  `StartOffload` arm into `offload::build_copy_plan` returning a
-  typed `Result<OffloadCopyPlan, OffloadPlanError>`; display strings
-  stay in the engine.  The clip-probe worker closure became
-  `clip_probe::probe_clip_set`, making the
-  `DEVICE_NAME_PROBE_SAMPLE` camera-probe cap unit-testable.
-- Dead plumbing: `ActiveJob._started` deleted; `TrackerInner.log` is
-  no longer dead — `ProgressTracker::push_log()` (4 KiB capped) is
-  implemented and conversion step failures are recorded into it, so
-  `JobStatus.log` / `JobOutcome` carry failure context.
-- Docs: AGENTS.md synced with the new dispatch/handler structure, the
-  `EngineLoopState` loop, `push_log()`, and the new `decode.rs` /
-  `clip_probe.rs` modules.
-
-* Unreleased — WP-0 correctness bundle (five verified defects fixed)
-
-Landing of the five small correctness fixes from the code-quality
-report's WP-0 work package (`reports/code-quality-2026-10-02.md`),
-each developed with the project TDD loop (failing test first).
-
-List of Changes:
-- WAV fmt-scan endianness (`gui-engine/src/tagger.rs`): the bext
-  tagger's fmt-chunk scanner read RIFF chunk sizes big-endian, so any
-  WAV with a chunk preceding `fmt ` (LIST/JUNK from recorders) failed
-  with "no fmt chunk found"; it also read the sample rate from the
-  wrong fmt payload offset (format tag + channels instead of the rate
-  bytes).  Consolidated on a single little-endian, padding-aware
-  scanner `converter::read_wav_sample_rate_from_file`; the path-based
-  `read_wav_sample_rate` now delegates to it instead of assuming
-  `fmt ` is the first chunk.
-- MP4 `tmcd` `stco` patch (`gui-engine/src/tagger.rs`): the native
-  in-place MP4 timecode tagger shipped the tmcd track's `stco` chunk
-  offset as 0 (comments promised a write-time patch that never
-  existed), so spec-strict tools resolving the timecode sample read
-  garbage.  The offset is now patched to the deterministic appended
-  mdat payload position before the new moov is written, verified by
-  an end-to-end ffmpeg+ffprobe round-trip fixture test.
-- Cross-decoder confidence contract (`audio-core`): the libltc
-  decoder stored `avg_confidence` as a 0–100 percentage while the
-  builtin decoder used a 0.0–1.0 fraction, and libltc classified
-  status as "any valid frames" (never `LowConfidence`) — libltc
-  results displayed 100× too high and marginal recordings were
-  classified differently per backend.  Both decoders now publish the
-  same 0.0–1.0 fraction with shared `CONFIDENCE_SUCCESS_THRESHOLD` /
-  `CONFIDENCE_LOW_THRESHOLD` constants; a contract test runs both
-  decoders over the real-world fixture.
-- Video-extension registry (`gui-engine/src/media_ext.rs`): the
-  video-extension list had drifted across five sites (ffprobe,
-  device_name, offload, converter/formats, tagger) — an `.m4v` file
-  was ingested by offload but rejected by `path_is_video()`.  A new
-  single-source registry (`VIDEO_EXTENSIONS`, `AUDIO_EXTENSIONS`,
-  `is_video`/`is_audio`, `container_for_input`) now backs all
-  classification and stream-copy container mapping; the duplicated
-  lists are deleted.
-- Subprocess hygiene (`offload.rs`, `hw_device.rs`): `udisks_mount`
-  (the only production `Command::new` outside `subprocess.rs`) now
-  spawns via `no_window_command` + `run_output_with_timeout` under a
-  15 s timeout instead of hanging the card scan; the VAAPI/Vulkan
-  hardware probes no longer call `.status()` unbounded — both run
-  under a 10 s timeout, with injectable-runner seams and unit tests
-  for each.
-
-* Unreleased — CI pipeline and SonarQube Cloud code-quality analysis
-
-Introduction of continuous integration and automated code-quality metrics
-via GitHub Actions and SonarQube Cloud (official SonarSource Rust
-analyzer).
-
-List of Changes:
-- GitHub Actions workflow (`.github/workflows/ci.yml`): runs on push to
-  `main` and on pull requests.  Installs the build prerequisites
-  (`libltc-dev`, `libclang-dev`, `ffmpeg`, `PKG_CONFIG_PATH`), runs
-  clippy across the workspace with a JSON report, executes the Rust
-  test suite with coverage via `cargo llvm-cov --nextest` (LCOV,
-  benefiting from the existing nextest `ci` retry profile for the
-  timing-sensitive integration suites), runs the TypeScript typecheck
-  and the vitest suite with coverage, and finishes with the SonarQube
-  Cloud scan.  Cargo and npm build caches keep repeat runs fast.
-- SonarQube Cloud integration (`sonar-project.properties`): project
-  key `D4id4los_ltc-timecode-generator`, organization `d4id4los`.
-  Analyzes the four workspace Rust crates plus the legacy web app;
-  the legacy `src-tauri`/`src-tauri-32bit` crates and Slint UI markup
-  (no Sonar analyzer exists for Slint) are excluded.  Clippy findings
-  are imported as external issues and LCOV coverage from both the Rust
-  and web test suites is published.  The scan step is skipped when the
-  `SONAR_TOKEN` repository secret is absent, so forks run plain CI.
-- Web test coverage tooling: `@vitest/coverage-v8` dev-dependency, a
-  `npm run test:coverage` script, and an LCOV coverage reporter
-  configured in `vite.config.ts`.
-- Documentation: new "CI & SonarQube Cloud" sections in AGENTS.md and
-  README.org; report artifacts (`clippy-report.json`, `lcov.info`)
-  added to `.gitignore`.
-- Local report exporter: `npm run sonar:report`
-  (`scripts/sonar-report.mjs`) fetches quality-gate status, measures,
-  open issues and security hotspots from the SonarQube Cloud Web API
-  and writes deterministic JSON + Markdown reports to
-  `reports/sonar/` for offline analysis or AI-agent consumption.
-
-
-* Unreleased — unified shadow-state interaction architecture
-
-Rework of how the GUIs communicate with the engine around interactive
-widgets, following established immediate-mode-UI patterns (local shadow
-state, controlled synchronisation, and an exact echo acknowledgement)
-to eliminate the class of races where a widget's freshly edited value
-was overwritten by a stale engine snapshot.
-
-List of Changes:
-- Engine acknowledgement counter: `AppStateSnapshot.applied_command_seq`
-  is bumped by the engine once per command drained from the command
-  channel and published with the tick, so a GUI can confirm exactly
-  when a sent command landed (the previous mechanisms relied on value
-  echo or fixed timeouts).  Idempotent writes now publish too — the
-  counter forces the structural-PartialEq publish gate open.
-- `gui-engine::edit_state::EditState<T>`: a GUI-framework-agnostic
-  shadow-state machine (shadow value, pending send with assigned ack
-  sequence, focus gate, ack confirmation, 2 s timeout fallback)
-  shared by both frontends; unit-tested in-module.
-- ltc-gui: every interactive widget — text fields (roll, offload
-  parent/device names, converter naming templates, output folder),
-  checkboxes, sliders, and all selector combos/buttons — now renders
-  from a typed `EditState` shadow (`shadows.rs`) through `bound.rs`
-  wrapper functions instead of re-seeding from the snapshot each
-  frame.  All commands flow through a sequence-assigning sink, and
-  fast repaints run while commands await their ack, so engine echoes
-  appear on the next frame instead of after the idle repaint
-  interval.
-- ltc-gui: the two previous ad-hoc mechanisms were removed —
-  `TextFieldEdit` (superseded by the generalised `EditState`) and the
-  converter three-way merge/diff machinery (`local_settings`,
-  `prev_engine_settings`, `merge_converter_settings`,
-  `diff_converter_commands`, `reconcile_converter_settings`, the
-  per-frame GUI-side `apply_available_defaults` and
-  `sync_channel_map_from_probe` rewrites).  Engine-side side-effects
-  (capability repair, decode auto-apply, probe channel-map resize,
-  recording-selection resets) now propagate through shadow sync.
-- Offload device-folder renaming is addressed by mount path
-  (`OffloadCommand::SetDeviceNameByMount`) instead of the volatile
-  card-list index, so a rescan during an edit can no longer retarget
-  the wrong card; per-file selection checkboxes are shadow-backed.
-- ltc-slint bugfixes: the converter focus gate was dead code (an
-  instantiation-site property override replaced the internal focus
-  aggregation with a never-written property — the gate now aggregates
-  `changed has-focus` from each editable input and is two-way linked
-  to the window); the ROLL TextInput lost every keystroke (the
-  callback re-read the stale window property — it now carries the new
-  value through a two-way binding and its poll push is focus-gated);
-  the converter prefix/suffix inputs silently detached from engine
-  updates after the first keystroke (one-way bindings — now two-way).
-
-* Unreleased — state audit and cleanup
-
-A full audit of the published application state
-(`gui-engine::state::AppStateSnapshot`) — necessity, grouping, and
-type quality — followed by a three-phase cleanup.  No user-visible
-behaviour changes except where noted.
-
-List of Changes:
-- Dead state removed: `generation` (bumped every tick, never read),
-  `wake_lock_active` (could never be true; its status chip is gone
-  from both GUIs), `ltc_decode_is_video` (write-only), the
-  "Trim to first LTC frame" toggle (a no-op — the pipeline supported
-  trimming but the engine always passed zero offsets; embedding the
-  start timecode from LTC remains the sync mechanism), the decorative
-  naming-pattern selector in the Slint converter (the engine always
-  scans with all patterns; its display branches now key off each
-  group's actual recording type), plus published-but-unread
-  `output_preview`/`encoder_chain_desc`, `system_time` (the egui GUI
-  now formats its own clock, as Slint already did), and several
-  set-only fields.
-- Type upgrades: LTC/beep channel routing is a `ChannelSel` enum
-  instead of `"left"/"right"/"both"` strings end-to-end (CLI,
-  engine, audio-core); FPS is stored only as an index with `fps()` /
-  `drop_frame()` accessors replacing four lockstep-maintained fields;
-  the three parallel group-decode vectors collapse into a single
-  `Vec<ClipDecodeState>`; `JobStatus` is now a `ProgressSnapshot`
-  plus an error; `ClapLogItem.id` is a `u64`;
-  `LtcQualityReport.grade` is a `QualityGrade` enum.
-- Regrouping: the ten loose LTC-decode fields move into
-  `AppStateSnapshot.decode` and the eight clapper/animation fields
-  into `AppStateSnapshot.clapper`; device selection is by stable
-  device id instead of an index into the (volatile) device list, so
-  re-scans can no longer silently repoint the selection; the egui
-  GUI dropped its duplicate copies of the LTC track index and the
-  selected converter folder.
-- All workspace clippy warnings fixed (the codebase is now
-  warning-free under the workspace lint configuration).
+- Correctness fixes (each developed with a failing test first):
+  - WAV fmt-scan endianness: the bext tagger read RIFF chunk sizes
+    big-endian, so any WAV with a chunk preceding `fmt ` (LIST/JUNK
+    from recorders) failed with "no fmt chunk found", and the sample
+    rate was read from the wrong payload offset; scanning is now one
+    little-endian, padding-aware reader that no longer assumes `fmt `
+    is the first chunk.
+  - MP4 tmcd stco patch: the native in-place MP4 timecode tagger
+    shipped the tmcd track's stco chunk offset as 0, so spec-strict
+    tools resolved the timecode sample to garbage; the offset is now
+    patched to the appended mdat payload position and verified by an
+    end-to-end ffmpeg+ffprobe round-trip fixture test.
+  - Cross-decoder confidence contract: libltc stored avg_confidence
+    as a 0–100 percentage (displayed 100× too high) and never
+    classified LowConfidence, while the builtin used a 0.0–1.0
+    fraction; both decoders now publish the same 0.0–1.0 scale with
+    shared threshold constants and a contract test over the
+    real-world fixture.
+  - Video-extension registry: the video-extension list had drifted
+    across five call sites (an .m4v was ingested by offload but
+    rejected by path_is_video()); a single VIDEO/AUDIO_EXTENSIONS
+    registry now backs all media classification and stream-copy
+    container mapping.
+  - Subprocess hygiene: the udisksctl mount call and the VAAPI/Vulkan
+    hardware probes ran unbounded (a stuck helper hung the card scan
+    or the startup probe forever); all remaining bare spawns —
+    udisksctl, hardware probes, `ffmpeg -version`, the encoder/format
+    list probe — now run through the shared timeout runner,
+    surfacing as a converter-unavailable error within 10 s per probe,
+    with list-probe failures logged instead of silent and the list
+    parsing extracted into a unit-tested function.
+  - Conversion progress no longer reaches 100% while ffmpeg steps are
+    still in flight (the in-flight step's fraction is capped below
+    its full weight).
+  - Offload/engine edge cases: the offload→converter handoff fires
+    only when copy devices actually completed; zero-length group
+    durations are treated as unknown; the playback volume mapping
+    clamps its input to 0..1; and offload collision renaming assigns
+    its "name (2).ext" suffixes in sorted order so duplicates resolve
+    deterministically.
+- Decoder improvements: the builtin decoder now decodes the first and
+  last frames of a file (previously dropped by the search windows)
+  and the chunked libltc path is exactly equal to direct libltc
+  decoding; WAV LTC decode auto-selects a non-silent channel when the
+  configured channel carries no signal; and cancellation is a typed
+  signal threaded through audio-core into gui-engine (asserted as
+  variants, not text).
+- Unified async-job system: all background tasks (conversion, offload
+  scan/copy, LTC decode, folder scans, clip/duration/capability
+  probes) run behind one JobSupervisor/spawn_job infrastructure with
+  weighted per-unit progress, cancellation tokens, EMA speed
+  metering, capped log capture, stale-result gating (events from
+  superseded jobs are rejected) and duplicate-spawn guards;
+  per-chunk decode progress is bridged into job units, and copy
+  speed plus per-drive scan messages are reported from it.
+- Engine decomposition (gui-engine): the tick loop's twelve
+  loop-carried locals collapsed into EngineLoopState; job-event
+  dispatch matches exhaustively on JobKind with named per-kind
+  handlers (a new kind without a handler is a compile error) and a
+  single process_command site owns the full GuiCommand match;
+  fourteen copy-paste converter setters collapsed into one
+  table-tested helper; the CLI and GUI share one decode pipeline
+  (decode.rs) instead of two near-copies, with the
+  single-pass-vs-chunked WAV-decode dispatch unified in
+  decode_wav_core behind a pure decision helper; idle ticks no longer
+  deep-clone the snapshot (the unchanged-publish gate compares before
+  cloning); dead plumbing was removed and conversion step failures
+  are recorded into the job log.
+- audio-core restructuring: lib.rs became a ~70-line front door with
+  types/wav_chunk_reader/chunked_decode modules and one chunk-boundary
+  planner (fixing ±1 chunk-count predictions in the gui-engine
+  progress totals); decoder backend selection is a trait LtcDecoder
+  seam; chunked decoding is decomposed into plan/run/merge units over
+  a mockable decoder; device enumeration has a single probe path; the
+  callback-stall recovery is a pure, virtual-clock-tested watchdog
+  state machine; the decoder strategy ladder and the LTC quality
+  score are decomposed into directly unit-tested pure functions; and
+  the dead API surface (quick_check_ltc and friends) was removed.
+- Converter consolidation: one channel-map/drop iteration
+  (selected_channel_pairs) replaces six drifted copies (the concat
+  fallback now respects the channel map too); output preview and
+  collision warning become projections of plan_output_paths, so
+  preview and execution agree on LTC dropping and the warning covers
+  concat/synthetic/passthrough outputs; the metadata-only pipeline is
+  decomposed into probe/extract/tag+rename/summarize phases with real
+  failure accounting — StepFailure details reach the UI and a fully
+  failed run no longer reports success; one ffmpeg stderr-watchdog
+  driver and one ffprobe JSON helper replace the duplicated
+  epilogues; and the camera→WAV-bext field mapping lives in a single
+  bext_meta module (originator constant, description mapping, mtime
+  date fallback).
+- Shadow-state GUI interaction: every interactive widget in both GUIs
+  renders from a typed EditState shadow synchronised against engine
+  truth with an exact echo acknowledgement (applied_command_seq),
+  replacing the value-echo and three-way-merge machinery;
+  engine-initiated setting changes propagate through the same sync;
+  offload device-folder renaming is addressed by mount path so a
+  rescan cannot retarget the wrong card; fixed ltc-slint bugs (dead
+  converter focus gate, the ROLL TextInput losing keystrokes,
+  prefix/suffix inputs detaching from engine updates after the first
+  keystroke).
+- Published-state audit: dead snapshot fields removed (per-tick
+  generation counter, wake-lock flag and chip, write-only and
+  set-only fields, the no-op "Trim to first LTC frame" toggle, the
+  decorative naming-pattern selector, system_time); channel routing
+  is a ChannelSel enum end-to-end, FPS a single index with accessors,
+  the quality grade an enum; decode and clapper fields regrouped into
+  sub-structs; audio devices are selected by stable id so re-scans
+  can no longer silently repoint the selection; the global
+  status_message became per-subsystem StatusChannels and audio events
+  are delivered via a one-shot channel instead of the snapshot; and
+  all pre-existing clippy warnings were fixed.
+- Typed errors: CLI timecode/device-resolution failures, ffprobe and
+  subprocess probe errors, audio-core chunk/bit-depth/watchdog
+  payloads, conversion checks (ConversionCheckError plus a
+  FailureLedger that makes a nothing-succeeded run end Failed),
+  stream selection, offload planning, skip reasons, tagging errors
+  and probe status labels are typed variants instead of formatted
+  strings; the matching message-text test pins were rewritten to
+  typed assertions and JobOutcome::Failed gained a typed panic flag.
+- Startup capability probe: per-stage timing instrumentation plus a
+  `--probe-caps` report mode; hardware encoders are withheld from the
+  initial capability publication and validated by a background
+  test-encode job that reconciles the list and republishes — a broken
+  GPU/driver can no longer stall startup, no codec loses its encoder
+  chain (every codec keeps a software fallback) and readiness never
+  blocks; validated passes are cached (keyed on ffmpeg version,
+  encoder list and hardware devices; failures are never cached; a
+  corrupt cache file is ignored) so repeat startups publish validated
+  hardware encoders immediately; when validation newly enables a
+  hardware encoder and the user has not touched container/encoder
+  settings this session, the engine re-picks the best default
+  combination.
+- Complexity burn-down: the SonarCloud CRITICAL census (29 × S3776
+  cognitive-complexity smells + 1 × wildcard import) was cleared by
+  decomposing the ltc-slint `_run_gui`/`setup_poll_timer`
+  mega-functions into per-concern register_/sync_ helpers (the
+  9-parameter poll signature is gone; static converter models are
+  built once instead of every tick), splitting the ltc-gui converter,
+  app-logic, clock, offload, settings and status hotspots into render
+  helpers plus pure unit-tested extractors, and extracting pure cores
+  from engine and audio-core hotspots (file-pattern matching,
+  converter runner/planning/args, card-detection mount filtering,
+  engine loop and command dispatch, CLI decode-report rendering, the
+  stderr watchdog, the scheduler loop, the decode search lattice,
+  libltc assembly) — +140 unit tests, logic moved verbatim behind
+  characterization tests; the tagger's wildcard imports were made
+  explicit.
+- Test infrastructure: offload card detection is injectable
+  (EngineSeams) with engine-thread integration tests for the full
+  offload pipeline, the SetDevice bogus-id revert and the audio
+  recovery ladder (init failure forced deterministically; the attempt
+  counter is published as audio_recovery_attempts); a committed MP4
+  fixture plus round-trip suite guards the native tmcd tagger;
+  process_cli_result returns a Result instead of exiting the process
+  (new tests/cli_decode.rs covers output-to-file, WAV/video decode
+  and the error paths); deadline-poll loops replace fixed sleeps;
+  message-text pins, duplicate, tautological and can-never-fail tests
+  were rewritten or deleted and process_command received unit-test
+  backfill; offload integration tests serialize their config access;
+  coverage of the named files rose to cli.rs 63% (from 46%),
+  offload 92%, tagger 90%, engine 84%; the test-lint guardrail
+  (sleep/text-pin rules) runs in CI with a --self-test mode;
+  .config/nextest.toml dropped keys nextest ignored; AGENTS.md gained
+  the Test Quality rules, the plan-folder convention and the
+  never-weaken-a-failing-test policy.
+- Continuous integration and quality gate: a GitHub Actions pipeline
+  runs the test-lint guardrail, clippy (JSON report imported by
+  Sonar), the test suite with coverage (cargo llvm-cov nextest +
+  LCOV) and the SonarQube Cloud scan (skipped without SONAR_TOKEN, so
+  forks run plain CI); the idempotent sonar-gate script creates the
+  LTC gate (new-code coverage > 80%, reliability/security/
+  maintainability ratings A) and CI passes
+  -Dsonar.qualitygate.wait=true so a failing gate reds the pipeline;
+  an overall-code enforcement step (sonar-overall-gate.sh with
+  self-test fixtures) reds main on overall-code violations (ratings
+  ≤ A, duplication < 3%, hotspots 100% reviewed); the report script
+  gained a per-condition new-code table, numeric rating rendering and
+  jq payload handling via file; the first gated scan passed with
+  every new-code condition green (new-code coverage 91.8%); assorted
+  runner fixes en route (missing audio/fontconfig/PipeWire/Pulse dev
+  libraries, cargo-llvm-cov ≥ 0.9 subcommand rename, cache action
+  bump, macOS Homebrew bindgen include path).
+- Legacy frontend retirement and version management: the React web
+  app, both Tauri crates and the entire Node/npm toolchain were
+  removed (pure subtraction — the shipped ltc-gui matrix of linux
+  x64, windows x64 and linux i686 is unaffected); the version source
+  of truth moved from package.json to [workspace.package] in the root
+  Cargo.toml, with scripts/bump-version.sh (patch/minor/major/
+  explicit, --dry-run, dirty-tree guard, commit+tag) replacing the
+  npm version flow; the sonar gate/report helpers were ported from
+  .mjs to bash+curl+jq; CI dropped its Node steps; AGENTS.md and
+  README.org were synced throughout.
+- Windows and macOS CI platforms: windows-cross-check compile-guards
+  the Windows-only cfg blocks on every PR; macos-check does the same
+  for the /Volumes card scan and CoreAudio arm; the first-class
+  windows-tests job runs the full nextest suite on windows-latest
+  against the shipped gnu target with ffmpeg installed (converter
+  integration tests execute instead of loud-skipping), libltc built
+  from a pinned source release and cached, a test-count summary
+  guard, and platform-independent test-lint parity; the new
+  LTC_CONFIG_HOME override is the single config-dir resolution point
+  (needed on Windows, where XDG_CONFIG_HOME is ignored — engine tests
+  set both variables — and useful for portable installs; no behavior
+  change when unset); the stderr-watchdog tests spawn paired native
+  cmd/sh processes so they run on Windows too.
 
 * v0.4.7
 
