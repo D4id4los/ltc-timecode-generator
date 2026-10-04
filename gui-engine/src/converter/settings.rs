@@ -152,7 +152,9 @@ mod tests {
             ..make_settings_audio_only()
         };
         let path = s.output_path_for_index("audio", 1, "wav");
-        assert_eq!(path.to_string_lossy(), "/tmp/output_audio_track1.wav");
+        let expected_dir = std::env::temp_dir();
+        assert_eq!(path.parent(), Some(expected_dir.as_path()));
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "output_audio_track1.wav");
     }
 
     #[test]
@@ -164,7 +166,9 @@ mod tests {
             ..make_settings_audio_only()
         };
         let path = s.output_path_for_index("audio", 10, "wav");
-        assert_eq!(path.to_string_lossy(), "/tmp/output_audio_track10.wav");
+        let expected_dir = std::env::temp_dir();
+        assert_eq!(path.parent(), Some(expected_dir.as_path()));
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "output_audio_track10.wav");
     }
 
     #[test]
@@ -176,7 +180,9 @@ mod tests {
             ..make_settings_audio_only()
         };
         let path = s.output_path_for_index("video", 2, "mov");
-        assert_eq!(path.to_string_lossy(), "/tmp/output_video_clip01.mov");
+        let expected_dir = std::env::temp_dir();
+        assert_eq!(path.parent(), Some(expected_dir.as_path()));
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "output_video_clip01.mov");
     }
 
     #[test]
