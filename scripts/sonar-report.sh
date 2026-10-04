@@ -113,14 +113,18 @@ issues_json="$(jq -c '
   sort_by(sevrank // 99, .component, (.line // 0))
 ' <<<"$(paginated "issues/search?componentKeys=${PROJECT}&resolved=false" issues)")"
 issues_total="$(jq 'length' <<<"$issues_json")"
-jq -n --argjson total "$issues_total" --argjson issues "$issues_json" '{total: $total, issues: $issues}' \
-  | jq -S . >"$OUT_DIR/issues.json"
+printf '%s' "$issues_json" >"$OUT_DIR/.issues.tmp.json"
+jq -S -n --argjson total "$issues_total" --slurpfile issues "$OUT_DIR/.issues.tmp.json" \
+  '{total: $total, issues: $issues[0]}' >"$OUT_DIR/issues.json"
+rm -f "$OUT_DIR/.issues.tmp.json"
 
 # 4. Security hotspots
 hotspots_json="$(paginated "hotspots/search?projectKey=${PROJECT}" hotspots)"
 hotspots_total="$(jq 'length' <<<"$hotspots_json")"
-jq -n --argjson total "$hotspots_total" --argjson hotspots "$hotspots_json" '{total: $total, hotspots: $hotspots}' \
-  | jq -S . >"$OUT_DIR/hotspots.json"
+printf '%s' "$hotspots_json" >"$OUT_DIR/.hotspots.tmp.json"
+jq -S -n --argjson total "$hotspots_total" --slurpfile hotspots "$OUT_DIR/.hotspots.tmp.json" \
+  '{total: $total, hotspots: $hotspots[0]}' >"$OUT_DIR/hotspots.json"
+rm -f "$OUT_DIR/.hotspots.tmp.json"
 
 # 5. Human-readable summary (same section order as the .mjs original).
 SUMMARY="$OUT_DIR/summary.md"
@@ -167,18 +171,18 @@ SUMMARY="$OUT_DIR/summary.md"
   fi
   echo ""
   echo "## Open issues: ${issues_total}"
-  jq -r --argjson issues "$issues_json" '
-    ($issues | group_by(.severity) | map({key: .[0].severity, value: length}) | from_entries) as $b
+  jq -r --slurpfile issues "$OUT_DIR/issues.json" '
+    ($issues[0].issues | group_by(.severity) | map({key: .[0].severity, value: length}) | from_entries) as $b
     | ["BLOCKER","CRITICAL","MAJOR","MINOR","INFO"]
     | map(select($b[.] != null) | "- \(.): \($b[.])")[]
-    ' <<<"$issues_json"
+    ' -n </dev/null
   echo ""
   echo "| Severity | Rule | Location | Message |"
   echo "|---|---|---|---|"
-  jq -r --argjson issues "$issues_json" --arg project "$PROJECT" '
+  jq -r --slurpfile issues "$OUT_DIR/issues.json" --arg project "$PROJECT" '
     def esc: (gsub("\\|"; "\\|"));
-    $issues[:200][]
-    | "| \(.severity) | \(.rule) | `\(.component | ltrimstr($project + ":")):\(.line // "-")` | \((.message // "") | esc) |"' <<<"$issues_json"
+    $issues[0].issues[:200][]
+    | "| \(.severity) | \(.rule) | `\(.component | ltrimstr($project + ":")):\(.line // "-")` | \((.message // "") | esc) |"' -n </dev/null
   if [ "$issues_total" -gt 200 ]; then
     echo ""
     echo "… $((issues_total - 200)) more in issues.json"
