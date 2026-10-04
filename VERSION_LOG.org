@@ -1,6 +1,51 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — Phase 4 S3776 burn-down + overall-code gate (Part A)
+
+Removes every CRITICAL code smell from the SonarCloud census (29 ×
+`rust:S3776` cognitive complexity + 1 × `rust:S2208` wildcard import)
+and extends quality-gate enforcement from new-code-only to overall code
+(plan: `plans/PHASE4-overall-gate-and-windows-tests-plan.md`, Part A).
+
+- GUI mega-function decomposition (WP-4.1…4.3, move-verbatim
+  discipline): `ltc-slint` `_run_gui` (176 → orchestration of 12
+  `register_*` functions over a `GuiRuntime` handle struct) and
+  `setup_poll_timer` (148 → per-concern `sync_*` functions over a
+  `PollContext`; the 9-parameter signature — the adjacent `S107` — is
+  gone; the static converter dropdown models are built once instead of
+  every 40 ms tick). `ltc-gui` converter widget hotspots (134/78/80/52/50/32),
+  app `logic()` + clock section, offload cards/progress, settings audio
+  device + the 8-param `stepper_card_col` (`TcField` enum + tested
+  command mapping), and the status bar all split into single-concern
+  render helpers plus pure, unit-tested extractors.
+- Engine-crate pure-core extractions (WP-4.4, tiered by test-pin
+  strength): file-pattern matching, converter runner/planning/args
+  (the unpinned `ChannelsExcept`/`Reordered` mux arms pinned first),
+  card detection mount-candidate filter chain, engine command dispatch
+  + clip-probe handler (characterization tests first) + engine loop,
+  CLI decode-report rendering (10 new characterization tests),
+  subprocess stderr watchdog, audio-core scheduler loop, decode search
+  lattice and libltc assembly. The non-Linux card-scan variant is
+  compile-guarded only (CI windows-cross-check + macos-check).
+- `tagger.rs` native module imports made explicit (S2208).
+- Overall-code gate (WP-4.5): the LTC gate definition gains the five
+  overall-code conditions (ratings ≤ A, duplication < 3 %, hotspots
+  100 % reviewed; overall coverage deliberately excluded — new-code
+  coverage at 80 % already forces tested changes). Because custom-gate
+  assignment 403s on this SonarCloud plan and the assigned "Sonar way"
+  gate is new-code-only, enforcement runs as a CI step:
+  `scripts/sonar-overall-gate.sh` (pure jq evaluator + `--self-test`
+  fixtures + threshold-override flags for live validation) runs on
+  main after the scan and reds the job on any overall-code violation.
+- `scripts/sonar-report.sh`: issue/hotspot payloads are handed to jq
+  via file (`--slurpfile`) instead of argv — the issues array had
+  outgrown ARG_MAX.
+- Test count: +140 unit tests across `ltc-slint` (first tests in the
+  crate), `ltc-gui`, `gui-engine` and `audio-core`; no behavior change
+  intended anywhere — pure extractors move logic verbatim and
+  unpinned handlers got characterization tests before their refactors.
+
 * Unreleased — Phase 3 startup HW-encoder validation latency
 
 Makes the ffmpeg capability probe's worst case bounded and small on
