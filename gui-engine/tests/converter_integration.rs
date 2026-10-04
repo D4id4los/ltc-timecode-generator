@@ -256,7 +256,7 @@ fn create_test_video_with_tone(
             "-f", "lavfi", "-i", &format!("color=c=blue:s=320x240:r=25:duration={}", duration_secs),
             "-f", "lavfi", "-i", &format!("sine=frequency={}:duration={}:sample_rate={}", frequency, duration_secs, sample_rate),
             "-map", "0:v", "-map", "1:a",
-            "-c:v", "libsvtav1", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-c:a", "pcm_s16le",
             "-shortest",
             "-t", &format!("{}", duration_secs),
