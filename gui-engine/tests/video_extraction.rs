@@ -50,6 +50,9 @@ fn init_test_config() {
     INIT.call_once(|| {
         let dir = tempfile::TempDir::new().expect("tempdir for test config");
         std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        // Windows ignores XDG_CONFIG_HOME (dirs uses SHGetKnownFolderPath),
+        // so tests isolate config state there via this override instead.
+        std::env::set_var("LTC_CONFIG_HOME", dir.path());
         let _ = Box::leak(Box::new(dir));
     });
 }

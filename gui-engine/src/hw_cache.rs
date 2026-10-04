@@ -182,10 +182,11 @@ pub fn save_hw_cache(cache_dir: &Path, cache: &HwValidationCache) {
     }
 }
 
-/// Default config-dir location of the cache (respects `XDG_CONFIG_HOME`, so
-/// engine tests are isolated by construction).
+/// Default config-dir location of the cache (respects `XDG_CONFIG_HOME`
+/// and the `LTC_CONFIG_HOME` test override, so engine tests are isolated
+/// by construction on every platform).
 pub fn cache_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|base| base.join(crate::config::CONFIG_DIR))
+    crate::config::config_base_dir().map(|base| base.join(crate::config::CONFIG_DIR))
 }
 
 /// The production stage-2 closure wired into `EngineSeams`: validate all HW

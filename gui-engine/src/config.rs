@@ -11,8 +11,24 @@ pub struct ConverterConfig {
     pub last_offload_parent: Option<String>,
 }
 
+/// Base directory for all persisted config/cache state.
+///
+/// Honors an `LTC_CONFIG_HOME` env override before `dirs::config_dir()`.
+/// The override exists because `XDG_CONFIG_HOME` alone is ignored by
+/// `dirs` on Windows (`SHGetKnownFolderPath` is registry-based), so engine
+/// tests set both variables to isolate config state on every platform; it
+/// also serves portable installs.
+pub fn config_base_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("LTC_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    dirs::config_dir()
+}
+
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|base| base.join(CONFIG_DIR).join(CONFIG_FILE))
+    config_base_dir().map(|base| base.join(CONFIG_DIR).join(CONFIG_FILE))
 }
 
 pub fn load() -> ConverterConfig {
@@ -75,6 +91,7 @@ pub fn seed_snapshot_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn save_and_load_offload_parent_roundtrip() {
@@ -155,5 +172,46 @@ mod tests {
             snapshot.converter.settings.output_folder.as_os_str().is_empty(),
             "output folder must not be seeded by config anymore; it defaults to source clip parent dir",
         );
+    }
+
+    // Env-var mutation is serialized: config_base_dir reads the process env,
+    // and sibling lib tests could otherwise race the override.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn config_base_dir_honors_ltc_config_home_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        // SAFETY: single-threaded w.r.t. env (ENV_LOCK held); restoring
+        // afterwards keeps sibling tests on the default resolution.
+        // (set_var/remove_var are not yet safe in std, so unwrap the Result
+        // is avoided on platforms where they are fns.)
+        std::env::set_var("LTC_CONFIG_HOME", dir.path());
+        let base = config_base_dir().expect("override must always resolve");
+        assert_eq!(base, dir.path());
+        // config_path() resolves through config_base_dir(), so with the
+        // override set the converter config round-trips inside the
+        // override dir and never touches the real user config.
+        let mut cfg = ConverterConfig::default();
+        cfg.last_input_folder = Some("/does/not/matter".into());
+        save(&cfg);
+        let expected = dir.path().join(CONFIG_DIR).join(CONFIG_FILE);
+        assert!(expected.exists(), "config must be written under the override dir");
+        assert_eq!(load().last_input_folder, cfg.last_input_folder);
+        std::env::remove_var("LTC_CONFIG_HOME");
+    }
+
+    #[test]
+    fn config_base_dir_falls_through_when_override_unset_or_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("LTC_CONFIG_HOME");
+        let plain = config_base_dir();
+        std::env::set_var("LTC_CONFIG_HOME", "");
+        let empty = config_base_dir();
+        // Empty override is treated as unset — both fall through to
+        // dirs::config_dir() (same Some/None shape, same value).
+        assert_eq!(plain.is_some(), empty.is_some());
+        assert_eq!(plain, empty);
+        std::env::remove_var("LTC_CONFIG_HOME");
     }
 }
