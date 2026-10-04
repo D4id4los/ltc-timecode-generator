@@ -23,6 +23,274 @@ use slint::Global;
 
 const POLL_INTERVAL_MS: u64 = 40;
 
+// ── Pure extractors ─────────────────────────────────────────────────────
+// Each moves a slice of the tick closure's logic out verbatim so it can be
+// unit-tested against hand-built snapshots (the crate has no UI harness).
+
+/// Map a routing selection to the settings combo index.
+fn channel_index(ch: ChannelSel) -> i32 {
+    match ch {
+        ChannelSel::Left => 0,
+        ChannelSel::Right => 1,
+        ChannelSel::Both => 2,
+    }
+}
+
+/// Advance the clapper pulse phase by one poll interval.
+fn advance_pulse(phase: f64) -> f64 {
+    let advanced = phase + 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
+    if advanced > PI * 100.0 { 0.0 } else { advanced }
+}
+
+/// Device list entry label, marking the system default device.
+fn device_display_name(name: &str, is_default: bool) -> String {
+    if is_default {
+        format!("{} (Default)", name)
+    } else {
+        name.to_string()
+    }
+}
+
+/// (status, result_text, error) triple for the LTC decode panel, derived
+/// from the engine snapshot's job states and decode snapshot.
+fn format_decode_status(s: &AppStateSnapshot) -> (String, String, String) {
+    if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_active() {
+        return ("detecting".to_string(), String::new(), String::new());
+    }
+    if let Some(ref err) = s.decode.error {
+        return ("error".to_string(), String::new(), err.clone());
+    }
+    if let Some(ref r) = s.decode.result {
+        let status_str = match &r.status {
+            gui_engine::LtcDecodeStatus::Success => "success",
+            gui_engine::LtcDecodeStatus::LowConfidence => "low_confidence",
+            gui_engine::LtcDecodeStatus::NoSyncWord => "no_sync",
+            gui_engine::LtcDecodeStatus::Error { .. } => "error",
+        };
+
+        let drop_flag = if r.drop_frame { " DF" } else { "" };
+        let fps_str = if r.detected_fps > 0.0 {
+            format!("{:.2} fps{}", r.detected_fps, drop_flag)
+        } else {
+            "—".to_string()
+        };
+        let first = r.timecodes.first().map(|t| t.timecode);
+        let last_tc = r.timecodes.last().map(|t| t.timecode);
+        let tc_range = match (first, last_tc) {
+            (Some(f), Some(l)) => {
+                let sep = if r.drop_frame { ";" } else { ":" };
+                format!(
+                    "{:02}{sep}{:02}{sep}{:02}{sep}{:02} → {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
+                    f.hours, f.minutes, f.seconds, f.frames,
+                    l.hours, l.minutes, l.seconds, l.frames,
+                )
+            }
+            _ => "—".to_string(),
+        };
+        let quality_str = r.quality.as_ref().map(|q| {
+            let issues = if q.edit_count > 0 {
+                format!("{} edit(s)", q.edit_count)
+            } else if q.glitch_count > 0 || q.gap_count > 0 {
+                format!("{}/{} gap/glitch", q.gap_count, q.glitch_count)
+            } else if q.missing_frames > 0 {
+                format!("{} missing", q.missing_frames)
+            } else {
+                "perfect".to_string()
+            };
+            format!(" | Quality: {:.0}% ({}) {:.1}% usable, {}",
+                q.score * 100.0, q.grade, q.usable_coverage * 100.0, issues)
+        }).unwrap_or_default();
+        let result_text = format!(
+            "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms{}",
+            fps_str,
+            r.avg_confidence * 100.0,
+            r.valid_frames,
+            r.total_possible_frames,
+            tc_range,
+            r.processing_time_ms,
+            quality_str,
+        );
+        return (status_str.to_string(), result_text, String::new());
+    }
+    (String::new(), String::new(), String::new())
+}
+
+/// Flat per-(stream, channel) labels for the decode channel list, plus the
+/// list row index of the currently selected stream/channel (-1 if none).
+fn build_channel_labels(
+    probe: &gui_engine::ffprobe::VideoAudioProbe,
+    selected_stream: usize,
+    selected_channel: usize,
+) -> (Vec<String>, i32) {
+    let mut channel_names_vec: Vec<String> = Vec::new();
+    let mut ltc_row_idx: i32 = -1;
+    for s_info in &probe.streams {
+        for ch in 0..s_info.channels {
+            let idx = channel_names_vec.len();
+            let label = if probe.streams.len() > 1 {
+                format!("S{} C{}", s_info.stream_index, ch + 1)
+            } else if s_info.channels == 2 {
+                format!("T1 {}", if ch == 0 { "L" } else { "R" })
+            } else {
+                format!("Ch {}", ch + 1)
+            };
+            channel_names_vec.push(label);
+            if s_info.stream_index == selected_stream && ch == selected_channel {
+                ltc_row_idx = idx as i32;
+            }
+        }
+    }
+    (channel_names_vec, ltc_row_idx)
+}
+
+/// Converter file-group list model from the snapshot.
+fn build_group_model(s: &AppStateSnapshot) -> Vec<FileGroupInfo> {
+    s.converter.groups.iter().map(|g| {
+        let durs: Vec<Option<f64>> = g.files.iter()
+            .map(|f| {
+                let full_path = s.converter.groups_folder.as_ref().map(|p| p.join(f));
+                full_path.and_then(|p| s.file_durations.get(&p).copied().flatten())
+            })
+            .collect();
+        let dur_text = group_duration_secs(
+            &g.recording_type, &durs,
+        ).map(format_duration_secs).unwrap_or_default();
+        FileGroupInfo {
+            prefix: SharedString::from(g.prefix.clone()),
+            files: ModelRc::new(VecModel::<SharedString>::from(
+                g.files.iter().map(|f| {
+                    SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+                }).collect::<Vec<_>>()
+            )),
+            channel_count: g.files.len() as i32,
+            is_audio_recording: matches!(g.recording_type, RecordingType::MultiTrackAudio),
+            duration_text: SharedString::from(dur_text),
+        }
+    }).collect()
+}
+
+/// Conversion status line for the converter panel ("idle", "running N%", …).
+fn conversion_status_text(jc: &gui_engine::JobStatus) -> String {
+    match jc.phase() {
+        JobPhase::Idle => "idle".to_string(),
+        JobPhase::Running | JobPhase::Indeterminate => {
+            format!("running {:.0}%", jc.fraction() * 100.0)
+        }
+        JobPhase::Succeeded => "completed".to_string(),
+        JobPhase::Cancelled => "cancelled".to_string(),
+        JobPhase::Failed => "failed".to_string(),
+    }
+}
+
+/// Per-file rows for one offload card.
+fn build_offload_file_infos(
+    card: &gui_engine::offload::SdCardInfo,
+    off: &gui_engine::offload::OffloadSnapshot,
+) -> Vec<crate::OffloadFileInfo> {
+    card.files.iter()
+        .zip(card.selected.iter())
+        .map(|(f, &sel)| {
+            let date_text = f.modified
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            let dur_text = off.file_durations.get(&f.path)
+                .and_then(|opt| *opt)
+                .map(format_duration_secs)
+                .unwrap_or_else(|| {
+                    if off.file_durations.contains_key(&f.path) {
+                        "—".to_string()
+                    } else {
+                        "…".to_string()
+                    }
+                });
+            crate::OffloadFileInfo {
+                name: SharedString::from(f.name.clone()),
+                date_text: SharedString::from(date_text),
+                duration_text: SharedString::from(dur_text),
+                size_text: SharedString::from(format_bytes(f.size_bytes)),
+                selected: sel,
+            }
+        }).collect()
+}
+
+/// Card list model for the offload panel.
+fn build_offload_card_infos(off: &gui_engine::offload::OffloadSnapshot) -> Vec<crate::OffloadCardInfo> {
+    off.cards.iter().map(|card| {
+        let files = build_offload_file_infos(card, off);
+        crate::OffloadCardInfo {
+            mount: SharedString::from(card.mount.to_string_lossy().as_ref()),
+            volume_label: SharedString::from(card.volume_label.clone()),
+            device_name: SharedString::from(card.device_name.clone()),
+            name_source: SharedString::from(format!("{:?}", card.name_source)),
+            media_file_count: card.media_file_count as i32,
+            total_bytes: SharedString::from(format_bytes(card.total_bytes)),
+            files: ModelRc::new(VecModel::<crate::OffloadFileInfo>::from(files)),
+            selected_count: card.selected_count as i32,
+            selected_bytes: SharedString::from(format_bytes(card.selected_bytes)),
+        }
+    }).collect()
+}
+
+/// Per-device copy-progress rows for the offload panel.
+fn build_offload_device_status(
+    off: &gui_engine::offload::OffloadSnapshot,
+    copy_job: &gui_engine::JobStatus,
+) -> Vec<crate::OffloadDeviceStatus> {
+    off.device_totals.iter().enumerate().map(|(i, dt)| {
+        let unit = copy_job.units().get(i);
+        let state_text = match unit.map(|u| u.state) {
+            Some(UnitState::Pending) => "Pending",
+            Some(UnitState::Running) => "Copying",
+            Some(UnitState::Done) => "Done",
+            Some(UnitState::Failed) => "Failed",
+            Some(UnitState::Skipped) => "Skipped",
+            None => "Pending",
+        };
+        let fraction = unit.map(|u| u.fraction).unwrap_or(0.0);
+        let bytes_done = (dt.bytes_total as f64 * fraction as f64) as u64;
+        let bytes_text = if dt.bytes_total > 0 {
+            format!("{} / {}", format_bytes(bytes_done), format_bytes(dt.bytes_total))
+        } else {
+            String::new()
+        };
+        let files_done = (dt.files_total as f32 * fraction) as i32;
+        let current_file = unit.map(|u| u.message.clone()).unwrap_or_default();
+        let error_str = match unit.map(|u| u.state) {
+            Some(UnitState::Failed) => current_file.clone(),
+            _ => String::new(),
+        };
+        crate::OffloadDeviceStatus {
+            device_name: SharedString::from(dt.name.clone()),
+            state_text: SharedString::from(state_text),
+            files_total: dt.files_total as i32,
+            files_done,
+            progress: fraction,
+            bytes_text: SharedString::from(bytes_text),
+            current_file: SharedString::from(current_file),
+            error: SharedString::from(error_str),
+        }
+    }).collect()
+}
+
+/// Map an audio event to its toast (message, severity) pair.
+fn audio_event_to_notification(event: &AudioEvent) -> (String, &'static str) {
+    match event {
+        AudioEvent::StreamError(m) => (m.clone(), "error"),
+        AudioEvent::StreamDied => ("Audio stream died".to_string(), "error"),
+        AudioEvent::StreamRecovering { attempt } => {
+            (format!("Stream recovering (attempt {})", attempt), "warning")
+        }
+        AudioEvent::StreamDead => ("Audio device unreachable".to_string(), "error"),
+        AudioEvent::RecoveryNeeded { reason } => {
+            (format!("Audio recovery needed: {}", reason), "warning")
+        }
+        AudioEvent::Underrun => ("Audio underrun".to_string(), "warning"),
+        AudioEvent::FramesDropped { total } => {
+            (format!("{} frames dropped", total), "warning")
+        }
+    }
+}
+
 pub fn setup_poll_timer(
     ui: &AppWindow,
     engine_state: Arc<ArcSwap<AppStateSnapshot>>,
@@ -82,71 +350,10 @@ pub fn setup_poll_timer(
 
             // 4. LTC decode state sync
             {
-if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_active() {
-                    ui.set_ltc_status(SharedString::from("detecting"));
-                    ui.set_ltc_result_text(SharedString::from(""));
-                    ui.set_ltc_error(SharedString::from(""));
-                } else if let Some(ref err) = s.decode.error {
-                    ui.set_ltc_status(SharedString::from("error"));
-                    ui.set_ltc_result_text(SharedString::from(""));
-                    ui.set_ltc_error(SharedString::from(err));
-                } else if let Some(ref r) = s.decode.result {
-                    let status_str = match &r.status {
-                        gui_engine::LtcDecodeStatus::Success => "success",
-                        gui_engine::LtcDecodeStatus::LowConfidence => "low_confidence",
-                        gui_engine::LtcDecodeStatus::NoSyncWord => "no_sync",
-                        gui_engine::LtcDecodeStatus::Error { .. } => "error",
-                    };
-
-                    let drop_flag = if r.drop_frame { " DF" } else { "" };
-                    let fps_str = if r.detected_fps > 0.0 {
-                        format!("{:.2} fps{}", r.detected_fps, drop_flag)
-                    } else {
-                        "—".to_string()
-                    };
-                    let first = r.timecodes.first().map(|t| t.timecode);
-                    let last_tc = r.timecodes.last().map(|t| t.timecode);
-                    let tc_range = match (first, last_tc) {
-                        (Some(f), Some(l)) => {
-                            let sep = if r.drop_frame { ";" } else { ":" };
-                            format!(
-                                "{:02}{sep}{:02}{sep}{:02}{sep}{:02} → {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
-                                f.hours, f.minutes, f.seconds, f.frames,
-                                l.hours, l.minutes, l.seconds, l.frames,
-                            )
-                        }
-                        _ => "—".to_string(),
-                    };
-                    ui.set_ltc_status(SharedString::from(status_str));
-                    let quality_str = r.quality.as_ref().map(|q| {
-                        let issues = if q.edit_count > 0 {
-                            format!("{} edit(s)", q.edit_count)
-                        } else if q.glitch_count > 0 || q.gap_count > 0 {
-                            format!("{}/{} gap/glitch", q.gap_count, q.glitch_count)
-                        } else if q.missing_frames > 0 {
-                            format!("{} missing", q.missing_frames)
-                        } else {
-                            "perfect".to_string()
-                        };
-                        format!(" | Quality: {:.0}% ({}) {:.1}% usable, {}",
-                            q.score * 100.0, q.grade, q.usable_coverage * 100.0, issues)
-                    }).unwrap_or_default();
-                    ui.set_ltc_result_text(SharedString::from(format!(
-                        "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms{}",
-                        fps_str,
-                        r.avg_confidence * 100.0,
-                        r.valid_frames,
-                        r.total_possible_frames,
-                        tc_range,
-                        r.processing_time_ms,
-                        quality_str,
-                    )));
-                    ui.set_ltc_error(SharedString::from(""));
-                } else {
-                    ui.set_ltc_status(SharedString::from(""));
-                    ui.set_ltc_result_text(SharedString::from(""));
-                    ui.set_ltc_error(SharedString::from(""));
-                }
+                let (status, result_text, error) = format_decode_status(&s);
+                ui.set_ltc_status(SharedString::from(status));
+                ui.set_ltc_result_text(SharedString::from(result_text));
+                ui.set_ltc_error(SharedString::from(error));
             }
 
             // 5. LTC decode FPS index sync (shadow-backed, gated on ack)
@@ -155,25 +362,12 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
 
             // 6. Video audio probe info
             if let Some(ref probe) = s.decode.probe {
-                let mut channel_names_vec: Vec<SharedString> = Vec::new();
-                let mut ltc_row_idx: i32 = -1;
-                for s_info in &probe.streams {
-                    for ch in 0..s_info.channels {
-                        let idx = channel_names_vec.len();
-                        let label = if probe.streams.len() > 1 {
-                            format!("S{} C{}", s_info.stream_index, ch + 1)
-                        } else if s_info.channels == 2 {
-                            format!("T1 {}", if ch == 0 { "L" } else { "R" })
-                        } else {
-                            format!("Ch {}", ch + 1)
-                        };
-                        channel_names_vec.push(SharedString::from(label));
-                        if s_info.stream_index == s.decode.selected_stream && ch == s.decode.selected_channel {
-                            ltc_row_idx = idx as i32;
-                        }
-                    }
-                }
-                ui.set_ltc_channel_names(ModelRc::new(VecModel::from(channel_names_vec)));
+                let (labels, ltc_row_idx) = build_channel_labels(
+                    probe, s.decode.selected_stream, s.decode.selected_channel,
+                );
+                ui.set_ltc_channel_names(ModelRc::new(VecModel::from(
+                    labels.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+                )));
                 ui.set_conv_ltc_row_index(ltc_row_idx);
             } else {
                 ui.set_ltc_channel_names(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
@@ -196,8 +390,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
 
             // 9. Pulse phase animation
             let mut pp = pulse_phase.lock().unwrap();
-            *pp += 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
-            if *pp > PI * 100.0 { *pp = 0.0; }
+            *pp = advance_pulse(*pp);
             ui.set_pulse_phase(*pp as f32);
 
             // 10. Timecode display
@@ -221,18 +414,8 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
 
             // 14. LTC/beep channel indices (fix one-way gaps)
             {
-                let ltc_idx = match s.ltc_channel {
-                    ChannelSel::Left => 0,
-                    ChannelSel::Right => 1,
-                    ChannelSel::Both => 2,
-                };
-                ui.set_ltc_channel_index(ltc_idx);
-                let beep_idx = match s.beep_channel {
-                    ChannelSel::Left => 0,
-                    ChannelSel::Right => 1,
-                    ChannelSel::Both => 2,
-                };
-                ui.set_beep_channel_index(beep_idx);
+                ui.set_ltc_channel_index(channel_index(s.ltc_channel));
+                ui.set_beep_channel_index(channel_index(s.beep_channel));
             }
 
             // 15. Sample rate metadata
@@ -369,28 +552,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 let selected_idx = s.converter.selected_group_idx;
                 ui.set_conv_selected_group_idx(selected_idx.map(|i| i as i32).unwrap_or(-1));
 
-                let group_model: Vec<FileGroupInfo> = groups.iter().map(|g| {
-                    let durs: Vec<Option<f64>> = g.files.iter()
-                        .map(|f| {
-                            let full_path = s.converter.groups_folder.as_ref().map(|p| p.join(f));
-                            full_path.and_then(|p| s.file_durations.get(&p).copied().flatten())
-                        })
-                        .collect();
-                    let dur_text = group_duration_secs(
-                        &g.recording_type, &durs,
-                    ).map(format_duration_secs).unwrap_or_default();
-                    FileGroupInfo {
-                        prefix: SharedString::from(g.prefix.clone()),
-                        files: ModelRc::new(VecModel::<SharedString>::from(
-                            g.files.iter().map(|f| {
-                                SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
-                            }).collect::<Vec<_>>()
-                        )),
-                        channel_count: g.files.len() as i32,
-                        is_audio_recording: matches!(g.recording_type, RecordingType::MultiTrackAudio),
-                        duration_text: SharedString::from(dur_text),
-                    }
-                }).collect();
+                let group_model: Vec<FileGroupInfo> = build_group_model(&s);
                 ui.set_conv_file_groups(ModelRc::new(VecModel::<FileGroupInfo>::from(group_model)));
 
                 if let Some(idx) = selected_idx {
@@ -416,16 +578,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             // 25. Conversion state sync (from engine-owned snapshot via JobStatus)
             {
                 let jc = s.job(JobKind::Conversion);
-                let status_str = match jc.phase() {
-                    JobPhase::Idle => "idle".to_string(),
-                    JobPhase::Running | JobPhase::Indeterminate => {
-                        format!("running {:.0}%", jc.fraction() * 100.0)
-                    }
-                    JobPhase::Succeeded => "completed".to_string(),
-                    JobPhase::Cancelled => "cancelled".to_string(),
-                    JobPhase::Failed => "failed".to_string(),
-                };
-                ui.set_conv_status(SharedString::from(status_str));
+                ui.set_conv_status(SharedString::from(conversion_status_text(jc)));
                 ui.set_conv_progress(jc.fraction());
                 ui.set_conv_log(SharedString::from(jc.log().to_string()));
             }
@@ -475,13 +628,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 if device_key != *last {
                     let device_names: Vec<SharedString> = s.devices
                         .iter()
-                        .map(|d| {
-                            if d.is_default {
-                                SharedString::from(format!("{} (Default)", d.name))
-                            } else {
-                                SharedString::from(d.name.clone())
-                            }
-                        })
+                        .map(|d| SharedString::from(device_display_name(&d.name, d.is_default)))
                         .collect();
                     ui.set_device_names(ModelRc::new(VecModel::<SharedString>::from(device_names)));
                     ui.set_device_count(s.devices.len() as i32);
@@ -492,23 +639,7 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
             // 29. Process events into toasts — drained from the
             // audio-event channel, not the snapshot (one-shot mailbox).
             while let Ok(event) = event_rx.try_recv() {
-                let (msg, typ) = match event {
-                    AudioEvent::StreamError(m) => (m.clone(), "error"),
-                    AudioEvent::StreamDied => ("Audio stream died".to_string(), "error"),
-                    AudioEvent::StreamRecovering { attempt } => {
-                        (format!("Stream recovering (attempt {})", attempt), "warning")
-                    }
-                    AudioEvent::StreamDead => {
-                        ("Audio device unreachable".to_string(), "error")
-                    }
-                    AudioEvent::RecoveryNeeded { reason } => {
-                        (format!("Audio recovery needed: {}", reason), "warning")
-                    }
-                    AudioEvent::Underrun => ("Audio underrun".to_string(), "warning"),
-                    AudioEvent::FramesDropped { total } => {
-                        (format!("{} frames dropped", total), "warning")
-                    }
-                };
+                let (msg, typ) = audio_event_to_notification(&event);
                 push_toast(&toasts, &next_toast_id, &ui, &msg, typ);
             }
 
@@ -552,79 +683,11 @@ if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_ac
                 ));
                 ui.set_off_error(SharedString::from(off.error.clone().unwrap_or_default()));
 
-                let card_infos: Vec<crate::OffloadCardInfo> = off.cards.iter().map(|card| {
-                    let files: Vec<crate::OffloadFileInfo> = card.files.iter()
-                        .zip(card.selected.iter())
-                        .map(|(f, &sel)| {
-                            let date_text = f.modified
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                                .unwrap_or_default();
-                            let dur_text = off.file_durations.get(&f.path)
-                                .and_then(|opt| *opt)
-                                .map(format_duration_secs)
-                                .unwrap_or_else(|| {
-                                    if off.file_durations.contains_key(&f.path) {
-                                        "—".to_string()
-                                    } else {
-                                        "…".to_string()
-                                    }
-                                });
-                            crate::OffloadFileInfo {
-                                name: SharedString::from(f.name.clone()),
-                                date_text: SharedString::from(date_text),
-                                duration_text: SharedString::from(dur_text),
-                                size_text: SharedString::from(format_bytes(f.size_bytes)),
-                                selected: sel,
-                            }
-                        }).collect();
-                    crate::OffloadCardInfo {
-                        mount: SharedString::from(card.mount.to_string_lossy().as_ref()),
-                        volume_label: SharedString::from(card.volume_label.clone()),
-                        device_name: SharedString::from(card.device_name.clone()),
-                        name_source: SharedString::from(format!("{:?}", card.name_source)),
-                        media_file_count: card.media_file_count as i32,
-                        total_bytes: SharedString::from(format_bytes(card.total_bytes)),
-                        files: ModelRc::new(VecModel::<crate::OffloadFileInfo>::from(files)),
-                        selected_count: card.selected_count as i32,
-                        selected_bytes: SharedString::from(format_bytes(card.selected_bytes)),
-                    }
-                }).collect();
+                let card_infos: Vec<crate::OffloadCardInfo> = build_offload_card_infos(off);
                 ui.set_off_cards(ModelRc::new(VecModel::<crate::OffloadCardInfo>::from(card_infos)));
 
-                let device_status: Vec<crate::OffloadDeviceStatus> = off.device_totals.iter().enumerate().map(|(i, dt)| {
-                    let unit = copy_job.units().get(i);
-                    let state_text = match unit.map(|u| u.state) {
-                        Some(UnitState::Pending) => "Pending",
-                        Some(UnitState::Running) => "Copying",
-                        Some(UnitState::Done) => "Done",
-                        Some(UnitState::Failed) => "Failed",
-                        Some(UnitState::Skipped) => "Skipped",
-                        None => "Pending",
-                    };
-                    let fraction = unit.map(|u| u.fraction).unwrap_or(0.0);
-                    let bytes_done = (dt.bytes_total as f64 * fraction as f64) as u64;
-                    let bytes_text = if dt.bytes_total > 0 {
-                        format!("{} / {}", format_bytes(bytes_done), format_bytes(dt.bytes_total))
-                    } else {
-                        String::new()
-                    };
-                    let files_done = (dt.files_total as f32 * fraction) as i32;
-                    let current_file = unit.map(|u| u.message.clone()).unwrap_or_default();
-                    let error_str = match unit.map(|u| u.state) {
-                        Some(UnitState::Failed) => current_file.clone(),
-                        _ => String::new(),
-                    };
-                    crate::OffloadDeviceStatus {
-                        device_name: SharedString::from(dt.name.clone()),
-                        state_text: SharedString::from(state_text),
-                        files_total: dt.files_total as i32,
-                        files_done,
-                        progress: fraction,
-                        bytes_text: SharedString::from(bytes_text),
-                        current_file: SharedString::from(current_file),
-                        error: SharedString::from(error_str),
-                    }
-                }).collect();
+                let device_status: Vec<crate::OffloadDeviceStatus> =
+                    build_offload_device_status(off, copy_job);
                 ui.set_off_device_progress(ModelRc::new(VecModel::<crate::OffloadDeviceStatus>::from(device_status)));
 
                 let completed: Vec<SharedString> = off.completed_devices.iter()
@@ -670,5 +733,323 @@ fn format_bytes(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[unit_idx])
     } else {
         format!("{:.1} {}", size, UNITS[unit_idx])
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slint::Model;
+    use gui_engine::ffprobe::{AudioStreamInfo, VideoAudioProbe};
+    use gui_engine::job::{JobStatus, ProgressSnapshot, UnitSnapshot};
+    use gui_engine::{
+        DeviceNameSource, FrameTimecode, LtcDecodeStatus, LtcDetectionResult, OffloadDeviceTotals,
+        OffloadFileInfo, SdCardInfo, Timecode,
+    };
+
+    fn result_with(status: LtcDecodeStatus) -> LtcDetectionResult {
+        let mut r = LtcDetectionResult::error("unused");
+        r.status = status;
+        r.detected_fps = 25.0;
+        r.drop_frame = false;
+        r.total_possible_frames = 100;
+        r.valid_frames = 90;
+        r.avg_confidence = 0.9;
+        r.processing_time_ms = 12.0;
+        r.timecodes.push(FrameTimecode {
+            frame_index: 0,
+            timecode: Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 },
+            timecode_secs: 0.0,
+        });
+        r.timecodes.push(FrameTimecode {
+            frame_index: 89,
+            timecode: Timecode { hours: 1, minutes: 2, seconds: 6, frames: 19 },
+            timecode_secs: 3.5,
+        });
+        r
+    }
+
+    #[test]
+    fn channel_index_maps_all_routes() {
+        assert_eq!(channel_index(ChannelSel::Left), 0);
+        assert_eq!(channel_index(ChannelSel::Right), 1);
+        assert_eq!(channel_index(ChannelSel::Both), 2);
+    }
+
+    #[test]
+    fn advance_pulse_increments_and_wraps() {
+        let step = 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
+        assert!((advance_pulse(0.0) - step).abs() < 1e-9);
+        assert_eq!(advance_pulse(PI * 100.0 + 1.0), 0.0);
+    }
+
+    #[test]
+    fn device_display_name_marks_default() {
+        assert_eq!(device_display_name("sink", false), "sink");
+        assert_eq!(device_display_name("sink", true), "sink (Default)");
+    }
+
+    #[test]
+    fn format_bytes_uses_binary_units() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KiB");
+    }
+
+    #[test]
+    fn decode_status_detecting_wins_while_jobs_run() {
+        let mut s = AppStateSnapshot::initial();
+        s.jobs.insert(
+            JobKind::LtcDecode,
+            JobStatus::running("decoding"),
+        );
+        s.decode.error = Some("stale".to_string());
+        let (status, result_text, error) = format_decode_status(&s);
+        assert_eq!(status, "detecting");
+        assert!(result_text.is_empty());
+        assert!(error.is_empty());
+    }
+
+    #[test]
+    fn decode_status_reports_error_over_result() {
+        let mut s = AppStateSnapshot::initial();
+        s.decode.result = Some(result_with(LtcDecodeStatus::Success));
+        s.decode.error = Some("boom".to_string());
+        let (status, result_text, error) = format_decode_status(&s);
+        assert_eq!(status, "error");
+        assert!(result_text.is_empty());
+        assert_eq!(error, "boom");
+    }
+
+    #[test]
+    fn decode_status_success_summarises_fps_range_and_frames() {
+        let mut s = AppStateSnapshot::initial();
+        s.decode.result = Some(result_with(LtcDecodeStatus::Success));
+        let (status, result_text, error) = format_decode_status(&s);
+        assert_eq!(status, "success");
+        assert!(error.is_empty());
+        // structural facts: fps, frame count, and the HH:MM:SS:FF range
+        assert!(result_text.contains("25.00 fps"));
+        assert!(result_text.contains("Frames: 90/100"));
+        assert!(result_text.contains("01:02:03:04 → 01:02:06:19"));
+    }
+
+    #[test]
+    fn decode_status_drop_frame_range_uses_semicolons() {
+        let mut s = AppStateSnapshot::initial();
+        let mut r = result_with(LtcDecodeStatus::Success);
+        r.drop_frame = true;
+        s.decode.result = Some(r);
+        let (_, result_text, _) = format_decode_status(&s);
+        assert!(result_text.contains("01;02;03;04 → 01;02;06;19"));
+    }
+
+    #[test]
+    fn decode_status_idle_is_all_empty() {
+        let s = AppStateSnapshot::initial();
+        let (status, result_text, error) = format_decode_status(&s);
+        assert!(status.is_empty() && result_text.is_empty() && error.is_empty());
+    }
+
+    fn probe(streams: &[(usize, usize)]) -> VideoAudioProbe {
+        VideoAudioProbe {
+            streams: streams.iter().map(|&(i, ch)| AudioStreamInfo {
+                stream_index: i,
+                channels: ch,
+                codec_name: "pcm".into(),
+                sample_rate: 48_000,
+            }).collect(),
+            total_audio_channels: streams.iter().map(|&(_, c)| c).sum(),
+            is_video_file: true,
+        }
+    }
+
+    #[test]
+    fn channel_labels_multistream_numbering_and_selection_row() {
+        let p = probe(&[(0, 2), (1, 2)]);
+        let (labels, row) = build_channel_labels(&p, 1, 1);
+        assert_eq!(labels, vec!["S0 C1", "S0 C2", "S1 C1", "S1 C2"]);
+        assert_eq!(row, 3);
+    }
+
+    #[test]
+    fn channel_labels_stereo_single_stream_uses_lr() {
+        let p = probe(&[(0, 2)]);
+        let (labels, row) = build_channel_labels(&p, 0, 1);
+        assert_eq!(labels, vec!["T1 L", "T1 R"]);
+        assert_eq!(row, 1);
+    }
+
+    #[test]
+    fn channel_labels_unselected_is_minus_one() {
+        let p = probe(&[(0, 2)]);
+        let (_, row) = build_channel_labels(&p, 5, 5);
+        assert_eq!(row, -1);
+    }
+
+    #[test]
+    fn conversion_status_text_covers_all_phases() {
+        let mut js = JobStatus::idle();
+        assert_eq!(conversion_status_text(&js), "idle");
+        js.progress = ProgressSnapshot {
+            phase: JobPhase::Running,
+            fraction: 0.25,
+            message: String::new(),
+            speed: None,
+            units: Vec::new(),
+            log: String::new(),
+        };
+        assert_eq!(conversion_status_text(&js), "running 25%");
+        js.progress.phase = JobPhase::Succeeded;
+        assert_eq!(conversion_status_text(&js), "completed");
+        js.progress.phase = JobPhase::Cancelled;
+        assert_eq!(conversion_status_text(&js), "cancelled");
+        js.progress.phase = JobPhase::Failed;
+        assert_eq!(conversion_status_text(&js), "failed");
+    }
+
+    #[test]
+    fn group_model_lists_files_and_marks_audio_recordings() {
+        let mut s = AppStateSnapshot::initial();
+        s.converter.groups.push(gui_engine::file_pattern::MatchedGroup {
+            prefix: "take1".into(),
+            rel_dir: String::new(),
+            files: vec![std::path::PathBuf::from("take1S1.wav")],
+            recording_type: RecordingType::MultiTrackAudio,
+        });
+        s.converter.groups.push(gui_engine::file_pattern::MatchedGroup {
+            prefix: "MVI_0001".into(),
+            rel_dir: String::new(),
+            files: vec![std::path::PathBuf::from("MVI_0001.MP4")],
+            recording_type: RecordingType::VideoClipSequence,
+        });
+        let model = build_group_model(&s);
+        assert_eq!(model.len(), 2);
+        assert!(model[0].is_audio_recording);
+        assert_eq!(model[0].channel_count, 1);
+        assert_eq!(model[0].prefix.as_str(), "take1");
+        assert!(!model[1].is_audio_recording);
+    }
+
+    fn card() -> SdCardInfo {
+        SdCardInfo {
+            mount: std::path::PathBuf::from("/media/card"),
+            volume_label: "EOS".into(),
+            device_name: "cam-a".into(),
+            name_source: DeviceNameSource::VolumeLabel,
+            media_file_count: 1,
+            total_bytes: 2048,
+            files: vec![OffloadFileInfo {
+                path: std::path::PathBuf::from("/media/card/a.wav"),
+                name: "a.wav".into(),
+                size_bytes: 2048,
+                modified: None,
+            }],
+            selected: vec![true],
+            selected_count: 1,
+            selected_bytes: 2048,
+        }
+    }
+
+    #[test]
+    fn offload_card_infos_carry_selection_and_sizes() {
+        let mut off = gui_engine::offload::OffloadSnapshot::initial();
+        off.cards.push(card());
+        let infos = build_offload_card_infos(&off);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].selected_count, 1);
+        assert_eq!(infos[0].total_bytes.as_str(), "2.0 KiB");
+        assert_eq!(infos[0].files.row_count(), 1);
+        assert!(infos[0].files.row_data(0).unwrap().selected);
+    }
+
+    #[test]
+    fn offload_file_duration_text_distinguishes_pending_from_failed() {
+        let mut off = gui_engine::offload::OffloadSnapshot::initial();
+        let c = card();
+        off.cards.push(c.clone());
+        off.file_durations.insert(c.files[0].path.clone(), None); // probed, failed
+        let infos = build_offload_card_infos(&off);
+        // failed probe renders the em dash; unprobed (absent key) renders ellipsis
+        assert_eq!(infos[0].files.row_data(0).unwrap().duration_text.as_str(), "—");
+        let mut off2 = gui_engine::offload::OffloadSnapshot::initial();
+        off2.cards.push(card());
+        let infos2 = build_offload_card_infos(&off2);
+        assert_eq!(infos2[0].files.row_data(0).unwrap().duration_text.as_str(), "…");
+    }
+
+    #[test]
+    fn offload_device_status_blends_totals_with_units() {
+        let mut off = gui_engine::offload::OffloadSnapshot::initial();
+        off.device_totals.push(OffloadDeviceTotals {
+            name: "cam-a".into(),
+            files_total: 10,
+            bytes_total: 1000,
+        });
+        let mut js = JobStatus::idle();
+        let (name, state, bytes, progress) = {
+            let rows = build_offload_device_status(&off, &js);
+            let r = &rows[0];
+            (r.device_name.clone(), r.state_text.clone(), r.bytes_text.clone(), r.progress)
+        };
+        assert_eq!(name.as_str(), "cam-a");
+        assert_eq!(state, "Pending");
+        assert_eq!(bytes.as_str(), "0 B / 1000 B");
+        assert_eq!(progress, 0.0);
+
+        js.progress = ProgressSnapshot {
+            phase: JobPhase::Running,
+            fraction: 0.5,
+            message: String::new(),
+            speed: None,
+            units: vec![UnitSnapshot {
+                label: "cam-a".into(),
+                message: "f3".into(),
+                fraction: 0.5,
+                state: UnitState::Running,
+            }],
+            log: String::new(),
+        };
+        let rows = build_offload_device_status(&off, &js);
+        assert_eq!(rows[0].state_text, "Copying");
+        assert_eq!(rows[0].files_done, 5);
+        assert_eq!(rows[0].bytes_text.as_str(), "500 B / 1000 B");
+    }
+
+    #[test]
+    fn offload_device_status_failed_unit_surfaces_error() {
+        let mut off = gui_engine::offload::OffloadSnapshot::initial();
+        off.device_totals.push(OffloadDeviceTotals {
+            name: "cam-b".into(),
+            files_total: 1,
+            bytes_total: 0,
+        });
+        let js = JobStatus {
+            progress: ProgressSnapshot {
+                phase: JobPhase::Failed,
+                fraction: 0.0,
+                message: String::new(),
+                speed: None,
+                units: vec![UnitSnapshot {
+                    label: "cam-b".into(),
+                    message: "disk full".into(),
+                    fraction: 0.0,
+                    state: UnitState::Failed,
+                }],
+                log: String::new(),
+            },
+            error: None,
+        };
+        let rows = build_offload_device_status(&off, &js);
+        assert_eq!(rows[0].state_text, "Failed");
+        assert_eq!(rows[0].error.as_str(), "disk full");
+    }
+
+    #[test]
+    fn audio_event_notifications_map_severity() {
+        let (msg, sev) = audio_event_to_notification(&AudioEvent::Underrun);
+        assert_eq!(sev, "warning");
+        assert!(!msg.is_empty());
+        let (msg, sev) = audio_event_to_notification(&AudioEvent::StreamError("x".into()));
+        assert_eq!(sev, "error");
+        assert_eq!(msg, "x");
     }
 }

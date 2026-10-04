@@ -31,6 +31,118 @@ mod toast;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// ── Pure helpers ─────────────────────────────────────────────────────────
+// Extracted verbatim from the callbacks below so they can be unit-tested
+// without a running Slint runtime.
+
+/// fps×100 value sent by settings.slint → FPS_OPTIONS index.
+fn fps_index_for(fps_x100: f64) -> Option<usize> {
+    FPS_OPTIONS.iter().position(|o| (o.fps - fps_x100).abs() < 0.01)
+}
+
+/// Sample-rate option label ("48000 Hz") → (rate, option index).
+fn sample_rate_index_for(val: &str) -> Option<(u32, usize)> {
+    let rate_str = val.split_whitespace().next()?;
+    let rate = rate_str.parse::<u32>().ok()?;
+    let idx = SAMPLE_RATE_OPTIONS.iter().position(|&r| r == rate).unwrap_or(0);
+    Some((rate, idx))
+}
+
+/// Flat channel-list index → (stream_index, channel_index); `None` when
+/// there is no probe or the index is out of range.
+fn resolve_flat_channel(
+    probe: Option<&gui_engine::ffprobe::VideoAudioProbe>,
+    flat_idx: usize,
+) -> Option<(usize, usize)> {
+    let probe = probe?;
+    let mut flat = 0usize;
+    for st in &probe.streams {
+        for ch in 0..st.channels {
+            if flat == flat_idx {
+                return Some((st.stream_index, ch));
+            }
+            flat += 1;
+        }
+    }
+    None
+}
+
+/// Clipboard report text for an LTC decode result (the slint-side report
+/// builder; the CLI has its own).
+fn build_ltc_report(result: &gui_engine::LtcDetectionResult) -> String {
+    let drop_flag = if result.drop_frame { " DF" } else { "" };
+    let fps_str = if result.detected_fps > 0.0 {
+        format!("{:.2}{}", result.detected_fps, drop_flag)
+    } else {
+        "—".to_string()
+    };
+    let first = result.timecodes.first();
+    let last = result.timecodes.last();
+    let tc_range = match (first, last) {
+        (Some(f), Some(l)) => {
+            format!(
+                "{} → {}",
+                timecode::timecode_to_string(f.timecode, result.drop_frame),
+                timecode::timecode_to_string(l.timecode, result.drop_frame),
+            )
+        }
+        _ => "—".to_string(),
+    };
+
+    let mut report = String::new();
+    report.push_str("LTC Decode Report\n");
+    report.push_str("=================\n");
+    report.push_str(&format!("Status:          {:?}\n", result.status));
+    report.push_str(&format!("FPS:             {}\n", fps_str));
+    report.push_str(&format!(
+        "Valid frames:   {} / {} ({:.1}%)\n",
+        result.valid_frames,
+        result.total_possible_frames,
+        result.avg_confidence * 100.0
+    ));
+    report.push_str(&format!("Timecode range:  {}\n", tc_range));
+    report.push_str(&format!("Sample rate:     {} Hz\n", result.sample_rate));
+    report.push_str(&format!("Audio duration:  {:.2}s\n", result.total_audio_duration_secs));
+    report.push_str(&format!("Processing time: {:.1}ms\n", result.processing_time_ms));
+
+    if let Some(ref q) = result.quality {
+        report.push_str(&format!(
+            "\nQuality Score:  {:.2} / 1.00 ({})\n",
+            q.score, q.grade
+        ));
+        report.push_str(&format!(
+            "  Usable:        {:.1}% ({} block(s), {} backward jump(s))\n",
+            q.usable_coverage * 100.0, q.block_count, q.backward_jump_count
+        ));
+        report.push_str(&format!(
+            "  Missing:       {} frames, {} gap(s), {} glitch(es), {} edit point(s)\n",
+            q.missing_frames, q.gap_count, q.glitch_count, q.edit_count
+        ));
+        if q.max_drift_secs > 0.01 {
+            report.push_str(&format!(
+                "  Max drift:    {:.3}s ({:.2} frames)\n",
+                q.max_drift_secs, q.worst_block_drift_frames
+            ));
+        }
+    }
+
+    if !result.timecodes.is_empty() {
+        report.push_str(&format!(
+            "\nTimecodes ({} total):\n",
+            result.timecodes.len()
+        ));
+        for ft in &result.timecodes {
+            let tc = timecode::timecode_to_string(ft.timecode, result.drop_frame);
+            report.push_str(&format!(
+                "  [{:4}] {}  ({:.3}s)\n",
+                ft.frame_index, tc, ft.timecode_secs
+            ));
+        }
+    }
+
+    report
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = gui_engine::cli::parse_args();
 
@@ -406,7 +518,7 @@ fn _run_gui(
         let ui_weak = ui.as_weak();
         ui.on_fps_selected(move |fps_x100| {
             let fps_val = fps_x100 as f64 / 100.0;
-            let Some(idx) = FPS_OPTIONS.iter().position(|o| (o.fps - fps_val).abs() < 0.01) else {
+            let Some(idx) = fps_index_for(fps_val) else {
                 return;
             };
             let seq = sink.send(GuiCommand::SetFpsIndex(idx));
@@ -424,15 +536,12 @@ fn _run_gui(
         let shadows = shadows.clone();
         let ui_weak = ui.as_weak();
         ui.on_sample_rate_tapped(move |_val| {
-            if let Some(rate_str) = _val.split_whitespace().next() {
-                if let Ok(rate) = rate_str.parse::<u32>() {
-                    let idx = SAMPLE_RATE_OPTIONS.iter().position(|&r| r == rate).unwrap_or(0);
-                    let seq = sink.send(GuiCommand::SetSampleRate(rate));
-                    let mut sh = shadows.lock().unwrap();
-                    sh.sample_rate.send_and_mark(idx, seq, Instant::now());
-                    if let Some(u) = ui_weak.upgrade() {
-                        u.set_sample_rate_index(idx as i32);
-                    }
+            if let Some((rate, idx)) = sample_rate_index_for(_val.as_str()) {
+                let seq = sink.send(GuiCommand::SetSampleRate(rate));
+                let mut sh = shadows.lock().unwrap();
+                sh.sample_rate.send_and_mark(idx, seq, Instant::now());
+                if let Some(u) = ui_weak.upgrade() {
+                    u.set_sample_rate_index(idx as i32);
                 }
             }
         });
@@ -870,18 +979,8 @@ fn _run_gui(
                 let flat_idx = ui_weak.upgrade()
                     .map(|u| u.get_ltc_selected_channel() as usize)
                     .unwrap_or(0);
-                let (stream_idx, channel_idx) = s.decode.probe.as_ref().map_or((0, 0), |probe| {
-                    let mut flat = 0usize;
-                    for st in &probe.streams {
-                        for ch in 0..st.channels {
-                            if flat == flat_idx {
-                                return (st.stream_index, ch);
-                            }
-                            flat += 1;
-                        }
-                    }
-                    (0, 0)
-                });
+                let (stream_idx, channel_idx) = resolve_flat_channel(s.decode.probe.as_ref(), flat_idx)
+                    .unwrap_or((0, 0));
                 let paths: Vec<String> = files.iter()
                     .map(|filename| std::path::PathBuf::from(&folder_str).join(filename).to_string_lossy().to_string())
                     .collect();
@@ -904,18 +1003,11 @@ fn _run_gui(
         let chan_engine_state = engine_state.clone();
         ui.on_channel_selected(move |flat_idx| {
             let s = chan_engine_state.load();
-            if let Some(ref probe) = s.decode.probe {
-                let mut flat = 0usize;
-                for st in &probe.streams {
-                    for ch in 0..st.channels {
-                        if flat == flat_idx as usize {
-                            let _ = cmd.send(GuiCommand::SetLtcDecodeStream(st.stream_index));
-                            let _ = cmd.send(GuiCommand::SetLtcDecodeChannel(ch));
-                            return;
-                        }
-                        flat += 1;
-                    }
-                }
+            if let Some((stream_idx, channel_idx)) =
+                resolve_flat_channel(s.decode.probe.as_ref(), flat_idx as usize)
+            {
+                let _ = cmd.send(GuiCommand::SetLtcDecodeStream(stream_idx));
+                let _ = cmd.send(GuiCommand::SetLtcDecodeChannel(channel_idx));
             }
         });
     }
@@ -950,76 +1042,7 @@ fn _run_gui(
         ui.on_conv_copy_ltc_report(move || {
             let s = state.load();
             if let Some(ref result) = s.decode.result {
-                let drop_flag = if result.drop_frame { " DF" } else { "" };
-                let fps_str = if result.detected_fps > 0.0 {
-                    format!("{:.2}{}", result.detected_fps, drop_flag)
-                } else {
-                    "—".to_string()
-                };
-                let first = result.timecodes.first();
-                let last = result.timecodes.last();
-                let tc_range = match (first, last) {
-                    (Some(f), Some(l)) => {
-                        format!(
-                            "{} → {}",
-                            timecode::timecode_to_string(f.timecode, result.drop_frame),
-                            timecode::timecode_to_string(l.timecode, result.drop_frame),
-                        )
-                    }
-                    _ => "—".to_string(),
-                };
-
-                let mut report = String::new();
-                report.push_str("LTC Decode Report\n");
-                report.push_str("=================\n");
-                report.push_str(&format!("Status:          {:?}\n", result.status));
-                report.push_str(&format!("FPS:             {}\n", fps_str));
-                report.push_str(&format!(
-                    "Valid frames:   {} / {} ({:.1}%)\n",
-                    result.valid_frames,
-                    result.total_possible_frames,
-                    result.avg_confidence * 100.0
-                ));
-                report.push_str(&format!("Timecode range:  {}\n", tc_range));
-                report.push_str(&format!("Sample rate:     {} Hz\n", result.sample_rate));
-                report.push_str(&format!("Audio duration:  {:.2}s\n", result.total_audio_duration_secs));
-                report.push_str(&format!("Processing time: {:.1}ms\n", result.processing_time_ms));
-
-                if let Some(ref q) = result.quality {
-                    report.push_str(&format!(
-                        "\nQuality Score:  {:.2} / 1.00 ({})\n",
-                        q.score, q.grade
-                    ));
-                    report.push_str(&format!(
-                        "  Usable:        {:.1}% ({} block(s), {} backward jump(s))\n",
-                        q.usable_coverage * 100.0, q.block_count, q.backward_jump_count
-                    ));
-                    report.push_str(&format!(
-                        "  Missing:       {} frames, {} gap(s), {} glitch(es), {} edit point(s)\n",
-                        q.missing_frames, q.gap_count, q.glitch_count, q.edit_count
-                    ));
-                    if q.max_drift_secs > 0.01 {
-                        report.push_str(&format!(
-                            "  Max drift:    {:.3}s ({:.2} frames)\n",
-                            q.max_drift_secs, q.worst_block_drift_frames
-                        ));
-                    }
-                }
-
-                if !result.timecodes.is_empty() {
-                    report.push_str(&format!(
-                        "\nTimecodes ({} total):\n",
-                        result.timecodes.len()
-                    ));
-                    for ft in &result.timecodes {
-                        let tc = timecode::timecode_to_string(ft.timecode, result.drop_frame);
-                        report.push_str(&format!(
-                            "  [{:4}] {}  ({:.3}s)\n",
-                            ft.frame_index, tc, ft.timecode_secs
-                        ));
-                    }
-                }
-
+                let report = build_ltc_report(result);
                 if let Ok(mut ctx) = arboard::Clipboard::new() {
                     let _ = ctx.set_text(report);
                 }
@@ -1139,4 +1162,108 @@ fn _run_gui(
 
     info!("LTC Slint GUI shutting down");
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fps_index_matches_exact_and_rejects_unknown() {
+        assert_eq!(fps_index_for(24.0), Some(0));
+        assert_eq!(fps_index_for(25.0), Some(1));
+        assert_eq!(fps_index_for(29.97), Some(2));
+        assert_eq!(fps_index_for(30.0), Some(4));
+        assert_eq!(fps_index_for(23.976), None);
+    }
+
+    #[test]
+    fn sample_rate_index_parses_label_and_defaults_known_rates() {
+        assert_eq!(sample_rate_index_for("44100 Hz"), Some((44100, 0)));
+        assert_eq!(sample_rate_index_for("48000 Hz"), Some((48000, 1)));
+        // rates not in the option list resolve to index 0 (existing behavior)
+        assert_eq!(sample_rate_index_for("96000 Hz"), Some((96000, 0)));
+        assert_eq!(sample_rate_index_for("garbage"), None);
+        assert_eq!(sample_rate_index_for(""), None);
+    }
+
+    fn stream(i: usize, channels: usize) -> gui_engine::ffprobe::AudioStreamInfo {
+        gui_engine::ffprobe::AudioStreamInfo {
+            stream_index: i,
+            channels,
+            codec_name: "pcm".into(),
+            sample_rate: 48_000,
+        }
+    }
+
+    #[test]
+    fn resolve_flat_channel_walks_streams_then_channels() {
+        let probe = gui_engine::ffprobe::VideoAudioProbe {
+            streams: vec![stream(0, 2), stream(1, 2)],
+            total_audio_channels: 4,
+            is_video_file: true,
+        };
+        assert_eq!(resolve_flat_channel(Some(&probe), 0), Some((0, 0)));
+        assert_eq!(resolve_flat_channel(Some(&probe), 1), Some((0, 1)));
+        assert_eq!(resolve_flat_channel(Some(&probe), 2), Some((1, 0)));
+        assert_eq!(resolve_flat_channel(Some(&probe), 3), Some((1, 1)));
+    }
+
+    #[test]
+    fn resolve_flat_channel_none_cases() {
+        let probe = gui_engine::ffprobe::VideoAudioProbe {
+            streams: vec![stream(0, 2)],
+            total_audio_channels: 2,
+            is_video_file: true,
+        };
+        assert_eq!(resolve_flat_channel(None, 0), None);
+        assert_eq!(resolve_flat_channel(Some(&probe), 2), None);
+    }
+
+    fn decode_result() -> gui_engine::LtcDetectionResult {
+        let mut r = gui_engine::LtcDetectionResult::error("unused");
+        r.status = gui_engine::LtcDecodeStatus::Success;
+        r.detected_fps = 25.0;
+        r.total_possible_frames = 100;
+        r.valid_frames = 90;
+        r.avg_confidence = 0.9;
+        r.sample_rate = 48_000;
+        r.total_audio_duration_secs = 4.0;
+        r.processing_time_ms = 10.0;
+        r.timecodes.push(gui_engine::FrameTimecode {
+            frame_index: 0,
+            timecode: gui_engine::Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            timecode_secs: 0.0,
+        });
+        r
+    }
+
+    // The report body is formatter output — the text is the contract
+    // (clipboard payload pasted into editor notes), so the assertions here
+    // pin the exact lines deliberately. test-lint: allow(text-pin): formatter
+    // output is the contract for a clipboard report builder.
+
+    #[test]
+    fn ltc_report_has_header_and_summary_lines() {
+        let report = build_ltc_report(&decode_result());
+        assert!(report.starts_with("LTC Decode Report\n=================\n"));
+        assert!(report.contains("Status:          Success\n"));
+        assert!(report.contains("FPS:             25.00\n"));
+        assert!(report.contains("Valid frames:   90 / 100 (90.0%)\n"));
+        assert!(report.contains("Sample rate:     48000 Hz\n"));
+    }
+
+    #[test]
+    fn ltc_report_lists_timecodes_and_range() {
+        let report = build_ltc_report(&decode_result());
+        assert!(report.contains("Timecode range:  01:00:00:00 → 01:00:00:00\n"));
+        assert!(report.contains("Timecodes (1 total):\n"));
+        assert!(report.contains("  [   0] 01:00:00:00  (0.000s)\n"));
+    }
+
+    #[test]
+    fn ltc_report_empty_result_has_no_timecode_block() {
+        let report = build_ltc_report(&gui_engine::LtcDetectionResult::error("x"));
+        assert!(!report.contains("Timecodes ("));
+        assert!(report.contains("Timecode range:  —\n"));
+    }
 }
