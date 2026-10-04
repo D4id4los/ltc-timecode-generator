@@ -5,9 +5,10 @@
 
 Main feature is a tag-driven release pipeline: pushing a strict
 vX.Y.Z tag now builds the official ship matrix in CI and publishes a
-GitHub Release with the matching =VERSION_LOG.org= entry as the release
+GitHub Release with the matching VERSION_LOG.org entry as the release
 body, replacing the manual build-and-copy ritual for public
-distribution.
+distribution. The pipeline was rehearsed end to end with the
+workflow's dry-run mode before this release.
 
 List of Changes:
 - Release pipeline: a new GitHub Actions workflow (release.yml) runs on
@@ -33,6 +34,14 @@ List of Changes:
   remains a manual docker speciality (the builder image was fixed to
   carry a pinned static libltc again, so it compiles after the
   libltc-rs migration).
+- CI fixes surfaced by the rehearsal: the windows-tests job now runs
+  nextest against the shipped x86_64-pc-windows-gnu target (previously
+  it silently targeted the host msvc toolchain, where the mingw libltc
+  setup never applied, and had never passed); bindgen in the release
+  jobs gets its libclang and include paths pinned explicitly
+  (zigbuild and backslash-mangling issues); and two latent Windows
+  test bugs were fixed (a /tmp output folder and an SVT-AV1 fixture
+  encoder that the CI ffmpeg build lacks).
 - Documentation: README gained a Releases section (assets, trigger,
   forward-only policy, i686 exclusion, dry-run rehearsal, tag
   hardening), and AGENTS.md documents the pipeline and the new
