@@ -623,8 +623,10 @@ pub fn parse_args() -> Cli {
 // ── LTC Decode mode ─────────────────────────────────────────────────────
 
 /// Run the actual decode on a WAV file (supports chunked or single-pass).
-/// Thin delegate to [`crate::decode::decode_wav_file`] — the WAV-side
-/// decode pipeline lives in the shared `decode` module.
+/// Wraps the shared [`crate::decode::decode_wav_core`] dispatch with the
+/// CLI's stderr progress printer (chunked branch only, 200 ms poll,
+/// 300 s deadline) — the CLI-only display lives here, decode.rs stays
+/// display-free.
 fn run_decode_on_wav(
     path: &Path,
     use_libltc: bool,
@@ -632,8 +634,52 @@ fn run_decode_on_wav(
     fps: f64,
     drop_frame: bool,
 ) -> Result<audio_core::LtcDetectionResult, String> {
-    crate::decode::decode_wav_file(path, use_libltc, single_pass, fps, drop_frame)
-        .map_err(|e| e.to_string())
+    // Pre-count so the printer thread knows the total (one extra
+    // header-only open — same cost as before the dispatch-core extraction).
+    let config = audio_core::DecodeConfig::default();
+    let chunk_count = audio_core::count_chunks_in_wav(path, &config).unwrap_or(1);
+
+    let progress = audio_core::DecodeProgress::new(chunk_count);
+    let dispatch = crate::decode::wav_dispatch_decision(single_pass, Some(chunk_count), chunk_count);
+
+    let progress_handle = if matches!(dispatch, crate::decode::WavDispatch::Chunked(_)) {
+        let completed_ref = progress.chunks_completed.clone();
+        let total_chunks = chunk_count;
+        Some(std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let done = completed_ref.load(Ordering::Relaxed);
+                let pct = (done.checked_mul(100))
+                    .and_then(|v| v.checked_div(total_chunks))
+                    .unwrap_or(100);
+                eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
+                if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline { break; }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }))
+    } else {
+        None
+    };
+
+    let outcome = crate::decode::decode_wav_core(
+        path,
+        crate::decode::WavDecodeParams {
+            use_libltc,
+            single_pass,
+            decode_fps: fps,
+            decode_drop_frame: drop_frame,
+        },
+        Some(chunk_count),
+        None,
+        Some(&progress),
+    )
+    .map_err(|e| e.to_string())?;
+
+    if let Some(progress_handle) = progress_handle {
+        let _ = progress_handle.join();
+        eprintln!("\rDecoding: 100%  (chunk {}/{})", chunk_count, chunk_count);
+    }
+    Ok(outcome.result)
 }
 
 fn print_decode_results(

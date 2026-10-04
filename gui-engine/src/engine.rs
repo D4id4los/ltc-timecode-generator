@@ -1151,20 +1151,24 @@ fn cmd_parse_ltc_wav_file(
 
         let dp_bridge = crate::decode::bridge_decode_progress(dp.clone(), unit, None);
 
-        let result = if chunk_count <= 1 {
-            let r = audio_core::decode_ltc_with_decoder(
-                Path::new(&path_job), use_libltc, decode_fps, decode_drop_frame,
-                Some(&cancel),
-            );
+        let result = crate::decode::decode_wav_core(
+            Path::new(&path_job),
+            crate::decode::WavDecodeParams {
+                use_libltc,
+                single_pass: false,
+                decode_fps,
+                decode_drop_frame,
+            },
+            Some(chunk_count),
+            Some(&cancel),
+            Some(&dp),
+        )
+        .map(|outcome| outcome.result);
+        // The single-pass path never touches the shared chunks_done atomic;
+        // release the progress bridge before joining it.
+        if chunk_count <= 1 {
             chunks_done.store(1, Ordering::Relaxed);
-            r
-        } else {
-            let config = DecodeConfig::default();
-            audio_core::decode_ltc_chunked(
-                Path::new(&path_job), use_libltc, decode_fps, decode_drop_frame,
-                config, &dp,
-            )
-        };
+        }
 
         let _ = dp_bridge.join();
 

@@ -150,53 +150,6 @@ fn dummy_cancel() -> &'static Arc<AtomicBool> {
     DUMMY_CANCEL.get_or_init(|| Arc::new(AtomicBool::new(false)))
 }
 
-/// Decode LTC directly from a WAV file — the WAV-side shared front door
-/// (mirrors [`decode_video_file`]'s shape). `single_pass` forces the
-/// non-chunked decoder for small files; otherwise the chunked decoder runs
-/// with a stderr progress indicator.
-pub fn decode_wav_file(
-    path: &Path,
-    use_libltc: bool,
-    single_pass: bool,
-    decode_fps: f64,
-    decode_drop_frame: bool,
-) -> Result<LtcDetectionResult, LtcDecodeError> {
-    if single_pass {
-        return audio_core::decode_ltc_with_decoder(path, use_libltc, decode_fps, decode_drop_frame, None);
-    }
-
-    let config = DecodeConfig::default();
-    let chunk_count = audio_core::count_chunks_in_wav(path, &config).unwrap_or(1);
-
-    if chunk_count <= 1 {
-        audio_core::decode_ltc_with_decoder(path, use_libltc, decode_fps, decode_drop_frame, None)
-    } else {
-        let progress = DecodeProgress::new(chunk_count);
-        let completed_ref = progress.chunks_completed.clone();
-        let total_chunks = chunk_count;
-
-        let progress_handle = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-            loop {
-                let done = completed_ref.load(Ordering::Relaxed);
-                let pct = (done.checked_mul(100))
-                    .and_then(|v| v.checked_div(total_chunks))
-                    .unwrap_or(100);
-                eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
-                if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline { break; }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-        });
-
-        let result = audio_core::decode_ltc_chunked(path, use_libltc, decode_fps, decode_drop_frame, config, &progress)?;
-        let _ = progress_handle.join();
-        eprintln!("\rDecoding: 100%  (chunk {}/{})", total_chunks, total_chunks);
-        Ok(result)
-    }
-}
-
-/// Shared WAV-decode dispatch core (WP-2.2): the single-pass-vs-chunked
-/// decision lives here exactly once, exercised by both the CLI and the
 /// engine job.
 #[derive(Clone, Copy, Debug)]
 pub struct WavDecodeParams {
@@ -222,20 +175,72 @@ pub enum WavDispatch {
     Chunked(usize),
 }
 
-// TDD stub: dispatch decision not yet implemented (WP-2.2 red phase).
-fn wav_dispatch_decision(_single_pass: bool, _known: Option<usize>, _counted: usize) -> WavDispatch {
-    WavDispatch::SinglePass
+/// Resolve the single-pass-vs-chunked dispatch for a WAV decode:
+/// `single_pass` wins over any count; otherwise the known (or counted)
+/// chunk count decides (`<= 1` → single-pass).
+pub(crate) fn wav_dispatch_decision(single_pass: bool, known: Option<usize>, counted: usize) -> WavDispatch {
+    if single_pass {
+        return WavDispatch::SinglePass;
+    }
+    match known.unwrap_or(counted) {
+        n if n <= 1 => WavDispatch::SinglePass,
+        n => WavDispatch::Chunked(n),
+    }
 }
 
-// TDD stub: dispatch core not yet implemented (WP-2.2 red phase).
+/// Decode LTC directly from a WAV file — the WAV-side shared dispatch core.
+/// The single-pass-vs-chunked decision lives here exactly once: the CLI
+/// wraps this with the stderr progress printer, the engine job wraps it
+/// with `ProgressTracker` bridging.
+///
+/// `known_chunk_count` — `Some` skips the header re-open (the engine has
+/// already counted for its eager status message; also the test lever to
+/// force the chunked branch). `None` = count here (CLI path), preserving
+/// the `unwrap_or(1)` fallback so a missing file surfaces as a typed error
+/// from the decoder itself.
+/// `cancel` / `progress` — optional cancellation flag and shared
+/// `DecodeProgress` for the chunked branch; `None` progress gets a fresh
+/// unused one.
 pub fn decode_wav_core(
-    _path: &Path,
-    _params: WavDecodeParams,
-    _known_chunk_count: Option<usize>,
-    _cancel: Option<&Arc<AtomicBool>>,
-    _progress: Option<&DecodeProgress>,
+    path: &Path,
+    params: WavDecodeParams,
+    known_chunk_count: Option<usize>,
+    cancel: Option<&Arc<AtomicBool>>,
+    progress: Option<&DecodeProgress>,
 ) -> Result<WavDecodeOutcome, LtcDecodeError> {
-    Err(LtcDecodeError::Failed("decode_wav_core not implemented".to_string()))
+    let config = DecodeConfig::default();
+    let counted = known_chunk_count
+        .unwrap_or_else(|| audio_core::count_chunks_in_wav(path, &config).unwrap_or(1));
+    let chunk_count = counted;
+
+    match wav_dispatch_decision(params.single_pass, known_chunk_count, counted) {
+        WavDispatch::SinglePass => {
+            let result = audio_core::decode_ltc_with_decoder(
+                path, params.use_libltc, params.decode_fps, params.decode_drop_frame,
+                cancel.map(|flag| flag.as_ref()),
+            )?;
+            Ok(WavDecodeOutcome { result, chunk_count })
+        }
+        WavDispatch::Chunked(count) => {
+            let owned_progress;
+            let progress = match progress {
+                Some(dp) => dp,
+                None => {
+                    owned_progress = DecodeProgress {
+                        chunks_total: count,
+                        chunks_completed: Arc::new(AtomicUsize::new(0)),
+                        cancel_flag: cancel.cloned().unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                    };
+                    &owned_progress
+                }
+            };
+            let result = audio_core::decode_ltc_chunked(
+                path, params.use_libltc, params.decode_fps, params.decode_drop_frame,
+                config, progress,
+            )?;
+            Ok(WavDecodeOutcome { result, chunk_count: count })
+        }
+    }
 }
 
 /// Probe → validate → extract → decode, the shared CLI/GUI front door.
