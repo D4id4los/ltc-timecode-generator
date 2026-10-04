@@ -572,6 +572,33 @@ fn detect_cards_from_mounts(
     progress: Option<&ScanProgress>,
 ) -> Vec<SdCardInfo> {
     let user = whoami_fallback();
+    let (candidates, skipped) = mount_candidates(mounts_content, sys_root, &user);
+
+    info!(
+        "Linux mount scan: {} candidate(s), {} skipped",
+        candidates.len(),
+        skipped
+    );
+
+    let (cards, rejected, budget_exhausted) = probe_candidates(&candidates, deadline, progress);
+
+    info!(
+        "Mount scan complete: {} card(s), {} rejected{}",
+        cards.len(),
+        rejected,
+        if budget_exhausted > 0 {
+            format!(", {} budget-exhausted", budget_exhausted)
+        } else {
+            String::new()
+        },
+    );
+    cards
+}
+
+/// Pure filter chain over `/proc/mounts` content: keep real-device mounts
+/// under recognised media roots that look like removable cards. Returns the
+/// candidate mount points and the number of skipped lines.
+fn mount_candidates(mounts_content: &str, sys_root: &Path, user: &str) -> (Vec<PathBuf>, u32) {
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut skipped = 0u32;
 
@@ -627,17 +654,22 @@ fn detect_cards_from_mounts(
         candidates.push(mp.to_path_buf());
     }
 
-    info!(
-        "Linux mount scan: {} candidate(s), {} skipped",
-        candidates.len(),
-        skipped
-    );
+    (candidates, skipped)
+}
 
+/// Probe candidate mounts into cards: dedup, respect the time budget,
+/// classify each mount, and report progress. Returns the cards plus the
+/// rejected and budget-exhausted counters.
+fn probe_candidates(
+    candidates: &[PathBuf],
+    deadline: Instant,
+    progress: Option<&ScanProgress>,
+) -> (Vec<SdCardInfo>, u32, u32) {
     let mut seen = std::collections::HashSet::new();
     let mut cards = Vec::new();
     let mut rejected = 0u32;
     let mut budget_exhausted = 0u32;
-    for mp in &candidates {
+    for mp in candidates {
         if !seen.insert(mp.clone()) {
             continue;
         }
@@ -666,18 +698,7 @@ fn detect_cards_from_mounts(
             info!("Mount {:?}: rejected — no recognized media files", mp);
         }
     }
-
-    info!(
-        "Mount scan complete: {} card(s), {} rejected{}",
-        cards.len(),
-        rejected,
-        if budget_exhausted > 0 {
-            format!(", {} budget-exhausted", budget_exhausted)
-        } else {
-            String::new()
-        },
-    );
-    cards
+    (cards, rejected, budget_exhausted)
 }
 
 /// Classify a mount point as a media card: shallow media scan + device name guess.
