@@ -93,15 +93,109 @@ To run the rust GUI with debug output, use:
   RUST_LOG=audio_core=info,ltc_gui=info cargo run --release
 #+end_src
 
-* Building All Ship Targets
+* Releases
 
-The shipped matrix (linux x64, windows x64, linux i686) is built by
-=build-all-rust-targets.sh=; the i686 tablet build cross-compiles =ltc-gui=
-inside the =ltc-debian11-builder= docker image (=Dockerfile.gui-build=):
+Official releases are tag-driven: pushing a =vX.Y.Z= tag (strict
+=v<major>.<minor>.<patch>=, cut via =scripts/bump-version.sh=) runs
+=.github/workflows/release.yml=, which builds the ship matrix and publishes
+a GitHub Release whose body is the matching =VERSION_LOG.org= entry.
+
+Official assets (per release):
+- =ltc-gui_<ver>_linux-x86_64.tar.xz= :: linux x64 binary, linked against
+  a static libltc (no =libltc.so= runtime dependency), built with a
+  glibc 2.31 floor (Debian 11 / oldest supported runtime)
+- =ltc-gui_<ver>_windows-x86_64.zip= :: windows x64 binary (static libltc)
+- =SHA256SUMS= :: checksums of both
+
+Policy:
+- Forward-only (D4): releases are cut from the first tagged version after
+  this pipeline exists; no retro-releases for old tags.
+- i686 is *not* part of the official release pipeline (D3). The Medion
+  tablet build remains a manual local speciality (see below); i686 is
+  re-introduced to CI/releases only on user demand.
+- The release workflow also has a =workflow_dispatch= dry-run mode
+  (default on) to rehearse the full pipeline on a branch without
+  publishing anything.
+- Hardening (D5): the workflow guard enforces the strict tag regex, and a
+  one-time repo setting (Settings → Tags → protection rule =v*=,
+  Maintainers/Owners only) blocks who may push release tags.
+
+If a release smoke test fails: delete the GitHub release, delete the tag,
+fix forward, re-tag.
+
+** Building the release matrix locally
+
+=build-all-rust-targets.sh= reproduces the CI release artifacts locally
+(static libltc via =scripts/build-libltc-static.sh= into the gitignored
+=./libltc-prefix/=, glibc 2.31 floor via zigbuild):
 
 #+begin_src bash
   ./build-all-rust-targets.sh
 #+end_src
+
+Prerequisites: =cargo install cargo-zigbuild= (plus zig 0.13.0),
+=rustup target add x86_64-pc-windows-gnu=, and =sudo apt install
+mingw-w64=. To link the windows build through a fixed prefix instead, see
+=.cargo/config.toml= under "Cross compiling from linux to windows".
+
+=deploy-to-onedrive.sh= remains the personal-distribution copy step; the
+x86 tablet line applies to manual docker builds only.
+
+** Building the 32bit version (manual speciality)
+
+The docker image (Dockerfile.gui-build) now carries a pinned static
+libltc again, so the tablet build works:
+
+#+begin_src bash
+  docker build --platform linux/386 -t ltc-debian11-builder -f Dockerfile.gui-build .
+  docker run --rm \
+         -v "$(pwd)":/app \
+         -v "$(pwd)/.cargo_cache:/usr/local/cargo/registry" \
+         -w /app/ltc-gui \
+         ltc-debian11-builder \
+         cargo zigbuild --target i686-unknown-linux-gnu.2.31 --release
+#+end_src
+
+** Cross compiling from linux to windows
+
+For the release-quality recipe, use =build-all-rust-targets.sh= (it
+provisions the static libltc prefix and sets the env vars for you). The
+manual recipe, if you need it:
+
+Install the windows target:
+#+begin_src bash
+  rustup target add x86_64-pc-windows-gnu
+#+end_src
+
+Build a static libltc prefix (pinned =v1.3.2=, static-only — no =.so= —
+so the binary carries no runtime libltc dependency):
+#+begin_src bash
+  scripts/build-libltc-static.sh /path/to/libltc-win64 x86_64-w64-mingw32
+#+end_src
+
+Place the following toolchain config in =.cargo/config.toml= in the project
+root (this is a developer-local setting, so not committed to git):
+#+begin_src toml
+  [target.x86_64-pc-windows-gnu]
+  linker = "x86_64-w64-mingw32-gcc"
+  rustflags = ["-L", "native=/path/to/libltc-win64/lib"]
+
+  [env]
+  BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu = "-I/path/to/libltc-win64/include"
+#+end_src
+
+Now compile with:
+#+begin_src bash
+  # dev
+  cargo build --target x86_64-pc-windows-gnu
+  # release
+  cargo build --target x86_64-pc-windows-gnu --release --bin ltc-gui
+  cargo build --target x86_64-pc-windows-gnu --release --bin ltc-slint
+#+end_src
+
+Note: for a *static* link the prefix must contain only =libltc.a= (which
+=build-libltc-static.sh= guarantees); if a distro =libltc-dev= package is
+also installed, =-lltc= may resolve to the shared library instead.
 
 * Continuous Integration & Code Quality (SonarQube Cloud)
 
@@ -139,6 +233,12 @@ in the root =Cargo.toml=; all four workspace members inherit it via
 The script refuses to run on a dirty working tree and verifies all four
 workspace members show the new version in =Cargo.lock= before committing.
 
+The tagged tree must contain a =VERSION_LOG.org= entry for the new version
+(headings =* vX.Y.Z=, newest first) — the release workflow extracts it as
+the release body and fails loudly if it is missing. Keep entries
+markdown-compatible (plain prose + hyphen bullets, no org-only markup like
+===verbatim===), so they publish as-is.
+
 
 * Installing Docker
 
@@ -158,42 +258,3 @@ Allow non root (i.e. you) users to run docker:
   newgrp docker
 #+end_src
 
-* Cross Compiling Libltc on Linux for Windows builds
-
-#+begin_src bash
-# 1. Clone source code
-git clone https://github.com/x42/libltc.git
-cd libltc
-
-# 2. Generate configuration files
-autoreconf -vfi
-
-# 3. Create a isolated install directory (e.g. $HOME/deps/libltc-win64)
-mkdir -p $HOME/bin/libltc-win64
-
-# 4. Configure build for Windows 64-bit MinGW
-./configure \
-  --host=x86_64-w64-mingw32 \
-  --prefix=$HOME/bin/libltc-win64 \
-  --enable-static \
-  --disable-shared
-
-# 5. Compile and install
-make -j$(nproc)
-make install 
-#+end_src
-
-Compile:
-#+begin_src bash
-BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu="-I$HOME/bin/libltc-win64/include" RUSTFLAGS="-L native=$HOME/bin/libltc-win64/lib" cargo build --target x86_64-pc-windows-gnu --release --bin ltc-gui
-#+end_src
-
-Make arguments automatic, edit =.cargo/config.toml=:
-#+begin_src toml
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
-rustflags = ["-L", "native=/home/viktoria/bin/libltc-win64/lib"]
-
-[env]
-BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu = "-I/home/viktoria/bin/libltc-win64/include"
-#+end_src
