@@ -172,7 +172,11 @@ pub fn tag_file(
 // ── Native MOV/MP4 in-place tagger ─────────────────────────────────────
 
 mod native {
-    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    use crate::converter::TimecodeMetadata;
+    use super::{BoxEntry, TagOutcome, build_tmcd_trak, patch_stco_offset, read_be_u24, read_be_u32, read_be_u64};
 
     /// Try to tag a MOV/MP4 file in place.  Returns `Ok(outcome)` on success;
     /// on failure (wrong layout, unparseable boxes) returns `Err(reason)` so
