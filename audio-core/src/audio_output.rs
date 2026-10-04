@@ -1102,6 +1102,127 @@ fn push_frame(
     None
 }
 
+/// Hybrid deadline wait: OS sleep until 2 ms before the deadline, then
+/// spin-loop for the remainder (tight timing without burning the core
+/// for the whole frame gap).
+fn wait_for_deadline(deadline: Instant) {
+    let now = Instant::now();
+    if now >= deadline {
+        return;
+    }
+    let sleep = deadline - now;
+    if sleep > Duration::from_millis(2) {
+        std::thread::sleep(sleep - Duration::from_millis(2));
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
+/// Outcome of one callback-watchdog tick.
+enum WatchdogOutcome {
+    /// Callback is alive — keep going.
+    Continue,
+    /// Callback stalled — recovery event was queued; sleep `backoff` and retry.
+    Recover { backoff: Duration },
+    /// Recovery ladder exhausted — StreamDead queued; the thread must exit.
+    Dead,
+}
+
+/// Run one watchdog tick against the audio-callback counter; on a stall or
+/// death, queue the matching event on `events`.
+fn run_watchdog_tick(
+    wd: &mut CallbackWatchdog,
+    callback_counter: &AtomicU64,
+    events: &Arc<Mutex<Vec<AudioEvent>>>,
+) -> WatchdogOutcome {
+    let current_callback = callback_counter.load(Ordering::Relaxed);
+    match wd.tick(Instant::now(), current_callback) {
+        WatchdogAction::Continue => WatchdogOutcome::Continue,
+        WatchdogAction::Recover { attempt, backoff } => {
+            error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
+            warn!("LTC scheduler: recovery attempt {}/3", attempt);
+            let reason = watchdog_reason(STALL_TIMEOUT, attempt, MAX_ATTEMPTS);
+            if let Ok(mut ev) = events.lock() {
+                ev.push(AudioEvent::RecoveryNeeded { reason });
+            }
+            WatchdogOutcome::Recover { backoff }
+        }
+        WatchdogAction::Dead => {
+            error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
+            error!("LTC scheduler: 3 recovery attempts exhausted — stream permanently dead");
+            if let Ok(mut ev) = events.lock() {
+                ev.push(AudioEvent::StreamDead);
+            }
+            WatchdogOutcome::Dead
+        }
+    }
+}
+
+/// Emit an Underrun event when the callback's underrun counter advanced.
+fn detect_underruns(
+    underrun_count: &AtomicU64,
+    last_underrun_value: &mut u64,
+    events: &Arc<Mutex<Vec<AudioEvent>>>,
+) {
+    let current_underrun = underrun_count.load(Ordering::Relaxed);
+    if current_underrun > *last_underrun_value {
+        let new_underruns = current_underrun - *last_underrun_value;
+        warn!("LTC scheduler: detected {} callback underruns (total: {})", new_underruns, current_underrun);
+        if let Ok(mut ev) = events.lock() {
+            ev.push(AudioEvent::Underrun);
+        }
+        *last_underrun_value = current_underrun;
+    }
+}
+
+/// Generate one stereo LTC frame into `frame_buf` and push it into the ring.
+/// Returns `false` when the producer mutex is poisoned (thread must exit).
+#[allow(clippy::too_many_arguments)]
+fn generate_and_push_frame(
+    ltc_producer: &Arc<Mutex<HeapProducer<f32>>>,
+    frame_buf: &mut Vec<f32>,
+    needed: usize,
+    tc: &crate::types::Timecode,
+    drop_frame: bool,
+    samples_per_bit: f32,
+    ltc_volume: f32,
+    ltc_channel: ChannelSel,
+    last_level: &mut (f32, f32),
+    push_stats: &mut FramePushStats,
+    events: &Arc<Mutex<Vec<AudioEvent>>>,
+) -> bool {
+    frame_buf.resize(needed, 0.0);
+
+    generate_ltc_frame_stereo(
+        tc,
+        drop_frame,
+        needed / 2,
+        samples_per_bit,
+        ltc_volume,
+        ltc_channel,
+        last_level,
+        &mut frame_buf[..needed],
+    );
+
+    // ── Push samples into lock-free ring buffer ──
+    {
+        let mut producer = match ltc_producer.lock() {
+            Ok(p) => p,
+            Err(e) => {
+                error!("LTC scheduler: producer mutex poisoned: {}", e);
+                return false;
+            }
+        };
+        if let Some(ev) = push_frame(&mut producer, &frame_buf[..needed], push_stats) {
+            if let Ok(mut evq) = events.lock() {
+                evq.push(ev);
+            }
+        }
+    }
+    true
+}
+
 fn ltc_scheduler_thread(
     ltc_producer: Arc<Mutex<HeapProducer<f32>>>,
     ltc: Arc<Mutex<LtcStreamState>>,
@@ -1149,16 +1270,9 @@ fn ltc_scheduler_thread(
 
             let now = Instant::now();
             if now < state.next_frame_time {
-                let sleep = state.next_frame_time - now;
                 let target = state.next_frame_time;
                 drop(state);
-                // Hybrid sleep: OS sleep until 2ms before deadline, then spin-loop
-                if sleep > Duration::from_millis(2) {
-                    std::thread::sleep(sleep - Duration::from_millis(2));
-                }
-                while Instant::now() < target {
-                    std::hint::spin_loop();
-                }
+                wait_for_deadline(target);
                 continue;
             }
 
@@ -1180,70 +1294,27 @@ fn ltc_scheduler_thread(
         };
 
         // ── Watchdog: check if audio callback is still alive ──
-        let current_callback = callback_counter.load(Ordering::Relaxed);
-        match wd.tick(Instant::now(), current_callback) {
-            WatchdogAction::Continue => {}
-            WatchdogAction::Recover { attempt, backoff } => {
-                error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
-                warn!("LTC scheduler: recovery attempt {}/3", attempt);
-                let reason = watchdog_reason(STALL_TIMEOUT, attempt, MAX_ATTEMPTS);
-                if let Ok(mut ev) = events.lock() {
-                    ev.push(AudioEvent::RecoveryNeeded { reason });
-                }
+        match run_watchdog_tick(&mut wd, &callback_counter, &events) {
+            WatchdogOutcome::Continue => {}
+            WatchdogOutcome::Recover { backoff } => {
                 // Sleep a short time before checking again so the main thread can act
                 std::thread::sleep(backoff);
                 continue;
             }
-            WatchdogAction::Dead => {
-                error!("LTC scheduler: audio callback has not fired for 500ms — stream appears dead");
-                error!("LTC scheduler: 3 recovery attempts exhausted — stream permanently dead");
-                if let Ok(mut ev) = events.lock() {
-                    ev.push(AudioEvent::StreamDead);
-                }
-                return;
-            }
+            WatchdogOutcome::Dead => return,
         }
 
         // ── Watchdog: check for underruns ──
-        let current_underrun = underrun_count.load(Ordering::Relaxed);
-        if current_underrun > last_underrun_value {
-            let new_underruns = current_underrun - last_underrun_value;
-            warn!("LTC scheduler: detected {} callback underruns (total: {})", new_underruns, current_underrun);
-            if let Ok(mut ev) = events.lock() {
-                ev.push(AudioEvent::Underrun);
-            }
-            last_underrun_value = current_underrun;
-        }
+        detect_underruns(&underrun_count, &mut last_underrun_value, &events);
 
-        // ── Generate LTC frame ──
+        // ── Generate LTC frame + push into the ring buffer ──
         let needed = total_samples * 2;
-        frame_buf.resize(needed, 0.0);
-
-        generate_ltc_frame_stereo(
-            &tc,
-            drop_frame,
-            total_samples,
-            samples_per_bit,
-            ltc_volume,
-            ltc_channel,
-            &mut last_level,
-            &mut frame_buf[..needed],
-        );
-
-        // ── Push samples into lock-free ring buffer ──
-        {
-            let mut producer = match ltc_producer.lock() {
-                Ok(p) => p,
-                Err(e) => {
-                    error!("LTC scheduler: producer mutex poisoned: {}", e);
-                    return;
-                }
-            };
-            if let Some(ev) = push_frame(&mut producer, &frame_buf[..needed], &mut push_stats) {
-                if let Ok(mut evq) = events.lock() {
-                    evq.push(ev);
-                }
-            }
+        if !generate_and_push_frame(
+            &ltc_producer, &mut frame_buf, needed, &tc, drop_frame,
+            samples_per_bit, ltc_volume, ltc_channel, &mut last_level,
+            &mut push_stats, &events,
+        ) {
+            return;
         }
 
         push_stats.frame_count += 1;

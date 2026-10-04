@@ -569,11 +569,30 @@ fn score_candidate(
     ))
 }
 
-/// Evaluate LTC on a slice using the given FPS.
-///
-/// Tries SPB variants to compensate for clock drift, with phases derived
-/// from the first several zero-crossings.
-fn evaluate_on_slice(
+/// Number of phase candidates to try for a given samples-per-bit: a quarter
+/// of the spb, clamped to a 5..=12 working window.
+fn phase_window(spb: f64) -> usize {
+    ((spb / 4.0).round() as usize).clamp(5, 12)
+}
+
+/// SPB search lattice around the nominal samples-per-bit: ±0.4% in five
+/// steps when the resolution is high enough for drift to matter, otherwise
+/// just the nominal value.
+fn spb_variants(spb_nominal: f64) -> Vec<f64> {
+    if spb_nominal >= 8.0 {
+        let half_range = (spb_nominal * 0.004).max(0.05);
+        (0..5)
+            .map(|i| { let t = i as f64 / 4.0; spb_nominal + (t - 0.5) * 2.0 * half_range })
+            .collect::<Vec<_>>()
+    } else {
+        vec![spb_nominal]
+    }
+}
+
+/// First search pass: try every (spb variant, zero-crossing phase) pair with
+/// plain bit extraction and keep the best valid-frame count.
+#[allow(clippy::too_many_arguments)]
+fn coarse_search(
     samples: &[f32],
     zc: &[usize],
     sample_rate: u32,
@@ -581,38 +600,23 @@ fn evaluate_on_slice(
     fps: f64,
     drop_frame: bool,
     cancel: Option<&AtomicBool>,
+    variants: &[f64],
+    eval_start: std::time::Instant,
 ) -> (Option<ScoredResult>, u32) {
-    let eval_start = std::time::Instant::now();
     let mut best_valid = 0u32;
     let mut best_result: Option<ScoredResult> = None;
 
-    let fps_name = format!("{:.2} fps", fps);
-    let spb_nominal = sample_rate as f64 / (fps * 80.0);
-    if spb_nominal < 0.5 {
-        return (None, 0);
-    }
-    debug!("LTC evaluate: trying {} (spb_nominal={:.2})", fps_name, spb_nominal);
-
-    let spb_variants = if spb_nominal >= 8.0 {
-        let half_range = (spb_nominal * 0.004).max(0.05);
-        (0..5)
-            .map(|i| { let t = i as f64 / 4.0; spb_nominal + (t - 0.5) * 2.0 * half_range })
-            .collect::<Vec<_>>()
-    } else {
-        vec![spb_nominal]
-    };
-
-    for (spb_idx, &spb) in spb_variants.iter().enumerate() {
+    for (spb_idx, &spb) in variants.iter().enumerate() {
         if cancelled(cancel) {
             return (None, 0);
         }
-        let max_phases = (spb / 4.0).round() as usize;
-        let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
+        let max_phases = phase_window(spb);
+        let phases_to_try = zc.iter().take(max_phases).copied();
 
         let half_spb = (spb * 0.5) as usize;
         let mut attempts_this_spb = 0u32;
         debug!("LTC evaluate: SPB variant {}/{} -- spb={:.2} ({} phases)",
-            spb_idx + 1, spb_variants.len(), spb, max_phases.clamp(5, 12) * 2);
+            spb_idx + 1, variants.len(), spb, max_phases * 2);
 
         for phase in phases_to_try {
             for &candidate_phase in &[phase, phase.saturating_sub(half_spb)] {
@@ -631,41 +635,93 @@ fn evaluate_on_slice(
             }
         }
         debug!("LTC evaluate: SPB variant {}/{} done -- {} attempts in {:.1}s, best={} valid",
-            spb_idx + 1, spb_variants.len(),
+            spb_idx + 1, variants.len(),
             attempts_this_spb, eval_start.elapsed().as_secs_f64(), best_valid);
     }
 
-    if let Some(ref best) = best_result.clone() {
-        debug!("LTC evaluate (+{:.1}s): refinement phase for best candidate ({} fps, spb={:.2}, best_valid={})",
-            eval_start.elapsed().as_secs_f64(), best.fps, best.spb, best_valid);
-        let best_spb = best.spb;
-        let best_phase = best.phase;
+    (best_result, best_valid)
+}
 
-        let max_phases = (best_spb / 4.0).round() as usize;
-        let phases_to_try = zc.iter().take(max_phases.clamp(5, 12)).copied();
-        let mut last_heartbeat = std::time::Instant::now();
-        let mut refine_idx = 0u32;
-        for phase in phases_to_try {
-            if cancelled(cancel) {
-                return (best_result, best_valid);
-            }
-            if phase == best_phase { continue; }
-            refine_idx += 1;
-            if last_heartbeat.elapsed().as_secs_f64() >= 10.0 {
-                debug!("LTC refine (+{:.1}s): phase {}/{} (phase={}), best_valid={}",
-                    eval_start.elapsed().as_secs_f64(), refine_idx, max_phases.clamp(5, 12) - 1,
-                    phase, best_valid);
-                last_heartbeat = std::time::Instant::now();
-            }
-            if let ScoredCandidate::Beat(new) = score_candidate(
-                samples, zc, best_spb, phase, threshold, best.fps, best.drop_frame,
-                sample_rate, true, best_valid, cancel,
-            ) {
-                best_valid = new.valid_frames;
-                best_result = Some(new);
-            }
+/// Second pass: refine the best coarse candidate with adaptive bit
+/// extraction over the remaining phases at the winner's spb.
+fn refine_best(
+    samples: &[f32],
+    zc: &[usize],
+    sample_rate: u32,
+    threshold: f32,
+    cancel: Option<&AtomicBool>,
+    best: ScoredResult,
+    best_valid: u32,
+    eval_start: std::time::Instant,
+) -> (Option<ScoredResult>, u32) {
+    debug!("LTC evaluate (+{:.1}s): refinement phase for best candidate ({} fps, spb={:.2}, best_valid={})",
+        eval_start.elapsed().as_secs_f64(), best.fps, best.spb, best_valid);
+    let best_spb = best.spb;
+    let best_phase = best.phase;
+    let best_fps = best.fps;
+    let best_drop_frame = best.drop_frame;
+
+    let max_phases = phase_window(best_spb);
+    let phases_to_try = zc.iter().take(max_phases).copied();
+    let mut last_heartbeat = std::time::Instant::now();
+    let mut refine_idx = 0u32;
+    let mut best_result = Some(best);
+    let mut best_valid = best_valid;
+    for phase in phases_to_try {
+        if cancelled(cancel) {
+            return (best_result, best_valid);
+        }
+        if phase == best_phase { continue; }
+        refine_idx += 1;
+        if last_heartbeat.elapsed().as_secs_f64() >= 10.0 {
+            debug!("LTC refine (+{:.1}s): phase {}/{} (phase={}), best_valid={}",
+                eval_start.elapsed().as_secs_f64(), refine_idx, max_phases - 1,
+                phase, best_valid);
+            last_heartbeat = std::time::Instant::now();
+        }
+        if let ScoredCandidate::Beat(new) = score_candidate(
+            samples, zc, best_spb, phase, threshold, best_fps, best_drop_frame,
+            sample_rate, true, best_valid, cancel,
+        ) {
+            best_valid = new.valid_frames;
+            best_result = Some(new);
         }
     }
+    (best_result, best_valid)
+}
+
+/// Evaluate LTC on a slice using the given FPS.
+///
+/// Tries SPB variants to compensate for clock drift, with phases derived
+/// from the first several zero-crossings.
+fn evaluate_on_slice(
+    samples: &[f32],
+    zc: &[usize],
+    sample_rate: u32,
+    threshold: f32,
+    fps: f64,
+    drop_frame: bool,
+    cancel: Option<&AtomicBool>,
+) -> (Option<ScoredResult>, u32) {
+    let eval_start = std::time::Instant::now();
+    let fps_name = format!("{:.2} fps", fps);
+    let spb_nominal = sample_rate as f64 / (fps * 80.0);
+    if spb_nominal < 0.5 {
+        return (None, 0);
+    }
+    debug!("LTC evaluate: trying {} (spb_nominal={:.2})", fps_name, spb_nominal);
+
+    let variants = spb_variants(spb_nominal);
+    let (best_result, best_valid) = coarse_search(
+        samples, zc, sample_rate, threshold, fps, drop_frame, cancel, &variants, eval_start,
+    );
+
+    let (best_result, best_valid) = match best_result {
+        Some(best) => refine_best(
+            samples, zc, sample_rate, threshold, cancel, best, best_valid, eval_start,
+        ),
+        None => (None, 0),
+    };
 
     let confidence = best_result.as_ref().map_or(0.0, |r| {
         if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
@@ -4921,4 +4977,49 @@ mod tests {
         assert_eq!(missing, 1);
         assert!(ratio > 0.0 && ratio < 0.05, "1 missing of ~50 is {:.3}", ratio);
     }
+}
+
+// ── evaluate_on_slice decomposition (pure variant math) ─────────────────
+
+#[test]
+fn spb_variants_low_resolution_is_nominal_only() {
+    // Below the 8.0 spb threshold there is no drift window — only nominal.
+    assert_eq!(spb_variants(4.0), vec![4.0]);
+    assert_eq!(spb_variants(7.999), vec![7.999]);
+}
+
+#[test]
+fn spb_variants_high_resolution_spans_half_percent_in_five_steps() {
+    let v = spb_variants(100.0);
+    assert_eq!(v.len(), 5);
+    // half_range = 100 * 0.004 = 0.4 → ±0.4 around nominal, symmetric.
+    assert!((v[0] - 99.6).abs() < 1e-9, "first variant {}", v[0]);
+    assert!((v[2] - 100.0).abs() < 1e-9, "middle variant is nominal");
+    assert!((v[4] - 100.4).abs() < 1e-9, "last variant {}", v[4]);
+    assert!(v.windows(2).all(|w| w[0] < w[1]), "variants must ascend");
+}
+
+#[test]
+fn spb_variants_small_spb_keeps_minimum_half_range() {
+    // half_range floors at 0.05 so tiny-but-high-resolution spb still
+    // gets a usable search window.
+    let v = spb_variants(8.0);
+    assert_eq!(v.len(), 5);
+    assert!((v[0] - (8.0 - 0.05)).abs() < 1e-9, "first variant {}", v[0]);
+    assert!((v[4] - (8.0 + 0.05)).abs() < 1e-9, "last variant {}", v[4]);
+}
+
+#[test]
+fn phase_window_clamps_quarter_spb_into_5_to_12() {
+    assert_eq!(phase_window(8.0), 5, "8/4 = 2 → clamped up to 5");
+    assert_eq!(phase_window(16.0), 5, "16/4 = 4 → clamped up to 5");
+    assert_eq!(phase_window(24.0), 6, "24/4 = 6 → exact");
+    assert_eq!(phase_window(100.0), 12, "100/4 = 25 → clamped down to 12");
+    assert_eq!(phase_window(1000.0), 12);
+}
+
+#[test]
+fn phase_window_rounds_quarter_spb_before_clamping() {
+    // 30/4 = 7.5 → rounds to 8 (banker's-unaware round-half-away).
+    assert_eq!(phase_window(30.0), 8);
 }
