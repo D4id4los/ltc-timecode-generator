@@ -142,101 +142,12 @@ pub fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep:
     args.push("0:v".to_string());
 
     match keep {
-        AudioKeep::AllAudio => {
-            args.push("-map".to_string());
-            args.push("0:a?".to_string());
-            args.push("-c:a".to_string());
-            if settings.copy_video {
-                args.push("copy".to_string());
-            } else {
-                args.push(settings.audio_encoder.clone());
-            }
-        }
+        AudioKeep::AllAudio => push_all_audio_args(&mut args, settings),
         AudioKeep::ChannelsExcept(drop_pairs) => {
-            let mut filter_parts: Vec<String> = Vec::new();
-            let mut output_labels: Vec<String> = Vec::new();
-            let mut filter_idx = 0;
-
-            for stream in &probe.streams {
-                let surviving_channels: Vec<usize> = (0..stream.channels)
-                    .filter(|ch| !drop_pairs.contains(&(stream.stream_index, *ch)))
-                    .collect();
-
-                if surviving_channels.is_empty() {
-                    continue;
-                }
-
-                if surviving_channels.len() == stream.channels {
-                    output_labels.push(format!("0:{}", stream.stream_index));
-                } else if surviving_channels.len() == 1 {
-                    let label = format!("a{}", filter_idx);
-                    filter_idx += 1;
-                    filter_parts.push(format!(
-                        "[0:{}]pan=mono|FC=c{}[{}]",
-                        stream.stream_index, surviving_channels[0], label
-                    ));
-                    output_labels.push(format!("[{}]", label));
-                } else {
-                    let ch_maps: Vec<String> = surviving_channels
-                        .iter()
-                        .enumerate()
-                        .map(|(out_ch, in_ch)| format!("c{}={}", out_ch, in_ch))
-                        .collect();
-                    let label = format!("a{}", filter_idx);
-                    filter_idx += 1;
-                    let layout = match surviving_channels.len() {
-                        1 => "mono",
-                        2 => "stereo",
-                        _ => "5.1",
-                    };
-                    let pan = format!("pan={}|{}", layout, ch_maps.join("|"));
-                    filter_parts.push(format!(
-                        "[0:{}]{}[{}]",
-                        stream.stream_index, pan, label
-                    ));
-                    output_labels.push(format!("[{}]", label));
-                }
-            }
-
-            if output_labels.is_empty() {
-                args.push("-an".to_string());
-            } else {
-                if !filter_parts.is_empty() {
-                    args.push("-filter_complex".to_string());
-                    args.push(filter_parts.join(";"));
-                }
-                for label in &output_labels {
-                    args.push("-map".to_string());
-                    args.push(label.clone());
-                }
-                args.push("-c:a".to_string());
-                args.push(settings.audio_encoder.clone());
-            }
+            push_channels_except_args(&mut args, settings, drop_pairs, probe)
         }
         AudioKeep::Reordered(ordered_pairs) => {
-            let mut filter_parts: Vec<String> = Vec::new();
-            for (i, &(stream_idx, channel_idx)) in ordered_pairs.iter().enumerate() {
-                let label = format!("a{}", i);
-                filter_parts.push(format!(
-                    "[0:{}]pan=mono|FC=c{}[{}]",
-                    stream_idx, channel_idx, label
-                ));
-            }
-            let n = ordered_pairs.len();
-            let merge_inputs: Vec<String> = (0..n).map(|i| format!("[a{}]", i)).collect();
-            filter_parts.push(format!(
-                "{}amerge=inputs={}[out]",
-                merge_inputs.join(""),
-                n
-            ));
-            if !filter_parts.is_empty() {
-                args.push("-filter_complex".to_string());
-                args.push(filter_parts.join(";"));
-            }
-            args.push("-map".to_string());
-            args.push("[out]".to_string());
-            args.push("-c:a".to_string());
-            args.push(settings.audio_encoder.clone());
+            push_reordered_args(&mut args, settings, ordered_pairs)
         }
     }
 
@@ -250,6 +161,128 @@ pub fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep:
     push_metadata_args(&mut args, settings, Some(file_idx), format);
     push_output_trailer(&mut args, format);
     args
+}
+
+/// AllAudio arm: map every audio stream through unchanged (re-encoded
+/// unless stream copy is requested).
+fn push_all_audio_args(args: &mut Vec<String>, settings: &ConverterSettings) {
+    args.push("-map".to_string());
+    args.push("0:a?".to_string());
+    args.push("-c:a".to_string());
+    if settings.copy_video {
+        args.push("copy".to_string());
+    } else {
+        args.push(settings.audio_encoder.clone());
+    }
+}
+
+/// ChannelsExcept arm: keep all audio except `drop_pairs`, emitting one
+/// pan filter per trimmed stream and direct maps for untouched streams.
+fn push_channels_except_args(
+    args: &mut Vec<String>,
+    settings: &ConverterSettings,
+    drop_pairs: &[(usize, usize)],
+    probe: &VideoAudioProbe,
+) {
+    let mut filter_parts: Vec<String> = Vec::new();
+    let mut output_labels: Vec<String> = Vec::new();
+    let mut filter_idx = 0;
+
+    for stream in &probe.streams {
+        let surviving = surviving_channels(stream.stream_index, stream.channels, drop_pairs);
+        if surviving.is_empty() {
+            continue;
+        }
+
+        if surviving.len() == stream.channels {
+            output_labels.push(format!("0:{}", stream.stream_index));
+        } else {
+            let label = format!("a{}", filter_idx);
+            filter_idx += 1;
+            let pan = pan_filter(&surviving);
+            filter_parts.push(format!(
+                "[0:{}]{}[{}]",
+                stream.stream_index, pan, label
+            ));
+            output_labels.push(format!("[{}]", label));
+        }
+    }
+
+    if output_labels.is_empty() {
+        args.push("-an".to_string());
+    } else {
+        if !filter_parts.is_empty() {
+            args.push("-filter_complex".to_string());
+            args.push(filter_parts.join(";"));
+        }
+        for label in &output_labels {
+            args.push("-map".to_string());
+            args.push(label.clone());
+        }
+        args.push("-c:a".to_string());
+        args.push(settings.audio_encoder.clone());
+    }
+}
+
+/// Reordered arm: one mono pan per pair, merged into a single audio
+/// output in the given order.
+fn push_reordered_args(
+    args: &mut Vec<String>,
+    settings: &ConverterSettings,
+    ordered_pairs: &[(usize, usize)],
+) {
+    let mut filter_parts: Vec<String> = Vec::new();
+    for (i, &(stream_idx, channel_idx)) in ordered_pairs.iter().enumerate() {
+        let label = format!("a{}", i);
+        filter_parts.push(format!(
+            "[0:{}]pan=mono|FC=c{}[{}]",
+            stream_idx, channel_idx, label
+        ));
+    }
+    let n = ordered_pairs.len();
+    let merge_inputs: Vec<String> = (0..n).map(|i| format!("[a{}]", i)).collect();
+    filter_parts.push(format!(
+        "{}amerge=inputs={}[out]",
+        merge_inputs.join(""),
+        n
+    ));
+    args.push("-filter_complex".to_string());
+    args.push(filter_parts.join(";"));
+    args.push("-map".to_string());
+    args.push("[out]".to_string());
+    args.push("-c:a".to_string());
+    args.push(settings.audio_encoder.clone());
+}
+
+/// Channel indices of a stream that survive `drop_pairs`, in order.
+fn surviving_channels(stream_index: usize, channels: usize, drop_pairs: &[(usize, usize)]) -> Vec<usize> {
+    (0..channels)
+        .filter(|ch| !drop_pairs.contains(&(stream_index, *ch)))
+        .collect()
+}
+
+/// A `pan=` filter expression placing `surviving` input channels on
+/// consecutive outputs with the smallest matching layout. A single
+/// surviving channel uses the direct `FC=` routing form.
+fn pan_filter(surviving: &[usize]) -> String {
+    if surviving.len() == 1 {
+        return format!("pan=mono|FC=c{}", surviving[0]);
+    }
+    let ch_maps: Vec<String> = surviving
+        .iter()
+        .enumerate()
+        .map(|(out_ch, in_ch)| format!("c{}={}", out_ch, in_ch))
+        .collect();
+    format!("pan={}|{}", layout_for_count(surviving.len()), ch_maps.join("|"))
+}
+
+/// Smallest common channel layout carrying `n` channels.
+fn layout_for_count(n: usize) -> &'static str {
+    match n {
+        1 => "mono",
+        2 => "stereo",
+        _ => "5.1",
+    }
 }
 
 pub fn build_video_track_extract_args(

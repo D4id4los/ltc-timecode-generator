@@ -213,9 +213,8 @@ pub fn plan_concat_outputs(
         .map(|p| p.as_ref().and_then(probe_channel_list))
         .collect();
 
-    let reference = match clip_channels.iter().find_map(|c| c.as_ref()) {
-        Some(r) => r.clone(),
-        None => return (steps, warnings),
+    let Some(reference) = reference_layout(&clip_channels) else {
+        return (steps, warnings);
     };
 
     let sample_rate: u32 = all_probes
@@ -266,34 +265,67 @@ pub fn plan_concat_outputs(
         warnings.push_str(
             "Warning: audio channel layouts differ across clips — falling back to per-clip audio outputs.\n"
         );
-        let fallback: Vec<VideoOutputStep> = all_probes
-            .iter()
-            .enumerate()
-            .filter_map(|(fi, p)| p.as_ref().map(|probe| (fi, probe)))
-            .flat_map(|(fi, probe)| {
-                let channels = probe_channel_list(probe).unwrap_or_default();
-                let mut file_steps = Vec::new();
-                let mut emitted = 0usize;
-                for sel in selected_channel_pairs(settings, &channels) {
-                    emitted += 1;
-                    let audio_out = settings.output_path_for_file("audio", fi, emitted, aext);
-                    file_steps.push(VideoOutputStep::AudioChannel {
-                        file_idx: fi,
-                        stream_idx: sel.pair.0,
-                        channel_idx: sel.pair.1,
-                        output: audio_out,
-                        format: fmt.to_string(),
-                        naming_index: emitted,
-                    });
-                }
-                file_steps
-            })
-            .collect();
-        return (fallback, warnings);
+        return (fallback_per_clip_steps(settings, all_probes, fmt, aext), warnings);
     }
 
+    let steps = concat_steps_for(settings, &reference, tracks_segments, fmt, aext, sample_rate);
+    (steps, warnings)
+}
+
+/// The channel layout every clip must share for concatenation: the first
+/// clip that has audio.
+fn reference_layout(clip_channels: &[Option<Vec<(usize, usize)>>]) -> Option<Vec<(usize, usize)>> {
+    clip_channels.iter().find_map(|c| c.as_ref()).cloned()
+}
+
+/// Concat-inconsistent fallback: one AudioChannel output per surviving
+/// channel-map slot of every probed clip.
+fn fallback_per_clip_steps(
+    settings: &ConverterSettings,
+    all_probes: &[Option<VideoAudioProbe>],
+    fmt: &str,
+    aext: &str,
+) -> Vec<VideoOutputStep> {
+    all_probes
+        .iter()
+        .enumerate()
+        .filter_map(|(fi, p)| p.as_ref().map(|probe| (fi, probe)))
+        .flat_map(|(fi, probe)| {
+            let channels = probe_channel_list(probe).unwrap_or_default();
+            let mut file_steps = Vec::new();
+            let mut emitted = 0usize;
+            for sel in selected_channel_pairs(settings, &channels) {
+                emitted += 1;
+                let audio_out = settings.output_path_for_file("audio", fi, emitted, aext);
+                file_steps.push(VideoOutputStep::AudioChannel {
+                    file_idx: fi,
+                    stream_idx: sel.pair.0,
+                    channel_idx: sel.pair.1,
+                    output: audio_out,
+                    format: fmt.to_string(),
+                    naming_index: emitted,
+                });
+            }
+            file_steps
+        })
+        .collect()
+}
+
+/// One AudioChannelConcat output per surviving channel-map slot, carrying
+/// that track's segments across all clips.
+#[allow(clippy::too_many_arguments)]
+fn concat_steps_for(
+    settings: &ConverterSettings,
+    reference: &[(usize, usize)],
+    tracks_segments: Vec<Vec<(usize, usize, usize)>>,
+    fmt: &str,
+    aext: &str,
+    sample_rate: u32,
+) -> Vec<VideoOutputStep> {
+    let num_tracks = reference.len();
+    let mut steps = Vec::new();
     let mut emitted = 0usize;
-    for sel in selected_channel_pairs(settings, &reference) {
+    for sel in selected_channel_pairs(settings, reference) {
         let segments: Vec<(usize, usize, usize)> = tracks_segments[sel.input_i].to_vec();
         if segments.is_empty() {
             continue;
@@ -307,8 +339,7 @@ pub fn plan_concat_outputs(
             sample_rate,
         });
     }
-
-    (steps, warnings)
+    steps
 }
 
 #[derive(Clone, Debug, PartialEq)]

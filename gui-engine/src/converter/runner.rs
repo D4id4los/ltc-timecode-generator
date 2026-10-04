@@ -781,6 +781,21 @@ fn run_video_to_video(
     report: &impl ConversionReport,
     total_steps: &mut usize,
 ) {
+    let probes = probe_all_video_audio(settings, report);
+    let steps = plan_video_steps(settings, &probes, report);
+
+    *total_steps = steps.len();
+
+    execute_video_steps(settings, &probes, fallback, steps, report);
+}
+
+/// Probe every input for its audio layout up front. Failed probes are
+/// recorded as `None` (treated as no-audio downstream). Stops early on
+/// cancellation, leaving a partial list.
+fn probe_all_video_audio(
+    settings: &ConverterSettings,
+    report: &impl ConversionReport,
+) -> Vec<Option<VideoAudioProbe>> {
     let mut probes: Vec<Option<VideoAudioProbe>> = Vec::new();
 
     for file_idx in 0..settings.input_files.len() {
@@ -797,6 +812,18 @@ fn run_video_to_video(
         }
     }
 
+    probes
+}
+
+/// Build the ordered step list: concat mode plans one video-only output per
+/// clip plus one concatenated audio output per surviving track; otherwise
+/// each probed clip is planned individually (unprobed clips get an empty
+/// probe → video-only handling).
+fn plan_video_steps(
+    settings: &ConverterSettings,
+    probes: &[Option<VideoAudioProbe>],
+    report: &impl ConversionReport,
+) -> Vec<StepEntry> {
     let mut steps: Vec<StepEntry> = Vec::new();
 
     let use_concat = settings.concat_audio
@@ -814,7 +841,7 @@ fn run_video_to_video(
             });
         }
 
-        let (concat_steps, warning) = plan_concat_outputs(settings, &probes);
+        let (concat_steps, warning) = plan_concat_outputs(settings, probes);
         if !warning.is_empty() {
             warn!("{}", warning.trim());
             report.append_log(&format!("\n--- {}\n", warning.trim()));
@@ -824,22 +851,31 @@ fn run_video_to_video(
         }
     } else {
         for (file_idx, probe_opt) in probes.iter().enumerate() {
-            let probe = match probe_opt {
-                Some(p) => p.clone(),
-                None => VideoAudioProbe {
+            let probe = probe_opt
+                .clone()
+                .unwrap_or(VideoAudioProbe {
                     streams: Vec::new(),
                     total_audio_channels: 0,
                     is_video_file: true,
-                },
-            };
+                });
             for s in plan_video_outputs_for_file(settings, file_idx, &probe) {
                 steps.push(StepEntry { step: s, is_audio_only: false });
             }
         }
     }
 
-    *total_steps = steps.len();
+    steps
+}
 
+/// Execute the planned steps in order, stopping on the first failure or
+/// cancellation.
+fn execute_video_steps(
+    settings: &mut ConverterSettings,
+    probes: &[Option<VideoAudioProbe>],
+    fallback: &mut EncoderFallback,
+    steps: Vec<StepEntry>,
+    report: &impl ConversionReport,
+) {
     for (step_idx, entry) in steps.iter().enumerate() {
         if report.is_cancelled() { break; }
 
@@ -1184,10 +1220,7 @@ fn extract_concat_audio(
             } => {
                 let sr = probes[*file_idx]
                     .as_ref()
-                    .and_then(|p| {
-                        p.streams.iter().find(|s| s.stream_index == *stream_idx)
-                    })
-                    .map(|s| s.sample_rate)
+                    .map(|p| sample_rate_for_stream(p, *stream_idx))
                     .unwrap_or(48000);
                 if let Err(e) = run_ffmpeg_process(
                     &build_video_track_extract_args(
@@ -1216,6 +1249,20 @@ fn extract_concat_audio(
         }
     }
     Some(())
+}
+
+/// Sample rate of `stream_idx` in the probe, defaulting to 48 kHz when the
+/// stream is absent from the probe.
+fn sample_rate_for_stream(
+    probe: &crate::ffprobe::VideoAudioProbe,
+    stream_idx: usize,
+) -> u32 {
+    probe
+        .streams
+        .iter()
+        .find(|s| s.stream_index == stream_idx)
+        .map(|s| s.sample_rate)
+        .unwrap_or(48000)
 }
 
 /// Phase E (per-file) — split or merged extraction for each probed clip.
@@ -1248,81 +1295,121 @@ fn extract_per_file_audio(
                 settings.split_tracks && settings.channel_map.num_channels() > 0;
 
             if use_split {
-                let mut emitted = 0usize;
-                for sel in selected_channel_pairs(settings, &channels) {
-                    if check_cancelled(report) {
-                        return None;
-                    }
-                    let (stream_idx, ch_idx) = sel.pair;
-                    emitted += 1;
-                    let output_path =
-                        settings.output_path_for_file("audio", file_idx, emitted, aext);
-                    let sample_rate = probe
-                        .streams
-                        .iter()
-                        .find(|s| s.stream_index == stream_idx)
-                        .map(|s| s.sample_rate)
-                        .unwrap_or(48000);
-                    let args = build_video_track_extract_args(
-                        settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
-                    );
-                    if let Err(e) = run_ffmpeg_process(
-                        &args,
-                        &output_path,
-                        report,
-                        total_actual,
-                        cursor,
-                    ) {
-                        note_step_failure(
-                            ledger,
-                            report,
-                            FailureKind::Extraction(e.clone()),
-                            Some(input_path),
-                            &format!("{} — audio extraction failed", input_path.display()),
-                        );
-                    } else {
-                        ledger.note_success();
-                    }
-                    cursor += 1;
-                }
+                let emitted = extract_split_channels_for_file(
+                    settings,
+                    probe,
+                    file_idx,
+                    input_path,
+                    &channels,
+                    fmt,
+                    aext,
+                    report,
+                    ledger,
+                    total_actual,
+                    &mut cursor,
+                )?;
                 if emitted == 0 {
                     report.advance_step();
                 }
             } else {
-                let output_path = settings.merged_audio_output_path(aext);
-                let (stream_idx, ch_idx) =
-                    channels.first().copied().unwrap_or((0, 0));
-                let sample_rate = probe
-                    .streams
-                    .first()
-                    .map(|s| s.sample_rate)
-                    .unwrap_or(48000);
-                let args = build_video_track_extract_args(
-                    settings, file_idx, stream_idx, ch_idx, fmt, sample_rate,
-                );
-                if let Err(e) = run_ffmpeg_process(
-                    &args,
-                    &output_path,
+                extract_merged_audio_for_file(
+                    settings,
+                    probe,
+                    file_idx,
+                    input_path,
+                    &channels,
+                    fmt,
+                    aext,
                     report,
+                    ledger,
                     total_actual,
-                    cursor,
-                ) {
-                    note_step_failure(
-                        ledger,
-                        report,
-                        FailureKind::Extraction(e.clone()),
-                        Some(input_path),
-                        &format!("{} — audio extraction failed", input_path.display()),
-                    );
-                } else {
-                    ledger.note_success();
-                }
-                cursor += 1;
+                    &mut cursor,
+                )?;
             }
         } else if !is_video {
             report.advance_step();
         }
     }
+    Some(())
+}
+
+/// Per-file split extraction: one output per surviving (stream, channel)
+/// pair of `channels`. Returns the number of emitted outputs, or `None`
+/// on cancellation. Advances `cursor` past every attempted step.
+#[allow(clippy::too_many_arguments)]
+fn extract_split_channels_for_file(
+    settings: &ConverterSettings,
+    probe: &crate::ffprobe::VideoAudioProbe,
+    file_idx: usize,
+    input_path: &Path,
+    channels: &[(usize, usize)],
+    fmt: &str,
+    aext: &str,
+    report: &impl ConversionReport,
+    ledger: &mut FailureLedger,
+    total_actual: usize,
+    cursor: &mut usize,
+) -> Option<usize> {
+    let mut emitted = 0usize;
+    for sel in selected_channel_pairs(settings, channels) {
+        if check_cancelled(report) {
+            return None;
+        }
+        let (stream_idx, ch_idx) = sel.pair;
+        emitted += 1;
+        let output_path = settings.output_path_for_file("audio", file_idx, emitted, aext);
+        let sample_rate = sample_rate_for_stream(probe, stream_idx);
+        let args =
+            build_video_track_extract_args(settings, file_idx, stream_idx, ch_idx, fmt, sample_rate);
+        if let Err(e) = run_ffmpeg_process(&args, &output_path, report, total_actual, *cursor) {
+            note_step_failure(
+                ledger,
+                report,
+                FailureKind::Extraction(e.clone()),
+                Some(input_path),
+                &format!("{} — audio extraction failed", input_path.display()),
+            );
+        } else {
+            ledger.note_success();
+        }
+        *cursor += 1;
+    }
+    Some(emitted)
+}
+
+/// Per-file merged extraction: a single output starting from the first
+/// audio channel of the clip. Returns `None` on cancellation.
+#[allow(clippy::too_many_arguments)]
+fn extract_merged_audio_for_file(
+    settings: &ConverterSettings,
+    probe: &crate::ffprobe::VideoAudioProbe,
+    file_idx: usize,
+    input_path: &Path,
+    channels: &[(usize, usize)],
+    fmt: &str,
+    aext: &str,
+    report: &impl ConversionReport,
+    ledger: &mut FailureLedger,
+    total_actual: usize,
+    cursor: &mut usize,
+) -> Option<()> {
+    let output_path = settings.merged_audio_output_path(aext);
+    let (stream_idx, ch_idx) = channels.first().copied().unwrap_or((0, 0));
+    let sample_rate = sample_rate_for_stream(probe, stream_idx);
+    let args =
+        build_video_track_extract_args(settings, file_idx, stream_idx, ch_idx, fmt, sample_rate);
+    if let Err(e) = run_ffmpeg_process(&args, &output_path, report, total_actual, *cursor) {
+        note_step_failure(
+            ledger,
+            report,
+            FailureKind::Extraction(e.clone()),
+            Some(input_path),
+            &format!("{} — audio extraction failed", input_path.display()),
+        );
+    } else {
+        ledger.note_success();
+    }
+    *cursor += 1;
     Some(())
 }
 
