@@ -1594,7 +1594,8 @@ mod tests {
 
         assert!(
             !*report.failed.lock().unwrap(),
-            "should not be failed when one track survives"
+            "should not be failed when one track survives — report log:\n{}",
+            report.log.lock().unwrap()
         );
     }
 
