@@ -521,6 +521,27 @@ A test must fail when behavior regresses and pass when behavior improves.
   inject a clock/runner seam. Never assert on wall-clock elapsed time or on
   observing a transient intermediate state; assert terminal state instead.
 
+### Test-Lint Guardrails (CI)
+
+`bash scripts/test-lint.sh` (also `npm run test:lint`, and the first CI step
+after checkout) fails on the two most recurrent violations of the rules above,
+over test code only (`tests/` dirs and `#[cfg(test)]` regions):
+
+- **sleep** — `thread::sleep` used as a test wait mechanism outside a
+  poll-with-deadline context. Worker-closure sleeps, deadline-adjacent polls,
+  and engine-start-then-join patterns are structurally exempt (WP-T1's
+  do-not-touch categories) — prefer fixing the *rule* over per-site allows
+  when a new legitimate shape appears.
+- **text-pin** — `.contains("` on an error/message-shaped identifier
+  (`err|error|msg|message|status|label|details`). Suppress only with an
+  inline, reason-bearing `// test-lint: allow(text-pin): <why>` comment
+  inside the test function, and only when the text *is* the contract (e.g.
+  a formatter's Display output, template/naming tokens) — additions need a
+  decision note in the PR, same as the "decide, then assert" workflow.
+
+Run `--self-test` (CI does) to verify the detector itself; exit code 2 means
+the lint is broken and must red rather than pass.
+
 ### Integration Suites
 
 - `gui-engine/tests/integration.rs` — engine-thread command processing, incl. offload scan/copy integration tests driven through `EngineSeams.scan_cards` (fake card, real tempdir copies, cancel + guard branches) and the `SetDevice` bogus-id revert test

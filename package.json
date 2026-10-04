@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:flaky": "cargo nextest run --profile ci",
+    "test:lint": "bash scripts/test-lint.sh",
     "sonar:gate": "node scripts/sonar-gate.mjs",
     "sonar:report": "node scripts/sonar-report.mjs",
     "version": "node scripts/sync-version.js"

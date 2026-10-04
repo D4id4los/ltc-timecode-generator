@@ -28,6 +28,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libltc-dev libclang-dev ffmpeg
 
+      # WP-T7 guardrail: needs only python3 (preinstalled), so it runs
+      # before any toolchain install and reds the PR cheapest-first.
+      - name: Test-lint guardrails (sleep / text-pin rules)
+        run: |
+          bash scripts/test-lint.sh --self-test
+          bash scripts/test-lint.sh
+
       - name: Install Rust toolchain (stable, clippy, llvm-tools)
         uses: dtolnay/rust-toolchain@stable
         with:
