@@ -78,9 +78,6 @@ jobs:
   # console suppression) that the Linux job never builds. Check-only: no
   # link, no tests — a full windows-latest test job is follow-up F-3/F-4 in
   # reports/wp4-test-gap-closure-plan.md.
-  # Deliberately out of scope: an Apple-target cross-check (CoreAudio SDK
-  # sysroot from Linux is fragile); the macOS /Volumes scan block stays
-  # guarded by review only.
   windows-cross-check:
     runs-on: ubuntu-latest
     env:
@@ -105,3 +102,35 @@ jobs:
 
       - name: cargo check (x86_64-pc-windows-gnu)
         run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+
+  # Compile-check the macOS-only cfg blocks (offload /Volumes card scan,
+  # audio-output CoreAudio arm) that no other job builds. Check-only guard,
+  # not a first-class test job (G3d decision): the /Volumes block still runs
+  # on no CI test. --all-targets compiles the test code too, so the
+  # cfg-gated test fixtures get a macOS compile signal. No x86_64 job: both
+  # macOS targets compile the same macOS cfg blocks.
+  macos-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Homebrew deps (libltc, llvm for bindgen)
+        # PKG_CONFIG_PATH/LIBCLANG_PATH computed here (not at job level —
+        # job env cannot reference GITHUB_ENV) so the job survives
+        # runner-image prefix changes (/opt/homebrew vs /usr/local).
+        run: |
+          brew install libltc llvm
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build (macos target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-check
+
+      - name: cargo check (aarch64-apple-darwin)
+        run: cargo check --workspace --all-targets
