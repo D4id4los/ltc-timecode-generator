@@ -259,9 +259,8 @@ pub fn match_files_to_groups(
             let a_stem = a.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let b_stem = b.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-            let a_ch: u32 = channel_index_of(&re, pattern.channel_group, &a_stem);
-            let a_ch: u32 = channel_index_of(&re, pattern.channel_group, &a_stem);
-            let b_ch: u32 = channel_index_of(&re, pattern.channel_group, &b_stem);
+            let a_ch: u32 = channel_index_of(&re, pattern.channel_group, a_stem);
+            let b_ch: u32 = channel_index_of(&re, pattern.channel_group, b_stem);
 
             a_ch.cmp(&b_ch)
         });

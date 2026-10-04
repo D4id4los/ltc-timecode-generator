@@ -205,7 +205,6 @@ pub fn plan_concat_outputs(
     all_probes: &[Option<VideoAudioProbe>],
 ) -> (Vec<VideoOutputStep>, String) {
     let (fmt, aext) = audio_encoder_to_output_format(&settings.audio_encoder);
-    let mut steps: Vec<VideoOutputStep> = Vec::new();
     let mut warnings = String::new();
 
     let clip_channels: Vec<Option<Vec<(usize, usize)>>> = all_probes
@@ -214,7 +213,7 @@ pub fn plan_concat_outputs(
         .collect();
 
     let Some(reference) = reference_layout(&clip_channels) else {
-        return (steps, warnings);
+        return (Vec::new(), warnings);
     };
 
     let sample_rate: u32 = all_probes
@@ -322,7 +321,6 @@ fn concat_steps_for(
     aext: &str,
     sample_rate: u32,
 ) -> Vec<VideoOutputStep> {
-    let num_tracks = reference.len();
     let mut steps = Vec::new();
     let mut emitted = 0usize;
     for sel in selected_channel_pairs(settings, reference) {
