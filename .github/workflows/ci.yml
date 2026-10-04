@@ -87,8 +87,8 @@ jobs:
 
   # Compile-check the Windows-only cfg blocks (offload win_driver, subprocess
   # console suppression) that the Linux job never builds. Check-only: no
-  # link, no tests — a full windows-latest test job is follow-up F-3/F-4 in
-  # reports/wp4-test-gap-closure-plan.md.
+  # link, no tests. The full test suite on windows-latest runs in the
+  # windows-tests job below; this stays as the fast per-PR compile guard.
   windows-cross-check:
     runs-on: ubuntu-latest
     env:
@@ -146,3 +146,101 @@ jobs:
 
       - name: cargo check (aarch64-apple-darwin)
         run: cargo check --workspace --all-targets
+
+  # Full test suite on the shipped Windows target (G3d / WP-4.6):
+  # x86_64-pc-windows-gnu, the same target build-all-rust-targets.sh ships.
+  # libltc has no Windows package (no MSYS2/vcpkg port), so it is built
+  # from a pinned source release inside an MSYS2 mingw64 shell (the
+  # README.org cross-compile recipe relocated onto the runner) and cached
+  # by tag. ffmpeg is installed so the converter integration tests execute
+  # instead of loud-skipping. No coverage instrumentation — LCOV/Sonar
+  # stay ubuntu-owned.
+  windows-tests:
+    runs-on: windows-latest
+    env:
+      LIBLTC_TAG: v1.3.2
+      LIBLTC_PREFIX: ${{ github.workspace }}/libltc-prefix
+      BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu: -I${{ github.workspace }}/libltc-prefix/include
+      RUSTFLAGS: -L native=${{ github.workspace }}/libltc-prefix/lib
+      # windows-latest images ship LLVM (libclang.dll for bindgen); the
+      # verify step falls back to choco if the image ever drops it.
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install ffmpeg (converter integration tests)
+        run: choco install ffmpeg -y
+
+      - name: Install Rust toolchain (stable, windows-gnu target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Verify libclang for bindgen
+        run: |
+          if (-not (Test-Path "$env:LIBCLANG_PATH\libclang.dll")) {
+            Write-Host "libclang.dll not found in image LLVM — installing via choco"
+            choco install llvm -y
+            echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Cache libltc prefix (keyed on the pinned release)
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/libltc-prefix
+          key: libltc-${{ env.LIBLTC_TAG }}-mingw64
+
+      - name: Provision libltc (MSYS2 mingw64 source build)
+        uses: msys2/setup-msys2@v2
+        with:
+          release: true
+          msystem: MINGW64
+          update: false
+          install: git make autoconf automake libtool mingw-w64-x86_64-toolchain
+
+      - name: Build libltc into the job prefix
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+          if [ -f "$LIBLTC_PREFIX/lib/libltc.a" ]; then
+            echo "libltc cache hit"
+            exit 0
+          fi
+          git clone --depth 1 --branch "$LIBLTC_TAG" https://github.com/x42/libltc.git /tmp/libltc-src
+          cd /tmp/libltc-src
+          autoreconf -vfi
+          ./configure --host=x86_64-w64-mingw32 --prefix="$(cygpath -u "$LIBLTC_PREFIX")" --enable-static --disable-shared
+          make -j"$(nproc)"
+          make install
+
+      - name: Put the MSYS2 mingw64 linker on PATH
+        # rustc's self-contained mingw only covers its own CRT objects; an
+        # external C library needs the mingw gcc as the linker. Set as env
+        # from day one so the rust-cache key is stable (RUSTFLAGS/env
+        # changes invalidate the cache).
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Cache cargo build (windows-tests)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-tests
+          workspaces: |
+            .
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run tests (cargo nextest, ci profile)
+        run: cargo nextest run --workspace --profile ci 2>&1 | Tee-Object -FilePath nextest-output.txt
+
+      - name: Test-count summary guard
+        # "all skipped" must not hide behind green: parse the nextest
+        # summary and fail if suspiciously few tests ran.
+        run: |
+          $line = (Select-String -Path nextest-output.txt -Pattern '(\d+) tests run: (\d+) passed' | Select-Object -Last 1)
+          if (-not $line) { throw "no nextest summary line found" }
+          Write-Host "SUMMARY: $($line.Line)"
+          if ([int]$line.Matches[0].Groups[1].Value -lt 800) { throw "suspiciously few tests ran: $($line.Line)" }
+
+      - name: Test-lint guardrail self-test (platform-independent)
+        run: bash scripts/test-lint.sh --self-test
