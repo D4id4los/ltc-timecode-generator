@@ -48,12 +48,6 @@ jobs:
         with:
           tool: cargo-nextest,cargo-llvm-cov
 
-      - name: Setup Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-
       - name: Clippy (JSON report for Sonar)
         run: cargo clippy --workspace --all-targets --message-format=json > clippy-report.json
 
@@ -62,18 +56,6 @@ jobs:
 
       - name: Generate LCOV coverage report for Sonar
         run: cargo llvm-cov report --lcov --output-path lcov.info
-
-      - name: npm install
-        run: npm ci
-
-      - name: TypeScript typecheck
-        run: npm run lint
-
-      # Coverage LCOV is no longer exported here: src/ is Sonar-frozen
-      # since WP-5 (see reports/wp5-process-hygiene-plan.md); the local
-      # `npm run test:coverage` remains for ad-hoc web-app work.
-      - name: Web tests (vitest) — legacy frontend guard
-        run: npm test
 
       - name: Cache SonarQube packages
         uses: actions/cache@v6
