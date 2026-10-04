@@ -1,0 +1,292 @@
+# Tag-driven release pipeline (Phase 6). Pushing a strict `vX.Y.Z` tag
+# builds the official ship matrix and publishes a GitHub Release whose body
+# is the matching VERSION_LOG.org entry.
+#
+# Tag pattern (D5): GitHub Actions tag filters are glob, not regex — `v*`
+# is too loose and `v[0-9]+.[0-9]+.[0-9]+` is not expressible. The trigger
+# below is therefore only a glob PREFILTER (two literal dots + leading
+# digit required); the `guard` job enforces the full convention with a real
+# regex (`^v[0-9]+\.[0-9]+\.[0-9]+$`) and fails the workflow before any
+# build starts. Do NOT "simplify" this to `v*` — the guard regex is the
+# authoritative layer.
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Rehearse the pipeline (guard + builds + packaging) without publishing'
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel a release mid-flight.
+  cancel-in-progress: false
+
+env:
+  LIBLTC_TAG: v1.3.2
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Determine tag and version
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            # workflow_dispatch rehearsal: derive the tag from the
+            # workspace version so the full pipeline (incl. notes
+            # extraction) is exercised without a real tag.
+            VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Rehearsing/publishing tag: ${TAG}"
+
+      - name: Strict tag-pattern guard (D5)
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$TAG' does not match v<major>.<minor>.<patch> (e.g. v0.6.0; no pre-release/build suffixes)"
+            exit 1
+          fi
+
+      - name: Version/tag consistency check
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)
+          if [ "v${VERSION}" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match [workspace.package] version $VERSION — cut the tag with scripts/bump-version.sh"
+            exit 1
+          fi
+
+      - name: Extract release notes from VERSION_LOG.org (loud-fail if missing)
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          bash scripts/release-notes.sh "$TAG" VERSION_LOG.org > release-notes.md
+          echo "--- release-notes.md ---"
+          cat release-notes.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  build-linux-x64:
+    needs: guard
+    runs-on: ubuntu-latest
+    env:
+      PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+      LIBLTC_PREFIX: ${{ github.workspace }}/libltc-prefix
+      # Static libltc: only libltc.a in the search path forces `-lltc` to
+      # resolve to the archive — never apt install libltc-dev here.
+      # --allow-shlib-undefined: the runner's libasound.so is built against
+      # a newer glibc than the 2.31 target; the runtime system supplies its
+      # own (old) libasound, and the objdump step below verifies our
+      # binary's direct symbol floor.
+      RUSTFLAGS: -L native=${{ github.workspace }}/libltc-prefix/lib -C link-arg=-Wl,--allow-shlib-undefined
+      # zigbuild passes TARGET=x86_64-unknown-linux-gnu.2.31, so bindgen's
+      # target-specific lookup carries a .2.31 suffix and misses the plain
+      # triple var — the plain var is the one that reliably reaches bindgen.
+      BINDGEN_EXTRA_CLANG_ARGS: -I${{ github.workspace }}/libltc-prefix/include
+      BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu: -I${{ github.workspace }}/libltc-prefix/include
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies (build-test-analyze set minus libltc-dev)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libclang-dev autoconf automake libtool
+
+      - name: Install Rust toolchain (stable, gnu target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Cache zig (pinned 0.13.0, parity with Dockerfile.gui-build)
+        uses: actions/cache@v4
+        with:
+          path: zig
+          key: zig-0.13.0-linux-x86_64
+
+      - name: Install zig 0.13.0
+        run: |
+          if [ ! -x zig/zig ]; then
+            curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+            mv zig-linux-x86_64-0.13.0 zig
+          fi
+          echo "$GITHUB_WORKSPACE/zig" >> "$GITHUB_PATH"
+
+      - name: Cache libltc static prefix (keyed on the pinned release)
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/libltc-prefix
+          key: libltc-${{ env.LIBLTC_TAG }}-linux64-static
+
+      - name: Provision static libltc
+        run: bash scripts/build-libltc-static.sh "$LIBLTC_PREFIX"
+
+      - name: Cache cargo build (linux-release)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-release
+
+      - name: Build ltc-gui with glibc 2.31 floor (D2)
+        run: cargo zigbuild --target x86_64-unknown-linux-gnu.2.31 --release --bin ltc-gui
+
+      - name: Verify static libltc (D1)
+        run: |
+          if ldd target/x86_64-unknown-linux-gnu/release/ltc-gui | grep libltc; then
+            echo "::error::released binary links libltc dynamically — static linking violated"
+            exit 1
+          fi
+
+      - name: Verify glibc 2.31 floor (D2)
+        run: |
+          max=$(objdump -T target/x86_64-unknown-linux-gnu/release/ltc-gui | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 | sed 's/^GLIBC_//')
+          echo "max required GLIBC symbol version: $max"
+          if [ "$(printf '2.31\n%s\n' "$max" | sort -V | tail -1)" != "2.31" ]; then
+            echo "::error::binary requires GLIBC $max > 2.31 floor"
+            exit 1
+          fi
+
+      - name: Stage and upload artifact
+        run: |
+          mkdir -p stage
+          cp target/x86_64-unknown-linux-gnu/release/ltc-gui stage/ltc-gui
+          tar -cJf "ltc-gui_${GITHUB_REF_NAME#v}_linux-x86_64.tar.xz" -C stage ltc-gui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: ltc-gui_*_linux-x86_64.tar.xz
+          if-no-files-found: error
+
+  build-windows-x64:
+    needs: guard
+    runs-on: windows-latest
+    env:
+      LIBLTC_PREFIX: ${{ github.workspace }}/libltc-prefix
+      BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu: -I${{ github.workspace }}/libltc-prefix/include
+      RUSTFLAGS: -L native=${{ github.workspace }}/libltc-prefix/lib
+      # windows-latest images ship LLVM (libclang.dll for bindgen).
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (stable, windows-gnu target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Verify libclang for bindgen
+        run: |
+          if (-not (Test-Path "$env:LIBCLANG_PATH\libclang.dll")) {
+            Write-Host "libclang.dll not found in image LLVM — installing via choco"
+            choco install llvm -y
+            echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Cache libltc static prefix (keyed on the pinned release)
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/libltc-prefix
+          key: libltc-${{ env.LIBLTC_TAG }}-mingw64
+
+      - name: Provision libltc (MSYS2 mingw64 source build via shared script)
+        uses: msys2/setup-msys2@v2
+        with:
+          release: true
+          msystem: MINGW64
+          update: false
+          install: git make autoconf automake libtool mingw-w64-x86_64-toolchain
+
+      - name: Build libltc into the job prefix
+        shell: msys2 {0}
+        run: bash scripts/build-libltc-static.sh "$(cygpath -u "$LIBLTC_PREFIX")" x86_64-w64-mingw32
+
+      - name: Put the MSYS2 mingw64 linker on PATH
+        # rustc's self-contained mingw only covers its own CRT objects; an
+        # external C library needs the mingw gcc as the linker.
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Cache cargo build (windows-release)
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+          workspaces: |
+            .
+
+      - name: Build ltc-gui.exe (x86_64-pc-windows-gnu)
+        run: cargo build --release --target x86_64-pc-windows-gnu --bin ltc-gui
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: target/x86_64-pc-windows-gnu/release/ltc-gui.exe
+          if-no-files-found: error
+
+  release:
+    needs: [guard, build-linux-x64, build-windows-x64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Determine tag (same derivation as guard)
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+
+      - name: Concatenate checksums
+        run: |
+          ls -la dist dist/linux-x64 dist/windows-x64 dist/release-notes
+          cd dist
+          sha256sum linux-x64/ltc-gui_*.tar.xz windows-x64/ltc-gui.exe > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release (VERSION_LOG entry as body)
+        # dry_run (workflow_dispatch only) skips the publish but everything
+        # else — guard, builds, packaging — still executes: the rehearsal.
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file dist/release-notes/release-notes.md \
+            dist/SHA256SUMS dist/linux-x64/ltc-gui_*.tar.xz dist/windows-x64/ltc-gui.exe
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run == true }}
+        run: echo "Dry run — pipeline green through packaging; skipped 'gh release create'."
