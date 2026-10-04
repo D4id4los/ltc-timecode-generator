@@ -30,8 +30,6 @@ use crate::state::{AppStateSnapshot, ClapLogItem, ClipDecodeState};
 use crate::timecode;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(40);
-const TARGET_ARM_ANGLE: f32 = -25.0 * std::f32::consts::PI / 180.0;
-const ARM_SETTLE_EPS: f32 = 1.0 * std::f32::consts::PI / 180.0; // 1 degree
 const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 const MAX_CLAP_LOGS: usize = 1000;
 const BUFFER_SIZE: u32 = 0;
@@ -237,7 +235,6 @@ fn engine_main_loop(
 
     'engine: loop {
         let now = Instant::now();
-        let dt = (now - els.last_tick).as_secs_f32();
         els.last_tick = now;
 
         // 1. Drain all pending commands.  Every successfully received
@@ -291,14 +288,13 @@ fn engine_main_loop(
             handle_event(event, &core, &event_tx, &mut els);
         }
 
-        // 4./5. Animation: flash alpha + arm angle decay, animating flag.
-        update_clapper_animation(&mut els.current.clapper, dt);
-
-        // 6. Publish state — only when the snapshot actually changed.
+        // 4. Publish state — only when the snapshot actually changed.
+        //    (Clap animation is GUI-local since Phase 5: the engine only
+        //    bumps `clapper.clap_seq` in `cmd_clap`; no per-tick decay.)
         els.current.audio_recovery_attempts = els.recovery_attempts;
         publish_if_changed(&mut els, &state);
 
-        // 7. Sleep until next tick
+        // 5. Sleep until next tick
         let next_tick = els.last_tick + TICK_INTERVAL;
         if let Some(sleep_dur) = next_tick.checked_duration_since(Instant::now()) {
             std::thread::sleep(sleep_dur);
@@ -324,20 +320,6 @@ fn sync_job_statuses(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) 
             els.current.jobs.insert(*kind, JobStatus::from_progress(snap));
         }
     }
-}
-
-/// Advance the clapper animations by `dt` seconds: flash alpha decays at
-/// 2.0/s, arm angle decays exponentially toward rest at 4.0/s, and the
-/// `animating` flag tracks whether the clap animation is still visibly in
-/// progress (the GUI uses it to pick its repaint rate).
-fn update_clapper_animation(clapper: &mut crate::state::ClapperSnapshot, dt: f32) {
-    if clapper.flash_alpha > 0.0 {
-        clapper.flash_alpha = (clapper.flash_alpha - dt * 2.0).max(0.0);
-    }
-    clapper.arm_angle += (TARGET_ARM_ANGLE - clapper.arm_angle)
-        * (1.0 - (-4.0 * dt).exp());
-    clapper.animating = clapper.flash_alpha > 0.0
-        || (clapper.arm_angle - TARGET_ARM_ANGLE).abs() > ARM_SETTLE_EPS;
 }
 
 /// Publish the snapshot only when it differs from the last-published one.
@@ -559,8 +541,8 @@ fn cmd_clap(core: &AudioCore, els: &mut EngineLoopState) {
         state.beep_volume,
         state.beep_channel,
     );
-    state.clapper.flash_alpha = 1.0;
-    state.clapper.arm_angle = 0.0;
+    // Clap animation is GUI-local: only the monotonic trigger counter and
+    // the clap log/take/status move here.
     state.clapper.clap_seq = state.clapper.clap_seq.wrapping_add(1);
 
     let tc_str = timecode::timecode_to_string(state.current_timecode, state.drop_frame());
@@ -2984,56 +2966,8 @@ mod tests {
         assert_eq!(els.current.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded);
     }
 
-    // ── update_clapper_animation (pure) ──────────────────────────────────
-
-    fn animation_clapper() -> crate::state::ClapperSnapshot {
-        crate::state::ClapperSnapshot {
-            scene: 0,
-            take: 0,
-            roll: String::new(),
-            auto_increment_take: false,
-            logs: Vec::new(),
-            flash_alpha: 0.0,
-            arm_angle: TARGET_ARM_ANGLE,
-            animating: false,
-            clap_seq: 0,
-        }
-    }
-
-    #[test]
-    fn clapper_animation_flash_decays_and_clamps_at_zero() {
-        let mut clapper = animation_clapper();
-        clapper.flash_alpha = 0.1;
-        update_clapper_animation(&mut clapper, 0.04);
-        assert!(clapper.flash_alpha > 0.0, "small decay must not clamp");
-        let a = clapper.flash_alpha;
-        update_clapper_animation(&mut clapper, 10.0);
-        assert_eq!(clapper.flash_alpha, 0.0, "large decay must clamp at zero");
-        assert!(a < 0.1);
-    }
-
-    #[test]
-    fn clapper_animation_arm_angle_settles_toward_rest_and_flag_clears() {
-        let mut clapper = animation_clapper();
-        clapper.flash_alpha = 1.0;
-        clapper.arm_angle = 0.0;
-        // Decay far past the settle window in one step.
-        update_clapper_animation(&mut clapper, 10.0);
-        assert!((clapper.arm_angle - TARGET_ARM_ANGLE).abs() < ARM_SETTLE_EPS,
-            "arm must settle within epsilon of the rest angle");
-        assert!(!clapper.animating,
-            "settled arm + zero flash must clear the animating flag");
-        assert!(clapper.flash_alpha == 0.0);
-    }
-
-    #[test]
-    fn clapper_animation_stays_animating_while_flash_visible() {
-        let mut clapper = animation_clapper();
-        clapper.flash_alpha = 0.5;
-        clapper.arm_angle = TARGET_ARM_ANGLE; // arm already at rest
-        update_clapper_animation(&mut clapper, 0.04);
-        assert!(clapper.animating, "visible flash must keep the animating flag set");
-    }
+    // ── update_clapper_animation decay tests were relocated to
+    //    ltc-gui/src/clap_anim.rs (GUI-local animation ownership, Phase 5).
 
     #[test]
     fn handle_job_event_ignores_wrong_payload_without_panicking() {

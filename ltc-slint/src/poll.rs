@@ -42,6 +42,13 @@ fn advance_pulse(phase: f64) -> f64 {
     if advanced > PI * 100.0 { 0.0 } else { advanced }
 }
 
+/// True when the engine's monotonic `clap_seq` has moved past the last
+/// value the GUI animated — the one-shot trigger for the declarative clap
+/// animation (see `ui/app.slint`'s `flash-strike` state machine).
+fn clap_started(new_seq: u64, last_seen: u64) -> bool {
+    new_seq != last_seen
+}
+
 /// Device list entry label, marking the system default device.
 fn device_display_name(name: &str, is_default: bool) -> String {
     if is_default {
@@ -306,6 +313,9 @@ pub(crate) struct PollContext {
     shadows: Arc<Mutex<Shadows>>,
     last_log_count: Arc<Mutex<usize>>,
     last_device_key: Arc<Mutex<(usize, String)>>,
+    /// Last `clapper.clap_seq` the GUI animated (seeded from the snapshot so
+    /// a mid-session start does not fire for an old clap).
+    last_clap_seq: Arc<Mutex<u64>>,
 }
 
 impl PollContext {
@@ -319,6 +329,7 @@ impl PollContext {
         pulse_phase: Arc<Mutex<f64>>,
         shadows: Arc<Mutex<Shadows>>,
     ) -> Self {
+        let initial_clap_seq = engine_state.load().clapper.clap_seq;
         Self {
             engine_state,
             event_rx,
@@ -330,6 +341,7 @@ impl PollContext {
             shadows,
             last_log_count: Arc::new(Mutex::new(0)),
             last_device_key: Arc::new(Mutex::new((0, String::new()))),
+            last_clap_seq: Arc::new(Mutex::new(initial_clap_seq)),
         }
     }
 }
@@ -455,9 +467,16 @@ fn sync_transport_display(ui: &AppWindow, s: &AppStateSnapshot) {
     ui.set_buffer_size(buffer_smp);
     ui.set_sample_format(SharedString::from(s.sample_format_name.to_uppercase()));
 
-    // 16. Arm angle and flash opacity
-    ui.set_arm_angle(s.clapper.arm_angle);
-    ui.set_flash_opacity(s.clapper.flash_alpha);
+}
+
+fn sync_clap_strike(ui: &AppWindow, s: &AppStateSnapshot, last_clap_seq: &Mutex<u64>) {
+    let mut last = last_clap_seq.lock().unwrap();
+    if clap_started(s.clapper.clap_seq, *last) {
+        *last = s.clapper.clap_seq;
+        ui.set_flash_strike(true);
+    } else if ui.get_flash_strike() {
+        ui.set_flash_strike(false);
+    }
 }
 
 fn sync_device_selection(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64, now: Instant, sh: &mut Shadows) {
@@ -774,6 +793,7 @@ pub fn setup_poll_timer(
         shadows,
         last_log_count,
         last_device_key,
+        last_clap_seq,
     } = ctx;
 
     let ui_weak = ui.as_weak();
@@ -806,6 +826,7 @@ pub fn setup_poll_timer(
             sync_decode_progress(&ui, &s);
             sync_pulse(&ui, &pulse_phase);
             sync_transport_display(&ui, &s);
+            sync_clap_strike(&ui, &s, &last_clap_seq);
             sync_device_selection(&ui, &s, applied_seq, now, &mut sh);
             sync_converter_settings(&ui, &s, applied_seq, now, &mut sh);
             sync_ffmpeg_caps(&ui, &s);
@@ -901,6 +922,14 @@ mod tests {
         let step = 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
         assert!((advance_pulse(0.0) - step).abs() < 1e-9);
         assert_eq!(advance_pulse(PI * 100.0 + 1.0), 0.0);
+    }
+
+    #[test]
+    fn clap_started_fires_only_on_seq_change() {
+        assert!(!clap_started(0, 0), "same seq must not retrigger");
+        assert!(clap_started(1, 0), "bumped seq triggers once");
+        assert!(!clap_started(1, 1), "already-animated seq must not retrigger");
+        assert!(clap_started(3, 2), "missed claps still trigger (animates once)");
     }
 
     #[test]

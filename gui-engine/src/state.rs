@@ -209,11 +209,10 @@ pub struct DecodeSnapshot {
 
 // ── Clapper snapshot (engine-owned) ────────────────────────────────────
 
-/// Engine-managed clapper-board state, clap log, and (transitionally) the
-/// engine-decayed animation values.  The animation moves GUI-local in
-/// Phase 5: the engine additionally publishes [`ClapperSnapshot::clap_seq`],
-/// a monotonic event-like counter each GUI watches to start its own
-/// animation.
+/// Engine-managed clapper-board state and clap log.  The continuous clap
+/// animation (flash/arm decay) is GUI-local since Phase 5: the engine only
+/// publishes [`ClapperSnapshot::clap_seq`], a monotonic event-like counter
+/// each GUI watches to start its own animation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClapperSnapshot {
     pub scene: u32,
@@ -222,12 +221,6 @@ pub struct ClapperSnapshot {
     pub auto_increment_take: bool,
     /// Clap log, newest first, capped at `MAX_CLAP_LOGS`.
     pub logs: Vec<ClapLogItem>,
-    /// Fullscreen white-flash opacity (1.0 on clap, decays to 0).
-    pub flash_alpha: f32,
-    /// Clapper arm angle in radians (animated toward rest on clap).
-    pub arm_angle: f32,
-    /// True while the clap animation is still visibly in progress.
-    pub animating: bool,
     /// Monotonic counter, incremented once per clap. Event-like, not state:
     /// a GUI that observes a value different from the last one it animated
     /// starts its local clap animation. If a GUI somehow misses two claps
@@ -432,9 +425,6 @@ impl AppStateSnapshot {
                 roll: "A001".to_string(),
                 auto_increment_take: true,
                 logs: Vec::new(),
-                flash_alpha: 0.0,
-                arm_angle: -25.0f32.to_radians(),
-                animating: false,
                 clap_seq: 0,
             },
             is_dark_theme: false,
@@ -615,16 +605,8 @@ mod tests {
     // ── Animation defaults ────────────────────────────────────────────────
 
     #[test]
-    fn test_initial_animation() {
-        let s = initial_state();
-        assert_eq!(s.clapper.flash_alpha, 0.0);
-        assert!((s.clapper.arm_angle - (-25.0f32).to_radians()).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_initial_clap_arm_angle_negative() {
-        let s = initial_state();
-        assert!(s.clapper.arm_angle < 0.0);
+    fn test_initial_clap_seq_zero() {
+        assert_eq!(initial_state().clapper.clap_seq, 0);
     }
 
     // ── Theme defaults ────────────────────────────────────────────────────

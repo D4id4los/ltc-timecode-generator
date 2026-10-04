@@ -39,6 +39,23 @@ export component AppWindow inherits Window {
 
     // ── Flash overlay ──
     in-out property <float> flash-opacity: 0.0;
+    // One-shot clap trigger: poll.rs sets it true on a new clap_seq and
+    // false on the next poll; the state machine below snaps the flash and
+    // arm to the struck pose on entry and animates both back to rest on
+    // exit (declaratively, at Slint's render rate — the 40 ms poll timer
+    // carries no animation values).
+    in-out property <bool> flash-strike: false;
+
+    states [
+        clapped when root.flash-strike: {
+            flash-opacity: 1.0;
+            arm-angle: 0.0;
+            out {
+                animate flash-opacity { duration: 500ms; }
+                animate arm-angle { duration: 700ms; easing: ease-out; }
+            }
+        }
+    ]
 
     // ── Pulse animation ──
     in-out property <float> pulse-phase: 0.0;
