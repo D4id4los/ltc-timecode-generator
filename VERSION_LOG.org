@@ -1,6 +1,44 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* v0.5.2
+
+Main feature is a tag-driven release pipeline: pushing a strict
+vX.Y.Z tag now builds the official ship matrix in CI and publishes a
+GitHub Release with the matching =VERSION_LOG.org= entry as the release
+body, replacing the manual build-and-copy ritual for public
+distribution.
+
+List of Changes:
+- Release pipeline: a new GitHub Actions workflow (release.yml) runs on
+  vX.Y.Z tag pushes — a guard job enforces the strict tag pattern,
+  checks the tag against the workspace version, and extracts the
+  VERSION_LOG.org release notes; two parallel build jobs produce the
+  linux x64 and windows x64 artifacts; a release job assembles
+  checksums and publishes the GitHub Release. A workflow_dispatch
+  dry-run mode rehearses the whole pipeline on a branch without
+  publishing.
+- Statically linked libltc in all shipped binaries: a new build script
+  (scripts/build-libltc-static.sh) builds a static-only libltc prefix
+  from the pinned v1.3.2 source release, shared by CI, the local
+  release script, and the documented manual recipe. Released binaries
+  no longer depend on libltc.so at runtime.
+- glibc 2.31 floor for the linux x64 artifact: the CI release job and
+  the local build script both build via cargo-zigbuild with an
+  explicit 2.31 target, and the workflow verifies the binary's maximum
+  required GLIBC symbol version.
+- Local release script rewritten (build-all-rust-targets.sh): ships
+  linux x64 + windows x64 with static libltc and the glibc floor; the
+  i686 tablet target is no longer part of the official matrix and
+  remains a manual docker speciality (the builder image was fixed to
+  carry a pinned static libltc again, so it compiles after the
+  libltc-rs migration).
+- Documentation: README gained a Releases section (assets, trigger,
+  forward-only policy, i686 exclusion, dry-run rehearsal, tag
+  hardening), and AGENTS.md documents the pipeline and the new
+  scripts.
+
+
 * v0.5.1
 
 Main features are a smoother clapper-board animation on both desktop
