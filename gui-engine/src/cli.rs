@@ -686,6 +686,172 @@ fn run_decode_on_wav(
     Ok(outcome.result)
 }
 
+/// Render the decode-results header block (everything up to and including
+/// the `details` lines). Byte-for-byte what `print_decode_results` prints.
+fn print_decode_summary(
+    path: &Path,
+    result: &audio_core::LtcDetectionResult,
+    use_libltc: bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str("\n=== LTC Decode Results ===\n");
+    out.push_str(&format!("  File:          {}\n", path.display()));
+    out.push_str(&format!("  Decoder:       {}\n",
+        if use_libltc { "libltc (C library)" } else { "builtin (Rust)" }));
+    out.push_str(&format!("  Status:        {:?}\n", result.status));
+    out.push_str(&format!("  Sample rate:   {} Hz\n", result.sample_rate));
+    out.push_str(&format!("  Duration:      {:.3}s\n", result.total_audio_duration_secs));
+    out.push_str(&format!("  FPS:           {:.2}{}\n", result.detected_fps,
+        if result.drop_frame { " DF" } else { "" }));
+    out.push_str(&format!("  Valid frames:  {} / {} ({:.1}%)\n",
+        result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0));
+    out.push_str(&format!("  First TC at:   {:.3}s\n", result.first_ltc_timecode_secs));
+    out.push_str(&format!("  Processing:    {:.1}ms\n", result.processing_time_ms));
+
+    if !result.timecodes.is_empty() {
+        let first = &result.timecodes[0];
+        let last = &result.timecodes[result.timecodes.len() - 1];
+        out.push_str(&format!("  First TC:      {:02}:{:02}:{:02}:{:02}\n",
+            first.timecode.hours, first.timecode.minutes,
+            first.timecode.seconds, first.timecode.frames));
+        out.push_str(&format!("  Last TC:       {:02}:{:02}:{:02}:{:02}\n",
+            last.timecode.hours, last.timecode.minutes,
+            last.timecode.seconds, last.timecode.frames));
+    }
+
+    for detail in &result.details {
+        out.push_str(&format!("  {}\n", detail));
+    }
+    out
+}
+
+/// Render the `=== LTC Quality ===` block (without the preceding blank line).
+fn print_quality_block(q: &audio_core::LtcQualityReport) -> String {
+    let mut out = String::new();
+    out.push_str("=== LTC Quality ===\n");
+    out.push_str(&format!("  Score:        {:.2} / 1.00 ({})\n", q.score, q.grade));
+    out.push_str(&format!("  Usable:       {:.1}% ({} block(s), {} backward jump(s))\n",
+        q.usable_coverage * 100.0, q.block_count, q.backward_jump_count));
+    out.push_str(&format!("  Frames:       {} missing, {} largest block\n",
+        q.missing_frames, q.largest_block));
+    out.push_str(&format!("  Contiguity:   {} gap(s), {} glitch(es), {} edit point(s)\n",
+        q.gap_count, q.glitch_count, q.edit_count));
+    out.push_str(&format!("  Sync drift:   max {:.3}s ({:.2} frames), rate {:.4} s/s\n",
+        q.max_drift_secs, q.worst_block_drift_frames, q.drift_rate));
+    out.push_str(&format!("  Summary:      {}\n", q.summary));
+    out
+}
+
+/// Map a frame timecode to its audio-time seconds at the given fps
+/// (the frames field contributes `frames / fps` seconds).
+fn frame_timecode_to_secs(ft: &audio_core::FrameTimecode, fps: f64) -> f64 {
+    ft.timecode.hours as f64 * 3600.0
+        + ft.timecode.minutes as f64 * 60.0
+        + ft.timecode.seconds as f64
+        + ft.timecode.frames as f64 / fps
+}
+
+/// One `"[   12] 01:02:03:04  (3723.167s)"` frame-context line.
+fn render_frame_context_line(ft: &audio_core::FrameTimecode) -> String {
+    format!("[{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
+        ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs)
+}
+
+/// Render the verbose gap sections (`--- Gap N ---` with pre/post context).
+/// Empty when the quality report reports no gaps.
+fn render_gap_report(
+    q: &audio_core::LtcQualityReport,
+    tc: &[audio_core::FrameTimecode],
+    fps: f64,
+    ctx: usize,
+) -> String {
+    let mut out = String::new();
+    for (gi, &(prev_last, next_first)) in q.gap_edges.iter().enumerate() {
+        out.push_str(&format!("\n--- Gap {} ---\n", gi + 1));
+        let pre_start = prev_last.saturating_sub(ctx) + 1;
+        for ft in &tc[pre_start..=prev_last] {
+            out.push_str(&format!("  {}\n", render_frame_context_line(ft)));
+        }
+        let missing = ((frame_timecode_to_secs(&tc[next_first], fps)
+            - frame_timecode_to_secs(&tc[prev_last], fps)
+            - 1.0 / fps) / (1.0 / fps)).round() as u32;
+        out.push_str(&format!("  ---- GAP ({} missing frame(s)) ----\n", missing));
+        let post_end = (next_first + ctx).min(tc.len());
+        for ft in &tc[next_first..post_end] {
+            out.push_str(&format!("  {}\n", render_frame_context_line(ft)));
+        }
+    }
+    out
+}
+
+/// Render the verbose glitch sections (`--- Glitch N ---` with pre/post
+/// context and the `<<< GLITCH` marker). Empty when there are no glitches.
+fn render_glitch_report(
+    q: &audio_core::LtcQualityReport,
+    tc: &[audio_core::FrameTimecode],
+    ctx: usize,
+) -> String {
+    let mut out = String::new();
+    for (gi, &idx) in q.glitch_indices.iter().enumerate() {
+        out.push_str(&format!("\n--- Glitch {} ---\n", gi + 1));
+        let pre_start = idx.saturating_sub(ctx);
+        for ft in &tc[pre_start..idx] {
+            out.push_str(&format!("  {}\n", render_frame_context_line(ft)));
+        }
+        let ft = &tc[idx];
+        out.push_str(&format!("  {}  <<< GLITCH\n", render_frame_context_line(ft)));
+        let post_end = (idx + 1 + ctx).min(tc.len());
+        for ft in &tc[(idx + 1)..post_end] {
+            out.push_str(&format!("  {}\n", render_frame_context_line(ft)));
+        }
+    }
+    out
+}
+
+/// Render the verbose quality report (gaps + glitches). Empty when the
+/// result has no quality report or reports no issues.
+fn render_verbose_quality(
+    result: &audio_core::LtcDetectionResult,
+    context_frames: u32,
+) -> String {
+    let Some(ref q) = result.quality else { return String::new() };
+    let has_issues = !q.gap_edges.is_empty() || !q.glitch_indices.is_empty();
+    if !has_issues {
+        return String::new();
+    }
+    let ctx = context_frames as usize;
+    let tc = &result.timecodes;
+    let fps = result.detected_fps as f64;
+    let mut out = String::from("\n=== Verbose Quality Report ===\n");
+    out.push_str(&render_gap_report(q, tc, fps, ctx));
+    out.push_str(&render_glitch_report(q, tc, ctx));
+    out
+}
+
+/// Render the `=== Decoded Timecodes ===` list (with leading blank line).
+fn print_timecode_list(result: &audio_core::LtcDetectionResult) -> String {
+    let mut out = String::from("\n=== Decoded Timecodes ===\n");
+    for ft in &result.timecodes {
+        let sep = if result.drop_frame { ";" } else { ":" };
+        out.push_str(&format!("  [{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  ({:.3}s)\n",
+            ft.frame_index, ft.timecode.hours, ft.timecode.minutes,
+            ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs));
+    }
+    out
+}
+
+/// Print a rendered block verbatim (each renderer's output is a sequence of
+/// full lines; `println!` re-adds the final newline).
+fn print_block(block: &str) {
+    if block.is_empty() {
+        return;
+    }
+    print!("{}", block);
+    if !block.ends_with('\n') {
+        println!();
+    }
+}
+
 fn print_decode_results(
     path: &Path,
     result: &audio_core::LtcDetectionResult,
@@ -694,113 +860,19 @@ fn print_decode_results(
     context_frames: u32,
     list_timecodes: bool,
 ) {
-    println!();
-    println!("=== LTC Decode Results ===");
-    println!("  File:          {}", path.display());
-    println!("  Decoder:       {}", if use_libltc { "libltc (C library)" } else { "builtin (Rust)" });
-    println!("  Status:        {:?}", result.status);
-    println!("  Sample rate:   {} Hz", result.sample_rate);
-    println!("  Duration:      {:.3}s", result.total_audio_duration_secs);
-    println!("  FPS:           {:.2}{}", result.detected_fps,
-        if result.drop_frame { " DF" } else { "" });
-    println!("  Valid frames:  {} / {} ({:.1}%)",
-        result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0);
-    println!("  First TC at:   {:.3}s", result.first_ltc_timecode_secs);
-    println!("  Processing:    {:.1}ms", result.processing_time_ms);
-
-    if !result.timecodes.is_empty() {
-        let first = &result.timecodes[0];
-        let last = &result.timecodes[result.timecodes.len() - 1];
-        println!("  First TC:      {:02}:{:02}:{:02}:{:02}",
-            first.timecode.hours, first.timecode.minutes,
-            first.timecode.seconds, first.timecode.frames);
-        println!("  Last TC:       {:02}:{:02}:{:02}:{:02}",
-            last.timecode.hours, last.timecode.minutes,
-            last.timecode.seconds, last.timecode.frames);
-    }
-
-    for detail in &result.details { println!("  {}", detail); }
+    print_block(&print_decode_summary(path, result, use_libltc));
 
     if let Some(ref q) = result.quality {
         println!();
-        println!("=== LTC Quality ===");
-        println!("  Score:        {:.2} / 1.00 ({})", q.score, q.grade);
-        println!("  Usable:       {:.1}% ({} block(s), {} backward jump(s))",
-            q.usable_coverage * 100.0, q.block_count, q.backward_jump_count);
-        println!("  Frames:       {} missing, {} largest block", q.missing_frames, q.largest_block);
-        println!("  Contiguity:   {} gap(s), {} glitch(es), {} edit point(s)", q.gap_count, q.glitch_count, q.edit_count);
-        println!("  Sync drift:   max {:.3}s ({:.2} frames), rate {:.4} s/s",
-            q.max_drift_secs, q.worst_block_drift_frames, q.drift_rate);
-        println!("  Summary:      {}", q.summary);
+        print_block(&print_quality_block(q));
     }
 
     if verbose {
-        if let Some(ref q) = result.quality {
-            let ctx = context_frames as usize;
-            let tc = &result.timecodes;
-            let fps = result.detected_fps as f64;
-            let tc_to_secs = |ft: &audio_core::FrameTimecode| -> f64 {
-                ft.timecode.hours as f64 * 3600.0
-                    + ft.timecode.minutes as f64 * 60.0
-                    + ft.timecode.seconds as f64
-                    + ft.timecode.frames as f64 / fps
-            };
-            let has_issues = !q.gap_edges.is_empty() || !q.glitch_indices.is_empty();
-
-            if has_issues {
-                println!();
-                println!("=== Verbose Quality Report ===");
-
-                if !q.gap_edges.is_empty() {
-                    for (gi, &(prev_last, next_first)) in q.gap_edges.iter().enumerate() {
-                        println!();
-                        println!("--- Gap {} ---", gi + 1);
-                        let pre_start = prev_last.saturating_sub(ctx) + 1;
-                        for ft in &tc[pre_start..=prev_last] {
-                            println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
-                                ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
-                        }
-                        let missing = ((tc_to_secs(&tc[next_first]) - tc_to_secs(&tc[prev_last]) - 1.0 / fps) / (1.0 / fps)).round() as u32;
-                        println!("  ---- GAP ({} missing frame(s)) ----", missing);
-                        let post_end = (next_first + ctx).min(tc.len());
-                        for ft in &tc[next_first..post_end] {
-                            println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
-                                ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
-                        }
-                    }
-                }
-
-                if !q.glitch_indices.is_empty() {
-                    for (gi, &idx) in q.glitch_indices.iter().enumerate() {
-                        println!();
-                        println!("--- Glitch {} ---", gi + 1);
-                        let pre_start = idx.saturating_sub(ctx);
-                        for ft in &tc[pre_start..idx] {
-                            println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
-                                ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
-                        }
-                        let ft = &tc[idx];
-                        println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)  <<< GLITCH", ft.frame_index,
-                            ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
-                        let post_end = (idx + 1 + ctx).min(tc.len());
-                        for ft in &tc[(idx + 1)..post_end] {
-                            println!("  [{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
-                                ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
-                        }
-                    }
-                }
-            }
-        }
+        print_block(&render_verbose_quality(result, context_frames));
     }
 
     if list_timecodes {
-        println!("\n=== Decoded Timecodes ===");
-        for ft in &result.timecodes {
-            let sep = if result.drop_frame { ";" } else { ":" };
-            println!("  [{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  ({:.3}s)",
-                ft.frame_index, ft.timecode.hours, ft.timecode.minutes,
-                ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs);
-        }
+        print_block(&print_timecode_list(result));
     }
     println!();
 }
@@ -1311,5 +1383,214 @@ mod tests {
         let cli = default_resolve_cli();
         let id = resolve_device(&devs, &cli).unwrap();
         assert_eq!(id, "dev1");
+    }
+
+    // ── decode-report renderers (characterization) ────────────────────────
+
+    fn frame(idx: u32, h: u32, m: u32, s: u32, f: u32, secs: f64) -> audio_core::FrameTimecode {
+        audio_core::FrameTimecode {
+            frame_index: idx,
+            timecode: audio_core::Timecode { hours: h, minutes: m, seconds: s, frames: f },
+            timecode_secs: secs,
+        }
+    }
+
+    fn quality(gap_edges: Vec<(usize, usize)>, glitch_indices: Vec<usize>) -> audio_core::LtcQualityReport {
+        audio_core::LtcQualityReport {
+            score: 0.87,
+            grade: audio_core::ltc_decoder::QualityGrade::Good,
+            missing_frames: 3,
+            gap_count: 1,
+            glitch_count: 1,
+            edit_count: 0,
+            max_drift_secs: 0.012,
+            drift_rate: 0.0004,
+            largest_block: 50,
+            usable_coverage: 0.95,
+            block_count: 2,
+            worst_block_drift_frames: 0.4,
+            backward_jump_count: 0,
+            gap_edges,
+            glitch_indices,
+            summary: "decent".to_string(),
+        }
+    }
+
+    fn detection(tc: Vec<audio_core::FrameTimecode>, q: Option<audio_core::LtcQualityReport>) -> audio_core::LtcDetectionResult {
+        audio_core::LtcDetectionResult {
+            status: audio_core::LtcDecodeStatus::Success,
+            detected_fps: 25.0,
+            drop_frame: false,
+            total_possible_frames: 100,
+            valid_frames: 97,
+            timecodes: tc,
+            avg_confidence: 0.97,
+            details: vec!["chunk 0: 97/100 frames".to_string()],
+            total_audio_duration_secs: 4.0,
+            sample_rate: 48_000,
+            processing_time_ms: 12.34,
+            first_ltc_timecode_secs: 0.04,
+            quality: q,
+            chunk_summaries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_frame_timecode_to_secs_frames_contribute_fraction() {
+        // 01:00:02:12 at 25 fps → 3600 + 2 + 12/25
+        let ft = frame(0, 1, 0, 2, 12, 3602.48);
+        let secs = frame_timecode_to_secs(&ft, 25.0);
+        assert!((secs - 3602.48).abs() < 1e-9, "got {}", secs);
+    }
+
+    // test-lint: allow(text-pin): the rendered report lines are the formatter
+    // output — their exact text is the contract under characterization.
+    #[test]
+    fn test_render_frame_context_line_format() {
+        let ft = frame(12, 1, 2, 3, 4, 3723.16);
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(render_frame_context_line(&ft), "[  12] 01:02:03:04  (3723.160s)");
+    }
+
+    #[test]
+    fn test_print_decode_summary_block() {
+        let result = detection(vec![
+            frame(0, 1, 0, 0, 0, 0.0),
+            frame(1, 1, 0, 0, 1, 0.04),
+        ], None);
+        let out = print_decode_summary(Path::new("/tmp/x.wav"), &result, true);
+        let lines: Vec<&str> = out.lines().collect();
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[1], "=== LTC Decode Results ===");
+        assert_eq!(lines[2], "  File:          /tmp/x.wav");
+        assert_eq!(lines[3], "  Decoder:       libltc (C library)");
+        assert!(lines.contains(&"  Status:        Success"));
+        assert!(lines.contains(&"  Sample rate:   48000 Hz"));
+        assert!(lines.contains(&"  Duration:      4.000s"));
+        assert!(lines.contains(&"  FPS:           25.00"));
+        assert!(lines.contains(&"  Valid frames:  97 / 100 (97.0%)"));
+        assert!(lines.contains(&"  First TC:      01:00:00:00"));
+        assert!(lines.contains(&"  Last TC:       01:00:00:01"));
+        assert!(lines.contains(&"  chunk 0: 97/100 frames"));
+        // detail line is indented
+        assert_eq!(lines.last().copied(), Some("  chunk 0: 97/100 frames"));
+    }
+
+    #[test]
+    fn test_print_decode_summary_builtin_and_df_marker() {
+        let mut result = detection(vec![], None);
+        result.drop_frame = true;
+        let out = print_decode_summary(Path::new("y.wav"), &result, false);
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert!(out.contains("  Decoder:       builtin (Rust)"));
+        assert!(out.contains("  FPS:           25.00 DF"));
+        // empty timecode list → no First/Last TC lines
+        assert!(!out.contains("First TC:"));
+    }
+
+    #[test]
+    fn test_print_quality_block_lines() {
+        let q = quality(vec![], vec![]);
+        let out = print_quality_block(&q);
+        let lines: Vec<&str> = out.lines().collect();
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[0], "=== LTC Quality ===");
+        assert!(lines.contains(&"  Score:        0.87 / 1.00 (Good)"));
+        assert!(lines.contains(&"  Usable:       95.0% (2 block(s), 0 backward jump(s))"));
+        assert!(lines.contains(&"  Frames:       3 missing, 50 largest block"));
+        assert!(lines.contains(&"  Contiguity:   1 gap(s), 1 glitch(es), 0 edit point(s)"));
+        assert!(lines.contains(&"  Sync drift:   max 0.012s (0.40 frames), rate 0.0004 s/s"));
+        assert!(lines.contains(&"  Summary:      decent"));
+    }
+
+    #[test]
+    fn test_render_gap_report_context_and_missing_count() {
+        // 4 frames at 25 fps; gap between index 1 (last of block) and 2..
+        // Build: frames 0,1 then a one-frame hole represented by jumping
+        // timecode; gap edge (1, 2) with 2 missing frames computed from secs.
+        let tc = vec![
+            frame(0, 0, 0, 0, 0, 0.0),
+            frame(1, 0, 0, 0, 1, 0.04),
+            frame(2, 0, 0, 0, 4, 0.16),
+            frame(3, 0, 0, 0, 5, 0.20),
+        ];
+        let q = quality(vec![(1, 2)], vec![]);
+        let out = render_gap_report(&q, &tc, 25.0, 1);
+        let lines: Vec<&str> = out.lines().collect();
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[1], "--- Gap 1 ---");
+        // pre-context: only frame 1 (ctx=1, pre_start = 1-1+1 = 1)
+        assert_eq!(lines[2], "  [   1] 00:00:00:01  (0.040s)");
+        // missing = round((0.16 - 0.04 - 0.04) / 0.04) = 2
+        assert_eq!(lines[3], "  ---- GAP (2 missing frame(s)) ----");
+        // post-context: frame 2 only (ctx=1)
+        assert_eq!(lines[4], "  [   2] 00:00:00:04  (0.160s)");
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn test_render_glitch_report_marks_glitch_frame() {
+        let tc = vec![
+            frame(0, 0, 0, 0, 0, 0.0),
+            frame(1, 0, 0, 0, 9, 0.36),
+            frame(2, 0, 0, 0, 2, 0.08),
+        ];
+        let q = quality(vec![], vec![1]);
+        let out = render_glitch_report(&q, &tc, 1);
+        let lines: Vec<&str> = out.lines().collect();
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[1], "--- Glitch 1 ---");
+        assert_eq!(lines[2], "  [   0] 00:00:00:00  (0.000s)");
+        assert_eq!(lines[3], "  [   1] 00:00:00:09  (0.360s)  <<< GLITCH");
+        assert_eq!(lines[4], "  [   2] 00:00:00:02  (0.080s)");
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn test_render_verbose_quality_empty_without_issues() {
+        let result = detection(vec![], Some(quality(vec![], vec![])));
+        assert!(render_verbose_quality(&result, 2).is_empty());
+        let no_quality = detection(vec![], None);
+        assert!(render_verbose_quality(&no_quality, 2).is_empty());
+    }
+
+    #[test]
+    fn test_render_verbose_quality_has_header_then_sections() {
+        let tc = vec![
+            frame(0, 0, 0, 0, 0, 0.0),
+            frame(1, 0, 0, 0, 9, 0.36),
+            frame(2, 0, 0, 0, 2, 0.08),
+        ];
+        let result = detection(tc, Some(quality(vec![], vec![1])));
+        let out = render_verbose_quality(&result, 2);
+        let lines: Vec<&str> = out.lines().collect();
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[1], "=== Verbose Quality Report ===");
+        assert!(out.contains("--- Glitch 1 ---"));
+    }
+
+    #[test]
+    fn test_print_timecode_list_colon_and_semicolon_separators() {
+        let mut result = detection(vec![
+            frame(0, 1, 0, 0, 0, 0.0),
+            frame(1, 1, 0, 0, 1, 0.04),
+        ], None);
+        let out = print_timecode_list(&result);
+        let lines: Vec<&str> = out.lines().collect();
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[1], "=== Decoded Timecodes ===");
+        assert_eq!(lines[2], "  [   0] 01:00:00:00  (0.000s)");
+        assert_eq!(lines[3], "  [   1] 01:00:00:01  (0.040s)");
+
+        result.drop_frame = true;
+        let out_df = print_timecode_list(&result);
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert!(out_df.contains("01;00;00;00"));
+        assert!(!out_df.contains("01:00:00:00"));
     }
 }
