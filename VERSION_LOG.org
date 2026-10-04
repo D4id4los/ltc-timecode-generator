@@ -1,6 +1,35 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — Phase 4 Windows test platform (Part B)
+
+Brings the full workspace test suite to `windows-latest` on the shipped
+`x86_64-pc-windows-gnu` target (plan:
+`plans/PHASE4-overall-gate-and-windows-tests-plan.md`, Part B / G3d).
+
+- New `windows-tests` CI job: `cargo nextest run --workspace --profile
+  ci` with ffmpeg installed, so the converter integration tests
+  execute on Windows instead of loud-skipping. libltc has no Windows
+  package, so it is built from a pinned source release in an MSYS2
+  mingw64 shell (the README.org cross-compile recipe relocated onto
+  the runner) and cached by tag; bindgen/linker env is set at job
+  level for a stable rust-cache key. A test-count summary guard fails
+  the job if suspiciously few tests ran, and `test-lint.sh
+  --self-test` gives platform-independent guardrail parity.
+  `windows-cross-check` remains the fast per-PR compile guard.
+- `LTC_CONFIG_HOME` config seam: `config::config_base_dir()` honors an
+  `LTC_CONFIG_HOME` env override before `dirs::config_dir()` and is now
+  the single resolution point for the converter config path and the
+  HW-encoder cache dir. Needed because `dirs` ignores
+  `XDG_CONFIG_HOME` on Windows — without the seam, engine tests would
+  read/write the real `%APPDATA%` config. `init_test_config()` sets
+  both variables. Also useful for portable installs; no behavior
+  change when the variable is unset or empty.
+- The stderr-watchdog subprocess tests no longer spawn `sh -c`
+  unconditionally: they use cfg-paired native spawners (cmd on
+  Windows, sh on unix), so the stall/cancel coverage runs natively on
+  Windows.
+
 * Unreleased — Phase 4 S3776 burn-down + overall-code gate (Part A)
 
 Removes every CRITICAL code smell from the SonarCloud census (29 ×
@@ -45,6 +74,7 @@ and extends quality-gate enforcement from new-code-only to overall code
   crate), `ltc-gui`, `gui-engine` and `audio-core`; no behavior change
   intended anywhere — pure extractors move logic verbatim and
   unpinned handlers got characterization tests before their refactors.
+||||||| parent of 6fe076a (docs: sync AGENTS/VERSION_LOG for windows test platform)
 
 * Unreleased — Phase 3 startup HW-encoder validation latency
 
