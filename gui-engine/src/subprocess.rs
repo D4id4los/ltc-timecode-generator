@@ -605,19 +605,54 @@ pub(crate) mod tests {
 
     // ── run_ffmpeg_collect_stderr tests ─────────────────────────────────
 
-    fn spawn_sh(script: &'static str) -> impl FnMut(&[String]) -> std::io::Result<Child> {
+    /// Spawn a fixed program+args, ignoring the passed args; stderr piped,
+    /// stdout discarded. Uses the platform's native shell command so the
+    /// watchdog coverage runs natively on Windows too (no `sh` there).
+    fn spawn_fixed(
+        program: &'static str,
+        args: &'static [&'static str],
+    ) -> impl FnMut(&[String]) -> std::io::Result<Child> {
         move |_args: &[String]| {
-            std::process::Command::new("sh")
-                .args(["-c", script])
+            std::process::Command::new(program)
+                .args(args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
         }
     }
 
+    /// Spawn the platform's silent sleeper (the paired `sleep_prog`).
+    fn spawn_sleeper(secs: u32) -> impl FnMut(&[String]) -> std::io::Result<Child> {
+        let args = sleep_args(secs);
+        move |_args: &[String]| {
+            std::process::Command::new(sleep_prog())
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        }
+    }
+
+    // Two stderr lines, exit 0.
+    #[cfg(windows)]
+    const STDERR_TWO_LINES: (&'static str, &[&str]) =
+        ("cmd", &["/C", "echo line1 >&2& echo line2 >&2"]);
+    #[cfg(not(windows))]
+    const STDERR_TWO_LINES: (&'static str, &[&str]) =
+        ("sh", &["-c", "echo line1 >&2; echo line2 >&2"]);
+
+    // One stderr line, exit code 1.
+    #[cfg(windows)]
+    const STDERR_EXIT1: (&'static str, &[&str]) =
+        ("cmd", &["/C", "echo boom >&2& exit /b 1"]);
+    #[cfg(not(windows))]
+    const STDERR_EXIT1: (&'static str, &[&str]) =
+        ("sh", &["-c", "echo boom >&2; exit 1"]);
+
     #[test]
     fn test_collect_stderr_success_collects_lines() {
-        let mut spawner = spawn_sh("echo line1 >&2; echo line2 >&2");
+        let (prog, args) = STDERR_TWO_LINES;
+        let mut spawner = spawn_fixed(prog, args);
         let mut seen = Vec::new();
         let result = run_ffmpeg_collect_stderr(
             &mut spawner, &[], Duration::from_secs(5), None, &mut |l| seen.push(l.to_string()),
@@ -629,7 +664,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_collect_stderr_exit_code_with_tail() {
-        let mut spawner = spawn_sh("echo boom >&2; exit 1");
+        let (prog, args) = STDERR_EXIT1;
+        let mut spawner = spawn_fixed(prog, args);
         let result = run_ffmpeg_collect_stderr(
             &mut spawner, &[], Duration::from_secs(5), None, &mut |_| {},
         );
@@ -644,7 +680,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_collect_stderr_silent_child_stalls() {
-        let mut spawner = spawn_sh("sleep 5");
+        let mut spawner = spawn_sleeper(5);
         let start = std::time::Instant::now();
         let result = run_ffmpeg_collect_stderr(
             &mut spawner, &[], Duration::from_millis(200), None, &mut |_| {},
@@ -656,7 +692,7 @@ pub(crate) mod tests {
     #[test]
     fn test_collect_stderr_precancelled() {
         let cancel = AtomicBool::new(true);
-        let mut spawner = spawn_sh("sleep 5");
+        let mut spawner = spawn_sleeper(5);
         let result = run_ffmpeg_collect_stderr(
             &mut spawner, &[], Duration::from_secs(5), Some(&cancel), &mut |_| {},
         );
