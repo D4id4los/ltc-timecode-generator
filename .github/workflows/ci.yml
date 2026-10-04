@@ -239,8 +239,13 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Run tests (cargo nextest, ci profile)
-        run: cargo nextest run --workspace --profile ci 2>&1 | Tee-Object -FilePath nextest-output.txt
+      - name: Run tests (cargo nextest, ci profile, shipped gnu target)
+        # --target is essential: without it nextest builds for the host
+        # default (x86_64-pc-windows-msvc), where the gnu-suffixed
+        # BINDGEN_EXTRA_CLANG_ARGS never applies and the mingw libltc
+        # prefix cannot link (job failed on its first runs for exactly
+        # this reason). The host default is msvc — windows-latest.
+        run: cargo nextest run --workspace --profile ci --target x86_64-pc-windows-gnu 2>&1 | Tee-Object -FilePath nextest-output.txt
 
       - name: Test-count summary guard
         # "all skipped" must not hide behind green: parse the nextest
