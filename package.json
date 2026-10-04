@@ -13,8 +13,8 @@
     "test:coverage": "vitest run --coverage",
     "test:flaky": "cargo nextest run --profile ci",
     "test:lint": "bash scripts/test-lint.sh",
-    "sonar:gate": "node scripts/sonar-gate.mjs",
-    "sonar:report": "node scripts/sonar-report.mjs",
+    "sonar:gate": "bash scripts/sonar-gate.sh",
+    "sonar:report": "bash scripts/sonar-report.sh",
     "version": "node scripts/sync-version.js"
   },
   "dependencies": {
