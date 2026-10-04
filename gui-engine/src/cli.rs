@@ -282,33 +282,39 @@ fn parse_timecode(s: &str) -> Result<Timecode, TimecodeParseError> {
 
 // ── Device listing ──────────────────────────────────────────────────────
 
-pub fn list_devices_and_exit() -> ! {
-    init_logger();
-    match list_audio_devices() {
-        Ok(devices) => {
-            println!("Available audio output devices:");
-            for (i, dev) in devices.iter().enumerate() {
-                let default_mark = if dev.is_default { " (default)" } else { "" };
-                println!("  [{:2}] {}{}", i, dev.name, default_mark);
-                println!(
-                    "         channels: {}-{}, sample rate: {}-{} Hz, formats: {}",
-                    dev.channels_min,
-                    dev.channels_max,
-                    dev.sample_rate_min,
-                    dev.sample_rate_max,
-                    dev.formats.join(", ")
-                );
-            }
-            if devices.is_empty() {
-                println!("  (no output devices found)");
-            }
-        }
-        Err(e) => {
-            eprintln!("Error listing audio devices: {}", e);
-            std::process::exit(1);
-        }
+/// Pure formatter for `--list-devices` output. Owns every output line,
+/// including the header and the empty-list line. Infallible; unit-tested.
+fn list_device_lines(devices: &[audio_core::AudioDeviceInfo]) -> Vec<String> {
+    let mut lines = vec!["Available audio output devices:".to_string()];
+    for (i, dev) in devices.iter().enumerate() {
+        let default_mark = if dev.is_default { " (default)" } else { "" };
+        lines.push(format!("  [{:2}] {}{}", i, dev.name, default_mark));
+        lines.push(format!(
+            "         channels: {}-{}, sample rate: {}-{} Hz, formats: {}",
+            dev.channels_min,
+            dev.channels_max,
+            dev.sample_rate_min,
+            dev.sample_rate_max,
+            dev.formats.join(", ")
+        ));
     }
-    std::process::exit(0);
+    if devices.is_empty() {
+        lines.push("  (no output devices found)".to_string());
+    }
+    lines
+}
+
+/// Boundary runner for `--list-devices`: logger init + real device
+/// enumeration + printing. No process exit — success returns `Ok(())`
+/// (the arm returns `Done` → exit 0 via `main`), enumeration failure
+/// returns `Err` for `CliError::ListDevices` rendering.
+fn run_list_devices() -> Result<(), String> {
+    init_logger();
+    let devices = list_audio_devices()?;
+    for line in list_device_lines(&devices) {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 fn resolve_device(
@@ -916,6 +922,15 @@ pub enum CliError {
     Decode(String),
     /// `--output-to-file` WAV generation failed.
     Generate(String),
+    /// `--list-devices` audio-device enumeration failed.
+    ///
+    /// Display renders the legacy stderr prose `Error listing audio
+    /// devices: {msg}`. Accepted deviation from the legacy path (Decision D3
+    /// of the phase-toggles plan): the old `list_devices_and_exit` printed the
+    /// bare prose; routing through [`process_cli`]'s unified renderer prefixes
+    /// `Error: `. The line has no consumers asserting on it, so the
+    /// byte-identical rule (R4) does not apply.
+    ListDevices(String),
 }
 
 impl std::fmt::Display for CliError {
@@ -923,6 +938,7 @@ impl std::fmt::Display for CliError {
         match self {
             CliError::Decode(msg) => write!(f, "{msg}"),
             CliError::Generate(msg) => write!(f, "{msg}"),
+            CliError::ListDevices(msg) => write!(f, "Error listing audio devices: {msg}"),
         }
     }
 }
@@ -969,14 +985,18 @@ fn run_decode_video(cli: Cli) -> Result<audio_core::LtcDetectionResult, CliError
 /// Testable dispatch: identical decision order to [`process_cli`], but
 /// decode/generate failures come back as `Err(CliError)` instead of killing
 /// the process, and the decodable runners return their
-/// [`audio_core::LtcDetectionResult`] (printing happens here, in the Done
-/// arm, so output is unchanged). The `list_devices` and `headless` arms
-/// remain process-bound (`exit`/real audio + infinite loop) — untestable by
+/// [`audio_core::LtcDetectionResult`] (printing happens here, in the Done arm, so output
+/// is unchanged). The `list_devices` arm is no longer process-bound: its
+/// output comes from the pure [`list_device_lines`] formatter (unit-tested)
+/// and errors return `Err(CliError::ListDevices)`; only the device
+/// enumeration itself stays environment-bound. The `headless` arm remains
+/// process-bound (real audio + infinite loop) — untestable by
 /// design; the `RunGui` arm spawns the real engine and is covered
 /// indirectly by the engine integration tests.
 pub fn process_cli_result(cli: Cli) -> Result<CliOutcome, CliError> {
     if cli.list_devices {
-        list_devices_and_exit();
+        run_list_devices().map_err(CliError::ListDevices)?;
+        return Ok(CliOutcome::Done);
     }
 
     if cli.probe_caps {
@@ -1356,6 +1376,69 @@ mod tests {
             matches!(err, ResolveDeviceError::NotFound { .. }),
             "expected NotFound, got {:?}",
             err
+        );
+    }
+
+    // ── list_device_lines ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_device_lines_header_and_entries() {
+        let lines = list_device_lines(&make_devices());
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[0], "Available audio output devices:");
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[1], "  [ 0] Built-in Audio (Default) (default)");
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[3], "  [ 1] UMC204HD");
+    }
+
+    #[test]
+    fn test_list_device_lines_detail_line() {
+        let lines = list_device_lines(&make_devices());
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(
+            lines[2],
+            "         channels: 2-2, sample rate: 44100-192000 Hz, formats: f32, i16"
+        );
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(
+            lines[4],
+            "         channels: 2-2, sample rate: 44100-96000 Hz, formats: f32, i16"
+        );
+    }
+
+    #[test]
+    fn test_list_device_lines_index_width() {
+        let mut devs = make_devices();
+        for i in 2..11 {
+            devs.push(audio_core::AudioDeviceInfo {
+                id: format!("dev{i}"),
+                name: format!("Device {i}"),
+                is_default: false,
+                formats: vec!["f32".into()],
+                channels_min: 2,
+                channels_max: 2,
+                sample_rate_min: 44100,
+                sample_rate_max: 48000,
+                buffer_min: 64,
+                buffer_max: 2048,
+            });
+        }
+        let lines = list_device_lines(&devs);
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(lines[21], "  [10] Device 10");
+    }
+
+    #[test]
+    fn test_list_device_lines_empty_list() {
+        let lines = list_device_lines(&[]);
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(
+            lines,
+            vec![
+                "Available audio output devices:".to_string(),
+                "  (no output devices found)".to_string(),
+            ]
         );
     }
 

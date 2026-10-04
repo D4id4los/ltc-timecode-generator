@@ -8,7 +8,9 @@
 //! `LtcDetectionResult`, so tests assert on return values, not stdout.
 //!
 //! Deliberately untested here (documented in `process_cli_result`):
-//! - `list_devices` arm — process-bound (`std::process::exit`).
+//! - `list_devices` arm — only the device enumeration stays
+//!   environment-bound; the output formatting is pure (`list_device_lines`)
+//!   and covered by unit tests in `cli.rs`.
 //! - `headless` arm — real audio device + infinite loop.
 //! - `RunGui` arm — spawns the real engine thread; covered indirectly by
 //!   `tests/integration.rs`.
