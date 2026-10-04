@@ -61,25 +61,45 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 
 fn render_timecode_steppers(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let max_frames = state.latest.fps().ceil() as u32;
     let is_playing = state.latest.is_playing;
     let tc = state.latest.start_timecode;
 
     ui.add_enabled_ui(!is_playing, |ui| {
         ui.columns(4, |cols| {
-            stepper_card_col(&mut cols[0], "HOURS", tc.hours, 24, &colors, GuiCommand::HourUp, GuiCommand::HourDown, state);
-            stepper_card_col(&mut cols[1], "MINUTES", tc.minutes, 60, &colors, GuiCommand::MinuteUp, GuiCommand::MinuteDown, state);
-            stepper_card_col(&mut cols[2], "SECONDS", tc.seconds, 60, &colors, GuiCommand::SecondUp, GuiCommand::SecondDown, state);
-            stepper_card_col(&mut cols[3], "FRAMES", tc.frames, max_frames, &colors, GuiCommand::FrameUp, GuiCommand::FrameDown, state);
+            stepper_card_col(&mut cols[0], "HOURS", tc.hours, &colors, TcField::Hours, state);
+            stepper_card_col(&mut cols[1], "MINUTES", tc.minutes, &colors, TcField::Minutes, state);
+            stepper_card_col(&mut cols[2], "SECONDS", tc.seconds, &colors, TcField::Seconds, state);
+            stepper_card_col(&mut cols[3], "FRAMES", tc.frames, &colors, TcField::Frames, state);
         });
     });
 }
 
+/// Which start-timecode segment a stepper card edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcField {
+    Hours,
+    Minutes,
+    Seconds,
+    Frames,
+}
+
+/// Pure mapping from a timecode segment to its `(increment, decrement)`
+/// engine commands.
+fn tc_commands(field: TcField) -> (GuiCommand, GuiCommand) {
+    match field {
+        TcField::Hours => (GuiCommand::HourUp, GuiCommand::HourDown),
+        TcField::Minutes => (GuiCommand::MinuteUp, GuiCommand::MinuteDown),
+        TcField::Seconds => (GuiCommand::SecondUp, GuiCommand::SecondDown),
+        TcField::Frames => (GuiCommand::FrameUp, GuiCommand::FrameDown),
+    }
+}
+
 fn stepper_card_col(
-    ui: &mut Ui, label: &str, value: u32, _max: u32,
+    ui: &mut Ui, label: &str, value: u32,
     colors: &crate::theme::ThemeColors,
-    cmd_up: GuiCommand, cmd_down: GuiCommand, state: &mut AppState,
+    field: TcField, state: &mut AppState,
 ) {
+    let (cmd_up, cmd_down) = tc_commands(field);
     let card = egui::Frame::new()
         .fill(colors.deep_bg)
         .stroke(egui::Stroke::new(1.0, colors.border_main))
@@ -87,13 +107,13 @@ fn stepper_card_col(
         .inner_margin(egui::Margin::symmetric(10, 8));
     card.show(ui, |ui| {
         ui.vertical_centered(|ui| {
-            if ui.button(RichText::new("^").strong()).clicked() { state.send(cmd_up.clone()); }
+            if ui.button(RichText::new("^").strong()).clicked() { state.send(cmd_up); }
             ui.add_space(1.0);
             ui.label(RichText::new(format!("{:02}", value)).font(FontId::monospace(20.0)).color(colors.text_title).strong());
             ui.add_space(1.0);
             ui.label(RichText::new(label).font(FontId::proportional(7.5)).color(colors.text_muted).strong());
             ui.add_space(1.0);
-            if ui.button(RichText::new("v").strong()).clicked() { state.send(cmd_down.clone()); }
+            if ui.button(RichText::new("v").strong()).clicked() { state.send(cmd_down); }
         });
     });
 }
@@ -200,36 +220,7 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
     card.show(ui, |ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
-                let device_names: Vec<String> = state.latest.devices.iter().map(|d| {
-                    if d.is_default { format!("{} (Default)", d.name) } else { d.name.clone() }
-                }).collect();
-                if device_names.is_empty() {
-                    ui.label(RichText::new("No devices found — using default output").font(FontId::monospace(12.0)).color(colors.text_muted));
-                } else {
-                    let selected = state.sh.selected_device.value().clone();
-                    let selected_text = selected
-                        .as_ref()
-                        .and_then(|id| state.latest.devices.iter().find(|d| &d.id == id))
-                        .map(|d| if d.is_default { format!("{} (Default)", d.name) } else { d.name.clone() })
-                        .unwrap_or_else(|| "Default".to_string());
-                    ui.label(RichText::new("Interface:").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
-                    egui::ComboBox::from_id_salt("settings_device_combo")
-                        .selected_text(&selected_text)
-                        .show_ui(ui, |ui| {
-                            for (i, dev) in state.latest.devices.clone().into_iter().enumerate() {
-                                let active = selected.as_ref() == Some(&dev.id);
-                                if ui.selectable_label(active, &device_names[i]).clicked() {
-                                    bound::select_value(
-                                        state,
-                                        |s| &mut s.sh.selected_device,
-                                        selected.clone(),
-                                        Some(dev.id.clone()),
-                                        |id| GuiCommand::SetDevice(id.unwrap_or_default()),
-                                    );
-                                }
-                            }
-                        });
-                }
+                render_device_combo(ui, state);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh List").clicked() {
                         state.send(GuiCommand::RefreshDevices);
@@ -237,18 +228,69 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
                 });
             });
             ui.add_space(8.0);
-            let info_frame = egui::Frame::new()
-                .fill(colors.card_bg)
-                .stroke(egui::Stroke::new(1.0, colors.border_main))
-                .corner_radius(6.0)
-                .inner_margin(egui::Margin::symmetric(10, 6));
-            info_frame.show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 3.0, ACCENT);
-                    ui.label(RichText::new("Sends SMPTE Linear Timecode audio to mixers, USB-DAC, or sync adapters.").font(FontId::proportional(10.0)).color(colors.text_muted));
-                });
+            render_device_info_note(ui, &colors);
+        });
+    });
+}
+
+/// Pure display name for one device in the combo list: `"<name> (Default)"`
+/// for the default output, plain name otherwise.
+fn device_display_name(name: &str, is_default: bool) -> String {
+    if is_default { format!("{} (Default)", name) } else { name.to_string() }
+}
+
+/// Pure combo-box label for the currently selected device id: the device's
+/// display name, or `Default` when nothing (or an unknown id) is selected.
+fn selected_device_text(selected: Option<&String>, devices: &[gui_engine::AudioDeviceInfo]) -> String {
+    selected
+        .and_then(|id| devices.iter().find(|d| &d.id == id))
+        .map(|d| device_display_name(&d.name, d.is_default))
+        .unwrap_or_else(|| "Default".to_string())
+}
+
+/// Device selector: empty-state label or the bound combo box.
+fn render_device_combo(ui: &mut Ui, state: &mut AppState) {
+    let colors = state.theme.colors();
+    let device_names: Vec<String> = state.latest.devices.iter().map(|d| {
+        device_display_name(&d.name, d.is_default)
+    }).collect();
+    if device_names.is_empty() {
+        ui.label(RichText::new("No devices found — using default output").font(FontId::monospace(12.0)).color(colors.text_muted));
+    } else {
+        let selected = state.sh.selected_device.value().clone();
+        let selected_text = selected_device_text(selected.as_ref(), &state.latest.devices);
+        ui.label(RichText::new("Interface:").font(FontId::proportional(11.0)).color(colors.text_muted).strong());
+        egui::ComboBox::from_id_salt("settings_device_combo")
+            .selected_text(&selected_text)
+            .show_ui(ui, |ui| {
+                for (i, dev) in state.latest.devices.clone().into_iter().enumerate() {
+                    let active = selected.as_ref() == Some(&dev.id);
+                    if ui.selectable_label(active, &device_names[i]).clicked() {
+                        bound::select_value(
+                            state,
+                            |s| &mut s.sh.selected_device,
+                            selected.clone(),
+                            Some(dev.id.clone()),
+                            |id| GuiCommand::SetDevice(id.unwrap_or_default()),
+                        );
+                    }
+                }
             });
+    }
+}
+
+/// Info note under the device selector: accent dot + description line.
+fn render_device_info_note(ui: &mut Ui, colors: &crate::theme::ThemeColors) {
+    let info_frame = egui::Frame::new()
+        .fill(colors.card_bg)
+        .stroke(egui::Stroke::new(1.0, colors.border_main))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(10, 6));
+    info_frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), Sense::hover());
+            ui.painter().circle_filled(rect.center(), 3.0, ACCENT);
+            ui.label(RichText::new("Sends SMPTE Linear Timecode audio to mixers, USB-DAC, or sync adapters.").font(FontId::proportional(10.0)).color(colors.text_muted));
         });
     });
 }
@@ -358,4 +400,62 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
         let shown = *state.sh.beep_duration.value();
         ui.label(RichText::new(format!("{:.0} ms", shown * 1000.0)).font(FontId::monospace(10.0)).color(colors.text_title));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(id: &str, name: &str, is_default: bool) -> gui_engine::AudioDeviceInfo {
+        gui_engine::AudioDeviceInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            is_default,
+            formats: Vec::new(),
+            channels_min: 0,
+            channels_max: 0,
+            sample_rate_min: 0,
+            sample_rate_max: 0,
+            buffer_min: 0,
+            buffer_max: 0,
+        }
+    }
+
+    #[test]
+    fn device_display_name_marks_the_default_output() {
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(device_display_name("PulseAudio", true), "PulseAudio (Default)");
+        assert_eq!(device_display_name("USB DAC", false), "USB DAC");
+    }
+
+    #[test]
+    fn selected_device_text_resolves_the_selected_id() {
+        let devices = vec![
+            device("a", "Built-in", false),
+            device("b", "USB DAC", true),
+        ];
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(selected_device_text(Some(&"b".to_string()), &devices), "USB DAC (Default)");
+        assert_eq!(selected_device_text(Some(&"a".to_string()), &devices), "Built-in");
+    }
+
+    #[test]
+    fn selected_device_text_falls_back_to_default() {
+        // test-lint: allow(text-pin): formatter output is the contract
+        assert_eq!(selected_device_text(None, &[]), "Default");
+        // A stale id (device unplugged) must not panic or show a wrong name.
+        assert_eq!(selected_device_text(Some(&"gone".to_string()), &[]), "Default");
+    }
+
+    #[test]
+    fn tc_commands_maps_each_segment_to_its_up_down_pair() {
+        let (up, down) = tc_commands(TcField::Hours);
+        assert!(matches!(up, GuiCommand::HourUp) && matches!(down, GuiCommand::HourDown));
+        let (up, down) = tc_commands(TcField::Minutes);
+        assert!(matches!(up, GuiCommand::MinuteUp) && matches!(down, GuiCommand::MinuteDown));
+        let (up, down) = tc_commands(TcField::Seconds);
+        assert!(matches!(up, GuiCommand::SecondUp) && matches!(down, GuiCommand::SecondDown));
+        let (up, down) = tc_commands(TcField::Frames);
+        assert!(matches!(up, GuiCommand::FrameUp) && matches!(down, GuiCommand::FrameDown));
+    }
 }

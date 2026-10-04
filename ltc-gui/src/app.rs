@@ -226,6 +226,116 @@ fn next_repaint_interval(s: &AppStateSnapshot) -> Duration {
     (base + predicted_dt).max(floor)
 }
 
+// ── Pure logic helpers (unit-tested below) ───────────────────────────────
+
+/// Maintain keyed offload shadows (value sync happens per-widget at draw
+/// time inside the `bound::` wrappers): prune vanished mounts/files and
+/// seed new entries from the engine snapshot.
+fn sync_offload_shadows(sh: &mut Shadows, snap: &AppStateSnapshot) {
+    let mounts: Vec<PathBuf> = snap.offload.cards.iter().map(|c| c.mount.clone()).collect();
+    sh.device_names.retain(|mount, _| mounts.contains(mount));
+    for card in &snap.offload.cards {
+        sh.device_names
+            .entry(card.mount.clone())
+            .or_insert_with(|| gui_engine::edit_state::EditState::new(card.device_name.clone()));
+    }
+    let file_keys: Vec<(PathBuf, PathBuf)> = snap.offload.cards.iter()
+        .flat_map(|c| c.files.iter().map(move |f| (c.mount.clone(), f.path.clone())))
+        .collect();
+    sh.file_selection.retain(|k, _| file_keys.contains(k));
+    for card in &snap.offload.cards {
+        for (i, file) in card.files.iter().enumerate() {
+            let selected = card.selected.get(i).copied().unwrap_or(false);
+            sh.file_selection
+                .entry((card.mount.clone(), file.path.clone()))
+                .or_insert_with(|| gui_engine::edit_state::EditState::new(selected));
+        }
+    }
+}
+
+/// Map a drained engine audio event to a toast notification, if the event
+/// deserves one. Pure decision — the caller performs the mutation.
+fn audio_event_to_notification(evt: &AudioEvent) -> Option<(NotificationType, String)> {
+    match evt {
+        AudioEvent::StreamError(msg) => {
+            Some((NotificationType::Error, format!("Audio stream error: {}", msg)))
+        }
+        AudioEvent::StreamDied => {
+            Some((NotificationType::Error, "Audio stream has died — re-initialize device".to_string()))
+        }
+        AudioEvent::StreamRecovering { attempt } => {
+            Some((NotificationType::Warning, format!("Audio stream recovering (attempt {})", attempt)))
+        }
+        AudioEvent::StreamDead => {
+            Some((NotificationType::Error, "Fatal: audio device unreachable".to_string()))
+        }
+        AudioEvent::RecoveryNeeded { reason } => {
+            Some((NotificationType::Warning, format!("Audio recovery needed: {}", reason)))
+        }
+        AudioEvent::Underrun => {
+            Some((NotificationType::Warning, "Audio underrun — samples not keeping up".to_string()))
+        }
+        AudioEvent::FramesDropped { total } => {
+            Some((NotificationType::Warning, format!("{} frame(s) dropped", total)))
+        }
+    }
+}
+
+/// Repaint delay for the command-echo round-trip: `None` when the engine's
+/// ack counter has caught up (echo confirmed), otherwise the fast-repaint
+/// delay so the echo is rendered on the next frame instead of waiting out
+/// the idle repaint interval (~40 ms engine tick + egui predicted_dt
+/// compensation, floored like `next_repaint_interval`).
+fn echo_repaint_delay(applied: u64, next: u64) -> Option<Duration> {
+    if applied >= next {
+        None
+    } else {
+        let floor = Duration::from_secs_f64(1.0 / 60.0) + Duration::from_millis(1);
+        Some((Duration::from_millis(40) + Duration::from_secs_f64(1.0 / 60.0)).max(floor))
+    }
+}
+
+/// Commands the current keyboard-shortcut press set maps to. Pure decision —
+/// the caller performs the sends. Lock-independent guards (play/clap/reset
+/// are ignored while locked) are applied here; `ToggleLock` is always sent.
+fn shortcut_commands(
+    toggle_play: bool,
+    do_clap: bool,
+    do_reset: bool,
+    do_lock: bool,
+    is_playing: bool,
+    is_locked: bool,
+) -> Vec<GuiCommand> {
+    let mut cmds = Vec::new();
+    if toggle_play && !is_locked {
+        cmds.push(if is_playing { GuiCommand::StopLtc } else { GuiCommand::StartLtc });
+    }
+    if do_clap && !is_locked {
+        cmds.push(GuiCommand::Clap);
+    }
+    if do_reset && !is_locked {
+        cmds.push(GuiCommand::Reset);
+    }
+    if do_lock {
+        cmds.push(GuiCommand::ToggleLock);
+    }
+    cmds
+}
+
+/// Offload-completion watch: `Some((new_version, parent))` when the engine's
+/// offload version has moved past `last_version`, carrying the fresh parent
+/// folder (if the engine published one) for the converter auto-switch.
+fn offload_just_finished(
+    snap: &AppStateSnapshot,
+    last_version: u64,
+) -> Option<(u64, Option<PathBuf>)> {
+    let version = snap.offload.last_offload_version;
+    if version == last_version {
+        return None;
+    }
+    Some((version, snap.offload.last_offload_parent.clone()))
+}
+
 // ── egui App ────────────────────────────────────────────────────────────
 
 impl eframe::App for AppState {
@@ -235,28 +345,8 @@ impl eframe::App for AppState {
         self.latest = Arc::clone(&snapshot);
         self.applied_seq = snapshot.applied_command_seq;
 
-        // 2. Maintain keyed offload shadows (value sync happens per-widget at
-        //    draw time inside the `bound::` wrappers): prune vanished
-        //    mounts/files and seed new entries from the engine snapshot.
-        let mounts: Vec<PathBuf> = self.latest.offload.cards.iter().map(|c| c.mount.clone()).collect();
-        self.sh.device_names.retain(|mount, _| mounts.contains(mount));
-        for card in &self.latest.offload.cards {
-            self.sh.device_names
-                .entry(card.mount.clone())
-                .or_insert_with(|| gui_engine::edit_state::EditState::new(card.device_name.clone()));
-        }
-        let file_keys: Vec<(PathBuf, PathBuf)> = self.latest.offload.cards.iter()
-            .flat_map(|c| c.files.iter().map(move |f| (c.mount.clone(), f.path.clone())))
-            .collect();
-        self.sh.file_selection.retain(|k, _| file_keys.contains(k));
-        for card in &self.latest.offload.cards {
-            for (i, file) in card.files.iter().enumerate() {
-                let selected = card.selected.get(i).copied().unwrap_or(false);
-                self.sh.file_selection
-                    .entry((card.mount.clone(), file.path.clone()))
-                    .or_insert_with(|| gui_engine::edit_state::EditState::new(selected));
-            }
-        }
+        // 2. Maintain keyed offload shadows
+        sync_offload_shadows(&mut self.sh, &self.latest);
 
         // 3. Maximize once
         if !self.has_requested_maximize {
@@ -278,30 +368,10 @@ impl eframe::App for AppState {
         self.last_frame_time = Some(now);
 
         // 5. Process engine events into toasts — drained from the
-        // audio-event channel, not the snapshot (one-shot mailbox).
+        //    audio-event channel, not the snapshot (one-shot mailbox).
         while let Ok(evt) = self.event_rx.try_recv() {
-            match evt {
-                AudioEvent::StreamError(msg) => {
-                    self.add_notification(NotificationType::Error, format!("Audio stream error: {}", msg));
-                }
-                AudioEvent::StreamDied => {
-                    self.add_notification(NotificationType::Error, "Audio stream has died — re-initialize device".to_string());
-                }
-                AudioEvent::StreamRecovering { attempt } => {
-                    self.add_notification(NotificationType::Warning, format!("Audio stream recovering (attempt {})", attempt));
-                }
-                AudioEvent::StreamDead => {
-                    self.add_notification(NotificationType::Error, "Fatal: audio device unreachable".to_string());
-                }
-                AudioEvent::RecoveryNeeded { reason } => {
-                    self.add_notification(NotificationType::Warning, format!("Audio recovery needed: {}", reason));
-                }
-                AudioEvent::Underrun => {
-                    self.add_notification(NotificationType::Warning, "Audio underrun — samples not keeping up".to_string());
-                }
-                AudioEvent::FramesDropped { total } => {
-                    self.add_notification(NotificationType::Warning, format!("{} frame(s) dropped", total));
-                }
+            if let Some((nt, msg)) = audio_event_to_notification(&evt) {
+                self.add_notification(nt, msg);
             }
         }
 
@@ -312,13 +382,9 @@ impl eframe::App for AppState {
         //     echo round-trip (~40 ms engine tick) is rendered on the next
         //     frame instead of waiting out the idle repaint interval.
         if self.awaiting_echo {
-            if self.applied_seq >= self.next_send_seq {
-                self.awaiting_echo = false;
-            } else {
-                let floor = Duration::from_secs_f64(1.0 / 60.0) + Duration::from_millis(1);
-                ctx.request_repaint_after(
-                    (Duration::from_millis(40) + Duration::from_secs_f64(1.0 / 60.0)).max(floor),
-                );
+            match echo_repaint_delay(self.applied_seq, self.next_send_seq) {
+                None => self.awaiting_echo = false,
+                Some(delay) => ctx.request_repaint_after(delay),
             }
         }
 
@@ -348,32 +414,20 @@ impl eframe::App for AppState {
             (false, false, false, false, false)
         };
 
-        if toggle_play && !self.latest.is_locked {
-            if self.latest.is_playing {
-                self.send(GuiCommand::StopLtc);
-            } else {
-                self.send(GuiCommand::StartLtc);
-            }
-        }
-        if do_clap && !self.latest.is_locked {
-            self.send(GuiCommand::Clap);
-        }
-        if do_reset && !self.latest.is_locked {
-            self.send(GuiCommand::Reset);
-        }
-        if do_lock {
-            self.send(GuiCommand::ToggleLock);
+        for cmd in shortcut_commands(
+            toggle_play, do_clap, do_reset, do_lock,
+            self.latest.is_playing, self.latest.is_locked,
+        ) {
+            self.send(cmd);
         }
         if toggle_debug {
             self.show_debug_log = !self.show_debug_log;
         }
 
         // 9. Auto-switch converter folder when an offload completes
-        let off_version = self.latest.offload.last_offload_version;
-        if off_version != self.offload_last_version {
-            self.offload_last_version = off_version;
-            if let Some(ref path) = self.latest.offload.last_offload_parent {
-                let path = path.clone();
+        if let Some((_version, parent)) = offload_just_finished(&self.latest, self.offload_last_version) {
+            self.offload_last_version = self.latest.offload.last_offload_version;
+            if let Some(path) = parent {
                 log::info!("Offload completed — auto-switching converter folder to {:?}", path);
                 // Preset the LTC source to the second track, mirroring the
                 // previous merge-buffer behavior, then switch the folder.
@@ -459,6 +513,65 @@ pub fn centered_horizontal_row<R>(
         ui.data_mut(|d| d.insert_temp(row_id, inner_response.rect.width()));
     });
     result.expect("Inner contents closure must run exactly once")
+}
+
+// ── Clock-section helpers ───────────────────────────────────────────────
+
+/// Routing pill text: `LTC: LEFT | CLAP: RIGHT` (uppercase channel names).
+fn route_label(ltc: gui_engine::ChannelSel, beep: gui_engine::ChannelSel) -> String {
+    format!("LTC: {} | CLAP: {}", ltc.as_str().to_uppercase(), beep.as_str().to_uppercase())
+}
+
+/// One transport button with the shared size/fill shape; returns whether it
+/// was clicked. Collapses the four near-identical button blocks.
+fn transport_button(
+    ui: &mut Ui,
+    width: f32,
+    label: RichText,
+    fill: Color32,
+) -> bool {
+    let btn = egui::Button::new(label)
+        .fill(fill)
+        .min_size(egui::vec2(width, 32.0));
+    ui.add(btn).clicked()
+}
+
+/// The Start/Stop · Clap · Reset · Lock row (egui-bound; sends commands).
+fn render_transport_buttons(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, btn_w: f32) {
+    centered_horizontal_row(ui, "transport_row", 400.0, |ui| {
+        ui.horizontal(|ui| {
+            // Start / Stop
+            if s.is_playing {
+                if transport_button(ui, btn_w, RichText::new("■ STOP").strong().color(Color32::WHITE), Color32::from_rgb(0xDC, 0x26, 0x26))
+                    && !s.is_locked
+                {
+                    state.send(GuiCommand::StopLtc);
+                }
+            } else {
+                if transport_button(ui, btn_w, RichText::new("▶ START").strong().color(Color32::BLACK), Color32::from_rgb(0x22, 0xC5, 0x5E))
+                    && !s.is_locked
+                {
+                    state.send(GuiCommand::StartLtc);
+                }
+            }
+            // Clap
+            if transport_button(ui, btn_w, RichText::new("CLAP & BEEP").strong().color(Color32::BLACK), ACCENT) && !s.is_locked {
+                state.send(GuiCommand::Clap);
+            }
+            // Reset
+            let colors = state.theme.colors();
+            let (text_title, nested_bg, text_muted) = (colors.text_title, colors.nested_bg, colors.text_muted);
+            if transport_button(ui, btn_w, RichText::new("↺").strong().color(text_title), nested_bg) && !s.is_locked {
+                state.send(GuiCommand::Reset);
+            }
+            // Lock
+            let lock_icon = if s.is_locked { "🔒" } else { "🔓" };
+            let lock_color = if s.is_locked { ACCENT } else { text_muted };
+            if transport_button(ui, btn_w, RichText::new(lock_icon).color(lock_color), colors.nested_bg) {
+                state.send(GuiCommand::ToggleLock);
+            }
+        });
+    });
 }
 
 // ── Render methods ──────────────────────────────────────────────────────
@@ -629,7 +742,7 @@ impl AppState {
                             .stroke(egui::Stroke::new(1.0, colors.border_main))
                             .inner_margin(egui::Margin::symmetric(8, 3));
                         route_pill.show(ui, |ui| {
-                            let route = format!("LTC: {} | CLAP: {}", s.ltc_channel.as_str().to_uppercase(), s.beep_channel.as_str().to_uppercase());
+                            let route = route_label(s.ltc_channel, s.beep_channel);
                             ui.label(RichText::new(route).font(FontId::monospace(8.0)).color(colors.text_muted));
                         });
                     });
@@ -639,49 +752,7 @@ impl AppState {
 
                 // Transport buttons
                 let btn_w = (ui.available_width() - 24.0) / 4.0;
-                centered_horizontal_row(ui, "transport_row", 400.0, |ui| {
-                    ui.horizontal(|ui| {
-                        // Start / Stop
-                        if s.is_playing {
-                            let stop_btn = egui::Button::new(RichText::new("■ STOP").strong().color(Color32::WHITE))
-                                .fill(Color32::from_rgb(0xDC, 0x26, 0x26))
-                                .min_size(egui::vec2(btn_w, 32.0));
-                            if ui.add(stop_btn).clicked() && !s.is_locked {
-                                self.send(GuiCommand::StopLtc);
-                            }
-                        } else {
-                            let start_btn = egui::Button::new(RichText::new("▶ START").strong().color(Color32::BLACK))
-                                .fill(Color32::from_rgb(0x22, 0xC5, 0x5E))
-                                .min_size(egui::vec2(btn_w, 32.0));
-                            if ui.add(start_btn).clicked() && !s.is_locked {
-                                self.send(GuiCommand::StartLtc);
-                            }
-                        }
-                        // Clap
-                        let clap_btn = egui::Button::new(RichText::new("CLAP & BEEP").strong().color(Color32::BLACK))
-                            .fill(ACCENT)
-                            .min_size(egui::vec2(btn_w, 32.0));
-                        if ui.add(clap_btn).clicked() && !s.is_locked {
-                            self.send(GuiCommand::Clap);
-                        }
-                        // Reset
-                        let reset_btn = egui::Button::new(RichText::new("↺").strong().color(colors.text_title))
-                            .fill(colors.nested_bg)
-                            .min_size(egui::vec2(btn_w, 32.0));
-                        if ui.add(reset_btn).clicked() && !s.is_locked {
-                            self.send(GuiCommand::Reset);
-                        }
-                        // Lock
-                        let lock_icon = if s.is_locked { "🔒" } else { "🔓" };
-                        let lock_color = if s.is_locked { ACCENT } else { colors.text_muted };
-                        let lock_btn = egui::Button::new(RichText::new(lock_icon).color(lock_color))
-                            .fill(colors.nested_bg)
-                            .min_size(egui::vec2(btn_w, 32.0));
-                        if ui.add(lock_btn).clicked() {
-                            self.send(GuiCommand::ToggleLock);
-                        }
-                    });
-                });
+                render_transport_buttons(ui, self, &s, btn_w);
             });
         });
     }
@@ -1078,6 +1149,173 @@ mod tests {
         assert_eq!(app.send(GuiCommand::Reset), 2);
         assert_eq!(app.next_send_seq, 2);
         assert_eq!(rx.iter().take(2).count(), 2);
+    }
+
+    // ── logic() helper extractions ───────────────────────────────────────
+
+    fn card_with_files(mount: &str, paths: &[&str]) -> gui_engine::offload::SdCardInfo {
+        let mut card = gui_engine::offload::SdCardInfo {
+            mount: PathBuf::from(mount),
+            volume_label: String::new(),
+            device_name: "CAM".to_string(),
+            name_source: gui_engine::offload::DeviceNameSource::Manual,
+            media_file_count: paths.len(),
+            total_bytes: 0,
+            files: Vec::new(),
+            selected: Vec::new(),
+            selected_count: 0,
+            selected_bytes: 0,
+        };
+        for p in paths {
+            card.files.push(gui_engine::offload::OffloadFileInfo {
+                path: PathBuf::from(p),
+                name: p.to_string(),
+                size_bytes: 0,
+                modified: None,
+            });
+            card.selected.push(false);
+        }
+        card
+    }
+
+    fn snapshot_with_card(card: gui_engine::offload::SdCardInfo) -> AppStateSnapshot {
+        let mut s = AppStateSnapshot::initial();
+        s.offload.cards.push(card);
+        s
+    }
+
+    #[test]
+    fn sync_offload_shadows_seeds_device_names_per_mount() {
+        let snap = snapshot_with_card(card_with_files("/mnt/a", &[]));
+        let mut sh = Shadows::new(&AppStateSnapshot::initial());
+        assert!(sh.device_names.is_empty());
+
+        sync_offload_shadows(&mut sh, &snap);
+
+        assert_eq!(sh.device_names.len(), 1);
+        assert_eq!(sh.device_names[&PathBuf::from("/mnt/a")].value(), "CAM");
+    }
+
+    #[test]
+    fn sync_offload_shadows_prunes_vanished_mounts_and_files() {
+        let mut sh = Shadows::new(&AppStateSnapshot::initial());
+        sh.device_names.insert(PathBuf::from("/mnt/old"), gui_engine::edit_state::EditState::new("X".to_string()));
+        sh.file_selection.insert((PathBuf::from("/mnt/old"), PathBuf::from("f.wav")), gui_engine::edit_state::EditState::new(true));
+
+        let snap = snapshot_with_card(card_with_files("/mnt/new", &["f.wav"]));
+        sync_offload_shadows(&mut sh, &snap);
+
+        assert!(!sh.device_names.contains_key(&PathBuf::from("/mnt/old")));
+        assert!(!sh.file_selection.contains_key(&(PathBuf::from("/mnt/old"), PathBuf::from("f.wav"))));
+        assert!(sh.device_names.contains_key(&PathBuf::from("/mnt/new")));
+        assert!(sh.file_selection.contains_key(&(PathBuf::from("/mnt/new"), PathBuf::from("f.wav"))));
+    }
+
+    #[test]
+    fn sync_offload_shadows_seeds_file_selection_from_engine_default() {
+        let mut card = card_with_files("/mnt/a", &["f1.wav", "f2.wav"]);
+        card.selected = vec![false, true];
+        let snap = snapshot_with_card(card);
+
+        let mut sh = Shadows::new(&AppStateSnapshot::initial());
+        sync_offload_shadows(&mut sh, &snap);
+
+        assert!(!*sh.file_selection[&(PathBuf::from("/mnt/a"), PathBuf::from("f1.wav"))].value());
+        assert!(*sh.file_selection[&(PathBuf::from("/mnt/a"), PathBuf::from("f2.wav"))].value());
+    }
+
+    #[test]
+    fn audio_event_to_notification_maps_all_variants() {
+        let (nt, _) = audio_event_to_notification(&AudioEvent::StreamError("boom".into())).unwrap();
+        assert_eq!(nt, NotificationType::Error);
+        let (nt, _) = audio_event_to_notification(&AudioEvent::StreamDied).unwrap();
+        assert_eq!(nt, NotificationType::Error);
+        let (nt, _) = audio_event_to_notification(&AudioEvent::StreamRecovering { attempt: 2 }).unwrap();
+        assert_eq!(nt, NotificationType::Warning);
+        let (nt, _) = audio_event_to_notification(&AudioEvent::StreamDead).unwrap();
+        assert_eq!(nt, NotificationType::Error);
+        let (nt, _) = audio_event_to_notification(&AudioEvent::RecoveryNeeded { reason: "x".into() }).unwrap();
+        assert_eq!(nt, NotificationType::Warning);
+        let (nt, _) = audio_event_to_notification(&AudioEvent::Underrun).unwrap();
+        assert_eq!(nt, NotificationType::Warning);
+        let (nt, msg) = audio_event_to_notification(&AudioEvent::FramesDropped { total: 7 }).unwrap();
+        assert_eq!(nt, NotificationType::Warning);
+        assert!(msg.contains('7'), "dropped-frame count must appear in the message");
+    }
+
+    #[test]
+    fn echo_repaint_delay_none_once_ack_caught_up() {
+        assert!(echo_repaint_delay(5, 5).is_none());
+        assert!(echo_repaint_delay(6, 5).is_none());
+    }
+
+    #[test]
+    fn echo_repaint_delay_some_while_pending_above_floor() {
+        let delay = echo_repaint_delay(5, 6).expect("pending echo must request a repaint");
+        let floor = Duration::from_secs_f64(1.0 / 60.0) + Duration::from_millis(1);
+        assert!(delay >= floor);
+    }
+
+    #[test]
+    fn shortcut_commands_toggle_play_chooses_start_or_stop() {
+        let cmds = shortcut_commands(true, false, false, false, false, false);
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], GuiCommand::StartLtc));
+
+        let cmds = shortcut_commands(true, false, false, false, true, false);
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], GuiCommand::StopLtc));
+    }
+
+    #[test]
+    fn shortcut_commands_suppressed_while_locked_except_lock_toggle() {
+        let cmds = shortcut_commands(true, true, true, false, true, true);
+        assert!(cmds.is_empty(), "play/clap/reset must be suppressed while locked");
+
+        let cmds = shortcut_commands(true, true, true, true, true, true);
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], GuiCommand::ToggleLock));
+    }
+
+    #[test]
+    fn shortcut_commands_full_unlocked_set() {
+        let cmds = shortcut_commands(true, true, true, false, false, false);
+        assert_eq!(cmds.len(), 3);
+        assert!(matches!(cmds[0], GuiCommand::StartLtc));
+        assert!(matches!(cmds[1], GuiCommand::Clap));
+        assert!(matches!(cmds[2], GuiCommand::Reset));
+    }
+
+    #[test]
+    fn offload_just_finished_none_while_version_unchanged() {
+        let s = AppStateSnapshot::initial();
+        assert!(offload_just_finished(&s, 0).is_none());
+    }
+
+    #[test]
+    fn offload_just_finished_carries_new_version_and_parent() {
+        let mut s = AppStateSnapshot::initial();
+        s.offload.last_offload_version = 3;
+        s.offload.last_offload_parent = Some(PathBuf::from("/out"));
+
+        let (version, parent) = offload_just_finished(&s, 2).expect("version moved");
+        assert_eq!(version, 3);
+        assert_eq!(parent, Some(PathBuf::from("/out")));
+    }
+
+    #[test]
+    fn offload_just_finished_allows_missing_parent() {
+        let mut s = AppStateSnapshot::initial();
+        s.offload.last_offload_version = 1;
+        let (_, parent) = offload_just_finished(&s, 0).expect("version moved");
+        assert_eq!(parent, None);
+    }
+
+    #[test]
+    fn route_label_uppercases_both_channels() {
+        // test-lint: allow(text-pin): formatter output is the contract
+        let label = route_label(gui_engine::ChannelSel::Left, gui_engine::ChannelSel::Right);
+        assert_eq!(label, "LTC: LEFT | CLAP: RIGHT");
     }
 
     #[test]
