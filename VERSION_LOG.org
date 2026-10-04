@@ -1,15 +1,31 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
-* Unreleased
+* v0.5.1
 
-The clapper-board animation now plays smoothly on both desktop apps:
-the clap flash and the slate arm used to be stepped by the engine's
-25 fps background tick, so they could only ever move that fast no
-matter how often the window repainted. The engine now simply announces
-each clap, and each app animates the flash and arm at its own full
-frame rate. Clap behaviour itself — beep, log entry, take numbering —
-is unchanged.
+Main features are a smoother clapper-board animation on both desktop
+apps and the formalisation of the project's error-handling policy.
+
+List of Changes:
+- Clapper animation: the clap flash and the slate arm used to be
+  stepped by the engine's 25 fps background tick, so they could only
+  ever move that fast no matter how often the window repainted. The
+  engine now publishes a monotonic clap_seq counter that simply
+  announces each clap, and each app animates at its own full frame
+  rate: ltc-gui runs a GUI-local animator (clap_anim.rs, decay
+  curves relocated from the engine, sampled at the GUI frame rate
+  with self-requested repaints), while ltc-slint pulses a one-shot
+  flash-strike trigger and animates the decay declaratively. All
+  engine-owned animation state was removed from the published
+  snapshot. Clap behaviour itself — beep, log entry, take numbering —
+  is unchanged.
+- CLI: the list-devices output formatting was extracted into a
+  testable formatter.
+- Documentation: AGENTS.md gained a normative Error-Handling Policy
+  section (typed errors at decision points, cancellation as a variant
+  instead of an error string, String only at display boundaries, and
+  the migration/classification rules for remaining Result<_, String>
+  sites), with the full inventory kept in a local report.
 
 
 * v0.5.0
