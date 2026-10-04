@@ -14,6 +14,7 @@ pub mod ffprobe;
 pub mod file_pattern;
 pub mod job;
 pub mod naming;
+pub mod hw_cache;
 pub mod hw_device;
 pub mod log_buffer;
 pub mod media_ext;
@@ -73,6 +74,7 @@ pub use media_ext::{container_for_input, is_audio, is_video, AUDIO_EXTENSIONS, V
 
 // Re-export duration helpers
 pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs};
+pub use hw_cache::{cache_key_for, publish_stage1_caps, validate_hw_encoders_cached_with, CacheKey, HwValidationCache};
 
 // Re-export job types
 pub use job::{

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use std::path::{Path, PathBuf};
 
 use arc_swap::ArcSwap;
-use gui_engine::command::{GuiCommand, OffloadCommand};
+use gui_engine::command::{ConverterCommand, GuiCommand, OffloadCommand};
 use gui_engine::engine::{engine_main_with_probe, engine_main_with_seams, EngineSeams, ScanCardsFn};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::offload::{OffloadFileInfo, SdCardInfo};
@@ -56,6 +56,7 @@ fn fake_probe() -> FfmpegCapabilities {
         available_encoders: BTreeSet::new(),
         available_formats: BTreeSet::new(),
         error_message: None,
+            ffmpeg_version: None,
         hw: HwDeviceCapabilities::default(),
     }
 }
@@ -742,6 +743,21 @@ fn test_idle_engine_does_not_republish() {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+    // The two-stage probe keeps mutating state after the stage-1 publish:
+    // the HwValidate job's terminal transition is the last guaranteed change,
+    // so idleness can only be asserted once it has settled.
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        if Instant::now() > deadline {
+            panic!("Timeout waiting for HwValidate job to settle");
+        }
+        if state.load().jobs.get(&JobKind::HwValidate).map(|j| {
+            matches!(j.phase(), JobPhase::Succeeded | JobPhase::Cancelled | JobPhase::Failed)
+        }).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 
     // Snapshot is now idle/static — several ticks must NOT store a new Arc.
     let before = state.load_full();
@@ -1270,6 +1286,224 @@ fn test_stream_dead_hard_reset_does_not_bump_counter() {
         |s| s.audio_recovery_attempts == 1,
     );
     assert_eq!(snap.audio_recovery_attempts, 1);
+
+    eng.shutdown();
+}
+
+// ── Two-stage ffmpeg caps probe (Phase 3) ────────────────────────────────
+
+/// Caps fixture listing one VAAPI encoder next to software fallbacks. The
+/// VAAPI device is "available" so the stage-2 validation actually probes it.
+fn hw_caps_with_vaapi() -> FfmpegCapabilities {
+    FfmpegCapabilities {
+        has_ffmpeg: true,
+        available_encoders: BTreeSet::from([
+            "libx264".to_string(),
+            "pcm_s24le".to_string(),
+            "hevc_vaapi".to_string(),
+        ]),
+        available_formats: BTreeSet::from([
+            "mov".to_string(), "matroska".to_string(), "mp4".to_string(), "mxf".to_string(),
+        ]),
+        error_message: None,
+        hw: HwDeviceCapabilities {
+            vaapi_device: Some("/dev/dri/renderD128".to_string()),
+            vulkan_available: false,
+        },
+        ffmpeg_version: None,
+    }
+}
+
+fn spawn_engine_with_caps_and_hw_validate(
+    caps: FfmpegCapabilities,
+    hw_validate: impl FnOnce(FfmpegCapabilities) -> FfmpegCapabilities + Send + 'static,
+) -> TestEngine {
+    init_test_config();
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+    let (event_tx, event_rx) = mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-hw-validate-test".into())
+        .spawn(move || {
+            let seams = EngineSeams {
+                ffmpeg_caps: Box::new(move || caps),
+                hw_validate: Box::new(hw_validate),
+                ..EngineSeams::default()
+            };
+            engine_main_with_seams(rx, state_clone, false, event_tx, seams);
+        })
+        .expect("failed to spawn engine thread");
+    TestEngine { tx, state, handle, event_rx }
+}
+
+#[test]
+fn test_stage1_withholds_unvalidated_hw_encoders_until_stage2_finishes() {
+    init_test_config();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let eng = spawn_engine_with_caps_and_hw_validate(hw_caps_with_vaapi(), move |caps| {
+        let _ = release_rx.recv(); // stage 2 gated until the test has observed stage 1
+        caps // hevc_vaapi passes its test encode
+    });
+
+    // Stage 1 published: software encoders visible…
+    wait_for_snapshot(
+        &eng.state,
+        "stage-1 caps to publish",
+        |s| {
+            s.ffmpeg_caps.as_ref()
+                .map(|c| c.available_encoders.contains("libx264"))
+                .unwrap_or(false)
+        },
+    );
+
+    // …but the bounded observation window must not show the unvalidated HW
+    // encoder in ANY published snapshot before stage 2 finishes.
+    let window_deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < window_deadline {
+        let snapshot = eng.state.load().as_ref().clone();
+        let caps = snapshot.ffmpeg_caps.as_ref().expect("stage-1 caps already published");
+        assert!(
+            !caps.available_encoders.contains("hevc_vaapi"),
+            "no snapshot before the HwValidate job finishes may contain an unvalidated HW encoder"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    // Release stage 2: the passing HW encoder must appear.
+    release_tx.send(()).expect("stage-2 gate receiver alive");
+    let snapshot = wait_for_snapshot(
+        &eng.state,
+        "stage-2 reconciliation to publish hevc_vaapi",
+        |s| {
+            s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded)
+                && s.ffmpeg_caps.as_ref()
+                    .map(|c| c.available_encoders.contains("hevc_vaapi"))
+                    .unwrap_or(false)
+        },
+    );
+    assert!(
+        snapshot.ffmpeg_caps.as_ref().unwrap().available_encoders.contains("hevc_vaapi"),
+        "after stage 2, passing HW encoders must be present"
+    );
+
+    eng.shutdown();
+}
+
+#[test]
+fn test_stage2_finish_upgrades_default_when_user_untouched() {
+    init_test_config();
+    // Stage 1 withholds hevc_vaapi → h265 unavailable → default h264.
+    // Stage 2 validates hevc_vaapi → h265 available → the untouched-latch
+    // upgrade must re-pick the best combination (h265).
+    let eng = spawn_engine_with_caps_and_hw_validate(hw_caps_with_vaapi(), |caps| caps);
+
+    let snapshot = wait_for_snapshot(
+        &eng.state,
+        "stage-2 default upgrade to h265",
+        |s| {
+            s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded)
+                && s.converter.settings.video_encoder == "h265"
+        },
+    );
+    assert_eq!(snapshot.converter.settings.video_encoder, "h265");
+    assert_eq!(snapshot.converter.settings.container, "mov");
+
+    eng.shutdown();
+}
+
+#[test]
+fn test_set_video_codec_before_stage2_blocks_default_upgrade() {
+    init_test_config();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let eng = spawn_engine_with_caps_and_hw_validate(hw_caps_with_vaapi(), move |caps| {
+        let _ = release_rx.recv();
+        caps
+    });
+
+    // User explicitly picks the video codec BEFORE stage 2 runs.
+    eng.tx.send(GuiCommand::Converter(ConverterCommand::SetVideoCodec("h264".to_string())))
+        .expect("engine alive");
+
+    // Wait until the command was acked (and stage 1 published) before releasing.
+    wait_for_snapshot(
+        &eng.state,
+        "SetVideoCodec to be acked",
+        |s| s.applied_command_seq >= 1 && s.ffmpeg_caps.is_some(),
+    );
+    release_tx.send(()).expect("stage-2 gate receiver alive");
+
+    let snapshot = wait_for_snapshot(
+        &eng.state,
+        "stage-2 to finish with the user's codec intact",
+        |s| s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded),
+    );
+    assert_eq!(
+        snapshot.converter.settings.video_encoder, "h264",
+        "an explicit user codec choice must never be overridden by the stage-2 upgrade"
+    );
+
+    eng.shutdown();
+}
+
+#[test]
+fn test_cache_vouch_publishes_hw_encoder_at_stage1_and_reconciles() {
+    use gui_engine::hw_cache::{cache_dir, save_hw_cache, load_hw_cache, validate_hw_encoders_cached_with, HwValidationCache};
+
+    init_test_config();
+    let mut caps = hw_caps_with_vaapi();
+    caps.ffmpeg_version = Some("phase3-cache-engine-test-v1".to_string());
+    let key = gui_engine::cache_key_for(&caps).expect("fixture has a version");
+    let dir = cache_dir().expect("test config dir exists");
+
+    // Pre-seed a matching-key cache that vouches for hevc_vaapi.
+    save_hw_cache(&dir, &HwValidationCache {
+        key: key.clone(),
+        passed: BTreeSet::from(["hevc_vaapi".to_string()]),
+    });
+
+    // Stage 2 runs the real cached-reconcile path with a probe that FAILS
+    // for hevc_vaapi: the cache-vouched pass must be pruned from the caps
+    // and from the persisted cache (stale pass dies within one session).
+    let job_dir = dir.clone();
+    let eng = spawn_engine_with_caps_and_hw_validate(caps, move |caps| {
+        validate_hw_encoders_cached_with(
+            caps,
+            &mut |name: &str, _hw: Option<gui_engine::HwFramePath>, _dev: Option<&str>| {
+                name != "hevc_vaapi"
+            },
+            &mut || load_hw_cache(&job_dir),
+            &mut |c| save_hw_cache(&job_dir, c),
+        )
+    });
+
+    // Stage 1: the cache-vouched encoder is published immediately.
+    wait_for_snapshot(
+        &eng.state,
+        "cache-vouched encoder at stage 1",
+        |s| {
+            s.ffmpeg_caps.as_ref()
+                .map(|c| c.available_encoders.contains("hevc_vaapi"))
+                .unwrap_or(false)
+        },
+    );
+
+    // Stage 2: the reconciliation prunes it.
+    let snapshot = wait_for_snapshot(
+        &eng.state,
+        "stage-2 pruning of the stale cache pass",
+        |s| s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded),
+    );
+    assert!(
+        !snapshot.ffmpeg_caps.as_ref().unwrap().available_encoders.contains("hevc_vaapi"),
+        "a cache-vouched encoder that fails its stage-2 test encode must be removed"
+    );
+    let saved = load_hw_cache(&dir).expect("write-back must have persisted a cache");
+    assert!(
+        !saved.passed.contains("hevc_vaapi"),
+        "the stale pass must be pruned from the persisted cache"
+    );
+    assert_eq!(saved.key, key);
 
     eng.shutdown();
 }

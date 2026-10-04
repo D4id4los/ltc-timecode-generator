@@ -57,6 +57,7 @@ pub fn make_caps(
         available_encoders: encoders.into_iter().map(String::from).collect(),
         available_formats: formats.into_iter().map(String::from).collect(),
         error_message: None,
+            ffmpeg_version: None,
         hw: HwDeviceCapabilities::default(),
     }
 }

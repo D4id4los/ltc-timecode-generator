@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CONFIG_DIR: &str = "ltc-timecode-generator";
+pub(crate) const CONFIG_DIR: &str = "ltc-timecode-generator";
 const CONFIG_FILE: &str = "converter_config.json";
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]

@@ -325,6 +325,7 @@ mod tests {
             available_encoders: encoders.into_iter().map(String::from).collect(),
             available_formats: BTreeSet::new(),
             error_message: None,
+            ffmpeg_version: None,
             hw: HwDeviceCapabilities::default(),
         }
     }
@@ -339,6 +340,7 @@ mod tests {
             available_encoders: encoders.into_iter().map(String::from).collect(),
             available_formats: BTreeSet::new(),
             error_message: None,
+            ffmpeg_version: None,
             hw: HwDeviceCapabilities {
                 vaapi_device: vaapi_device.map(String::from),
                 vulkan_available: vulkan,

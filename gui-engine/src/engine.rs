@@ -16,9 +16,10 @@ use crate::converter::{
     FfmpegCapabilities, ChannelMap, ConversionPipeline, ConverterSettings,
     RecordingType, duplicate_output_names, duplicate_output_warning, evaluate_readiness,
     output_collision_warning, preview_output_files, apply_available_defaults,
-    spawn_conversion_job,
+    select_best_combination, spawn_conversion_job,
 };
 use crate::ffprobe::VideoAudioProbe;
+use crate::hw_cache;
 use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor, spawn_job};
 use crate::job::CancelToken;
 use crate::offload::{
@@ -61,9 +62,17 @@ pub type AudioEventsFn = Box<dyn Fn(&AudioCore) -> Vec<AudioEvent> + Send>;
 /// resets the recovery counter, which would make it environment-dependent).
 pub type AudioInitFn = Box<dyn Fn(&AudioCore, &str, u32, u32) -> Result<u32, String> + Send>;
 
+/// Stage-2 HW-encoder validation: takes the full (unvalidated) stage-1 caps
+/// and returns the reconciled caps after test-encoding every HW candidate.
+pub type HwValidateFn = Box<dyn FnOnce(FfmpegCapabilities) -> FfmpegCapabilities + Send>;
+
 pub struct EngineSeams {
     /// ffmpeg capability probe (the `engine_main_with_probe` seam).
     pub ffmpeg_caps: Box<dyn FnOnce() -> FfmpegCapabilities + Send>,
+    /// Stage-2 HW-encoder validation + cache reconciliation. The default is
+    /// `hw_cache::default_hw_validate`; tests inject an immediate or
+    /// channel-gated fake (mirrors the `fake_probe()` precedent).
+    pub hw_validate: HwValidateFn,
     /// Card-detection source for offload `ScanCards` jobs. The real
     /// implementation walks `/proc/mounts` / `/sys/class/block`; tests
     /// hand-build `SdCardInfo` values. May block and poll `cancel`.
@@ -86,6 +95,7 @@ impl Default for EngineSeams {
             init_output: Box::new(|core, device_id, sample_rate, buffer_size| {
                 core.init_output(device_id, sample_rate, buffer_size)
             }),
+            hw_validate: Box::new(hw_cache::default_hw_validate),
         }
     }
 }
@@ -135,6 +145,13 @@ struct EngineLoopState {
     /// Audio-output initializer (default = real `AudioCore::init_output`;
     /// tests inject failure for deterministic recovery-ladder behavior).
     audio_init: AudioInitFn,
+    /// Stage-2 HW-encoder validation seam, taken once when the stage-1 caps
+    /// finish triggers the `HwValidate` job spawn.
+    hw_validate: Option<HwValidateFn>,
+    /// Untouched-latch (Item 2d): armed by any user command touching
+    /// container/encoder/audio-encoder; once armed, the stage-2 arrival
+    /// never auto-upgrades the default combination this session.
+    encoder_touched: bool,
 }
 
 impl EngineLoopState {
@@ -155,6 +172,8 @@ impl EngineLoopState {
             audio_init: Box::new(|core, device_id, sample_rate, buffer_size| {
                 core.init_output(device_id, sample_rate, buffer_size)
             }),
+            hw_validate: None,
+            encoder_touched: false,
         }
     }
 }
@@ -196,6 +215,7 @@ fn engine_main_loop(
     let mut els = EngineLoopState::new(initial);
     els.scan_cards = seams.scan_cards;
     els.audio_init = seams.init_output;
+    els.hw_validate = Some(seams.hw_validate);
     let audio_events = seams.audio_events;
 
     // Job supervisor — single channel for all async task result events
@@ -626,6 +646,14 @@ fn handle_converter_command(
     supervisor: &mut JobSupervisor,
 ) {
     use ConverterCommand as C;
+    // Untouched-latch (Item 2d): an explicit user choice of container or
+    // encoder arms the latch — the stage-2 default upgrade never overrides it.
+    match cmd {
+        C::SetContainer(_) | C::SetVideoCodec(_) | C::SetAudioEncoder(_) => {
+            els.encoder_touched = true;
+        }
+        _ => {}
+    }
     match cmd {
         C::SelectFolder(path) => cmd_select_folder(els, supervisor, path),
         C::SelectRecording(idx) => {
@@ -1458,7 +1486,8 @@ fn handle_job_event(
     match event {
         JobEvent::Finished { kind, outcome, payload, .. } => match kind {
             JobKind::Conversion => on_conversion_finished(els, outcome, payload),
-            JobKind::FfmpegCapProbe => on_ffmpeg_caps_finished(els, outcome, payload),
+            JobKind::FfmpegCapProbe => on_ffmpeg_caps_finished(els, supervisor, outcome, payload),
+            JobKind::HwValidate => on_hw_validate_finished(els, outcome, payload),
             JobKind::FolderScan => on_folder_scan_finished(els, supervisor, outcome, payload),
             JobKind::VideoProbe => on_video_probe_finished(els, outcome, payload),
             JobKind::OffloadScan => on_offload_scan_finished(els, supervisor, outcome, payload),
@@ -1531,19 +1560,104 @@ fn on_conversion_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
     }
 }
 
-fn on_ffmpeg_caps_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+fn on_ffmpeg_caps_finished(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    outcome: JobOutcome,
+    payload: JobFinal,
+) {
     if let Some(status) = els.current.jobs.get_mut(&JobKind::FfmpegCapProbe) {
         status.apply_outcome(&outcome);
     }
     match payload {
-        JobFinal::FfmpegCaps { caps: Some(caps) } => {
-            apply_ffmpeg_probe_result(&mut els.current, caps);
+        JobFinal::FfmpegCaps { caps: Some(full_caps) } => {
+            // Stage 1: publish the caps with all HW encoders withheld, except
+            // those vouched for by a key-matching validation cache. No codec's
+            // encoder chain empties without its HW candidates (every codec has
+            // a software fallback), so no readiness blocker appears.
+            let cache = hw_cache::cache_dir().and_then(|dir| hw_cache::load_hw_cache(&dir));
+            let published = hw_cache::publish_stage1_caps(&full_caps, cache.as_ref());
+            let withheld = full_caps.available_encoders.len().saturating_sub(published.available_encoders.len());
+            info!(
+                "stage-1 caps published: {} encoder(s) ({} HW encoder(s) withheld pending validation)",
+                published.available_encoders.len(),
+                withheld,
+            );
+            apply_ffmpeg_probe_result(&mut els.current, published);
+            // Stage 2: validate every HW candidate in the background and
+            // reconcile the result (and the cache) when it lands.
+            spawn_hw_validate_job(els, supervisor, full_caps);
         }
         JobFinal::FfmpegCaps { caps: None } => {
             warn!("FFmpeg capability probe returned no caps");
             recompute_converter_derived(&mut els.current);
         }
         other => warn!("JobKind::FfmpegCapProbe finished with unexpected payload: {:?}", other),
+    }
+}
+
+/// Spawn the stage-2 `HwValidate` job: runs the (cache-reconciling) full
+/// HW-encoder validation over the full stage-1 encoder list on a background
+/// thread. Single-job-at-a-time per kind plus the stale-event gate drops a
+/// late stage-2 finish from a superseded probe.
+fn spawn_hw_validate_job(
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+    full_caps: FfmpegCapabilities,
+) {
+    let Some(hw_validate) = els.hw_validate.take() else {
+        warn!("no hw_validate seam available — skipping stage-2 HW validation");
+        return;
+    };
+    let spec = job::JobSpec {
+        kind: JobKind::HwValidate,
+        name: "hw-validate",
+        units: Vec::new(),
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        ctx.progress.set_indeterminate(true);
+        let caps = hw_validate(full_caps);
+        Ok(JobFinal::FfmpegCaps { caps: Some(caps) })
+    });
+}
+
+fn on_hw_validate_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::HwValidate) {
+        status.apply_outcome(&outcome);
+    }
+    match payload {
+        JobFinal::FfmpegCaps { caps: Some(caps) } => {
+            info!(
+                "stage-2 HW validation reconciled caps: {} encoder(s)",
+                caps.available_encoders.len(),
+            );
+            apply_ffmpeg_probe_result(&mut els.current, caps.clone());
+            // Item 2d — untouched-latch default upgrade: while the user has
+            // not touched container/encoder settings this session, re-pick
+            // the best combination so a newly validated HW encoder can
+            // become the default. Encoder choices are not persisted across
+            // sessions, so the flip cannot survive a restart.
+            if !els.encoder_touched {
+                let (container, video_encoder, audio_encoder) = select_best_combination(&caps);
+                let settings = &mut els.current.converter.settings;
+                if settings.container != container
+                    || settings.video_encoder != video_encoder
+                    || settings.audio_encoder != audio_encoder
+                {
+                    info!(
+                        "stage-2 default upgrade: container={} video={} audio={} (user untouched)",
+                        container, video_encoder, audio_encoder,
+                    );
+                    settings.container = container;
+                    settings.video_encoder = video_encoder;
+                    settings.audio_encoder = audio_encoder;
+                }
+            }
+        }
+        JobFinal::FfmpegCaps { caps: None } => {
+            warn!("HW validation returned no caps");
+        }
+        other => warn!("JobKind::HwValidate finished with unexpected payload: {:?}", other),
     }
 }
 
@@ -3505,6 +3619,7 @@ mod tests {
             available_formats: BTreeSet::new(),
             hw: HwDeviceCapabilities::default(),
             error_message: None,
+            ffmpeg_version: None,
         };
 
         let mut state = AppStateSnapshot::initial();

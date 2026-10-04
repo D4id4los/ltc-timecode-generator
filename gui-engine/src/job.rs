@@ -38,6 +38,7 @@ pub enum JobKind {
     VideoProbe,
     DurationProbe,
     FfmpegCapProbe,
+    HwValidate,
 }
 
 // ── Job phase ───────────────────────────────────────────────────────────

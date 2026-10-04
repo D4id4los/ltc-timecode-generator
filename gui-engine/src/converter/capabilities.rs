@@ -43,7 +43,7 @@ pub struct HwDeviceContext {
     pub vulkan_available: bool,
 }
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct HwDeviceCapabilities {
     pub vaapi_device: Option<String>,
     pub vulkan_available: bool,
@@ -57,6 +57,10 @@ pub struct FfmpegCapabilities {
     pub error_message: Option<String>,
     #[serde(default)]
     pub hw: HwDeviceCapabilities,
+    /// First line of `ffmpeg -version` (cache-key ingredient for the HW
+    /// validation cache). `None` when unknown (probe failure, test fakes).
+    #[serde(default)]
+    pub ffmpeg_version: Option<String>,
 }
 
 pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
@@ -104,15 +108,15 @@ pub fn query_ffmpeg_capabilities_timed() -> (FfmpegCapabilities, ProbeTimings) {
     let start = Instant::now();
     let probe = probe_ffmpeg_version();
     timings.version_ms = elapsed_ms(start);
-    match probe {
-        FfmpegVersionProbe::Available => {}
+    let version = match probe {
+        FfmpegVersionProbe::Available(version) => Some(version),
         ref failure => {
             if matches!(failure, FfmpegVersionProbe::TimedOut) {
                 log::warn!("ffmpeg -version probe timed out; treating ffmpeg as unavailable");
             }
             return (caps_for_version_failure(failure), timings);
         }
-    }
+    };
 
     let start = Instant::now();
     let encoders = run_ffmpeg_list(&["-encoders", "-hide_banner"], |flags| {
@@ -142,6 +146,7 @@ pub fn query_ffmpeg_capabilities_timed() -> (FfmpegCapabilities, ProbeTimings) {
         available_formats: formats,
         error_message: None,
         hw,
+        ffmpeg_version: version,
     };
 
     let start = Instant::now();
@@ -261,10 +266,12 @@ pub(crate) fn parse_ffmpeg_list_output(
         .collect()
 }
 
-/// Outcome of the `ffmpeg -version` availability probe.
+/// Outcome of the `ffmpeg -version` availability probe. `Available` carries
+/// the version string (first stdout line) — the HW-validation cache key
+/// ingredient.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum FfmpegVersionProbe {
-    Available,
+    Available(String),
     NonZeroExit,
     SpawnFailed(String),
     TimedOut,
@@ -275,7 +282,13 @@ pub(crate) enum FfmpegVersionProbe {
 fn probe_version_with(cmd: &mut Command, timeout: Duration) -> FfmpegVersionProbe {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     match run_output_with_timeout(cmd, timeout) {
-        Ok(out) if out.status.success() => FfmpegVersionProbe::Available,
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let first_line = stdout.lines().find(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default();
+            FfmpegVersionProbe::Available(first_line)
+        }
         Ok(_) => FfmpegVersionProbe::NonZeroExit,
         Err(crate::subprocess::SubprocessFailure::TimedOut) => FfmpegVersionProbe::TimedOut,
         Err(crate::subprocess::SubprocessFailure::Io(e)) => FfmpegVersionProbe::SpawnFailed(e),
@@ -294,13 +307,16 @@ fn probe_ffmpeg_version() -> FfmpegVersionProbe {
 /// shape (empty encoder/format sets + an error message).
 pub(crate) fn caps_for_version_failure(probe: &FfmpegVersionProbe) -> FfmpegCapabilities {
     let msg = match probe {
-        FfmpegVersionProbe::Available => return FfmpegCapabilities {
-            has_ffmpeg: true,
-            available_encoders: BTreeSet::new(),
-            available_formats: BTreeSet::new(),
-            error_message: None,
-            hw: HwDeviceCapabilities::default(),
-        },
+        FfmpegVersionProbe::Available(version) => {
+            return FfmpegCapabilities {
+                has_ffmpeg: true,
+                available_encoders: BTreeSet::new(),
+                available_formats: BTreeSet::new(),
+                error_message: None,
+                hw: HwDeviceCapabilities::default(),
+                ffmpeg_version: Some(version.clone()),
+            }
+        }
         FfmpegVersionProbe::NonZeroExit => {
             "ffmpeg found but returned a non-zero exit status".to_string()
         }
@@ -322,6 +338,7 @@ pub(crate) fn caps_for_version_failure(probe: &FfmpegVersionProbe) -> FfmpegCapa
         available_formats: BTreeSet::new(),
         error_message: Some(msg),
         hw: HwDeviceCapabilities::default(),
+        ffmpeg_version: None,
     }
 }
 
@@ -378,7 +395,7 @@ mod tests {
     fn test_probe_version_success() {
         let mut cmd = Command::new(success_prog());
         let probe = probe_version_with(&mut cmd, Duration::from_secs(5));
-        assert!(matches!(probe, FfmpegVersionProbe::Available), "got {:?}", probe);
+        assert!(matches!(probe, FfmpegVersionProbe::Available(_)), "got {:?}", probe);
     }
 
     // ── caps_for_version_failure ────────────────────────────────────────────
@@ -432,6 +449,7 @@ mod tests {
             available_formats: BTreeSet::from(["matroska".to_string()]),
             error_message: None,
             hw: HwDeviceCapabilities { vaapi_device: Some("/dev/dri/renderD128".to_string()), vulkan_available: false },
+            ffmpeg_version: None,
         };
         let timings = ProbeTimings {
             version_ms: 11,

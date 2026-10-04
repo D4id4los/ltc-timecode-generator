@@ -39,6 +39,7 @@ fn fake_probe() -> FfmpegCapabilities {
         available_encoders: BTreeSet::new(),
         available_formats: BTreeSet::new(),
         error_message: None,
+            ffmpeg_version: None,
         hw: HwDeviceCapabilities::default(),
     }
 }
