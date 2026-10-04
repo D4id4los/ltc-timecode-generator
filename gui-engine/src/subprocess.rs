@@ -229,9 +229,37 @@ pub fn watch_stderr_lines(
     cancel: Option<&AtomicBool>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<std::process::ExitStatus, WatchdogStop> {
-    let (tx, rx) = mpsc::channel::<String>();
+    let rx = spawn_stderr_reader(stderr);
+    let mut last_activity = Instant::now();
 
-    // Spawn reader thread (detached — handle is dropped on return).
+    loop {
+        if let Some(stop) = check_cancel(child, cancel) {
+            return Err(stop);
+        }
+
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                last_activity = Instant::now();
+                on_line(&line);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last_activity.elapsed() >= stall {
+                    if let Some(stop) = kill_on_stall(child) {
+                        return Err(stop);
+                    }
+                    // Child already exited — keep draining below.
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return await_exit_bounded(child, stall);
+            }
+        }
+    }
+}
+
+/// Spawn the detached reader thread that pumps stderr lines into a channel.
+fn spawn_stderr_reader(stderr: impl io::Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel::<String>();
     std::thread::Builder::new()
         .name("stderr-watchdog-reader".into())
         .spawn(move || {
@@ -248,65 +276,59 @@ pub fn watch_stderr_lines(
             }
         })
         .expect("failed to spawn stderr reader thread");
+    rx
+}
 
-    let mut last_activity = Instant::now();
+/// Cancel is checked on every poll iteration, not just per-line.
+/// Returns `Some(Cancelled)` (child killed and reaped) when the flag is set.
+fn check_cancel(child: &mut Child, cancel: Option<&AtomicBool>) -> Option<WatchdogStop> {
+    let cancelled = cancel?.load(Ordering::Relaxed);
+    if cancelled {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Some(WatchdogStop::Cancelled);
+    }
+    None
+}
 
-    loop {
-        // Cancel is checked on every poll iteration, not just per-line.
-        if let Some(cancel) = cancel {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(WatchdogStop::Cancelled);
-            }
+/// Stall (no stderr activity) reached: kill the child if it is still running.
+/// Returns `None` when the child already exited (keep draining).
+fn kill_on_stall(child: &mut Child) -> Option<WatchdogStop> {
+    match child.try_wait() {
+        Ok(None) => {
+            // Child is still running but silent → kill.
+            let _ = child.kill();
+            let _ = child.wait();
+            Some(WatchdogStop::Stalled)
         }
+        // Child already exited — keep draining below.
+        Ok(Some(_)) => None,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Some(WatchdogStop::Wait(format!("{}", e)))
+        }
+    }
+}
 
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(line) => {
-                last_activity = Instant::now();
-                on_line(&line);
+/// Reader thread finished. Normally the child has also exited (pipe close =
+/// child exit).  Safeguard: if the child closed stderr while still alive
+/// (rare edge case), bound the wait by the stall timeout.
+fn await_exit_bounded(child: &mut Child, stall: Duration) -> Result<std::process::ExitStatus, WatchdogStop> {
+    let disconnect_start = Instant::now();
+    loop {
+        if disconnect_start.elapsed() >= stall {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(WatchdogStop::Stalled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                std::thread::sleep(Duration::from_millis(100));
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if last_activity.elapsed() >= stall {
-                    match child.try_wait() {
-                        Ok(None) => {
-                            // Child is still running but silent → kill.
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(WatchdogStop::Stalled);
-                        }
-                        // Child already exited — keep draining below.
-                        Ok(Some(_)) => {}
-                        Err(e) => {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(WatchdogStop::Wait(format!("{}", e)));
-                        }
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Reader thread finished. Normally the child has also
-                // exited (pipe close = child exit).  Safeguard: if the
-                // child closed stderr while still alive (rare edge case),
-                // bound the wait by the stall timeout.
-                let disconnect_start = Instant::now();
-                loop {
-                    if disconnect_start.elapsed() >= stall {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(WatchdogStop::Stalled);
-                    }
-                    match child.try_wait() {
-                        Ok(Some(status)) => return Ok(status),
-                        Ok(None) => {
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
-                        Err(e) => {
-                            return Err(WatchdogStop::Wait(format!("{}", e)));
-                        }
-                    }
-                }
+            Err(e) => {
+                return Err(WatchdogStop::Wait(format!("{}", e)));
             }
         }
     }

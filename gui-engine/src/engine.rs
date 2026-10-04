@@ -270,20 +270,7 @@ fn engine_main_loop(
 
         // 1.4 Poll supervisor for finished jobs and drain events — unified dispatcher
         //     for all async job results that were started via spawn_job.
-        let progress_snapshots = supervisor.poll();
-        for (_id, kind, snap) in &progress_snapshots {
-            // Only overwrite job status from poll if the current phase is not
-            // a terminal state (Succeeded/Cancelled/Failed). The poll snapshot
-            // always shows Running; the terminal phase comes from the Finished
-            // event which apply_outcome sets, and must not be clobbered if the
-            // thread hasn't finished yet but the event already arrived.
-            let is_terminal = els.current.jobs.get(kind)
-                .map(|s| matches!(s.phase(), job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
-                .unwrap_or(false);
-            if !is_terminal {
-                els.current.jobs.insert(*kind, JobStatus::from_progress(snap));
-            }
-        }
+        sync_job_statuses(&mut els, &mut supervisor);
         for event in supervisor.drain() {
             if job_event_is_stale(&supervisor.latest_job, &event) {
                 continue;
@@ -304,33 +291,12 @@ fn engine_main_loop(
             handle_event(event, &core, &event_tx, &mut els);
         }
 
-        // 4. Animation: flash alpha decays at 2.0/s
-        if els.current.clapper.flash_alpha > 0.0 {
-            els.current.clapper.flash_alpha = (els.current.clapper.flash_alpha - dt * 2.0).max(0.0);
-        }
-
-        // 5. Animation: arm angle exponential decay toward rest position at 4.0/s
-        els.current.clapper.arm_angle += (TARGET_ARM_ANGLE - els.current.clapper.arm_angle)
-            * (1.0 - (-4.0 * dt).exp());
-
-        // 5.5 Determine whether clap animation is still visibly in progress.
-        // The GUI uses this flag to decide whether to render at 60 fps
-        // (for smooth animation) or to throttle to a lower rate.
-        els.current.clapper.animating = els.current.clapper.flash_alpha > 0.0
-            || (els.current.clapper.arm_angle - TARGET_ARM_ANGLE).abs() > ARM_SETTLE_EPS;
+        // 4./5. Animation: flash alpha + arm angle decay, animating flag.
+        update_clapper_animation(&mut els.current.clapper, dt);
 
         // 6. Publish state — only when the snapshot actually changed.
-        //    Compare against the last-published snapshot *before* cloning:
-        //    the common idle tick then costs one structural PartialEq and
-        //    no allocation/deep clone at all.
         els.current.audio_recovery_attempts = els.recovery_attempts;
-        let changed = els.last_published.as_ref()
-            .map_or(true, |p| p.as_ref() != &els.current);
-        if changed {
-            let next = Arc::new(els.current.clone());
-            state.store(next.clone());
-            els.last_published = Some(next);
-        }
+        publish_if_changed(&mut els, &state);
 
         // 7. Sleep until next tick
         let next_tick = els.last_tick + TICK_INTERVAL;
@@ -342,6 +308,52 @@ fn engine_main_loop(
     supervisor.shutdown(Duration::from_secs(2));
 }
 
+/// Poll the supervisor for progress snapshots and publish them into the
+/// snapshot's job-status map. Only overwrites a job status when the current
+/// phase is not terminal (Succeeded/Cancelled/Failed): the poll snapshot
+/// always shows Running; the terminal phase comes from the Finished event
+/// which apply_outcome sets, and must not be clobbered if the thread hasn't
+/// finished yet but the event already arrived.
+fn sync_job_statuses(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
+    let progress_snapshots = supervisor.poll();
+    for (_id, kind, snap) in &progress_snapshots {
+        let is_terminal = els.current.jobs.get(kind)
+            .map(|s| matches!(s.phase(), job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
+            .unwrap_or(false);
+        if !is_terminal {
+            els.current.jobs.insert(*kind, JobStatus::from_progress(snap));
+        }
+    }
+}
+
+/// Advance the clapper animations by `dt` seconds: flash alpha decays at
+/// 2.0/s, arm angle decays exponentially toward rest at 4.0/s, and the
+/// `animating` flag tracks whether the clap animation is still visibly in
+/// progress (the GUI uses it to pick its repaint rate).
+fn update_clapper_animation(clapper: &mut crate::state::ClapperSnapshot, dt: f32) {
+    if clapper.flash_alpha > 0.0 {
+        clapper.flash_alpha = (clapper.flash_alpha - dt * 2.0).max(0.0);
+    }
+    clapper.arm_angle += (TARGET_ARM_ANGLE - clapper.arm_angle)
+        * (1.0 - (-4.0 * dt).exp());
+    clapper.animating = clapper.flash_alpha > 0.0
+        || (clapper.arm_angle - TARGET_ARM_ANGLE).abs() > ARM_SETTLE_EPS;
+}
+
+/// Publish the snapshot only when it differs from the last-published one.
+/// Compares against the last-published snapshot *before* cloning: the common
+/// idle tick then costs one structural PartialEq and no allocation/deep
+/// clone at all.
+fn publish_if_changed(els: &mut EngineLoopState, state: &Arc<ArcSwap<AppStateSnapshot>>) {
+    let changed = els.last_published.as_ref()
+        .map_or(true, |p| p.as_ref() != &els.current);
+    if changed {
+        let next = Arc::new(els.current.clone());
+        state.store(next.clone());
+        els.last_published = Some(next);
+    }
+}
+
 fn process_command(
     cmd: GuiCommand,
     core: &AudioCore,
@@ -351,31 +363,7 @@ fn process_command(
     supervisor: &mut JobSupervisor,
 ) {
     match cmd {
-        GuiCommand::StartLtc => {
-            ensure_audio_init(core, els, event_tx);
-            if !els.current.audio_initialized {
-                els.current.status.set_audio("Cannot start — audio not initialized");
-                return;
-            }
-            let state = &mut els.current;
-            match core.start_ltc(
-                state.start_timecode,
-                state.fps(),
-                state.drop_frame(),
-                state.ltc_channel,
-                state.ltc_volume,
-            ) {
-                Ok(()) => {
-                    state.is_playing = true;
-                    state.status.set_audio("Streaming LTC");
-                    state.current_timecode = state.start_timecode;
-                }
-                Err(e) => {
-                    error!("Failed to start LTC: {}", e);
-                    state.status.set_audio(format!("Start failed: {}", e));
-                }
-            }
-        }
+        GuiCommand::StartLtc => cmd_start_ltc(core, els, event_tx),
 
         GuiCommand::StopLtc => {
             let _ = core.stop_ltc();
@@ -393,41 +381,7 @@ fn process_command(
             els.current.is_locked = !els.current.is_locked;
         }
 
-        GuiCommand::Clap => {
-            let state = &mut els.current;
-            let _ = core.play_beep(
-                state.sample_rate,
-                state.beep_frequency,
-                state.beep_duration,
-                state.beep_volume,
-                state.beep_channel,
-            );
-            state.clapper.flash_alpha = 1.0;
-            state.clapper.arm_angle = 0.0;
-
-            let tc_str = timecode::timecode_to_string(state.current_timecode, state.drop_frame());
-            let ms_str =
-                timecode::timecode_to_ms_string(state.current_timecode, state.fps());
-            els.log_id_counter += 1;
-            let ts = timecode::chrono_now_string();
-            let note = format!("Scene {}", state.clapper.scene);
-
-            state.clapper.logs.push(ClapLogItem {
-                id: els.log_id_counter,
-                timestamp: ts,
-                timecode: tc_str,
-                milliseconds: ms_str,
-                note,
-            });
-            while state.clapper.logs.len() > MAX_CLAP_LOGS {
-                state.clapper.logs.remove(0);
-            }
-
-            if state.clapper.auto_increment_take {
-                state.clapper.take = state.clapper.take.saturating_add(1);
-            }
-            state.status.set_audio("Clap!");
-        }
+        GuiCommand::Clap => cmd_clap(core, els),
 
         GuiCommand::SetStartTimecode(tc) => {
             els.current.start_timecode = tc;
@@ -443,50 +397,9 @@ fn process_command(
             els.current.sample_rate = rate;
         }
 
-        GuiCommand::SetDevice(device_id) => {
-            if els.current.is_playing {
-                let _ = core.stop_ltc();
-                els.current.is_playing = false;
-            }
+        GuiCommand::SetDevice(device_id) => cmd_set_device(core, els, event_tx, device_id),
 
-            let _ = core.stop_output();
-            els.current.audio_initialized = false;
-
-            els.previous_device = els.current.selected_device.clone();
-            els.current.selected_device = Some(device_id);
-
-            if !try_init_device(core, els) {
-                // Revert to previous device
-                els.current.selected_device = els.previous_device.take();
-                if try_init_device(core, els) {
-                    els.current.status.set_audio("Device selection reverted to previous");
-                } else {
-                    // Previous selection may have been automatic (None);
-                    // fall back to the default/first device.
-                    ensure_audio_init(core, els, event_tx);
-                }
-            }
-        }
-
-        GuiCommand::RefreshDevices => {
-            match audio_core::list_audio_devices() {
-                Ok(devices) => {
-                    els.current.devices = devices;
-                    // Drop the selection if the chosen device vanished;
-                    // the next init falls back to the default/first device.
-                    if let Some(ref id) = els.current.selected_device {
-                        if !els.current.devices.iter().any(|d| &d.id == id) {
-                            els.current.selected_device = None;
-                        }
-                    }
-                    els.current.status.set_audio(format!("{} devices found", els.current.devices.len()));
-                }
-                Err(e) => {
-                    error!("Failed to list devices: {}", e);
-                    els.current.status.set_audio(format!("Device scan failed: {}", e));
-                }
-            }
-        }
+        GuiCommand::RefreshDevices => cmd_refresh_devices(els),
 
         GuiCommand::InitAudio => {
             ensure_audio_init(core, els, event_tx);
@@ -539,39 +452,13 @@ fn process_command(
             }
         }
 
-        GuiCommand::CancelDecode => {
-            let state = &mut els.current;
-            supervisor.cancel(JobKind::LtcDecode);
-            supervisor.cancel(JobKind::LtcGroupDecode);
-            if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
-                status.progress.phase = job::JobPhase::Cancelled;
-                status.progress.message = "Canceled by user".to_string();
-            }
-            if let Some(status) = state.jobs.get_mut(&JobKind::LtcGroupDecode) {
-                status.progress.phase = job::JobPhase::Cancelled;
-                status.progress.message = "Canceled by user".to_string();
-            }
-            state.status.set_decode("Decode canceled by user");
-        }
+        GuiCommand::CancelDecode => cmd_cancel_decode(els, supervisor),
 
         GuiCommand::DecodeLtcVideoGroup { paths, stream_index, channel_index } => {
             cmd_decode_ltc_video_group(els, supervisor, &paths, stream_index, channel_index, use_libltc);
         }
 
-        GuiCommand::ClearRecordingDecodeState => {
-            let state = &mut els.current;
-            state.decode.result = None;
-            state.decode.error = None;
-            state.decode.probe = None;
-            supervisor.cancel(JobKind::LtcDecode);
-            state.jobs.insert(JobKind::LtcDecode, job::JobStatus::idle());
-            state.decode.generation = state.decode.generation.wrapping_add(1);
-            state.decode.group_paths = Vec::new();
-            state.decode.group_results = Vec::new();
-            supervisor.cancel(JobKind::LtcGroupDecode);
-            state.jobs.insert(JobKind::LtcGroupDecode, job::JobStatus::idle());
-            state.decode.group_generation = state.decode.group_generation.wrapping_add(1);
-        }
+        GuiCommand::ClearRecordingDecodeState => cmd_clear_recording_decode_state(els, supervisor),
 
         GuiCommand::ProbeVideo(path) => {
             cmd_probe_video(els, supervisor, path);
@@ -633,6 +520,150 @@ fn process_command(
             warn!("GuiCommand::Shutdown reached process_command — ignored");
         }
     }
+}
+
+// ── Transport / audio-device command handlers ──────────────────────────
+
+fn cmd_start_ltc(core: &AudioCore, els: &mut EngineLoopState, event_tx: &Sender<AudioEvent>) {
+    ensure_audio_init(core, els, event_tx);
+    if !els.current.audio_initialized {
+        els.current.status.set_audio("Cannot start — audio not initialized");
+        return;
+    }
+    let state = &mut els.current;
+    match core.start_ltc(
+        state.start_timecode,
+        state.fps(),
+        state.drop_frame(),
+        state.ltc_channel,
+        state.ltc_volume,
+    ) {
+        Ok(()) => {
+            state.is_playing = true;
+            state.status.set_audio("Streaming LTC");
+            state.current_timecode = state.start_timecode;
+        }
+        Err(e) => {
+            error!("Failed to start LTC: {}", e);
+            state.status.set_audio(format!("Start failed: {}", e));
+        }
+    }
+}
+
+fn cmd_clap(core: &AudioCore, els: &mut EngineLoopState) {
+    let state = &mut els.current;
+    let _ = core.play_beep(
+        state.sample_rate,
+        state.beep_frequency,
+        state.beep_duration,
+        state.beep_volume,
+        state.beep_channel,
+    );
+    state.clapper.flash_alpha = 1.0;
+    state.clapper.arm_angle = 0.0;
+
+    let tc_str = timecode::timecode_to_string(state.current_timecode, state.drop_frame());
+    let ms_str =
+        timecode::timecode_to_ms_string(state.current_timecode, state.fps());
+    els.log_id_counter += 1;
+    let ts = timecode::chrono_now_string();
+    let note = format!("Scene {}", state.clapper.scene);
+
+    state.clapper.logs.push(ClapLogItem {
+        id: els.log_id_counter,
+        timestamp: ts,
+        timecode: tc_str,
+        milliseconds: ms_str,
+        note,
+    });
+    while state.clapper.logs.len() > MAX_CLAP_LOGS {
+        state.clapper.logs.remove(0);
+    }
+
+    if state.clapper.auto_increment_take {
+        state.clapper.take = state.clapper.take.saturating_add(1);
+    }
+    state.status.set_audio("Clap!");
+}
+
+fn cmd_set_device(
+    core: &AudioCore,
+    els: &mut EngineLoopState,
+    event_tx: &Sender<AudioEvent>,
+    device_id: String,
+) {
+    if els.current.is_playing {
+        let _ = core.stop_ltc();
+        els.current.is_playing = false;
+    }
+
+    let _ = core.stop_output();
+    els.current.audio_initialized = false;
+
+    els.previous_device = els.current.selected_device.clone();
+    els.current.selected_device = Some(device_id);
+
+    if !try_init_device(core, els) {
+        // Revert to previous device
+        els.current.selected_device = els.previous_device.take();
+        if try_init_device(core, els) {
+            els.current.status.set_audio("Device selection reverted to previous");
+        } else {
+            // Previous selection may have been automatic (None);
+            // fall back to the default/first device.
+            ensure_audio_init(core, els, event_tx);
+        }
+    }
+}
+
+fn cmd_refresh_devices(els: &mut EngineLoopState) {
+    match audio_core::list_audio_devices() {
+        Ok(devices) => {
+            els.current.devices = devices;
+            // Drop the selection if the chosen device vanished;
+            // the next init falls back to the default/first device.
+            if let Some(ref id) = els.current.selected_device {
+                if !els.current.devices.iter().any(|d| &d.id == id) {
+                    els.current.selected_device = None;
+                }
+            }
+            els.current.status.set_audio(format!("{} devices found", els.current.devices.len()));
+        }
+        Err(e) => {
+            error!("Failed to list devices: {}", e);
+            els.current.status.set_audio(format!("Device scan failed: {}", e));
+        }
+    }
+}
+
+fn cmd_cancel_decode(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
+    let state = &mut els.current;
+    supervisor.cancel(JobKind::LtcDecode);
+    supervisor.cancel(JobKind::LtcGroupDecode);
+    if let Some(status) = state.jobs.get_mut(&JobKind::LtcDecode) {
+        status.progress.phase = job::JobPhase::Cancelled;
+        status.progress.message = "Canceled by user".to_string();
+    }
+    if let Some(status) = state.jobs.get_mut(&JobKind::LtcGroupDecode) {
+        status.progress.phase = job::JobPhase::Cancelled;
+        status.progress.message = "Canceled by user".to_string();
+    }
+    state.status.set_decode("Decode canceled by user");
+}
+
+fn cmd_clear_recording_decode_state(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
+    let state = &mut els.current;
+    state.decode.result = None;
+    state.decode.error = None;
+    state.decode.probe = None;
+    supervisor.cancel(JobKind::LtcDecode);
+    state.jobs.insert(JobKind::LtcDecode, job::JobStatus::idle());
+    state.decode.generation = state.decode.generation.wrapping_add(1);
+    state.decode.group_paths = Vec::new();
+    state.decode.group_results = Vec::new();
+    supervisor.cancel(JobKind::LtcGroupDecode);
+    state.jobs.insert(JobKind::LtcGroupDecode, job::JobStatus::idle());
+    state.decode.group_generation = state.decode.group_generation.wrapping_add(1);
 }
 
 // ── Converter command handling ─────────────────────────────────────────
@@ -1967,44 +1998,60 @@ fn on_clip_probes_finished(els: &mut EngineLoopState, outcome: JobOutcome, paylo
     };
     let probe_generation = els.current.converter.probes_generation;
     if probe_generation > 0 {
-        if let Some(ref idx) = els.current.converter.selected_group_idx {
-            if let Some(group) = els.current.converter.groups.get(*idx) {
-                if group.recording_type == RecordingType::VideoClipSequence {
-                    if let Some(Ok(ref probe)) = probes.iter().find(|r| r.is_ok()) {
-                        els.current.decode.probe = Some(probe.clone());
-                        els.current.decode.selected_stream = 0;
-                        els.current.decode.selected_channel = 0;
-                        els.current.decode.error = None;
-                    } else {
-                        let err = probes.iter().find_map(|r| {
-                            if let Err(ref e) = r { Some(e.clone()) } else { None }
-                        }).unwrap_or_else(|| "No audio streams detected.".to_string());
-                        els.current.decode.error = Some(format!("LTC source probe failed: {}", err));
-                        els.current.status.set_decode(format!("Video probe failed: {}", err));
-                    }
-                }
-            }
+        if video_group_selected(&els.current) {
+            seed_decode_state_from_probes(&mut els.current, &probes);
         }
         els.current.converter.probes = probes.iter().map(|r| r.as_ref().ok().cloned()).collect();
         els.current.converter.camera_meta = cameras;
         els.current.converter.device_name = device_name;
         info!("Converter clip probe complete: {} files", els.current.converter.probes.len());
-        let is_video_group = els.current.converter.selected_group_idx
-            .and_then(|i| els.current.converter.groups.get(i))
-            .map(|g| g.recording_type == RecordingType::VideoClipSequence)
-            .unwrap_or(false);
-        if is_video_group {
-            let probe_channels = els.current.converter.probes.first()
-                .and_then(|p| p.as_ref())
-                .map(|p| p.total_audio_channels);
-            let map_channels = els.current.converter.settings.channel_map.num_channels();
-            if let Some(ch) = probe_channels {
-                if ch > 0 && ch != map_channels {
-                    els.current.converter.settings.channel_map = ChannelMap::identity(ch);
-                }
-            }
+        if video_group_selected(&els.current) {
+            reconcile_channel_map_to_probe(&mut els.current);
         }
         recompute_converter_derived(&mut els.current);
+    }
+}
+
+/// True when the currently selected converter group is a video clip sequence.
+fn video_group_selected(state: &AppStateSnapshot) -> bool {
+    state.converter.selected_group_idx
+        .and_then(|i| state.converter.groups.get(i))
+        .map(|g| g.recording_type == RecordingType::VideoClipSequence)
+        .unwrap_or(false)
+}
+
+/// Seed the decode panel from a video group's clip probes: the first
+/// successful probe becomes the LTC decode source; when every probe failed,
+/// the first error surfaces on the decode status channel instead.
+fn seed_decode_state_from_probes(
+    state: &mut AppStateSnapshot,
+    probes: &[Result<crate::ffprobe::VideoAudioProbe, String>],
+) {
+    if let Some(Ok(ref probe)) = probes.iter().find(|r| r.is_ok()) {
+        state.decode.probe = Some(probe.clone());
+        state.decode.selected_stream = 0;
+        state.decode.selected_channel = 0;
+        state.decode.error = None;
+    } else {
+        let err = probes.iter().find_map(|r| {
+            if let Err(ref e) = r { Some(e.clone()) } else { None }
+        }).unwrap_or_else(|| "No audio streams detected.".to_string());
+        state.decode.error = Some(format!("LTC source probe failed: {}", err));
+        state.status.set_decode(format!("Video probe failed: {}", err));
+    }
+}
+
+/// Resize the channel map to the first probed clip's audio channel count
+/// (video groups only; the map starts from an 8-channel identity default).
+fn reconcile_channel_map_to_probe(state: &mut AppStateSnapshot) {
+    let probe_channels = state.converter.probes.first()
+        .and_then(|p| p.as_ref())
+        .map(|p| p.total_audio_channels);
+    let map_channels = state.converter.settings.channel_map.num_channels();
+    if let Some(ch) = probe_channels {
+        if ch > 0 && ch != map_channels {
+            state.converter.settings.channel_map = ChannelMap::identity(ch);
+        }
     }
 }
 
@@ -2934,6 +2981,56 @@ mod tests {
         assert!(els.current.converter.probes.is_empty(), "mismatched payload must not be applied");
         // Outcome still transitions the job phase.
         assert_eq!(els.current.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded);
+    }
+
+    // ── update_clapper_animation (pure) ──────────────────────────────────
+
+    fn animation_clapper() -> crate::state::ClapperSnapshot {
+        crate::state::ClapperSnapshot {
+            scene: 0,
+            take: 0,
+            roll: String::new(),
+            auto_increment_take: false,
+            logs: Vec::new(),
+            flash_alpha: 0.0,
+            arm_angle: TARGET_ARM_ANGLE,
+            animating: false,
+        }
+    }
+
+    #[test]
+    fn clapper_animation_flash_decays_and_clamps_at_zero() {
+        let mut clapper = animation_clapper();
+        clapper.flash_alpha = 0.1;
+        update_clapper_animation(&mut clapper, 0.04);
+        assert!(clapper.flash_alpha > 0.0, "small decay must not clamp");
+        let a = clapper.flash_alpha;
+        update_clapper_animation(&mut clapper, 10.0);
+        assert_eq!(clapper.flash_alpha, 0.0, "large decay must clamp at zero");
+        assert!(a < 0.1);
+    }
+
+    #[test]
+    fn clapper_animation_arm_angle_settles_toward_rest_and_flag_clears() {
+        let mut clapper = animation_clapper();
+        clapper.flash_alpha = 1.0;
+        clapper.arm_angle = 0.0;
+        // Decay far past the settle window in one step.
+        update_clapper_animation(&mut clapper, 10.0);
+        assert!((clapper.arm_angle - TARGET_ARM_ANGLE).abs() < ARM_SETTLE_EPS,
+            "arm must settle within epsilon of the rest angle");
+        assert!(!clapper.animating,
+            "settled arm + zero flash must clear the animating flag");
+        assert!(clapper.flash_alpha == 0.0);
+    }
+
+    #[test]
+    fn clapper_animation_stays_animating_while_flash_visible() {
+        let mut clapper = animation_clapper();
+        clapper.flash_alpha = 0.5;
+        clapper.arm_angle = TARGET_ARM_ANGLE; // arm already at rest
+        update_clapper_animation(&mut clapper, 0.04);
+        assert!(clapper.animating, "visible flash must keep the animating flag set");
     }
 
     #[test]
