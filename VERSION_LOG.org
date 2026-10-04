@@ -1,6 +1,49 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased — Phase 2 test seams + macOS CI guard
+
+Closes the two largest remaining structural risks from the 2026-10-04
+follow-up triage and adds the macOS compile guard (plan:
+`plans/PHASE2-test-seams-and-macos-ci-plan.md`). No user-visible
+behavior change; no version bump.
+
+- Recovery-ladder testability (WP-2.1): the audio-stream recovery
+  ladder (`StreamDied`/`RecoveryNeeded`/`StreamDead` → recovery →
+  exhaustion) is no longer untestable. `EngineSeams` gained an
+  `audio_events` injection seam (default: AudioCore's own event queue)
+  and an `init_output` initializer seam, the ladder's branch logic was
+  extracted into the pure `recovery_action` decision function, and the
+  previously private attempt counter is now published as
+  `AppStateSnapshot.audio_recovery_attempts`. New tests: a unit
+  decision table plus three engine-loop integration tests pinning the
+  soft ladder counting up to exhaustion, the `StreamDead` hard reset
+  not consuming a soft attempt, and GUI event forwarding — all with
+  typed assertions only (init failure is forced deterministically so
+  the ladder behaves identically on CI and audio-equipped dev
+  machines).
+- WAV-decode dispatch unification (WP-2.2): the
+  single-pass-vs-chunked dispatch that was duplicated between
+  `decode::decode_wav_file` (CLI) and the engine's decode job now
+  lives exactly once in `decode::decode_wav_core` with the pure
+  `wav_dispatch_decision` helper. The CLI keeps its stderr progress
+  printer (moved out of decode.rs, which is display-free), the engine
+  keeps its `ProgressTracker` bridging; `decode_wav_file` is deleted.
+  Decision table, cancel handling on both branches, and the
+  missing-file error are unit-tested on synthetic LTC WAVs.
+- macOS CI guard (WP-2.3): new `macos-check` job — check-only
+  `cargo check --workspace --all-targets` on a native `macos-latest`
+  runner — so the macOS-only `cfg` blocks (offload `/Volumes` card
+  scan, CoreAudio audio-output arm) are compile-guarded on every PR
+  instead of review-only.
+- Test isolation fix: the offload integration tests now serialize
+  access to the persisted offload-parent config (all tests in the
+  binary share one `XDG_CONFIG_HOME`); previously a concurrently
+  written config could seed a parent folder into the no-parent guard
+  test's engine, starting a real copy job instead of firing the
+  guard. Unreachable under nextest's one-process-per-test, reachable
+  under `cargo test`.
+
 * Unreleased — Phase 1 legacy frontend retirement
 
 Removal of the frozen React web app (`src/`), both legacy Tauri

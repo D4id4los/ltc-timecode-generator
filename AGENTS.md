@@ -45,7 +45,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │   │   ├── log_buffer.rs         # LogBuffer ring buffer + init_logger (canonical logger)
 │   │   ├── theme.rs              # Shared dark/light ThemeColors palettes used by both Rust GUIs
 │   │   ├── device_name.rs        # Device-name resolution chain (XAVC sniff → camera meta → filename → volume → "unknown")
-│   │   ├── decode.rs             # Shared video→extract→decode + WAV decode pipelines (engine + CLI), temp-WAV management, progress bridge
+│   │   ├── decode.rs             # Shared video→extract→decode + WAV decode pipelines (engine + CLI), temp-WAV management, progress bridge, decode_wav_core dispatch core
 │   │   ├── clip_probe.rs         # Converter clip-probe policy: ffprobe + camera-meta sample cap + device-name resolution
 │   │   ├── duration.rs           # File-duration helpers (WAV header / ffprobe), group aggregation, H:MM:SS formatting
 │   │   ├── naming.rs             # Named-placeholder output-filename template engine ({filename}/{device}/{clip}/{track})
@@ -216,7 +216,7 @@ Commands are sent from the GUI thread to the engine via `mpsc::Sender<GuiCommand
 ### AppStateSnapshot
 The full application state is published as an `AppStateSnapshot` struct wrapped in `Arc<ArcSwap<AppStateSnapshot>>`. The engine thread calls `state.store(Arc::new(snapshot))` after each tick. The GUI calls `state.load()` to get the latest snapshot — this is lock-free and always returns the latest state without queue management.
 
-Field groups (see `state.rs` for the full struct): generation counter; transport (is_playing/is_locked, current + start timecode); FPS; audio routing + device state; clapper metadata + clap log; engine-computed animations (clap flash alpha, arm angle); theme; per-subsystem status channels (`StatusChannels`: audio/decode/converter/offload + last-writer tag); decode state (decode FPS, decoder selection, decode result/error); video probe info; per-clip LTC group results; ffmpeg capability probe (`ffmpeg_caps` — engine-owned, async); unified job status map (`jobs: HashMap<JobKind, JobStatus>`) covering all async tasks; offload (`OffloadSnapshot`: cards + per-file selection, parent folder/name, `device_totals` from copy plans, completed devices, last_offload_parent + handoff version, error, per-file durations).
+Field groups (see `state.rs` for the full struct): generation counter; transport (is_playing/is_locked, current + start timecode, `audio_recovery_attempts` — published soft-recovery attempt counter of the audio-stream recovery ladder, reset by a successful re-init); FPS; audio routing + device state; clapper metadata + clap log; engine-computed animations (clap flash alpha, arm angle); theme; per-subsystem status channels (`StatusChannels`: audio/decode/converter/offload + last-writer tag); decode state (decode FPS, decoder selection, decode result/error); video probe info; per-clip LTC group results; ffmpeg capability probe (`ffmpeg_caps` — engine-owned, async); unified job status map (`jobs: HashMap<JobKind, JobStatus>`) covering all async tasks; offload (`OffloadSnapshot`: cards + per-file selection, parent folder/name, `device_totals` from copy plans, completed devices, last_offload_parent + handoff version, error, per-file durations).
 
 ### Engine Thread Loop
 The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
@@ -234,7 +234,7 @@ The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
     - LtcGroupDecode `Item` → fills per-clip results; `Finished` → auto-applies group settings
     - ClipProbe → populates `converter.probes`/`camera_meta`/`device_name`
 3. **Poll timecode** — `core.current_timecode()` when playing
-4. **Drain audio events** — drains `core.drain_events()`, dispatches to recovery, and sends each event through the engine→GUI `mpsc::Sender<AudioEvent>` channel (events are a one-shot mailbox, not snapshot state)
+4. **Drain audio events** — drains the injectable audio-event source (`EngineSeams.audio_events`, default `core.drain_events()`), dispatches each through the pure `recovery_action` decision table to the recovery ladder, and sends each event through the engine→GUI `mpsc::Sender<AudioEvent>` channel (events are a one-shot mailbox, not snapshot state)
 5. **Animate** — flash alpha decay (2.0/s), arm angle exponential decay toward rest (4.0/s); determines if clap animation is still visibly in progress.
 6. **Recompute converter-derived data** — on demand via `recompute_converter_derived()` (readiness, collision warning, output preview, encoder chain desc)
 7. **Update system time**
@@ -243,7 +243,7 @@ The engine runs at ~25 fps (40ms ticks) — see `engine.rs::engine_main`:
 
 ### Audio Lifecycle
 - **Init**: 3 retries with exponential backoff (50ms → 100ms → 200ms). Distinguishes permanent errors (permission denied — no retry) from transient (device busy — retry).
-- **Recovery**: When `StreamDied` or `RecoveryNeeded` events are detected, the engine attempts up to 3 recovery cycles (stop → reinit → restart LTC if was playing).
+- **Recovery**: When `StreamDied` or `RecoveryNeeded` events are detected, the engine attempts up to 3 recovery cycles (stop → reinit → restart LTC if was playing). The branch logic is the pure `recovery_action(event, attempts)` decision function (`StreamDead` → hard reset without consuming a soft attempt; soft events → `Attempt`/`Exhausted` vs `MAX_RECOVERY_ATTEMPTS`), unit-tested as a decision table and integration-tested via the `EngineSeams.audio_events` injection seam; the attempt counter is published as `AppStateSnapshot.audio_recovery_attempts`.
 - **Device switching**: Stops LTC, stops output, re-initializes on new device, restarts LTC. Reverts to previous device on failure.
 
 ### Offload / Card-Ingest Subsystem
@@ -446,7 +446,7 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
    `init_test_config()`, preventing writes to `~/.config/`. All test engine
    spawns must call `init_test_config()` first.
 
-5. **No real ffmpeg probe** — Engine tests use `engine_main_with_probe()` (or `engine_main_with_seams`, which additionally injects the offload card-detection source) with
+5. **No real ffmpeg probe** — Engine tests use `engine_main_with_probe()` (or `engine_main_with_seams`, which additionally injects the offload card-detection source, an audio-event source for recovery-ladder tests, and the audio-output initializer) with
    `fake_probe()`, skipping the real ffmpeg-capability subprocess probe.
    This removes N concurrent `ffmpeg -encoders` calls per test run and the
    mid-test `apply_available_defaults` mutation. The real probe path is exercised
@@ -519,7 +519,7 @@ the lint is broken and must red rather than pass.
 
 ### Integration Suites
 
-- `gui-engine/tests/integration.rs` — engine-thread command processing, incl. offload scan/copy integration tests driven through `EngineSeams.scan_cards` (fake card, real tempdir copies, cancel + guard branches) and the `SetDevice` bogus-id revert test
+- `gui-engine/tests/integration.rs` — engine-thread command processing, incl. offload scan/copy integration tests driven through `EngineSeams.scan_cards` (fake card, real tempdir copies, cancel + guard branches), the `SetDevice` bogus-id revert test, and the audio-stream recovery ladder driven through `EngineSeams.audio_events` (with `EngineSeams.init_output` injecting init failure so the ladder behaves identically on deviceless CI and audio-equipped dev machines)
 - `gui-engine/tests/cli_decode.rs` — CLI dispatch via `process_cli_result` (output-to-file, WAV/video decode, error paths)
 - `gui-engine/tests/tagger_mp4.rs` — native MP4 tmcd in-place tagging against the committed fixture `test-data/tmcd-roundtrip-trailing-moov.mp4` (stco-offset regression net + ffprobe round-trip)
 - `gui-engine/tests/converter_integration.rs` — conversion pipelines (real ffmpeg)
@@ -539,7 +539,7 @@ Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 
 ## CI & SonarQube Cloud
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on push to `main` and on PRs: the test-lint guardrail, clippy (JSON report), Rust tests via `cargo llvm-cov nextest --workspace --profile ci` + LCOV report via `cargo llvm-cov report` (cargo-llvm-cov ≥0.9 split the old `--nextest` flag into a `nextest` subcommand), and a SonarQube Cloud scan. The Sonar step is skipped when the `SONAR_TOKEN` repo secret is absent, so the workflow works in forks without setup; when the token is present, the scan passes `-Dsonar.qualitygate.wait=true`, so the **LTC gate** quality gate can red CI on a failing push/PR (revert to advisory-only by deleting the `args` line). A second job, `windows-cross-check`, runs `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu` on ubuntu-latest (mingw-w64 + host `libltc-dev` headers suffice for bindgen at check time) so the Windows-only `cfg` blocks (`offload::win_driver`, `subprocess` console suppression, unix-only test fixtures being properly gated) compile on every PR — check-only, no link and no tests; a macOS cross-check is deliberately out of scope (SDK sysroot fragility).
+GitHub Actions (`.github/workflows/ci.yml`) runs on push to `main` and on PRs: the test-lint guardrail, clippy (JSON report), Rust tests via `cargo llvm-cov nextest --workspace --profile ci` + LCOV report via `cargo llvm-cov report` (cargo-llvm-cov ≥0.9 split the old `--nextest` flag into a `nextest` subcommand), and a SonarQube Cloud scan. The Sonar step is skipped when the `SONAR_TOKEN` repo secret is absent, so the workflow works in forks without setup; when the token is present, the scan passes `-Dsonar.qualitygate.wait=true`, so the **LTC gate** quality gate can red CI on a failing push/PR (revert to advisory-only by deleting the `args` line). A second job, `windows-cross-check`, runs `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu` on ubuntu-latest (mingw-w64 + host `libltc-dev` headers suffice for bindgen at check time) so the Windows-only `cfg` blocks (`offload::win_driver`, `subprocess` console suppression, unix-only test fixtures being properly gated) compile on every PR — check-only, no link and no tests. A third job, `macos-check`, runs `cargo check --workspace --all-targets` on a native `macos-latest` runner (Homebrew `libltc` + `llvm` for the bindgen probe; `PKG_CONFIG_PATH`/`LIBCLANG_PATH` computed from `brew --prefix`) so the macOS-only `cfg` blocks (offload `/Volumes` card scan, CoreAudio audio-output arm) are compile-guarded on every PR — a check-only guard, not a first-class test job.
 
 - **Sonar project**: `D4id4los_ltc-timecode-generator` in organization `d4id4los` (sonarcloud.io). Analysis config lives in `sonar-project.properties` (sources = the four workspace crates; exclusions = `*.slint` — Slint markup has no Sonar analyzer; the legacy React web app and Tauri crates were removed from the repo in Phase 1).
 - **Quality gate**: enforcement runs on SonarCloud's built-in **Sonar way** gate (the org's plan entitlement rejects assigning custom gates — HTTP 403). The idempotent `SONAR_TOKEN=<token> scripts/sonar-gate.sh` creates the custom **LTC gate** with the four WP-5 new-code conditions (coverage > 80 %, reliability/security/maintainability ratings on new code rating A) and verifies the assigned gate covers all four metrics — Sonar way is a strict superset (it adds new-code duplication < 3 % and 100 % hotspots reviewed). Overall-code conditions are a deliberate non-goal until the pre-existing CRITICAL `S3776` smells are burned down (F-2 baseline: 29 `S3776` + 1 `S2208` as of the first gated scan).
