@@ -479,80 +479,10 @@ pub fn detect_cards_with_progress(progress: Option<&ScanProgress>) -> Vec<SdCard
     let start = std::time::Instant::now();
 
     #[cfg(target_os = "windows")]
-    {
-        let candidates = win_driver::enumerate();
-        info!(
-            "Windows card scan: {} drive(s) detected via GetLogicalDrives",
-            candidates.len()
-        );
-        for cand in &candidates {
-            let tname = win_driver::drive_type_name(cand.kind);
-            if cand.kind != win_driver::DRIVE_REMOVABLE {
-                debug!("Skipping drive {}: type={}", cand.letter, tname);
-                continue;
-            }
-            if Instant::now() >= deadline {
-                warn!("Windows card scan: budget exceeded — skipping drive {}", cand.letter);
-                break;
-            }
-            if let Some(p) = progress {
-                p.set(format!("Scanning drive {}:…", cand.letter));
-            }
-            debug!("Probing removable drive {}: {:?}", cand.letter, cand.root);
-            if let Some(info) = classify_mount(&cand.root, &cand.root, deadline) {
-                info!(
-                    "Drive {} → card: {} files, {} bytes, name='{}'",
-                    cand.letter, info.media_file_count, info.total_bytes, info.device_name
-                );
-                cards.push(info);
-            } else {
-                debug!("Drive {}: no media files found", cand.letter);
-            }
-        }
-    }
+    scan_windows_drives(&mut cards, deadline, progress);
 
     #[cfg(target_os = "macos")]
-    {
-        match fs::read_dir("/Volumes") {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let mp = entry.path();
-                    if !mp.is_dir() {
-                        continue;
-                    }
-                    if Instant::now() >= deadline {
-                        warn!("macOS card scan: budget exceeded — skipping {:?}", mp);
-                        break;
-                    }
-                    if let Some(p) = progress {
-                        let label = volume_label_for(&mp);
-                        if label.is_empty() {
-                            p.set(format!("Scanning {}…", mp.display()));
-                        } else {
-                            p.set(format!("Scanning drive {label} ({})…", mp.display()));
-                        }
-                    }
-                    debug!("Probing macOS volume: {:?}", mp);
-                    if let Some(info) = classify_mount(&mp, &mp, deadline) {
-                        info!(
-                            "macOS volume {:?} → card: {} files, {} bytes, name='{}'",
-                            mp, info.media_file_count, info.total_bytes, info.device_name
-                        );
-                        cards.push(info);
-                    } else {
-                        debug!("macOS volume {:?}: no media files found", mp);
-                    }
-                }
-                info!(
-                    "macOS /Volumes scan: {} volume(s) processed",
-                    cards.len()
-                );
-            }
-            Err(e) => {
-                log::warn!("Cannot read /Volumes: {} — only real volumes skipped", e);
-            }
-        }
-    }
+    scan_macos_volumes(&mut cards, deadline, progress);
 
     info!(
         "Card scan finished in {:.2?}: {} card(s)",
@@ -560,6 +490,86 @@ pub fn detect_cards_with_progress(progress: Option<&ScanProgress>) -> Vec<SdCard
         cards.len()
     );
     cards
+}
+
+/// Windows arm of [`detect_cards_with_progress`]: probe each removable drive
+/// found via `GetLogicalDrives` and append accepted cards to `cards`.
+#[cfg(all(not(target_os = "linux"), target_os = "windows"))]
+fn scan_windows_drives(cards: &mut Vec<SdCardInfo>, deadline: Instant, progress: Option<&ScanProgress>) {
+    let candidates = win_driver::enumerate();
+    info!(
+        "Windows card scan: {} drive(s) detected via GetLogicalDrives",
+        candidates.len()
+    );
+    for cand in &candidates {
+        let tname = win_driver::drive_type_name(cand.kind);
+        if cand.kind != win_driver::DRIVE_REMOVABLE {
+            debug!("Skipping drive {}: type={}", cand.letter, tname);
+            continue;
+        }
+        if Instant::now() >= deadline {
+            warn!("Windows card scan: budget exceeded — skipping drive {}", cand.letter);
+            break;
+        }
+        if let Some(p) = progress {
+            p.set(format!("Scanning drive {}:…", cand.letter));
+        }
+        debug!("Probing removable drive {}: {:?}", cand.letter, cand.root);
+        if let Some(info) = classify_mount(&cand.root, &cand.root, deadline) {
+            info!(
+                "Drive {} → card: {} files, {} bytes, name='{}'",
+                cand.letter, info.media_file_count, info.total_bytes, info.device_name
+            );
+            cards.push(info);
+        } else {
+            debug!("Drive {}: no media files found", cand.letter);
+        }
+    }
+}
+
+/// macOS arm of [`detect_cards_with_progress`]: probe each volume under
+/// `/Volumes` and append accepted cards to `cards`.
+#[cfg(all(not(target_os = "linux"), target_os = "macos"))]
+fn scan_macos_volumes(cards: &mut Vec<SdCardInfo>, deadline: Instant, progress: Option<&ScanProgress>) {
+    match fs::read_dir("/Volumes") {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let mp = entry.path();
+                if !mp.is_dir() {
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    warn!("macOS card scan: budget exceeded — skipping {:?}", mp);
+                    break;
+                }
+                if let Some(p) = progress {
+                    let label = volume_label_for(&mp);
+                    if label.is_empty() {
+                        p.set(format!("Scanning {}…", mp.display()));
+                    } else {
+                        p.set(format!("Scanning drive {label} ({})…", mp.display()));
+                    }
+                }
+                debug!("Probing macOS volume: {:?}", mp);
+                if let Some(info) = classify_mount(&mp, &mp, deadline) {
+                    info!(
+                        "macOS volume {:?} → card: {} files, {} bytes, name='{}'",
+                        mp, info.media_file_count, info.total_bytes, info.device_name
+                    );
+                    cards.push(info);
+                } else {
+                    debug!("macOS volume {:?}: no media files found", mp);
+                }
+            }
+            info!(
+                "macOS /Volumes scan: {} volume(s) processed",
+                cards.len()
+            );
+        }
+        Err(e) => {
+            log::warn!("Cannot read /Volumes: {} — only real volumes skipped", e);
+        }
+    }
 }
 
 /// Parse `/proc/mounts` content and return detected cards.
