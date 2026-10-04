@@ -1045,8 +1045,13 @@ fn test_start_offload_guard_branches() {
 /// ever touched, so this is deterministic on every host — headless CI and
 /// audio-equipped dev machines alike. The failed selection must never stick.
 ///
-/// Non-goal (documented per WP-4 §4/F-2): the deeper `StreamDead`/
-/// `RecoveryNeeded` recovery ladder needs an AudioCore event-injection seam.
+/// Non-goal (documented per WP-4 §4/F-2, closed by WP-2.1): the deeper
+/// `StreamDead`/`RecoveryNeeded` recovery ladder is now engine-tested via
+/// the `EngineSeams.audio_events` injection seam (see the recovery-ladder
+/// tests below) plus the pure `recovery_action` decision table in engine.rs.
+/// What remains untested is the restart-while-playing *success* path of
+/// `attempt_recovery` — it needs a real or fully faked audio output device
+/// (an AudioCore trait abstraction; see WP-2.1 Out of Scope).
 #[test]
 fn test_set_device_bogus_id_does_not_stick() {
     const BOGUS: &str = "__ltc_test_nonexistent__";
@@ -1110,6 +1115,7 @@ fn spawn_engine_with_event_seam(queue: EventQueue) -> TestEngine {
             let seams = EngineSeams {
                 ffmpeg_caps: Box::new(fake_probe),
                 audio_events: Box::new(move |_core| queue.lock().unwrap().drain(..).collect()),
+                init_output: Box::new(|_, _, _, _| Err("test: audio init forced to fail".to_string())),
                 ..EngineSeams::default()
             };
             engine_main_with_seams(rx, state_clone, false, event_tx, seams);
@@ -1121,26 +1127,17 @@ fn spawn_engine_with_event_seam(queue: EventQueue) -> TestEngine {
 /// Mirrors `MAX_RECOVERY_ATTEMPTS` in engine.rs (kept private there).
 const MAX_SOFT_RECOVERY_ATTEMPTS: u8 = 3;
 
-/// Force `ensure_audio_init` to fail deterministically on every host: no
-/// audio device supports a 1 Hz sample rate, so `attempt_recovery` never
-/// succeeds and never resets the counter through a successful re-init.
-/// Without this, audio-equipped dev machines would succeed and reset the
-/// counter to 0, making the ladder's published counter environment-dependent.
-fn force_init_failure(eng: &TestEngine) {
-    eng.tx.send(GuiCommand::SetSampleRate(1)).unwrap();
-}
-
-/// Poll the engine→GUI event channel until a `RecoveryNeeded` arrives.
+/// Poll the engine→GUI event channel until the injected `RecoveryNeeded`
+/// arrives. Failed inits emit their own `StreamError`s on this channel —
+/// skip those; only the injected events are asserted on.
 fn wait_for_forwarded_recovery_needed(eng: &TestEngine, what: &str) {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         match eng.event_rx.recv_timeout(POLL_INTERVAL) {
             Ok(e) => {
-                assert!(
-                    matches!(e, AudioEvent::RecoveryNeeded { .. }),
-                    "unexpected event forwarded to the GUI channel"
-                );
-                return;
+                if matches!(e, AudioEvent::RecoveryNeeded { .. }) {
+                    return;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
             Err(e) => panic!("timeout waiting for {what}: {e}"),
@@ -1152,7 +1149,6 @@ fn wait_for_forwarded_recovery_needed(eng: &TestEngine, what: &str) {
 fn test_recovery_needed_event_increments_published_counter() {
     let queue: EventQueue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let eng = spawn_engine_with_event_seam(Arc::clone(&queue));
-    force_init_failure(&eng);
 
     queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded { reason: "seam test".to_string() });
 
@@ -1173,7 +1169,6 @@ fn test_recovery_needed_event_increments_published_counter() {
 fn test_recovery_attempts_exhaust_at_max() {
     let queue: EventQueue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let eng = spawn_engine_with_event_seam(Arc::clone(&queue));
-    force_init_failure(&eng);
 
     // MAX + 1 soft events: the first MAX count up, the last one exhausts.
     {
@@ -1215,7 +1210,6 @@ fn test_recovery_attempts_exhaust_at_max() {
 fn test_stream_dead_hard_reset_does_not_bump_counter() {
     let queue: EventQueue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let eng = spawn_engine_with_event_seam(Arc::clone(&queue));
-    force_init_failure(&eng);
 
     queue.lock().unwrap().push_back(AudioEvent::StreamDead);
     // Ack marker: proves the StreamDead event was processed (commands drain

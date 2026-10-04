@@ -55,6 +55,12 @@ pub type ScanCardsFn = Arc<dyn Fn(&CancelToken, Option<&ScanProgress>) -> Result
 /// AudioCore's own event queue; tests inject a queue they can push to.
 pub type AudioEventsFn = Box<dyn Fn(&AudioCore) -> Vec<AudioEvent> + Send>;
 
+/// Audio output initializer. The default calls `AudioCore::init_output`;
+/// tests inject a failure so the recovery ladder behaves identically on
+/// audio-equipped dev machines and deviceless CI (a successful re-init
+/// resets the recovery counter, which would make it environment-dependent).
+pub type AudioInitFn = Box<dyn Fn(&AudioCore, &str, u32, u32) -> Result<u32, String> + Send>;
+
 pub struct EngineSeams {
     /// ffmpeg capability probe (the `engine_main_with_probe` seam).
     pub ffmpeg_caps: Box<dyn FnOnce() -> FfmpegCapabilities + Send>,
@@ -66,6 +72,9 @@ pub struct EngineSeams {
     /// seam). The default drains AudioCore's own event queue; tests inject
     /// a shared queue they can push `AudioEvent`s into.
     pub audio_events: AudioEventsFn,
+    /// Audio output initializer used by `ensure_audio_init` /
+    /// `try_init_device`. The default is the real `AudioCore::init_output`.
+    pub init_output: AudioInitFn,
 }
 
 impl Default for EngineSeams {
@@ -74,6 +83,9 @@ impl Default for EngineSeams {
             ffmpeg_caps: Box::new(query_ffmpeg_capabilities),
             scan_cards: Arc::new(|_cancel, progress| Ok(crate::offload::detect_cards_with_progress(progress))),
             audio_events: Box::new(|core| core.drain_events()),
+            init_output: Box::new(|core, device_id, sample_rate, buffer_size| {
+                core.init_output(device_id, sample_rate, buffer_size)
+            }),
         }
     }
 }
@@ -120,6 +132,9 @@ struct EngineLoopState {
     /// Card-detection seam for offload `ScanCards` jobs (default = real
     /// detector; tests inject hand-built cards).
     scan_cards: ScanCardsFn,
+    /// Audio-output initializer (default = real `AudioCore::init_output`;
+    /// tests inject failure for deterministic recovery-ladder behavior).
+    audio_init: AudioInitFn,
 }
 
 impl EngineLoopState {
@@ -137,6 +152,9 @@ impl EngineLoopState {
             last_published: None,
             applied_command_seq: 0,
             scan_cards: Arc::new(|_cancel, progress| Ok(crate::offload::detect_cards_with_progress(progress))),
+            audio_init: Box::new(|core, device_id, sample_rate, buffer_size| {
+                core.init_output(device_id, sample_rate, buffer_size)
+            }),
         }
     }
 }
@@ -177,6 +195,8 @@ fn engine_main_loop(
     let core = AudioCore::new();
     let mut els = EngineLoopState::new(initial);
     els.scan_cards = seams.scan_cards;
+    els.audio_init = seams.init_output;
+    let audio_events = seams.audio_events;
 
     // Job supervisor — single channel for all async task result events
     let mut supervisor = JobSupervisor::new();
@@ -260,7 +280,7 @@ fn engine_main_loop(
         // through the audio-event channel.  Events are a one-shot mailbox,
         // not state — they must not ride in the snapshot (which is also
         // publish-gated: an empty-events tick must compare equal).
-        for event in core.drain_events() {
+        for event in audio_events(&core) {
             handle_event(event, &core, &event_tx, &mut els);
         }
 
@@ -283,6 +303,7 @@ fn engine_main_loop(
         //    Compare against the last-published snapshot *before* cloning:
         //    the common idle tick then costs one structural PartialEq and
         //    no allocation/deep clone at all.
+        els.current.audio_recovery_attempts = els.recovery_attempts;
         let changed = els.last_published.as_ref()
             .map_or(true, |p| p.as_ref() != &els.current);
         if changed {
@@ -1208,7 +1229,7 @@ fn ensure_audio_init(
     let mut last_error = String::new();
 
     for attempt in 1..=max_attempts {
-        match core.init_output(&device_id, state.sample_rate, BUFFER_SIZE) {
+        match (els.audio_init)(core, &device_id, state.sample_rate, BUFFER_SIZE) {
             Ok(actual_rate) => {
                 state.sample_rate = actual_rate;
                 state.audio_initialized = true;
@@ -1252,7 +1273,7 @@ fn try_init_device(
         _ => return false,
     };
 
-    match core.init_output(&device_id, state.sample_rate, BUFFER_SIZE) {
+    match (els.audio_init)(core, &device_id, state.sample_rate, BUFFER_SIZE) {
         Ok(actual_rate) => {
             state.sample_rate = actual_rate;
             state.audio_initialized = true;
@@ -1287,9 +1308,18 @@ enum RecoveryAction {
     Exhausted,
 }
 
-// TDD stub: decision table not yet implemented (WP-2.1 red phase).
-fn recovery_action(_event: &AudioEvent, _attempts: u8) -> Option<RecoveryAction> {
-    None
+fn recovery_action(event: &AudioEvent, attempts: u8) -> Option<RecoveryAction> {
+    match event {
+        AudioEvent::StreamDead => Some(RecoveryAction::HardReset),
+        AudioEvent::RecoveryNeeded { .. } | AudioEvent::StreamDied => {
+            if attempts < MAX_RECOVERY_ATTEMPTS {
+                Some(RecoveryAction::Attempt { next: attempts + 1 })
+            } else {
+                Some(RecoveryAction::Exhausted)
+            }
+        }
+        _ => None,
+    }
 }
 
 fn handle_event(
@@ -1314,8 +1344,8 @@ fn handle_event(
 
     warn!("{}", event_str);
 
-    match event {
-        AudioEvent::StreamDead => {
+    match recovery_action(&event, els.recovery_attempts) {
+        Some(RecoveryAction::HardReset) => {
             // Full teardown-and-recreate: drop the orphaned cpal::Stream,
             // wait for OS driver cleanup, then re-init and restart if playing.
             // The scheduler watchdog already exhausted 3 soft-recovery attempts
@@ -1323,17 +1353,16 @@ fn handle_event(
             els.current.status.set_audio("Stream dead — performing hard reset");
             attempt_recovery(core, els, event_tx);
         }
-        AudioEvent::RecoveryNeeded { .. } | AudioEvent::StreamDied => {
-            if els.recovery_attempts < MAX_RECOVERY_ATTEMPTS {
-                els.recovery_attempts += 1;
-                els.current.status.set_audio(format!("Recovery attempt {}/{}", els.recovery_attempts, MAX_RECOVERY_ATTEMPTS));
-                attempt_recovery(core, els, event_tx);
-            } else {
-                els.current.is_playing = false;
-                els.current.status.set_audio("Recovery exhausted");
-            }
+        Some(RecoveryAction::Attempt { next }) => {
+            els.recovery_attempts = next;
+            els.current.status.set_audio(format!("Recovery attempt {}/{}", next, MAX_RECOVERY_ATTEMPTS));
+            attempt_recovery(core, els, event_tx);
         }
-        _ => {}
+        Some(RecoveryAction::Exhausted) => {
+            els.current.is_playing = false;
+            els.current.status.set_audio("Recovery exhausted");
+        }
+        None => {}
     }
 
     let _ = event_tx.send(event);
