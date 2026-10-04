@@ -2804,6 +2804,138 @@ mod tests {
         );
     }
 
+    // ── on_clip_probes_finished (characterization) ────────────────────────
+
+    fn clip_probe_event(
+        probes: Vec<Result<crate::ffprobe::VideoAudioProbe, String>>,
+    ) -> JobEvent {
+        JobEvent::Finished {
+            job: job::JobId(7),
+            kind: JobKind::ClipProbe,
+            outcome: JobOutcome::Succeeded { log: String::new() },
+            payload: JobFinal::ClipProbes {
+                probes,
+                cameras: vec![Some(crate::camera_meta::CameraInfo {
+                    make: Some("Sony".to_string()),
+                    model: Some("NEX-FS100EK".to_string()),
+                    source: crate::camera_meta::CameraMetaSource::ExifTool,
+                    creation_date: None,
+                    lens: None,
+                    serial: None,
+                    creation_time: None,
+                    gamma: None,
+                    native_timecode: None,
+                    exposure_summary: None,
+                })],
+                device_name: Some("cam-a".to_string()),
+            },
+        }
+    }
+
+    fn two_channel_probe() -> crate::ffprobe::VideoAudioProbe {
+        crate::ffprobe::VideoAudioProbe {
+            total_audio_channels: 2,
+            streams: vec![AudioStreamInfo {
+                stream_index: 0, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
+            }],
+            is_video_file: true,
+        }
+    }
+
+    fn els_with_video_group() -> EngineLoopState {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.converter.probes_generation = 1;
+        els.current.converter.selected_group_idx = Some(0);
+        els.current.converter.groups.push(MatchedGroup {
+            prefix: "MVI_".into(),
+            rel_dir: String::new(),
+            files: vec![PathBuf::from("/card/MVI_0001.MP4")],
+            recording_type: crate::converter::RecordingType::VideoClipSequence,
+        });
+        els.current.jobs.insert(JobKind::ClipProbe, JobStatus::running("probing"));
+        els
+    }
+
+    #[test]
+    fn clip_probes_finished_video_group_seeds_decode_probe_and_resizes_channel_map() {
+        let mut els = els_with_video_group();
+        handle_job_event(&mut els, &mut JobSupervisor::new(),
+            clip_probe_event(vec![Ok(two_channel_probe())]));
+
+        // Decode panel seeded from the first successful probe.
+        assert!(els.current.decode.probe.is_some(), "video group must seed the decode probe");
+        assert_eq!(els.current.decode.selected_stream, 0);
+        assert_eq!(els.current.decode.selected_channel, 0);
+        assert!(els.current.decode.error.is_none());
+
+        // Converter snapshot populated.
+        assert_eq!(els.current.converter.probes.len(), 1);
+        assert!(els.current.converter.probes[0].is_some());
+        assert_eq!(els.current.converter.camera_meta.len(), 1);
+        assert_eq!(els.current.converter.device_name.as_deref(), Some("cam-a"));
+
+        // Channel map reconciled to the probe's channel count.
+        assert_eq!(els.current.converter.settings.channel_map.num_channels(), 2);
+
+        // Job status reached the terminal Succeeded phase.
+        assert_eq!(els.current.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded);
+    }
+
+    #[test]
+    fn clip_probes_finished_video_group_all_err_surfaces_decode_error() {
+        let mut els = els_with_video_group();
+        handle_job_event(&mut els, &mut JobSupervisor::new(),
+            clip_probe_event(vec![Err("no streams".to_string())]));
+
+        assert!(els.current.decode.probe.is_none());
+        assert!(els.current.decode.error.is_some(), "failed probes must surface a decode error");
+        // Converter snapshot still populated (per-file None for failed probes).
+        assert_eq!(els.current.converter.probes, vec![None]);
+        assert_eq!(els.current.converter.device_name.as_deref(), Some("cam-a"));
+    }
+
+    #[test]
+    fn clip_probes_finished_audio_group_skips_decode_seed_and_channel_reconcile() {
+        let mut els = els_with_video_group();
+        els.current.converter.groups[0].recording_type =
+            crate::converter::RecordingType::MultiTrackAudio;
+        // Channel map at a non-probe width must stay untouched for audio groups.
+        handle_job_event(&mut els, &mut JobSupervisor::new(),
+            clip_probe_event(vec![Ok(two_channel_probe())]));
+
+        assert!(els.current.decode.probe.is_none(), "audio groups must not seed the decode probe");
+        assert!(els.current.decode.error.is_none());
+        assert_eq!(els.current.converter.probes.len(), 1, "probes still populate for audio groups");
+    }
+
+    #[test]
+    fn clip_probes_finished_zero_generation_ignores_payload() {
+        let mut els = els_with_video_group();
+        els.current.converter.probes_generation = 0;
+        handle_job_event(&mut els, &mut JobSupervisor::new(),
+            clip_probe_event(vec![Ok(two_channel_probe())]));
+
+        assert!(els.current.decode.probe.is_none(), "stale (generation 0) results must be ignored");
+        assert!(els.current.converter.probes.is_empty());
+        assert!(els.current.converter.camera_meta.is_empty());
+        assert!(els.current.converter.device_name.is_none());
+    }
+
+    #[test]
+    fn clip_probes_finished_wrong_payload_is_logged_and_dropped() {
+        let mut els = els_with_video_group();
+        handle_job_event(&mut els, &mut JobSupervisor::new(),
+            JobEvent::Finished {
+                job: job::JobId(8),
+                kind: JobKind::ClipProbe,
+                outcome: JobOutcome::Succeeded { log: String::new() },
+                payload: JobFinal::DurationsDone, // wrong payload for ClipProbe
+            });
+        assert!(els.current.converter.probes.is_empty(), "mismatched payload must not be applied");
+        // Outcome still transitions the job phase.
+        assert_eq!(els.current.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded);
+    }
+
     #[test]
     fn handle_job_event_ignores_wrong_payload_without_panicking() {
         let mut els = EngineLoopState::new(AppStateSnapshot::initial());
