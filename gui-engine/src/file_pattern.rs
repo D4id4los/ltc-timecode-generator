@@ -179,6 +179,45 @@ pub fn group_key_prefix(key: &str) -> &str {
     key
 }
 
+impl FileNamingPattern {
+    /// The text of a path this pattern matches against: channel-tagged audio
+    /// patterns (TASCAM-style) match the file stem, extension-bearing camera
+    /// patterns match the full file name.
+    fn match_text<'a>(&self, file_name: &'a str, stem: &'a str) -> &'a str {
+        if self.channel_group.is_some() {
+            stem
+        } else {
+            file_name
+        }
+    }
+
+    /// Recording type this pattern produces: channel-tagged audio patterns
+    /// are multi-track audio; the rest are video clip sequences.
+    fn recording_type(&self) -> crate::converter::RecordingType {
+        if self.channel_group.is_some() {
+            crate::converter::RecordingType::MultiTrackAudio
+        } else {
+            crate::converter::RecordingType::VideoClipSequence
+        }
+    }
+
+    /// Sort key for files within a group: the captured channel index when
+    /// the pattern captures one, `u32::MAX` otherwise (preserving the
+    /// lexicographic scan order for patterns without channels).
+    fn sort_key(&self, re: &Regex, text: &str) -> u32 {
+        channel_index_of(re, self.channel_group, text)
+    }
+}
+
+/// Channel index captured from `text` via `re`, or `u32::MAX` when the
+/// pattern has no channel group or the capture is absent / non-numeric.
+fn channel_index_of(re: &Regex, channel_group: Option<&str>, text: &str) -> u32 {
+    re.captures(text)
+        .and_then(|c| channel_group.and_then(|n| c.name(n)))
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(u32::MAX)
+}
+
 pub fn match_files_to_groups(
     folder: &Path,
     pattern: &FileNamingPattern,
@@ -220,20 +259,9 @@ pub fn match_files_to_groups(
             let a_stem = a.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let b_stem = b.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-            let a_ch: u32 = {
-                let ch_name = pattern.channel_group;
-                re.captures(a_stem)
-                    .and_then(|c| ch_name.and_then(move |n| c.name(n)))
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(u32::MAX)
-            };
-            let b_ch: u32 = {
-                let ch_name = pattern.channel_group;
-                re.captures(b_stem)
-                    .and_then(|c| ch_name.and_then(move |n| c.name(n)))
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(u32::MAX)
-            };
+            let a_ch: u32 = channel_index_of(&re, pattern.channel_group, &a_stem);
+            let a_ch: u32 = channel_index_of(&re, pattern.channel_group, &a_stem);
+            let b_ch: u32 = channel_index_of(&re, pattern.channel_group, &b_stem);
 
             a_ch.cmp(&b_ch)
         });
@@ -278,120 +306,105 @@ pub struct MatchedGroup {
 /// Files matching multiple patterns are assigned to the first match (TASCAM first).
 /// Returns groups tagged with their `RecordingType`.
 pub fn match_files_all_patterns(folder: &Path) -> Vec<MatchedGroup> {
-    let mut used_paths: HashSet<PathBuf> = HashSet::new();
-    let mut results: Vec<MatchedGroup> = Vec::new();
+    match_files_all_patterns_in(folder, &collect_files_recursive(folder))
+}
 
+/// Pure core of [`match_files_all_patterns`]: match an already-collected
+/// file list against all applicable patterns.
+fn match_files_all_patterns_in(folder: &Path, files: &[PathBuf]) -> Vec<MatchedGroup> {
     // TASCAM pattern (audio) — limited to .wav only
     let audio_patterns = &BUILTIN_PATTERNS[..1];
     let all_patterns: Vec<&FileNamingPattern> =
         audio_patterns.iter().chain(CAMERA_PATTERNS.iter()).collect();
 
-    let files = collect_files_recursive(folder);
+    let mut used_paths: HashSet<PathBuf> = HashSet::new();
+    let mut results: Vec<MatchedGroup> = Vec::new();
 
     for pattern in &all_patterns {
         let re = match Regex::new(pattern.regex) {
             Ok(r) => r,
             Err(_) => continue,
         };
+        results.extend(group_files_for_pattern(
+            folder,
+            files,
+            pattern,
+            &re,
+            &mut used_paths,
+        ));
+    }
 
-        // Group by (rel_dir, prefix) so files with the same raw prefix but
-        // located in different subdirectories stay separate.
-        let mut group_map: BTreeMap<(String, String), Vec<PathBuf>> = BTreeMap::new();
+    merge_consecutive_video_groups(results)
+}
 
-        for path in &files {
-            if used_paths.contains(path) {
-                continue;
-            }
+/// Group `files` matching `pattern` into per-`(rel_dir, prefix)` groups,
+/// skipping (and marking) already-used paths so files matching multiple
+/// patterns stick to their first pattern. Files within each group are
+/// sorted by channel index.
+fn group_files_for_pattern(
+    folder: &Path,
+    files: &[PathBuf],
+    pattern: &FileNamingPattern,
+    re: &Regex,
+    used_paths: &mut HashSet<PathBuf>,
+) -> Vec<MatchedGroup> {
+    // Group by (rel_dir, prefix) so files with the same raw prefix but
+    // located in different subdirectories stay separate.
+    let mut group_map: BTreeMap<(String, String), Vec<PathBuf>> = BTreeMap::new();
 
-            let file_name = match path.file_name().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-
-            // Track which form to use for matching (stems for TASCAM, full
-            // name for cameras)
-            let match_str = if pattern.name == "TASCAM" {
-                &stem
-            } else {
-                &file_name
-            };
-
-            if let Some(caps) = re.captures(match_str) {
-                let prefix = caps
-                    .name(pattern.prefix_group)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-                let rel = relative_dir(folder, path);
-                used_paths.insert(path.clone());
-                group_map.entry((rel, prefix)).or_default().push(path.clone());
-            }
+    for path in files {
+        if used_paths.contains(path) {
+            continue;
         }
 
-        // Sort files in each group by the capture index (for TASCAM) or by
-        // sequential number (for cameras)
-        for ((rel_dir, prefix), mut files) in group_map {
-            files.sort_by(|a, b| {
-                let a_str = if pattern.name == "TASCAM" {
-                    a.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    a.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                };
-                let b_str = if pattern.name == "TASCAM" {
-                    b.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    b.file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                };
-                let a_ch: u32 = {
-                    let ch_name = pattern.channel_group;
-                    re.captures(&a_str)
-                        .and_then(|c| ch_name.and_then(move |n| c.name(n)))
-                        .and_then(|m| m.as_str().parse().ok())
-                        .unwrap_or(u32::MAX)
-                };
-                let b_ch: u32 = {
-                    let ch_name = pattern.channel_group;
-                    re.captures(&b_str)
-                        .and_then(|c| ch_name.and_then(move |n| c.name(n)))
-                        .and_then(|m| m.as_str().parse().ok())
-                        .unwrap_or(u32::MAX)
-                };
-                a_ch.cmp(&b_ch)
-            });
+        let file_name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
 
-            let recording_type = if pattern.name == "TASCAM" {
-                crate::converter::RecordingType::MultiTrackAudio
-            } else {
-                crate::converter::RecordingType::VideoClipSequence
-            };
-
-            results.push(MatchedGroup {
-                prefix,
-                rel_dir,
-                files,
-                recording_type,
-            });
+        if let Some(caps) = re.captures(pattern.match_text(&file_name, &stem)) {
+            let prefix = caps
+                .name(pattern.prefix_group)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let rel = relative_dir(folder, path);
+            used_paths.insert(path.clone());
+            group_map.entry((rel, prefix)).or_default().push(path.clone());
         }
     }
 
-    // Consecutive-numbering heuristic for video clips:
-    // Group consecutive numbered files within the same camera pattern AND the
-    // same relative directory.
+    group_map
+        .into_iter()
+        .map(|((rel_dir, prefix), mut files)| {
+            files.sort_by_key(|p| match_name_of(p, pattern).map(|t| pattern.sort_key(re, &t)));
+            MatchedGroup {
+                prefix,
+                rel_dir,
+                files,
+                recording_type: pattern.recording_type(),
+            }
+        })
+        .collect()
+}
+
+/// The pattern's match text of a path (stem for channel-tagged audio
+/// patterns, full file name otherwise), for sort-key computation.
+fn match_name_of(path: &Path, pattern: &FileNamingPattern) -> Option<String> {
+    if pattern.channel_group.is_some() {
+        path.file_stem().and_then(|s| s.to_str()).map(String::from)
+    } else {
+        path.file_name().and_then(|s| s.to_str()).map(String::from)
+    }
+}
+
+/// Merge camera-pattern groups whose prefixes differ only in trailing
+/// consecutive digits within the same relative directory (consecutive
+/// video-clip numbering).
+fn merge_consecutive_video_groups(results: Vec<MatchedGroup>) -> Vec<MatchedGroup> {
     let mut merged = Vec::new();
     let mut i = 0;
     while i < results.len() {
