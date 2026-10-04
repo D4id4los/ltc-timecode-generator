@@ -170,7 +170,11 @@ where
             return state.load().as_ref().clone();
         }
         if Instant::now() > deadline {
-            panic!("Timeout waiting for {what}");
+            panic!("Timeout waiting for {what}; state: is_playing={} plan_error={:?} cards={} jobs_offload_scan={:?} jobs_offload_copy={:?} applied_seq={} recovery={}",
+                snapshot.is_playing, snapshot.offload.plan_error, snapshot.offload.cards.len(),
+                snapshot.jobs.get(&JobKind::OffloadScan).map(|j| j.phase()),
+                snapshot.jobs.get(&JobKind::OffloadCopy).map(|j| j.phase()),
+                snapshot.applied_command_seq, snapshot.audio_recovery_attempts);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -212,6 +216,32 @@ fn make_card(mount: &Path, device_name: &str, file_names: &[&str]) -> SdCardInfo
         selected: Vec::new(),
         selected_count: 0,
         selected_bytes: 0,
+    }
+}
+
+/// Serialize tests that touch the persisted offload-parent config. All
+/// tests in this binary share one leaked `XDG_CONFIG_HOME` (see
+/// `init_test_config`), and `SetParentFolder` persists the parent — so an
+/// engine spawned afterwards seeds it and the no-parent guard never fires.
+/// Tests that write the parent hold the lock for their whole body; the
+/// guard test holds it and deletes the config file before spawning its
+/// engines. (Under nextest each test runs in its own process, where the
+/// shared dir cannot leak; this lock closes the `cargo test` window.)
+static OFFLOAD_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn take_offload_config_lock() -> std::sync::MutexGuard<'static, ()> {
+    OFFLOAD_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remove the persisted converter config so a fresh engine seeds no
+/// offload parent. Callers must hold [`OFFLOAD_CONFIG_LOCK`].
+fn delete_persisted_offload_parent() {
+    if let Ok(base) = std::env::var("XDG_CONFIG_HOME") {
+        let _ = std::fs::remove_file(
+            std::path::Path::new(&base)
+                .join("ltc-timecode-generator")
+                .join("converter_config.json"),
+        );
     }
 }
 
@@ -845,6 +875,7 @@ fn card_for_existing_files(mount: &Path, device_name: &str, file_names: &[&str])
 
 #[test]
 fn test_offload_happy_path_scan_select_copy() {
+    let _config_lock = take_offload_config_lock();
     let mount = make_persistent_dir("offload-happy-mount");
     let dest = make_persistent_dir("offload-happy-dest");
 
@@ -906,6 +937,7 @@ fn test_offload_happy_path_scan_select_copy() {
 
 #[test]
 fn test_offload_copy_failure_completes_with_no_devices() {
+    let _config_lock = take_offload_config_lock();
     // NOTE: a per-file copy failure does NOT fail the job — the job-level
     // contract is "Succeeded with the list of completed devices" (per-device
     // failure lives in the unit state). This test pins that contract: the
@@ -1007,8 +1039,11 @@ fn test_offload_cancel_during_scan() {
 fn test_start_offload_guard_branches() {
     use gui_engine::offload::OffloadPlanError;
 
+    let _config_lock = take_offload_config_lock();
+
     // (a) No cards → typed NoCards plan error.
     {
+        delete_persisted_offload_parent();
         let engine = spawn_engine_with_scan_seam(Arc::new(|_c, _p| Ok(Vec::new())));
         engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
         let snap = wait_for_snapshot(&engine.state, "no-cards guard", |s| s.offload.plan_error.is_some());
@@ -1018,6 +1053,7 @@ fn test_start_offload_guard_branches() {
 
     // (b) Card present but no parent folder → typed NoParentFolder plan error.
     {
+        delete_persisted_offload_parent();
         let mount = make_persistent_dir("offload-guard-mount");
         let card = make_card(&mount, "TESTCAM", &["a.wav"]);
         let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
