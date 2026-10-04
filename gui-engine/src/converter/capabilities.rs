@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde;
 
-use crate::subprocess::no_window_command;
+use crate::subprocess::{no_window_command, run_output_with_timeout, PROBE_TIMEOUT};
 
 /// Hardware device info resolved for a concrete encoder at conversion time.
 #[derive(Clone, Debug)]
@@ -58,39 +59,13 @@ pub struct FfmpegCapabilities {
 }
 
 pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
-    let version_ok = no_window_command("ffmpeg")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    match version_ok {
-        Ok(status) if status.success() => {}
-        Ok(_) => {
-            return FfmpegCapabilities {
-                has_ffmpeg: false,
-                available_encoders: BTreeSet::new(),
-                available_formats: BTreeSet::new(),
-                error_message: Some(
-                    "ffmpeg found but returned a non-zero exit status".to_string(),
-                ),
-                hw: HwDeviceCapabilities::default(),
-            };
-        }
-        Err(e) => {
-            let msg = format!(
-                "ffmpeg not found in PATH. Please install ffmpeg to use the converter. \
-                 Error: {}",
-                e
-            );
-            log::warn!("{}", msg);
-            return FfmpegCapabilities {
-                has_ffmpeg: false,
-                available_encoders: BTreeSet::new(),
-                available_formats: BTreeSet::new(),
-                error_message: Some(msg),
-                hw: HwDeviceCapabilities::default(),
-            };
+    match probe_ffmpeg_version() {
+        FfmpegVersionProbe::Available => {}
+        ref failure => {
+            if matches!(failure, FfmpegVersionProbe::TimedOut) {
+                log::warn!("ffmpeg -version probe timed out; treating ffmpeg as unavailable");
+            }
+            return caps_for_version_failure(failure);
         }
     }
 
@@ -118,40 +93,222 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
 }
 
 fn run_ffmpeg_list(args: &[&str], filter_fn: fn(&str) -> bool) -> BTreeSet<String> {
-    let output = no_window_command("ffmpeg")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
+    run_ffmpeg_list_with(|| no_window_command("ffmpeg"), PROBE_TIMEOUT, args, filter_fn)
+}
 
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            text.lines()
-                .flat_map(|line| {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with("--") {
-                        return Vec::new().into_iter();
-                    }
-                    if trimmed.starts_with("Encoders:")
-                        || trimmed.starts_with("Formats:")
-                        || trimmed.starts_with("File formats:")
-                    {
-                        return Vec::new().into_iter();
-                    }
-                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                    if parts.len() >= 2 && filter_fn(parts[0]) {
-                        parts[1]
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                    } else {
-                        Vec::new().into_iter()
-                    }
-                })
-                .collect()
+/// Testable seam for the encoder/format list probe: builds the command via
+/// `make_cmd`, runs it under `timeout`, and parses the stdout with the
+/// flag `filter_fn`. Any failure (spawn error, non-zero exit, timeout)
+/// yields an empty set.
+pub(crate) fn run_ffmpeg_list_with(
+    make_cmd: impl Fn() -> Command,
+    timeout: Duration,
+    args: &[&str],
+    filter_fn: fn(&str) -> bool,
+) -> BTreeSet<String> {
+    let _ = (make_cmd, timeout, args, filter_fn);
+    BTreeSet::new()
+}
+
+/// Parse the stdout of `ffmpeg -encoders` / `ffmpeg -formats`: skip blank
+/// lines, option lines (`-`/`--`) and section headers, split the name field
+/// on commas, and keep only lines whose flag field passes `filter_fn`.
+pub(crate) fn parse_ffmpeg_list_output(
+    text: &str,
+    filter_fn: fn(&str) -> bool,
+) -> BTreeSet<String> {
+    let _ = (text, filter_fn);
+    BTreeSet::new()
+}
+
+/// Outcome of the `ffmpeg -version` availability probe.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FfmpegVersionProbe {
+    Available,
+    NonZeroExit,
+    SpawnFailed(String),
+    TimedOut,
+}
+
+/// Testable seam: run an already-built command under `timeout` and classify
+/// the outcome as a version-probe result.
+fn probe_version_with(_cmd: &mut Command, _timeout: Duration) -> FfmpegVersionProbe {
+    FfmpegVersionProbe::SpawnFailed("stub".to_string())
+}
+
+/// Production wrapper: probe `ffmpeg -version` under [`PROBE_TIMEOUT`].
+fn probe_ffmpeg_version() -> FfmpegVersionProbe {
+    probe_version_with(&mut no_window_command("ffmpeg"), PROBE_TIMEOUT)
+}
+
+/// Map a failed version probe onto the "converter unavailable" capabilities
+/// shape (empty encoder/format sets + an error message).
+pub(crate) fn caps_for_version_failure(_probe: &FfmpegVersionProbe) -> FfmpegCapabilities {
+    FfmpegCapabilities {
+        has_ffmpeg: false,
+        available_encoders: BTreeSet::new(),
+        available_formats: BTreeSet::new(),
+        error_message: None,
+        hw: HwDeviceCapabilities::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subprocess::tests::{echo_args, echo_prog, sleep_args, sleep_prog, success_prog};
+
+    fn any_flag(_flags: &str) -> bool {
+        true
+    }
+
+    // ── probe_version_with ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_probe_version_hung_command_times_out() {
+        let mut cmd = Command::new(sleep_prog());
+        cmd.args(sleep_args(30));
+        let probe = probe_version_with(&mut cmd, Duration::from_millis(100));
+        assert!(
+            matches!(probe, FfmpegVersionProbe::TimedOut),
+            "a hung command must classify as TimedOut, got {:?}",
+            probe
+        );
+    }
+
+    #[test]
+    fn test_probe_version_nonzero_exit_returns_nonzero() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "exit 1"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "exit 1"]);
+            c
+        };
+        let probe = probe_version_with(&mut cmd, Duration::from_secs(5));
+        assert!(matches!(probe, FfmpegVersionProbe::NonZeroExit), "got {:?}", probe);
+    }
+
+    #[test]
+    fn test_probe_version_spawn_failure() {
+        let mut cmd = Command::new("this-command-does-not-exist-99999");
+        let probe = probe_version_with(&mut cmd, Duration::from_secs(5));
+        assert!(
+            matches!(probe, FfmpegVersionProbe::SpawnFailed(_)),
+            "got {:?}",
+            probe
+        );
+    }
+
+    #[test]
+    fn test_probe_version_success() {
+        let mut cmd = Command::new(success_prog());
+        let probe = probe_version_with(&mut cmd, Duration::from_secs(5));
+        assert!(matches!(probe, FfmpegVersionProbe::Available), "got {:?}", probe);
+    }
+
+    // ── caps_for_version_failure ────────────────────────────────────────────
+
+    #[test]
+    fn test_caps_from_version_failure_variants_disable_ffmpeg() {
+        let probes = [
+            FfmpegVersionProbe::NonZeroExit,
+            FfmpegVersionProbe::SpawnFailed("nope".to_string()),
+            FfmpegVersionProbe::TimedOut,
+        ];
+        for probe in &probes {
+            let caps = caps_for_version_failure(probe);
+            assert!(!caps.has_ffmpeg, "{:?} must not enable ffmpeg", probe);
+            assert!(
+                caps.available_encoders.is_empty() && caps.available_formats.is_empty(),
+                "{:?} must not report encoders/formats",
+                probe
+            );
+            assert!(
+                caps.error_message.is_some(),
+                "{:?} must carry an error message",
+                probe
+            );
+            assert_eq!(caps.hw, HwDeviceCapabilities::default());
         }
-        _ => BTreeSet::new(),
+    }
+
+    // ── parse_ffmpeg_list_output ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_ffmpeg_list_output_skips_headers_and_options() {
+        let text = "\
+ffmpeg version 6.1
+Encoders:
+ V....D libx264  libx264 H.264
+ A....D aac  AAC encoder
+Formats:
+ --enable-something
+File formats:
+ DE mov  QuickTime format
+
+";
+        let got = parse_ffmpeg_list_output(text, any_flag);
+        assert!(got.contains("libx264"), "got {:?}", got);
+        assert!(got.contains("aac"), "got {:?}", got);
+        assert!(got.contains("mov"), "got {:?}", got);
+        // headers, option lines, version banner and blanks contribute nothing
+        assert_eq!(got.len(), 3, "got {:?}", got);
+    }
+
+    #[test]
+    fn test_parse_ffmpeg_list_output_splits_comma_names() {
+        let text = " V.S... foo,bar,baz  description here\n";
+        let got = parse_ffmpeg_list_output(text, any_flag);
+        let expected: BTreeSet<String> = ["foo", "bar", "baz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_parse_ffmpeg_list_output_applies_flag_filter() {
+        let text = "\
+ V....D vcodec  video encoder
+ A....D acodec  audio encoder
+";
+        let video_only = parse_ffmpeg_list_output(text, |flags| flags.starts_with('V'));
+        assert!(video_only.contains("vcodec"));
+        assert!(!video_only.contains("acodec"), "got {:?}", video_only);
+    }
+
+    // ── run_ffmpeg_list_with (routing) ──────────────────────────────────────
+
+    #[test]
+    fn test_run_ffmpeg_list_respects_timeout() {
+        let got = run_ffmpeg_list_with(
+            || {
+                let mut c = Command::new(sleep_prog());
+                c.args(sleep_args(30));
+                c
+            },
+            Duration::from_millis(100),
+            &[],
+            any_flag,
+        );
+        assert!(got.is_empty(), "a hung list probe must yield an empty set");
+    }
+
+    #[test]
+    fn test_run_ffmpeg_list_parses_successful_output() {
+        let got = run_ffmpeg_list_with(
+            || {
+                let mut c = Command::new(echo_prog());
+                c.args(echo_args());
+                c
+            },
+            Duration::from_secs(5),
+            &[],
+            any_flag,
+        );
+        assert!(got.contains("hello"), "got {:?}", got);
     }
 }

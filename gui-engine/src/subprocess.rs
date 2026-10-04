@@ -360,7 +360,7 @@ fn join_output(
 
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Stdio;
 
@@ -558,28 +558,28 @@ mod tests {
     // ── platform helpers ─────────────────────────────────────────────────────
 
     #[cfg(windows)]
-    fn success_prog() -> &'static str { "cmd" }
+    pub(crate) fn success_prog() -> &'static str { "cmd" }
     #[cfg(not(windows))]
-    fn success_prog() -> &'static str { "true" }
+    pub(crate) fn success_prog() -> &'static str { "true" }
 
     #[cfg(windows)]
-    fn echo_prog() -> &'static str { "cmd" }
+    pub(crate) fn echo_prog() -> &'static str { "cmd" }
     #[cfg(not(windows))]
-    fn echo_prog() -> &'static str { "printf" }
+    pub(crate) fn echo_prog() -> &'static str { "printf" }
 
     #[cfg(windows)]
-    fn echo_args() -> Vec<&'static str> { vec!["/C", "echo", "hello"] }
+    pub(crate) fn echo_args() -> Vec<&'static str> { vec!["/C", "echo hello"] }
     #[cfg(not(windows))]
-    fn echo_args() -> Vec<&'static str> { vec!["hello"] }
+    pub(crate) fn echo_args() -> Vec<&'static str> { vec!["hello"] }
 
     #[cfg(windows)]
-    fn sleep_prog() -> &'static str { "ping" }
+    pub(crate) fn sleep_prog() -> &'static str { "ping" }
     #[cfg(windows)]
-    fn sleep_args(secs: u32) -> Vec<String> { vec!["-n".into(), (secs + 1).to_string(), "127.0.0.1".into()] }
+    pub(crate) fn sleep_args(secs: u32) -> Vec<String> { vec!["-n".into(), (secs + 1).to_string(), "127.0.0.1".into()] }
     #[cfg(not(windows))]
-    fn sleep_prog() -> &'static str { "sleep" }
+    pub(crate) fn sleep_prog() -> &'static str { "sleep" }
     #[cfg(not(windows))]
-    fn sleep_args(secs: u32) -> Vec<String> { vec![secs.to_string()] }
+    pub(crate) fn sleep_args(secs: u32) -> Vec<String> { vec![secs.to_string()] }
 
     // ── run_ffmpeg_collect_stderr tests ─────────────────────────────────
 
