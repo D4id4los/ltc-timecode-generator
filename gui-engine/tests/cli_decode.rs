@@ -58,6 +58,7 @@ fn cli_with(mutate: impl FnOnce(&mut Cli)) -> Cli {
         context_frames: 3,
         list_timecodes: false,
         autostart: false,
+        probe_caps: false,
     };
     mutate(&mut cli);
     cli
@@ -203,4 +204,16 @@ fn process_cli_result_decode_video_out_of_range_stream_fails() {
         Ok(_) => panic!("out-of-range stream must fail, not succeed"),
     };
     assert!(matches!(err, CliError::Decode(_)), "got: {err:?}");
+}
+
+#[test]
+fn process_cli_result_probe_caps_dispatches_and_exits() {
+    init_test_config();
+    if !ffmpeg_tooling_available() {
+        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available");
+        return;
+    }
+    let outcome = process_cli_result(cli_with(|c| c.probe_caps = true))
+        .expect("--probe-caps dispatch should succeed");
+    assert!(matches!(outcome, CliOutcome::Done));
 }

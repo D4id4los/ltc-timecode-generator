@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde;
 
@@ -59,25 +60,81 @@ pub struct FfmpegCapabilities {
 }
 
 pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
-    match probe_ffmpeg_version() {
+    let (caps, timings) = query_ffmpeg_capabilities_timed();
+    log::info!(
+        "ffmpeg capability probe timings: version={}ms encoders={}ms formats={}ms discover={}ms ({} VAAPI nodes) validate={}ms across {} candidate(s)",
+        timings.version_ms,
+        timings.encoders_ms,
+        timings.formats_ms,
+        timings.discover_ms,
+        timings.discover_vaapi_nodes,
+        timings.validate_ms,
+        timings.validate_candidates.len(),
+    );
+    for (name, ms) in &timings.validate_candidates {
+        log::info!("  hw encoder '{}' test encode: {}ms", name, ms);
+    }
+    caps
+}
+
+/// Per-stage wall-clock timings of one capability-probe run (diagnostics;
+/// durations are logged for humans, never asserted in tests).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProbeTimings {
+    pub version_ms: u64,
+    pub encoders_ms: u64,
+    pub formats_ms: u64,
+    pub discover_ms: u64,
+    pub discover_vaapi_nodes: usize,
+    pub validate_ms: u64,
+    /// `(encoder name, elapsed ms)` per test-encoded HW candidate, in probe order.
+    pub validate_candidates: Vec<(String, u64)>,
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+/// [`query_ffmpeg_capabilities`] with per-stage timing instrumentation.
+/// The functional result is identical to the plain wrapper; the timings are
+/// additive diagnostics (surfaced via `--probe-caps` and the info log).
+pub fn query_ffmpeg_capabilities_timed() -> (FfmpegCapabilities, ProbeTimings) {
+    let mut timings = ProbeTimings::default();
+
+    let start = Instant::now();
+    let probe = probe_ffmpeg_version();
+    timings.version_ms = elapsed_ms(start);
+    match probe {
         FfmpegVersionProbe::Available => {}
         ref failure => {
             if matches!(failure, FfmpegVersionProbe::TimedOut) {
                 log::warn!("ffmpeg -version probe timed out; treating ffmpeg as unavailable");
             }
-            return caps_for_version_failure(failure);
+            return (caps_for_version_failure(failure), timings);
         }
     }
 
+    let start = Instant::now();
     let encoders = run_ffmpeg_list(&["-encoders", "-hide_banner"], |flags| {
         let f = flags.as_bytes();
         !f.is_empty() && (f[0] == b'V' || f[0] == b'A')
     });
+    timings.encoders_ms = elapsed_ms(start);
+
+    let start = Instant::now();
     let formats = run_ffmpeg_list(&["-formats", "-hide_banner"], |flags| {
         flags.contains('E')
     });
+    timings.formats_ms = elapsed_ms(start);
 
+    // Node count is a cheap directory read done for the measurement record;
+    // `discover` itself re-lists the nodes when probing.
+    timings.discover_vaapi_nodes =
+        crate::hw_device::list_vaapi_render_nodes(Path::new("/dev/dri")).len();
+
+    let start = Instant::now();
     let hw = crate::hw_device::discover("ffmpeg", &encoders);
+    timings.discover_ms = elapsed_ms(start);
 
     let mut caps = FfmpegCapabilities {
         has_ffmpeg: true,
@@ -87,9 +144,55 @@ pub fn query_ffmpeg_capabilities() -> FfmpegCapabilities {
         hw,
     };
 
-    crate::hw_device::validate_hw_encoders(&mut caps.available_encoders, &caps.hw);
+    let start = Instant::now();
+    let mut candidate_timings: Vec<(String, u64)> = Vec::new();
+    {
+        let mut timed_probe = |name: &str, hw_frames, vaapi_device: Option<&str>| {
+            let candidate_start = Instant::now();
+            let ok = crate::hw_device::test_encode("ffmpeg", name, hw_frames, vaapi_device);
+            candidate_timings.push((name.to_string(), elapsed_ms(candidate_start)));
+            ok
+        };
+        crate::hw_device::validate_hw_encoders_with(
+            &mut caps.available_encoders,
+            &caps.hw,
+            &mut timed_probe,
+        );
+    }
+    timings.validate_candidates = candidate_timings;
+    timings.validate_ms = elapsed_ms(start);
 
-    caps
+    (caps, timings)
+}
+
+/// Build the `key=value` report rows for `--probe-caps`. Pure — the builder
+/// is the unit-test surface; the CLI merely prints the rows.
+pub fn probe_caps_report(caps: &FfmpegCapabilities, timings: &ProbeTimings) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = vec![
+        ("has_ffmpeg".to_string(), caps.has_ffmpeg.to_string()),
+        ("encoder_count".to_string(), caps.available_encoders.len().to_string()),
+        ("format_count".to_string(), caps.available_formats.len().to_string()),
+        (
+            "hw_vaapi_device".to_string(),
+            caps.hw.vaapi_device.clone().unwrap_or_else(|| "none".to_string()),
+        ),
+        ("hw_vulkan".to_string(), caps.hw.vulkan_available.to_string()),
+        (
+            "error".to_string(),
+            caps.error_message.clone().unwrap_or_else(|| "none".to_string()),
+        ),
+        ("version_ms".to_string(), timings.version_ms.to_string()),
+        ("encoders_ms".to_string(), timings.encoders_ms.to_string()),
+        ("formats_ms".to_string(), timings.formats_ms.to_string()),
+        ("discover_ms".to_string(), timings.discover_ms.to_string()),
+        ("discover_vaapi_nodes".to_string(), timings.discover_vaapi_nodes.to_string()),
+        ("validate_ms".to_string(), timings.validate_ms.to_string()),
+        ("validate_candidates".to_string(), timings.validate_candidates.len().to_string()),
+    ];
+    for (name, ms) in &timings.validate_candidates {
+        rows.push((format!("validate_{}", name), ms.to_string()));
+    }
+    rows
 }
 
 fn run_ffmpeg_list(args: &[&str], filter_fn: fn(&str) -> bool) -> BTreeSet<String> {
@@ -302,6 +405,58 @@ mod tests {
             );
             assert_eq!(caps.hw, HwDeviceCapabilities::default());
         }
+    }
+
+    // ── timed probe + probe_caps_report ─────────────────────────────────────
+
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn test_timed_probe_returns_capabilities_unchanged() {
+        if !ffmpeg_available() {
+            eprintln!("--- SKIPPED: ffmpeg not available on this machine");
+            return;
+        }
+        let (timed_caps, _timings) = query_ffmpeg_capabilities_timed();
+        let plain_caps = query_ffmpeg_capabilities();
+        assert_eq!(timed_caps, plain_caps, "the timed path must return identical capabilities");
+    }
+
+    #[test]
+    fn test_probe_caps_report_structural_facts() {
+        let caps = FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: BTreeSet::from(["libx264".to_string(), "h264_vaapi".to_string()]),
+            available_formats: BTreeSet::from(["matroska".to_string()]),
+            error_message: None,
+            hw: HwDeviceCapabilities { vaapi_device: Some("/dev/dri/renderD128".to_string()), vulkan_available: false },
+        };
+        let timings = ProbeTimings {
+            version_ms: 11,
+            encoders_ms: 22,
+            formats_ms: 33,
+            discover_ms: 44,
+            discover_vaapi_nodes: 1,
+            validate_ms: 120,
+            validate_candidates: vec![("h264_vaapi".to_string(), 120)],
+        };
+
+        let rows = probe_caps_report(&caps, &timings);
+        let get = |key: &str| {
+            rows.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        };
+
+        assert_eq!(get("has_ffmpeg").as_deref(), Some("true"), "report must carry has_ffmpeg matching the caps");
+        assert_eq!(get("encoder_count").as_deref(), Some("2"));
+        // one timing entry per stage field
+        for stage in ["version_ms", "encoders_ms", "formats_ms", "discover_ms", "validate_ms"] {
+            assert!(get(stage).is_some(), "report must carry a {} timing entry", stage);
+        }
+        assert_eq!(get("discover_vaapi_nodes").as_deref(), Some("1"));
+        // one per-candidate entry per candidate
+        assert_eq!(get("validate_h264_vaapi").as_deref(), Some("120"));
     }
 
     // ── parse_ffmpeg_list_output ────────────────────────────────────────────

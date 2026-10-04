@@ -420,6 +420,7 @@ mod tests {
             context_frames: 3,
             list_timecodes: false,
             autostart: false,
+        probe_caps: false,
         };
         crate::cli::generate_wav(cli).expect("WAV generation failed");
     }

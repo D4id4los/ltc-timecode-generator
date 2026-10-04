@@ -14,7 +14,10 @@ pub use timecode::{
 };
 
 pub(crate) mod capabilities;
-pub use capabilities::{query_ffmpeg_capabilities, FfmpegCapabilities, HwDeviceCapabilities};
+pub use capabilities::{
+    probe_caps_report, query_ffmpeg_capabilities, query_ffmpeg_capabilities_timed,
+    FfmpegCapabilities, HwDeviceCapabilities, ProbeTimings,
+};
 
 pub(crate) mod formats;
 pub use formats::{

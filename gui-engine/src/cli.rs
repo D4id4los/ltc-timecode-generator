@@ -36,6 +36,10 @@ pub struct Cli {
     #[arg(long, short = 'l')]
     pub list_devices: bool,
 
+    /// Probe ffmpeg capabilities, print a stage-timing report (`key=value` lines) and exit
+    #[arg(long)]
+    pub probe_caps: bool,
+
     /// Run in headless mode (no GUI). Implied by --output-to-file.
     #[arg(long, short = 'H')]
     pub headless: bool,
@@ -903,6 +907,14 @@ pub fn process_cli_result(cli: Cli) -> Result<CliOutcome, CliError> {
         list_devices_and_exit();
     }
 
+    if cli.probe_caps {
+        let (caps, timings) = crate::converter::query_ffmpeg_capabilities_timed();
+        for (key, value) in crate::converter::probe_caps_report(&caps, &timings) {
+            println!("{}={}", key, value);
+        }
+        return Ok(CliOutcome::Done);
+    }
+
     if let Some(path) = cli.decode.clone() {
         let path = PathBuf::from(path);
         // Copy the display flags out before `cli` is moved into a runner.
@@ -1197,6 +1209,7 @@ mod tests {
             context_frames: 3,
             list_timecodes: false,
             autostart: false,
+        probe_caps: false,
         }
     }
 
