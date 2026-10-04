@@ -343,6 +343,11 @@ pub struct AppStateSnapshot {
     /// Engine-internal working flag: whether the audio output stream was
     /// successfully initialized.  Not rendered by any GUI.
     pub audio_initialized: bool,
+    /// Soft-recovery attempt counter of the audio-stream recovery ladder
+    /// (`handle_event`/`recovery_action`), published so tests can assert the
+    /// ladder with typed values instead of status text. Reset to 0 by a
+    /// successful audio (re-)init. Not rendered by any GUI.
+    pub audio_recovery_attempts: u8,
     pub sample_rate: u32,
     pub sample_format_name: String,
 
@@ -410,6 +415,7 @@ impl AppStateSnapshot {
             devices: Vec::new(),
             selected_device: None,
             audio_initialized: false,
+            audio_recovery_attempts: 0,
             sample_rate: suggest_sr,
             sample_format_name: String::new(),
             clapper: ClapperSnapshot {

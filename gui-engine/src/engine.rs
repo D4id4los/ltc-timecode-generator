@@ -51,6 +51,10 @@ pub fn engine_main(
 /// the seams they exercise.
 pub type ScanCardsFn = Arc<dyn Fn(&CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String> + Send + Sync>;
 
+/// Audio-event source drained once per engine tick. The default is
+/// AudioCore's own event queue; tests inject a queue they can push to.
+pub type AudioEventsFn = Box<dyn Fn(&AudioCore) -> Vec<AudioEvent> + Send>;
+
 pub struct EngineSeams {
     /// ffmpeg capability probe (the `engine_main_with_probe` seam).
     pub ffmpeg_caps: Box<dyn FnOnce() -> FfmpegCapabilities + Send>,
@@ -58,6 +62,10 @@ pub struct EngineSeams {
     /// implementation walks `/proc/mounts` / `/sys/class/block`; tests
     /// hand-build `SdCardInfo` values. May block and poll `cancel`.
     pub scan_cards: ScanCardsFn,
+    /// Audio-event source drained once per engine tick (the recovery-ladder
+    /// seam). The default drains AudioCore's own event queue; tests inject
+    /// a shared queue they can push `AudioEvent`s into.
+    pub audio_events: AudioEventsFn,
 }
 
 impl Default for EngineSeams {
@@ -65,6 +73,7 @@ impl Default for EngineSeams {
         EngineSeams {
             ffmpeg_caps: Box::new(query_ffmpeg_capabilities),
             scan_cards: Arc::new(|_cancel, progress| Ok(crate::offload::detect_cards_with_progress(progress))),
+            audio_events: Box::new(|core| core.drain_events()),
         }
     }
 }
@@ -1262,6 +1271,26 @@ fn try_init_device(
 }
 
 // ── Event handling ──────────────────────────────────────────────────────
+
+/// The recovery ladder's decision, extracted from `handle_event` as a pure
+/// function (unit-tested as a decision table). `handle_event` executes the
+/// returned action.
+#[derive(Clone, Debug, PartialEq)]
+enum RecoveryAction {
+    /// Full teardown-and-recreate (`StreamDead`) — never consumes a soft
+    /// attempt: the scheduler watchdog has already exhausted its own soft
+    /// attempts before emitting `StreamDead`.
+    HardReset,
+    /// A soft recovery attempt: bump the counter to `next` and re-init.
+    Attempt { next: u8 },
+    /// Soft attempts exhausted — stop playback, freeze the counter.
+    Exhausted,
+}
+
+// TDD stub: decision table not yet implemented (WP-2.1 red phase).
+fn recovery_action(_event: &AudioEvent, _attempts: u8) -> Option<RecoveryAction> {
+    None
+}
 
 fn handle_event(
     event: AudioEvent,
@@ -3763,6 +3792,67 @@ mod tests {
         apply_sel(&mut state, 1);
         assert_eq!(state.converter.settings.output_folder, second_dir,
             "second selection must still re-default after a no-op echo");
+    }
+
+    // ── recovery ladder decision table (WP-2.1) ──────────────────────────
+
+    fn soft_events() -> Vec<AudioEvent> {
+        vec![
+            AudioEvent::StreamDied,
+            AudioEvent::RecoveryNeeded { reason: "seam test".to_string() },
+        ]
+    }
+
+    #[test]
+    fn test_recovery_action_stream_dead_is_always_hard_reset() {
+        for attempts in 0..=MAX_RECOVERY_ATTEMPTS {
+            assert_eq!(
+                recovery_action(&AudioEvent::StreamDead, attempts),
+                Some(RecoveryAction::HardReset),
+                "StreamDead must hard-reset without consuming a soft attempt (attempts={attempts})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recovery_action_soft_ladder_counts_up() {
+        for event in soft_events() {
+            for attempts in 0..MAX_RECOVERY_ATTEMPTS {
+                assert_eq!(
+                    recovery_action(&event, attempts),
+                    Some(RecoveryAction::Attempt { next: attempts + 1 }),
+                    "soft event at attempts={attempts} must bump the counter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_recovery_action_exhausted_at_max() {
+        for event in soft_events() {
+            assert_eq!(
+                recovery_action(&event, MAX_RECOVERY_ATTEMPTS),
+                Some(RecoveryAction::Exhausted),
+                "soft event at MAX attempts must exhaust the ladder"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recovery_action_ignores_non_recovery_events() {
+        let events = [
+            AudioEvent::Underrun,
+            AudioEvent::StreamError("x".to_string()),
+            AudioEvent::StreamRecovering { attempt: 1 },
+            AudioEvent::FramesDropped { total: 3 },
+        ];
+        for event in events {
+            assert_eq!(
+                recovery_action(&event, 0),
+                None,
+                "non-recovery events must not drive the ladder"
+            );
+        }
     }
 
     }

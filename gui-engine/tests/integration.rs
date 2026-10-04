@@ -10,7 +10,7 @@ use gui_engine::command::{GuiCommand, OffloadCommand};
 use gui_engine::engine::{engine_main_with_probe, engine_main_with_seams, EngineSeams, ScanCardsFn};
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::offload::{OffloadFileInfo, SdCardInfo};
-use gui_engine::{decode_ltc_from_wav, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities, DeviceNameSource};
+use gui_engine::{decode_ltc_from_wav, AudioEvent, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities, DeviceNameSource};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -118,6 +118,9 @@ struct TestEngine {
     tx: mpsc::Sender<GuiCommand>,
     state: Arc<ArcSwap<AppStateSnapshot>>,
     handle: std::thread::JoinHandle<()>,
+    /// Receiver of the engine→GUI audio-event channel (the engine forwards
+    /// every drained `AudioEvent` through it, seam or not).
+    event_rx: mpsc::Receiver<AudioEvent>,
 }
 
 impl TestEngine {
@@ -135,18 +138,19 @@ fn spawn_engine_with_scan_seam(
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
     let state_clone = Arc::clone(&state);
+    let (event_tx, event_rx) = mpsc::channel();
     let handle = std::thread::Builder::new()
         .name("gui-engine-seams-test".into())
         .spawn(move || {
-            let (event_tx, _event_rx) = mpsc::channel();
             let seams = EngineSeams {
                 ffmpeg_caps: Box::new(fake_probe),
                 scan_cards,
+                ..EngineSeams::default()
             };
             engine_main_with_seams(rx, state_clone, false, event_tx, seams);
         })
         .expect("failed to spawn engine thread");
-    TestEngine { tx, state, handle }
+    TestEngine { tx, state, handle, event_rx }
 }
 
 /// Build a one-card seam whose files live in `mount_dir`.
@@ -1077,4 +1081,164 @@ fn test_set_device_bogus_id_does_not_stick() {
             "on a deviceless host there is nothing to revert/fall back to"
         );
     }
+}
+
+// ── Recovery ladder (WP-2.1 event-injection seam) ─────────────────────────
+//
+// The ladder's branch logic is unit-tested as the pure `recovery_action`
+// decision table in engine.rs. These tests drive the real engine loop with
+// injected `AudioEvent`s through `EngineSeams.audio_events` and pin the
+// published side effects with typed assertions only: the soft ladder counts
+// up to MAX_RECOVERY_ATTEMPTS and then exhausts, `StreamDead` hard-resets
+// without consuming a soft attempt, and every event is forwarded to the
+// GUI event channel.
+
+type EventQueue = Arc<std::sync::Mutex<std::collections::VecDeque<AudioEvent>>>;
+
+/// Spawn the engine with an injectable audio-event queue. Events pushed to
+/// the queue are drained by the engine once per tick, exactly like
+/// AudioCore's own event queue.
+fn spawn_engine_with_event_seam(queue: EventQueue) -> TestEngine {
+    init_test_config();
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+    let (event_tx, event_rx) = mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-event-seam-test".into())
+        .spawn(move || {
+            let seams = EngineSeams {
+                ffmpeg_caps: Box::new(fake_probe),
+                audio_events: Box::new(move |_core| queue.lock().unwrap().drain(..).collect()),
+                ..EngineSeams::default()
+            };
+            engine_main_with_seams(rx, state_clone, false, event_tx, seams);
+        })
+        .expect("failed to spawn engine thread");
+    TestEngine { tx, state, handle, event_rx }
+}
+
+/// Mirrors `MAX_RECOVERY_ATTEMPTS` in engine.rs (kept private there).
+const MAX_SOFT_RECOVERY_ATTEMPTS: u8 = 3;
+
+/// Force `ensure_audio_init` to fail deterministically on every host: no
+/// audio device supports a 1 Hz sample rate, so `attempt_recovery` never
+/// succeeds and never resets the counter through a successful re-init.
+/// Without this, audio-equipped dev machines would succeed and reset the
+/// counter to 0, making the ladder's published counter environment-dependent.
+fn force_init_failure(eng: &TestEngine) {
+    eng.tx.send(GuiCommand::SetSampleRate(1)).unwrap();
+}
+
+/// Poll the engine→GUI event channel until a `RecoveryNeeded` arrives.
+fn wait_for_forwarded_recovery_needed(eng: &TestEngine, what: &str) {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        match eng.event_rx.recv_timeout(POLL_INTERVAL) {
+            Ok(e) => {
+                assert!(
+                    matches!(e, AudioEvent::RecoveryNeeded { .. }),
+                    "unexpected event forwarded to the GUI channel"
+                );
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+            Err(e) => panic!("timeout waiting for {what}: {e}"),
+        }
+    }
+}
+
+#[test]
+fn test_recovery_needed_event_increments_published_counter() {
+    let queue: EventQueue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let eng = spawn_engine_with_event_seam(Arc::clone(&queue));
+    force_init_failure(&eng);
+
+    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded { reason: "seam test".to_string() });
+
+    let snap = wait_for_snapshot(
+        &eng.state,
+        "published recovery counter to reach 1",
+        |s| s.audio_recovery_attempts == 1,
+    );
+    assert_eq!(snap.audio_recovery_attempts, 1);
+
+    // The event must also be forwarded to the GUI event channel.
+    wait_for_forwarded_recovery_needed(&eng, "the injected RecoveryNeeded to be forwarded");
+
+    eng.shutdown();
+}
+
+#[test]
+fn test_recovery_attempts_exhaust_at_max() {
+    let queue: EventQueue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let eng = spawn_engine_with_event_seam(Arc::clone(&queue));
+    force_init_failure(&eng);
+
+    // MAX + 1 soft events: the first MAX count up, the last one exhausts.
+    {
+        let mut q = queue.lock().unwrap();
+        for _ in 0..=MAX_SOFT_RECOVERY_ATTEMPTS {
+            q.push_back(AudioEvent::RecoveryNeeded { reason: "exhaust".to_string() });
+        }
+    }
+
+    let snap = wait_for_snapshot(
+        &eng.state,
+        "recovery counter to reach MAX",
+        |s| s.audio_recovery_attempts == MAX_SOFT_RECOVERY_ATTEMPTS,
+    );
+    assert_eq!(snap.audio_recovery_attempts, MAX_SOFT_RECOVERY_ATTEMPTS);
+
+    // One more event: the exhausted branch must consume it (forward it to
+    // the GUI), freeze the counter at MAX, and stop playback.
+    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded { reason: "past max".to_string() });
+    wait_for_forwarded_recovery_needed(&eng, "the past-max RecoveryNeeded to be forwarded");
+    // Ack marker: a command sent after the past-max event is processed in a
+    // strictly later tick, so satisfying this predicate proves the snapshot
+    // postdates the past-max event's tick.
+    eng.tx.send(GuiCommand::SetFpsIndex(2)).unwrap();
+    let snap = wait_for_snapshot(
+        &eng.state,
+        "counter frozen at MAX with playback stopped after exhaustion",
+        |s| s.applied_command_seq >= 1 && s.fps_index == 2
+            && s.audio_recovery_attempts == MAX_SOFT_RECOVERY_ATTEMPTS
+            && !s.is_playing,
+    );
+    assert_eq!(snap.audio_recovery_attempts, MAX_SOFT_RECOVERY_ATTEMPTS);
+    assert!(!snap.is_playing, "the exhausted branch must stop playback");
+
+    eng.shutdown();
+}
+
+#[test]
+fn test_stream_dead_hard_reset_does_not_bump_counter() {
+    let queue: EventQueue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let eng = spawn_engine_with_event_seam(Arc::clone(&queue));
+    force_init_failure(&eng);
+
+    queue.lock().unwrap().push_back(AudioEvent::StreamDead);
+    // Ack marker: proves the StreamDead event was processed (commands drain
+    // before events within a tick, so the ack snapshot postdates the event).
+    eng.tx.send(GuiCommand::SetFpsIndex(2)).unwrap();
+    let snap = wait_for_snapshot(
+        &eng.state,
+        "the ack marker after StreamDead",
+        |s| s.applied_command_seq >= 1 && s.fps_index == 2,
+    );
+    assert_eq!(
+        snap.audio_recovery_attempts, 0,
+        "the hard-reset path must never consume a soft attempt"
+    );
+
+    // A following soft event counts from 1 — proving the two paths differ.
+    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded { reason: "after hard reset".to_string() });
+    let snap = wait_for_snapshot(
+        &eng.state,
+        "counter to count from 1 after the hard reset",
+        |s| s.audio_recovery_attempts == 1,
+    );
+    assert_eq!(snap.audio_recovery_attempts, 1);
+
+    eng.shutdown();
 }
