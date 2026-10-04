@@ -37,7 +37,14 @@ GATE="LTC gate"
 # Expressed the way the API wants it (a condition FAILS when op holds):
 # coverage fails when below 80% (LT 80); ratings fail when worse than A
 # (GT 1) — i.e. coverage > 80% and rating A on new code.
-CONDITIONS=("new_coverage:LT:80" "new_reliability_rating:GT:1" "new_security_rating:GT:1" "new_maintainability_rating:GT:1")
+GATE_CONDITIONS=("new_coverage:LT:80" "new_reliability_rating:GT:1" "new_security_rating:GT:1" "new_maintainability_rating:GT:1")
+# Overall-code conditions (Phase 4, decision D2): added to the LTC gate
+# definition for future-proofing, but NOT checked in the 403 fallback
+# below — the assigned built-in "Sonar way" gate has no overall-code
+# conditions.  They are enforced on every main push by the CI step
+# `scripts/sonar-overall-gate.sh` instead (which also explains why
+# overall coverage is excluded: see the script header / plan decision D2).
+OVERALL_CONDITIONS=("reliability_rating:GT:1" "security_rating:GT:1" "maintainability_rating:GT:1" "duplicated_lines_density:GT:3" "security_hotspots_reviewed:LT:100")
 
 api_get() { # path → body on stdout, non-zero exit on HTTP error
   local path="$1"
@@ -75,7 +82,7 @@ fi
 
 # 2. Ensure every condition is present (matched by metric+op+error).
 shown="$(api_get "qualitygates/show?${ORGQ}&name=$(jq -rn --arg n "$GATE" '$n|@uri')")"
-for c in "${CONDITIONS[@]}"; do
+for c in "${GATE_CONDITIONS[@]}" "${OVERALL_CONDITIONS[@]}"; do
   metric="${c%%:*}"; rest="${c#*:}"; op="${rest%%:*}"; error="${rest##*:}"
   present="$(jq -r --arg m "$metric" --arg o "$op" --arg e "$error" \
     '[.conditions[] | select(.metric == $m and .op == $o and ((.error|tostring) == $e))] | length > 0' \
@@ -112,7 +119,10 @@ else
   fi
   assigned_show="$(api_get "qualitygates/show?${ORGQ}&name=$(jq -rn --arg n "$assigned" '$n|@uri')")"
   missing=""
-  for c in "${CONDITIONS[@]}"; do
+  # Only the new-code conditions are fallback-checked: "Sonar way" carries
+  # no overall-code conditions at all — those are enforced by the CI step
+  # scripts/sonar-overall-gate.sh (see OVERALL_CONDITIONS above).
+  for c in "${GATE_CONDITIONS[@]}"; do
     metric="${c%%:*}"
     if ! jq -e -r --arg m "$metric" '[.conditions[].metric] | index($m) != null' <<<"$assigned_show" >/dev/null; then
       missing="${missing:+$missing, }${metric}"
@@ -122,7 +132,8 @@ else
     echo "error: assigned gate \"${assigned}\" is missing conditions for: ${missing}" >&2
     exit 1
   fi
-  echo "warning: proceeding with the assigned built-in gate \"${assigned}\" — it covers all four metrics"
+  echo "warning: proceeding with the assigned built-in gate \"${assigned}\" — it covers all new-code metrics"
+  echo "warning: overall-code conditions (ratings A, duplication < 3%, hotspots 100% reviewed) are CI-enforced by scripts/sonar-overall-gate.sh, not by the assigned gate"
 fi
 
 # 4. Print the final assigned gate definition verbatim.

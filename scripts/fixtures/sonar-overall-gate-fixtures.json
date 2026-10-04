@@ -1,0 +1,100 @@
+{
+  "cases": [
+    {
+      "name": "all-clear",
+      "measures": {
+        "reliability_rating": "1.0",
+        "security_rating": "1.0",
+        "maintainability_rating": "1.0",
+        "duplicated_lines_density": "1.6",
+        "security_hotspots_reviewed": "100.0"
+      },
+      "thresholds": {},
+      "expected_violations": []
+    },
+    {
+      "name": "server-string-measures",
+      "measures": {
+        "reliability_rating": "1.0",
+        "security_rating": "1.0",
+        "sqale_rating": "1.0",
+        "duplicated_lines_density": "3.0",
+        "security_hotspots_reviewed": "100.0"
+      },
+      "thresholds": {"use_sqale_fallback": true},
+      "expected_violations": []
+    },
+    {
+      "name": "rating-regressions",
+      "measures": {
+        "reliability_rating": "2.0",
+        "security_rating": "1.0",
+        "maintainability_rating": "3.0",
+        "duplicated_lines_density": "1.6",
+        "security_hotspots_reviewed": "100.0"
+      },
+      "thresholds": {},
+      "expected_violations": [
+        "reliability_rating 2.0 is worse than A (max 1)",
+        "maintainability_rating 3.0 is worse than A (max 1)"
+      ]
+    },
+    {
+      "name": "duplication-and-hotspots",
+      "measures": {
+        "reliability_rating": "1.0",
+        "security_rating": "1.0",
+        "maintainability_rating": "1.0",
+        "duplicated_lines_density": "4.2",
+        "security_hotspots_reviewed": "80.0"
+      },
+      "thresholds": {},
+      "expected_violations": [
+        "duplicated_lines_density 4.2% exceeds 3%",
+        "security_hotspots_reviewed 80.0% below 100%"
+      ]
+    },
+    {
+      "name": "optional-coverage-violated",
+      "measures": {
+        "reliability_rating": "1.0",
+        "security_rating": "1.0",
+        "maintainability_rating": "1.0",
+        "duplicated_lines_density": "1.6",
+        "security_hotspots_reviewed": "100.0",
+        "coverage": "55.0"
+      },
+      "thresholds": {"coverage_lt": 80},
+      "expected_violations": ["coverage 55.0% below 80%"]
+    },
+    {
+      "name": "optional-coverage-off-by-default",
+      "measures": {
+        "reliability_rating": "1.0",
+        "security_rating": "1.0",
+        "maintainability_rating": "1.0",
+        "duplicated_lines_density": "1.6",
+        "security_hotspots_reviewed": "100.0"
+      },
+      "thresholds": {},
+      "expected_violations": []
+    },
+    {
+      "name": "threshold-overrides-relax",
+      "measures": {
+        "reliability_rating": "2.0",
+        "security_rating": "1.0",
+        "maintainability_rating": "2.0",
+        "duplicated_lines_density": "4.2",
+        "security_hotspots_reviewed": "90.0"
+      },
+      "thresholds": {
+        "max_reliability_rating": 2,
+        "max_maintainability_rating": 2,
+        "max_duplication": 5,
+        "min_hotspots_reviewed": 90
+      },
+      "expected_violations": []
+    }
+  ]
+}

@@ -74,6 +74,17 @@ jobs:
         with:
           args: -Dsonar.qualitygate.wait=true
 
+      - name: Overall-code quality gate (ratings A, duplication < 3%, hotspots 100% reviewed)
+        # Overall-code conditions cannot ride the assigned built-in gate
+        # (custom-gate assignment 403s on this plan, and "Sonar way" is
+        # new-code only).  This CI step is the overall-code enforcement:
+        # it queries the project-level measures after the scan and fails
+        # the job on any violation.  Main-branch invariant — PR analyses
+        # already enforce new code via qualitygate.wait above.
+        # Reverting to new-code-only enforcement = delete this step.
+        if: ${{ github.ref == 'refs/heads/main' && env.SONAR_TOKEN != '' }}
+        run: bash scripts/sonar-overall-gate.sh
+
   # Compile-check the Windows-only cfg blocks (offload win_driver, subprocess
   # console suppression) that the Linux job never builds. Check-only: no
   # link, no tests — a full windows-latest test job is follow-up F-3/F-4 in
