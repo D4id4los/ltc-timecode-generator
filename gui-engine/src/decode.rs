@@ -195,6 +195,49 @@ pub fn decode_wav_file(
     }
 }
 
+/// Shared WAV-decode dispatch core (WP-2.2): the single-pass-vs-chunked
+/// decision lives here exactly once, exercised by both the CLI and the
+/// engine job.
+#[derive(Clone, Copy, Debug)]
+pub struct WavDecodeParams {
+    pub use_libltc: bool,
+    /// Force the non-chunked decoder regardless of file size.
+    pub single_pass: bool,
+    pub decode_fps: f64,
+    pub decode_drop_frame: bool,
+}
+
+#[derive(Debug)]
+pub struct WavDecodeOutcome {
+    pub result: LtcDetectionResult,
+    /// The chunk count that drove the dispatch decision (1 for the
+    /// single-pass path).
+    pub chunk_count: usize,
+}
+
+/// The dispatch decision, extracted for lowest-layer unit testing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WavDispatch {
+    SinglePass,
+    Chunked(usize),
+}
+
+// TDD stub: dispatch decision not yet implemented (WP-2.2 red phase).
+fn wav_dispatch_decision(_single_pass: bool, _known: Option<usize>, _counted: usize) -> WavDispatch {
+    WavDispatch::SinglePass
+}
+
+// TDD stub: dispatch core not yet implemented (WP-2.2 red phase).
+pub fn decode_wav_core(
+    _path: &Path,
+    _params: WavDecodeParams,
+    _known_chunk_count: Option<usize>,
+    _cancel: Option<&Arc<AtomicBool>>,
+    _progress: Option<&DecodeProgress>,
+) -> Result<WavDecodeOutcome, LtcDecodeError> {
+    Err(LtcDecodeError::Failed("decode_wav_core not implemented".to_string()))
+}
+
 /// Probe → validate → extract → decode, the shared CLI/GUI front door.
 ///
 /// `stream_pos` is the 0-based *position* among the audio streams (the CLI
@@ -317,6 +360,132 @@ mod tests {
             assert_eq!(p.extension().and_then(|e| e.to_str()), Some("wav"));
             assert!(names.insert(p), "temp WAV path collision at iteration {}", i);
         }
+    }
+
+    // ── WAV decode dispatch core (WP-2.2) ────────────────────────────────
+
+    fn test_params(single_pass: bool) -> WavDecodeParams {
+        WavDecodeParams {
+            use_libltc: false,
+            single_pass,
+            decode_fps: 25.0,
+            decode_drop_frame: false,
+        }
+    }
+
+    #[test]
+    fn test_wav_dispatch_decision_table() {
+        // Forced single-pass wins over any count.
+        assert_eq!(wav_dispatch_decision(true, Some(9), 9), WavDispatch::SinglePass);
+        assert_eq!(wav_dispatch_decision(true, None, 4), WavDispatch::SinglePass);
+        // Known counts drive the decision.
+        assert_eq!(wav_dispatch_decision(false, Some(1), 9), WavDispatch::SinglePass);
+        assert_eq!(wav_dispatch_decision(false, Some(0), 9), WavDispatch::SinglePass);
+        assert_eq!(wav_dispatch_decision(false, Some(3), 9), WavDispatch::Chunked(3));
+        // No known count: fall back to the counted value.
+        assert_eq!(wav_dispatch_decision(false, None, 1), WavDispatch::SinglePass);
+        assert_eq!(wav_dispatch_decision(false, None, 4), WavDispatch::Chunked(4));
+    }
+
+    /// Write a small real LTC WAV via the CLI generator (in-module, so no
+    /// engine/config test setup is needed).
+    fn make_ltc_wav(path: &Path, seconds: f64) {
+        let cli = crate::cli::Cli {
+            output_to_file: Some(path.to_string_lossy().to_string()),
+            duration: Some(seconds),
+            fps: 25.0,
+            start_timecode: "01:00:00:00".to_string(),
+            channel: "left".to_string(),
+            volume: 0.5,
+            sample_rate: Some(48000),
+            list_devices: false,
+            headless: false,
+            device: None,
+            device_index: None,
+            drop_frame: false,
+            verbose: false,
+            debug: false,
+            decode: None,
+            audio_stream: 0,
+            audio_channel: 0,
+            decoder: "builtin".to_string(),
+            decode_fps: 25.0,
+            decode_drop_frame: false,
+            single_pass: false,
+            context_frames: 3,
+            list_timecodes: false,
+            autostart: false,
+        };
+        crate::cli::generate_wav(cli).expect("WAV generation failed");
+    }
+
+    #[test]
+    fn test_wav_core_decodes_synthetic_ltc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("small.wav");
+        make_ltc_wav(&wav, 0.5);
+
+        let outcome = decode_wav_core(&wav, test_params(false), None, None, None)
+            .expect("small single-chunk WAV must decode");
+        assert_eq!(outcome.chunk_count, 1);
+        assert!(
+            outcome.result.valid_frames >= 1,
+            "synthetic LTC must decode at least one frame (got {})",
+            outcome.result.valid_frames
+        );
+    }
+
+    #[test]
+    fn test_wav_core_forced_chunked_path_succeeds_on_small_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("small.wav");
+        make_ltc_wav(&wav, 0.5);
+
+        // known_chunk_count = Some(3) forces the chunked branch on a file
+        // that would normally dispatch single-pass; decode_ltc_chunked
+        // re-plans internally from the real file, so the result must not be
+        // corrupted by the forced count.
+        let outcome = decode_wav_core(&wav, test_params(false), Some(3), None, None)
+            .expect("forced-chunked decode of a small WAV must succeed");
+        assert_eq!(outcome.chunk_count, 3);
+        assert!(
+            outcome.result.valid_frames >= 1,
+            "forced-chunked decode must still find the LTC frames (got {})",
+            outcome.result.valid_frames
+        );
+    }
+
+    #[test]
+    fn test_wav_core_cancelled_single_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("small.wav");
+        make_ltc_wav(&wav, 0.5);
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = decode_wav_core(&wav, test_params(false), None, Some(&cancel), None)
+            .expect_err("pre-set cancel must abort the single-pass decode");
+        assert!(matches!(err, LtcDecodeError::Cancelled));
+    }
+
+    #[test]
+    fn test_wav_core_cancelled_chunked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("small.wav");
+        make_ltc_wav(&wav, 0.5);
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = decode_wav_core(&wav, test_params(false), Some(3), Some(&cancel), None)
+            .expect_err("pre-set cancel must abort the chunked decode");
+        assert!(matches!(err, LtcDecodeError::Cancelled));
+    }
+
+    #[test]
+    fn test_wav_core_missing_file_is_typed_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("does-not-exist.wav");
+        let err = decode_wav_core(&wav, test_params(false), None, None, None)
+            .expect_err("a missing file must be a typed decode error");
+        assert!(matches!(err, LtcDecodeError::Failed(_)));
     }
 
     #[test]
