@@ -1,6 +1,17 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased
+
+The clapper-board animation now plays smoothly on both desktop apps:
+the clap flash and the slate arm used to be stepped by the engine's
+25 fps background tick, so they could only ever move that fast no
+matter how often the window repainted. The engine now simply announces
+each clap, and each app animates the flash and arm at its own full
+frame rate. Clap behaviour itself — beep, log entry, take numbering —
+is unchanged.
+
+
 * v0.5.0
 
 Main features are a workspace-wide quality campaign: the engine and
