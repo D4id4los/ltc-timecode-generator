@@ -2547,7 +2547,7 @@ mod tests {
         els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
         on_conversion_finished(
             &mut els,
-            JobOutcome::Failed { error: "boom".into(), log: String::new() },
+            JobOutcome::Failed { error: "boom".into(), log: String::new(), panicked: false },
             JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
         );
         assert_eq!(els.current.job(JobKind::Conversion).error.as_deref(), Some("boom"));
@@ -2613,7 +2613,7 @@ mod tests {
         els.current.decode.result = Some(make_ltc_result());
         on_ltc_decode_finished(
             &mut els,
-            job::JobOutcome::Failed { error: "boom".into(), log: String::new() },
+            job::JobOutcome::Failed { error: "boom".into(), log: String::new(), panicked: false },
             job::JobFinal::Decode {
                 result: Err(LtcDecodeError::Failed("x".into())),
                 path: PathBuf::from("/tmp/x.wav"),

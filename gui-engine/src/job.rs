@@ -377,7 +377,7 @@ impl JobStatus {
                     self.progress.log = log.clone();
                 }
             }
-            JobOutcome::Failed { error, log } => {
+            JobOutcome::Failed { error, log, .. } => {
                 self.progress.phase = JobPhase::Failed;
                 self.error = Some(error.clone());
                 if !log.is_empty() {
@@ -481,7 +481,10 @@ pub fn probe_status_label(probe_active: bool, probe_is_none: bool) -> ProbeStatu
 pub enum JobOutcome {
     Succeeded { log: String },
     Cancelled { log: String },
-    Failed { error: String, log: String },
+    /// `panicked` distinguishes a worker panic (catch_unwind conversion)
+    /// from a worker that returned `Err(JobError::Failed)` — a typed fact
+    /// that must not be recovered from the error text.
+    Failed { error: String, log: String, panicked: bool },
 }
 
 // ── Payload enums ───────────────────────────────────────────────────────
@@ -758,6 +761,7 @@ where
                 Ok(Err(JobError::Failed(msg))) => (JobOutcome::Failed {
                     error: msg,
                     log: String::new(),
+                    panicked: false,
                 }, JobFinal::NoPayload),
                 Err(panic) => {
                     let msg = panic_message(&panic);
@@ -765,6 +769,7 @@ where
                     (JobOutcome::Failed {
                         error: format!("internal error (panic in {})", job_name),
                         log: msg,
+                        panicked: true,
                     }, JobFinal::NoPayload)
                 }
             };
@@ -1074,12 +1079,8 @@ mod tests {
         assert!(finished.is_some(), "expected a Finished event");
         if let Some(JobEvent::Finished { outcome, .. }) = finished {
             match outcome {
-                JobOutcome::Failed { error, .. } => {
-                    assert!(
-                        error.contains("panic"),
-                        "expected panic in error, got: {}",
-                        error
-                    );
+                JobOutcome::Failed { panicked, .. } => {
+                    assert!(panicked, "expected a panic-converted failure");
                 }
                 other => panic!("expected Failed, got {:?}", other),
             }
