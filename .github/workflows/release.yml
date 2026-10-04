@@ -97,18 +97,22 @@ jobs:
       # own (old) libasound, and the objdump step below verifies our
       # binary's direct symbol floor.
       RUSTFLAGS: -L native=${{ github.workspace }}/libltc-prefix/lib -C link-arg=-Wl,--allow-shlib-undefined
-      # zigbuild passes TARGET=x86_64-unknown-linux-gnu.2.31, so bindgen's
-      # target-specific lookup carries a .2.31 suffix and misses the plain
-      # triple var — the plain var is the one that reliably reaches bindgen.
-      BINDGEN_EXTRA_CLANG_ARGS: -I${{ github.workspace }}/libltc-prefix/include
-      BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu: -I${{ github.workspace }}/libltc-prefix/include
     steps:
       - uses: actions/checkout@v5
 
       - name: Install system dependencies (build-test-analyze set minus libltc-dev)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libclang-dev autoconf automake libtool
+          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libclang-dev clang autoconf automake libtool
+
+      - name: Pin libclang for bindgen (libdir + clang resource include)
+        # Without a pinned LIBCLANG_PATH the runner's multi-LLVM layout can
+        # leave bindgen with a libclang whose builtin headers (stdbool.h…)
+        # are not found (observed as libspa-sys build failure).
+        run: |
+          RES=$(clang -print-resource-dir)
+          echo "LIBCLANG_PATH=${RES%/lib/clang/*}/lib" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$RES/include -I$GITHUB_WORKSPACE/libltc-prefix/include" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain (stable, gnu target)
         uses: dtolnay/rust-toolchain@stable
@@ -183,12 +187,20 @@ jobs:
     runs-on: windows-latest
     env:
       LIBLTC_PREFIX: ${{ github.workspace }}/libltc-prefix
-      BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu: -I${{ github.workspace }}/libltc-prefix/include
       RUSTFLAGS: -L native=${{ github.workspace }}/libltc-prefix/lib
       # windows-latest images ship LLVM (libclang.dll for bindgen).
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
     steps:
       - uses: actions/checkout@v5
+
+      - name: Configure bindgen include path (forward slashes)
+        # bindgen splits BINDGEN_EXTRA_CLANG_ARGS with a POSIX shell-word
+        # lexer, which strips backslashes — a `-ID:\a\...\include` value
+        # mangles into `-ID:altc...` and ltc.h is never found. Forward
+        # slashes keep the path intact.
+        run: |
+          $inc = "${{ github.workspace }}/libltc-prefix/include" -replace '\\','/'
+          "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu=-I$inc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Rust toolchain (stable, windows-gnu target)
         uses: dtolnay/rust-toolchain@stable
