@@ -535,6 +535,22 @@ In-module `#[cfg(test)]` unit tests cover offload (46 tests), naming (38), durat
 
 Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 
+## Error-Handling Policy
+
+Normative rules for error types and `Result<_, String>` (G6, 2026-10; full
+inventory and rationale live in the local `reports/error-boundary-policy-*.md` —
+this section deliberately carries no inventories):
+
+- **R1 — Typed at decision points.** Any error the code branches on (retry/fallback classification, cancel-vs-fail, readiness gating, step orchestration) is an enum with matchable variants. Exemplar: `StepFailure` (`converter/process.rs`).
+- **R2 — Cancellation is a variant, not an error string.** Every cancellable subsystem carries a `Cancelled` variant whose doc comment states callers must not surface it as an error; typed cancellation never round-trips through string matching. Exemplar: `JobError::Cancelled` (`job.rs`).
+- **R3 — `String` at display boundaries is the contract, not a smell.** Snapshot error fields, `JobStatus`/`JobOutcome` error strings, toast messages, and CLI stderr are display surfaces: the last writer stringifies, exactly once, via `Display`; do not re-type or re-parse them (no sentinel-string matching on anything typed underneath). Exemplar: `JobOutcome::Failed { error: String, .. }` (`job.rs`).
+- **R4 — Migration style: hand-rolled enum + manual `Display`.** When replacing a former `Result<_, String>` public API, `Display` renders byte-identical legacy strings and the doc comment records the contract; deviations are allowed only for consumer-less error paths and must be stated in the variant's doc comment. Exemplar: `CliError::ListDevices` (`cli.rs`).
+- **R5 — `std::error::Error` impl on demand, not by default.** Implement it when the type propagates via `?` into `Box<dyn Error>`/anyhow-like contexts or is public-API facing; `Display` alone suffices for internal match-only types. Existing impls stay. Exemplar: `TagError` (`tagger.rs`).
+- **R6 — Leaf-IO `String` errors: tolerated, typed when touched.** Leaf-IO helpers currently returning `Result<_, String>` are standing debt; type them per R1 when their module is next touched — no sweep scheduled, no permanent exemption. Exemplar: `wav_chunk_reader.rs` (wrapped via `map_err(LtcDecodeError::Failed)` in `chunked_decode.rs`).
+- **R7 — No new production `Result<_, String>` in public APIs.** New code classifies at the boundary per R1/R3. Enforcement is review discipline, not a lint.
+- **R8 — Classification of remaining sites: stay vs type-if-touched.** Display-bound sites (e.g. the `AudioCore` `Result<_, String>` family in `audio_output.rs`) stay; sites inconsistent with their own subsystem's typed siblings (e.g. `tag_mp4_tmcd`/`tag_wav_bext` in `tagger.rs`, `verify_copy` in `offload.rs`) are typed when the module is next touched.
+- **R9 — `thiserror`: not adopted.** The house pattern renders contractual hand-tuned `Display` prose (R4), which defeats derived `Display`; the type count is stable. Revisit only if a single future phase adds >5 new error types.
+
 ## Planning & Analysis
 
 - Place any analysis reports or the like in `reports/` (local dir, not commited)
