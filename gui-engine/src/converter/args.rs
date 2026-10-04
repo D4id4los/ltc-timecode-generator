@@ -683,6 +683,137 @@ mod tests {
         assert!(args_str.contains("0:a?"));
     }
 
+    // ── build_video_mux_args: ChannelsExcept arm ──────────────────────
+
+    /// ffmpeg arg vectors are legitimate string contracts (AGENTS.md).
+    fn map_operand(args: &[String], occurrence: usize) -> &str {
+        let mut seen = 0;
+        for (i, a) in args.iter().enumerate() {
+            if a == "-map" {
+                if seen == occurrence {
+                    return &args[i + 1];
+                }
+                seen += 1;
+            }
+        }
+        panic!("no -map occurrence {occurrence}");
+    }
+
+    #[test]
+    fn test_build_video_mux_channels_except_single_survivor_mono_pan() {
+        let s = make_video_settings();
+        // Stream 0 with 2 channels; dropping channel 0 leaves one survivor
+        // → mono pan filter.
+        let probe = make_probe(0, 2, 48000);
+        let args = build_video_mux_args(&s, 0, &AudioKeep::ChannelsExcept(vec![(0, 0)]), &probe);
+        assert!(args.contains(&"-filter_complex".to_string()));
+        assert!(args.contains(&"[0:0]pan=mono|FC=c1[a0]".to_string()));
+        assert_eq!(map_operand(&args, 1), "[a0]", "audio maps from the filter label");
+        assert!(args.contains(&"pcm_s24le".to_string()), "re-encoded with the audio encoder");
+    }
+
+    #[test]
+    fn test_build_video_mux_channels_except_multiple_survivors_pan_layout() {
+        let s = make_video_settings();
+        // Dropping channel 0 of 3 leaves survivors [1, 2] → stereo pan
+        // with channels remapped in surviving order.
+        let probe = make_probe(0, 3, 48000);
+        let args = build_video_mux_args(&s, 0, &AudioKeep::ChannelsExcept(vec![(0, 0)]), &probe);
+        assert!(args.contains(&"[0:0]pan=stereo|c0=1|c1=2[a0]".to_string()));
+    }
+
+    #[test]
+    fn test_build_video_mux_channels_except_nothing_surviving_is_an() {
+        let s = make_video_settings();
+        let probe = make_probe(0, 2, 48000);
+        let args = build_video_mux_args(
+            &s,
+            0,
+            &AudioKeep::ChannelsExcept(vec![(0, 0), (0, 1)]),
+            &probe,
+        );
+        assert!(args.contains(&"-an".to_string()));
+        assert!(!args.contains(&"-filter_complex".to_string()));
+        assert!(!args.iter().any(|a| a == "0:a?" || a.starts_with("[a")), "no audio maps");
+    }
+
+    #[test]
+    fn test_build_video_mux_channels_except_untouched_stream_maps_directly() {
+        let s = make_video_settings();
+        // Drop a channel that does not exist: stream 0 keeps all channels
+        // → mapped directly as "0:0" with no filter.
+        let probe = make_probe(0, 2, 48000);
+        let args = build_video_mux_args(&s, 0, &AudioKeep::ChannelsExcept(vec![(0, 9)]), &probe);
+        assert!(!args.contains(&"-filter_complex".to_string()));
+        assert_eq!(map_operand(&args, 1), "0:0");
+    }
+
+    #[test]
+    fn test_build_video_mux_channels_except_mixed_streams() {
+        let s = make_video_settings();
+        // Two streams: stream 0 loses channel 0 (filter), stream 1 untouched
+        // (direct map). Labels appear in stream order.
+        let probe = VideoAudioProbe {
+            streams: vec![
+                crate::ffprobe::AudioStreamInfo {
+                    stream_index: 0,
+                    channels: 2,
+                    codec_name: "pcm_s24le".to_string(),
+                    sample_rate: 48000,
+                },
+                crate::ffprobe::AudioStreamInfo {
+                    stream_index: 1,
+                    channels: 2,
+                    codec_name: "pcm_s24le".to_string(),
+                    sample_rate: 48000,
+                },
+            ],
+            total_audio_channels: 4,
+            is_video_file: true,
+        };
+        let args = build_video_mux_args(&s, 0, &AudioKeep::ChannelsExcept(vec![(0, 0)]), &probe);
+        assert!(args.contains(&"[0:0]pan=mono|FC=c1[a0]".to_string()));
+        assert_eq!(map_operand(&args, 1), "[a0]", "filtered stream first");
+        assert_eq!(map_operand(&args, 2), "0:1", "untouched stream mapped directly");
+    }
+
+    // ── build_video_mux_args: Reordered arm ───────────────────────────
+
+    #[test]
+    fn test_build_video_mux_reordered_pan_and_amerge() {
+        let s = make_video_settings();
+        let probe = make_probe(0, 2, 48000);
+        let args = build_video_mux_args(
+            &s,
+            0,
+            &AudioKeep::Reordered(vec![(0, 1), (0, 0)]),
+            &probe,
+        );
+        assert!(args.contains(
+            &"[0:0]pan=mono|FC=c1[a0];[0:0]pan=mono|FC=c0[a1];[a0][a1]amerge=inputs=2[out]"
+                .to_string()
+        ));
+        assert_eq!(map_operand(&args, 1), "[out]");
+        assert!(args.contains(&"pcm_s24le".to_string()));
+    }
+
+    #[test]
+    fn test_build_video_mux_reordered_four_inputs() {
+        let s = make_video_settings();
+        let probe = make_probe(0, 4, 48000);
+        let args = build_video_mux_args(
+            &s,
+            0,
+            &AudioKeep::Reordered(vec![(0, 3), (0, 2), (0, 1), (0, 0)]),
+            &probe,
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("amerge=inputs=4"), "one merged output per pair");
+        assert!(joined.contains("FC=c3"));
+        assert!(joined.contains("FC=c0"));
+        assert_eq!(map_operand(&args, 1), "[out]");
+    }
+
     #[test]
     fn test_build_video_track_extract_args_wav() {
         let s = make_video_settings();
