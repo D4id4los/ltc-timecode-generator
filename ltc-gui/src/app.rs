@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, RichText, Sense, Ui};
+use crate::theme::ThemeColors;
 use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::config;
 use gui_engine::state::AppStateSnapshot;
@@ -577,40 +578,56 @@ fn transport_button(
     ui.add(btn).clicked()
 }
 
+/// Start/Stop button: green while stopped, red while playing. Gated by the
+/// lock guard like every transport action.
+fn render_start_stop(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, btn_w: f32) {
+    if s.is_playing {
+        if transport_button(ui, btn_w, RichText::new("■ STOP").strong().color(Color32::WHITE), Color32::from_rgb(0xDC, 0x26, 0x26))
+            && !s.is_locked
+        {
+            state.send(GuiCommand::StopLtc);
+        }
+    } else {
+        if transport_button(ui, btn_w, RichText::new("▶ START").strong().color(Color32::BLACK), Color32::from_rgb(0x22, 0xC5, 0x5E))
+            && !s.is_locked
+        {
+            state.send(GuiCommand::StartLtc);
+        }
+    }
+}
+
+/// Clap & beep button (lock-guarded).
+fn render_clap_button(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, btn_w: f32) {
+    if transport_button(ui, btn_w, RichText::new("CLAP & BEEP").strong().color(Color32::BLACK), ACCENT) && !s.is_locked {
+        state.send(GuiCommand::Clap);
+    }
+}
+
+/// Reset button (lock-guarded).
+fn render_reset_button(ui: &mut Ui, state: &mut AppState, colors: ThemeColors, s: &AppStateSnapshot, btn_w: f32) {
+    if transport_button(ui, btn_w, RichText::new("↺").strong().color(colors.text_title), colors.nested_bg) && !s.is_locked {
+        state.send(GuiCommand::Reset);
+    }
+}
+
+/// Lock toggle button (always clickable — it *is* the lock).
+fn render_lock_button(ui: &mut Ui, state: &mut AppState, colors: ThemeColors, s: &AppStateSnapshot, btn_w: f32) {
+    let lock_icon = if s.is_locked { "🔒" } else { "🔓" };
+    let lock_color = if s.is_locked { ACCENT } else { colors.text_muted };
+    if transport_button(ui, btn_w, RichText::new(lock_icon).color(lock_color), colors.nested_bg) {
+        state.send(GuiCommand::ToggleLock);
+    }
+}
+
 /// The Start/Stop · Clap · Reset · Lock row (egui-bound; sends commands).
 fn render_transport_buttons(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, btn_w: f32) {
+    let colors = state.theme.colors();
     centered_horizontal_row(ui, "transport_row", 400.0, |ui| {
         ui.horizontal(|ui| {
-            // Start / Stop
-            if s.is_playing {
-                if transport_button(ui, btn_w, RichText::new("■ STOP").strong().color(Color32::WHITE), Color32::from_rgb(0xDC, 0x26, 0x26))
-                    && !s.is_locked
-                {
-                    state.send(GuiCommand::StopLtc);
-                }
-            } else {
-                if transport_button(ui, btn_w, RichText::new("▶ START").strong().color(Color32::BLACK), Color32::from_rgb(0x22, 0xC5, 0x5E))
-                    && !s.is_locked
-                {
-                    state.send(GuiCommand::StartLtc);
-                }
-            }
-            // Clap
-            if transport_button(ui, btn_w, RichText::new("CLAP & BEEP").strong().color(Color32::BLACK), ACCENT) && !s.is_locked {
-                state.send(GuiCommand::Clap);
-            }
-            // Reset
-            let colors = state.theme.colors();
-            let (text_title, nested_bg, text_muted) = (colors.text_title, colors.nested_bg, colors.text_muted);
-            if transport_button(ui, btn_w, RichText::new("↺").strong().color(text_title), nested_bg) && !s.is_locked {
-                state.send(GuiCommand::Reset);
-            }
-            // Lock
-            let lock_icon = if s.is_locked { "🔒" } else { "🔓" };
-            let lock_color = if s.is_locked { ACCENT } else { text_muted };
-            if transport_button(ui, btn_w, RichText::new(lock_icon).color(lock_color), colors.nested_bg) {
-                state.send(GuiCommand::ToggleLock);
-            }
+            render_start_stop(ui, state, s, btn_w);
+            render_clap_button(ui, state, s, btn_w);
+            render_reset_button(ui, state, colors, s, btn_w);
+            render_lock_button(ui, state, colors, s, btn_w);
         });
     });
 }

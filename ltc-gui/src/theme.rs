@@ -73,6 +73,7 @@ impl Theme {
     }
 }
 
+#[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub struct ThemeColors {
     pub app_bg: Color32,
