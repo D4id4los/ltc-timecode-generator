@@ -54,6 +54,12 @@ jobs:
       - name: Clippy (JSON report for Sonar)
         run: cargo clippy --workspace --all-targets --message-format=json > clippy-report.json
 
+      - name: Clippy gate (-D warnings)
+        # Native enforcement: clippy findings reach Sonar only as external
+        # issues, which do not feed the LTC gate's ratings — warnings must
+        # red the build directly. Second invocation is ~free (warm cache).
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Rust tests (nextest, ci retry profile, coverage instrumentation)
         run: cargo llvm-cov nextest --workspace --profile ci
 
