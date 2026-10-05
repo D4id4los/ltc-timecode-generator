@@ -611,8 +611,6 @@ the lint is broken and must red rather than pass.
 
 In-module `#[cfg(test)]` unit tests cover offload (46 tests), naming (38), duration (20), device_name (14), and subprocess (11). `converter/test_fixtures.rs` provides shared fixtures for converter unit tests.
 
-Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
-
 ## Error-Handling Policy
 
 Normative rules for error types and `Result<_, String>` (G6, 2026-10; full
