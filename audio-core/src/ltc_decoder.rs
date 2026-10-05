@@ -181,6 +181,18 @@ const SYNC_OFFSET: usize = 64;
 
 /// Decode LTC from a pre-loaded buffer of mono f32 samples.
 /// This is the core decoding logic, extracted from `decode_ltc_from_wav`.
+/// Shared substrate of the decode strategy ladder (coarse scan → refinement
+/// → result assembly). Built once per decode pass.
+struct DecodeCtx<'a> {
+    samples: &'a [f32],
+    zc: &'a [usize],
+    sample_rate: u32,
+    threshold: f32,
+    fps: f64,
+    drop_frame: bool,
+    cancel: Option<&'a AtomicBool>,
+}
+
 fn decode_ltc_samples_inner(
     samples: &[f32],
     sample_rate: u32,
@@ -256,6 +268,15 @@ fn decode_ltc_samples_inner(
     // chain-inflated confidence must not skip the detailed decode path (its
     // sample-locked extraction decodes fade/noise regions the ZC bitstream
     // mangles).
+    let ctx = DecodeCtx {
+        samples,
+        zc: &zc,
+        sample_rate,
+        threshold,
+        fps,
+        drop_frame,
+        cancel,
+    };
     let zc_result = try_decode_via_zc_intervals(&zc, sample_rate, fps, drop_frame, samples.len());
     let zc_conf = zc_result.as_ref().map_or(0.0, |r| {
         if r.total_possible > 0 { r.grid_valid as f32 / r.total_possible as f32 } else { 0.0 }
@@ -269,19 +290,19 @@ fn decode_ltc_samples_inner(
 
     if zc_conf >= 0.70 {
         info!("LTC decode: ZC-interval grid confidence {:.1}% >= 70% -- using directly", zc_conf * 100.0);
-        return build_result(zc_result, &zc, samples, sample_rate, threshold, channels, total_duration, start);
+        return build_result(&ctx, zc_result, channels, total_duration, start);
     }
 
     // ── Sliding window search for SPB/phase ─────────────────────────────────
     // Evaluates 30s windows at 15s strides, using ZCs to skip silent regions.
     // First window with >=70% confidence -> single-pass extract_bits on full file.
-    let scan = scan_windows(samples, &zc, sample_rate, threshold, fps, drop_frame, cancel)?;
+    let scan = scan_windows(&ctx)?;
 
     match scan {
         WindowScan::HighConf { params, window_start } => {
             let decoded = decode_full_file(samples, &params, threshold, sample_rate, window_start, &zc, cancel);
             let final_r = prefer_zc_or_detailed(zc_result, Some(decoded), "detailed scan");
-            return build_result(final_r, &zc, samples, sample_rate, threshold, channels, total_duration, start);
+            return build_result(&ctx, final_r, channels, total_duration, start);
         }
         WindowScan::Best { params, window_start } => {
             let conf = params.valid_frames as f32 / params.total_possible.max(1) as f32;
@@ -289,16 +310,16 @@ fn decode_ltc_samples_inner(
                 conf * 100.0, params.valid_frames, params.spb, params.phase);
             let decoded = decode_full_file(samples, &params, threshold, sample_rate, window_start, &zc, cancel);
             let final_r = prefer_zc_or_detailed(zc_result, Some(decoded), "detailed scan");
-            return build_result(final_r, &zc, samples, sample_rate, threshold, channels, total_duration, start);
+            return build_result(&ctx, final_r, channels, total_duration, start);
         }
         WindowScan::NoCandidate => {}
     }
 
     // ── Fallback: full-file evaluate_on_slice (rare) ────────────────────────
     warn!("LTC decode: sliding window found no valid LTC -- full-file eval fallback");
-    let (fallback_result, _) = evaluate_on_slice(samples, &zc, sample_rate, threshold, fps, drop_frame, cancel);
+    let (fallback_result, _) = evaluate_on_slice(&ctx);
     let final_r = prefer_zc_or_detailed(zc_result, fallback_result, "fallback scan");
-    build_result(final_r, &zc, samples, sample_rate, threshold, channels, total_duration, start)
+    build_result(&ctx, final_r, channels, total_duration, start)
 }
 
 /// Outcome of the sliding-window scan (:253-317 of the pre-refactor inner).
@@ -314,15 +335,10 @@ enum WindowScan {
 
 /// The window-scan loop, returning instead of early-returning a full decode.
 /// `Err` propagates cancellation from the loop body.
-fn scan_windows(
-    samples: &[f32],
-    zc: &[usize],
-    sample_rate: u32,
-    threshold: f32,
-    fps: f64,
-    drop_frame: bool,
-    cancel: Option<&AtomicBool>,
-) -> Result<WindowScan, LtcDecodeError> {
+fn scan_windows(ctx: &DecodeCtx) -> Result<WindowScan, LtcDecodeError> {
+    let samples = ctx.samples;
+    let zc = ctx.zc;
+    let sample_rate = ctx.sample_rate;
     const WINDOW_SECS: f64 = 30.0;
     const STRIDE_SECS: f64 = 15.0;
     const HIGH_CONF_THRESHOLD: f32 = 0.70;
@@ -336,7 +352,7 @@ fn scan_windows(
     let mut best_window_start = 0usize;
 
     for window_idx in 0..max_windows {
-        if cancelled(cancel) {
+        if cancelled(ctx.cancel) {
             return Err(LtcDecodeError::Cancelled);
         }
         let window_start = window_idx * stride;
@@ -355,10 +371,16 @@ fn scan_windows(
             window_end as f64 / sample_rate as f64,
             window_zc.len(), best_window_valid);
 
-        let (result, valid) = evaluate_on_slice(
-            &samples[window_start..window_end], &window_zc,
-            sample_rate, threshold, fps, drop_frame, cancel,
-        );
+        let window_ctx = DecodeCtx {
+            samples: &samples[window_start..window_end],
+            zc: &window_zc,
+            sample_rate: ctx.sample_rate,
+            threshold: ctx.threshold,
+            fps: ctx.fps,
+            drop_frame: ctx.drop_frame,
+            cancel: ctx.cancel,
+        };
+        let (result, valid) = evaluate_on_slice(&window_ctx);
 
         if valid > best_window_valid {
             best_window_valid = valid;
@@ -540,35 +562,28 @@ enum ScoredCandidate {
 /// One (spb, phase) decode attempt; `Beat(new)` iff it beats `best_valid`.
 /// `adaptive` selects extract_bits_adaptive (refinement loop) vs extract_bits.
 fn score_candidate(
-    samples: &[f32],
-    zc: &[usize],
+    ctx: &DecodeCtx,
     spb: f64,
     phase: usize,
-    threshold: f32,
-    fps: f64,
-    drop_frame: bool,
-    sample_rate: u32,
     adaptive: bool,
     best_valid: u32,
-    cancel: Option<&AtomicBool>,
 ) -> ScoredCandidate {
     let bits = if adaptive {
-        extract_bits_adaptive(samples, spb, phase, threshold, zc, cancel)
+        extract_bits_adaptive(ctx.samples, spb, phase, ctx.threshold, ctx.zc, ctx.cancel)
     } else {
-        extract_bits(samples, spb, phase, threshold, cancel)
+        extract_bits(ctx.samples, spb, phase, ctx.threshold, ctx.cancel)
     };
     if bits.len() < 80 {
         return ScoredCandidate::TooShort;
     }
 
-    let scan = find_frames(&bits, fps, drop_frame);
+    let scan = find_frames(&bits, ctx.fps, ctx.drop_frame);
     let (valid_frames, total_possible, frame_starts, grid_valid) =
         (scan.valid_frames, scan.total_possible, scan.frame_starts, scan.grid_valid);
     if valid_frames <= best_valid {
         return ScoredCandidate::NoBeat;
     }
-
-    let fps_name = format!("{:.2} fps", fps);
+    let fps_name = format!("{:.2} fps", ctx.fps);
     let details_entry = if adaptive {
         debug!("LTC refinement adaptive -- {} valid / {} possible (phase={})",
             valid_frames, total_possible, phase);
@@ -586,8 +601,8 @@ fn score_candidate(
     };
 
     ScoredCandidate::Beat(ScoredResult::from_frame_starts(
-        fps, drop_frame, spb, phase, total_possible, &bits, frame_starts, sample_rate, details_entry, adaptive,
-        grid_valid,
+        ctx.fps, ctx.drop_frame, spb, phase, total_possible, &bits, frame_starts, ctx.sample_rate,
+        details_entry, adaptive, grid_valid,
     ))
 }
 
@@ -613,15 +628,8 @@ fn spb_variants(spb_nominal: f64) -> Vec<f64> {
 
 /// First search pass: try every (spb variant, zero-crossing phase) pair with
 /// plain bit extraction and keep the best valid-frame count.
-#[allow(clippy::too_many_arguments)]
 fn coarse_search(
-    samples: &[f32],
-    zc: &[usize],
-    sample_rate: u32,
-    threshold: f32,
-    fps: f64,
-    drop_frame: bool,
-    cancel: Option<&AtomicBool>,
+    ctx: &DecodeCtx,
     variants: &[f64],
     eval_start: std::time::Instant,
 ) -> (Option<ScoredResult>, u32) {
@@ -629,11 +637,11 @@ fn coarse_search(
     let mut best_result: Option<ScoredResult> = None;
 
     for (spb_idx, &spb) in variants.iter().enumerate() {
-        if cancelled(cancel) {
+        if cancelled(ctx.cancel) {
             return (None, 0);
         }
         let max_phases = phase_window(spb);
-        let phases_to_try = zc.iter().take(max_phases).copied();
+        let phases_to_try = ctx.zc.iter().take(max_phases).copied();
 
         let half_spb = (spb * 0.5) as usize;
         let mut attempts_this_spb = 0u32;
@@ -642,10 +650,7 @@ fn coarse_search(
 
         for phase in phases_to_try {
             for &candidate_phase in &[phase, phase.saturating_sub(half_spb)] {
-                match score_candidate(
-                    samples, zc, spb, candidate_phase, threshold, fps, drop_frame,
-                    sample_rate, false, best_valid, cancel,
-                ) {
+                match score_candidate(ctx, spb, candidate_phase, false, best_valid) {
                     ScoredCandidate::TooShort => {}
                     ScoredCandidate::NoBeat => attempts_this_spb += 1,
                     ScoredCandidate::Beat(new) => {
@@ -667,11 +672,7 @@ fn coarse_search(
 /// Second pass: refine the best coarse candidate with adaptive bit
 /// extraction over the remaining phases at the winner's spb.
 fn refine_best(
-    samples: &[f32],
-    zc: &[usize],
-    sample_rate: u32,
-    threshold: f32,
-    cancel: Option<&AtomicBool>,
+    ctx: &DecodeCtx,
     best: ScoredResult,
     best_valid: u32,
     eval_start: std::time::Instant,
@@ -680,17 +681,15 @@ fn refine_best(
         eval_start.elapsed().as_secs_f64(), best.fps, best.spb, best_valid);
     let best_spb = best.spb;
     let best_phase = best.phase;
-    let best_fps = best.fps;
-    let best_drop_frame = best.drop_frame;
 
     let max_phases = phase_window(best_spb);
-    let phases_to_try = zc.iter().take(max_phases).copied();
+    let phases_to_try = ctx.zc.iter().take(max_phases).copied();
     let mut last_heartbeat = std::time::Instant::now();
     let mut refine_idx = 0u32;
     let mut best_result = Some(best);
     let mut best_valid = best_valid;
     for phase in phases_to_try {
-        if cancelled(cancel) {
+        if cancelled(ctx.cancel) {
             return (best_result, best_valid);
         }
         if phase == best_phase { continue; }
@@ -701,10 +700,7 @@ fn refine_best(
                 phase, best_valid);
             last_heartbeat = std::time::Instant::now();
         }
-        if let ScoredCandidate::Beat(new) = score_candidate(
-            samples, zc, best_spb, phase, threshold, best_fps, best_drop_frame,
-            sample_rate, true, best_valid, cancel,
-        ) {
+        if let ScoredCandidate::Beat(new) = score_candidate(ctx, best_spb, phase, true, best_valid) {
             best_valid = new.valid_frames;
             best_result = Some(new);
         }
@@ -716,32 +712,21 @@ fn refine_best(
 ///
 /// Tries SPB variants to compensate for clock drift, with phases derived
 /// from the first several zero-crossings.
-fn evaluate_on_slice(
-    samples: &[f32],
-    zc: &[usize],
-    sample_rate: u32,
-    threshold: f32,
-    fps: f64,
-    drop_frame: bool,
-    cancel: Option<&AtomicBool>,
-) -> (Option<ScoredResult>, u32) {
+fn evaluate_on_slice(ctx: &DecodeCtx) -> (Option<ScoredResult>, u32) {
     let eval_start = std::time::Instant::now();
+    let fps = ctx.fps;
     let fps_name = format!("{:.2} fps", fps);
-    let spb_nominal = sample_rate as f64 / (fps * 80.0);
+    let spb_nominal = ctx.sample_rate as f64 / (fps * 80.0);
     if spb_nominal < 0.5 {
         return (None, 0);
     }
     debug!("LTC evaluate: trying {} (spb_nominal={:.2})", fps_name, spb_nominal);
 
     let variants = spb_variants(spb_nominal);
-    let (best_result, best_valid) = coarse_search(
-        samples, zc, sample_rate, threshold, fps, drop_frame, cancel, &variants, eval_start,
-    );
+    let (best_result, best_valid) = coarse_search(ctx, &variants, eval_start);
 
     let (best_result, best_valid) = match best_result {
-        Some(best) => refine_best(
-            samples, zc, sample_rate, threshold, cancel, best, best_valid, eval_start,
-        ),
+        Some(best) => refine_best(ctx, best, best_valid, eval_start),
         None => (None, 0),
     };
 
@@ -758,15 +743,16 @@ fn evaluate_on_slice(
 }
 
 fn build_result(
+    ctx: &DecodeCtx,
     best_result: Option<ScoredResult>,
-    zc: &[usize],
-    samples: &[f32],
-    sample_rate: u32,
-    threshold: f32,
     channels: usize,
     total_duration: f64,
     start: std::time::Instant,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
+    let zc = ctx.zc;
+    let samples = ctx.samples;
+    let sample_rate = ctx.sample_rate;
+    let threshold = ctx.threshold;
     let elapsed = start.elapsed();
     let processing_time_ms = elapsed.as_secs_f64() * 1000.0;
 
@@ -4164,6 +4150,19 @@ mod tests {
 
     // ── build_result ──────────────────────────────────────────────────
 
+    /// Test substrate for the ladder functions (real values filled per test).
+    fn mk_ctx<'a>(samples: &'a [f32], zc: &'a [usize]) -> DecodeCtx<'a> {
+        DecodeCtx {
+            samples,
+            zc,
+            sample_rate: 48000,
+            threshold: 0.01,
+            fps: 25.0,
+            drop_frame: false,
+            cancel: None,
+        }
+    }
+
     #[test]
     fn test_build_result_with_valid_result() {
         let r = ScoredResult {
@@ -4186,7 +4185,7 @@ mod tests {
             frame_starts: vec![0],
         };
         let zc = vec![12, 36, 60];
-        let result = build_result(Some(r), &zc, &[], 48000, 0.01, 2, 2.0, std::time::Instant::now()).unwrap();
+        let result = build_result(&mk_ctx(&[], &zc), Some(r), 2, 2.0, std::time::Instant::now()).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success));
         assert!((result.avg_confidence - 50.0 / 60.0).abs() < 0.001);
         assert_eq!(result.valid_frames, 50);
@@ -4197,7 +4196,7 @@ mod tests {
     #[test]
     fn test_build_result_with_none() {
         let zc = vec![];
-        let result = build_result(None, &zc, &[], 48000, 0.01, 2, 0.5, std::time::Instant::now()).unwrap();
+        let result = build_result(&mk_ctx(&[], &zc), None, 2, 0.5, std::time::Instant::now()).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::NoSyncWord));
         assert_eq!(result.valid_frames, 0);
         assert!(result.timecodes.is_empty());
@@ -4219,7 +4218,7 @@ mod tests {
             frame_starts: vec![],
         };
         let zc = vec![];
-        let result = build_result(Some(low_conf), &zc, &[], 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
+        let result = build_result(&mk_ctx(&[], &zc), Some(low_conf), 2, 1.0, std::time::Instant::now()).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::NoSyncWord));
 
         let med_conf = ScoredResult {
@@ -4235,7 +4234,7 @@ mod tests {
             adaptive: false,
             frame_starts: vec![],
         };
-        let result = build_result(Some(med_conf), &zc, &[], 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
+        let result = build_result(&mk_ctx(&[], &zc), Some(med_conf), 2, 1.0, std::time::Instant::now()).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::LowConfidence));
 
         let high_conf = ScoredResult {
@@ -4251,7 +4250,7 @@ mod tests {
             adaptive: false,
             frame_starts: vec![],
         };
-        let result = build_result(Some(high_conf), &zc, &[], 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
+        let result = build_result(&mk_ctx(&[], &zc), Some(high_conf), 2, 1.0, std::time::Instant::now()).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success));
     }
 
@@ -4271,7 +4270,7 @@ mod tests {
             frame_starts: vec![],
         };
         let zc = vec![];
-        let result = build_result(Some(r), &zc, &[], 48000, 0.01, 2, 1.0, std::time::Instant::now()).unwrap();
+        let result = build_result(&mk_ctx(&[], &zc), Some(r), 2, 1.0, std::time::Instant::now()).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::NoSyncWord));
         assert_eq!(result.avg_confidence, 0.0);
     }
@@ -5721,7 +5720,7 @@ mod tests {
         let threshold = 0.005f32; // extract_bits ignores the threshold
 
         // Nominal branch, beats best_valid=0.
-        match score_candidate(&samples, &[], 24.0, 0, threshold, 25.0, false, 48000, false, 0, None) {
+        match score_candidate(&mk_ctx(&samples, &[]), 24.0, 0, false, 0) {
             ScoredCandidate::Beat(r) => {
                 assert!(r.valid_frames >= 5, "expected several frames, got {}", r.valid_frames);
                 assert_eq!(r.spb, 24.0);
@@ -5732,7 +5731,7 @@ mod tests {
         }
 
         // Adaptive branch: flagged adaptive, still beats 0.
-        match score_candidate(&samples, &[], 24.0, 0, threshold, 25.0, false, 48000, true, 0, None) {
+        match score_candidate(&mk_ctx(&samples, &[]), 24.0, 0, true, 0) {
             ScoredCandidate::Beat(r) => {
                 assert!(r.adaptive, "refinement branch must be flagged adaptive");
                 assert_eq!(r.spb, 24.0);
@@ -5742,14 +5741,14 @@ mod tests {
         }
 
         // No beat: a best_valid no candidate can beat → NoBeat.
-        match score_candidate(&samples, &[], 12.0, 0, threshold, 25.0, false, 48000, false, u32::MAX, None) {
+        match score_candidate(&mk_ctx(&samples, &[]), 12.0, 0, false, u32::MAX) {
             ScoredCandidate::NoBeat => {}
             other => panic!("expected NoBeat, got {:?}", other),
         }
 
         // Too short: fewer than 80 bits extractable → TooShort.
         let tiny = vec![0.0f32; 100];
-        match score_candidate(&tiny, &[], 12.0, 0, threshold, 25.0, false, 48000, false, 0, None) {
+        match score_candidate(&mk_ctx(&tiny, &[]), 12.0, 0, false, 0) {
             ScoredCandidate::TooShort => {}
             other => panic!("expected TooShort, got {:?}", other),
         }
