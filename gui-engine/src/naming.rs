@@ -479,3 +479,243 @@ mod tests {
         assert!(NameTemplate::parse(DEFAULT_VIDEO_SUFFIX).is_ok());
     }
 }
+
+// ── Property tests (proptest) ────────────────────────────────────────────
+// Oracles are independent of the implementation: marker-delimited digit
+// spans (value + shape), literal/sentinel concatenation, and placeholder
+// accounting. Never re-derive expected values with production code.
+// See plans/2026-10-05-proptest-targeted-adoption-plan.md.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Sentinel character that can never appear in a generated literal or a
+    /// clip/track expansion, so counting it counts placeholders exactly.
+    const SENTINEL: char = '\u{1}';
+    const FILENAME_SENTINEL: &str = "\u{1}F";
+    const DEVICE_SENTINEL: &str = "\u{1}D";
+    /// Marker letters around every placeholder when rendering the concrete
+    /// template string; excluded from the generated-literal alphabet.
+    const MARK_OPEN: char = 'q';
+    const MARK_CLOSE: char = 'z';
+
+    #[derive(Clone, Debug)]
+    enum TemplateSeg {
+        Lit(String),
+        Ph(Placeholder, Option<usize>),
+    }
+
+    fn placeholder_body(name: &Placeholder, width: Option<usize>) -> String {
+        match name {
+            Placeholder::Filename => "filename".to_string(),
+            Placeholder::Device => "device".to_string(),
+            Placeholder::Clip => width_suffix("clip", width),
+            Placeholder::Track => width_suffix("track", width),
+        }
+    }
+
+    fn width_suffix(base: &str, width: Option<usize>) -> String {
+        match width {
+            None => base.to_string(),
+            Some(w) => format!("{base}:0{w}d"),
+        }
+    }
+
+    fn arb_literal() -> impl Strategy<Value = String> {
+        // Excludes '{' (would break rendering) and the marker letters q/z and
+        // the sentinel char (would break span extraction).
+        const ALPHABET: &[char] = &['a', 'b', 'c', '9', '0', ':', '}', '-', '_', '.', ' '];
+        proptest::collection::vec(proptest::sample::select(ALPHABET), 0..=6)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn arb_placeholder() -> impl Strategy<Value = (Placeholder, Option<usize>)> {
+        (
+            proptest::sample::select(vec![
+                Placeholder::Filename,
+                Placeholder::Device,
+                Placeholder::Clip,
+                Placeholder::Track,
+            ]),
+            proptest::option::of(1usize..=9),
+        )
+    }
+
+    fn arb_segs() -> impl Strategy<Value = Vec<TemplateSeg>> {
+        proptest::collection::vec(
+            prop_oneof![
+                arb_literal().prop_map(TemplateSeg::Lit),
+                arb_placeholder().prop_map(|(name, width)| TemplateSeg::Ph(name, width)),
+            ],
+            0..=8,
+        )
+    }
+
+    /// Render the segment list to a concrete template string. Placeholders
+    /// are expected to already be surrounded by marker literal segments.
+    fn render(segs: &[TemplateSeg]) -> String {
+        let mut s = String::new();
+        for seg in segs {
+            match seg {
+                TemplateSeg::Lit(l) => s.push_str(l),
+                TemplateSeg::Ph(name, width) => {
+                    s.push('{');
+                    s.push_str(&placeholder_body(name, *width));
+                    s.push('}');
+                }
+            }
+        }
+        s
+    }
+
+    /// Test-side expansion oracle: literals verbatim, sentinels for
+    /// filename/device, marker-delimited padded digits for clip/track. The
+    /// padding is computed independently of `push_padded`.
+    fn expected_expansion(segs: &[TemplateSeg], ctx: &NamingContext) -> String {
+        let mut s = String::new();
+        for seg in segs {
+            match seg {
+                TemplateSeg::Lit(l) => s.push_str(l),
+                TemplateSeg::Ph(Placeholder::Filename, _) => s.push_str(FILENAME_SENTINEL),
+                TemplateSeg::Ph(Placeholder::Device, _) => s.push_str(DEVICE_SENTINEL),
+                TemplateSeg::Ph(Placeholder::Clip, width) => {
+                    s.push_str(&padded_oracle(ctx.clip, *width));
+                }
+                TemplateSeg::Ph(Placeholder::Track, width) => {
+                    s.push_str(&padded_oracle(ctx.track, *width));
+                }
+            }
+        }
+        s
+    }
+
+    fn padded_oracle(value: usize, width: Option<usize>) -> String {
+        let decimal = value.to_string();
+        let target = width.unwrap_or(1).max(decimal.len());
+        format!("{:0>target$}", decimal, target = target)
+    }
+
+    /// Walk the expansion with the segment list and check each clip/track
+    /// span: marker-delimited, all ASCII digits, parses back to the context
+    /// value, length = max(width, decimal_len).
+    fn check_digit_spans(segs: &[TemplateSeg], expanded: &str, ctx: &NamingContext) {
+        let mut cursor = 0usize;
+        for seg in segs {
+            match seg {
+                TemplateSeg::Lit(l) => cursor += l.len(),
+                TemplateSeg::Ph(Placeholder::Filename, _) => cursor += FILENAME_SENTINEL.len(),
+                TemplateSeg::Ph(Placeholder::Device, _) => cursor += DEVICE_SENTINEL.len(),
+                TemplateSeg::Ph(name, width) => {
+                    let value = match name {
+                        Placeholder::Clip => ctx.clip,
+                        Placeholder::Track => ctx.track,
+                        _ => unreachable!("handled above"),
+                    };
+                    let digits = value.to_string();
+                    let span_len = width.unwrap_or(1).max(digits.len());
+                    let span = &expanded[cursor..cursor + span_len];
+                    assert!(
+                        !span.is_empty() && span.bytes().all(|b| b.is_ascii_digit()),
+                        "span {span:?} not a non-empty digit run (width {width:?})"
+                    );
+                    assert_eq!(
+                        span.parse::<usize>(),
+                        Ok(value),
+                        "span {span:?} != ctx value {value} (width {width:?})"
+                    );
+                    cursor += span_len;
+                }
+            }
+        }
+    }
+
+    proptest! {
+        // P1 — generated-AST round-trip: parse the rendered template, then
+        // verify the expansion against the independent concatenation oracle.
+        #[test]
+        fn p1_generated_template_roundtrip(
+            segs in arb_segs(),
+            clip in 0usize..1000,
+            track in 0usize..1000,
+        ) {
+            // The markers become literal segments once parsed, so the oracle
+            // segment list must include them.
+            let mut marked: Vec<TemplateSeg> = Vec::new();
+            for seg in &segs {
+                if matches!(seg, TemplateSeg::Ph(..)) {
+                    marked.push(TemplateSeg::Lit(MARK_OPEN.to_string()));
+                    marked.push(seg.clone());
+                    marked.push(TemplateSeg::Lit(MARK_CLOSE.to_string()));
+                } else {
+                    marked.push(seg.clone());
+                }
+            }
+            let rendered = render(&marked);
+            let tmpl = NameTemplate::parse(&rendered)
+                .unwrap_or_else(|e| panic!("rendered template {rendered:?} failed to parse: {e:?}"));
+            let ctx = NamingContext {
+                filename: FILENAME_SENTINEL.to_string(),
+                device: DEVICE_SENTINEL.to_string(),
+                clip,
+                track,
+            };
+            let expanded = tmpl.expand(&ctx);
+            let oracle = expected_expansion(&marked, &ctx);
+            assert_eq!(expanded, oracle, "expansion != oracle for template {rendered:?}");
+            check_digit_spans(&marked, &expanded, &ctx);
+        }
+
+        // P2 — raw-string crash-safety + placeholder accounting: parse and
+        // expand never panic; in an accepted string every '{' starts exactly
+        // one placeholder, so the expansion carries one sentinel per
+        // filename/device placeholder (clip/track expand to digits) and never
+        // a stray '{' (literals can never contain one).
+        #[test]
+        fn p2_raw_string_crash_safety(input in arb_raw_template()) {
+            if let Ok(t) = NameTemplate::parse(&input) {
+                let ctx = NamingContext {
+                    filename: FILENAME_SENTINEL.to_string(),
+                    device: DEVICE_SENTINEL.to_string(),
+                    clip: 7,
+                    track: 3,
+                };
+                let expanded = t.expand(&ctx);
+                prop_assert_eq!(
+                    expanded.matches(SENTINEL).count(),
+                    input.matches("{filename}").count() + input.matches("{device}").count(),
+                    "sentinel count mismatch for input {:?} -> {:?}",
+                    input,
+                    expanded
+                );
+                prop_assert!(
+                    !expanded.contains('{'),
+                    "expansion {:?} contains a brace for input {:?}",
+                    expanded,
+                    input
+                );
+            }
+        }
+    }
+
+    fn arb_raw_template() -> impl Strategy<Value = String> {
+        let tokens = prop_oneof![
+            4 => Just("{".to_string()),
+            4 => Just("}".to_string()),
+            3 => Just("clip".to_string()),
+            3 => Just("track".to_string()),
+            2 => Just("device".to_string()),
+            2 => Just("filename".to_string()),
+            2 => Just(":0".to_string()),
+            3 => Just("d".to_string()),
+            4 => proptest::sample::select(
+                "0123456789".chars().map(String::from).collect::<Vec<_>>()
+            ),
+            1 => Just("-".to_string()),
+            1 => Just("_".to_string()),
+            1 => Just(".".to_string()),
+            1 => Just(" ".to_string()),
+        ];
+        proptest::collection::vec(tokens, 0..=48).prop_map(|toks| toks.concat())
+    }
+}
