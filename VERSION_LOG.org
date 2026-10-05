@@ -1,14 +1,13 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
-* Unreleased
+* v0.5.3
 
-Main features are a permanent real-world decode-test asset (WP-RW) — a
-corpus sweep harness plus committed fixtures covering signal classes no
-synthetic test can produce — and the decoder fix the corpus immediately
-paid for: frame detection now re-locks after bitstream shifts, which
-cures a collapse class where long or disturbed recordings lost
-everything after the first glitch.
+Main features are a permanent real-world decode-test asset (WP-RW) — a corpus
+sweep harness plus committed fixtures covering signal classes no synthetic test
+produces. The decoder fix immediately paid for itself: frame detection now
+re-locks after bitstream shifts, which cures a collapse class where long or
+disturbed recordings lost everything after the first glitch.
 
 List of Changes:
 - Decoder: glitch-recovery - frame detection decodes along the dominant
@@ -36,8 +35,6 @@ List of Changes:
   only, so it cannot decode the 24-bit fixtures or the video
   extraction pipeline's 24-bit output; cross-backend agreement is
   asserted on 16-bit material.
-
-List of Changes:
 - Decoder: wrong-value robustness up 2x+ - a new value-integrity pass
   validates every decoded frame against LTC's BCD digit ranges and
   frame-rate bounds, repairs single-frame outliers from their coherent
