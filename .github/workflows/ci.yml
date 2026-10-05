@@ -38,7 +38,7 @@ jobs:
       - name: Install Rust toolchain (stable, clippy, llvm-tools)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, llvm-tools-preview
+          components: clippy, llvm-tools-preview, rustfmt
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -47,6 +47,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest,cargo-llvm-cov
+
+      - name: Rustfmt check
+        run: cargo fmt --all --check
 
       - name: Clippy (JSON report for Sonar)
         run: cargo clippy --workspace --all-targets --message-format=json > clippy-report.json
