@@ -95,7 +95,12 @@ fn main() {
     // 2. Changed-tick path: per-tick progress mutation + compare + clone.
     let mut changed_samples = Vec::with_capacity(TICKS);
     for i in 0..TICKS {
-        current.jobs.get_mut(&JobKind::Conversion).unwrap().progress.fraction = (i % 1000) as f32 / 1000.0;
+        current
+            .jobs
+            .get_mut(&JobKind::Conversion)
+            .unwrap()
+            .progress
+            .fraction = (i % 1000) as f32 / 1000.0;
         let t = Instant::now();
         let changed = last.as_ref() != &current;
         if changed {
@@ -106,9 +111,18 @@ fn main() {
 
     let (c50, c99) = percentiles(cmp_samples);
     let (d50, d99) = percentiles(changed_samples);
-    println!("snapshot scalability ({} clap logs, {} card files, {} ticks)", CLAP_LOG_ENTRIES, CARD_FILES, TICKS);
-    println!("idle tick   (PartialEq compare only): p50 {:.3} ms, p99 {:.3} ms", c50, c99);
-    println!("active tick (compare + deep clone):   p50 {:.3} ms, p99 {:.3} ms", d50, d99);
+    println!(
+        "snapshot scalability ({} clap logs, {} card files, {} ticks)",
+        CLAP_LOG_ENTRIES, CARD_FILES, TICKS
+    );
+    println!(
+        "idle tick   (PartialEq compare only): p50 {:.3} ms, p99 {:.3} ms",
+        c50, c99
+    );
+    println!(
+        "active tick (compare + deep clone):   p50 {:.3} ms, p99 {:.3} ms",
+        d50, d99
+    );
     println!("tick budget = 40 ms; trigger threshold ≈ 1 ms compare cost (2.5 % of budget)");
 }
 

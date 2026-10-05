@@ -107,7 +107,9 @@ impl<T: PartialEq + Clone> EditState<T> {
     ///    focused widget never adopts — the user is editing.
     pub fn sync(&mut self, truth: &T, applied_seq: u64, now: Instant) {
         if let Some(pending) = &self.pending {
-            if applied_seq >= pending.seq || now.duration_since(pending.since) > EDIT_CONFIRM_TIMEOUT {
+            if applied_seq >= pending.seq
+                || now.duration_since(pending.since) > EDIT_CONFIRM_TIMEOUT
+            {
                 self.pending = None;
             } else {
                 // Still awaiting the ack — keep the user's value.

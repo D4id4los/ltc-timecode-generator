@@ -12,19 +12,19 @@ use log::{error, info, warn};
 use crate::command::{ConverterCommand, GuiCommand};
 use crate::config;
 use crate::converter::{
-    query_ffmpeg_capabilities,
-    FfmpegCapabilities, ChannelMap, ConversionPipeline, ConverterSettings,
-    RecordingType, duplicate_output_names, duplicate_output_warning, evaluate_readiness,
-    output_collision_warning, preview_output_files, apply_available_defaults,
-    select_best_combination, spawn_conversion_job,
+    apply_available_defaults, duplicate_output_names, duplicate_output_warning, evaluate_readiness,
+    output_collision_warning, preview_output_files, query_ffmpeg_capabilities,
+    select_best_combination, spawn_conversion_job, ChannelMap, ConversionPipeline,
+    ConverterSettings, FfmpegCapabilities, RecordingType,
 };
 use crate::ffprobe::VideoAudioProbe;
 use crate::hw_cache;
-use crate::job::{self, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor, spawn_job};
 use crate::job::CancelToken;
+use crate::job::{
+    self, spawn_job, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor,
+};
 use crate::offload::{
-    DeviceNameSource, SdCardInfo, ScanProgress,
-    run_offload_copy_job, run_offload_scan_job_with,
+    run_offload_copy_job, run_offload_scan_job_with, DeviceNameSource, ScanProgress, SdCardInfo,
 };
 use crate::state::{AppStateSnapshot, ClapLogItem, ClipDecodeState};
 use crate::timecode;
@@ -34,21 +34,27 @@ const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 const MAX_CLAP_LOGS: usize = 1000;
 const BUFFER_SIZE: u32 = 0;
 
-
-
 pub fn engine_main(
     cmd_rx: Receiver<GuiCommand>,
     state: Arc<ArcSwap<AppStateSnapshot>>,
     use_libltc: bool,
     event_tx: Sender<AudioEvent>,
 ) {
-    engine_main_with_probe(cmd_rx, state, use_libltc, event_tx, query_ffmpeg_capabilities)
+    engine_main_with_probe(
+        cmd_rx,
+        state,
+        use_libltc,
+        event_tx,
+        query_ffmpeg_capabilities,
+    )
 }
 
 /// Injectable I/O sources for the engine loop (the project's `_with` seam
 /// convention). Every field has a production default; tests replace only
 /// the seams they exercise.
-pub type ScanCardsFn = Arc<dyn Fn(&CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String> + Send + Sync>;
+pub type ScanCardsFn = Arc<
+    dyn Fn(&CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String> + Send + Sync,
+>;
 
 /// Audio-event source drained once per engine tick. The default is
 /// AudioCore's own event queue; tests inject a queue they can push to.
@@ -88,7 +94,9 @@ impl Default for EngineSeams {
     fn default() -> Self {
         EngineSeams {
             ffmpeg_caps: Box::new(query_ffmpeg_capabilities),
-            scan_cards: Arc::new(|_cancel, progress| Ok(crate::offload::detect_cards_with_progress(progress))),
+            scan_cards: Arc::new(|_cancel, progress| {
+                Ok(crate::offload::detect_cards_with_progress(progress))
+            }),
             audio_events: Box::new(|core| core.drain_events()),
             init_output: Box::new(|core, device_id, sample_rate, buffer_size| {
                 core.init_output(device_id, sample_rate, buffer_size)
@@ -166,7 +174,9 @@ impl EngineLoopState {
             pending_recording: None,
             last_published: None,
             applied_command_seq: 0,
-            scan_cards: Arc::new(|_cancel, progress| Ok(crate::offload::detect_cards_with_progress(progress))),
+            scan_cards: Arc::new(|_cancel, progress| {
+                Ok(crate::offload::detect_cards_with_progress(progress))
+            }),
             audio_init: Box::new(|core, device_id, sample_rate, buffer_size| {
                 core.init_output(device_id, sample_rate, buffer_size)
             }),
@@ -188,8 +198,14 @@ pub fn engine_main_with_probe<F>(
     F: FnOnce() -> FfmpegCapabilities + Send + 'static,
 {
     engine_main_with_seams(
-        cmd_rx, state, use_libltc, event_tx,
-        EngineSeams { ffmpeg_caps: Box::new(probe_fn), ..EngineSeams::default() },
+        cmd_rx,
+        state,
+        use_libltc,
+        event_tx,
+        EngineSeams {
+            ffmpeg_caps: Box::new(probe_fn),
+            ..EngineSeams::default()
+        },
     )
 }
 
@@ -313,11 +329,21 @@ fn engine_main_loop(
 fn sync_job_statuses(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
     let progress_snapshots = supervisor.poll();
     for (_id, kind, snap) in &progress_snapshots {
-        let is_terminal = els.current.jobs.get(kind)
-            .map(|s| matches!(s.phase(), job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
+        let is_terminal = els
+            .current
+            .jobs
+            .get(kind)
+            .map(|s| {
+                matches!(
+                    s.phase(),
+                    job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed
+                )
+            })
             .unwrap_or(false);
         if !is_terminal {
-            els.current.jobs.insert(*kind, JobStatus::from_progress(snap));
+            els.current
+                .jobs
+                .insert(*kind, JobStatus::from_progress(snap));
         }
     }
 }
@@ -327,7 +353,9 @@ fn sync_job_statuses(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) 
 /// idle tick then costs one structural PartialEq and no allocation/deep
 /// clone at all.
 fn publish_if_changed(els: &mut EngineLoopState, state: &Arc<ArcSwap<AppStateSnapshot>>) {
-    let changed = els.last_published.as_ref()
+    let changed = els
+        .last_published
+        .as_ref()
         .map_or(true, |p| p.as_ref() != &els.current);
     if changed {
         let next = Arc::new(els.current.clone());
@@ -436,8 +464,19 @@ fn process_command(
 
         GuiCommand::CancelDecode => cmd_cancel_decode(els, supervisor),
 
-        GuiCommand::DecodeLtcVideoGroup { paths, stream_index, channel_index } => {
-            cmd_decode_ltc_video_group(els, supervisor, &paths, stream_index, channel_index, use_libltc);
+        GuiCommand::DecodeLtcVideoGroup {
+            paths,
+            stream_index,
+            channel_index,
+        } => {
+            cmd_decode_ltc_video_group(
+                els,
+                supervisor,
+                &paths,
+                stream_index,
+                channel_index,
+                use_libltc,
+            );
         }
 
         GuiCommand::ClearRecordingDecodeState => cmd_clear_recording_decode_state(els, supervisor),
@@ -447,7 +486,14 @@ fn process_command(
         }
 
         GuiCommand::ParseLtcVideo(path, stream_index, channel_index) => {
-            cmd_parse_ltc_video(els, supervisor, &path, stream_index, channel_index, use_libltc);
+            cmd_parse_ltc_video(
+                els,
+                supervisor,
+                &path,
+                stream_index,
+                channel_index,
+                use_libltc,
+            );
         }
 
         GuiCommand::SetLtcDecodeStream(idx) => {
@@ -474,14 +520,30 @@ fn process_command(
         GuiCommand::TakeDown => {
             els.current.clapper.take = els.current.clapper.take.saturating_sub(1);
         }
-        GuiCommand::HourUp => { stepper_hour(&mut els.current, 1); }
-        GuiCommand::HourDown => { stepper_hour(&mut els.current, -1); }
-        GuiCommand::MinuteUp => { stepper_minute(&mut els.current, 1); }
-        GuiCommand::MinuteDown => { stepper_minute(&mut els.current, -1); }
-        GuiCommand::SecondUp => { stepper_second(&mut els.current, 1); }
-        GuiCommand::SecondDown => { stepper_second(&mut els.current, -1); }
-        GuiCommand::FrameUp => { stepper_frame(&mut els.current, 1); }
-        GuiCommand::FrameDown => { stepper_frame(&mut els.current, -1); }
+        GuiCommand::HourUp => {
+            stepper_hour(&mut els.current, 1);
+        }
+        GuiCommand::HourDown => {
+            stepper_hour(&mut els.current, -1);
+        }
+        GuiCommand::MinuteUp => {
+            stepper_minute(&mut els.current, 1);
+        }
+        GuiCommand::MinuteDown => {
+            stepper_minute(&mut els.current, -1);
+        }
+        GuiCommand::SecondUp => {
+            stepper_second(&mut els.current, 1);
+        }
+        GuiCommand::SecondDown => {
+            stepper_second(&mut els.current, -1);
+        }
+        GuiCommand::FrameUp => {
+            stepper_frame(&mut els.current, 1);
+        }
+        GuiCommand::FrameDown => {
+            stepper_frame(&mut els.current, -1);
+        }
 
         GuiCommand::ProbeFileDurations(paths) => {
             cmd_probe_file_durations(els, supervisor, paths);
@@ -509,7 +571,9 @@ fn process_command(
 fn cmd_start_ltc(core: &AudioCore, els: &mut EngineLoopState, event_tx: &Sender<AudioEvent>) {
     ensure_audio_init(core, els, event_tx);
     if !els.current.audio_initialized {
-        els.current.status.set_audio("Cannot start — audio not initialized");
+        els.current
+            .status
+            .set_audio("Cannot start — audio not initialized");
         return;
     }
     let state = &mut els.current;
@@ -546,8 +610,7 @@ fn cmd_clap(core: &AudioCore, els: &mut EngineLoopState) {
     state.clapper.clap_seq = state.clapper.clap_seq.wrapping_add(1);
 
     let tc_str = timecode::timecode_to_string(state.current_timecode, state.drop_frame());
-    let ms_str =
-        timecode::timecode_to_ms_string(state.current_timecode, state.fps());
+    let ms_str = timecode::timecode_to_ms_string(state.current_timecode, state.fps());
     els.log_id_counter += 1;
     let ts = timecode::chrono_now_string();
     let note = format!("Scene {}", state.clapper.scene);
@@ -590,7 +653,9 @@ fn cmd_set_device(
         // Revert to previous device
         els.current.selected_device = els.previous_device.take();
         if try_init_device(core, els) {
-            els.current.status.set_audio("Device selection reverted to previous");
+            els.current
+                .status
+                .set_audio("Device selection reverted to previous");
         } else {
             // Previous selection may have been automatic (None);
             // fall back to the default/first device.
@@ -610,11 +675,15 @@ fn cmd_refresh_devices(els: &mut EngineLoopState) {
                     els.current.selected_device = None;
                 }
             }
-            els.current.status.set_audio(format!("{} devices found", els.current.devices.len()));
+            els.current
+                .status
+                .set_audio(format!("{} devices found", els.current.devices.len()));
         }
         Err(e) => {
             error!("Failed to list devices: {}", e);
-            els.current.status.set_audio(format!("Device scan failed: {}", e));
+            els.current
+                .status
+                .set_audio(format!("Device scan failed: {}", e));
         }
     }
 }
@@ -640,12 +709,16 @@ fn cmd_clear_recording_decode_state(els: &mut EngineLoopState, supervisor: &mut 
     state.decode.error = None;
     state.decode.probe = None;
     supervisor.cancel(JobKind::LtcDecode);
-    state.jobs.insert(JobKind::LtcDecode, job::JobStatus::idle());
+    state
+        .jobs
+        .insert(JobKind::LtcDecode, job::JobStatus::idle());
     state.decode.generation = state.decode.generation.wrapping_add(1);
     state.decode.group_paths = Vec::new();
     state.decode.group_results = Vec::new();
     supervisor.cancel(JobKind::LtcGroupDecode);
-    state.jobs.insert(JobKind::LtcGroupDecode, job::JobStatus::idle());
+    state
+        .jobs
+        .insert(JobKind::LtcGroupDecode, job::JobStatus::idle());
     state.decode.group_generation = state.decode.group_generation.wrapping_add(1);
 }
 
@@ -722,30 +795,26 @@ fn apply_simple_converter_setting(
 ) -> bool {
     use ConverterCommand as C;
     match cmd {
-        C::SetMetadataOnly(v)           => settings.metadata_only = *v,
+        C::SetMetadataOnly(v) => settings.metadata_only = *v,
         C::SetGenerateSyntheticVideo(v) => settings.generate_synthetic_video = *v,
-        C::SetCopyVideo(v)              => settings.copy_video = *v,
-        C::SetSplitTracks(v)            => settings.split_tracks = *v,
-        C::SetDropLtcTrack(v)           => settings.drop_ltc_track = *v,
-        C::SetConcatAudio(v)            => settings.concat_audio = *v,
-        C::SetStartFromLtc(v)           => settings.set_start_from_ltc = *v,
-        C::SetEmbedCameraMetadata(v)    => settings.embed_camera_metadata = *v,
-        C::SetLtcFileIndex(v)           => settings.ltc_file_idx = *v,
-        C::SetVideoCodec(c)             => settings.video_encoder = c.clone(),
-        C::SetAudioEncoder(e)           => settings.audio_encoder = e.clone(),
-        C::SetFilenamePrefix(p)         => settings.filename_prefix = p.clone(),
-        C::SetAudioSuffixTemplate(t)    => settings.audio_suffix_template = t.clone(),
-        C::SetVideoSuffixTemplate(t)    => settings.video_suffix_template = t.clone(),
+        C::SetCopyVideo(v) => settings.copy_video = *v,
+        C::SetSplitTracks(v) => settings.split_tracks = *v,
+        C::SetDropLtcTrack(v) => settings.drop_ltc_track = *v,
+        C::SetConcatAudio(v) => settings.concat_audio = *v,
+        C::SetStartFromLtc(v) => settings.set_start_from_ltc = *v,
+        C::SetEmbedCameraMetadata(v) => settings.embed_camera_metadata = *v,
+        C::SetLtcFileIndex(v) => settings.ltc_file_idx = *v,
+        C::SetVideoCodec(c) => settings.video_encoder = c.clone(),
+        C::SetAudioEncoder(e) => settings.audio_encoder = e.clone(),
+        C::SetFilenamePrefix(p) => settings.filename_prefix = p.clone(),
+        C::SetAudioSuffixTemplate(t) => settings.audio_suffix_template = t.clone(),
+        C::SetVideoSuffixTemplate(t) => settings.video_suffix_template = t.clone(),
         _ => return false,
     }
     true
 }
 
-fn cmd_select_folder(
-    els: &mut EngineLoopState,
-    supervisor: &mut JobSupervisor,
-    path: PathBuf,
-) {
+fn cmd_select_folder(els: &mut EngineLoopState, supervisor: &mut JobSupervisor, path: PathBuf) {
     let current = &mut els.current;
     current.converter.groups.clear();
     current.converter.groups_folder = Some(path.clone());
@@ -753,9 +822,18 @@ fn cmd_select_folder(
     current.converter.selected_group_idx = None;
     current.converter.probes.clear();
     current.converter.probes_generation = 0;
-    current.jobs.entry(JobKind::Conversion).or_insert_with(JobStatus::idle);
-    current.jobs.entry(JobKind::FolderScan).or_insert_with(JobStatus::idle);
-    current.jobs.entry(JobKind::ClipProbe).or_insert_with(JobStatus::idle);
+    current
+        .jobs
+        .entry(JobKind::Conversion)
+        .or_insert_with(JobStatus::idle);
+    current
+        .jobs
+        .entry(JobKind::FolderScan)
+        .or_insert_with(JobStatus::idle);
+    current
+        .jobs
+        .entry(JobKind::ClipProbe)
+        .or_insert_with(JobStatus::idle);
     // Fresh scan — reset user-set flag so the next recording
     // selection re-defaults output_folder to the record's
     // parent dir.
@@ -776,7 +854,10 @@ fn cmd_select_folder(
             scan_path.display(),
             groups.len(),
         );
-        Ok(JobFinal::FolderScan { path: scan_path, groups })
+        Ok(JobFinal::FolderScan {
+            path: scan_path,
+            groups,
+        })
     });
     recompute_converter_derived(current);
 }
@@ -787,7 +868,8 @@ fn cmd_start_conversion(els: &mut EngineLoopState, supervisor: &mut JobSuperviso
         return;
     }
     let Some(settings) = assemble_converter_settings(&els.current) else {
-        let msg = "Cannot start conversion — no recording group selected or settings incomplete".to_string();
+        let msg = "Cannot start conversion — no recording group selected or settings incomplete"
+            .to_string();
         els.current.status.set_converter(msg.clone());
         warn!("{}", msg);
         return;
@@ -798,13 +880,19 @@ fn cmd_start_conversion(els: &mut EngineLoopState, supervisor: &mut JobSuperviso
     let spec = job::JobSpec {
         kind: JobKind::Conversion,
         name: "conversion",
-        units: vec![job::UnitSpec { weight: 1.0, label: "conversion".into() }],
+        units: vec![job::UnitSpec {
+            weight: 1.0,
+            label: "conversion".into(),
+        }],
     };
     spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
         spawn_conversion_job(ctx, settings, caps)
     });
     // Immediately reflect running state in snapshot
-    els.current.jobs.insert(JobKind::Conversion, JobStatus::running("Conversion started…"));
+    els.current.jobs.insert(
+        JobKind::Conversion,
+        JobStatus::running("Conversion started…"),
+    );
     els.current.status.set_converter("Conversion started…");
     info!("Conversion started via engine StartConversion command (job-based)");
 }
@@ -832,7 +920,10 @@ fn cmd_probe_file_durations(
     let spec = job::JobSpec {
         kind: JobKind::DurationProbe,
         name: "duration-probe",
-        units: vec![job::UnitSpec { weight: 1.0, label: "duration probe".into() }],
+        units: vec![job::UnitSpec {
+            weight: 1.0,
+            label: "duration probe".into(),
+        }],
     };
     spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
         ctx.progress.set_indeterminate(true);
@@ -852,10 +943,15 @@ fn cmd_probe_video(els: &mut EngineLoopState, supervisor: &mut JobSupervisor, pa
         info!("Video probe already in progress — ignoring duplicate ProbeVideo");
         return;
     }
-    info!("Probing video file for audio streams (async via job): {}", path);
+    info!(
+        "Probing video file for audio streams (async via job): {}",
+        path
+    );
     els.current.decode.probe = None;
     els.current.decode.error = None;
-    els.current.status.set_decode(format!("Probing video: {}", path));
+    els.current
+        .status
+        .set_decode(format!("Probing video: {}", path));
     let path_clone = path.clone();
     let spec = job::JobSpec {
         kind: JobKind::VideoProbe,
@@ -864,8 +960,8 @@ fn cmd_probe_video(els: &mut EngineLoopState, supervisor: &mut JobSupervisor, pa
     };
     spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
         ctx.progress.set_indeterminate(true);
-        let result = crate::ffprobe::probe_video_audio(Path::new(&path_clone))
-            .map_err(|e| e.to_string());
+        let result =
+            crate::ffprobe::probe_video_audio(Path::new(&path_clone)).map_err(|e| e.to_string());
         Ok(JobFinal::VideoProbe { result })
     });
 }
@@ -891,7 +987,11 @@ fn cmd_decode_ltc_video_group(
     let decoder_name = if use_libltc { "libltc" } else { "builtin" };
     info!(
         "LTC group decode requested: {} clip(s), stream={}, channel={}, decoder={}, fps={}",
-        total, stream_index, channel_index, decoder_name, els.current.decode_fps(),
+        total,
+        stream_index,
+        channel_index,
+        decoder_name,
+        els.current.decode_fps(),
     );
 
     // Reset group decode state with new generation
@@ -904,7 +1004,9 @@ fn cmd_decode_ltc_video_group(
         JobKind::LtcGroupDecode,
         JobStatus::running(format!("Decoding LTC group: 0/{} clips", total)),
     );
-    state.status.set_decode(format!("Decoding LTC group: 0/{} clips", total));
+    state
+        .status
+        .set_decode(format!("Decoding LTC group: 0/{} clips", total));
 
     let capture_gen = state.decode.group_generation;
     let decode_fps = state.decode_fps();
@@ -914,10 +1016,12 @@ fn cmd_decode_ltc_video_group(
     let spec = job::JobSpec {
         kind: JobKind::LtcGroupDecode,
         name: "ltc-group-decode",
-        units: (0..total).map(|_| job::UnitSpec {
-            weight: 1.0 / total as f32,
-            label: "clip".into(),
-        }).collect(),
+        units: (0..total)
+            .map(|_| job::UnitSpec {
+                weight: 1.0 / total as f32,
+                label: "clip".into(),
+            })
+            .collect(),
     };
     spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
         let cancel = ctx.cancel.inner().clone();
@@ -928,13 +1032,20 @@ fn cmd_decode_ltc_video_group(
             }
 
             let clip_unit = ctx.progress.unit(idx);
-            let clip_name = path.rsplit('/').next()
+            let clip_name = path
+                .rsplit('/')
+                .next()
                 .or_else(|| path.rsplit('\\').next())
                 .unwrap_or(path);
             clip_unit.set_label(clip_name.to_string());
             clip_unit.set_message(format!("Clip {}/{}", idx + 1, total));
 
-            info!("LTC group decode clip {}/{} started: {}", idx + 1, total, path);
+            info!(
+                "LTC group decode clip {}/{} started: {}",
+                idx + 1,
+                total,
+                path
+            );
             let result = crate::decode::decode_video_channel(
                 crate::decode::VideoDecodeRequest {
                     path: Path::new(path),
@@ -956,17 +1067,20 @@ fn cmd_decode_ltc_video_group(
             }
             ctx.progress.unit(idx).finish();
 
-            info!("LTC group decode clip {}/{} finished: {} — {}",
-                idx + 1, total, path,
+            info!(
+                "LTC group decode clip {}/{} finished: {} — {}",
+                idx + 1,
+                total,
+                path,
                 if result.is_ok() { "OK" } else { "FAILED" },
             );
 
-            ctx.emit(JobItem::ClipLtcResult {
-                index: idx,
-                result,
-            });
+            ctx.emit(JobItem::ClipLtcResult { index: idx, result });
         }
-        info!("LTC group decode thread finished — all {} clips processed", total);
+        info!(
+            "LTC group decode thread finished — all {} clips processed",
+            total
+        );
         Ok(JobFinal::NoPayload)
     });
 }
@@ -986,7 +1100,11 @@ fn cmd_parse_ltc_video(
     let decoder_name = if use_libltc { "libltc" } else { "builtin" };
     info!(
         "LTC video decode requested: {} (stream={}, channel={}, decoder={}, fps={})",
-        path, stream_index, channel_index, decoder_name, els.current.decode_fps(),
+        path,
+        stream_index,
+        channel_index,
+        decoder_name,
+        els.current.decode_fps(),
     );
 
     let state = &mut els.current;
@@ -998,7 +1116,9 @@ fn cmd_parse_ltc_video(
         path, stream_index, channel_index,
     );
     state.status.set_decode(msg.clone());
-    state.jobs.insert(JobKind::LtcDecode, JobStatus::running(msg));
+    state
+        .jobs
+        .insert(JobKind::LtcDecode, JobStatus::running(msg));
 
     let capture_gen = state.decode.generation;
     let decode_fps = state.decode_fps();
@@ -1034,8 +1154,14 @@ fn cmd_parse_ltc_video(
         kind: JobKind::LtcDecode,
         name: "ltc-video-decode",
         units: vec![
-            job::UnitSpec { weight: 0.5, label: "extract".into() },
-            job::UnitSpec { weight: 0.5, label: "decode".into() },
+            job::UnitSpec {
+                weight: 0.5,
+                label: "extract".into(),
+            },
+            job::UnitSpec {
+                weight: 0.5,
+                label: "decode".into(),
+            },
         ],
     };
     spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
@@ -1066,9 +1192,15 @@ fn cmd_parse_ltc_video(
         extract_unit.set_fraction(1.0);
 
         match result {
-            Ok(r) => Ok(JobFinal::Decode { result: Ok(r), path: PathBuf::from(&path_job) }),
+            Ok(r) => Ok(JobFinal::Decode {
+                result: Ok(r),
+                path: PathBuf::from(&path_job),
+            }),
             Err(LtcDecodeError::Cancelled) => Err(job::JobError::Cancelled),
-            Err(e) => Ok(JobFinal::Decode { result: Err(e), path: PathBuf::from(&path_job) }),
+            Err(e) => Ok(JobFinal::Decode {
+                result: Err(e),
+                path: PathBuf::from(&path_job),
+            }),
         }
     });
 }
@@ -1089,7 +1221,10 @@ impl std::fmt::Display for StreamSelectionError {
                 write!(f, "Stream {stream} not found")
             }
             StreamSelectionError::ChannelOutOfRange { channel, channels } => {
-                write!(f, "Channel {channel} out of range ({channels} channels available)")
+                write!(
+                    f,
+                    "Channel {channel} out of range ({channels} channels available)"
+                )
             }
         }
     }
@@ -1103,8 +1238,14 @@ fn validate_stream_channel_selection(
     stream_index: usize,
     channel_index: usize,
 ) -> Result<(), StreamSelectionError> {
-    match probe.streams.iter().find(|s| s.stream_index == stream_index) {
-        None => Err(StreamSelectionError::MissingStream { stream: stream_index }),
+    match probe
+        .streams
+        .iter()
+        .find(|s| s.stream_index == stream_index)
+    {
+        None => Err(StreamSelectionError::MissingStream {
+            stream: stream_index,
+        }),
         Some(s) if channel_index >= s.channels => Err(StreamSelectionError::ChannelOutOfRange {
             channel: channel_index,
             channels: s.channels,
@@ -1128,14 +1269,24 @@ fn cmd_parse_ltc_wav_file(
         .current
         .jobs
         .get(&JobKind::LtcDecode)
-        .map(|s| matches!(s.phase(), job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed))
+        .map(|s| {
+            matches!(
+                s.phase(),
+                job::JobPhase::Succeeded | job::JobPhase::Cancelled | job::JobPhase::Failed
+            )
+        })
         .unwrap_or(false);
     if supervisor.is_running(JobKind::LtcDecode) && !decode_phase_terminal {
         info!("LTC decode already in progress — ignoring duplicate ParseLtcWavFile");
         return;
     }
     let decoder_name = if use_libltc { "libltc" } else { "builtin" };
-    info!("LTC decode requested for: {} (decoder: {}, fps: {})", path, decoder_name, els.current.decode_fps());
+    info!(
+        "LTC decode requested for: {} (decoder: {}, fps: {})",
+        path,
+        decoder_name,
+        els.current.decode_fps()
+    );
 
     // Quick open to calculate chunk count
     let config = DecodeConfig::default();
@@ -1160,22 +1311,32 @@ fn cmd_parse_ltc_wav_file(
     state.decode.generation = state.decode.generation.wrapping_add(1);
     let msg = format!(
         "Decoding LTC from: {} [{}] at {:.2} fps ({} chunks)",
-        path, decoder_name, state.decode_fps(), chunk_count
+        path,
+        decoder_name,
+        state.decode_fps(),
+        chunk_count
     );
     state.status.set_decode(msg.clone());
-    state.jobs.insert(JobKind::LtcDecode, JobStatus::running(msg));
+    state
+        .jobs
+        .insert(JobKind::LtcDecode, JobStatus::running(msg));
 
     let decode_fps = state.decode_fps();
     let decode_drop_frame = state.decode_drop_frame();
 
-    info!("Spawning chunked decode ({} chunks, decoder={}, fps={})",
-        chunk_count, decoder_name, decode_fps);
+    info!(
+        "Spawning chunked decode ({} chunks, decoder={}, fps={})",
+        chunk_count, decoder_name, decode_fps
+    );
 
     let path_job = path.to_string();
     let spec = job::JobSpec {
         kind: JobKind::LtcDecode,
         name: "ltc-wav-decode",
-        units: vec![job::UnitSpec { weight: 1.0, label: "decode".into() }],
+        units: vec![job::UnitSpec {
+            weight: 1.0,
+            label: "decode".into(),
+        }],
     };
     spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
         let cancel = ctx.cancel.inner().clone();
@@ -1215,9 +1376,15 @@ fn cmd_parse_ltc_wav_file(
         let _ = dp_bridge.join();
 
         match result {
-            Ok(r) => Ok(JobFinal::Decode { result: Ok(r), path: PathBuf::from(path_job) }),
+            Ok(r) => Ok(JobFinal::Decode {
+                result: Ok(r),
+                path: PathBuf::from(path_job),
+            }),
             Err(LtcDecodeError::Cancelled) => Err(job::JobError::Cancelled),
-            Err(e) => Ok(JobFinal::Decode { result: Err(e), path: PathBuf::from(path_job) }),
+            Err(e) => Ok(JobFinal::Decode {
+                result: Err(e),
+                path: PathBuf::from(path_job),
+            }),
         }
     });
 }
@@ -1282,7 +1449,10 @@ fn ensure_audio_init(
                 state.sample_format_name = core.sample_format_name();
                 els.last_device_id = Some(device_id.clone());
                 els.recovery_attempts = 0;
-                info!("Audio initialized at {} Hz on device {}", actual_rate, device_id);
+                info!(
+                    "Audio initialized at {} Hz on device {}",
+                    actual_rate, device_id
+                );
                 return true;
             }
             Err(e) => {
@@ -1303,16 +1473,18 @@ fn ensure_audio_init(
         }
     }
 
-    error!("Audio init failed after {} attempts: {}", max_attempts, last_error);
-    state.status.set_audio(format!("Audio init failed: {}", last_error));
+    error!(
+        "Audio init failed after {} attempts: {}",
+        max_attempts, last_error
+    );
+    state
+        .status
+        .set_audio(format!("Audio init failed: {}", last_error));
     let _ = event_tx.send(AudioEvent::StreamError(last_error.clone()));
     false
 }
 
-fn try_init_device(
-    core: &AudioCore,
-    els: &mut EngineLoopState,
-) -> bool {
+fn try_init_device(core: &AudioCore, els: &mut EngineLoopState) -> bool {
     let state = &mut els.current;
     let device_id = match &state.selected_device {
         Some(id) if state.devices.iter().any(|d| &d.id == id) => id.clone(),
@@ -1396,12 +1568,17 @@ fn handle_event(
             // wait for OS driver cleanup, then re-init and restart if playing.
             // The scheduler watchdog already exhausted 3 soft-recovery attempts
             // before emitting StreamDead, so this is the final hard reset.
-            els.current.status.set_audio("Stream dead — performing hard reset");
+            els.current
+                .status
+                .set_audio("Stream dead — performing hard reset");
             attempt_recovery(core, els, event_tx);
         }
         Some(RecoveryAction::Attempt { next }) => {
             els.recovery_attempts = next;
-            els.current.status.set_audio(format!("Recovery attempt {}/{}", next, MAX_RECOVERY_ATTEMPTS));
+            els.current.status.set_audio(format!(
+                "Recovery attempt {}/{}",
+                next, MAX_RECOVERY_ATTEMPTS
+            ));
             attempt_recovery(core, els, event_tx);
         }
         Some(RecoveryAction::Exhausted) => {
@@ -1414,11 +1591,7 @@ fn handle_event(
     let _ = event_tx.send(event);
 }
 
-fn attempt_recovery(
-    core: &AudioCore,
-    els: &mut EngineLoopState,
-    event_tx: &Sender<AudioEvent>,
-) {
+fn attempt_recovery(core: &AudioCore, els: &mut EngineLoopState, event_tx: &Sender<AudioEvent>) {
     let was_playing = els.current.is_playing;
     let stored_tc = els.current.current_timecode;
 
@@ -1484,7 +1657,10 @@ fn apply_ffmpeg_probe_result(current: &mut AppStateSnapshot, caps: FfmpegCapabil
 /// spawned are also stale (defensive). Stale-result gating: without this,
 /// a cancelled job's late Finished event would clobber the state written
 /// by its replacement.
-fn job_event_is_stale(latest_job: &std::collections::HashMap<JobKind, job::JobId>, event: &JobEvent) -> bool {
+fn job_event_is_stale(
+    latest_job: &std::collections::HashMap<JobKind, job::JobId>,
+    event: &JobEvent,
+) -> bool {
     let (event_job, event_kind) = match event {
         JobEvent::Finished { job, kind, .. } => (*job, *kind),
         JobEvent::Item { job, kind, .. } => (*job, *kind),
@@ -1492,13 +1668,14 @@ fn job_event_is_stale(latest_job: &std::collections::HashMap<JobKind, job::JobId
     latest_job.get(&event_kind) != Some(&event_job)
 }
 
-fn handle_job_event(
-    els: &mut EngineLoopState,
-    supervisor: &mut JobSupervisor,
-    event: JobEvent,
-) {
+fn handle_job_event(els: &mut EngineLoopState, supervisor: &mut JobSupervisor, event: JobEvent) {
     match event {
-        JobEvent::Finished { kind, outcome, payload, .. } => match kind {
+        JobEvent::Finished {
+            kind,
+            outcome,
+            payload,
+            ..
+        } => match kind {
             JobKind::Conversion => on_conversion_finished(els, outcome, payload),
             JobKind::FfmpegCapProbe => on_ffmpeg_caps_finished(els, supervisor, outcome, payload),
             JobKind::HwValidate => on_hw_validate_finished(els, outcome, payload),
@@ -1530,7 +1707,10 @@ fn on_conversion_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
         status.apply_outcome(&outcome);
     }
     let payload = match payload {
-        JobFinal::Conversion { encoder_used, steps_attempted } => {
+        JobFinal::Conversion {
+            encoder_used,
+            steps_attempted,
+        } => {
             info!(
                 "Conversion finished: encoder_used={:?}, steps_attempted={}",
                 encoder_used, steps_attempted,
@@ -1538,7 +1718,10 @@ fn on_conversion_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
             Some(encoder_used)
         }
         other => {
-            warn!("JobKind::Conversion finished with unexpected payload: {:?}", other);
+            warn!(
+                "JobKind::Conversion finished with unexpected payload: {:?}",
+                other
+            );
             None
         }
     };
@@ -1546,9 +1729,10 @@ fn on_conversion_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
         (Some(encoder_used), JobOutcome::Succeeded { .. }) => {
             recompute_converter_derived(&mut els.current);
             match encoder_used {
-                Some(enc) => els.current.status.set_converter(
-                    format!("Conversion completed — video encoder: {}", enc),
-                ),
+                Some(enc) => els
+                    .current
+                    .status
+                    .set_converter(format!("Conversion completed — video encoder: {}", enc)),
                 None => els.current.status.set_converter("Conversion completed"),
             }
             info!("Engine-owned conversion completed successfully (job)");
@@ -1568,7 +1752,9 @@ fn on_conversion_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
                 status.error = Some(error.clone());
             }
             recompute_converter_derived(&mut els.current);
-            els.current.status.set_converter(format!("Conversion failed: {}", error));
+            els.current
+                .status
+                .set_converter(format!("Conversion failed: {}", error));
             warn!("Engine-owned conversion failed: {}", error);
         }
     }
@@ -1584,14 +1770,19 @@ fn on_ffmpeg_caps_finished(
         status.apply_outcome(&outcome);
     }
     match payload {
-        JobFinal::FfmpegCaps { caps: Some(full_caps) } => {
+        JobFinal::FfmpegCaps {
+            caps: Some(full_caps),
+        } => {
             // Stage 1: publish the caps with all HW encoders withheld, except
             // those vouched for by a key-matching validation cache. No codec's
             // encoder chain empties without its HW candidates (every codec has
             // a software fallback), so no readiness blocker appears.
             let cache = hw_cache::cache_dir().and_then(|dir| hw_cache::load_hw_cache(&dir));
             let published = hw_cache::publish_stage1_caps(&full_caps, cache.as_ref());
-            let withheld = full_caps.available_encoders.len().saturating_sub(published.available_encoders.len());
+            let withheld = full_caps
+                .available_encoders
+                .len()
+                .saturating_sub(published.available_encoders.len());
             info!(
                 "stage-1 caps published: {} encoder(s) ({} HW encoder(s) withheld pending validation)",
                 published.available_encoders.len(),
@@ -1606,7 +1797,10 @@ fn on_ffmpeg_caps_finished(
             warn!("FFmpeg capability probe returned no caps");
             recompute_converter_derived(&mut els.current);
         }
-        other => warn!("JobKind::FfmpegCapProbe finished with unexpected payload: {:?}", other),
+        other => warn!(
+            "JobKind::FfmpegCapProbe finished with unexpected payload: {:?}",
+            other
+        ),
     }
 }
 
@@ -1671,7 +1865,10 @@ fn on_hw_validate_finished(els: &mut EngineLoopState, outcome: JobOutcome, paylo
         JobFinal::FfmpegCaps { caps: None } => {
             warn!("HW validation returned no caps");
         }
-        other => warn!("JobKind::HwValidate finished with unexpected payload: {:?}", other),
+        other => warn!(
+            "JobKind::HwValidate finished with unexpected payload: {:?}",
+            other
+        ),
     }
 }
 
@@ -1688,16 +1885,25 @@ fn on_folder_scan_finished(
         JobFinal::FolderScan { path, groups } => {
             if Some(&path) == els.current.converter.groups_folder.as_ref() {
                 els.current.converter.groups = groups;
-                info!("Folder scan complete: {} group(s)", els.current.converter.groups.len());
+                info!(
+                    "Folder scan complete: {} group(s)",
+                    els.current.converter.groups.len()
+                );
                 if let Some(idx) = els.pending_recording.take() {
-                    info!("Applying deferred SelectRecording({}) after folder scan", idx);
+                    info!(
+                        "Applying deferred SelectRecording({}) after folder scan",
+                        idx
+                    );
                     apply_recording_selection(els, supervisor, idx);
                 }
             } else {
                 warn!("Discarding stale supervisor folder scan result (path mismatch)");
             }
         }
-        other => warn!("JobKind::FolderScan finished with unexpected payload: {:?}", other),
+        other => warn!(
+            "JobKind::FolderScan finished with unexpected payload: {:?}",
+            other
+        ),
     }
 }
 
@@ -1717,16 +1923,25 @@ fn on_video_probe_finished(els: &mut EngineLoopState, outcome: JobOutcome, paylo
                     probe.streams.len(),
                     probe.total_audio_channels,
                 ));
-                info!("Video probe succeeded (job): {} streams, {} channels", probe.streams.len(), probe.total_audio_channels);
+                info!(
+                    "Video probe succeeded (job): {} streams, {} channels",
+                    probe.streams.len(),
+                    probe.total_audio_channels
+                );
             }
             Err(e) => {
                 els.current.decode.probe = None;
                 els.current.decode.error = Some(e.clone());
-                els.current.status.set_decode(format!("Video probe failed: {}", e));
+                els.current
+                    .status
+                    .set_decode(format!("Video probe failed: {}", e));
                 error!("Video probe failed (job): {}", e);
             }
         },
-        other => warn!("JobKind::VideoProbe finished with unexpected payload: {:?}", other),
+        other => warn!(
+            "JobKind::VideoProbe finished with unexpected payload: {:?}",
+            other
+        ),
     }
 }
 
@@ -1742,12 +1957,16 @@ fn on_offload_scan_finished(
     let mut cards = match payload {
         JobFinal::OffloadScan { cards } => cards,
         other => {
-            warn!("JobKind::OffloadScan finished with unexpected payload: {:?}", other);
+            warn!(
+                "JobKind::OffloadScan finished with unexpected payload: {:?}",
+                other
+            );
             return;
         }
     };
     // Apply default selection (latest recording day) to each card.
-    let file_paths: Vec<PathBuf> = cards.iter()
+    let file_paths: Vec<PathBuf> = cards
+        .iter()
         .flat_map(|c| c.files.iter().map(|f| f.path.clone()))
         .collect();
     for card in &mut cards {
@@ -1756,8 +1975,7 @@ fn on_offload_scan_finished(
     }
     els.current.offload.cards = cards;
     els.current.offload.file_durations.clear();
-    els.current.offload.durations_version =
-        els.current.offload.durations_version.wrapping_add(1);
+    els.current.offload.durations_version = els.current.offload.durations_version.wrapping_add(1);
 
     if els.current.offload.cards.is_empty() {
         info!(
@@ -1795,8 +2013,7 @@ fn on_duration_result(els: &mut EngineLoopState, path: PathBuf, secs: Option<f64
     els.current.file_durations.insert(path.clone(), secs);
     // Write to offload file_durations
     els.current.offload.file_durations.insert(path, secs);
-    els.current.offload.durations_version =
-        els.current.offload.durations_version.wrapping_add(1);
+    els.current.offload.durations_version = els.current.offload.durations_version.wrapping_add(1);
 }
 
 fn on_duration_probe_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
@@ -1805,7 +2022,10 @@ fn on_duration_probe_finished(els: &mut EngineLoopState, outcome: JobOutcome, pa
     }
     match payload {
         JobFinal::DurationsDone => info!("Duration probe complete"),
-        other => warn!("JobKind::DurationProbe finished with unexpected payload: {:?}", other),
+        other => warn!(
+            "JobKind::DurationProbe finished with unexpected payload: {:?}",
+            other
+        ),
     }
 }
 
@@ -1816,7 +2036,10 @@ fn on_offload_copy_finished(els: &mut EngineLoopState, outcome: JobOutcome, payl
     let completed_devices = match payload {
         JobFinal::OffloadCopy { completed_devices } => completed_devices,
         other => {
-            warn!("JobKind::OffloadCopy finished with unexpected payload: {:?}", other);
+            warn!(
+                "JobKind::OffloadCopy finished with unexpected payload: {:?}",
+                other
+            );
             return;
         }
     };
@@ -1868,7 +2091,10 @@ fn on_ltc_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
     let (result, path) = match payload {
         JobFinal::Decode { result, path } => (result, path),
         other => {
-            warn!("JobKind::LtcDecode finished with unexpected payload: {:?}", other);
+            warn!(
+                "JobKind::LtcDecode finished with unexpected payload: {:?}",
+                other
+            );
             return;
         }
     };
@@ -1879,15 +2105,21 @@ fn on_ltc_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
             info!(
                 "LTC decode result: path={}, fps={:.2}, valid={}/{}, \
                  confidence={:.1}%, first_ltc_timecode_secs={:.3}s",
-                path.display(), r.detected_fps, r.valid_frames, r.total_possible_frames,
-                r.avg_confidence * 100.0, first_offset,
+                path.display(),
+                r.detected_fps,
+                r.valid_frames,
+                r.total_possible_frames,
+                r.avg_confidence * 100.0,
+                first_offset,
             );
             els.current.decode.result = Some(r.clone());
             els.current.decode.error = None;
             let summary = format!(
                 "LTC decode: {} frames (confidence {:.1}%, {} fps{})",
-                r.valid_frames, r.avg_confidence * 100.0,
-                r.detected_fps, if r.drop_frame { " DF" } else { "" },
+                r.valid_frames,
+                r.avg_confidence * 100.0,
+                r.detected_fps,
+                if r.drop_frame { " DF" } else { "" },
             );
             els.current.status.set_decode(summary);
             if generation > els.last_auto_applied_ltc_gen {
@@ -1905,29 +2137,48 @@ fn on_ltc_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
             let msg = e.to_string();
             els.current.decode.result = None;
             els.current.decode.error = Some(msg.clone());
-            els.current.status.set_decode(format!("Parse failed: {}", msg));
+            els.current
+                .status
+                .set_decode(format!("Parse failed: {}", msg));
             error!("LTC decode failed: {} — {}", path.display(), msg);
         }
     }
 }
 
-fn on_group_clip_result(els: &mut EngineLoopState, index: usize, result: Result<Box<LtcDetectionResult>, String>) {
+fn on_group_clip_result(
+    els: &mut EngineLoopState,
+    index: usize,
+    result: Result<Box<LtcDetectionResult>, String>,
+) {
     if els.current.decode.group_results.len() > index {
         els.current.decode.group_results[index] = ClipDecodeState::Done(result);
-        let done = els.current.decode.group_results.iter().filter(|r| r.is_done()).count();
+        let done = els
+            .current
+            .decode
+            .group_results
+            .iter()
+            .filter(|r| r.is_done())
+            .count();
         els.current.status.set_decode(format!(
             "Decoding group: {}/{} clips",
-            done, els.current.decode.group_results.len(),
+            done,
+            els.current.decode.group_results.len(),
         ));
         if let ClipDecodeState::Done(Ok(r)) = &els.current.decode.group_results[index] {
             info!(
                 "LTC group decode [{}/{}]: {} frames (confidence {:.1}%)",
-                done, els.current.decode.group_results.len(),
-                r.valid_frames, r.avg_confidence * 100.0,
+                done,
+                els.current.decode.group_results.len(),
+                r.valid_frames,
+                r.avg_confidence * 100.0,
             );
         } else if let ClipDecodeState::Done(Err(e)) = &els.current.decode.group_results[index] {
-            warn!("LTC group decode [{}/{}]: failed: {}",
-                done, els.current.decode.group_results.len(), e);
+            warn!(
+                "LTC group decode [{}/{}]: failed: {}",
+                done,
+                els.current.decode.group_results.len(),
+                e
+            );
         }
     }
 }
@@ -1937,30 +2188,47 @@ fn on_group_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payl
         status.apply_outcome(&outcome);
     }
     if !matches!(payload, JobFinal::NoPayload) {
-        warn!("JobKind::LtcGroupDecode finished with unexpected payload: {:?}", payload);
+        warn!(
+            "JobKind::LtcGroupDecode finished with unexpected payload: {:?}",
+            payload
+        );
     }
     // When the user cancelled and a new decode was spawned,
     // this event is already rejected by the latest_job gate above.
     let total = els.current.decode.group_results.len();
-    let successes = els.current.decode.group_results.iter().filter(|r| r.ok().is_some()).count();
+    let successes = els
+        .current
+        .decode
+        .group_results
+        .iter()
+        .filter(|r| r.ok().is_some())
+        .count();
     let failures = total - successes;
     let gen = els.current.decode.group_generation;
     let tc_info = if successes > 0 {
         if let Some(ClipDecodeState::Done(Ok(r))) = els.current.decode.group_results.first() {
             format!(
                 "{} clips decoded ({} ok, {} fail) — {} fps{}",
-                total, successes, failures,
-                r.detected_fps, if r.drop_frame { " DF" } else { "" },
+                total,
+                successes,
+                failures,
+                r.detected_fps,
+                if r.drop_frame { " DF" } else { "" },
             )
         } else {
-            format!("{} clips decoded ({} ok, {} fail)", total, successes, failures)
+            format!(
+                "{} clips decoded ({} ok, {} fail)",
+                total, successes, failures
+            )
         }
     } else {
         format!("Group decode complete (all {} clips failed)", failures)
     };
     els.current.status.set_decode(tc_info);
-    info!("LTC group decode complete: {}/{} ok, {}/{} failed",
-        successes, total, failures, total);
+    info!(
+        "LTC group decode complete: {}/{} ok, {}/{} failed",
+        successes, total, failures, total
+    );
     if gen > els.last_auto_applied_group_ltc_gen {
         auto_apply_group_ltc_to_settings(&mut els.current);
         els.last_auto_applied_group_ltc_gen = gen;
@@ -1973,9 +2241,16 @@ fn on_clip_probes_finished(els: &mut EngineLoopState, outcome: JobOutcome, paylo
         status.apply_outcome(&outcome);
     }
     let (probes, cameras, device_name) = match payload {
-        JobFinal::ClipProbes { probes, cameras, device_name } => (probes, cameras, device_name),
+        JobFinal::ClipProbes {
+            probes,
+            cameras,
+            device_name,
+        } => (probes, cameras, device_name),
         other => {
-            warn!("JobKind::ClipProbe finished with unexpected payload: {:?}", other);
+            warn!(
+                "JobKind::ClipProbe finished with unexpected payload: {:?}",
+                other
+            );
             return;
         }
     };
@@ -1987,7 +2262,10 @@ fn on_clip_probes_finished(els: &mut EngineLoopState, outcome: JobOutcome, paylo
         els.current.converter.probes = probes.iter().map(|r| r.as_ref().ok().cloned()).collect();
         els.current.converter.camera_meta = cameras;
         els.current.converter.device_name = device_name;
-        info!("Converter clip probe complete: {} files", els.current.converter.probes.len());
+        info!(
+            "Converter clip probe complete: {} files",
+            els.current.converter.probes.len()
+        );
         if video_group_selected(&els.current) {
             reconcile_channel_map_to_probe(&mut els.current);
         }
@@ -1997,7 +2275,9 @@ fn on_clip_probes_finished(els: &mut EngineLoopState, outcome: JobOutcome, paylo
 
 /// True when the currently selected converter group is a video clip sequence.
 fn video_group_selected(state: &AppStateSnapshot) -> bool {
-    state.converter.selected_group_idx
+    state
+        .converter
+        .selected_group_idx
         .and_then(|i| state.converter.groups.get(i))
         .map(|g| g.recording_type == RecordingType::VideoClipSequence)
         .unwrap_or(false)
@@ -2016,18 +2296,30 @@ fn seed_decode_state_from_probes(
         state.decode.selected_channel = 0;
         state.decode.error = None;
     } else {
-        let err = probes.iter().find_map(|r| {
-            if let Err(ref e) = r { Some(e.clone()) } else { None }
-        }).unwrap_or_else(|| "No audio streams detected.".to_string());
+        let err = probes
+            .iter()
+            .find_map(|r| {
+                if let Err(ref e) = r {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "No audio streams detected.".to_string());
         state.decode.error = Some(format!("LTC source probe failed: {}", err));
-        state.status.set_decode(format!("Video probe failed: {}", err));
+        state
+            .status
+            .set_decode(format!("Video probe failed: {}", err));
     }
 }
 
 /// Resize the channel map to the first probed clip's audio channel count
 /// (video groups only; the map starts from an 8-channel identity default).
 fn reconcile_channel_map_to_probe(state: &mut AppStateSnapshot) {
-    let probe_channels = state.converter.probes.first()
+    let probe_channels = state
+        .converter
+        .probes
+        .first()
         .and_then(|p| p.as_ref())
         .map(|p| p.total_audio_channels);
     let map_channels = state.converter.settings.channel_map.num_channels();
@@ -2057,7 +2349,10 @@ fn handle_offload_command(
             let spec = job::JobSpec {
                 kind: JobKind::OffloadScan,
                 name: "offload-scan",
-                units: vec![job::UnitSpec { weight: 1.0, label: "scan".into() }],
+                units: vec![job::UnitSpec {
+                    weight: 1.0,
+                    label: "scan".into(),
+                }],
             };
             spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
                 run_offload_scan_job_with(ctx, |cancel, progress| scan_seam(cancel, progress))
@@ -2094,7 +2389,9 @@ fn handle_offload_command(
                 if file_idx < card.selected.len() {
                     card.selected[file_idx] = selected;
                     card.selected_count = card.selected.iter().filter(|&&s| s).count();
-                    card.selected_bytes = card.files.iter()
+                    card.selected_bytes = card
+                        .files
+                        .iter()
                         .zip(card.selected.iter())
                         .filter(|(_, &sel)| sel)
                         .map(|(f, _)| f.size_bytes)
@@ -2131,7 +2428,8 @@ fn handle_offload_command(
                 Some(p) => p,
                 None => {
                     state.offload.error = Some("No parent folder selected.".to_string());
-                    state.offload.plan_error = Some(crate::offload::OffloadPlanError::NoParentFolder);
+                    state.offload.plan_error =
+                        Some(crate::offload::OffloadPlanError::NoParentFolder);
                     return;
                 }
             };
@@ -2166,10 +2464,13 @@ fn handle_offload_command(
             let spec = job::JobSpec {
                 kind: JobKind::OffloadCopy,
                 name: "offload-copy",
-                units: names_job.iter().map(|n| job::UnitSpec {
-                    weight: 1.0 / names_job.len() as f32,
-                    label: n.clone(),
-                }).collect(),
+                units: names_job
+                    .iter()
+                    .map(|n| job::UnitSpec {
+                        weight: 1.0 / names_job.len() as f32,
+                        label: n.clone(),
+                    })
+                    .collect(),
             };
             spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
                 run_offload_copy_job(ctx, plans_job, names_job, dest_parent_job)
@@ -2192,11 +2493,17 @@ fn handle_offload_command(
 fn recompute_converter_derived(state: &mut AppStateSnapshot) {
     let has_group = state.converter.selected_group_idx.is_some();
     let prefix_empty = state.converter.settings.filename_prefix.is_empty();
-    let output_empty = state.converter.settings.output_folder.as_os_str().is_empty();
+    let output_empty = state
+        .converter
+        .settings
+        .output_folder
+        .as_os_str()
+        .is_empty();
     let caps = state.ffmpeg_caps.clone();
 
     // Readiness — no mutable borrow of converter yet
-    let blockers = evaluate_readiness(has_group, prefix_empty, output_empty, caps.as_ref()).blockers;
+    let blockers =
+        evaluate_readiness(has_group, prefix_empty, output_empty, caps.as_ref()).blockers;
 
     // Compute warnings via a temporary settings assembly. The output preview
     // is only needed here (as input to the duplicate-name warning); the GUIs
@@ -2247,7 +2554,10 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
             (0..group.files.len()).map(|_| meta.clone()).collect()
         } else if !state.decode.group_results.is_empty() {
             // Group decode — one per clip
-            state.decode.group_results.iter()
+            state
+                .decode
+                .group_results
+                .iter()
                 .map(|r| r.ok().and_then(crate::converter::start_timecode_from_ltc))
                 .collect()
         } else {
@@ -2266,7 +2576,10 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
         let native_fps = state.fps();
         let native_df = state.drop_frame();
         for (i, meta) in timecode_meta_per_file.iter_mut().enumerate() {
-            let camera_native = state.converter.camera_meta.get(i)
+            let camera_native = state
+                .converter
+                .camera_meta
+                .get(i)
                 .and_then(|c| c.as_ref())
                 .and_then(|c| c.native_timecode.as_ref())
                 .and_then(|s| crate::converter::timecode::parse_native_timecode(s));
@@ -2274,22 +2587,30 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
                 (Some(ltc_meta), Some(native_tc)) => {
                     if ltc_meta.start != native_tc {
                         let ltc_str = crate::converter::format_ffmpeg_timecode(
-                            &ltc_meta.start, ltc_meta.drop_frame);
+                            &ltc_meta.start,
+                            ltc_meta.drop_frame,
+                        );
                         log::warn!(
                             "Native camera TC differs from LTC decode for file {}: \
                              native={:02}:{:02}:{:02}:{:02}, LTC={}",
                             i,
-                            native_tc.hours, native_tc.minutes, native_tc.seconds,
-                            native_tc.frames, ltc_str,
+                            native_tc.hours,
+                            native_tc.minutes,
+                            native_tc.seconds,
+                            native_tc.frames,
+                            ltc_str,
                         );
                     }
                 }
                 (None, Some(native_tc)) => {
-                    let tc_str = format!("{:02}:{:02}:{:02}:{:02}",
-                        native_tc.hours, native_tc.minutes, native_tc.seconds, native_tc.frames);
+                    let tc_str = format!(
+                        "{:02}:{:02}:{:02}:{:02}",
+                        native_tc.hours, native_tc.minutes, native_tc.seconds, native_tc.frames
+                    );
                     log::info!(
                         "Using native camera timecode {} for file {} (LTC decode: none)",
-                        tc_str, i
+                        tc_str,
+                        i
                     );
                     *meta = Some(crate::converter::TimecodeMetadata {
                         start: native_tc,
@@ -2318,7 +2639,10 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
             log::info!(
                 "Repaired stale channel map: identity({}) → identity({}) \
                  for MultiTrackAudio group '{}' ({} files)",
-                s.channel_map.num_channels(), correct_n, group.prefix, correct_n,
+                s.channel_map.num_channels(),
+                correct_n,
+                group.prefix,
+                correct_n,
             );
             ChannelMap::identity(correct_n)
         } else {
@@ -2389,15 +2713,25 @@ fn apply_recording_selection(
     state.converter.camera_meta.clear();
     state.converter.device_name = None;
     state.converter.probes_generation += 1;
-    state.jobs.entry(JobKind::Conversion).or_insert_with(JobStatus::idle);
-    state.jobs.entry(JobKind::ClipProbe).or_insert_with(JobStatus::idle);
+    state
+        .jobs
+        .entry(JobKind::Conversion)
+        .or_insert_with(JobStatus::idle);
+    state
+        .jobs
+        .entry(JobKind::ClipProbe)
+        .or_insert_with(JobStatus::idle);
     // Reset per-recording settings flags
-    let channel_count = state.converter.groups.get(idx)
+    let channel_count = state
+        .converter
+        .groups
+        .get(idx)
         .map(|g| {
             if g.recording_type == RecordingType::MultiTrackAudio {
                 log::info!(
                     "Setting channel map to identity({}) for MultiTrackAudio group '{}'",
-                    g.files.len(), g.prefix,
+                    g.files.len(),
+                    g.prefix,
                 );
                 g.files.len()
             } else {
@@ -2416,7 +2750,10 @@ fn apply_recording_selection(
     // (scan root or one of its subdirectories).  Re-defaults on every
     // recording selection unless the user has manually set it.
     if !s.output_folder_user_set {
-        let record_dir = state.converter.groups.get(idx)
+        let record_dir = state
+            .converter
+            .groups
+            .get(idx)
             .and_then(|g| g.files.first())
             .and_then(|f| f.parent())
             .map(|p| p.to_path_buf())
@@ -2464,7 +2801,11 @@ fn apply_recording_selection(
         spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
             ctx.progress.set_indeterminate(true);
             let (probes, cameras, device_name) = crate::clip_probe::probe_clip_set(&files);
-            Ok(JobFinal::ClipProbes { probes, cameras, device_name: Some(device_name) })
+            Ok(JobFinal::ClipProbes {
+                probes,
+                cameras,
+                device_name: Some(device_name),
+            })
         });
     } else {
         warn!(
@@ -2488,7 +2829,11 @@ fn auto_apply_ltc_to_settings(state: &mut AppStateSnapshot, decoded_path: &str) 
         .selected_group_idx
         .and_then(|gi| state.converter.groups.get(gi))
         .filter(|g| g.recording_type == RecordingType::MultiTrackAudio)
-        .and_then(|g| g.files.iter().position(|f| f.to_string_lossy() == decoded_path))
+        .and_then(|g| {
+            g.files
+                .iter()
+                .position(|f| f.to_string_lossy() == decoded_path)
+        })
     {
         state.converter.settings.ltc_file_idx = idx;
         info!(
@@ -2506,12 +2851,12 @@ fn auto_apply_group_ltc_to_settings(state: &mut AppStateSnapshot) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use audio_core::ChannelSel;
     use super::*;
     use crate::converter::HwDeviceCapabilities;
-    use crate::file_pattern::MatchedGroup;
     use crate::ffprobe::AudioStreamInfo;
+    use crate::file_pattern::MatchedGroup;
+    use audio_core::ChannelSel;
+    use std::path::PathBuf;
 
     // ── re-decode after cancel (one-tick reaping window) ─────────────────
 
@@ -2546,7 +2891,11 @@ mod tests {
         // for the whole test (the unreaped-thread window).
         spawn_job::<JobFinal, _>(
             &mut sup,
-            JobSpec { kind: crate::job::JobKind::LtcDecode, name: "parked decode", units: vec![] },
+            JobSpec {
+                kind: crate::job::JobKind::LtcDecode,
+                name: "parked decode",
+                units: vec![],
+            },
             move |_ctx| {
                 while !parked_cancel.is_cancelled() {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2560,27 +2909,34 @@ mod tests {
         // The engine published the terminal Cancelled phase for the previous job.
         let mut status = JobStatus::running("decode");
         status.progress.phase = JobPhase::Cancelled;
-        els.current.jobs.insert(crate::job::JobKind::LtcDecode, status);
+        els.current
+            .jobs
+            .insert(crate::job::JobKind::LtcDecode, status);
 
         cmd_parse_ltc_wav_file(&mut els, &mut sup, wav.to_str().unwrap(), false);
 
         let respawned = *sup.latest_job.get(&crate::job::JobKind::LtcDecode).unwrap();
-        assert_ne!(respawned, parked_id,
-            "a re-decode must spawn a new job once the published phase is terminal");
+        assert_ne!(
+            respawned, parked_id,
+            "a re-decode must spawn a new job once the published phase is terminal"
+        );
         cancel.cancel();
         sup.shutdown(std::time::Duration::from_secs(5));
     }
 
     // ── job_event_is_stale (stale-event gate) ────────────────────────────
 
-    use crate::job::{JobId, JobItem, JobOutcome, JobFinal};
+    use crate::job::{JobFinal, JobId, JobItem, JobOutcome};
 
     fn finished(kind: JobKind, job: u64) -> JobEvent {
         JobEvent::Finished {
             job: JobId(job),
             kind,
             outcome: JobOutcome::Succeeded { log: String::new() },
-            payload: JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
+            payload: JobFinal::Conversion {
+                encoder_used: None,
+                steps_attempted: 1,
+            },
         }
     }
 
@@ -2588,7 +2944,10 @@ mod tests {
         JobEvent::Item {
             job: JobId(job),
             kind,
-            item: JobItem::DurationResult { path: PathBuf::from("x"), secs: Some(1.0) },
+            item: JobItem::DurationResult {
+                path: PathBuf::from("x"),
+                secs: Some(1.0),
+            },
         }
     }
 
@@ -2596,34 +2955,49 @@ mod tests {
     fn stale_finished_event_is_rejected() {
         let mut latest = std::collections::HashMap::new();
         latest.insert(JobKind::LtcDecode, JobId(2));
-        assert!(job_event_is_stale(&latest, &finished(JobKind::LtcDecode, 1)));
+        assert!(job_event_is_stale(
+            &latest,
+            &finished(JobKind::LtcDecode, 1)
+        ));
     }
 
     #[test]
     fn fresh_finished_event_passes() {
         let mut latest = std::collections::HashMap::new();
         latest.insert(JobKind::LtcDecode, JobId(2));
-        assert!(!job_event_is_stale(&latest, &finished(JobKind::LtcDecode, 2)));
+        assert!(!job_event_is_stale(
+            &latest,
+            &finished(JobKind::LtcDecode, 2)
+        ));
     }
 
     #[test]
     fn stale_item_event_is_rejected() {
         let mut latest = std::collections::HashMap::new();
         latest.insert(JobKind::DurationProbe, JobId(7));
-        assert!(job_event_is_stale(&latest, &item(JobKind::DurationProbe, 6)));
+        assert!(job_event_is_stale(
+            &latest,
+            &item(JobKind::DurationProbe, 6)
+        ));
     }
 
     #[test]
     fn fresh_item_event_passes() {
         let mut latest = std::collections::HashMap::new();
         latest.insert(JobKind::DurationProbe, JobId(7));
-        assert!(!job_event_is_stale(&latest, &item(JobKind::DurationProbe, 7)));
+        assert!(!job_event_is_stale(
+            &latest,
+            &item(JobKind::DurationProbe, 7)
+        ));
     }
 
     #[test]
     fn event_for_never_spawned_kind_is_stale() {
         let latest: std::collections::HashMap<JobKind, JobId> = std::collections::HashMap::new();
-        assert!(job_event_is_stale(&latest, &finished(JobKind::Conversion, 1)));
+        assert!(job_event_is_stale(
+            &latest,
+            &finished(JobKind::Conversion, 1)
+        ));
         assert!(job_event_is_stale(&latest, &item(JobKind::Conversion, 1)));
     }
 
@@ -2650,33 +3024,75 @@ mod tests {
         use crate::command::ConverterCommand;
         let mut s = crate::state::ConverterUserSettings::initial();
 
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetMetadataOnly(true)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetMetadataOnly(true)
+        ));
         assert!(s.metadata_only);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetGenerateSyntheticVideo(true)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetGenerateSyntheticVideo(true)
+        ));
         assert!(s.generate_synthetic_video);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetCopyVideo(true)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetCopyVideo(true)
+        ));
         assert!(s.copy_video);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetSplitTracks(true)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetSplitTracks(true)
+        ));
         assert!(s.split_tracks);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetDropLtcTrack(true)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetDropLtcTrack(true)
+        ));
         assert!(s.drop_ltc_track);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetConcatAudio(true)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetConcatAudio(true)
+        ));
         assert!(s.concat_audio);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetStartFromLtc(true)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetStartFromLtc(true)
+        ));
         assert!(s.set_start_from_ltc);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetEmbedCameraMetadata(false)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetEmbedCameraMetadata(false)
+        ));
         assert!(!s.embed_camera_metadata);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetLtcFileIndex(3)));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetLtcFileIndex(3)
+        ));
         assert_eq!(s.ltc_file_idx, 3);
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetVideoCodec("av1".into())));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetVideoCodec("av1".into())
+        ));
         assert_eq!(s.video_encoder, "av1");
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetAudioEncoder("aac".into())));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetAudioEncoder("aac".into())
+        ));
         assert_eq!(s.audio_encoder, "aac");
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetFilenamePrefix("pre".into())));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetFilenamePrefix("pre".into())
+        ));
         assert_eq!(s.filename_prefix, "pre");
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetAudioSuffixTemplate("_a".into())));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetAudioSuffixTemplate("_a".into())
+        ));
         assert_eq!(s.audio_suffix_template, "_a");
-        assert!(apply_simple_converter_setting(&mut s, &ConverterCommand::SetVideoSuffixTemplate("_v".into())));
+        assert!(apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetVideoSuffixTemplate("_v".into())
+        ));
         assert_eq!(s.video_suffix_template, "_v");
     }
 
@@ -2686,14 +3102,38 @@ mod tests {
         let mut s = crate::state::ConverterUserSettings::initial();
         let before = s.clone();
 
-        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SetContainer("mkv".into())));
-        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SwapChannelMapCells(0, 1)));
-        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SetOutputFolder(PathBuf::from("/x"))));
-        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SelectFolder(PathBuf::from("/x"))));
-        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::SelectRecording(0)));
-        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::StartConversion));
-        assert!(!apply_simple_converter_setting(&mut s, &ConverterCommand::CancelConversion));
-        assert_eq!(s, before, "special commands must not mutate settings in the simple setter");
+        assert!(!apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetContainer("mkv".into())
+        ));
+        assert!(!apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SwapChannelMapCells(0, 1)
+        ));
+        assert!(!apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SetOutputFolder(PathBuf::from("/x"))
+        ));
+        assert!(!apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SelectFolder(PathBuf::from("/x"))
+        ));
+        assert!(!apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::SelectRecording(0)
+        ));
+        assert!(!apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::StartConversion
+        ));
+        assert!(!apply_simple_converter_setting(
+            &mut s,
+            &ConverterCommand::CancelConversion
+        ));
+        assert_eq!(
+            s, before,
+            "special commands must not mutate settings in the simple setter"
+        );
     }
 
     // ── job-event handlers ───────────────────────────────────────────────
@@ -2720,44 +3160,81 @@ mod tests {
     #[test]
     fn on_conversion_finished_consumes_encoder_used() {
         let mut els = EngineLoopState::new(AppStateSnapshot::initial());
-        els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
+        els.current
+            .jobs
+            .insert(JobKind::Conversion, JobStatus::running("conversion"));
         on_conversion_finished(
             &mut els,
             JobOutcome::Succeeded { log: String::new() },
-            JobFinal::Conversion { encoder_used: Some("av1_nvenc".into()), steps_attempted: 2 },
+            JobFinal::Conversion {
+                encoder_used: Some("av1_nvenc".into()),
+                steps_attempted: 2,
+            },
         );
         // The Some("av1_nvenc") payload above must be consumed: the handler
         // writes the converter status channel and the job ends Succeeded.
-        assert_eq!(els.current.status.last, crate::state::StatusChannel::Converter);
-        assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Succeeded);
+        assert_eq!(
+            els.current.status.last,
+            crate::state::StatusChannel::Converter
+        );
+        assert_eq!(
+            els.current.job(JobKind::Conversion).phase(),
+            JobPhase::Succeeded
+        );
     }
 
     #[test]
     fn on_conversion_finished_encoder_none_keeps_plain_message() {
         let mut els = EngineLoopState::new(AppStateSnapshot::initial());
-        els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
+        els.current
+            .jobs
+            .insert(JobKind::Conversion, JobStatus::running("conversion"));
         on_conversion_finished(
             &mut els,
             JobOutcome::Succeeded { log: String::new() },
-            JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
+            JobFinal::Conversion {
+                encoder_used: None,
+                steps_attempted: 1,
+            },
         );
         // encoder_used: None payload still terminates successfully through
         // the converter status channel.
-        assert_eq!(els.current.status.last, crate::state::StatusChannel::Converter);
-        assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Succeeded);
+        assert_eq!(
+            els.current.status.last,
+            crate::state::StatusChannel::Converter
+        );
+        assert_eq!(
+            els.current.job(JobKind::Conversion).phase(),
+            JobPhase::Succeeded
+        );
     }
 
     #[test]
     fn on_conversion_finished_failed_sets_error() {
         let mut els = EngineLoopState::new(AppStateSnapshot::initial());
-        els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
+        els.current
+            .jobs
+            .insert(JobKind::Conversion, JobStatus::running("conversion"));
         on_conversion_finished(
             &mut els,
-            JobOutcome::Failed { error: "boom".into(), log: String::new(), panicked: false },
-            JobFinal::Conversion { encoder_used: None, steps_attempted: 1 },
+            JobOutcome::Failed {
+                error: "boom".into(),
+                log: String::new(),
+                panicked: false,
+            },
+            JobFinal::Conversion {
+                encoder_used: None,
+                steps_attempted: 1,
+            },
         );
-        assert_eq!(els.current.job(JobKind::Conversion).error.as_deref(), Some("boom"));
-        assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Failed);
+        assert_eq!(
+            els.current.job(JobKind::Conversion).error.as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            els.current.job(JobKind::Conversion).phase(),
+            JobPhase::Failed
+        );
     }
 
     #[test]
@@ -2780,24 +3257,35 @@ mod tests {
         let outcome = || JobOutcome::Succeeded { log: String::new() };
 
         on_ltc_decode_finished(&mut els, outcome(), payload());
-        assert!(els.current.converter.settings.split_tracks, "first finish auto-applies");
+        assert!(
+            els.current.converter.settings.split_tracks,
+            "first finish auto-applies"
+        );
         assert!(els.current.converter.settings.set_start_from_ltc);
 
         // User un-ticks, then a duplicate event for the same generation arrives.
         els.current.converter.settings.split_tracks = false;
         on_ltc_decode_finished(&mut els, outcome(), payload());
-        assert!(!els.current.converter.settings.split_tracks, "latch must prevent re-apply within a generation");
+        assert!(
+            !els.current.converter.settings.split_tracks,
+            "latch must prevent re-apply within a generation"
+        );
 
         // New generation → auto-apply again.
         els.current.decode.generation = 6;
         on_ltc_decode_finished(&mut els, outcome(), payload());
-        assert!(els.current.converter.settings.split_tracks, "new generation re-applies");
+        assert!(
+            els.current.converter.settings.split_tracks,
+            "new generation re-applies"
+        );
     }
 
     #[test]
     fn on_ltc_decode_finished_cancel_error_clears_result() {
         let mut els = EngineLoopState::new(AppStateSnapshot::initial());
-        els.current.jobs.insert(JobKind::LtcDecode, JobStatus::running("decoding"));
+        els.current
+            .jobs
+            .insert(JobKind::LtcDecode, JobStatus::running("decoding"));
         els.current.decode.result = Some(make_ltc_result());
         on_ltc_decode_finished(
             &mut els,
@@ -2805,9 +3293,15 @@ mod tests {
             job::JobFinal::NoPayload,
         );
         assert!(els.current.decode.result.is_none());
-        assert!(els.current.decode.error.is_none(), "cancel must not surface as an error");
+        assert!(
+            els.current.decode.error.is_none(),
+            "cancel must not surface as an error"
+        );
         assert_eq!(
-            els.current.jobs.get(&JobKind::LtcDecode).map(|s| s.progress.phase),
+            els.current
+                .jobs
+                .get(&JobKind::LtcDecode)
+                .map(|s| s.progress.phase),
             Some(job::JobPhase::Cancelled),
             "a cancelled decode must end in the Cancelled phase",
         );
@@ -2819,16 +3313,26 @@ mod tests {
         els.current.decode.result = Some(make_ltc_result());
         on_ltc_decode_finished(
             &mut els,
-            job::JobOutcome::Failed { error: "boom".into(), log: String::new(), panicked: false },
+            job::JobOutcome::Failed {
+                error: "boom".into(),
+                log: String::new(),
+                panicked: false,
+            },
             job::JobFinal::Decode {
                 result: Err(LtcDecodeError::Failed("x".into())),
                 path: PathBuf::from("/tmp/x.wav"),
             },
         );
-        assert!(els.current.decode.error.is_some(), "failures must surface as an error");
+        assert!(
+            els.current.decode.error.is_some(),
+            "failures must surface as an error"
+        );
         assert!(els.current.decode.result.is_none());
         assert_ne!(
-            els.current.jobs.get(&JobKind::LtcDecode).map(|s| s.progress.phase),
+            els.current
+                .jobs
+                .get(&JobKind::LtcDecode)
+                .map(|s| s.progress.phase),
             Some(job::JobPhase::Cancelled),
             "a failed decode must not be reported as cancelled",
         );
@@ -2836,9 +3340,7 @@ mod tests {
 
     // ── on_clip_probes_finished (characterization) ────────────────────────
 
-    fn clip_probe_event(
-        probes: Vec<Result<crate::ffprobe::VideoAudioProbe, String>>,
-    ) -> JobEvent {
+    fn clip_probe_event(probes: Vec<Result<crate::ffprobe::VideoAudioProbe, String>>) -> JobEvent {
         JobEvent::Finished {
             job: job::JobId(7),
             kind: JobKind::ClipProbe,
@@ -2866,7 +3368,10 @@ mod tests {
         crate::ffprobe::VideoAudioProbe {
             total_audio_channels: 2,
             streams: vec![AudioStreamInfo {
-                stream_index: 0, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
+                stream_index: 0,
+                channels: 2,
+                codec_name: "pcm_s16le".into(),
+                sample_rate: 48000,
             }],
             is_video_file: true,
         }
@@ -2882,18 +3387,26 @@ mod tests {
             files: vec![PathBuf::from("/card/MVI_0001.MP4")],
             recording_type: crate::converter::RecordingType::VideoClipSequence,
         });
-        els.current.jobs.insert(JobKind::ClipProbe, JobStatus::running("probing"));
+        els.current
+            .jobs
+            .insert(JobKind::ClipProbe, JobStatus::running("probing"));
         els
     }
 
     #[test]
     fn clip_probes_finished_video_group_seeds_decode_probe_and_resizes_channel_map() {
         let mut els = els_with_video_group();
-        handle_job_event(&mut els, &mut JobSupervisor::new(),
-            clip_probe_event(vec![Ok(two_channel_probe())]));
+        handle_job_event(
+            &mut els,
+            &mut JobSupervisor::new(),
+            clip_probe_event(vec![Ok(two_channel_probe())]),
+        );
 
         // Decode panel seeded from the first successful probe.
-        assert!(els.current.decode.probe.is_some(), "video group must seed the decode probe");
+        assert!(
+            els.current.decode.probe.is_some(),
+            "video group must seed the decode probe"
+        );
         assert_eq!(els.current.decode.selected_stream, 0);
         assert_eq!(els.current.decode.selected_channel, 0);
         assert!(els.current.decode.error.is_none());
@@ -2908,17 +3421,26 @@ mod tests {
         assert_eq!(els.current.converter.settings.channel_map.num_channels(), 2);
 
         // Job status reached the terminal Succeeded phase.
-        assert_eq!(els.current.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded);
+        assert_eq!(
+            els.current.job(JobKind::ClipProbe).phase(),
+            JobPhase::Succeeded
+        );
     }
 
     #[test]
     fn clip_probes_finished_video_group_all_err_surfaces_decode_error() {
         let mut els = els_with_video_group();
-        handle_job_event(&mut els, &mut JobSupervisor::new(),
-            clip_probe_event(vec![Err("no streams".to_string())]));
+        handle_job_event(
+            &mut els,
+            &mut JobSupervisor::new(),
+            clip_probe_event(vec![Err("no streams".to_string())]),
+        );
 
         assert!(els.current.decode.probe.is_none());
-        assert!(els.current.decode.error.is_some(), "failed probes must surface a decode error");
+        assert!(
+            els.current.decode.error.is_some(),
+            "failed probes must surface a decode error"
+        );
         // Converter snapshot still populated (per-file None for failed probes).
         assert_eq!(els.current.converter.probes, vec![None]);
         assert_eq!(els.current.converter.device_name.as_deref(), Some("cam-a"));
@@ -2930,22 +3452,38 @@ mod tests {
         els.current.converter.groups[0].recording_type =
             crate::converter::RecordingType::MultiTrackAudio;
         // Channel map at a non-probe width must stay untouched for audio groups.
-        handle_job_event(&mut els, &mut JobSupervisor::new(),
-            clip_probe_event(vec![Ok(two_channel_probe())]));
+        handle_job_event(
+            &mut els,
+            &mut JobSupervisor::new(),
+            clip_probe_event(vec![Ok(two_channel_probe())]),
+        );
 
-        assert!(els.current.decode.probe.is_none(), "audio groups must not seed the decode probe");
+        assert!(
+            els.current.decode.probe.is_none(),
+            "audio groups must not seed the decode probe"
+        );
         assert!(els.current.decode.error.is_none());
-        assert_eq!(els.current.converter.probes.len(), 1, "probes still populate for audio groups");
+        assert_eq!(
+            els.current.converter.probes.len(),
+            1,
+            "probes still populate for audio groups"
+        );
     }
 
     #[test]
     fn clip_probes_finished_zero_generation_ignores_payload() {
         let mut els = els_with_video_group();
         els.current.converter.probes_generation = 0;
-        handle_job_event(&mut els, &mut JobSupervisor::new(),
-            clip_probe_event(vec![Ok(two_channel_probe())]));
+        handle_job_event(
+            &mut els,
+            &mut JobSupervisor::new(),
+            clip_probe_event(vec![Ok(two_channel_probe())]),
+        );
 
-        assert!(els.current.decode.probe.is_none(), "stale (generation 0) results must be ignored");
+        assert!(
+            els.current.decode.probe.is_none(),
+            "stale (generation 0) results must be ignored"
+        );
         assert!(els.current.converter.probes.is_empty());
         assert!(els.current.converter.camera_meta.is_empty());
         assert!(els.current.converter.device_name.is_none());
@@ -2954,16 +3492,25 @@ mod tests {
     #[test]
     fn clip_probes_finished_wrong_payload_is_logged_and_dropped() {
         let mut els = els_with_video_group();
-        handle_job_event(&mut els, &mut JobSupervisor::new(),
+        handle_job_event(
+            &mut els,
+            &mut JobSupervisor::new(),
             JobEvent::Finished {
                 job: job::JobId(8),
                 kind: JobKind::ClipProbe,
                 outcome: JobOutcome::Succeeded { log: String::new() },
                 payload: JobFinal::DurationsDone, // wrong payload for ClipProbe
-            });
-        assert!(els.current.converter.probes.is_empty(), "mismatched payload must not be applied");
+            },
+        );
+        assert!(
+            els.current.converter.probes.is_empty(),
+            "mismatched payload must not be applied"
+        );
         // Outcome still transitions the job phase.
-        assert_eq!(els.current.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded);
+        assert_eq!(
+            els.current.job(JobKind::ClipProbe).phase(),
+            JobPhase::Succeeded
+        );
     }
 
     // ── update_clapper_animation decay tests were relocated to
@@ -2972,7 +3519,9 @@ mod tests {
     #[test]
     fn handle_job_event_ignores_wrong_payload_without_panicking() {
         let mut els = EngineLoopState::new(AppStateSnapshot::initial());
-        els.current.jobs.insert(JobKind::Conversion, JobStatus::running("conversion"));
+        els.current
+            .jobs
+            .insert(JobKind::Conversion, JobStatus::running("conversion"));
         handle_job_event(
             &mut els,
             &mut JobSupervisor::new(),
@@ -2985,7 +3534,10 @@ mod tests {
         );
         // Outcome is still applied, but the (missing) encoder payload must
         // not produce the completion message.
-        assert_eq!(els.current.job(JobKind::Conversion).phase(), JobPhase::Succeeded);
+        assert_eq!(
+            els.current.job(JobKind::Conversion).phase(),
+            JobPhase::Succeeded
+        );
         assert_ne!(
             els.current.status.last,
             crate::state::StatusChannel::Converter,
@@ -3002,10 +3554,16 @@ mod tests {
             JobEvent::Item {
                 job: job::JobId(1),
                 kind: JobKind::Conversion, // wrong kind for a DurationResult item
-                item: JobItem::DurationResult { path: PathBuf::from("/x.wav"), secs: Some(1.0) },
+                item: JobItem::DurationResult {
+                    path: PathBuf::from("/x.wav"),
+                    secs: Some(1.0),
+                },
             },
         );
-        assert!(els.current.file_durations.is_empty(), "mismatched item must not be applied");
+        assert!(
+            els.current.file_durations.is_empty(),
+            "mismatched item must not be applied"
+        );
     }
 
     // ── validate_stream_channel_selection ────────────────────────────────
@@ -3021,7 +3579,10 @@ mod tests {
     #[test]
     fn validate_stream_selection_accepts_valid_pair() {
         let probe = probe_with_streams(vec![AudioStreamInfo {
-            stream_index: 2, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
+            stream_index: 2,
+            channels: 2,
+            codec_name: "pcm_s16le".into(),
+            sample_rate: 48000,
         }]);
         assert!(validate_stream_channel_selection(&probe, 2, 1).is_ok());
     }
@@ -3029,7 +3590,10 @@ mod tests {
     #[test]
     fn validate_stream_selection_rejects_missing_stream() {
         let probe = probe_with_streams(vec![AudioStreamInfo {
-            stream_index: 2, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
+            stream_index: 2,
+            channels: 2,
+            codec_name: "pcm_s16le".into(),
+            sample_rate: 48000,
         }]);
         let err = validate_stream_channel_selection(&probe, 0, 0).unwrap_err();
         assert_eq!(err, StreamSelectionError::MissingStream { stream: 0 });
@@ -3038,10 +3602,19 @@ mod tests {
     #[test]
     fn validate_stream_selection_rejects_out_of_range_channel() {
         let probe = probe_with_streams(vec![AudioStreamInfo {
-            stream_index: 1, channels: 2, codec_name: "pcm_s16le".into(), sample_rate: 48000,
+            stream_index: 1,
+            channels: 2,
+            codec_name: "pcm_s16le".into(),
+            sample_rate: 48000,
         }]);
         let err = validate_stream_channel_selection(&probe, 1, 2).unwrap_err();
-        assert_eq!(err, StreamSelectionError::ChannelOutOfRange { channel: 2, channels: 2 });
+        assert_eq!(
+            err,
+            StreamSelectionError::ChannelOutOfRange {
+                channel: 2,
+                channels: 2
+            }
+        );
     }
 
     use crate::job::JobPhase;
@@ -3098,7 +3671,12 @@ mod tests {
     #[test]
     fn test_stepper_hour_other_fields_unchanged() {
         let mut state = setup_state();
-        state.start_timecode = Timecode { hours: 5, minutes: 30, seconds: 15, frames: 10 };
+        state.start_timecode = Timecode {
+            hours: 5,
+            minutes: 30,
+            seconds: 15,
+            frames: 10,
+        };
         stepper_hour(&mut state, 1);
         assert_eq!(state.start_timecode.minutes, 30);
         assert_eq!(state.start_timecode.seconds, 15);
@@ -3151,8 +3729,10 @@ mod tests {
 
         auto_apply_ltc_to_settings(&mut state, "TEST_S02.wav");
 
-        assert_eq!(state.converter.settings.ltc_file_idx, 1,
-            "must derive index from decoded path position in audio group");
+        assert_eq!(
+            state.converter.settings.ltc_file_idx, 1,
+            "must derive index from decoded path position in audio group"
+        );
         assert!(state.converter.settings.split_tracks);
         assert!(state.converter.settings.drop_ltc_track);
         assert!(state.converter.settings.set_start_from_ltc);
@@ -3161,10 +3741,7 @@ mod tests {
     #[test]
     fn auto_apply_ltc_skips_idx_for_path_not_in_group() {
         let mut state = setup_state();
-        let files = vec![
-            PathBuf::from("TEST_S01.wav"),
-            PathBuf::from("TEST_S02.wav"),
-        ];
+        let files = vec![PathBuf::from("TEST_S01.wav"), PathBuf::from("TEST_S02.wav")];
         state.converter.groups = vec![MatchedGroup {
             prefix: "TEST".into(),
             rel_dir: String::new(),
@@ -3176,8 +3753,10 @@ mod tests {
 
         auto_apply_ltc_to_settings(&mut state, "NONEXISTENT.wav");
 
-        assert_eq!(state.converter.settings.ltc_file_idx, 999,
-            "must not change idx when decoded path is not in group");
+        assert_eq!(
+            state.converter.settings.ltc_file_idx, 999,
+            "must not change idx when decoded path is not in group"
+        );
         assert!(state.converter.settings.split_tracks);
     }
 
@@ -3188,18 +3767,17 @@ mod tests {
             prefix: "CLIP".into(),
             rel_dir: String::new(),
             recording_type: crate::converter::RecordingType::VideoClipSequence,
-            files: vec![
-                PathBuf::from("GOPR0001.MP4"),
-                PathBuf::from("GOPR0002.MP4"),
-            ],
+            files: vec![PathBuf::from("GOPR0001.MP4"), PathBuf::from("GOPR0002.MP4")],
         }];
         state.converter.selected_group_idx = Some(0);
         state.converter.settings.ltc_file_idx = 999;
 
         auto_apply_ltc_to_settings(&mut state, "GOPR0001.MP4");
 
-        assert_eq!(state.converter.settings.ltc_file_idx, 999,
-            "must not change idx for VideoClipSequence groups (uses ltc_video_source)");
+        assert_eq!(
+            state.converter.settings.ltc_file_idx, 999,
+            "must not change idx for VideoClipSequence groups (uses ltc_video_source)"
+        );
     }
 
     // ── stepper_minute ────────────────────────────────────────────────────
@@ -3378,12 +3956,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
         // ToggleLock on: false → true
         process_command(
-            GuiCommand::ToggleLock, &core, true, &event_tx, &mut els, &mut supervisor,
+            GuiCommand::ToggleLock,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
         );
         assert!(els.current.is_locked);
     }
@@ -3393,11 +3979,28 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::ToggleLock, &core, true, &event_tx, &mut els, &mut supervisor);
-        process_command(GuiCommand::ToggleLock, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::ToggleLock,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
+        process_command(
+            GuiCommand::ToggleLock,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!(!els.current.is_locked);
     }
 
@@ -3406,10 +4009,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetFpsIndex(4), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetFpsIndex(4),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.fps_index, 4);
         assert_eq!(els.current.fps(), 30.0);
         assert!(!els.current.drop_frame());
@@ -3420,10 +4033,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetFpsIndex(3), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetFpsIndex(3),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.fps_index, 3);
         assert!((els.current.fps() - 29.97).abs() < 0.01);
         assert!(els.current.drop_frame());
@@ -3434,10 +4057,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetFpsIndex(99), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetFpsIndex(99),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.fps_index, 1);
         assert_eq!(els.current.fps(), 25.0);
     }
@@ -3447,13 +4080,30 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetTheme(true), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetTheme(true),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!(els.current.is_dark_theme);
 
-        process_command(GuiCommand::SetTheme(false), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetTheme(false),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!(!els.current.is_dark_theme);
     }
 
@@ -3462,13 +4112,33 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::ToggleTheme, &core, true, &event_tx, &mut els, &mut supervisor);
-        assert!(els.current.is_dark_theme, "toggle from initial false → true");
+        process_command(
+            GuiCommand::ToggleTheme,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
+        assert!(
+            els.current.is_dark_theme,
+            "toggle from initial false → true"
+        );
 
-        process_command(GuiCommand::ToggleTheme, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::ToggleTheme,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!(!els.current.is_dark_theme, "toggle again true → false");
     }
 
@@ -3476,19 +4146,35 @@ mod tests {
     fn test_process_command_clear_logs() {
         let mut state = setup_state();
         state.clapper.logs.push(ClapLogItem {
-            id: 1, timestamp: "12:00:00".into(),
-            timecode: "01:00:00:00".into(), milliseconds: "0".into(), note: "test".into(),
+            id: 1,
+            timestamp: "12:00:00".into(),
+            timecode: "01:00:00:00".into(),
+            milliseconds: "0".into(),
+            note: "test".into(),
         });
         state.clapper.logs.push(ClapLogItem {
-            id: 2, timestamp: "12:00:01".into(),
-            timecode: "01:00:00:01".into(), milliseconds: "0".into(), note: "test2".into(),
+            id: 2,
+            timestamp: "12:00:01".into(),
+            timecode: "01:00:00:01".into(),
+            milliseconds: "0".into(),
+            note: "test2".into(),
         });
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::ClearLogs, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::ClearLogs,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!(els.current.clapper.logs.is_empty());
     }
 
@@ -3497,10 +4183,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetLtcChannel(ChannelSel::Both), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetLtcChannel(ChannelSel::Both),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.ltc_channel, ChannelSel::Both);
     }
 
@@ -3509,10 +4205,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetBeepVolume(0.75), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetBeepVolume(0.75),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!((els.current.beep_volume - 0.75).abs() < 1e-6);
     }
 
@@ -3521,10 +4227,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetBeepChannel(ChannelSel::Right), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetBeepChannel(ChannelSel::Right),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.beep_channel, ChannelSel::Right);
     }
 
@@ -3533,10 +4249,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetLtcVolume(0.4), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetLtcVolume(0.4),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!((els.current.ltc_volume - 0.4).abs() < 1e-6);
     }
 
@@ -3545,10 +4271,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetBeepFrequency(1200.0), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetBeepFrequency(1200.0),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!((els.current.beep_frequency - 1200.0).abs() < 1e-3);
     }
 
@@ -3557,10 +4293,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetBeepDuration(0.8), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetBeepDuration(0.8),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!((els.current.beep_duration - 0.8).abs() < 1e-6);
     }
 
@@ -3569,10 +4315,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetLtcDecodeStream(2), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetLtcDecodeStream(2),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.decode.selected_stream, 2);
     }
 
@@ -3581,10 +4337,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetLtcDecodeChannel(1), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetLtcDecodeChannel(1),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.decode.selected_channel, 1);
     }
 
@@ -3593,11 +4359,26 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        els.current.current_timecode = Timecode { hours: 5, minutes: 4, seconds: 3, frames: 2 };
-        process_command(GuiCommand::Reset, &core, true, &event_tx, &mut els, &mut supervisor);
+        els.current.current_timecode = Timecode {
+            hours: 5,
+            minutes: 4,
+            seconds: 3,
+            frames: 2,
+        };
+        process_command(
+            GuiCommand::Reset,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.current_timecode, els.current.start_timecode);
     }
 
@@ -3606,30 +4387,81 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetAutoIncrement(false), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetAutoIncrement(false),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         let take_before = els.current.clapper.take;
-        process_command(GuiCommand::Clap, &core, true, &event_tx, &mut els, &mut supervisor);
-        process_command(GuiCommand::Clap, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::Clap,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
+        process_command(
+            GuiCommand::Clap,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
 
-        assert_eq!(els.current.clapper.logs.len(), 2, "each clap appends one log entry");
-        assert_eq!(els.current.clapper.take, take_before, "take must not move when auto-increment is off");
+        assert_eq!(
+            els.current.clapper.logs.len(),
+            2,
+            "each clap appends one log entry"
+        );
+        assert_eq!(
+            els.current.clapper.take, take_before,
+            "take must not move when auto-increment is off"
+        );
     }
 
     #[test]
     fn cmd_clap_increments_clap_seq() {
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(setup_state());
 
         assert_eq!(els.current.clapper.clap_seq, 0, "no clap yet");
-        process_command(GuiCommand::Clap, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::Clap,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.clap_seq, 1);
-        process_command(GuiCommand::Clap, &core, true, &event_tx, &mut els, &mut supervisor);
-        assert_eq!(els.current.clapper.clap_seq, 2, "clap_seq must be monotonic per clap");
+        process_command(
+            GuiCommand::Clap,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
+        assert_eq!(
+            els.current.clapper.clap_seq, 2,
+            "clap_seq must be monotonic per clap"
+        );
     }
 
     #[test]
@@ -3637,11 +4469,26 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
-        let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
+        let tc = Timecode {
+            hours: 10,
+            minutes: 20,
+            seconds: 30,
+            frames: 15,
+        };
 
-        process_command(GuiCommand::SetStartTimecode(tc), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetStartTimecode(tc),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.start_timecode, tc);
     }
 
@@ -3650,16 +4497,40 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetScene(42), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetScene(42),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.scene, 42);
 
-        process_command(GuiCommand::SetTake(7), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetTake(7),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.take, 7);
 
-        process_command(GuiCommand::SetRoll("B002".into()), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetRoll("B002".into()),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.roll, "B002");
     }
 
@@ -3668,14 +4539,31 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
         els.current.clapper.scene = 5;
-        process_command(GuiCommand::SceneUp, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SceneUp,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.scene, 6);
 
-        process_command(GuiCommand::SceneDown, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SceneDown,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.scene, 5);
     }
 
@@ -3684,14 +4572,31 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
         els.current.clapper.take = 3;
-        process_command(GuiCommand::TakeUp, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::TakeUp,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.take, 4);
 
-        process_command(GuiCommand::TakeDown, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::TakeDown,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.take, 3);
     }
 
@@ -3700,11 +4605,21 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
         els.current.clapper.scene = 0;
-        process_command(GuiCommand::SceneDown, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SceneDown,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.scene, 0, "scene should not go below 0");
     }
 
@@ -3713,11 +4628,21 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
         els.current.clapper.take = 0;
-        process_command(GuiCommand::TakeDown, &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::TakeDown,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.clapper.take, 0, "take should not go below 0");
     }
 
@@ -3726,10 +4651,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetSampleRate(48000), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetSampleRate(48000),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.sample_rate, 48000);
     }
 
@@ -3738,13 +4673,30 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetAutoIncrement(false), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetAutoIncrement(false),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!(!els.current.clapper.auto_increment_take);
 
-        process_command(GuiCommand::SetAutoIncrement(true), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetAutoIncrement(true),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!(els.current.clapper.auto_increment_take);
     }
 
@@ -3753,10 +4705,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetDecodeFpsIndex(4), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetDecodeFpsIndex(4),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert_eq!(els.current.decode.fps_index, 4);
         assert_eq!(els.current.decode_fps(), 30.0);
         assert!(!els.current.decode_drop_frame());
@@ -3767,10 +4729,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetDecodeFpsIndex(3), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetDecodeFpsIndex(3),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         assert!((els.current.decode_fps() - 29.97).abs() < 0.01);
         assert!(els.current.decode_drop_frame());
     }
@@ -3780,10 +4752,20 @@ mod tests {
         let state = setup_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
-        process_command(GuiCommand::SetDecodeFpsIndex(99), &core, true, &event_tx, &mut els, &mut supervisor);
+        process_command(
+            GuiCommand::SetDecodeFpsIndex(99),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
         // Should not change since index is out of range
         assert_eq!(els.current.decode.fps_index, 1);
     }
@@ -3849,18 +4831,33 @@ mod tests {
         let state = setup_decode_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, true, &event_tx, &mut els, &mut supervisor,
+            GuiCommand::ClearRecordingDecodeState,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
         );
 
         assert!(els.current.decode.result.is_none(), "single result cleared");
         assert!(els.current.decode.error.is_none(), "error cleared");
         assert!(els.current.decode.probe.is_none(), "probe cleared");
-        assert_eq!(els.current.job(JobKind::LtcDecode).phase(), JobPhase::Idle, "LtcDecode job reset to Idle");
-        assert_eq!(els.current.decode.generation, 43, "decode gen bumped from 42");
+        assert_eq!(
+            els.current.job(JobKind::LtcDecode).phase(),
+            JobPhase::Idle,
+            "LtcDecode job reset to Idle"
+        );
+        assert_eq!(
+            els.current.decode.generation, 43,
+            "decode gen bumped from 42"
+        );
     }
 
     #[test]
@@ -3868,17 +4865,38 @@ mod tests {
         let state = setup_decode_state();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, true, &event_tx, &mut els, &mut supervisor,
+            GuiCommand::ClearRecordingDecodeState,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
         );
 
-        assert!(els.current.decode.group_paths.is_empty(), "group paths cleared");
-        assert!(els.current.decode.group_results.is_empty(), "group results cleared");
-        assert_eq!(els.current.job(JobKind::LtcGroupDecode).phase(), JobPhase::Idle, "LtcGroupDecode job reset to Idle");
-        assert_eq!(els.current.decode.group_generation, 100, "group decode gen bumped from 99");
+        assert!(
+            els.current.decode.group_paths.is_empty(),
+            "group paths cleared"
+        );
+        assert!(
+            els.current.decode.group_results.is_empty(),
+            "group results cleared"
+        );
+        assert_eq!(
+            els.current.job(JobKind::LtcGroupDecode).phase(),
+            JobPhase::Idle,
+            "LtcGroupDecode job reset to Idle"
+        );
+        assert_eq!(
+            els.current.decode.group_generation, 100,
+            "group decode gen bumped from 99"
+        );
     }
 
     #[test]
@@ -3886,16 +4904,27 @@ mod tests {
         let state = AppStateSnapshot::initial();
         let core = audio_core::AudioCore::new();
         let mut supervisor = JobSupervisor::new();
-        let (event_tx, _event_rx): (std::sync::mpsc::Sender<audio_core::AudioEvent>, std::sync::mpsc::Receiver<audio_core::AudioEvent>) = std::sync::mpsc::channel();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
         let mut els = EngineLoopState::new(state);
 
         process_command(
-            GuiCommand::ClearRecordingDecodeState, &core, true, &event_tx, &mut els, &mut supervisor,
+            GuiCommand::ClearRecordingDecodeState,
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
         );
 
         // Should not panic on empty state, just bump generations
         assert_eq!(els.current.decode.generation, 1, "decode gen bumped from 0");
-        assert_eq!(els.current.decode.group_generation, 1, "group decode gen bumped from 0");
+        assert_eq!(
+            els.current.decode.group_generation, 1,
+            "group decode gen bumped from 0"
+        );
     }
 
     // ── assemble_converter_settings ─────────────────────────────────────
@@ -3912,9 +4941,9 @@ mod tests {
     #[test]
     fn test_assemble_converter_settings_repairs_stale_map_for_audio() {
         let mut state = setup_state();
-        let files: Vec<PathBuf> = (0..4).map(|i| {
-            PathBuf::from(format!("/tmp/TASCAM_0097S{}.wav", i + 1))
-        }).collect();
+        let files: Vec<PathBuf> = (0..4)
+            .map(|i| PathBuf::from(format!("/tmp/TASCAM_0097S{}.wav", i + 1)))
+            .collect();
         state.converter.groups = vec![make_audio_group(files)];
         state.converter.selected_group_idx = Some(0);
         state.converter.settings.channel_map = ChannelMap::identity(1);
@@ -3937,11 +4966,11 @@ mod tests {
             settings.recording_type,
             crate::converter::RecordingType::MultiTrackAudio,
         );
-        assert_eq!(
-            settings.ltc_track_channel_index,
-            0,
-        );
-        assert!(matches!(settings.pipeline, crate::converter::ConversionPipeline::AudioOnly { .. }));
+        assert_eq!(settings.ltc_track_channel_index, 0,);
+        assert!(matches!(
+            settings.pipeline,
+            crate::converter::ConversionPipeline::AudioOnly { .. }
+        ));
     }
 
     #[test]
@@ -3966,7 +4995,10 @@ mod tests {
             2,
             "video group channel map must NOT be repaired, should stay at probe size (2)"
         );
-        assert!(matches!(settings.pipeline, crate::converter::ConversionPipeline::VideoPassthrough));
+        assert!(matches!(
+            settings.pipeline,
+            crate::converter::ConversionPipeline::VideoPassthrough
+        ));
     }
 
     // ── output_folder defaulting ─────────────────────────────────────────
@@ -3999,16 +5031,15 @@ mod tests {
         let second_dir = root.join("day2");
         let mut state = setup_state();
         state.converter.groups_folder = Some(root.to_path_buf());
-        state.converter.groups = vec![
-            make_video_group(&first_dir),
-            make_video_group(&second_dir),
-        ];
+        state.converter.groups = vec![make_video_group(&first_dir), make_video_group(&second_dir)];
         state.converter.settings.output_folder = PathBuf::new();
 
         apply_sel(&mut state, 0);
 
-        assert_eq!(state.converter.settings.output_folder, first_dir,
-            "default output for a subdir recording should be the recording's parent dir");
+        assert_eq!(
+            state.converter.settings.output_folder, first_dir,
+            "default output for a subdir recording should be the recording's parent dir"
+        );
     }
 
     #[test]
@@ -4026,8 +5057,10 @@ mod tests {
 
         apply_sel(&mut state, 0);
 
-        assert_eq!(state.converter.settings.output_folder, root,
-            "default output for a root-level recording should be the scan root");
+        assert_eq!(
+            state.converter.settings.output_folder, root,
+            "default output for a root-level recording should be the scan root"
+        );
     }
 
     #[test]
@@ -4037,19 +5070,20 @@ mod tests {
         let second_dir = root.join("day2");
         let mut state = setup_state();
         state.converter.groups_folder = Some(root.to_path_buf());
-        state.converter.groups = vec![
-            make_video_group(&first_dir),
-            make_video_group(&second_dir),
-        ];
+        state.converter.groups = vec![make_video_group(&first_dir), make_video_group(&second_dir)];
         state.converter.settings.output_folder = PathBuf::new();
 
         apply_sel(&mut state, 0);
-        assert_eq!(state.converter.settings.output_folder, first_dir,
-            "first selection defaults to first dir");
+        assert_eq!(
+            state.converter.settings.output_folder, first_dir,
+            "first selection defaults to first dir"
+        );
 
         apply_sel(&mut state, 1);
-        assert_eq!(state.converter.settings.output_folder, second_dir,
-            "second selection defaults to second dir when not user-set");
+        assert_eq!(
+            state.converter.settings.output_folder, second_dir,
+            "second selection defaults to second dir when not user-set"
+        );
     }
 
     #[test]
@@ -4060,21 +5094,22 @@ mod tests {
         let custom = Path::new("/custom/output");
         let mut state = setup_state();
         state.converter.groups_folder = Some(root.to_path_buf());
-        state.converter.groups = vec![
-            make_video_group(&first_dir),
-            make_video_group(&second_dir),
-        ];
+        state.converter.groups = vec![make_video_group(&first_dir), make_video_group(&second_dir)];
 
         state.converter.settings.output_folder = custom.to_path_buf();
         state.converter.settings.output_folder_user_set = true;
 
         apply_sel(&mut state, 0);
-        assert_eq!(state.converter.settings.output_folder, custom,
-            "user-set output must survive recording selection");
+        assert_eq!(
+            state.converter.settings.output_folder, custom,
+            "user-set output must survive recording selection"
+        );
 
         apply_sel(&mut state, 1);
-        assert_eq!(state.converter.settings.output_folder, custom,
-            "user-set output must survive selection switch");
+        assert_eq!(
+            state.converter.settings.output_folder, custom,
+            "user-set output must survive selection switch"
+        );
     }
 
     #[test]
@@ -4085,9 +5120,14 @@ mod tests {
 
         apply_set_output_folder(&mut state, PathBuf::from("/new"));
 
-        assert_eq!(state.converter.settings.output_folder, PathBuf::from("/new"));
-        assert!(state.converter.settings.output_folder_user_set,
-            "setting a different folder must mark it as user-set");
+        assert_eq!(
+            state.converter.settings.output_folder,
+            PathBuf::from("/new")
+        );
+        assert!(
+            state.converter.settings.output_folder_user_set,
+            "setting a different folder must mark it as user-set"
+        );
     }
 
     #[test]
@@ -4097,28 +5137,35 @@ mod tests {
         let second_dir = root.join("day2");
         let mut state = setup_state();
         state.converter.groups_folder = Some(root.to_path_buf());
-        state.converter.groups = vec![
-            make_video_group(&first_dir),
-            make_video_group(&second_dir),
-        ];
+        state.converter.groups = vec![make_video_group(&first_dir), make_video_group(&second_dir)];
         state.converter.settings.output_folder = PathBuf::new();
 
         apply_sel(&mut state, 0);
-        assert_eq!(state.converter.settings.output_folder, first_dir,
-            "first selection defaults to first dir");
-        assert!(!state.converter.settings.output_folder_user_set,
-            "flag must be false after first auto-default");
+        assert_eq!(
+            state.converter.settings.output_folder, first_dir,
+            "first selection defaults to first dir"
+        );
+        assert!(
+            !state.converter.settings.output_folder_user_set,
+            "flag must be false after first auto-default"
+        );
 
         // Simulate the GUI echo-back: SetOutputFolder with the same value
         apply_set_output_folder(&mut state, first_dir.clone());
-        assert_eq!(state.converter.settings.output_folder, first_dir,
-            "folder unchanged by no-op echo");
-        assert!(!state.converter.settings.output_folder_user_set,
-            "echo must NOT set the flag — regression: echo froze the folder");
+        assert_eq!(
+            state.converter.settings.output_folder, first_dir,
+            "folder unchanged by no-op echo"
+        );
+        assert!(
+            !state.converter.settings.output_folder_user_set,
+            "echo must NOT set the flag — regression: echo froze the folder"
+        );
 
         apply_sel(&mut state, 1);
-        assert_eq!(state.converter.settings.output_folder, second_dir,
-            "second selection must still re-default after a no-op echo");
+        assert_eq!(
+            state.converter.settings.output_folder, second_dir,
+            "second selection must still re-default after a no-op echo"
+        );
     }
 
     // ── recovery ladder decision table (WP-2.1) ──────────────────────────
@@ -4126,7 +5173,9 @@ mod tests {
     fn soft_events() -> Vec<AudioEvent> {
         vec![
             AudioEvent::StreamDied,
-            AudioEvent::RecoveryNeeded { reason: "seam test".to_string() },
+            AudioEvent::RecoveryNeeded {
+                reason: "seam test".to_string(),
+            },
         ]
     }
 
@@ -4181,5 +5230,4 @@ mod tests {
             );
         }
     }
-
-    }
+}

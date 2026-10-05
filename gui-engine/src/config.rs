@@ -150,8 +150,7 @@ mod tests {
         seed_snapshot_from_config(&mut snapshot, &cfg);
 
         assert_eq!(
-            snapshot.offload.parent_folder,
-            None,
+            snapshot.offload.parent_folder, None,
             "non-existent offload parent should be ignored",
         );
     }
@@ -197,8 +196,14 @@ mod tests {
             last_offload_parent: None,
         });
         let expected = dir.path().join(CONFIG_DIR).join(CONFIG_FILE);
-        assert!(expected.exists(), "config must be written under the override dir");
-        assert_eq!(load().last_input_folder, Some("/does/not/matter".to_string()));
+        assert!(
+            expected.exists(),
+            "config must be written under the override dir"
+        );
+        assert_eq!(
+            load().last_input_folder,
+            Some("/does/not/matter".to_string())
+        );
         std::env::remove_var("LTC_CONFIG_HOME");
     }
 

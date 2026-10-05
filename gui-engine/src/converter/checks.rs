@@ -2,7 +2,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::converter::capabilities::FfmpegCapabilities;
-use crate::converter::formats::{container_supports_audio_encoder, encoder_available_in_ffmpeg, format_available_in_ffmpeg};
+use crate::converter::formats::{
+    container_supports_audio_encoder, encoder_available_in_ffmpeg, format_available_in_ffmpeg,
+};
 use crate::naming;
 use crate::video_codecs;
 
@@ -17,15 +19,33 @@ pub enum ConversionCheckError {
     FfmpegUnavailable(Option<String>),
     NoInputFiles,
     NoOutputName,
-    UnsupportedContainer { container: String },
+    UnsupportedContainer {
+        container: String,
+    },
     InvalidAudioSuffixTemplate(String),
     InvalidVideoSuffixTemplate(String),
     InvalidPrefixTemplate(String),
-    UnknownVideoCodec { codec: String, supported: String },
-    NoEncoderAvailable { codec: String, candidates: String },
-    UnsupportedAudioEncoder { encoder: String },
-    IncompatibleVideoContainer { codec: String, container: String, hint: String },
-    IncompatibleAudioContainer { encoder: String, container: String, hint: String },
+    UnknownVideoCodec {
+        codec: String,
+        supported: String,
+    },
+    NoEncoderAvailable {
+        codec: String,
+        candidates: String,
+    },
+    UnsupportedAudioEncoder {
+        encoder: String,
+    },
+    IncompatibleVideoContainer {
+        codec: String,
+        container: String,
+        hint: String,
+    },
+    IncompatibleAudioContainer {
+        encoder: String,
+        container: String,
+        hint: String,
+    },
     MissingInput(PathBuf),
     MissingOutputFolder(PathBuf),
 }
@@ -153,7 +173,10 @@ pub fn conversion_sanity_check_pure(
         return Err(ConversionCheckError::NoInputFiles);
     }
 
-    if filename_prefix.is_empty() && audio_suffix.unwrap_or("").is_empty() && video_suffix.unwrap_or("").is_empty() {
+    if filename_prefix.is_empty()
+        && audio_suffix.unwrap_or("").is_empty()
+        && video_suffix.unwrap_or("").is_empty()
+    {
         return Err(ConversionCheckError::NoOutputName);
     }
 
@@ -165,16 +188,19 @@ pub fn conversion_sanity_check_pure(
 
     if let Some(t) = audio_suffix {
         if !t.is_empty() {
-            naming::validate_template(t).map_err(|e| ConversionCheckError::InvalidAudioSuffixTemplate(e.to_string()))?;
+            naming::validate_template(t)
+                .map_err(|e| ConversionCheckError::InvalidAudioSuffixTemplate(e.to_string()))?;
         }
     }
     if let Some(t) = video_suffix {
         if !t.is_empty() {
-            naming::validate_template(t).map_err(|e| ConversionCheckError::InvalidVideoSuffixTemplate(e.to_string()))?;
+            naming::validate_template(t)
+                .map_err(|e| ConversionCheckError::InvalidVideoSuffixTemplate(e.to_string()))?;
         }
     }
     if !filename_prefix.is_empty() {
-        naming::validate_template(filename_prefix).map_err(|e| ConversionCheckError::InvalidPrefixTemplate(e.to_string()))?;
+        naming::validate_template(filename_prefix)
+            .map_err(|e| ConversionCheckError::InvalidPrefixTemplate(e.to_string()))?;
     }
 
     if !copy_video {
@@ -204,10 +230,12 @@ pub fn conversion_sanity_check_pure(
         });
     }
 
-    if !copy_video && !video_codecs::codec_supports_container(
-        video_codecs::normalize_video_codec(video_codec),
-        container,
-    ) {
+    if !copy_video
+        && !video_codecs::codec_supports_container(
+            video_codecs::normalize_video_codec(video_codec),
+            container,
+        )
+    {
         let codec_id = video_codecs::normalize_video_codec(video_codec);
         return Err(ConversionCheckError::IncompatibleVideoContainer {
             codec: codec_id.to_string(),
@@ -251,7 +279,9 @@ pub fn validate_conversion_paths(
         }
     }
     if !output_folder.as_os_str().is_empty() && !output_folder.exists() {
-        return Err(ConversionCheckError::MissingOutputFolder(output_folder.to_path_buf()));
+        return Err(ConversionCheckError::MissingOutputFolder(
+            output_folder.to_path_buf(),
+        ));
     }
     Ok(())
 }
@@ -322,7 +352,12 @@ pub fn conversion_sanity_check_metadata_only(
     video_suffix: Option<&str>,
 ) -> Result<(), ConversionCheckError> {
     conversion_sanity_check_metadata_only_pure(
-        input_files, output_folder, filename_prefix, caps, audio_suffix, video_suffix,
+        input_files,
+        output_folder,
+        filename_prefix,
+        caps,
+        audio_suffix,
+        video_suffix,
     )?;
     validate_conversion_paths(input_files, output_folder)
 }
@@ -360,7 +395,9 @@ pub fn evaluate_readiness(
     }
     match caps {
         None => blockers.push(ConvertBlocker::FfmpegNotQueried),
-        Some(c) if !c.has_ffmpeg => blockers.push(ConvertBlocker::FfmpegMissing(c.error_message.clone())),
+        Some(c) if !c.has_ffmpeg => {
+            blockers.push(ConvertBlocker::FfmpegMissing(c.error_message.clone()))
+        }
         Some(_) => {}
     }
     ConvertReadiness {
@@ -370,28 +407,35 @@ pub fn evaluate_readiness(
 }
 
 pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
-    let imperatives: Vec<&str> = blockers.iter().filter_map(|b| match b {
-        ConvertBlocker::NoRecording => Some("select a recording"),
-        ConvertBlocker::NoPrefix => Some("set a filename prefix"),
-        ConvertBlocker::NoOutputFolder => Some("choose an output folder"),
-        ConvertBlocker::FfmpegNotQueried | ConvertBlocker::FfmpegMissing(_) => None,
-    }).collect();
+    let imperatives: Vec<&str> = blockers
+        .iter()
+        .filter_map(|b| match b {
+            ConvertBlocker::NoRecording => Some("select a recording"),
+            ConvertBlocker::NoPrefix => Some("set a filename prefix"),
+            ConvertBlocker::NoOutputFolder => Some("choose an output folder"),
+            ConvertBlocker::FfmpegNotQueried | ConvertBlocker::FfmpegMissing(_) => None,
+        })
+        .collect();
 
-    let ffmpeg_messages: Vec<String> = blockers.iter().filter_map(|b| match b {
-        ConvertBlocker::NoRecording
-        | ConvertBlocker::NoPrefix
-        | ConvertBlocker::NoOutputFolder => None,
-        ConvertBlocker::FfmpegNotQueried => {
-            Some("ffmpeg availability is being checked…".to_string())
-        }
-        ConvertBlocker::FfmpegMissing(msg) => {
-            let base = "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.";
-            match msg {
-                Some(detail) if !detail.is_empty() => Some(format!("{} ({})", base, detail)),
-                _ => Some(base.to_string()),
+    let ffmpeg_messages: Vec<String> = blockers
+        .iter()
+        .filter_map(|b| match b {
+            ConvertBlocker::NoRecording
+            | ConvertBlocker::NoPrefix
+            | ConvertBlocker::NoOutputFolder => None,
+            ConvertBlocker::FfmpegNotQueried => {
+                Some("ffmpeg availability is being checked…".to_string())
             }
-        }
-    }).collect();
+            ConvertBlocker::FfmpegMissing(msg) => {
+                let base =
+                    "ffmpeg is not available. Please install ffmpeg and ensure it is in your PATH.";
+                match msg {
+                    Some(detail) if !detail.is_empty() => Some(format!("{} ({})", base, detail)),
+                    _ => Some(base.to_string()),
+                }
+            }
+        })
+        .collect();
 
     let mut parts: Vec<String> = Vec::new();
     if !imperatives.is_empty() {
@@ -404,8 +448,8 @@ pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
     use crate::converter::test_fixtures::*;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     #[test]
@@ -428,7 +472,11 @@ mod tests {
             video_suffix: Some("_video"),
             copy_video: true,
         });
-        assert!(result.is_ok(), "pure check should not fail on nonexistent paths: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "pure check should not fail on nonexistent paths: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -482,10 +530,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
         std::fs::write(&file_path, b"dummy").unwrap();
-        let result = validate_conversion_paths(
-            &[file_path],
-            dir.path(),
-        );
+        let result = validate_conversion_paths(&[file_path], dir.path());
         assert!(result.is_ok());
     }
 
@@ -505,10 +550,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
         std::fs::write(&file_path, b"dummy").unwrap();
-        let result = validate_conversion_paths(
-            &[file_path],
-            Path::new("/nonexistent/output_dir"),
-        );
+        let result = validate_conversion_paths(&[file_path], Path::new("/nonexistent/output_dir"));
         match result {
             Err(ConversionCheckError::MissingOutputFolder(p)) => {
                 assert_eq!(p, PathBuf::from("/nonexistent/output_dir"));
@@ -549,7 +591,9 @@ mod tests {
         assert!(!r.can_convert);
         assert_eq!(
             r.blockers,
-            vec![ConvertBlocker::FfmpegMissing(Some("permission denied".into()))]
+            vec![ConvertBlocker::FfmpegMissing(Some(
+                "permission denied".into()
+            ))]
         );
     }
 

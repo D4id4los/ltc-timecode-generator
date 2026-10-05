@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gui_engine::converter::{
-    query_ffmpeg_capabilities, run_conversion, ChannelMap, ConversionPipeline,
-    ConversionReport, ConverterSettings, RecordingType, TestReport,
+    query_ffmpeg_capabilities, run_conversion, ChannelMap, ConversionPipeline, ConversionReport,
+    ConverterSettings, RecordingType, TestReport,
 };
 use gui_engine::video_codecs::resolve_encoder_chain;
 
@@ -71,10 +71,17 @@ fn test_conversion_progress_tracking() {
         expected_output.exists(),
         "Output file was not created: {} (dir contents: {:?})",
         expected_output.display(),
-        std::fs::read_dir(dir.path()).map(|e| e.filter_map(|e| e.ok().map(|e| e.path())).collect::<Vec<_>>()).unwrap_or_default(),
+        std::fs::read_dir(dir.path())
+            .map(|e| e
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect::<Vec<_>>())
+            .unwrap_or_default(),
     );
     assert!(
-        expected_output.metadata().map(|m| m.len() > 0).unwrap_or(false),
+        expected_output
+            .metadata()
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
         "Output file is empty: {}",
         expected_output.display()
     );
@@ -147,7 +154,9 @@ fn test_conversion_cancellation() {
 
 fn make_test_settings(dir: &Path, input_files: Vec<std::path::PathBuf>) -> ConverterSettings {
     ConverterSettings {
-        pipeline: ConversionPipeline::AudioOnly { generate_synthetic_video: true },
+        pipeline: ConversionPipeline::AudioOnly {
+            generate_synthetic_video: true,
+        },
         input_files,
         recording_type: RecordingType::MultiTrackAudio,
         ltc_track_channel_index: 0,
@@ -186,10 +195,8 @@ fn test_conversion_resolves_and_reports_encoder() {
         eprintln!("--- SKIPPED: libx264 encoder not available");
         return;
     }
-    caps.available_encoders = std::collections::BTreeSet::from([
-        "libx264".to_string(),
-        "pcm_s24le".to_string(),
-    ]);
+    caps.available_encoders =
+        std::collections::BTreeSet::from(["libx264".to_string(), "pcm_s24le".to_string()]);
 
     let dir = tempfile::TempDir::new().unwrap();
     let wav1 = dir.path().join("ch1.wav");
@@ -252,19 +259,42 @@ fn create_test_video_with_tone(
 ) {
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-v", "error",
-            "-f", "lavfi", "-i", &format!("color=c=blue:s=320x240:r=25:duration={}", duration_secs),
-            "-f", "lavfi", "-i", &format!("sine=frequency={}:duration={}:sample_rate={}", frequency, duration_secs, sample_rate),
-            "-map", "0:v", "-map", "1:a",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-c:a", "pcm_s16le",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c=blue:s=320x240:r=25:duration={}", duration_secs),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "sine=frequency={}:duration={}:sample_rate={}",
+                frequency, duration_secs, sample_rate
+            ),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "pcm_s16le",
             "-shortest",
-            "-t", &format!("{}", duration_secs),
+            "-t",
+            &format!("{}", duration_secs),
             &path.to_string_lossy(),
         ])
         .status()
         .expect("failed to spawn ffmpeg for test video");
-    assert!(status.success(), "ffmpeg fixture creation failed for {}", path.display());
+    assert!(
+        status.success(),
+        "ffmpeg fixture creation failed for {}",
+        path.display()
+    );
 }
 
 #[test]
@@ -274,7 +304,8 @@ fn test_concat_audio_across_two_video_clips() {
         eprintln!("--- SKIPPED: ffmpeg not available");
         return;
     }
-    if resolve_encoder_chain("h264", &caps).is_empty() && !caps.available_encoders.contains("mpeg4") {
+    if resolve_encoder_chain("h264", &caps).is_empty() && !caps.available_encoders.contains("mpeg4")
+    {
         eprintln!("--- SKIPPED: no suitable video encoder");
         return;
     }
@@ -331,7 +362,8 @@ fn test_concat_audio_across_two_video_clips() {
     assert!(
         (steps - steps.round()).abs() < 0.06,
         "step weight must be 1.0/N (got {} → {} steps)",
-        sw, steps
+        sw,
+        steps
     );
 
     let concat_audio = dir.path().join("concat_test_audio_track1.wav");
@@ -339,7 +371,11 @@ fn test_concat_audio_across_two_video_clips() {
         concat_audio.exists(),
         "Concatenated audio file not created: {} (dir: {:?})",
         concat_audio.display(),
-        std::fs::read_dir(dir.path()).map(|e| e.filter_map(|e| e.ok().map(|e| e.path())).collect::<Vec<_>>()).unwrap_or_default(),
+        std::fs::read_dir(dir.path())
+            .map(|e| e
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect::<Vec<_>>())
+            .unwrap_or_default(),
     );
 
     if let Ok(reader) = hound::WavReader::open(&concat_audio) {
@@ -350,11 +386,16 @@ fn test_concat_audio_across_two_video_clips() {
         assert!(
             num_samples.abs_diff(expected_samples) <= tolerance,
             "Expected ~{} samples, got {} (tolerance: {})",
-            expected_samples, num_samples, tolerance,
+            expected_samples,
+            num_samples,
+            tolerance,
         );
         assert_eq!(spec.channels, 1, "concatenated audio should be mono");
     } else {
-        panic!("Could not open concatenated WAV: {}", concat_audio.display());
+        panic!(
+            "Could not open concatenated WAV: {}",
+            concat_audio.display()
+        );
     }
 }
 
@@ -413,14 +454,22 @@ fn test_metadata_only_concat_audio_across_two_video_clips() {
     let audio_files: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|ext| ext == "wav").unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "wav")
+                .unwrap_or(false)
+        })
         .collect();
     assert_eq!(
         audio_files.len(),
         1,
         "Expected exactly 1 concatenated audio file, got {} (files: {:?})",
         audio_files.len(),
-        audio_files.iter().map(|e| e.path().display().to_string()).collect::<Vec<_>>(),
+        audio_files
+            .iter()
+            .map(|e| e.path().display().to_string())
+            .collect::<Vec<_>>(),
     );
 
     let concat_path = audio_files[0].path();
@@ -432,13 +481,23 @@ fn test_metadata_only_concat_audio_across_two_video_clips() {
     assert!(
         num_samples.abs_diff(expected_samples) <= tolerance,
         "Expected ~{} samples, got {} (tolerance: {})",
-        expected_samples, num_samples, tolerance,
+        expected_samples,
+        num_samples,
+        tolerance,
     );
 
     let renamed1 = dir.path().join("clip1_video_clip01.mp4");
     let renamed2 = dir.path().join("clip2_video_clip02.mp4");
-    assert!(renamed1.exists(), "Renamed clip1 not found: {}", renamed1.display());
-    assert!(renamed2.exists(), "Renamed clip2 not found: {}", renamed2.display());
+    assert!(
+        renamed1.exists(),
+        "Renamed clip1 not found: {}",
+        renamed1.display()
+    );
+    assert!(
+        renamed2.exists(),
+        "Renamed clip2 not found: {}",
+        renamed2.display()
+    );
 
     assert!(!clip1.exists(), "Original clip1 should have been renamed");
     assert!(!clip2.exists(), "Original clip2 should have been renamed");
@@ -450,32 +509,64 @@ fn test_metadata_only_concat_audio_across_two_video_clips() {
 fn create_test_video_with_gop(path: &std::path::Path, duration_secs: f64, gop: u32) {
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-v", "error",
-            "-f", "lavfi", "-i", &format!("color=c=blue:s=320x240:r=25:duration={}", duration_secs),
-            "-f", "lavfi", "-i", &format!("sine=frequency=440:duration={}:sample_rate=48000", duration_secs),
-            "-map", "0:v", "-map", "1:a",
-            "-c:v", "mpeg4", "-g", &gop.to_string(), "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c=blue:s=320x240:r=25:duration={}", duration_secs),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "sine=frequency=440:duration={}:sample_rate=48000",
+                duration_secs
+            ),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "mpeg4",
+            "-g",
+            &gop.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
             "-shortest",
-            "-t", &format!("{}", duration_secs),
+            "-t",
+            &format!("{}", duration_secs),
             &path.to_string_lossy(),
         ])
         .status()
         .expect("failed to spawn ffmpeg for test video");
-    assert!(status.success(), "ffmpeg fixture creation failed for {}", path.display());
+    assert!(
+        status.success(),
+        "ffmpeg fixture creation failed for {}",
+        path.display()
+    );
 }
 
 fn probe_duration_secs(path: &Path) -> f64 {
     let out = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "csv=p=0",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
             &path.to_string_lossy(),
         ])
         .output()
         .expect("failed to spawn ffprobe");
-    assert!(out.status.success(), "ffprobe failed for {}", path.display());
+    assert!(
+        out.status.success(),
+        "ffprobe failed for {}",
+        path.display()
+    );
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse::<f64>()
@@ -485,16 +576,24 @@ fn probe_duration_secs(path: &Path) -> f64 {
 fn probe_stream_codecs(path: &Path) -> Vec<String> {
     let out = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-show_entries", "stream=codec_name,codec_type",
-            "-of", "csv=p=0",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name,codec_type",
+            "-of",
+            "csv=p=0",
             &path.to_string_lossy(),
         ])
         .output()
         .expect("failed to spawn ffprobe");
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .flat_map(|l| l.trim().split(',').map(|s| s.to_string()).collect::<Vec<_>>())
+        .flat_map(|l| {
+            l.trim()
+                .split(',')
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
         .filter(|l| !l.is_empty() && l != "unknown")
         .collect()
 }
@@ -539,7 +638,12 @@ fn test_copy_mode_streams_video_and_derives_container() {
         embed_camera_metadata: true,
         trim_offsets_secs: vec![2.5],
         timecode_meta_per_file: vec![Some(gui_engine::converter::TimecodeMetadata {
-            start: audio_core::Timecode { hours: 1, minutes: 0, seconds: 4, frames: 12 },
+            start: audio_core::Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 4,
+                frames: 12,
+            },
             fps: 25.0,
             drop_frame: false,
         })],
@@ -562,7 +666,11 @@ fn test_copy_mode_streams_video_and_derives_container() {
     assert!(
         output.exists(),
         "stream-copy output not created (dir: {:?})",
-        std::fs::read_dir(dir.path()).map(|e| e.filter_map(|e| e.ok().map(|e| e.path())).collect::<Vec<_>>()).unwrap_or_default(),
+        std::fs::read_dir(dir.path())
+            .map(|e| e
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect::<Vec<_>>())
+            .unwrap_or_default(),
     );
 
     let codecs = probe_stream_codecs(&output);
@@ -602,7 +710,9 @@ fn test_progress_stays_below_100_until_all_steps_done() {
     }
 
     let settings = ConverterSettings {
-        pipeline: ConversionPipeline::AudioOnly { generate_synthetic_video: false },
+        pipeline: ConversionPipeline::AudioOnly {
+            generate_synthetic_video: false,
+        },
         input_files,
         recording_type: RecordingType::MultiTrackAudio,
         ltc_track_channel_index: 0,
@@ -639,7 +749,10 @@ fn test_progress_stays_below_100_until_all_steps_done() {
     );
 
     let hist = report.progress_history();
-    assert!(hist.len() >= 2, "conversion must report progress more than once");
+    assert!(
+        hist.len() >= 2,
+        "conversion must report progress more than once"
+    );
     assert!(
         hist.windows(2).all(|w| w[0] <= w[1]),
         "progress must be non-decreasing: {:?}",
@@ -650,5 +763,8 @@ fn test_progress_stays_below_100_until_all_steps_done() {
         "progress must stay below 100% until the final step completes: {:?}",
         hist
     );
-    assert!(*hist.last().unwrap() >= 0.99, "final progress must reach ~1.0");
+    assert!(
+        *hist.last().unwrap() >= 0.99,
+        "final progress must reach ~1.0"
+    );
 }

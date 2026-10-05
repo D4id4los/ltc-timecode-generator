@@ -6,7 +6,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use crate::camera_meta::CameraInfo;
-use crate::converter::{TimecodeMetadata, format_ffmpeg_timecode};
+use crate::converter::{format_ffmpeg_timecode, TimecodeMetadata};
 use crate::subprocess::{no_window_command, run_output_with_timeout, SubprocessFailure};
 
 /// Total timeout for the ffmpeg stream-copy tagging fallback.
@@ -44,15 +44,24 @@ pub enum TagOutcome {
 #[derive(Debug)]
 pub enum TagError {
     /// The ffmpeg subprocess could not run or timed out.
-    Subprocess { path: PathBuf, failure: SubprocessFailure },
+    Subprocess {
+        path: PathBuf,
+        failure: SubprocessFailure,
+    },
     /// ffmpeg ran but exited non-zero; carries the stderr tail.
     FfmpegFailed { path: PathBuf, stderr_tail: String },
     /// The temporary remux output could not be stat'ed.
-    MissingOutput { path: PathBuf, source: std::io::Error },
+    MissingOutput {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// The temporary remux output was suspiciously small.
     OutputTooSmall { path: PathBuf, bytes: u64 },
     /// The atomic rename over the original failed.
-    Rename { path: PathBuf, source: std::io::Error },
+    Rename {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl fmt::Display for TagError {
@@ -122,33 +131,21 @@ pub fn tag_file(
         .unwrap_or_default();
 
     match ext.as_str() {
-        "mov" | "mp4" | "m4v" => {
-            match native::tag_mp4_tmcd(path, meta) {
-                Ok(outcome) => return Ok(outcome),
-                Err(e) => {
-                    log::warn!(
-                        "Native MP4 tagger skipped for {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
+        "mov" | "mp4" | "m4v" => match native::tag_mp4_tmcd(path, meta) {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => {
+                log::warn!("Native MP4 tagger skipped for {}: {}", path.display(), e);
             }
-        }
+        },
         "mxf" => {
             // MXF uses ffmpeg fallback (header-partition TC is structural)
         }
-        "wav" => {
-            match tag_wav_bext(path, meta, camera) {
-                Ok(outcome) => return Ok(outcome),
-                Err(e) => {
-                    log::warn!(
-                        "Native WAV tagger skipped for {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
+        "wav" => match tag_wav_bext(path, meta, camera) {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => {
+                log::warn!("Native WAV tagger skipped for {}: {}", path.display(), e);
             }
-        }
+        },
         "mts" | "m2ts" | "ts" | "m2t" => {
             return Ok(TagOutcome::Skipped {
                 reason: SkipReason::UnsupportedContainer {
@@ -175,19 +172,21 @@ mod native {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::Path;
 
+    use super::{
+        build_tmcd_trak, patch_stco_offset, read_be_u24, read_be_u32, read_be_u64, BoxEntry,
+        TagOutcome,
+    };
     use crate::converter::TimecodeMetadata;
-    use super::{BoxEntry, TagOutcome, build_tmcd_trak, patch_stco_offset, read_be_u24, read_be_u32, read_be_u64};
 
     /// Try to tag a MOV/MP4 file in place.  Returns `Ok(outcome)` on success;
     /// on failure (wrong layout, unparseable boxes) returns `Err(reason)` so
     /// the caller can fall through to the ffmpeg fallback.
     pub fn tag_mp4_tmcd(path: &Path, meta: &TimecodeMetadata) -> Result<TagOutcome, String> {
-        let mut file =
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-                .map_err(|e| format!("cannot open {}: {}", path.display(), e))?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("cannot open {}: {}", path.display(), e))?;
 
         let file_len = file
             .seek(SeekFrom::End(0))
@@ -240,8 +239,7 @@ mod native {
         //   rate(4), volume(2), reserved(10), matrix(36), predef(24), next_track_id(4)
 
         let mvhd_payload_offset = mvhd_box.payload_offset;
-        let rel_payload = &moov_data
-            [(mvhd_payload_offset - (moov_offset + 8)) as usize..];
+        let rel_payload = &moov_data[(mvhd_payload_offset - (moov_offset + 8)) as usize..];
 
         let version = rel_payload[0];
         let _flags = read_be_u24(&rel_payload[1..4]);
@@ -264,13 +262,11 @@ mod native {
         }
 
         // Read current next_track_id
-        let cur_next_track_id =
-            read_be_u32(&rel_payload[next_track_id_off..next_track_id_off + 4]);
+        let cur_next_track_id = read_be_u32(&rel_payload[next_track_id_off..next_track_id_off + 4]);
         let new_track_id = cur_next_track_id;
 
         // ── Phase 4: build the tmcd trak box ────────────────────────────
-        let tmcd_trak =
-            build_tmcd_trak(meta, new_track_id, timescale, duration)?;
+        let tmcd_trak = build_tmcd_trak(meta, new_track_id, timescale, duration)?;
 
         // The appended mdat payload lands at file_len + 8 (file_len was
         // captured before any writes; nothing else grows the file first).
@@ -289,8 +285,7 @@ mod native {
         let _old_val = read_be_u32(&moov_data[abs_next_off as usize..abs_next_off as usize + 4]);
         let new_val = new_track_id;
         let next_bytes = new_val.to_be_bytes();
-        moov_data[abs_next_off as usize..abs_next_off as usize + 4]
-            .copy_from_slice(&next_bytes);
+        moov_data[abs_next_off as usize..abs_next_off as usize + 4].copy_from_slice(&next_bytes);
 
         // Build the new moov payload: old moov_data + tmcd_trak
         let mut new_moov_payload = moov_data;
@@ -341,8 +336,7 @@ mod native {
         file.write_all(&new_moov_payload)
             .map_err(|e| format!("write new moov payload: {}", e))?;
 
-        file.sync_all()
-            .map_err(|e| format!("fsync: {}", e))?;
+        file.sync_all().map_err(|e| format!("fsync: {}", e))?;
 
         log::info!(
             "Tagged {} in place (moov → free, appended tmcd + mdat, size delta ∼{} B)",
@@ -377,10 +371,7 @@ mod native {
                 break;
             }
             if size < 8 {
-                return Err(format!(
-                    "invalid box size {} at offset {}",
-                    size, offset
-                ));
+                return Err(format!("invalid box size {} at offset {}", size, offset));
             }
             boxes.push(BoxEntry {
                 offset,
@@ -545,7 +536,12 @@ pub(super) fn patch_stco_offset(trak: &mut [u8], chunk_offset: u32) -> Result<()
 /// Build a `tkhd` box (version 0, flags 0x0003 = enabled + in movie).
 fn build_tkhd(track_id: u32, duration: u64, _timescale: u32) -> Vec<u8> {
     let flags: u32 = 0x0000_0003; // track enabled + in movie
-    let version_flags = [0u8, ((flags >> 16) & 0xFF) as u8, ((flags >> 8) & 0xFF) as u8, (flags & 0xFF) as u8];
+    let version_flags = [
+        0u8,
+        ((flags >> 16) & 0xFF) as u8,
+        ((flags >> 8) & 0xFF) as u8,
+        (flags & 0xFF) as u8,
+    ];
     let mut buf = Vec::with_capacity(92);
     buf.extend_from_slice(&version_flags); // 4 bytes: version(1) + flags(3)
     buf.extend_from_slice(&0u32.to_be_bytes()); // creation_time
@@ -554,13 +550,13 @@ fn build_tkhd(track_id: u32, duration: u64, _timescale: u32) -> Vec<u8> {
     buf.extend_from_slice(&0u32.to_be_bytes()); // reserved
     buf.extend_from_slice(&(duration.to_be_bytes())); // duration
     buf.extend_from_slice(&0u64.to_be_bytes()); // reserved [layer, alternate_group, volume] + reserved
-    // matrix (36 bytes) = identity
+                                                // matrix (36 bytes) = identity
     let identity_matrix: [u8; 36] = [
-        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // a=1, b=0
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,  // u=0, c=0
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // d=1, v=0
-        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // w=1, x=0
-        0x00, 0x00, 0x00, 0x00,                             // y=0
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // a=1, b=0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, // u=0, c=0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // d=1, v=0
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // w=1, x=0
+        0x00, 0x00, 0x00, 0x00, // y=0
     ];
     buf.extend_from_slice(&identity_matrix);
     // width(4) + height(4) = 0 (default)
@@ -591,7 +587,7 @@ fn build_hdlr_tmcd() -> Vec<u8> {
     buf.extend_from_slice(&[0u8; 4]); // component manufacturer
     buf.extend_from_slice(&[0u8; 4]); // component flags
     buf.extend_from_slice(&[0u8; 4]); // component flags mask
-    // Name string (pascal-style: count byte + "TimecodeHandler\0")
+                                      // Name string (pascal-style: count byte + "TimecodeHandler\0")
     buf.push(15u8); // string length
     buf.extend_from_slice(b"TimecodeHandler");
     build_box(b"hdlr", &[&buf])
@@ -725,7 +721,6 @@ fn bext_padded_string(s: &str, len: usize) -> Vec<u8> {
     buf
 }
 
-
 /// Build a 602-byte BWF `bext` chunk payload (BWF v1 fixed-size fields).
 ///
 /// Layout (from payload start):
@@ -783,7 +778,11 @@ fn build_bext_payload(
 /// If no `bext` chunk exists, creates one by appending it at the end of
 /// the file (O(1) for any file size — most WAV parsers accept bext after
 /// the data chunk).
-fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo>) -> Result<TagOutcome, String> {
+fn tag_wav_bext(
+    path: &Path,
+    meta: &TimecodeMetadata,
+    camera: Option<&CameraInfo>,
+) -> Result<TagOutcome, String> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -865,8 +864,7 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
                 .map_err(|e| format!("seek to time_reference: {}", e))?;
             file.write_all(&time_ref_bytes[0..8])
                 .map_err(|e| format!("write time_reference: {}", e))?;
-            file.sync_all()
-                .map_err(|e| format!("fsync: {}", e))?;
+            file.sync_all().map_err(|e| format!("fsync: {}", e))?;
 
             log::info!(
                 "Patched bext originator={}, time_reference={} in {}",
@@ -915,7 +913,6 @@ fn tag_wav_bext(path: &Path, meta: &TimecodeMetadata, camera: Option<&CameraInfo
     Ok(TagOutcome::TaggedInPlace)
 }
 
-
 // ── ffmpeg fallback ────────────────────────────────────────────────────
 
 /// Tag a file via ffmpeg stream-copy remux: write to a temp file in the
@@ -950,10 +947,7 @@ fn tag_via_ffmpeg_with(
     camera: Option<&CameraInfo>,
     runner: &mut dyn FnMut(&[String], &Path) -> Result<Output, SubprocessFailure>,
 ) -> Result<TagOutcome, TagError> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("bin");
 
     // Determine output container (match input); mkv maps to ffmpeg's
     // "matroska" name for the -f flag.
@@ -964,10 +958,7 @@ fn tag_via_ffmpeg_with(
 
     // Temp file in same directory
     let parent = path.parent().unwrap_or(Path::new("."));
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("temp");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("temp");
     let tmp_path = parent.join(format!(".{}.tc-{}.tmp.{}", stem, std::process::id(), ext));
     let _final_path = tmp_path.with_extension(ext);
 
@@ -1004,7 +995,10 @@ fn tag_via_ffmpeg_with(
     // Run ffmpeg via the injectable runner
     let output = runner(&args, &tmp_path).map_err(|failure| {
         let _ = std::fs::remove_file(&tmp_path);
-        TagError::Subprocess { path: path.to_path_buf(), failure }
+        TagError::Subprocess {
+            path: path.to_path_buf(),
+            failure,
+        }
     })?;
 
     if !output.status.success() {
@@ -1017,17 +1011,22 @@ fn tag_via_ffmpeg_with(
     }
 
     // Validate output exists and is non-trivial
-    let meta_out = std::fs::metadata(&tmp_path).map_err(|source| {
-        TagError::MissingOutput { path: path.to_path_buf(), source }
+    let meta_out = std::fs::metadata(&tmp_path).map_err(|source| TagError::MissingOutput {
+        path: path.to_path_buf(),
+        source,
     })?;
     if meta_out.len() < 256 {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(TagError::OutputTooSmall { path: path.to_path_buf(), bytes: meta_out.len() });
+        return Err(TagError::OutputTooSmall {
+            path: path.to_path_buf(),
+            bytes: meta_out.len(),
+        });
     }
 
     // Atomic rename over the original
-    std::fs::rename(&tmp_path, path).map_err(|source| {
-        TagError::Rename { path: path.to_path_buf(), source }
+    std::fs::rename(&tmp_path, path).map_err(|source| TagError::Rename {
+        path: path.to_path_buf(),
+        source,
     })?;
 
     log::info!("Tagged {} via ffmpeg (stream copy)", path.display());
@@ -1102,25 +1101,25 @@ mod tests {
 
     #[test]
     fn test_scan_top_level_boxes_single() {
-// Build one box: ftyp with 8B payload (b"mp42isom" is 8 bytes)
-    let mut data = Vec::new();
-    let box_size: u32 = 16; // header 8 + payload 8
-    data.extend_from_slice(&box_size.to_be_bytes());
-    data.extend_from_slice(b"ftyp");
-    data.extend_from_slice(b"mp42isom");
+        // Build one box: ftyp with 8B payload (b"mp42isom" is 8 bytes)
+        let mut data = Vec::new();
+        let box_size: u32 = 16; // header 8 + payload 8
+        data.extend_from_slice(&box_size.to_be_bytes());
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(b"mp42isom");
 
-    let dir = TempDir::new().unwrap();
-    let p = dir.path().join("test.mp4");
-    std::fs::write(&p, &data).unwrap();
-    let flen = data.len() as u64;
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("test.mp4");
+        std::fs::write(&p, &data).unwrap();
+        let flen = data.len() as u64;
 
-    let mut f = std::fs::OpenOptions::new().read(true).open(&p).unwrap();
-    let boxes = native::scan_top_level_boxes(&mut f, flen).unwrap();
-    assert_eq!(boxes.len(), 1);
-    assert_eq!(boxes[0].box_type, *b"ftyp");
-    assert_eq!(boxes[0].box_size, 16);
-    assert_eq!(boxes[0].offset, 0);
-    assert_eq!(boxes[0].payload_offset, 8);
+        let mut f = std::fs::OpenOptions::new().read(true).open(&p).unwrap();
+        let boxes = native::scan_top_level_boxes(&mut f, flen).unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].box_type, *b"ftyp");
+        assert_eq!(boxes[0].box_size, 16);
+        assert_eq!(boxes[0].offset, 0);
+        assert_eq!(boxes[0].payload_offset, 8);
     }
 
     #[test]
@@ -1225,7 +1224,7 @@ mod tests {
     fn test_build_stco_one() {
         let stco = build_stco_one(42);
         let payload = &stco[8..]; // skip box header
-        // stco header: version(1) flags(3) entry_count(4) = 8 bytes before data
+                                  // stco header: version(1) flags(3) entry_count(4) = 8 bytes before data
         let version = payload[0];
         assert_eq!(version, 0);
         let entry_count = read_be_u32(&payload[4..8]);
@@ -1299,14 +1298,11 @@ mod tests {
         // Read the file, locate "data" chunk, insert bext before data
         let original = std::fs::read(&p).unwrap();
         // Find "fmt " in the original, then find "data" after it
-        let fmt_pos = original
-            .windows(4)
-            .position(|w| w == b"fmt ")
-            .unwrap();
+        let fmt_pos = original.windows(4).position(|w| w == b"fmt ").unwrap();
         let fmt_size_pos = fmt_pos + 4;
-        let fmt_size = u32::from_le_bytes(
-            original[fmt_size_pos..fmt_size_pos + 4].try_into().unwrap(),
-        ) as usize;
+        let fmt_size =
+            u32::from_le_bytes(original[fmt_size_pos..fmt_size_pos + 4].try_into().unwrap())
+                as usize;
         // data chunk starts after fmt chunk: fmt header(8) + fmt_size
         let data_chunk_start = fmt_size_pos + 4 + fmt_size;
         // Data chunk header is at data_chunk_start, "data" at data_chunk_start + 4
@@ -1353,16 +1349,10 @@ mod tests {
 
         // Verify the time_reference changed from the initial dummy value
         let patched = std::fs::read(&p).unwrap();
-        let bext_pos = patched
-            .windows(4)
-            .position(|w| w == b"bext")
-            .unwrap();
+        let bext_pos = patched.windows(4).position(|w| w == b"bext").unwrap();
         let time_ref_pos = bext_pos + 8 + 338;
-        let time_ref_val = u64::from_le_bytes(
-            patched[time_ref_pos..time_ref_pos + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let time_ref_val =
+            u64::from_le_bytes(patched[time_ref_pos..time_ref_pos + 8].try_into().unwrap());
         // Should no longer be the dummy 12345678
         assert_ne!(time_ref_val, 12345678, "time_reference was not patched");
         // Should be > 0 and reasonable for 1h @ samplerate
@@ -1396,9 +1386,18 @@ mod tests {
         // Create a short test video with ffmpeg
         let status = no_window_command("ffmpeg")
             .args([
-                "-f", "lavfi", "-i", "color=c=blue:s=128x72:r=25:d=1",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-                "-c:v", "libx264", "-c:a", "aac",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=128x72:r=25:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
                 "-y",
             ])
             .arg(&video)
@@ -1409,7 +1408,12 @@ mod tests {
         assert!(status.success(), "test video creation failed");
 
         let meta = TimecodeMetadata {
-            start: Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 },
+            start: Timecode {
+                hours: 10,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
             fps: 25.0,
             drop_frame: false,
         };
@@ -1455,8 +1459,12 @@ mod tests {
         // Create a WAV with ffmpeg
         let status = no_window_command("ffmpeg")
             .args([
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-                "-c:a", "pcm_s16le",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "pcm_s16le",
                 "-y",
             ])
             .arg(&wav)
@@ -1485,7 +1493,10 @@ mod tests {
         match result.unwrap() {
             TagOutcome::Skipped { reason } => assert_eq!(
                 reason,
-                SkipReason::UnsupportedContainer { family: "MPEG-TS", ext: "mts".to_string() }
+                SkipReason::UnsupportedContainer {
+                    family: "MPEG-TS",
+                    ext: "mts".to_string()
+                }
             ),
             other => panic!("expected Skipped outcome, got {other:?}"),
         }
@@ -1532,7 +1543,10 @@ mod tests {
         assert!(
             matches!(
                 result.unwrap_err(),
-                TagError::Subprocess { failure: SubprocessFailure::TimedOut, .. }
+                TagError::Subprocess {
+                    failure: SubprocessFailure::TimedOut,
+                    ..
+                }
             ),
             "timeout must map to TagError::Subprocess(TimedOut)"
         );
@@ -1550,9 +1564,8 @@ mod tests {
         std::fs::write(&p, b"dummy content").unwrap();
         let meta = test_meta();
 
-        let mut io_runner = |_: &[String], _: &Path| {
-            Err(SubprocessFailure::Io("binary not found".into()))
-        };
+        let mut io_runner =
+            |_: &[String], _: &Path| Err(SubprocessFailure::Io("binary not found".into()));
         let result = tag_via_ffmpeg_with(&p, &meta, None, &mut io_runner);
         assert!(result.is_err(), "expected Io error, got {:?}", result);
         assert!(
@@ -1574,16 +1587,15 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         let junk_payload = [0u8; 32];
         let data_payload = [0u8; 8];
-        let riff_size = 4u32
-            + (8 + junk_payload.len() as u32)
-            + (8 + 16)
-            + (8 + data_payload.len() as u32);
+        let riff_size =
+            4u32 + (8 + junk_payload.len() as u32) + (8 + 16) + (8 + data_payload.len() as u32);
         f.write_all(b"RIFF").unwrap();
         f.write_all(&riff_size.to_le_bytes()).unwrap();
         f.write_all(b"WAVE").unwrap();
         // JUNK chunk before fmt — recorders (e.g. TASCAM) emit these.
         f.write_all(b"JUNK").unwrap();
-        f.write_all(&(junk_payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&(junk_payload.len() as u32).to_le_bytes())
+            .unwrap();
         f.write_all(&junk_payload).unwrap();
         // fmt chunk
         f.write_all(b"fmt ").unwrap();
@@ -1594,9 +1606,10 @@ mod tests {
         f.write_all(&(sample_rate * 2).to_le_bytes()).unwrap(); // byte rate
         f.write_all(&2u16.to_le_bytes()).unwrap(); // block align
         f.write_all(&16u16.to_le_bytes()).unwrap(); // bits per sample
-        // data chunk
+                                                    // data chunk
         f.write_all(b"data").unwrap();
-        f.write_all(&(data_payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&(data_payload.len() as u32).to_le_bytes())
+            .unwrap();
         f.write_all(&data_payload).unwrap();
         path
     }
@@ -1633,7 +1646,8 @@ mod tests {
         f.write_all(&riff_size.to_le_bytes()).unwrap();
         f.write_all(b"WAVE").unwrap();
         f.write_all(b"JUNK").unwrap();
-        f.write_all(&(odd_payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&(odd_payload.len() as u32).to_le_bytes())
+            .unwrap();
         f.write_all(&odd_payload).unwrap();
         f.write_all(&[0u8]).unwrap(); // pad byte
         f.write_all(b"fmt ").unwrap();

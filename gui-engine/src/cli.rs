@@ -20,9 +20,7 @@ use crate::state::AppStateSnapshot;
 
 fn init_logger() {
     let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(
-            crate::log_buffer::DEFAULT_LOG_FILTER,
-        ),
+        env_logger::Env::default().default_filter_or(crate::log_buffer::DEFAULT_LOG_FILTER),
     )
     .try_init();
 }
@@ -30,7 +28,11 @@ fn init_logger() {
 // ── CLI struct ──────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "ltc-timecode-generator", about = "LTC Timecode Generator", version)]
+#[command(
+    name = "ltc-timecode-generator",
+    about = "LTC Timecode Generator",
+    version
+)]
 pub struct Cli {
     /// List available audio devices and exit
     #[arg(long, short = 'l')]
@@ -129,7 +131,11 @@ pub struct Cli {
     pub context_frames: u32,
 
     /// Print all decoded timecodes from the LTC file
-    #[arg(short = 't', long = "list-timecodes", help = "Print all decoded LTC timecodes")]
+    #[arg(
+        short = 't',
+        long = "list-timecodes",
+        help = "Print all decoded LTC timecodes"
+    )]
     pub list_timecodes: bool,
 
     /// Start LTC generation immediately when the GUI opens (GUI mode only)
@@ -182,7 +188,11 @@ impl std::fmt::Display for TimecodeParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TimecodeParseError::BadFormat { input } => {
-                write!(f, "Invalid timecode format '{}' — expected HH:MM:SS:FF", input)
+                write!(
+                    f,
+                    "Invalid timecode format '{}' — expected HH:MM:SS:FF",
+                    input
+                )
             }
             TimecodeParseError::InvalidComponent { field, input } => {
                 write!(f, "Invalid {} in '{}'", field.as_str(), input)
@@ -255,12 +265,12 @@ fn parse_timecode(s: &str) -> Result<Timecode, TimecodeParseError> {
         TcField::Frames,
     ];
     for (i, field) in fields.iter().enumerate() {
-        parsed[i] = parts[i].parse::<u32>().map_err(|_| {
-            TimecodeParseError::InvalidComponent {
+        parsed[i] = parts[i]
+            .parse::<u32>()
+            .map_err(|_| TimecodeParseError::InvalidComponent {
                 field: *field,
                 input: s.to_string(),
-            }
-        })?;
+            })?;
     }
     let [hours, minutes, seconds, frames] = parsed;
     if hours >= 24 {
@@ -332,9 +342,7 @@ fn resolve_device(
                 return Ok(dev.id.clone());
             }
         }
-        return Err(ResolveDeviceError::NotFound {
-            query: id.clone(),
-        });
+        return Err(ResolveDeviceError::NotFound { query: id.clone() });
     }
 
     if let Some(index) = cli.device_index {
@@ -352,7 +360,10 @@ fn resolve_device(
             return Ok(dev.id.clone());
         }
     }
-    devices.first().map(|d| d.id.clone()).ok_or(ResolveDeviceError::NoDevices)
+    devices
+        .first()
+        .map(|d| d.id.clone())
+        .ok_or(ResolveDeviceError::NoDevices)
 }
 
 // ── Headless mode ───────────────────────────────────────────────────────
@@ -375,9 +386,11 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let valid_fps = [24.0, 25.0, 29.97, 30.0];
     if !valid_fps.iter().any(|f| (f - fps).abs() < 0.01) {
-        return Err(
-            format!("Unsupported fps: {}. Must be one of: 24, 25, 29.97, 30", fps).into(),
-        );
+        return Err(format!(
+            "Unsupported fps: {}. Must be one of: 24, 25, 29.97, 30",
+            fps
+        )
+        .into());
     }
 
     if !(0.0..=1.0).contains(&volume) {
@@ -398,7 +411,9 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let device_id = resolve_device(&devices, &cli)?;
     info!("Using audio device: id={}", device_id);
 
-    let sample_rate = cli.sample_rate.unwrap_or_else(audio_core::suggest_sample_rate);
+    let sample_rate = cli
+        .sample_rate
+        .unwrap_or_else(audio_core::suggest_sample_rate);
 
     let core = AudioCore::new();
 
@@ -453,7 +468,11 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         if verbose {
             let current_tc = core.current_timecode();
             if current_tc != last_tc {
-                println!("  {}  ({})", timecode_fmt(&current_tc), timecode_fmt(&start_tc));
+                println!(
+                    "  {}  ({})",
+                    timecode_fmt(&current_tc),
+                    timecode_fmt(&start_tc)
+                );
                 last_tc = current_tc;
             }
         }
@@ -579,10 +598,18 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     for frame_num in 0..total_frames {
         frame_buf.fill(0.0);
-        generate_ltc_frame_stereo(audio_core::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume, channel },
-        &mut last_level,
-        &mut frame_buf[..samples_per_frame * 2]
-    );
+        generate_ltc_frame_stereo(
+            audio_core::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame,
+                total_samples: samples_per_frame,
+                samples_per_bit,
+                volume,
+                channel,
+            },
+            &mut last_level,
+            &mut frame_buf[..samples_per_frame * 2],
+        );
 
         for &sample in &frame_buf[..samples_per_frame * 2] {
             let clamped = sample.clamp(-1.0, 1.0);
@@ -644,7 +671,8 @@ fn run_decode_on_wav(
     let chunk_count = audio_core::count_chunks_in_wav(path, &config).unwrap_or(1);
 
     let progress = audio_core::DecodeProgress::new(chunk_count);
-    let dispatch = crate::decode::wav_dispatch_decision(single_pass, Some(chunk_count), chunk_count);
+    let dispatch =
+        crate::decode::wav_dispatch_decision(single_pass, Some(chunk_count), chunk_count);
 
     let progress_handle = if matches!(dispatch, crate::decode::WavDispatch::Chunked(_)) {
         let completed_ref = progress.chunks_completed.clone();
@@ -656,8 +684,18 @@ fn run_decode_on_wav(
                 let pct = (done.checked_mul(100))
                     .and_then(|v| v.checked_div(total_chunks))
                     .unwrap_or(100);
-                eprint!("\rDecoding: {:3}%  (chunk {}/{})", pct.min(100), done.min(total_chunks), total_chunks);
-                if done >= total_chunks || total_chunks == 0 || std::time::Instant::now() >= deadline { break; }
+                eprint!(
+                    "\rDecoding: {:3}%  (chunk {}/{})",
+                    pct.min(100),
+                    done.min(total_chunks),
+                    total_chunks
+                );
+                if done >= total_chunks
+                    || total_chunks == 0
+                    || std::time::Instant::now() >= deadline
+                {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }))
@@ -696,27 +734,54 @@ fn print_decode_summary(
     let mut out = String::new();
     out.push_str("\n=== LTC Decode Results ===\n");
     out.push_str(&format!("  File:          {}\n", path.display()));
-    out.push_str(&format!("  Decoder:       {}\n",
-        if use_libltc { "libltc (C library)" } else { "builtin (Rust)" }));
+    out.push_str(&format!(
+        "  Decoder:       {}\n",
+        if use_libltc {
+            "libltc (C library)"
+        } else {
+            "builtin (Rust)"
+        }
+    ));
     out.push_str(&format!("  Status:        {:?}\n", result.status));
     out.push_str(&format!("  Sample rate:   {} Hz\n", result.sample_rate));
-    out.push_str(&format!("  Duration:      {:.3}s\n", result.total_audio_duration_secs));
-    out.push_str(&format!("  FPS:           {:.2}{}\n", result.detected_fps,
-        if result.drop_frame { " DF" } else { "" }));
-    out.push_str(&format!("  Valid frames:  {} / {} ({:.1}%)\n",
-        result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0));
-    out.push_str(&format!("  First TC at:   {:.3}s\n", result.first_ltc_timecode_secs));
-    out.push_str(&format!("  Processing:    {:.1}ms\n", result.processing_time_ms));
+    out.push_str(&format!(
+        "  Duration:      {:.3}s\n",
+        result.total_audio_duration_secs
+    ));
+    out.push_str(&format!(
+        "  FPS:           {:.2}{}\n",
+        result.detected_fps,
+        if result.drop_frame { " DF" } else { "" }
+    ));
+    out.push_str(&format!(
+        "  Valid frames:  {} / {} ({:.1}%)\n",
+        result.valid_frames,
+        result.total_possible_frames,
+        result.avg_confidence * 100.0
+    ));
+    out.push_str(&format!(
+        "  First TC at:   {:.3}s\n",
+        result.first_ltc_timecode_secs
+    ));
+    out.push_str(&format!(
+        "  Processing:    {:.1}ms\n",
+        result.processing_time_ms
+    ));
 
     if !result.timecodes.is_empty() {
         let first = &result.timecodes[0];
         let last = &result.timecodes[result.timecodes.len() - 1];
-        out.push_str(&format!("  First TC:      {:02}:{:02}:{:02}:{:02}\n",
-            first.timecode.hours, first.timecode.minutes,
-            first.timecode.seconds, first.timecode.frames));
-        out.push_str(&format!("  Last TC:       {:02}:{:02}:{:02}:{:02}\n",
-            last.timecode.hours, last.timecode.minutes,
-            last.timecode.seconds, last.timecode.frames));
+        out.push_str(&format!(
+            "  First TC:      {:02}:{:02}:{:02}:{:02}\n",
+            first.timecode.hours,
+            first.timecode.minutes,
+            first.timecode.seconds,
+            first.timecode.frames
+        ));
+        out.push_str(&format!(
+            "  Last TC:       {:02}:{:02}:{:02}:{:02}\n",
+            last.timecode.hours, last.timecode.minutes, last.timecode.seconds, last.timecode.frames
+        ));
     }
 
     for detail in &result.details {
@@ -729,15 +794,28 @@ fn print_decode_summary(
 fn print_quality_block(q: &audio_core::LtcQualityReport) -> String {
     let mut out = String::new();
     out.push_str("=== LTC Quality ===\n");
-    out.push_str(&format!("  Score:        {:.2} / 1.00 ({})\n", q.score, q.grade));
-    out.push_str(&format!("  Usable:       {:.1}% ({} block(s), {} backward jump(s))\n",
-        q.usable_coverage * 100.0, q.block_count, q.backward_jump_count));
-    out.push_str(&format!("  Frames:       {} missing, {} largest block\n",
-        q.missing_frames, q.largest_block));
-    out.push_str(&format!("  Contiguity:   {} gap(s), {} glitch(es), {} edit point(s)\n",
-        q.gap_count, q.glitch_count, q.edit_count));
-    out.push_str(&format!("  Sync drift:   max {:.3}s ({:.2} frames), rate {:.4} s/s\n",
-        q.max_drift_secs, q.worst_block_drift_frames, q.drift_rate));
+    out.push_str(&format!(
+        "  Score:        {:.2} / 1.00 ({})\n",
+        q.score, q.grade
+    ));
+    out.push_str(&format!(
+        "  Usable:       {:.1}% ({} block(s), {} backward jump(s))\n",
+        q.usable_coverage * 100.0,
+        q.block_count,
+        q.backward_jump_count
+    ));
+    out.push_str(&format!(
+        "  Frames:       {} missing, {} largest block\n",
+        q.missing_frames, q.largest_block
+    ));
+    out.push_str(&format!(
+        "  Contiguity:   {} gap(s), {} glitch(es), {} edit point(s)\n",
+        q.gap_count, q.glitch_count, q.edit_count
+    ));
+    out.push_str(&format!(
+        "  Sync drift:   max {:.3}s ({:.2} frames), rate {:.4} s/s\n",
+        q.max_drift_secs, q.worst_block_drift_frames, q.drift_rate
+    ));
     out.push_str(&format!("  Summary:      {}\n", q.summary));
     out
 }
@@ -753,8 +831,15 @@ fn frame_timecode_to_secs(ft: &audio_core::FrameTimecode, fps: f64) -> f64 {
 
 /// One `"[   12] 01:02:03:04  (3723.167s)"` frame-context line.
 fn render_frame_context_line(ft: &audio_core::FrameTimecode) -> String {
-    format!("[{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)", ft.frame_index,
-        ft.timecode.hours, ft.timecode.minutes, ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs)
+    format!(
+        "[{:4}] {:02}:{:02}:{:02}:{:02}  ({:.3}s)",
+        ft.frame_index,
+        ft.timecode.hours,
+        ft.timecode.minutes,
+        ft.timecode.seconds,
+        ft.timecode.frames,
+        ft.timecode_secs
+    )
 }
 
 /// Render the verbose gap sections (`--- Gap N ---` with pre/post context).
@@ -774,7 +859,9 @@ fn render_gap_report(
         }
         let missing = ((frame_timecode_to_secs(&tc[next_first], fps)
             - frame_timecode_to_secs(&tc[prev_last], fps)
-            - 1.0 / fps) / (1.0 / fps)).round() as u32;
+            - 1.0 / fps)
+            / (1.0 / fps))
+            .round() as u32;
         out.push_str(&format!("  ---- GAP ({} missing frame(s)) ----\n", missing));
         let post_end = (next_first + ctx).min(tc.len());
         for ft in &tc[next_first..post_end] {
@@ -799,7 +886,10 @@ fn render_glitch_report(
             out.push_str(&format!("  {}\n", render_frame_context_line(ft)));
         }
         let ft = &tc[idx];
-        out.push_str(&format!("  {}  <<< GLITCH\n", render_frame_context_line(ft)));
+        out.push_str(&format!(
+            "  {}  <<< GLITCH\n",
+            render_frame_context_line(ft)
+        ));
         let post_end = (idx + 1 + ctx).min(tc.len());
         for ft in &tc[(idx + 1)..post_end] {
             out.push_str(&format!("  {}\n", render_frame_context_line(ft)));
@@ -810,11 +900,10 @@ fn render_glitch_report(
 
 /// Render the verbose quality report (gaps + glitches). Empty when the
 /// result has no quality report or reports no issues.
-fn render_verbose_quality(
-    result: &audio_core::LtcDetectionResult,
-    context_frames: u32,
-) -> String {
-    let Some(ref q) = result.quality else { return String::new() };
+fn render_verbose_quality(result: &audio_core::LtcDetectionResult, context_frames: u32) -> String {
+    let Some(ref q) = result.quality else {
+        return String::new();
+    };
     let has_issues = !q.gap_edges.is_empty() || !q.glitch_indices.is_empty();
     if !has_issues {
         return String::new();
@@ -833,9 +922,15 @@ fn print_timecode_list(result: &audio_core::LtcDetectionResult) -> String {
     let mut out = String::from("\n=== Decoded Timecodes ===\n");
     for ft in &result.timecodes {
         let sep = if result.drop_frame { ";" } else { ":" };
-        out.push_str(&format!("  [{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  ({:.3}s)\n",
-            ft.frame_index, ft.timecode.hours, ft.timecode.minutes,
-            ft.timecode.seconds, ft.timecode.frames, ft.timecode_secs));
+        out.push_str(&format!(
+            "  [{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  ({:.3}s)\n",
+            ft.frame_index,
+            ft.timecode.hours,
+            ft.timecode.minutes,
+            ft.timecode.seconds,
+            ft.timecode.frames,
+            ft.timecode_secs
+        ));
     }
     out
 }
@@ -880,18 +975,33 @@ fn print_decode_results(
 /// Run the WAV decode; returns the detection result for callers that want
 /// to assert on it (printing happens in `process_cli_result`).
 fn run_decode(cli: Cli) -> Result<audio_core::LtcDetectionResult, CliError> {
-    let path = cli.decode.as_ref().ok_or_else(|| CliError::Decode("--decode path required".to_string()))?;
+    let path = cli
+        .decode
+        .as_ref()
+        .ok_or_else(|| CliError::Decode("--decode path required".to_string()))?;
     let path = PathBuf::from(path);
     let use_libltc = cli.decoder == "libltc";
 
-    if cli.debug { init_logger(); }
+    if cli.debug {
+        init_logger();
+    }
 
-    info!("Decoding LTC from '{}' with {} decoder at {:.2} fps{}",
-        path.display(), if use_libltc { "libltc" } else { "builtin" },
-        cli.decode_fps, if cli.decode_drop_frame { " DF" } else { "" });
+    info!(
+        "Decoding LTC from '{}' with {} decoder at {:.2} fps{}",
+        path.display(),
+        if use_libltc { "libltc" } else { "builtin" },
+        cli.decode_fps,
+        if cli.decode_drop_frame { " DF" } else { "" }
+    );
 
-    run_decode_on_wav(&path, use_libltc, cli.single_pass, cli.decode_fps, cli.decode_drop_frame)
-        .map_err(CliError::Decode)
+    run_decode_on_wav(
+        &path,
+        use_libltc,
+        cli.single_pass,
+        cli.decode_fps,
+        cli.decode_drop_frame,
+    )
+    .map_err(CliError::Decode)
 }
 
 // ── Outcome enum + dispatch ─────────────────────────────────────────────
@@ -940,7 +1050,10 @@ impl std::fmt::Display for CliError {
 fn run_decode_video(cli: Cli) -> Result<audio_core::LtcDetectionResult, CliError> {
     let pipeline_start = Instant::now();
 
-    let path = cli.decode.as_ref().ok_or_else(|| CliError::Decode("--decode path required".to_string()))?;
+    let path = cli
+        .decode
+        .as_ref()
+        .ok_or_else(|| CliError::Decode("--decode path required".to_string()))?;
     let path = PathBuf::from(path);
 
     let use_libltc = cli.decoder == "libltc";
@@ -1004,8 +1117,12 @@ pub fn process_cli_result(cli: Cli) -> Result<CliOutcome, CliError> {
     if let Some(path) = cli.decode.clone() {
         let path = PathBuf::from(path);
         // Copy the display flags out before `cli` is moved into a runner.
-        let (verbose, context_frames, list_timecodes, use_libltc) =
-            (cli.verbose, cli.context_frames, cli.list_timecodes, cli.decoder == "libltc");
+        let (verbose, context_frames, list_timecodes, use_libltc) = (
+            cli.verbose,
+            cli.context_frames,
+            cli.list_timecodes,
+            cli.decoder == "libltc",
+        );
 
         let result = if ffprobe::path_is_video(&path) {
             // Video file: use ffmpeg extraction
@@ -1015,8 +1132,12 @@ pub fn process_cli_result(cli: Cli) -> Result<CliOutcome, CliError> {
             run_decode(cli)?
         };
         print_decode_results(
-            &path, &result, use_libltc,
-            verbose, context_frames, list_timecodes,
+            &path,
+            &result,
+            use_libltc,
+            verbose,
+            context_frames,
+            list_timecodes,
         );
         return Ok(CliOutcome::Done);
     }
@@ -1135,7 +1256,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TimecodeParseError::InvalidComponent { field: TcField::Hours, .. }
+                TimecodeParseError::InvalidComponent {
+                    field: TcField::Hours,
+                    ..
+                }
             ),
             "expected InvalidComponent(Hours), got {:?}",
             err
@@ -1148,7 +1272,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TimecodeParseError::InvalidComponent { field: TcField::Frames, .. }
+                TimecodeParseError::InvalidComponent {
+                    field: TcField::Frames,
+                    ..
+                }
             ),
             "expected InvalidComponent(Frames), got {:?}",
             err
@@ -1201,7 +1328,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TimecodeParseError::InvalidComponent { field: TcField::Hours, .. }
+                TimecodeParseError::InvalidComponent {
+                    field: TcField::Hours,
+                    ..
+                }
             ),
             "expected InvalidComponent(Hours), got {:?}",
             err
@@ -1212,25 +1342,45 @@ mod tests {
 
     #[test]
     fn test_timecode_fmt_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         assert_eq!(timecode_fmt(&tc), "00:00:00:00");
     }
 
     #[test]
     fn test_timecode_fmt_typical() {
-        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 2,
+            seconds: 3,
+            frames: 4,
+        };
         assert_eq!(timecode_fmt(&tc), "01:02:03:04");
     }
 
     #[test]
     fn test_timecode_fmt_max() {
-        let tc = Timecode { hours: 23, minutes: 59, seconds: 59, frames: 29 };
+        let tc = Timecode {
+            hours: 23,
+            minutes: 59,
+            seconds: 59,
+            frames: 29,
+        };
         assert_eq!(timecode_fmt(&tc), "23:59:59:29");
     }
 
     #[test]
     fn test_timecode_fmt_width() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         assert_eq!(timecode_fmt(&tc).len(), 11);
     }
 
@@ -1281,21 +1431,31 @@ mod tests {
 
     fn default_resolve_cli() -> Cli {
         Cli {
-            device: None, device_index: None,
-            list_devices: false, headless: false,
+            device: None,
+            device_index: None,
+            list_devices: false,
+            headless: false,
             start_timecode: "01:00:00:00".into(),
-            fps: 25.0, drop_frame: false,
-            channel: "left".into(), volume: 0.25,
-            sample_rate: None, duration: None,
-            output_to_file: None, verbose: false, debug: false,
-            decode: None, audio_stream: 0, audio_channel: 0,
+            fps: 25.0,
+            drop_frame: false,
+            channel: "left".into(),
+            volume: 0.25,
+            sample_rate: None,
+            duration: None,
+            output_to_file: None,
+            verbose: false,
+            debug: false,
+            decode: None,
+            audio_stream: 0,
+            audio_channel: 0,
             decoder: "builtin".into(),
-            decode_fps: 25.0, decode_drop_frame: false,
+            decode_fps: 25.0,
+            decode_drop_frame: false,
             single_pass: false,
             context_frames: 3,
             list_timecodes: false,
             autostart: false,
-        probe_caps: false,
+            probe_caps: false,
         }
     }
 
@@ -1353,7 +1513,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ResolveDeviceError::IndexOutOfRange { index: 99, count: 2 }
+                ResolveDeviceError::IndexOutOfRange {
+                    index: 99,
+                    count: 2
+                }
             ),
             "expected IndexOutOfRange {{ index: 99, count: 2 }}, got {:?}",
             err
@@ -1450,13 +1613,18 @@ mod tests {
 
     #[test]
     fn test_resolve_device_first_when_no_default() {
-        let devs = vec![
-            AudioDeviceInfo {
-                id: "dev1".into(), name: "Device 1".into(), is_default: false,
-                formats: vec![], channels_min: 0, channels_max: 0,
-                sample_rate_min: 0, sample_rate_max: 0, buffer_min: 0, buffer_max: 0,
-            },
-        ];
+        let devs = vec![AudioDeviceInfo {
+            id: "dev1".into(),
+            name: "Device 1".into(),
+            is_default: false,
+            formats: vec![],
+            channels_min: 0,
+            channels_max: 0,
+            sample_rate_min: 0,
+            sample_rate_max: 0,
+            buffer_min: 0,
+            buffer_max: 0,
+        }];
         let cli = default_resolve_cli();
         let id = resolve_device(&devs, &cli).unwrap();
         assert_eq!(id, "dev1");
@@ -1467,12 +1635,20 @@ mod tests {
     fn frame(idx: u32, h: u32, m: u32, s: u32, f: u32, secs: f64) -> audio_core::FrameTimecode {
         audio_core::FrameTimecode {
             frame_index: idx,
-            timecode: audio_core::Timecode { hours: h, minutes: m, seconds: s, frames: f },
+            timecode: audio_core::Timecode {
+                hours: h,
+                minutes: m,
+                seconds: s,
+                frames: f,
+            },
             timecode_secs: secs,
         }
     }
 
-    fn quality(gap_edges: Vec<(usize, usize)>, glitch_indices: Vec<usize>) -> audio_core::LtcQualityReport {
+    fn quality(
+        gap_edges: Vec<(usize, usize)>,
+        glitch_indices: Vec<usize>,
+    ) -> audio_core::LtcQualityReport {
         audio_core::LtcQualityReport {
             score: 0.87,
             grade: audio_core::ltc_decoder::QualityGrade::Good,
@@ -1493,7 +1669,10 @@ mod tests {
         }
     }
 
-    fn detection(tc: Vec<audio_core::FrameTimecode>, q: Option<audio_core::LtcQualityReport>) -> audio_core::LtcDetectionResult {
+    fn detection(
+        tc: Vec<audio_core::FrameTimecode>,
+        q: Option<audio_core::LtcQualityReport>,
+    ) -> audio_core::LtcDetectionResult {
         audio_core::LtcDetectionResult {
             status: audio_core::LtcDecodeStatus::Success,
             detected_fps: 25.0,
@@ -1526,15 +1705,18 @@ mod tests {
     fn test_render_frame_context_line_format() {
         let ft = frame(12, 1, 2, 3, 4, 3723.16);
         // test-lint: allow(text-pin): formatter output is the contract
-        assert_eq!(render_frame_context_line(&ft), "[  12] 01:02:03:04  (3723.160s)");
+        assert_eq!(
+            render_frame_context_line(&ft),
+            "[  12] 01:02:03:04  (3723.160s)"
+        );
     }
 
     #[test]
     fn test_print_decode_summary_block() {
-        let result = detection(vec![
-            frame(0, 1, 0, 0, 0, 0.0),
-            frame(1, 1, 0, 0, 1, 0.04),
-        ], None);
+        let result = detection(
+            vec![frame(0, 1, 0, 0, 0, 0.0), frame(1, 1, 0, 0, 1, 0.04)],
+            None,
+        );
         let out = print_decode_summary(Path::new("/tmp/x.wav"), &result, true);
         let lines: Vec<&str> = out.lines().collect();
         // test-lint: allow(text-pin): formatter output is the contract
@@ -1652,10 +1834,10 @@ mod tests {
 
     #[test]
     fn test_print_timecode_list_colon_and_semicolon_separators() {
-        let mut result = detection(vec![
-            frame(0, 1, 0, 0, 0, 0.0),
-            frame(1, 1, 0, 0, 1, 0.04),
-        ], None);
+        let mut result = detection(
+            vec![frame(0, 1, 0, 0, 0, 0.0), frame(1, 1, 0, 0, 1, 0.04)],
+            None,
+        );
         let out = print_timecode_list(&result);
         let lines: Vec<&str> = out.lines().collect();
         // test-lint: allow(text-pin): formatter output is the contract

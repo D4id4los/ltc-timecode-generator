@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use gui_engine::LtcDecodeStatus;
 use gui_engine::decode::{decode_video_file, decode_wav_core, WavDecodeParams};
+use gui_engine::LtcDecodeStatus;
 
 const FPS: f64 = 25.0;
 
@@ -212,7 +212,11 @@ fn collect_files(root: &Path, day_filter: Option<&str>) -> Result<Vec<SweepFile>
         .collect();
     days.sort();
     for day in days {
-        let day_name = day.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let day_name = day
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if !is_day_folder(&day_name) {
             continue;
         }
@@ -242,7 +246,9 @@ fn is_day_folder(name: &str) -> bool {
 }
 
 fn walk_files(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.filter_map(|e| e.ok()) {
         let p = entry.path();
         if p.is_dir() {
@@ -261,7 +267,11 @@ fn walk_files(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBuf>
 fn classify(path: &Path) -> FileClass {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let lower = name.to_lowercase();
-    let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+    let ext = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
 
     // Derived converter outputs first (they also match the base patterns).
     if lower.contains("_clip") || lower.contains("_tr") || lower.contains("_audio_track") {
@@ -293,7 +303,10 @@ fn classify(path: &Path) -> FileClass {
 /// Decode one file (WAV direct, video via extract→decode) and package the
 /// outcome. Empty-buffer errors (slicing past EOF) classify as `Empty`.
 fn decode_one(path: &Path, class: FileClass, use_libltc: bool, start: Instant) -> FileOutcome {
-    let is_wav = path.extension().unwrap_or_default().eq_ignore_ascii_case("wav");
+    let is_wav = path
+        .extension()
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("wav");
     let params = WavDecodeParams {
         use_libltc,
         single_pass: false,
@@ -362,7 +375,10 @@ fn decode_one(path: &Path, class: FileClass, use_libltc: bool, start: Instant) -
 }
 
 fn format_tc(tc: &gui_engine::Timecode) -> String {
-    format!("{:02}:{:02}:{:02}:{:02}", tc.hours, tc.minutes, tc.seconds, tc.frames)
+    format!(
+        "{:02}:{:02}:{:02}:{:02}",
+        tc.hours, tc.minutes, tc.seconds, tc.frames
+    )
 }
 
 /// Absolute frame number on a non-drop grid.
@@ -437,21 +453,21 @@ fn evaluate_days(outcomes: &[FileOutcome]) -> Vec<DayVerdict> {
             for (i, (da, (a0, a1))) in devices.iter().enumerate() {
                 for (db, (b0, b1)) in devices.iter().skip(i + 1) {
                     let overlap_frames = (*a1).min(*b1).saturating_sub((*a0).max(*b0));
-                    overlaps.push((
-                        da.clone(),
-                        db.clone(),
-                        overlap_frames as f64 / FPS / 60.0,
-                    ));
+                    overlaps.push((da.clone(), db.clone(), overlap_frames as f64 / FPS / 60.0));
                     if overlap_frames == 0 {
-                        violations.push(format!(
-                            "devices {da} and {db} TC ranges do not overlap"
-                        ));
+                        violations.push(format!("devices {da} and {db} TC ranges do not overlap"));
                     }
                 }
             }
 
             let consistent = violations.is_empty();
-            DayVerdict { day, ltc_files, consistent, violations, overlaps }
+            DayVerdict {
+                day,
+                ltc_files,
+                consistent,
+                violations,
+                overlaps,
+            }
         })
         .collect()
 }
@@ -467,17 +483,26 @@ fn day_of(path: &Path) -> String {
 }
 
 fn file_name(path: &Path) -> String {
-    path.file_name().unwrap_or_default().to_string_lossy().to_string()
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
 }
 
 /// The device folder: the path component directly below the day folder.
 /// Folder names vary across days (`DR70D` vs `TASCAM`, …) but are stable
 /// within a day, which is all the oracle needs.
 fn device_of(path: &Path) -> String {
-    let comps: Vec<_> = path.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+    let comps: Vec<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
     for (i, c) in comps.iter().enumerate() {
         if is_day_folder(c) {
-            return comps.get(i + 1).cloned().unwrap_or_else(|| "unknown".to_string());
+            return comps
+                .get(i + 1)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
         }
     }
     "unknown".to_string()
@@ -578,9 +603,7 @@ fn write_json(
                 .join(", "),
             v.overlaps
                 .iter()
-                .map(|(a, b, m)| {
-                    format!("[{}, {}, {m:.2}]", json_str(a), json_str(b))
-                })
+                .map(|(a, b, m)| { format!("[{}, {}, {m:.2}]", json_str(a), json_str(b)) })
                 .collect::<Vec<_>>()
                 .join(", "),
             if i + 1 < verdicts.len() { "," } else { "" },

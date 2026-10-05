@@ -2,10 +2,12 @@ use std::path::Path;
 
 use crate::bext_meta;
 use crate::camera_meta::CameraInfo;
-use crate::converter::formats::{container_to_ffmpeg_format};
+use crate::converter::formats::container_to_ffmpeg_format;
 use crate::converter::planning::{AudioKeep, VideoOutputStep};
 use crate::converter::settings::ConverterSettings;
-use crate::converter::timecode::{format_ffmpeg_timecode, time_reference_samples, TimecodeMetadata};
+use crate::converter::timecode::{
+    format_ffmpeg_timecode, time_reference_samples, TimecodeMetadata,
+};
 use crate::ffprobe::VideoAudioProbe;
 use crate::video_codecs;
 
@@ -44,8 +46,10 @@ pub fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<
     let mut args: Vec<String> = vec!["-y".to_string()];
     push_hw_device_prelude(&mut args, settings);
     args.extend([
-        "-f".to_string(), "lavfi".to_string(),
-        "-i".to_string(), "color=c=blue:s=1280x720:r=25".to_string(),
+        "-f".to_string(),
+        "lavfi".to_string(),
+        "-i".to_string(),
+        "color=c=blue:s=1280x720:r=25".to_string(),
     ]);
 
     for f in &settings.input_files {
@@ -70,7 +74,11 @@ pub fn build_audio_to_synthetic_video_args(settings: &ConverterSettings) -> Vec<
         } else {
             filter_parts.push(format!(
                 "[{}:a]{}[trimmed{}];[trimmed{}]volume=0dB[a{}]",
-                idx, trim_filter, idx, idx, output_ch + 1,
+                idx,
+                trim_filter,
+                idx,
+                idx,
+                output_ch + 1,
             ));
         }
     }
@@ -110,7 +118,11 @@ pub fn push_video_codec_args(args: &mut Vec<String>, settings: &ConverterSetting
 
 pub fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> Vec<String> {
     let input = &settings.input_files[file_idx];
-    let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
+    let trim_secs = settings
+        .trim_offsets_secs
+        .get(file_idx)
+        .copied()
+        .unwrap_or(0.0);
 
     let mut args: Vec<String> = vec!["-y".to_string()];
     push_hw_device_prelude(&mut args, settings);
@@ -131,9 +143,18 @@ pub fn build_video_only_args(settings: &ConverterSettings, file_idx: usize) -> V
     args
 }
 
-pub fn build_video_mux_args(settings: &ConverterSettings, file_idx: usize, keep: &AudioKeep, probe: &VideoAudioProbe) -> Vec<String> {
+pub fn build_video_mux_args(
+    settings: &ConverterSettings,
+    file_idx: usize,
+    keep: &AudioKeep,
+    probe: &VideoAudioProbe,
+) -> Vec<String> {
     let input = &settings.input_files[file_idx];
-    let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
+    let trim_secs = settings
+        .trim_offsets_secs
+        .get(file_idx)
+        .copied()
+        .unwrap_or(0.0);
 
     let mut args: Vec<String> = vec!["-y".to_string()];
     push_hw_device_prelude(&mut args, settings);
@@ -200,10 +221,7 @@ fn push_channels_except_args(
             let label = format!("a{}", filter_idx);
             filter_idx += 1;
             let pan = pan_filter(&surviving);
-            filter_parts.push(format!(
-                "[0:{}]{}[{}]",
-                stream.stream_index, pan, label
-            ));
+            filter_parts.push(format!("[0:{}]{}[{}]", stream.stream_index, pan, label));
             output_labels.push(format!("[{}]", label));
         }
     }
@@ -241,11 +259,7 @@ fn push_reordered_args(
     }
     let n = ordered_pairs.len();
     let merge_inputs: Vec<String> = (0..n).map(|i| format!("[a{}]", i)).collect();
-    filter_parts.push(format!(
-        "{}amerge=inputs={}[out]",
-        merge_inputs.join(""),
-        n
-    ));
+    filter_parts.push(format!("{}amerge=inputs={}[out]", merge_inputs.join(""), n));
     args.push("-filter_complex".to_string());
     args.push(filter_parts.join(";"));
     args.push("-map".to_string());
@@ -255,7 +269,11 @@ fn push_reordered_args(
 }
 
 /// Channel indices of a stream that survive `drop_pairs`, in order.
-fn surviving_channels(stream_index: usize, channels: usize, drop_pairs: &[(usize, usize)]) -> Vec<usize> {
+fn surviving_channels(
+    stream_index: usize,
+    channels: usize,
+    drop_pairs: &[(usize, usize)],
+) -> Vec<usize> {
     (0..channels)
         .filter(|ch| !drop_pairs.contains(&(stream_index, *ch)))
         .collect()
@@ -273,7 +291,11 @@ fn pan_filter(surviving: &[usize]) -> String {
         .enumerate()
         .map(|(out_ch, in_ch)| format!("c{}={}", out_ch, in_ch))
         .collect();
-    format!("pan={}|{}", layout_for_count(surviving.len()), ch_maps.join("|"))
+    format!(
+        "pan={}|{}",
+        layout_for_count(surviving.len()),
+        ch_maps.join("|")
+    )
 }
 
 /// Smallest common channel layout carrying `n` channels.
@@ -294,7 +316,11 @@ pub fn build_video_track_extract_args(
     sample_rate: u32,
 ) -> Vec<String> {
     let input = &settings.input_files[file_idx];
-    let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
+    let trim_secs = settings
+        .trim_offsets_secs
+        .get(file_idx)
+        .copied()
+        .unwrap_or(0.0);
 
     let mut args: Vec<String> = vec!["-y".to_string()];
     push_input_with_trim(&mut args, input, trim_secs);
@@ -332,7 +358,11 @@ pub fn build_concat_audio_args(
     let mut args: Vec<String> = vec!["-y".to_string()];
 
     for &(file_idx, _stream_idx, _channel_idx) in segments.iter() {
-        let trim_secs = settings.trim_offsets_secs.get(file_idx).copied().unwrap_or(0.0);
+        let trim_secs = settings
+            .trim_offsets_secs
+            .get(file_idx)
+            .copied()
+            .unwrap_or(0.0);
         push_input_with_trim(&mut args, &settings.input_files[file_idx], trim_secs);
     }
 
@@ -346,11 +376,11 @@ pub fn build_concat_audio_args(
         ));
     }
 
-    let concat_inputs: String = (0..n).map(|i| format!("[a{}]", i)).collect::<Vec<_>>().join("");
-    filter_parts.push(format!(
-        "{}concat=n={}:v=0:a=1[out]",
-        concat_inputs, n
-    ));
+    let concat_inputs: String = (0..n)
+        .map(|i| format!("[a{}]", i))
+        .collect::<Vec<_>>()
+        .join("");
+    filter_parts.push(format!("{}concat=n={}:v=0:a=1[out]", concat_inputs, n));
 
     args.push("-filter_complex".to_string());
     args.push(filter_parts.join(";"));
@@ -369,22 +399,37 @@ pub fn build_concat_audio_args(
     args
 }
 
-pub fn build_video_to_video_args(settings: &ConverterSettings, step: &VideoOutputStep, probe: &VideoAudioProbe) -> Vec<String> {
+pub fn build_video_to_video_args(
+    settings: &ConverterSettings,
+    step: &VideoOutputStep,
+    probe: &VideoAudioProbe,
+) -> Vec<String> {
     match step {
-        VideoOutputStep::VideoOnly { file_idx, .. } => {
-            build_video_only_args(settings, *file_idx)
-        }
+        VideoOutputStep::VideoOnly { file_idx, .. } => build_video_only_args(settings, *file_idx),
         VideoOutputStep::VideoMux { file_idx, keep, .. } => {
             build_video_mux_args(settings, *file_idx, keep, probe)
         }
-        VideoOutputStep::AudioChannel { file_idx, stream_idx, channel_idx, format, .. } => {
+        VideoOutputStep::AudioChannel {
+            file_idx,
+            stream_idx,
+            channel_idx,
+            format,
+            ..
+        } => {
             let sample_rate = probe
                 .streams
                 .iter()
                 .find(|s| s.stream_index == *stream_idx)
                 .map(|s| s.sample_rate)
                 .unwrap_or(48000);
-            build_video_track_extract_args(settings, *file_idx, *stream_idx, *channel_idx, format, sample_rate)
+            build_video_track_extract_args(
+                settings,
+                *file_idx,
+                *stream_idx,
+                *channel_idx,
+                format,
+                sample_rate,
+            )
         }
         VideoOutputStep::AudioChannelConcat { .. } => {
             panic!("AudioChannelConcat must be executed directly via run_ffmpeg_process, not through build_video_to_video_args")
@@ -562,7 +607,12 @@ pub fn push_timecode_args(args: &mut Vec<String>, tc: &TimecodeMetadata, force_f
     }
 }
 
-pub fn push_audio_timecode_args(args: &mut Vec<String>, tc: &TimecodeMetadata, format: &str, sample_rate: u32) {
+pub fn push_audio_timecode_args(
+    args: &mut Vec<String>,
+    tc: &TimecodeMetadata,
+    format: &str,
+    sample_rate: u32,
+) {
     let tc_str = format_ffmpeg_timecode(&tc.start, tc.drop_frame);
     if format == "wav" {
         let time_reference = time_reference_samples(tc, sample_rate);
@@ -583,9 +633,16 @@ pub fn build_split_track_args(
     sample_rate: u32,
 ) -> Vec<String> {
     let mapping = settings.channel_map.mapping();
-    let input_idx = mapping.iter().position(|&o| o == track_idx).unwrap_or(track_idx);
+    let input_idx = mapping
+        .iter()
+        .position(|&o| o == track_idx)
+        .unwrap_or(track_idx);
     let mut args: Vec<String> = vec!["-y".to_string()];
-    let trim_secs = settings.trim_offsets_secs.get(input_idx).copied().unwrap_or(0.0);
+    let trim_secs = settings
+        .trim_offsets_secs
+        .get(input_idx)
+        .copied()
+        .unwrap_or(0.0);
 
     if input_idx < settings.input_files.len() {
         push_input_with_trim(&mut args, &settings.input_files[input_idx], trim_secs);
@@ -605,32 +662,42 @@ pub fn build_split_track_args(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use audio_core::Timecode;
-    use crate::camera_meta::{CameraInfo, CameraMetaSource};
-    use crate::converter::test_fixtures::*;
-    use crate::converter::planning::VideoOutputStep;
     use super::*;
+    use crate::camera_meta::{CameraInfo, CameraMetaSource};
+    use crate::converter::planning::VideoOutputStep;
+    use crate::converter::test_fixtures::*;
+    use audio_core::Timecode;
+    use std::path::Path;
 
     #[test]
     fn test_build_synthetic_video_args_contains_timecode() {
         let mut s = make_settings_synthetic_video(0.0);
         s.timecode_meta_per_file = vec![Some(crate::converter::TimecodeMetadata {
-            start: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            start: Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
             fps: 25.0,
             drop_frame: false,
         })];
         let args = build_audio_to_synthetic_video_args(&s);
         let args_str = args.join(" ");
-        assert!(args_str.contains("-timecode"), "synthetic video args should contain -timecode");
+        assert!(
+            args_str.contains("-timecode"),
+            "synthetic video args should contain -timecode"
+        );
     }
 
     #[test]
     fn test_build_synthetic_video_args_contains_filter_complex() {
         let s = make_settings_synthetic_video(0.0);
         let args = build_audio_to_synthetic_video_args(&s);
-        assert!(args.iter().any(|a| a.contains("filter_complex")),
-            "synthetic video args should contain filter_complex");
+        assert!(
+            args.iter().any(|a| a.contains("filter_complex")),
+            "synthetic video args should contain filter_complex"
+        );
     }
 
     #[test]
@@ -645,7 +712,12 @@ mod tests {
     fn test_build_audio_to_audio_args_wav_timecode() {
         let s = make_settings_audio_only();
         let tc = crate::converter::TimecodeMetadata {
-            start: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            start: Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
             fps: 25.0,
             drop_frame: false,
         };
@@ -659,7 +731,12 @@ mod tests {
     fn test_build_audio_to_audio_args_mov_format_no_bext() {
         let s = make_settings_audio_only();
         let tc = crate::converter::TimecodeMetadata {
-            start: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            start: Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
             fps: 25.0,
             drop_frame: false,
         };
@@ -741,8 +818,15 @@ mod tests {
         let args = build_video_mux_args(&s, 0, &AudioKeep::ChannelsExcept(vec![(0, 0)]), &probe);
         assert!(args.contains(&"-filter_complex".to_string()));
         assert!(args.contains(&"[0:0]pan=mono|FC=c1[a0]".to_string()));
-        assert_eq!(map_operand(&args, 1), "[a0]", "audio maps from the filter label");
-        assert!(args.contains(&"pcm_s24le".to_string()), "re-encoded with the audio encoder");
+        assert_eq!(
+            map_operand(&args, 1),
+            "[a0]",
+            "audio maps from the filter label"
+        );
+        assert!(
+            args.contains(&"pcm_s24le".to_string()),
+            "re-encoded with the audio encoder"
+        );
     }
 
     #[test]
@@ -767,7 +851,10 @@ mod tests {
         );
         assert!(args.contains(&"-an".to_string()));
         assert!(!args.contains(&"-filter_complex".to_string()));
-        assert!(!args.iter().any(|a| a == "0:a?" || a.starts_with("[a")), "no audio maps");
+        assert!(
+            !args.iter().any(|a| a == "0:a?" || a.starts_with("[a")),
+            "no audio maps"
+        );
     }
 
     #[test]
@@ -807,7 +894,11 @@ mod tests {
         let args = build_video_mux_args(&s, 0, &AudioKeep::ChannelsExcept(vec![(0, 0)]), &probe);
         assert!(args.contains(&"[0:0]pan=mono|FC=c1[a0]".to_string()));
         assert_eq!(map_operand(&args, 1), "[a0]", "filtered stream first");
-        assert_eq!(map_operand(&args, 2), "0:1", "untouched stream mapped directly");
+        assert_eq!(
+            map_operand(&args, 2),
+            "0:1",
+            "untouched stream mapped directly"
+        );
     }
 
     // ── build_video_mux_args: Reordered arm ───────────────────────────
@@ -816,12 +907,7 @@ mod tests {
     fn test_build_video_mux_reordered_pan_and_amerge() {
         let s = make_video_settings();
         let probe = make_probe(0, 2, 48000);
-        let args = build_video_mux_args(
-            &s,
-            0,
-            &AudioKeep::Reordered(vec![(0, 1), (0, 0)]),
-            &probe,
-        );
+        let args = build_video_mux_args(&s, 0, &AudioKeep::Reordered(vec![(0, 1), (0, 0)]), &probe);
         assert!(args.contains(
             &"[0:0]pan=mono|FC=c1[a0];[0:0]pan=mono|FC=c0[a1];[a0][a1]amerge=inputs=2[out]"
                 .to_string()
@@ -841,7 +927,10 @@ mod tests {
             &probe,
         );
         let joined = args.join(" ");
-        assert!(joined.contains("amerge=inputs=4"), "one merged output per pair");
+        assert!(
+            joined.contains("amerge=inputs=4"),
+            "one merged output per pair"
+        );
         assert!(joined.contains("FC=c3"));
         assert!(joined.contains("FC=c0"));
         assert_eq!(map_operand(&args, 1), "[out]");
@@ -874,7 +963,11 @@ mod tests {
 
     #[test]
     fn test_build_video_to_video_args_dispatch_video_only() {
-        let step = VideoOutputStep::VideoOnly { file_idx: 0, output: Path::new("/tmp/out.mkv").to_path_buf(), naming_index: 1 };
+        let step = VideoOutputStep::VideoOnly {
+            file_idx: 0,
+            output: Path::new("/tmp/out.mkv").to_path_buf(),
+            naming_index: 1,
+        };
         let s = make_video_settings();
         let probe = make_probe(1, 2, 48000);
         let args = build_video_to_video_args(&s, &step, &probe);
@@ -979,20 +1072,18 @@ mod tests {
     #[test]
     fn test_push_metadata_model_only() {
         let mut s = make_camera_settings();
-        s.camera_meta_per_file = vec![
-            Some(CameraInfo {
-                make: None,
-                model: Some("GH6".to_string()),
-                source: CameraMetaSource::FfprobeTags,
-                creation_date: None,
-                lens: None,
-                serial: None,
-                creation_time: None,
-                gamma: None,
-                native_timecode: None,
-                exposure_summary: None,
-            }),
-        ];
+        s.camera_meta_per_file = vec![Some(CameraInfo {
+            make: None,
+            model: Some("GH6".to_string()),
+            source: CameraMetaSource::FfprobeTags,
+            creation_date: None,
+            lens: None,
+            serial: None,
+            creation_time: None,
+            gamma: None,
+            native_timecode: None,
+            exposure_summary: None,
+        })];
         let mut args = vec![];
         push_metadata_args(&mut args, &s, Some(0), "matroska");
         let joined = args.join(" ");
@@ -1045,8 +1136,10 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("com.apple.quicktime.make=Sony"));
         assert!(joined.contains("com.apple.quicktime.model=ILCE-6700"));
-        assert!(has_movflags(&joined),
-            "mov output with extended keys needs -movflags use_metadata_tags");
+        assert!(
+            has_movflags(&joined),
+            "mov output with extended keys needs -movflags use_metadata_tags"
+        );
         assert!(joined.contains("lens=E PZ 18-105mm F4 G OSS"));
         assert!(joined.contains("creation_time=2026-09-25T20:45:22+01:00"));
         assert!(joined.contains("gamma=ex-cine4"));
@@ -1078,8 +1171,10 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("com.apple.quicktime.make=Sony"));
         assert!(joined.contains("com.apple.quicktime.model=NEX-FS100EK"));
-        assert!(!has_movflags(&joined),
-            "no -movflags when only make/model are present");
+        assert!(
+            !has_movflags(&joined),
+            "no -movflags when only make/model are present"
+        );
     }
 
     #[test]
@@ -1106,7 +1201,9 @@ mod tests {
         push_metadata_args(&mut args, &s, Some(0), "wav");
         let joined = args.join(" ");
         // No lens → no description tag expected
-        assert!(!joined.contains("description="),
-            "no description when camera has no lens/model info beyond originator");
+        assert!(
+            !joined.contains("description="),
+            "no description when camera has no lens/model info beyond originator"
+        );
     }
 }

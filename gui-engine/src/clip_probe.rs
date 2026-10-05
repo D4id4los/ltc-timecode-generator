@@ -19,7 +19,11 @@ use crate::ffprobe::VideoAudioProbe;
 /// `JobFinal::ClipProbes` minus its `Option` wrapper.
 pub fn probe_clip_set(
     files: &[PathBuf],
-) -> (Vec<Result<VideoAudioProbe, String>>, Vec<Option<crate::CameraInfo>>, String) {
+) -> (
+    Vec<Result<VideoAudioProbe, String>>,
+    Vec<Option<crate::CameraInfo>>,
+    String,
+) {
     probe_clip_set_with(files, &mut camera_meta::run_probe_program)
 }
 
@@ -30,12 +34,18 @@ pub fn probe_clip_set(
 pub fn probe_clip_set_with(
     files: &[PathBuf],
     camera_runner: &mut dyn FnMut(&str, &[String]) -> io::Result<Output>,
-) -> (Vec<Result<VideoAudioProbe, String>>, Vec<Option<crate::CameraInfo>>, String) {
+) -> (
+    Vec<Result<VideoAudioProbe, String>>,
+    Vec<Option<crate::CameraInfo>>,
+    String,
+) {
     log::info!("Converter clip probe started: {} file(s)", files.len());
-    let probes: Vec<Result<VideoAudioProbe, String>> = files.iter()
+    let probes: Vec<Result<VideoAudioProbe, String>> = files
+        .iter()
         .map(|f| crate::ffprobe::probe_video_audio(f).map_err(|e| e.to_string()))
         .collect();
-    let cameras: Vec<Option<crate::CameraInfo>> = files.iter()
+    let cameras: Vec<Option<crate::CameraInfo>> = files
+        .iter()
         .enumerate()
         .map(|(i, f)| {
             if i < device_name::DEVICE_NAME_PROBE_SAMPLE {
@@ -84,7 +94,11 @@ mod tests {
         assert_eq!(cameras.len(), files.len());
         for (i, cam) in cameras.iter().enumerate() {
             if i >= device_name::DEVICE_NAME_PROBE_SAMPLE {
-                assert!(cam.is_none(), "camera probe attempted beyond sample cap (index {})", i);
+                assert!(
+                    cam.is_none(),
+                    "camera probe attempted beyond sample cap (index {})",
+                    i
+                );
             }
         }
     }

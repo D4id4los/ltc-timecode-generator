@@ -63,15 +63,11 @@ impl Log for CapturingLogger {
     }
 }
 
-pub fn init_logger(
-    filter: &str,
-) -> Result<Arc<Mutex<LogBuffer>>, SetLoggerError> {
+pub fn init_logger(filter: &str) -> Result<Arc<Mutex<LogBuffer>>, SetLoggerError> {
     let buffer = Arc::new(Mutex::new(LogBuffer::new(MAX_LOG_ENTRIES)));
 
-    let stderr_logger = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(filter),
-    )
-    .build();
+    let stderr_logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter)).build();
 
     let logger = CapturingLogger {
         buffer: buffer.clone(),
@@ -90,11 +86,26 @@ mod tests {
 
     #[test]
     fn test_default_log_filter_contains_project_crates() {
-        assert!(DEFAULT_LOG_FILTER.contains("ltc_gui=debug"), "missing ltc_gui=debug");
-        assert!(DEFAULT_LOG_FILTER.contains("ltc_slint=debug"), "missing ltc_slint=debug");
-        assert!(DEFAULT_LOG_FILTER.contains("audio_core=debug"), "missing audio_core=debug");
-        assert!(DEFAULT_LOG_FILTER.contains("gui_engine=debug"), "missing gui_engine=debug");
-        assert!(DEFAULT_LOG_FILTER.ends_with(",info"), "should end with ,info fallback");
+        assert!(
+            DEFAULT_LOG_FILTER.contains("ltc_gui=debug"),
+            "missing ltc_gui=debug"
+        );
+        assert!(
+            DEFAULT_LOG_FILTER.contains("ltc_slint=debug"),
+            "missing ltc_slint=debug"
+        );
+        assert!(
+            DEFAULT_LOG_FILTER.contains("audio_core=debug"),
+            "missing audio_core=debug"
+        );
+        assert!(
+            DEFAULT_LOG_FILTER.contains("gui_engine=debug"),
+            "missing gui_engine=debug"
+        );
+        assert!(
+            DEFAULT_LOG_FILTER.ends_with(",info"),
+            "should end with ,info fallback"
+        );
     }
 
     #[test]

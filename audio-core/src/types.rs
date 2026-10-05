@@ -88,7 +88,10 @@ impl std::fmt::Display for LtcDecodeError {
             LtcDecodeError::Failed(msg) => f.write_str(msg),
             // Byte-identical to the former Failed(...) prose payload.
             LtcDecodeError::UnsupportedBitDepth { bits } => {
-                write!(f, "libltc decoder requires 16-bit integer PCM WAV (got {bits} bit Int)")
+                write!(
+                    f,
+                    "libltc decoder requires 16-bit integer PCM WAV (got {bits} bit Int)"
+                )
             }
         }
     }
@@ -105,7 +108,7 @@ pub struct DecodeConfig {
 impl Default for DecodeConfig {
     fn default() -> Self {
         Self {
-            chunk_size_bytes: 50_000_000,  // 50 MB
+            chunk_size_bytes: 50_000_000, // 50 MB
             overlap_seconds: 2.0,
         }
     }
@@ -148,7 +151,12 @@ mod tests {
 
     #[test]
     fn test_timecode_serialize_deserialize() {
-        let tc = Timecode { hours: 10, minutes: 20, seconds: 30, frames: 15 };
+        let tc = Timecode {
+            hours: 10,
+            minutes: 20,
+            seconds: 30,
+            frames: 15,
+        };
         let json = serde_json::to_string(&tc).unwrap();
         let deserialized: Timecode = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, tc);

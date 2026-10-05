@@ -31,7 +31,10 @@ const FIXTURE: &str = "test-data/tmcd-roundtrip-trailing-moov.mp4";
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR = gui-engine/; the fixture lives in the repo root.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn fixture_path() -> PathBuf {
@@ -40,7 +43,12 @@ fn fixture_path() -> PathBuf {
 
 fn test_meta() -> TimecodeMetadata {
     TimecodeMetadata {
-        start: Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 },
+        start: Timecode {
+            hours: 10,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        },
         fps: 25.0,
         drop_frame: false,
     }
@@ -98,7 +106,10 @@ fn fixture_has_trailing_moov() {
     let boxes = top_level_boxes(&fixture_path());
     assert!(!boxes.is_empty(), "fixture has no boxes");
     let (typ, _, _) = boxes.last().unwrap();
-    assert_eq!(typ, "moov", "fixture's last top-level box must be moov, got {typ}");
+    assert_eq!(
+        typ, "moov",
+        "fixture's last top-level box must be moov, got {typ}"
+    );
 }
 
 #[test]
@@ -158,7 +169,10 @@ fn test_tag_mp4_stco_offset_resolves_to_appended_payload() {
     let expected_frames: u32 = 10 * 3600 * 25; // 10:00:00:00 at 25 fps
 
     let mut data = Vec::new();
-    std::fs::File::open(&p).unwrap().read_to_end(&mut data).unwrap();
+    std::fs::File::open(&p)
+        .unwrap()
+        .read_to_end(&mut data)
+        .unwrap();
 
     // Walk the appended (last) moov, find trak with hdlr 'tmcd', read stco.
     let boxes = top_level_boxes(&p);
@@ -222,9 +236,7 @@ fn test_tag_mp4_stco_offset_resolves_to_appended_payload() {
         stco as u64, expected_stco,
         "stco must point at file_len_before + 8 (the appended mdat payload)"
     );
-    let sample = u32::from_be_bytes(
-        data[stco as usize..stco as usize + 4].try_into().unwrap(),
-    );
+    let sample = u32::from_be_bytes(data[stco as usize..stco as usize + 4].try_into().unwrap());
     assert_eq!(
         sample, expected_frames,
         "mdat payload at the stco offset must be the tagged frame count"
@@ -248,7 +260,10 @@ fn test_tag_mp4_ffprobe_roundtrip() {
         .expect("ffprobe should run");
     assert!(out.status.success(), "ffprobe must accept the tagged file");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("tmcd"), "tagged file must expose a tmcd stream");
+    assert!(
+        stdout.contains("tmcd"),
+        "tagged file must expose a tmcd stream"
+    );
     // The embedded start timecode VALUE lives in the tmcd sample (the mdat
     // payload asserted by test_tag_mp4_stco_offset_resolves_to_appended_payload);
     // ffprobe surfaces the stream but not the sample bytes as a text tag —

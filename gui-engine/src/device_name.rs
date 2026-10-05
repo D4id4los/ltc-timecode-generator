@@ -11,8 +11,8 @@
 use std::fs;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 
@@ -95,7 +95,9 @@ pub fn resolve_device_name_with_budget(
         info!("resolve_device_name: budget exhausted after XAVC sniff — falling through");
     } else {
         // 2) Camera metadata via exiftool/ffprobe on a sample of files.
-        if let Some((name, source)) = try_camera_meta_name_with(files, cameras, DEVICE_NAME_PROBE_SAMPLE) {
+        if let Some((name, source)) =
+            try_camera_meta_name_with(files, cameras, DEVICE_NAME_PROBE_SAMPLE)
+        {
             return (name, source, None);
         }
     }
@@ -128,29 +130,39 @@ pub fn resolve_device_name_with_budget(
 
 /// Try to extract a model name from a video file's XAVC metadata.
 /// Only examines the first `max_files` video files that exist in `files`.
-fn try_metadata_name(
-    files: &[PathBuf],
-    max_files: usize,
-) -> Option<(String, DeviceNameSource)> {
+fn try_metadata_name(files: &[PathBuf], max_files: usize) -> Option<(String, DeviceNameSource)> {
     let mut sampled = 0u32;
     for f in files {
         if !is_video_file(f) {
             continue;
         }
         if sampled >= max_files as u32 {
-            debug!("try_metadata_name: reached sample limit of {} files, stopping", max_files);
+            debug!(
+                "try_metadata_name: reached sample limit of {} files, stopping",
+                max_files
+            );
             break;
         }
         sampled += 1;
         let start = Instant::now();
-        debug!("try_metadata_name: sniffing {:?} (head+tail, {:?} budget)", f, READ_BUDGET);
+        debug!(
+            "try_metadata_name: sniffing {:?} (head+tail, {:?} budget)",
+            f, READ_BUDGET
+        );
         if let Some(model) = extract_model_name(f) {
             let elapsed = start.elapsed();
             let normalized = normalize_model_name(&model);
-            info!("try_metadata_name: {:?} → model '{}' → '{}' in {:.2?}", f, model, normalized, elapsed);
+            info!(
+                "try_metadata_name: {:?} → model '{}' → '{}' in {:.2?}",
+                f, model, normalized, elapsed
+            );
             return Some((normalized, DeviceNameSource::Metadata));
         }
-        debug!("try_metadata_name: {:?} → no model found ({:.2?})", f, start.elapsed());
+        debug!(
+            "try_metadata_name: {:?} → no model found ({:.2?})",
+            f,
+            start.elapsed()
+        );
     }
     None
 }
@@ -179,7 +191,10 @@ fn try_camera_meta_name_with(
                 continue;
             }
             if sampled >= max_files as u32 {
-                debug!("try_camera_meta_name_with: reached sample limit of {} files", max_files);
+                debug!(
+                    "try_camera_meta_name_with: reached sample limit of {} files",
+                    max_files
+                );
                 break;
             }
             sampled += 1;
@@ -188,11 +203,18 @@ fn try_camera_meta_name_with(
             if let Some(info) = camera_meta::probe_camera_info(f) {
                 let elapsed = start.elapsed();
                 if let Some(model) = info.model {
-                    info!("try_camera_meta_name_with: {:?} → model '{}' in {:.2?}", f, model, elapsed);
+                    info!(
+                        "try_camera_meta_name_with: {:?} → model '{}' in {:.2?}",
+                        f, model, elapsed
+                    );
                     return Some((model, DeviceNameSource::Metadata));
                 }
             }
-            debug!("try_camera_meta_name_with: {:?} → no metadata ({:.2?})", f, start.elapsed());
+            debug!(
+                "try_camera_meta_name_with: {:?} → no metadata ({:.2?})",
+                f,
+                start.elapsed()
+            );
         }
         None
     }
@@ -316,14 +338,9 @@ fn match_files_to_pattern_names(files: &[PathBuf]) -> Vec<String> {
         };
         for path in files {
             if !used.contains(path) {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let match_str = if pattern.name == "TASCAM" {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
+                    path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
                 } else {
                     name
                 };
@@ -517,7 +534,10 @@ mod tests {
     /// model-bearing one at `model_index` (sorted `clipNNNN.mp4` names —
     /// no camera pattern matches `clip*`, so resolution must come from the
     /// metadata probe).
-    fn make_model_probe_files(dir: &std::path::Path, model_index: usize) -> Vec<std::path::PathBuf> {
+    fn make_model_probe_files(
+        dir: &std::path::Path,
+        model_index: usize,
+    ) -> Vec<std::path::PathBuf> {
         for i in 0..DEVICE_NAME_PROBE_SAMPLE + 1 {
             let f = dir.join(format!("clip{:04}.mp4", i));
             let mut content = vec![0u8; 5000];
@@ -527,7 +547,9 @@ mod tests {
             }
             fs::write(&f, &content).unwrap();
         }
-        let mut files: Vec<_> = dir.read_dir().unwrap()
+        let mut files: Vec<_> = dir
+            .read_dir()
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .collect();
@@ -571,10 +593,15 @@ mod tests {
         content0[4500..4500 + xml.len()].copy_from_slice(xml);
         fs::write(dir.path().join("clip0000.mp4"), &content0).unwrap();
         for i in 1..6 {
-            fs::write(dir.path().join(format!("clip{:04}.mp4", i)), vec![0u8; 5000]).unwrap();
+            fs::write(
+                dir.path().join(format!("clip{:04}.mp4", i)),
+                vec![0u8; 5000],
+            )
+            .unwrap();
         }
 
-        let mut files: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        let mut files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .collect();
@@ -590,15 +617,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // .wav files are not video → no probe steps will run.
         fs::write(dir.path().join("track01.wav"), b"data").unwrap();
-        let mut files: Vec<_> = dir.path().read_dir().unwrap()
+        let mut files: Vec<_> = dir
+            .path()
+            .read_dir()
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .collect();
         files.sort();
 
-        let (name, source, _) = resolve_device_name_with_budget(
-            &files, "EOS_DIGITAL", None, Duration::from_nanos(1),
-        );
+        let (name, source, _) =
+            resolve_device_name_with_budget(&files, "EOS_DIGITAL", None, Duration::from_nanos(1));
         assert_eq!(name, "EOS_DIGITAL");
         assert_eq!(source, DeviceNameSource::VolumeLabel);
     }
@@ -607,15 +636,17 @@ mod tests {
     fn test_resolve_with_expired_budget_and_no_label_returns_unknown() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("track01.wav"), b"data").unwrap();
-        let mut files: Vec<_> = dir.path().read_dir().unwrap()
+        let mut files: Vec<_> = dir
+            .path()
+            .read_dir()
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .collect();
         files.sort();
 
-        let (name, source, _) = resolve_device_name_with_budget(
-            &files, "", None, Duration::from_nanos(1),
-        );
+        let (name, source, _) =
+            resolve_device_name_with_budget(&files, "", None, Duration::from_nanos(1));
         assert_eq!(name, "unknown");
         assert_eq!(source, DeviceNameSource::Unknown);
     }

@@ -103,7 +103,11 @@ pub fn decode_video_channel<F: Fn(f32)>(
 
             if chunk_count <= 1 || total_mono == 0 {
                 let result = audio_core::decode_ltc_with_decoder(
-                    &wav_path, use_libltc, decode_fps, decode_drop_frame, Some(cancel),
+                    &wav_path,
+                    use_libltc,
+                    decode_fps,
+                    decode_drop_frame,
+                    Some(cancel),
                 );
                 chunks_done.store(1, Ordering::Relaxed);
                 result
@@ -119,8 +123,12 @@ pub fn decode_video_channel<F: Fn(f32)>(
                 });
 
                 let result = audio_core::decode_ltc_chunked(
-                    &wav_path, use_libltc, decode_fps, decode_drop_frame,
-                    config, &decode_progress,
+                    &wav_path,
+                    use_libltc,
+                    decode_fps,
+                    decode_drop_frame,
+                    config,
+                    &decode_progress,
                 );
 
                 if let Some(h) = bridge {
@@ -130,7 +138,10 @@ pub fn decode_video_channel<F: Fn(f32)>(
                 result
             }
         }
-        Err(e) => Err(LtcDecodeError::Failed(format!("Failed to open extracted WAV: {}", e))),
+        Err(e) => Err(LtcDecodeError::Failed(format!(
+            "Failed to open extracted WAV: {}",
+            e
+        ))),
     };
 
     // Stamp total pipeline time (extraction + decode) onto the result
@@ -178,7 +189,11 @@ pub enum WavDispatch {
 /// Resolve the single-pass-vs-chunked dispatch for a WAV decode:
 /// `single_pass` wins over any count; otherwise the known (or counted)
 /// chunk count decides (`<= 1` → single-pass).
-pub(crate) fn wav_dispatch_decision(single_pass: bool, known: Option<usize>, counted: usize) -> WavDispatch {
+pub(crate) fn wav_dispatch_decision(
+    single_pass: bool,
+    known: Option<usize>,
+    counted: usize,
+) -> WavDispatch {
     if single_pass {
         return WavDispatch::SinglePass;
     }
@@ -216,10 +231,16 @@ pub fn decode_wav_core(
     match wav_dispatch_decision(params.single_pass, known_chunk_count, counted) {
         WavDispatch::SinglePass => {
             let result = audio_core::decode_ltc_with_decoder(
-                path, params.use_libltc, params.decode_fps, params.decode_drop_frame,
+                path,
+                params.use_libltc,
+                params.decode_fps,
+                params.decode_drop_frame,
                 cancel.map(|flag| flag.as_ref()),
             )?;
-            Ok(WavDecodeOutcome { result, chunk_count })
+            Ok(WavDecodeOutcome {
+                result,
+                chunk_count,
+            })
         }
         WavDispatch::Chunked(count) => {
             let owned_progress;
@@ -229,16 +250,25 @@ pub fn decode_wav_core(
                     owned_progress = DecodeProgress {
                         chunks_total: count,
                         chunks_completed: Arc::new(AtomicUsize::new(0)),
-                        cancel_flag: cancel.cloned().unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                        cancel_flag: cancel
+                            .cloned()
+                            .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
                     };
                     &owned_progress
                 }
             };
             let result = audio_core::decode_ltc_chunked(
-                path, params.use_libltc, params.decode_fps, params.decode_drop_frame,
-                config, progress,
+                path,
+                params.use_libltc,
+                params.decode_fps,
+                params.decode_drop_frame,
+                config,
+                progress,
             )?;
-            Ok(WavDecodeOutcome { result, chunk_count: count })
+            Ok(WavDecodeOutcome {
+                result,
+                chunk_count: count,
+            })
         }
     }
 }
@@ -330,23 +360,21 @@ pub(crate) fn bridge_decode_progress(
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("dp-bridge".into())
-        .spawn(move || {
-            loop {
-                let done = dp.chunks_completed.load(Ordering::Relaxed);
-                let total = dp.chunks_total;
-                if total > 0 {
-                    unit.set_fraction(done as f32 / total as f32);
-                    let msg = match &msg_prefix {
-                        Some(prefix) => format!("{} — Chunk {}/{}", prefix, done.min(total), total),
-                        None => format!("Chunk {}/{}", done.min(total), total),
-                    };
-                    unit.set_message(msg);
-                }
-                if done >= total || dp.cancel_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+        .spawn(move || loop {
+            let done = dp.chunks_completed.load(Ordering::Relaxed);
+            let total = dp.chunks_total;
+            if total > 0 {
+                unit.set_fraction(done as f32 / total as f32);
+                let msg = match &msg_prefix {
+                    Some(prefix) => format!("{} — Chunk {}/{}", prefix, done.min(total), total),
+                    None => format!("Chunk {}/{}", done.min(total), total),
+                };
+                unit.set_message(msg);
             }
+            if done >= total || dp.cancel_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         })
         .expect("failed to spawn decode-progress bridge thread")
 }
@@ -360,10 +388,21 @@ mod tests {
         let mut names = std::collections::HashSet::new();
         for i in 0..1000u64 {
             let p = temp_extract_wav(i, i as usize % 4, i as usize % 2);
-            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            assert!(name.starts_with("ltc_extract_"), "unexpected temp name: {}", name);
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            assert!(
+                name.starts_with("ltc_extract_"),
+                "unexpected temp name: {}",
+                name
+            );
             assert_eq!(p.extension().and_then(|e| e.to_str()), Some("wav"));
-            assert!(names.insert(p), "temp WAV path collision at iteration {}", i);
+            assert!(
+                names.insert(p),
+                "temp WAV path collision at iteration {}",
+                i
+            );
         }
     }
 
@@ -381,15 +420,36 @@ mod tests {
     #[test]
     fn test_wav_dispatch_decision_table() {
         // Forced single-pass wins over any count.
-        assert_eq!(wav_dispatch_decision(true, Some(9), 9), WavDispatch::SinglePass);
-        assert_eq!(wav_dispatch_decision(true, None, 4), WavDispatch::SinglePass);
+        assert_eq!(
+            wav_dispatch_decision(true, Some(9), 9),
+            WavDispatch::SinglePass
+        );
+        assert_eq!(
+            wav_dispatch_decision(true, None, 4),
+            WavDispatch::SinglePass
+        );
         // Known counts drive the decision.
-        assert_eq!(wav_dispatch_decision(false, Some(1), 9), WavDispatch::SinglePass);
-        assert_eq!(wav_dispatch_decision(false, Some(0), 9), WavDispatch::SinglePass);
-        assert_eq!(wav_dispatch_decision(false, Some(3), 9), WavDispatch::Chunked(3));
+        assert_eq!(
+            wav_dispatch_decision(false, Some(1), 9),
+            WavDispatch::SinglePass
+        );
+        assert_eq!(
+            wav_dispatch_decision(false, Some(0), 9),
+            WavDispatch::SinglePass
+        );
+        assert_eq!(
+            wav_dispatch_decision(false, Some(3), 9),
+            WavDispatch::Chunked(3)
+        );
         // No known count: fall back to the counted value.
-        assert_eq!(wav_dispatch_decision(false, None, 1), WavDispatch::SinglePass);
-        assert_eq!(wav_dispatch_decision(false, None, 4), WavDispatch::Chunked(4));
+        assert_eq!(
+            wav_dispatch_decision(false, None, 1),
+            WavDispatch::SinglePass
+        );
+        assert_eq!(
+            wav_dispatch_decision(false, None, 4),
+            WavDispatch::Chunked(4)
+        );
     }
 
     /// Write a small real LTC WAV via the CLI generator (in-module, so no
@@ -420,7 +480,7 @@ mod tests {
             context_frames: 3,
             list_timecodes: false,
             autostart: false,
-        probe_caps: false,
+            probe_caps: false,
         };
         crate::cli::generate_wav(cli).expect("WAV generation failed");
     }
@@ -498,6 +558,10 @@ mod tests {
     fn temp_extract_wav_encodes_request_coordinates() {
         let p = temp_extract_wav(42, 3, 1);
         let s = p.to_string_lossy();
-        assert!(s.contains("_42_3_1_"), "path should encode gen/stream/channel: {}", s);
+        assert!(
+            s.contains("_42_3_1_"),
+            "path should encode gen/stream/channel: {}",
+            s
+        );
     }
 }

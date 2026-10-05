@@ -45,8 +45,7 @@ const MAX_IN_FLIGHT_STEP_FRACTION: f32 = 0.99;
 pub fn parse_out_time(line: &str) -> Option<f64> {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE
-        .get_or_init(|| regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap());
+    let re = RE.get_or_init(|| regex::Regex::new(r"out_time=(\d+):(\d+):(\d+)\.(\d+)").unwrap());
     let caps = re.captures(line)?;
     let raw = caps.get(0).map(|m| m.as_str()).unwrap_or("");
     let tail = &raw["out_time".len()..];
@@ -65,10 +64,8 @@ pub fn parse_out_time(line: &str) -> Option<f64> {
 /// parsing) and a file-size sanity check so encoder-init failures that
 /// leave a header-only (or zero-length) file are correctly retried.
 pub fn classify_step_failure(produced_output: bool, output: &Path, code: &str) -> StepFailure {
-    let file_output = std::fs::metadata(output)
-        .map(|m| m.len())
-        .unwrap_or(0)
-        >= MIN_PRODUCED_OUTPUT_BYTES;
+    let file_output =
+        std::fs::metadata(output).map(|m| m.len()).unwrap_or(0) >= MIN_PRODUCED_OUTPUT_BYTES;
     if file_output && !produced_output {
         info!(
             "classify_step_failure: produced_output=false but output file is {} bytes — treating as Fatal",
@@ -98,12 +95,25 @@ pub fn run_ffmpeg_process<R: crate::converter::runner::ConversionReport>(
     current_step: usize,
 ) -> Result<(), StepFailure> {
     let step_label = format!("[{}/{}]", current_step, total_steps);
-    info!("{} Spawning ffmpeg with {} args → {}", step_label, args.len(), output.display());
+    info!(
+        "{} Spawning ffmpeg with {} args → {}",
+        step_label,
+        args.len(),
+        output.display()
+    );
 
-    let full_args: Vec<String> = args.iter().cloned().chain(std::iter::once(output.to_string_lossy().to_string())).collect();
+    let full_args: Vec<String> = args
+        .iter()
+        .cloned()
+        .chain(std::iter::once(output.to_string_lossy().to_string()))
+        .collect();
 
     run_ffmpeg_process_with(
-        &full_args, output, report, total_steps, current_step,
+        &full_args,
+        output,
+        report,
+        total_steps,
+        current_step,
         &mut |full_args: &[String]| {
             no_window_command("ffmpeg")
                 .args(full_args)
@@ -204,7 +214,12 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
             Err(StepFailure::Fatal(err_msg))
         }
         Err(crate::subprocess::FfmpegRunError::Exit { code, .. }) => {
-            warn!("{} ffmpeg exited with code {}: {}", step_label, code, output.display());
+            warn!(
+                "{} ffmpeg exited with code {}: {}",
+                step_label,
+                code,
+                output.display()
+            );
             report.append_log(&format!("\n\n--- FFMPEG EXITED WITH CODE {} ---", code));
             let classification = classify_step_failure(produced_output, output, &code);
             if matches!(classification, StepFailure::EncoderInit(_)) {
@@ -218,10 +233,7 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
             Err(StepFailure::Fatal("cancelled by user".to_string()))
         }
         Err(crate::subprocess::FfmpegRunError::Stalled) => {
-            let msg = format!(
-                "ffmpeg stalled — no stderr output for {}s",
-                stall.as_secs()
-            );
+            let msg = format!("ffmpeg stalled — no stderr output for {}s", stall.as_secs());
             warn!("{} {}", step_label, msg);
             report.append_log(&format!("\n\n--- {} ---", msg));
             Err(StepFailure::Fatal(msg))
@@ -237,9 +249,9 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use super::*;
     use crate::converter::runner::{ConversionReport, TestReport};
+    use std::path::Path;
 
     #[test]
     fn test_parse_out_time_happy_path() {
@@ -257,8 +269,14 @@ mod tests {
 
     #[test]
     fn test_parse_out_time_key_suffixes() {
-        assert!(parse_out_time("out_time_us=12345").is_none(), "out_time_us must not match");
-        assert!(parse_out_time("out_time_ms=1234").is_none(), "out_time_ms must not match");
+        assert!(
+            parse_out_time("out_time_us=12345").is_none(),
+            "out_time_us must not match"
+        );
+        assert!(
+            parse_out_time("out_time_ms=1234").is_none(),
+            "out_time_ms must not match"
+        );
     }
 
     #[test]
@@ -345,19 +363,32 @@ mod tests {
     #[test]
     fn test_run_ffmpeg_cancel_while_silent() {
         let report = TestReport::new();
-        report.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        report
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let out = Path::new("/tmp/_test_ffmpeg_cancel.mp4");
         let start = std::time::Instant::now();
 
         let result = run_ffmpeg_process_with(
-            &[], out, &report, 2, 1,
+            &[],
+            out,
+            &report,
+            2,
+            1,
             &mut silent_spawner,
             Duration::from_secs(10),
         );
         let elapsed = start.elapsed();
-        assert!(matches!(result, Err(StepFailure::Fatal(ref m)) if m == "cancelled by user"),
-            "expected cancel, got {:?}", result);
-        assert!(elapsed < Duration::from_secs(5), "cancel took {:?}", elapsed);
+        assert!(
+            matches!(result, Err(StepFailure::Fatal(ref m)) if m == "cancelled by user"),
+            "expected cancel, got {:?}",
+            result
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel took {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -367,14 +398,22 @@ mod tests {
         let start = std::time::Instant::now();
 
         let result = run_ffmpeg_process_with(
-            &[], out, &report, 2, 1,
+            &[],
+            out,
+            &report,
+            2,
+            1,
             &mut silent_spawner,
             Duration::from_millis(200),
         );
         let elapsed = start.elapsed();
         assert!(result.is_err(), "expected stall error, got {:?}", result);
         let log = report.log.lock().unwrap().clone();
-        assert!(log.contains("stalled") || log.contains("stall"), "log: {}", log);
+        assert!(
+            log.contains("stalled") || log.contains("stall"),
+            "log: {}",
+            log
+        );
         assert!(elapsed < Duration::from_secs(5), "stall took {:?}", elapsed);
     }
 
@@ -402,7 +441,11 @@ mod tests {
         };
 
         let result = run_ffmpeg_process_with(
-            &["-i".to_string(), "dummy".to_string()], out, &report, 2, 1,
+            &["-i".to_string(), "dummy".to_string()],
+            out,
+            &report,
+            2,
+            1,
             &mut spawner,
             Duration::from_secs(5),
         );
@@ -410,7 +453,11 @@ mod tests {
         assert!(result.is_ok(), "expected ok, got {:?}", result);
         // Progress should have advanced (step weight was 0.5)
         let progress = *report.progress.lock().unwrap();
-        assert!(progress > 0.0, "progress should have advanced: {}", progress);
+        assert!(
+            progress > 0.0,
+            "progress should have advanced: {}",
+            progress
+        );
         assert!(progress <= 1.0, "progress should be <= 1.0: {}", progress);
     }
 
@@ -443,21 +490,33 @@ mod tests {
         };
 
         let result = run_ffmpeg_process_with(
-            &["-i".to_string(), "dummy".to_string()], out, &report, 1, 1,
+            &["-i".to_string(), "dummy".to_string()],
+            out,
+            &report,
+            1,
+            1,
             &mut spawner,
             Duration::from_secs(5),
         );
         assert!(result.is_ok(), "expected ok, got {:?}", result);
 
         let hist = report.progress_history();
-        assert!(hist.len() >= 2, "must have in-flight reports plus advance_step: {:?}", hist);
+        assert!(
+            hist.len() >= 2,
+            "must have in-flight reports plus advance_step: {:?}",
+            hist
+        );
         assert!(
             hist[..hist.len() - 1].iter().all(|&p| p < 1.0),
             "in-flight progress must stay below the full step weight: {:?}",
             hist
         );
         let last = *hist.last().unwrap();
-        assert!(last >= 0.99, "advance_step must complete the step: {}", last);
+        assert!(
+            last >= 0.99,
+            "advance_step must complete the step: {}",
+            last
+        );
     }
 
     #[test]
@@ -485,7 +544,11 @@ mod tests {
         };
 
         let result = run_ffmpeg_process_with(
-            &["-i".to_string(), "nonexistent".to_string()], &out, &report, 1, 1,
+            &["-i".to_string(), "nonexistent".to_string()],
+            &out,
+            &report,
+            1,
+            1,
             &mut spawner,
             Duration::from_secs(5),
         );

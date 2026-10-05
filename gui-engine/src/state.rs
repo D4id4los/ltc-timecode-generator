@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::camera_meta::CameraInfo;
-use crate::converter::{FfmpegCapabilities, RecordingType, ChannelMap, ConvertBlocker};
+use crate::converter::{ChannelMap, ConvertBlocker, FfmpegCapabilities, RecordingType};
 use crate::ffprobe::VideoAudioProbe;
 use crate::file_pattern::MatchedGroup;
 use crate::job::{JobKind, JobStatus};
-use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_VIDEO_SUFFIX, DEFAULT_PREFIX};
-use crate::timecode::FPS_OPTIONS;
+use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_PREFIX, DEFAULT_VIDEO_SUFFIX};
 use crate::offload::OffloadSnapshot;
+use crate::timecode::FPS_OPTIONS;
 use audio_core::{AudioDeviceInfo, ChannelSel, LtcDetectionResult, Timecode};
 
 // ── Converter user settings (single source of truth) ─────────────────
@@ -128,9 +128,8 @@ impl ConverterSnapshot {
     }
 
     pub fn selected_recording_type(&self) -> Option<RecordingType> {
-        self.selected_group_idx.and_then(|idx| {
-            self.groups.get(idx).map(|g| g.recording_type.clone())
-        })
+        self.selected_group_idx
+            .and_then(|idx| self.groups.get(idx).map(|g| g.recording_type.clone()))
     }
 }
 
@@ -444,7 +443,7 @@ impl AppStateSnapshot {
             ffmpeg_caps: None,
             jobs: HashMap::new(),
             file_durations: HashMap::new(),
-            
+
             converter: ConverterSnapshot {
                 groups: Vec::new(),
                 selected_group_idx: None,

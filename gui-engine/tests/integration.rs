@@ -1,23 +1,34 @@
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::{Duration, Instant};
-use std::path::{Path, PathBuf};
 
 use arc_swap::ArcSwap;
 use gui_engine::command::{ConverterCommand, GuiCommand, OffloadCommand};
-use gui_engine::engine::{engine_main_with_probe, engine_main_with_seams, EngineSeams, ScanCardsFn};
-use gui_engine::state::AppStateSnapshot;
+use gui_engine::engine::{
+    engine_main_with_probe, engine_main_with_seams, EngineSeams, ScanCardsFn,
+};
 use gui_engine::offload::{OffloadFileInfo, SdCardInfo};
-use gui_engine::{decode_ltc_from_wav, AudioEvent, JobKind, JobPhase, LtcDecodeStatus, FfmpegCapabilities, HwDeviceCapabilities, DeviceNameSource};
+use gui_engine::state::AppStateSnapshot;
+use gui_engine::{
+    decode_ltc_from_wav, AudioEvent, DeviceNameSource, FfmpegCapabilities, HwDeviceCapabilities,
+    JobKind, JobPhase, LtcDecodeStatus,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-fn make_wav_cli(path: &Path, fps: f64, drop_frame: bool, duration: f64, sample_rate: u32) -> gui_engine::cli::Cli {
+fn make_wav_cli(
+    path: &Path,
+    fps: f64,
+    drop_frame: bool,
+    duration: f64,
+    sample_rate: u32,
+) -> gui_engine::cli::Cli {
     gui_engine::cli::Cli {
         output_to_file: Some(path.to_string_lossy().to_string()),
         duration: Some(duration),
@@ -33,7 +44,9 @@ fn make_wav_cli(path: &Path, fps: f64, drop_frame: bool, duration: f64, sample_r
         drop_frame,
         verbose: false,
         debug: false,
-        decode: None, audio_stream: 0, audio_channel: 0,
+        decode: None,
+        audio_stream: 0,
+        audio_channel: 0,
         decoder: "builtin".to_string(),
         decode_fps: fps,
         decode_drop_frame: drop_frame,
@@ -56,7 +69,7 @@ fn fake_probe() -> FfmpegCapabilities {
         available_encoders: BTreeSet::new(),
         available_formats: BTreeSet::new(),
         error_message: None,
-            ffmpeg_version: None,
+        ffmpeg_version: None,
         hw: HwDeviceCapabilities::default(),
     }
 }
@@ -109,7 +122,8 @@ where
         if Instant::now() > deadline {
             panic!(
                 "Timeout waiting for predicate (ltc_job={:?}, status={})",
-                snapshot.job(JobKind::LtcDecode), snapshot.status.message()
+                snapshot.job(JobKind::LtcDecode),
+                snapshot.status.message()
             );
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -136,9 +150,7 @@ impl TestEngine {
 }
 
 /// Spawn the engine with the default seams except `scan_cards`.
-fn spawn_engine_with_scan_seam(
-    scan_cards: ScanCardsFn,
-) -> TestEngine {
+fn spawn_engine_with_scan_seam(scan_cards: ScanCardsFn) -> TestEngine {
     init_test_config();
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
@@ -155,7 +167,12 @@ fn spawn_engine_with_scan_seam(
             engine_main_with_seams(rx, state_clone, false, event_tx, seams);
         })
         .expect("failed to spawn engine thread");
-    TestEngine { tx, state, handle, event_rx }
+    TestEngine {
+        tx,
+        state,
+        handle,
+        event_rx,
+    }
 }
 
 /// Build a one-card seam whose files live in `mount_dir`.
@@ -164,7 +181,11 @@ fn static_scan_seam(card: SdCardInfo) -> ScanCardsFn {
 }
 
 /// Poll the published snapshot until `predicate` holds; panic on timeout.
-fn wait_for_snapshot<F>(state: &Arc<ArcSwap<AppStateSnapshot>>, what: &str, predicate: F) -> AppStateSnapshot
+fn wait_for_snapshot<F>(
+    state: &Arc<ArcSwap<AppStateSnapshot>>,
+    what: &str,
+    predicate: F,
+) -> AppStateSnapshot
 where
     F: Fn(&AppStateSnapshot) -> bool,
 {
@@ -235,7 +256,9 @@ fn make_card(mount: &Path, device_name: &str, file_names: &[&str]) -> SdCardInfo
 static OFFLOAD_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn take_offload_config_lock() -> std::sync::MutexGuard<'static, ()> {
-    OFFLOAD_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    OFFLOAD_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Remove the persisted converter config so a fresh engine seeds no
@@ -282,7 +305,10 @@ fn test_cancel_decode_then_redecode_succeeds() {
     generate_wav(&path2, 25.0, false, 0.5, 48000);
 
     // Start decoding file 1
-    tx.send(GuiCommand::ParseLtcWavFile(path1.to_string_lossy().to_string())).unwrap();
+    tx.send(GuiCommand::ParseLtcWavFile(
+        path1.to_string_lossy().to_string(),
+    ))
+    .unwrap();
 
     // Wait until Running
     let deadline = Instant::now() + POLL_TIMEOUT;
@@ -313,7 +339,10 @@ fn test_cancel_decode_then_redecode_succeeds() {
     }
 
     // Now start decoding file 2
-    tx.send(GuiCommand::ParseLtcWavFile(path2.to_string_lossy().to_string())).unwrap();
+    tx.send(GuiCommand::ParseLtcWavFile(
+        path2.to_string_lossy().to_string(),
+    ))
+    .unwrap();
 
     // Wait until the second decode succeeds
     let deadline = Instant::now() + POLL_TIMEOUT;
@@ -323,8 +352,10 @@ fn test_cancel_decode_then_redecode_succeeds() {
             break;
         }
         if Instant::now() > deadline {
-            panic!("timeout waiting for second decode to succeed (phase: {:?})",
-                snap.job(JobKind::LtcDecode).phase());
+            panic!(
+                "timeout waiting for second decode to succeed (phase: {:?})",
+                snap.job(JobKind::LtcDecode).phase()
+            );
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -387,9 +418,17 @@ fn test_wav_roundtrip_25fps() {
     let path = dir.path().join("test_25fps.wav");
     generate_wav(&path, 25.0, false, 2.0, 48000);
     let result = decode_ltc_from_wav(&path, 25.0, false, None).expect("LTC decode failed");
-    assert!(matches!(result.status, LtcDecodeStatus::Success),
-        "expected Success, got {:?} (valid={})", result.status, result.valid_frames);
-    assert!(result.valid_frames >= 48, "expected ~50 frames, got {}", result.valid_frames);
+    assert!(
+        matches!(result.status, LtcDecodeStatus::Success),
+        "expected Success, got {:?} (valid={})",
+        result.status,
+        result.valid_frames
+    );
+    assert!(
+        result.valid_frames >= 48,
+        "expected ~50 frames, got {}",
+        result.valid_frames
+    );
 }
 
 #[test]
@@ -398,8 +437,12 @@ fn test_wav_roundtrip_2997_df() {
     let path = dir.path().join("test_2997df.wav");
     generate_wav(&path, 29.97, true, 3.0, 48000);
     let result = decode_ltc_from_wav(&path, 29.97, true, None).expect("LTC decode failed");
-    assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
-        "expected no Error, got {:?} (valid={})", result.status, result.valid_frames);
+    assert!(
+        !matches!(result.status, LtcDecodeStatus::Error { .. }),
+        "expected no Error, got {:?} (valid={})",
+        result.status,
+        result.valid_frames
+    );
 }
 
 // ── Engine MPSC: ParseLtcWavFile ────────────────────────────────────────
@@ -411,15 +454,23 @@ fn test_engine_mpsc_parse_ltc_command() {
     generate_wav(&path, 25.0, false, 1.0, 48000);
 
     let snapshot = run_engine(
-        vec![GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())],
+        vec![GuiCommand::ParseLtcWavFile(
+            path.to_string_lossy().to_string(),
+        )],
         false,
         |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.result.is_some(),
     );
 
-    assert!(snapshot.decode.result.is_some(), "expected ltc_decode_result to be Some");
+    assert!(
+        snapshot.decode.result.is_some(),
+        "expected ltc_decode_result to be Some"
+    );
     let result = snapshot.decode.result.as_ref().unwrap();
-    assert!(matches!(result.status, LtcDecodeStatus::Success),
-        "expected Success, got {:?}", result.status);
+    assert!(
+        matches!(result.status, LtcDecodeStatus::Success),
+        "expected Success, got {:?}",
+        result.status
+    );
     assert!(result.valid_frames > 0, "expected valid_frames > 0");
     assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running);
     assert!(snapshot.decode.error.is_none());
@@ -429,7 +480,9 @@ fn test_engine_mpsc_parse_ltc_command() {
 #[test]
 fn test_engine_mpsc_parse_invalid_file() {
     let snapshot = run_engine(
-        vec![GuiCommand::ParseLtcWavFile("/tmp/nonexistent_ltc_test_file.wav".to_string())],
+        vec![GuiCommand::ParseLtcWavFile(
+            "/tmp/nonexistent_ltc_test_file.wav".to_string(),
+        )],
         false,
         |s| s.job(JobKind::LtcDecode).phase() != JobPhase::Running && s.decode.error.is_some(),
     );
@@ -445,11 +498,22 @@ fn test_engine_mpsc_parse_invalid_file() {
 fn test_engine_clap_creates_log_entry() {
     let snapshot = run_engine(vec![GuiCommand::Clap], false, |s| s.clapper.clap_seq == 1);
 
-    assert_eq!(snapshot.clapper.clap_seq, 1, "clap_seq must bump once per clap");
-    assert_eq!(snapshot.clapper.logs.len(), 1, "expected 1 log entry after Clap");
+    assert_eq!(
+        snapshot.clapper.clap_seq, 1,
+        "clap_seq must bump once per clap"
+    );
+    assert_eq!(
+        snapshot.clapper.logs.len(),
+        1,
+        "expected 1 log entry after Clap"
+    );
     let log = &snapshot.clapper.logs[0];
     assert_eq!(log.note, "Scene 1");
-    assert!(log.timecode.contains(':'), "expected timecode in log, got {}", log.timecode);
+    assert!(
+        log.timecode.contains(':'),
+        "expected timecode in log, got {}",
+        log.timecode
+    );
     assert_eq!(log.id, 1);
 }
 
@@ -461,10 +525,20 @@ fn test_engine_multiple_claps_accumulate_logs() {
         |s| s.clapper.clap_seq == 3,
     );
 
-    assert_eq!(snapshot.clapper.clap_seq, 3, "clap_seq must be monotonic across claps");
-    assert_eq!(snapshot.clapper.logs.len(), 3, "expected 3 log entries after 3 Claps");
+    assert_eq!(
+        snapshot.clapper.clap_seq, 3,
+        "clap_seq must be monotonic across claps"
+    );
+    assert_eq!(
+        snapshot.clapper.logs.len(),
+        3,
+        "expected 3 log entries after 3 Claps"
+    );
     // take auto-increments 3 times from 1
-    assert_eq!(snapshot.clapper.take, 4, "take should be 4 after 3 Claps starting from 1");
+    assert_eq!(
+        snapshot.clapper.take, 4,
+        "take should be 4 after 3 Claps starting from 1"
+    );
 }
 
 // ── Engine shutdown ─────────────────────────────────────────────────────
@@ -556,15 +630,24 @@ fn test_engine_probe_file_durations_wav() {
     init_test_config();
 
     // Create two WAVs with known durations
-    let spec = hound::WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 48000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
     {
         let mut w = hound::WavWriter::create(&path1, spec).unwrap();
-        for _ in 0..96000 { w.write_sample(0i16).unwrap(); }
+        for _ in 0..96000 {
+            w.write_sample(0i16).unwrap();
+        }
         w.finalize().unwrap();
     }
     {
         let mut w = hound::WavWriter::create(&path2, spec).unwrap();
-        for _ in 0..48000 { w.write_sample(0i16).unwrap(); }
+        for _ in 0..48000 {
+            w.write_sample(0i16).unwrap();
+        }
         w.finalize().unwrap();
     }
 
@@ -580,7 +663,11 @@ fn test_engine_probe_file_durations_wav() {
         })
         .expect("failed to spawn engine thread");
 
-    tx.send(GuiCommand::ProbeFileDurations(vec![path1.clone(), path2.clone()])).unwrap();
+    tx.send(GuiCommand::ProbeFileDurations(vec![
+        path1.clone(),
+        path2.clone(),
+    ]))
+    .unwrap();
 
     // Poll until both durations appear in the snapshot
     let deadline = Instant::now() + POLL_TIMEOUT;
@@ -596,10 +683,26 @@ fn test_engine_probe_file_durations_wav() {
     }
 
     let snapshot: AppStateSnapshot = state.load().as_ref().clone();
-    let dur1 = snapshot.file_durations.get(&path1).expect("missing path1").expect("path1 duration should be Some");
-    let dur2 = snapshot.file_durations.get(&path2).expect("missing path2").expect("path2 duration should be Some");
-    assert!((dur1 - 2.0).abs() < 0.001, "expected 2.0s for path1, got {}", dur1);
-    assert!((dur2 - 1.0).abs() < 0.001, "expected 1.0s for path2, got {}", dur2);
+    let dur1 = snapshot
+        .file_durations
+        .get(&path1)
+        .expect("missing path1")
+        .expect("path1 duration should be Some");
+    let dur2 = snapshot
+        .file_durations
+        .get(&path2)
+        .expect("missing path2")
+        .expect("path2 duration should be Some");
+    assert!(
+        (dur1 - 2.0).abs() < 0.001,
+        "expected 2.0s for path1, got {}",
+        dur1
+    );
+    assert!(
+        (dur2 - 1.0).abs() < 0.001,
+        "expected 1.0s for path2, got {}",
+        dur2
+    );
 
     drop(tx);
     handle.join().expect("engine thread panicked");
@@ -618,12 +721,17 @@ fn cancel_decode_clears_is_detecting() {
             phase != JobPhase::Running && s.decode.error.is_some()
         },
     );
-    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
-        "CancelDecode should clear LtcDecode job phase");
-    assert!(matches!(
-        snapshot.job(JobKind::LtcDecode).phase(),
-        JobPhase::Idle | JobPhase::Cancelled,
-    ), "cancelled single decode must end Idle (failed synchronously before spawning) or Cancelled");
+    assert!(
+        snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
+        "CancelDecode should clear LtcDecode job phase"
+    );
+    assert!(
+        matches!(
+            snapshot.job(JobKind::LtcDecode).phase(),
+            JobPhase::Idle | JobPhase::Cancelled,
+        ),
+        "cancelled single decode must end Idle (failed synchronously before spawning) or Cancelled"
+    );
 }
 
 #[test]
@@ -642,14 +750,21 @@ fn cancel_decode_also_clears_group_detecting() {
         // cancel deterministically lands in the Cancelled phase.
         |s| matches!(s.job(JobKind::LtcGroupDecode).phase(), JobPhase::Cancelled),
     );
-    assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running,
-        "CancelDecode should clear LtcGroupDecode job phase");
-    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
-        "CancelDecode should clear LtcDecode job phase");
-    assert!(matches!(
-        snapshot.job(JobKind::LtcGroupDecode).phase(),
-        JobPhase::Idle | JobPhase::Cancelled,
-    ), "cancelled group decode must end Idle or Cancelled, never Running/Failed/Succeeded");
+    assert!(
+        snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running,
+        "CancelDecode should clear LtcGroupDecode job phase"
+    );
+    assert!(
+        snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
+        "CancelDecode should clear LtcDecode job phase"
+    );
+    assert!(
+        matches!(
+            snapshot.job(JobKind::LtcGroupDecode).phase(),
+            JobPhase::Idle | JobPhase::Cancelled,
+        ),
+        "cancelled group decode must end Idle or Cancelled, never Running/Failed/Succeeded"
+    );
 }
 
 // ── Multi-chunk WAV decode progress ───────────────────────────────────────
@@ -677,7 +792,10 @@ fn test_multi_chunk_decode_succeeds() {
         })
         .expect("failed to spawn engine thread");
 
-    tx.send(GuiCommand::ParseLtcWavFile(path.to_string_lossy().to_string())).unwrap();
+    tx.send(GuiCommand::ParseLtcWavFile(
+        path.to_string_lossy().to_string(),
+    ))
+    .unwrap();
 
     // Break on a terminal phase only: before the first publication
     // `job(kind)` returns an *idle* default, so `!= Running` alone would
@@ -756,9 +874,18 @@ fn test_idle_engine_does_not_republish() {
         if Instant::now() > deadline {
             panic!("Timeout waiting for HwValidate job to settle");
         }
-        if state.load().jobs.get(&JobKind::HwValidate).map(|j| {
-            matches!(j.phase(), JobPhase::Succeeded | JobPhase::Cancelled | JobPhase::Failed)
-        }).unwrap_or(false) {
+        if state
+            .load()
+            .jobs
+            .get(&JobKind::HwValidate)
+            .map(|j| {
+                matches!(
+                    j.phase(),
+                    JobPhase::Succeeded | JobPhase::Cancelled | JobPhase::Failed
+                )
+            })
+            .unwrap_or(false)
+        {
             break;
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -799,8 +926,8 @@ fn test_idle_engine_does_not_republish() {
 fn test_applied_command_seq_counts_commands() {
     let snapshot = run_engine(
         vec![
-            GuiCommand::SetFpsIndex(0),      // seq 1 — value change
-            GuiCommand::SetLtcVolume(0.25),  // seq 2 — idempotent vs default 0.25
+            GuiCommand::SetFpsIndex(0),           // seq 1 — value change
+            GuiCommand::SetLtcVolume(0.25),       // seq 2 — idempotent vs default 0.25
             GuiCommand::SetBeepFrequency(1234.0), // seq 3 — value change
         ],
         false,
@@ -851,9 +978,13 @@ fn fake_scan_reaches_snapshot() {
     let card = make_card(&mount, "TESTCAM", &["CLIP001.wav", "CLIP002.wav"]);
     let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
 
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::ScanCards))
+        .unwrap();
     let snap = wait_for_snapshot(&engine.state, "OffloadScan to succeed", |s| {
-        s.jobs.get(&JobKind::OffloadScan)
+        s.jobs
+            .get(&JobKind::OffloadScan)
             .map(|j| j.phase() == JobPhase::Succeeded)
             .unwrap_or(false)
     });
@@ -861,7 +992,10 @@ fn fake_scan_reaches_snapshot() {
     assert_eq!(snap.offload.cards.len(), 1, "fake card must reach snapshot");
     assert_eq!(snap.offload.cards[0].device_name, "TESTCAM");
     // on_offload_scan_finished applies the default (latest-day) selection.
-    assert_eq!(snap.offload.cards[0].selected_count, 2, "default selection applied on scan finish");
+    assert_eq!(
+        snap.offload.cards[0].selected_count, 2,
+        "default selection applied on scan finish"
+    );
     engine.shutdown();
 }
 
@@ -872,7 +1006,8 @@ fn card_for_existing_files(mount: &Path, device_name: &str, file_names: &[&str])
     let mut files = Vec::new();
     for name in file_names {
         let path = mount.join(name);
-        let meta = std::fs::metadata(&path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+        let meta =
+            std::fs::metadata(&path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
         files.push(OffloadFileInfo {
             path: path.clone(),
             name: (*name).to_string(),
@@ -909,19 +1044,46 @@ fn test_offload_happy_path_scan_select_copy() {
     let card = card_for_existing_files(&mount, "TESTCAM", &["CLIP001.wav", "CLIP002.wav"]);
 
     let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::ScanCards))
+        .unwrap();
     let snap = wait_for_snapshot(&engine.state, "OffloadScan success", |s| {
-        s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+        s.jobs
+            .get(&JobKind::OffloadScan)
+            .map(|j| j.phase() == JobPhase::Succeeded)
+            .unwrap_or(false)
     });
     let version_before = snap.offload.last_offload_version;
 
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetParentFolder(dest.clone()))).unwrap();
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetParentName("day1".into()))).unwrap();
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(0, true))).unwrap();
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::SetParentFolder(
+            dest.clone(),
+        )))
+        .unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::SetParentName(
+            "day1".into(),
+        )))
+        .unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(
+            0, true,
+        )))
+        .unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::StartOffload))
+        .unwrap();
 
     let snap = wait_for_snapshot(&engine.state, "OffloadCopy success", |s| {
-        s.jobs.get(&JobKind::OffloadCopy).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+        s.jobs
+            .get(&JobKind::OffloadCopy)
+            .map(|j| j.phase() == JobPhase::Succeeded)
+            .unwrap_or(false)
             && s.offload.completed_devices.contains(&"TESTCAM".to_string())
     });
 
@@ -939,10 +1101,22 @@ fn test_offload_happy_path_scan_select_copy() {
     }
 
     assert_eq!(snap.offload.completed_devices, vec!["TESTCAM".to_string()]);
-    assert_eq!(snap.offload.last_offload_parent, Some(dev_dir.parent().unwrap().to_path_buf()));
-    assert_eq!(snap.offload.last_offload_version, version_before + 1, "completion bumps the handoff version");
+    assert_eq!(
+        snap.offload.last_offload_parent,
+        Some(dev_dir.parent().unwrap().to_path_buf())
+    );
+    assert_eq!(
+        snap.offload.last_offload_version,
+        version_before + 1,
+        "completion bumps the handoff version"
+    );
 
-    let totals = snap.offload.device_totals.iter().find(|t| t.name == "TESTCAM").expect("device totals for TESTCAM");
+    let totals = snap
+        .offload
+        .device_totals
+        .iter()
+        .find(|t| t.name == "TESTCAM")
+        .expect("device totals for TESTCAM");
     assert_eq!(totals.files_total, 2);
     assert_eq!(totals.bytes_total, snap.offload.cards[0].selected_bytes);
 
@@ -951,7 +1125,10 @@ fn test_offload_happy_path_scan_select_copy() {
         s.offload.file_durations.contains_key(&p1) && s.offload.file_durations.contains_key(&p2)
     });
     let snap = engine.state.load().as_ref().clone();
-    assert!(snap.offload.file_durations[&p1].is_some(), "WAV duration should probe successfully");
+    assert!(
+        snap.offload.file_durations[&p1].is_some(),
+        "WAV duration should probe successfully"
+    );
     assert!(snap.offload.file_durations[&p2].is_some());
 
     engine.shutdown();
@@ -974,15 +1151,32 @@ fn test_offload_copy_failure_completes_with_no_devices() {
     std::fs::remove_file(mount.join("gone2.wav")).unwrap();
 
     let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::ScanCards))
+        .unwrap();
     wait_for_snapshot(&engine.state, "scan success", |s| {
-        s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+        s.jobs
+            .get(&JobKind::OffloadScan)
+            .map(|j| j.phase() == JobPhase::Succeeded)
+            .unwrap_or(false)
     });
 
     let version_before = engine.state.load().offload.last_offload_version;
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetParentFolder(dest))).unwrap();
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(0, true))).unwrap();
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::SetParentFolder(dest)))
+        .unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(
+            0, true,
+        )))
+        .unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::StartOffload))
+        .unwrap();
 
     let snap = wait_for_snapshot(&engine.state, "OffloadCopy terminal", |s| {
         matches!(
@@ -997,15 +1191,33 @@ fn test_offload_copy_failure_completes_with_no_devices() {
     );
     // Desired: the offload→converter handoff only fires when the destination
     // actually received files. Zero completed devices = no handoff.
-    assert_eq!(snap.offload.last_offload_version, version_before,
-        "no handoff version bump when zero devices completed");
-    assert!(snap.offload.last_offload_parent.is_none(),
-        "handoff must not point at an empty destination");
-    let dev_dir = snap.offload.parent_folder.as_ref().unwrap().join(&snap.offload.parent_name).join("VANISH");
-    assert!(!dev_dir.join("gone1.wav").exists(), "no partial file may survive as a deliverable");
+    assert_eq!(
+        snap.offload.last_offload_version, version_before,
+        "no handoff version bump when zero devices completed"
+    );
+    assert!(
+        snap.offload.last_offload_parent.is_none(),
+        "handoff must not point at an empty destination"
+    );
+    let dev_dir = snap
+        .offload
+        .parent_folder
+        .as_ref()
+        .unwrap()
+        .join(&snap.offload.parent_name)
+        .join("VANISH");
+    assert!(
+        !dev_dir.join("gone1.wav").exists(),
+        "no partial file may survive as a deliverable"
+    );
 
     // Engine alive and publishable afterwards: a no-op command is acked.
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::SetParentName("post-fail".into()))).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::SetParentName(
+            "post-fail".into(),
+        )))
+        .unwrap();
     wait_for_snapshot(&engine.state, "engine alive after failure", |s| {
         s.offload.parent_name == "post-fail"
     });
@@ -1037,20 +1249,38 @@ fn test_offload_cancel_during_scan() {
     });
 
     let engine = spawn_engine_with_scan_seam(seam);
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::ScanCards))
+        .unwrap();
     wait_for_snapshot(&engine.state, "scan running", |s| {
-        matches!(s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase()), Some(JobPhase::Running) | Some(JobPhase::Indeterminate))
+        matches!(
+            s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase()),
+            Some(JobPhase::Running) | Some(JobPhase::Indeterminate)
+        )
     });
 
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::CancelOffload)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::CancelOffload))
+        .unwrap();
     wait_for_snapshot(&engine.state, "scan cancelled", |s| {
-        s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Cancelled).unwrap_or(false)
+        s.jobs
+            .get(&JobKind::OffloadScan)
+            .map(|j| j.phase() == JobPhase::Cancelled)
+            .unwrap_or(false)
     });
 
     // A subsequent scan works again — no stale-supervisor lockout.
-    engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::ScanCards))
+        .unwrap();
     let snap = wait_for_snapshot(&engine.state, "rescan after cancel succeeds", |s| {
-        s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+        s.jobs
+            .get(&JobKind::OffloadScan)
+            .map(|j| j.phase() == JobPhase::Succeeded)
+            .unwrap_or(false)
     });
     assert_eq!(snap.offload.cards.len(), 1);
 
@@ -1067,8 +1297,13 @@ fn test_start_offload_guard_branches() {
     {
         delete_persisted_offload_parent();
         let engine = spawn_engine_with_scan_seam(Arc::new(|_c, _p| Ok(Vec::new())));
-        engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
-        let snap = wait_for_snapshot(&engine.state, "no-cards guard", |s| s.offload.plan_error.is_some());
+        engine
+            .tx
+            .send(GuiCommand::Offload(OffloadCommand::StartOffload))
+            .unwrap();
+        let snap = wait_for_snapshot(&engine.state, "no-cards guard", |s| {
+            s.offload.plan_error.is_some()
+        });
         assert_eq!(snap.offload.plan_error, Some(OffloadPlanError::NoCards));
         engine.shutdown();
     }
@@ -1079,15 +1314,27 @@ fn test_start_offload_guard_branches() {
         let mount = make_persistent_dir("offload-guard-mount");
         let card = make_card(&mount, "TESTCAM", &["a.wav"]);
         let engine = spawn_engine_with_scan_seam(static_scan_seam(card));
-        engine.tx.send(GuiCommand::Offload(OffloadCommand::ScanCards)).unwrap();
+        engine
+            .tx
+            .send(GuiCommand::Offload(OffloadCommand::ScanCards))
+            .unwrap();
         wait_for_snapshot(&engine.state, "scan success", |s| {
-            s.jobs.get(&JobKind::OffloadScan).map(|j| j.phase() == JobPhase::Succeeded).unwrap_or(false)
+            s.jobs
+                .get(&JobKind::OffloadScan)
+                .map(|j| j.phase() == JobPhase::Succeeded)
+                .unwrap_or(false)
         });
-        engine.tx.send(GuiCommand::Offload(OffloadCommand::StartOffload)).unwrap();
+        engine
+            .tx
+            .send(GuiCommand::Offload(OffloadCommand::StartOffload))
+            .unwrap();
         let snap = wait_for_snapshot(&engine.state, "no-parent guard", |s| {
             s.offload.plan_error == Some(OffloadPlanError::NoParentFolder)
         });
-        assert_eq!(snap.offload.plan_error, Some(OffloadPlanError::NoParentFolder));
+        assert_eq!(
+            snap.offload.plan_error,
+            Some(OffloadPlanError::NoParentFolder)
+        );
         engine.shutdown();
     }
     // (c) Duplicate StartOffload while copy running is deliberately not
@@ -1138,7 +1385,10 @@ fn test_set_device_bogus_id_does_not_stick() {
     // thread cleanly after the ack predicate (a panicked loop would poison
     // the join). On a deviceless host (CI) the bogus selection also cannot
     // have been replaced by anything: the selection stays as it was.
-    if audio_core::list_audio_devices().map(|d| d.is_empty()).unwrap_or(true) {
+    if audio_core::list_audio_devices()
+        .map(|d| d.is_empty())
+        .unwrap_or(true)
+    {
         assert_eq!(
             snapshot.selected_device, None,
             "on a deviceless host there is nothing to revert/fall back to"
@@ -1173,13 +1423,20 @@ fn spawn_engine_with_event_seam(queue: EventQueue) -> TestEngine {
             let seams = EngineSeams {
                 ffmpeg_caps: Box::new(fake_probe),
                 audio_events: Box::new(move |_core| queue.lock().unwrap().drain(..).collect()),
-                init_output: Box::new(|_, _, _, _| Err("test: audio init forced to fail".to_string())),
+                init_output: Box::new(|_, _, _, _| {
+                    Err("test: audio init forced to fail".to_string())
+                }),
                 ..EngineSeams::default()
             };
             engine_main_with_seams(rx, state_clone, false, event_tx, seams);
         })
         .expect("failed to spawn engine thread");
-    TestEngine { tx, state, handle, event_rx }
+    TestEngine {
+        tx,
+        state,
+        handle,
+        event_rx,
+    }
 }
 
 /// Mirrors `MAX_RECOVERY_ATTEMPTS` in engine.rs (kept private there).
@@ -1208,13 +1465,13 @@ fn test_recovery_needed_event_increments_published_counter() {
     let queue: EventQueue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     let eng = spawn_engine_with_event_seam(Arc::clone(&queue));
 
-    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded { reason: "seam test".to_string() });
+    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded {
+        reason: "seam test".to_string(),
+    });
 
-    let snap = wait_for_snapshot(
-        &eng.state,
-        "published recovery counter to reach 1",
-        |s| s.audio_recovery_attempts == 1,
-    );
+    let snap = wait_for_snapshot(&eng.state, "published recovery counter to reach 1", |s| {
+        s.audio_recovery_attempts == 1
+    });
     assert_eq!(snap.audio_recovery_attempts, 1);
 
     // The event must also be forwarded to the GUI event channel.
@@ -1232,20 +1489,22 @@ fn test_recovery_attempts_exhaust_at_max() {
     {
         let mut q = queue.lock().unwrap();
         for _ in 0..=MAX_SOFT_RECOVERY_ATTEMPTS {
-            q.push_back(AudioEvent::RecoveryNeeded { reason: "exhaust".to_string() });
+            q.push_back(AudioEvent::RecoveryNeeded {
+                reason: "exhaust".to_string(),
+            });
         }
     }
 
-    let snap = wait_for_snapshot(
-        &eng.state,
-        "recovery counter to reach MAX",
-        |s| s.audio_recovery_attempts == MAX_SOFT_RECOVERY_ATTEMPTS,
-    );
+    let snap = wait_for_snapshot(&eng.state, "recovery counter to reach MAX", |s| {
+        s.audio_recovery_attempts == MAX_SOFT_RECOVERY_ATTEMPTS
+    });
     assert_eq!(snap.audio_recovery_attempts, MAX_SOFT_RECOVERY_ATTEMPTS);
 
     // One more event: the exhausted branch must consume it (forward it to
     // the GUI), freeze the counter at MAX, and stop playback.
-    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded { reason: "past max".to_string() });
+    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded {
+        reason: "past max".to_string(),
+    });
     wait_for_forwarded_recovery_needed(&eng, "the past-max RecoveryNeeded to be forwarded");
     // Ack marker: a command sent after the past-max event is processed in a
     // strictly later tick, so satisfying this predicate proves the snapshot
@@ -1254,9 +1513,12 @@ fn test_recovery_attempts_exhaust_at_max() {
     let snap = wait_for_snapshot(
         &eng.state,
         "counter frozen at MAX with playback stopped after exhaustion",
-        |s| s.applied_command_seq >= 1 && s.fps_index == 2
-            && s.audio_recovery_attempts == MAX_SOFT_RECOVERY_ATTEMPTS
-            && !s.is_playing,
+        |s| {
+            s.applied_command_seq >= 1
+                && s.fps_index == 2
+                && s.audio_recovery_attempts == MAX_SOFT_RECOVERY_ATTEMPTS
+                && !s.is_playing
+        },
     );
     assert_eq!(snap.audio_recovery_attempts, MAX_SOFT_RECOVERY_ATTEMPTS);
     assert!(!snap.is_playing, "the exhausted branch must stop playback");
@@ -1273,18 +1535,18 @@ fn test_stream_dead_hard_reset_does_not_bump_counter() {
     // Ack marker: proves the StreamDead event was processed (commands drain
     // before events within a tick, so the ack snapshot postdates the event).
     eng.tx.send(GuiCommand::SetFpsIndex(2)).unwrap();
-    let snap = wait_for_snapshot(
-        &eng.state,
-        "the ack marker after StreamDead",
-        |s| s.applied_command_seq >= 1 && s.fps_index == 2,
-    );
+    let snap = wait_for_snapshot(&eng.state, "the ack marker after StreamDead", |s| {
+        s.applied_command_seq >= 1 && s.fps_index == 2
+    });
     assert_eq!(
         snap.audio_recovery_attempts, 0,
         "the hard-reset path must never consume a soft attempt"
     );
 
     // A following soft event counts from 1 — proving the two paths differ.
-    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded { reason: "after hard reset".to_string() });
+    queue.lock().unwrap().push_back(AudioEvent::RecoveryNeeded {
+        reason: "after hard reset".to_string(),
+    });
     let snap = wait_for_snapshot(
         &eng.state,
         "counter to count from 1 after the hard reset",
@@ -1308,7 +1570,10 @@ fn hw_caps_with_vaapi() -> FfmpegCapabilities {
             "hevc_vaapi".to_string(),
         ]),
         available_formats: BTreeSet::from([
-            "mov".to_string(), "matroska".to_string(), "mp4".to_string(), "mxf".to_string(),
+            "mov".to_string(),
+            "matroska".to_string(),
+            "mp4".to_string(),
+            "mxf".to_string(),
         ]),
         error_message: None,
         hw: HwDeviceCapabilities {
@@ -1339,7 +1604,12 @@ fn spawn_engine_with_caps_and_hw_validate(
             engine_main_with_seams(rx, state_clone, false, event_tx, seams);
         })
         .expect("failed to spawn engine thread");
-    TestEngine { tx, state, handle, event_rx }
+    TestEngine {
+        tx,
+        state,
+        handle,
+        event_rx,
+    }
 }
 
 #[test]
@@ -1352,22 +1622,22 @@ fn test_stage1_withholds_unvalidated_hw_encoders_until_stage2_finishes() {
     });
 
     // Stage 1 published: software encoders visible…
-    wait_for_snapshot(
-        &eng.state,
-        "stage-1 caps to publish",
-        |s| {
-            s.ffmpeg_caps.as_ref()
-                .map(|c| c.available_encoders.contains("libx264"))
-                .unwrap_or(false)
-        },
-    );
+    wait_for_snapshot(&eng.state, "stage-1 caps to publish", |s| {
+        s.ffmpeg_caps
+            .as_ref()
+            .map(|c| c.available_encoders.contains("libx264"))
+            .unwrap_or(false)
+    });
 
     // …but the bounded observation window must not show the unvalidated HW
     // encoder in ANY published snapshot before stage 2 finishes.
     let window_deadline = Instant::now() + Duration::from_millis(300);
     while Instant::now() < window_deadline {
         let snapshot = eng.state.load().as_ref().clone();
-        let caps = snapshot.ffmpeg_caps.as_ref().expect("stage-1 caps already published");
+        let caps = snapshot
+            .ffmpeg_caps
+            .as_ref()
+            .expect("stage-1 caps already published");
         assert!(
             !caps.available_encoders.contains("hevc_vaapi"),
             "no snapshot before the HwValidate job finishes may contain an unvalidated HW encoder"
@@ -1382,13 +1652,19 @@ fn test_stage1_withholds_unvalidated_hw_encoders_until_stage2_finishes() {
         "stage-2 reconciliation to publish hevc_vaapi",
         |s| {
             s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded)
-                && s.ffmpeg_caps.as_ref()
+                && s.ffmpeg_caps
+                    .as_ref()
                     .map(|c| c.available_encoders.contains("hevc_vaapi"))
                     .unwrap_or(false)
         },
     );
     assert!(
-        snapshot.ffmpeg_caps.as_ref().unwrap().available_encoders.contains("hevc_vaapi"),
+        snapshot
+            .ffmpeg_caps
+            .as_ref()
+            .unwrap()
+            .available_encoders
+            .contains("hevc_vaapi"),
         "after stage 2, passing HW encoders must be present"
     );
 
@@ -1403,14 +1679,10 @@ fn test_stage2_finish_upgrades_default_when_user_untouched() {
     // upgrade must re-pick the best combination (h265).
     let eng = spawn_engine_with_caps_and_hw_validate(hw_caps_with_vaapi(), |caps| caps);
 
-    let snapshot = wait_for_snapshot(
-        &eng.state,
-        "stage-2 default upgrade to h265",
-        |s| {
-            s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded)
-                && s.converter.settings.video_encoder == "h265"
-        },
-    );
+    let snapshot = wait_for_snapshot(&eng.state, "stage-2 default upgrade to h265", |s| {
+        s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded)
+            && s.converter.settings.video_encoder == "h265"
+    });
     assert_eq!(snapshot.converter.settings.video_encoder, "h265");
     assert_eq!(snapshot.converter.settings.container, "mov");
 
@@ -1427,15 +1699,16 @@ fn test_set_video_codec_before_stage2_blocks_default_upgrade() {
     });
 
     // User explicitly picks the video codec BEFORE stage 2 runs.
-    eng.tx.send(GuiCommand::Converter(ConverterCommand::SetVideoCodec("h264".to_string())))
+    eng.tx
+        .send(GuiCommand::Converter(ConverterCommand::SetVideoCodec(
+            "h264".to_string(),
+        )))
         .expect("engine alive");
 
     // Wait until the command was acked (and stage 1 published) before releasing.
-    wait_for_snapshot(
-        &eng.state,
-        "SetVideoCodec to be acked",
-        |s| s.applied_command_seq >= 1 && s.ffmpeg_caps.is_some(),
-    );
+    wait_for_snapshot(&eng.state, "SetVideoCodec to be acked", |s| {
+        s.applied_command_seq >= 1 && s.ffmpeg_caps.is_some()
+    });
     release_tx.send(()).expect("stage-2 gate receiver alive");
 
     let snapshot = wait_for_snapshot(
@@ -1453,7 +1726,10 @@ fn test_set_video_codec_before_stage2_blocks_default_upgrade() {
 
 #[test]
 fn test_cache_vouch_publishes_hw_encoder_at_stage1_and_reconciles() {
-    use gui_engine::hw_cache::{cache_dir, save_hw_cache, load_hw_cache, validate_hw_encoders_cached_with, HwValidationCache};
+    use gui_engine::hw_cache::{
+        cache_dir, load_hw_cache, save_hw_cache, validate_hw_encoders_cached_with,
+        HwValidationCache,
+    };
 
     init_test_config();
     let mut caps = hw_caps_with_vaapi();
@@ -1462,10 +1738,13 @@ fn test_cache_vouch_publishes_hw_encoder_at_stage1_and_reconciles() {
     let dir = cache_dir().expect("test config dir exists");
 
     // Pre-seed a matching-key cache that vouches for hevc_vaapi.
-    save_hw_cache(&dir, &HwValidationCache {
-        key: key.clone(),
-        passed: BTreeSet::from(["hevc_vaapi".to_string()]),
-    });
+    save_hw_cache(
+        &dir,
+        &HwValidationCache {
+            key: key.clone(),
+            passed: BTreeSet::from(["hevc_vaapi".to_string()]),
+        },
+    );
 
     // Stage 2 runs the real cached-reconcile path with a probe that FAILS
     // for hevc_vaapi: the cache-vouched pass must be pruned from the caps
@@ -1483,24 +1762,24 @@ fn test_cache_vouch_publishes_hw_encoder_at_stage1_and_reconciles() {
     });
 
     // Stage 1: the cache-vouched encoder is published immediately.
-    wait_for_snapshot(
-        &eng.state,
-        "cache-vouched encoder at stage 1",
-        |s| {
-            s.ffmpeg_caps.as_ref()
-                .map(|c| c.available_encoders.contains("hevc_vaapi"))
-                .unwrap_or(false)
-        },
-    );
+    wait_for_snapshot(&eng.state, "cache-vouched encoder at stage 1", |s| {
+        s.ffmpeg_caps
+            .as_ref()
+            .map(|c| c.available_encoders.contains("hevc_vaapi"))
+            .unwrap_or(false)
+    });
 
     // Stage 2: the reconciliation prunes it.
-    let snapshot = wait_for_snapshot(
-        &eng.state,
-        "stage-2 pruning of the stale cache pass",
-        |s| s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded),
-    );
+    let snapshot = wait_for_snapshot(&eng.state, "stage-2 pruning of the stale cache pass", |s| {
+        s.jobs.get(&JobKind::HwValidate).map(|j| j.phase()) == Some(JobPhase::Succeeded)
+    });
     assert!(
-        !snapshot.ffmpeg_caps.as_ref().unwrap().available_encoders.contains("hevc_vaapi"),
+        !snapshot
+            .ffmpeg_caps
+            .as_ref()
+            .unwrap()
+            .available_encoders
+            .contains("hevc_vaapi"),
         "a cache-vouched encoder that fails its stage-2 test encode must be removed"
     );
     let saved = load_hw_cache(&dir).expect("write-back must have persisted a cache");

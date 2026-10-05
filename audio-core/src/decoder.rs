@@ -5,10 +5,10 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use crate::LtcDecodeError;
 use crate::ltc_decoder::{decode_ltc_from_wav, decode_ltc_samples, LtcDetectionResult};
 use crate::ltc_decoder_libltc::{decode_ltc_from_wav_libltc, decode_ltc_samples_libltc};
 use crate::wav_chunk_reader::WavChunkReader;
+use crate::LtcDecodeError;
 
 /// Backend-agnostic LTC decode interface.
 pub trait LtcDecoder: Send + Sync {
@@ -84,9 +84,18 @@ impl LtcDecoder for BuiltinDecoder {
         } = req;
         match reader.read_mono_samples_f32(start, len) {
             Ok(samples) => decode_ltc_samples(
-                &samples, sample_rate, 1, fps, drop_frame, start_time, Some(cancel),
+                &samples,
+                sample_rate,
+                1,
+                fps,
+                drop_frame,
+                start_time,
+                Some(cancel),
             ),
-            Err(e) => Err(LtcDecodeError::Failed(format!("Failed to read chunk {}: {}", chunk_idx, e))),
+            Err(e) => Err(LtcDecodeError::Failed(format!(
+                "Failed to read chunk {}: {}",
+                chunk_idx, e
+            ))),
         }
     }
 }
@@ -121,9 +130,18 @@ impl LtcDecoder for LibltcDecoder {
         } = req;
         match reader.read_mono_samples_i16(start, len) {
             Ok(samples) => decode_ltc_samples_libltc(
-                &samples, 1, sample_rate, fps, drop_frame, start_time, Some(cancel),
+                &samples,
+                1,
+                sample_rate,
+                fps,
+                drop_frame,
+                start_time,
+                Some(cancel),
             ),
-            Err(e) => Err(LtcDecodeError::Failed(format!("Failed to read chunk {}: {}", chunk_idx, e))),
+            Err(e) => Err(LtcDecodeError::Failed(format!(
+                "Failed to read chunk {}: {}",
+                chunk_idx, e
+            ))),
         }
     }
 }
@@ -133,7 +151,11 @@ static LIBLTC: LibltcDecoder = LibltcDecoder;
 
 /// The single `if use_libltc` left in the crate.
 pub fn decoder_for(use_libltc: bool) -> &'static dyn LtcDecoder {
-    if use_libltc { &LIBLTC } else { &BUILTIN }
+    if use_libltc {
+        &LIBLTC
+    } else {
+        &BUILTIN
+    }
 }
 
 #[cfg(test)]

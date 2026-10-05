@@ -93,17 +93,27 @@ mod tests {
         let a = flash_alpha_at(0.04);
         assert!(a > 0.0 && a < 1.0, "small elapsed must not clamp");
         assert!((a - (1.0 - 0.04 * 2.0)).abs() < 1e-5, "linear 2.0/s decay");
-        assert_eq!(flash_alpha_at(10.0), 0.0, "large elapsed must clamp at zero");
+        assert_eq!(
+            flash_alpha_at(10.0),
+            0.0,
+            "large elapsed must clamp at zero"
+        );
     }
 
     #[test]
     fn arm_at_zero_is_struck() {
-        assert!(arm_angle_at(0.0).abs() < 1e-6, "arm starts at the struck 0° angle");
+        assert!(
+            arm_angle_at(0.0).abs() < 1e-6,
+            "arm starts at the struck 0° angle"
+        );
     }
 
     #[test]
     fn arm_settles_toward_rest_within_epsilon() {
-        assert!(arm_angle_at(10.0) < 0.0, "rest angle is negative (raised arm)");
+        assert!(
+            arm_angle_at(10.0) < 0.0,
+            "rest angle is negative (raised arm)"
+        );
         assert!(
             (arm_angle_at(10.0) - TARGET_ARM_ANGLE).abs() < ARM_SETTLE_EPS,
             "arm must settle within epsilon of the rest angle",
@@ -127,7 +137,10 @@ mod tests {
 
     #[test]
     fn settled_true_after_decay_completes() {
-        assert!(animation_settled(10.0), "fully decayed clap must be settled");
+        assert!(
+            animation_settled(10.0),
+            "fully decayed clap must be settled"
+        );
     }
 
     // ── ClapAnim state machine ───────────────────────────────────────────
@@ -140,7 +153,10 @@ mod tests {
         assert!(!anim.is_settled(start), "fresh animator must be running");
         // Settle time: flash 0 at 0.5 s; arm needs ln(25)/4 ≈ 0.805 s.
         let later = start + Duration::from_millis(900);
-        assert!(anim.is_settled(later), "animator must stop after the settle window");
+        assert!(
+            anim.is_settled(later),
+            "animator must stop after the settle window"
+        );
     }
 
     #[test]
@@ -158,20 +174,26 @@ mod tests {
         let start = Instant::now();
         let anim = ClapAnim::new(1, start);
         let later = start + Duration::from_secs(10);
-        assert!(animation_repaint_delay(&anim, later).is_none(),
-            "a settled animator must not request further repaints");
+        assert!(
+            animation_repaint_delay(&anim, later).is_none(),
+            "a settled animator must not request further repaints"
+        );
     }
 
     #[test]
     fn animation_repaint_delay_running_applies_predicted_dt_compensation() {
         let start = Instant::now();
         let anim = ClapAnim::new(1, start);
-        let delay = animation_repaint_delay(&anim, start)
-            .expect("running animator must request repaints");
+        let delay =
+            animation_repaint_delay(&anim, start).expect("running animator must request repaints");
         // base 1/60 s + predicted_dt compensation = 33.33 ms (the old
         // `clapper.animating` repaint branch), floored at 1/60 + 1 ms.
         let floor = Duration::from_secs_f64(1.0 / 60.0) + Duration::from_millis(1);
         assert!(delay >= floor);
-        assert!(delay <= Duration::from_millis(35), "animation repaints at ~60 fps, got {:?}", delay);
+        assert!(
+            delay <= Duration::from_millis(35),
+            "animation repaints at ~60 fps, got {:?}",
+            delay
+        );
     }
 }

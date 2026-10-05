@@ -10,9 +10,9 @@ pub mod audio_output;
 pub mod chunked_decode;
 pub mod decoder;
 pub mod ltc_decoder;
-pub(crate) mod ltc_integrity;
 pub mod ltc_decoder_libltc;
 pub mod ltc_encoder;
+pub(crate) mod ltc_integrity;
 pub mod types;
 pub mod wav_chunk_reader;
 
@@ -43,9 +43,9 @@ pub use audio_output::{
 // ── LTC decoder re-exports ────────────────────────────────────────────────
 
 pub use ltc_decoder::{
-    compute_ltc_quality, decode_ltc_from_wav, find_first_coherent_index,
-    CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, ChunkSummary, FrameTimecode,
-    LtcDecodeStatus, LtcDetectionResult, LtcQualityReport,
+    compute_ltc_quality, decode_ltc_from_wav, find_first_coherent_index, ChunkSummary,
+    FrameTimecode, LtcDecodeStatus, LtcDetectionResult, LtcQualityReport, CONFIDENCE_LOW_THRESHOLD,
+    CONFIDENCE_SUCCESS_THRESHOLD,
 };
 pub use ltc_decoder_libltc::decode_ltc_from_wav_libltc;
 

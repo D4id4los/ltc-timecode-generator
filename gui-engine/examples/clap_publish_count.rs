@@ -59,5 +59,8 @@ fn main() {
 
     let _ = tx.send(GuiCommand::Shutdown);
     handle.join().unwrap();
-    println!("publishes observed across one clap (3 s window): {}", publishes);
+    println!(
+        "publishes observed across one clap (3 s window): {}",
+        publishes
+    );
 }

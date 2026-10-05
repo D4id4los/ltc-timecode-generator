@@ -65,9 +65,7 @@ pub(crate) fn run_probe_program(prog: &str, args: &[String]) -> io::Result<Outpu
         crate::subprocess::PROBE_TIMEOUT,
     )
     .map_err(|e| match e {
-        crate::subprocess::SubprocessFailure::Io(msg) => {
-            io::Error::other(msg)
-        }
+        crate::subprocess::SubprocessFailure::Io(msg) => io::Error::other(msg),
         crate::subprocess::SubprocessFailure::TimedOut => {
             io::Error::new(io::ErrorKind::TimedOut, "probe timed out")
         }
@@ -217,15 +215,11 @@ fn parse_exiftool_json(stdout: &str) -> Option<CameraInfo> {
         .filter(|s| !s.is_empty())
         .filter(|s| s != "4294967295" && s != "0xFFFFFFFF" && s != "FFFFFFFF");
 
-    let raw_ct = entry
-        .get("CreationDateValue")
-        .and_then(|v| v.as_str());
+    let raw_ct = entry.get("CreationDateValue").and_then(|v| v.as_str());
     let creation_time = raw_ct
         .or(raw_date)
         .and_then(normalize_exiftool_timestamp)
-        .or_else(|| {
-            raw_date.and_then(normalize_exiftool_timestamp)
-        });
+        .or_else(|| raw_date.and_then(normalize_exiftool_timestamp));
 
     let gamma = entry
         .get("CaptureGammaEquation")
@@ -239,7 +233,8 @@ fn parse_exiftool_json(stdout: &str) -> Option<CameraInfo> {
         .filter(|s| s.len() >= 8)
         .map(|s| format!("{}:{}:{}:{}", &s[0..2], &s[2..4], &s[4..6], &s[6..8]))
         .or_else(|| {
-            entry.get("TimeCode")
+            entry
+                .get("TimeCode")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
@@ -266,33 +261,62 @@ fn parse_exiftool_json(stdout: &str) -> Option<CameraInfo> {
 fn build_exposure_summary(entry: &serde_json::Value) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
-    if let Some(et) = entry.get("ExposureTime").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(et) = entry
+        .get("ExposureTime")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("{}s", et));
     }
     if let Some(fn_val) = entry.get("FNumber").and_then(|v| v.as_f64()) {
         parts.push(format!("F{}", fn_val));
     }
-    if let Some(gain) = entry.get("Gain").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(gain) = entry
+        .get("Gain")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("{} gain", gain));
     }
     if let Some(iso) = entry.get("ISO").and_then(|v| {
-        v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     }) {
         parts.push(format!("ISO {}", iso));
     }
-    if let Some(wb) = entry.get("WhiteBalance").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(wb) = entry
+        .get("WhiteBalance")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("WB {}", wb));
     }
-    if let Some(focus) = entry.get("Focus").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(focus) = entry
+        .get("Focus")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("Focus {}", focus));
     }
-    if let Some(is_val) = entry.get("ImageStabilization").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(is_val) = entry
+        .get("ImageStabilization")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("IS {}", is_val));
     }
-    if let Some(prog) = entry.get("ExposureProgram").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(prog) = entry
+        .get("ExposureProgram")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("{} exp", prog));
     }
-    if let Some(ap) = entry.get("ApertureSetting").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(ap) = entry
+        .get("ApertureSetting")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("Aperture {}", ap));
     }
 
@@ -335,9 +359,7 @@ fn parse_ffprobe_tags(stdout: &str) -> Option<CameraInfo> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())?;
 
-    let raw_date = tags
-        .get("creation_time")
-        .and_then(|v| v.as_str());
+    let raw_date = tags.get("creation_time").and_then(|v| v.as_str());
     let creation_date = raw_date.and_then(normalize_date);
 
     Some(CameraInfo {
@@ -465,7 +487,10 @@ mod tests {
         assert_eq!(info.model, Some("ILCE-6700".to_string()));
         assert_eq!(info.lens, Some("E PZ 18-105mm F4 G OSS".to_string()));
         assert_eq!(info.serial, None); // 0xFFFFFFFF sentinel
-        assert_eq!(info.creation_time, Some("2026-09-25T20:45:22+01:00".to_string()));
+        assert_eq!(
+            info.creation_time,
+            Some("2026-09-25T20:45:22+01:00".to_string())
+        );
         assert_eq!(info.gamma, Some("ex-cine4".to_string()));
         assert_eq!(info.native_timecode, Some("08:09:59:15".to_string()));
         assert_eq!(info.exposure_summary, None);
@@ -614,7 +639,8 @@ mod tests {
 
     #[test]
     fn test_ffprobe_tags_with_creation_time() {
-        let json = r#"{"format":{"tags":{"model":"GH6","creation_time":"2023-12-25T10:00:00.000000Z"}}}"#;
+        let json =
+            r#"{"format":{"tags":{"model":"GH6","creation_time":"2023-12-25T10:00:00.000000Z"}}}"#;
         let info = parse_ffprobe_tags(json).unwrap();
         assert_eq!(info.creation_date, Some("2023-12-25".to_string()));
         check_ffprobe_extended_none(&info);
@@ -635,7 +661,10 @@ mod tests {
         assert_eq!(info.model, Some("ILCE-6700".to_string()));
         assert_eq!(info.lens, Some("E PZ 18-105mm F4 G OSS".to_string()));
         assert_eq!(info.serial, None);
-        assert_eq!(info.creation_time, Some("2026-09-25T20:45:22+01:00".to_string()));
+        assert_eq!(
+            info.creation_time,
+            Some("2026-09-25T20:45:22+01:00".to_string())
+        );
         assert_eq!(info.gamma, Some("ex-cine4".to_string()));
         assert_eq!(info.native_timecode, Some("08:09:59:15".to_string()));
     }
@@ -735,12 +764,18 @@ mod tests {
 
     #[test]
     fn test_normalize_date_exiftool_format() {
-        assert_eq!(normalize_date("2024:01:01 12:00:00"), Some("2024-01-01".to_string()));
+        assert_eq!(
+            normalize_date("2024:01:01 12:00:00"),
+            Some("2024-01-01".to_string())
+        );
     }
 
     #[test]
     fn test_normalize_date_iso_format() {
-        assert_eq!(normalize_date("2024-01-01T12:00:00.000000Z"), Some("2024-01-01".to_string()));
+        assert_eq!(
+            normalize_date("2024-01-01T12:00:00.000000Z"),
+            Some("2024-01-01".to_string())
+        );
     }
 
     #[test]
@@ -772,32 +807,42 @@ mod tests {
 
     #[test]
     fn test_normalize_timestamp_exiftool_w_tz() {
-        assert_eq!(normalize_exiftool_timestamp("2026:09:25 20:45:22+01:00"),
-            Some("2026-09-25T20:45:22+01:00".to_string()));
+        assert_eq!(
+            normalize_exiftool_timestamp("2026:09:25 20:45:22+01:00"),
+            Some("2026-09-25T20:45:22+01:00".to_string())
+        );
     }
 
     #[test]
     fn test_normalize_timestamp_exiftool_no_tz() {
-        assert_eq!(normalize_exiftool_timestamp("2024:01:01 12:00:00"),
-            Some("2024-01-01T12:00:00".to_string()));
+        assert_eq!(
+            normalize_exiftool_timestamp("2024:01:01 12:00:00"),
+            Some("2024-01-01T12:00:00".to_string())
+        );
     }
 
     #[test]
     fn test_normalize_timestamp_exiftool_neg_tz() {
-        assert_eq!(normalize_exiftool_timestamp("2026:09:25 20:45:22-05:00"),
-            Some("2026-09-25T20:45:22-05:00".to_string()));
+        assert_eq!(
+            normalize_exiftool_timestamp("2026:09:25 20:45:22-05:00"),
+            Some("2026-09-25T20:45:22-05:00".to_string())
+        );
     }
 
     #[test]
     fn test_normalize_timestamp_iso_already() {
-        assert_eq!(normalize_exiftool_timestamp("2024-01-01T12:00:00.000000Z"),
-            Some("2024-01-01T12:00:00.000000Z".to_string()));
+        assert_eq!(
+            normalize_exiftool_timestamp("2024-01-01T12:00:00.000000Z"),
+            Some("2024-01-01T12:00:00.000000Z".to_string())
+        );
     }
 
     #[test]
     fn test_normalize_timestamp_iso_no_z() {
-        assert_eq!(normalize_exiftool_timestamp("2024-01-01T12:00:00"),
-            Some("2024-01-01T12:00:00".to_string()));
+        assert_eq!(
+            normalize_exiftool_timestamp("2024-01-01T12:00:00"),
+            Some("2024-01-01T12:00:00".to_string())
+        );
     }
 
     #[test]

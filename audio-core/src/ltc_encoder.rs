@@ -145,7 +145,12 @@ pub fn compute_frame_sample_count(
 ) -> (usize, f32, f64) {
     let frac = exact_samples_per_frame - base_samples as f64;
     let mut acc = samples_accumulator + frac;
-    let extra = if acc >= 1.0 { acc -= 1.0; 1 } else { 0 };
+    let extra = if acc >= 1.0 {
+        acc -= 1.0;
+        1
+    } else {
+        0
+    };
     let frame_samples = base_samples + extra;
     let spb = frame_samples as f32 / 80.0;
     (frame_samples, spb, acc)
@@ -162,7 +167,6 @@ pub struct LtcFrameParams<'a> {
     pub volume: f32,
     pub channel: ChannelSel,
 }
-
 
 /// Generate one stereo LTC audio frame (bi-phase mark modulation).
 ///
@@ -289,10 +293,30 @@ mod tests {
     #[test]
     fn test_get_ltc_bits_sync_word_invariant() {
         for tc in [
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            Timecode { hours: 23, minutes: 59, seconds: 59, frames: 29 },
-            Timecode { hours: 12, minutes: 34, seconds: 56, frames: 18 },
-            Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 },
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            Timecode {
+                hours: 23,
+                minutes: 59,
+                seconds: 59,
+                frames: 29,
+            },
+            Timecode {
+                hours: 12,
+                minutes: 34,
+                seconds: 56,
+                frames: 18,
+            },
+            Timecode {
+                hours: 10,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
         ] {
             let bits = get_ltc_bits(&tc, false);
             let sync = &bits[64..80];
@@ -305,7 +329,10 @@ mod tests {
     // ── get_ltc_bits: round-trip via decoder ──────────────────────────────
 
     fn bits_to_u8(slice: &[u8]) -> u8 {
-        slice.iter().enumerate().fold(0u8, |acc, (i, &b)| acc | (b << i))
+        slice
+            .iter()
+            .enumerate()
+            .fold(0u8, |acc, (i, &b)| acc | (b << i))
     }
 
     fn decode_timecode_from_bits(bits: &[u8], frame_start: usize) -> Timecode {
@@ -337,82 +364,172 @@ mod tests {
 
     #[test]
     fn test_increment_basic() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         assert_eq!(
             increment_timecode(&tc, 25.0, false),
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 1 }
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 1
+            }
         );
     }
 
     #[test]
     fn test_increment_25fps_rollover() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 24 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 24,
+        };
         assert_eq!(
             increment_timecode(&tc, 25.0, false),
-            Timecode { hours: 0, minutes: 0, seconds: 1, frames: 0 }
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 1,
+                frames: 0
+            }
         );
     }
 
     #[test]
     fn test_increment_30fps_rollover() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 29 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 29,
+        };
         assert_eq!(
             increment_timecode(&tc, 30.0, false),
-            Timecode { hours: 0, minutes: 0, seconds: 1, frames: 0 }
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 1,
+                frames: 0
+            }
         );
     }
 
     #[test]
     fn test_increment_24fps_rollover() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 23 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 23,
+        };
         assert_eq!(
             increment_timecode(&tc, 24.0, false),
-            Timecode { hours: 0, minutes: 0, seconds: 1, frames: 0 }
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 1,
+                frames: 0
+            }
         );
     }
 
     #[test]
     fn test_increment_2997_non_drop_rollover() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 29 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 29,
+        };
         assert_eq!(
             increment_timecode(&tc, 29.97, false),
-            Timecode { hours: 0, minutes: 0, seconds: 1, frames: 0 }
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 1,
+                frames: 0
+            }
         );
     }
 
     #[test]
     fn test_increment_second_rollover() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 59, frames: 24 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 59,
+            frames: 24,
+        };
         assert_eq!(
             increment_timecode(&tc, 25.0, false),
-            Timecode { hours: 0, minutes: 1, seconds: 0, frames: 0 }
+            Timecode {
+                hours: 0,
+                minutes: 1,
+                seconds: 0,
+                frames: 0
+            }
         );
     }
 
     #[test]
     fn test_increment_minute_rollover() {
-        let tc = Timecode { hours: 0, minutes: 59, seconds: 59, frames: 24 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 59,
+            seconds: 59,
+            frames: 24,
+        };
         assert_eq!(
             increment_timecode(&tc, 25.0, false),
-            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0
+            }
         );
     }
 
     #[test]
     fn test_increment_hour_rollover() {
-        let tc = Timecode { hours: 23, minutes: 59, seconds: 59, frames: 24 };
+        let tc = Timecode {
+            hours: 23,
+            minutes: 59,
+            seconds: 59,
+            frames: 24,
+        };
         assert_eq!(
             increment_timecode(&tc, 25.0, false),
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 }
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0
+            }
         );
     }
 
     #[test]
     fn test_increment_23976_rollover() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 23 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 23,
+        };
         assert_eq!(
             increment_timecode(&tc, 23.976, false),
-            Timecode { hours: 0, minutes: 0, seconds: 1, frames: 0 }
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 1,
+                frames: 0
+            }
         );
     }
 
@@ -421,10 +538,20 @@ mod tests {
     #[test]
     fn test_increment_drop_frame_skip_frames_0_1() {
         // 01:00:59:29 at 29.97df → should skip frames 0,1 → 01:01:00:02
-        let tc = Timecode { hours: 1, minutes: 0, seconds: 59, frames: 29 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 59,
+            frames: 29,
+        };
         assert_eq!(
             increment_timecode(&tc, 29.97, true),
-            Timecode { hours: 1, minutes: 1, seconds: 0, frames: 2 }
+            Timecode {
+                hours: 1,
+                minutes: 1,
+                seconds: 0,
+                frames: 2
+            }
         );
     }
 
@@ -435,10 +562,20 @@ mod tests {
         // 01:09:59:29, m%10 = 9 → skip BUT we just advanced m to 10, and m%10=0 → no skip
         // Wait, the check happens AFTER m is incremented. So if m becomes 10, m%10==0 → no skip.
         // So: 01:09:59:29 → s rolls to 60 → m becomes 10 → m%10==0 → no skip
-        let tc = Timecode { hours: 1, minutes: 9, seconds: 59, frames: 29 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 9,
+            seconds: 59,
+            frames: 29,
+        };
         assert_eq!(
             increment_timecode(&tc, 29.97, true),
-            Timecode { hours: 1, minutes: 10, seconds: 0, frames: 0 }
+            Timecode {
+                hours: 1,
+                minutes: 10,
+                seconds: 0,
+                frames: 0
+            }
         );
     }
 
@@ -447,7 +584,12 @@ mod tests {
         // 00:59:59:29 at 29.97df → frames roll to 30 → f=0, s rolls to 60 → s=0,
         // m rolls to 60 → m=0, h becomes 1.  Then drop check: m%10=0 → no skip.
         // Result: 01:00:00:00 (no drop because minute 0 never drops).
-        let tc = Timecode { hours: 0, minutes: 59, seconds: 59, frames: 29 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 59,
+            seconds: 59,
+            frames: 29,
+        };
         let next = increment_timecode(&tc, 29.97, true);
         assert_eq!(next.hours, 1);
         assert_eq!(next.minutes, 0);
@@ -461,24 +603,63 @@ mod tests {
         // But what about 01:00:00:29? Let's test: m stays 0, frame just rolls normally
         // Actually let's test the case where the frame stays at the boundary:
         // 00:00:00:29 at 29.97df → frames=30, which >= 30 → f=0, s=1, no minute change → no drop check
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 29 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 29,
+        };
         let next = increment_timecode(&tc, 29.97, true);
-        assert_eq!(next, Timecode { hours: 0, minutes: 0, seconds: 1, frames: 0 });
+        assert_eq!(
+            next,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 1,
+                frames: 0
+            }
+        );
     }
 
     #[test]
     fn test_increment_drop_frame_sequential() {
-        let mut tc = Timecode { hours: 1, minutes: 1, seconds: 0, frames: 0 };
+        let mut tc = Timecode {
+            hours: 1,
+            minutes: 1,
+            seconds: 0,
+            frames: 0,
+        };
         tc = increment_timecode(&tc, 29.97, true);
-        assert_eq!(tc, Timecode { hours: 1, minutes: 1, seconds: 0, frames: 1 });
+        assert_eq!(
+            tc,
+            Timecode {
+                hours: 1,
+                minutes: 1,
+                seconds: 0,
+                frames: 1
+            }
+        );
         tc = increment_timecode(&tc, 29.97, true);
-        assert_eq!(tc, Timecode { hours: 1, minutes: 1, seconds: 0, frames: 2 });
+        assert_eq!(
+            tc,
+            Timecode {
+                hours: 1,
+                minutes: 1,
+                seconds: 0,
+                frames: 2
+            }
+        );
     }
 
     #[test]
     fn test_increment_drop_frame_at_23976() {
         // 23.976 drop-frame is uncommon but shouldn't crash/misbehave
-        let tc = Timecode { hours: 1, minutes: 0, seconds: 59, frames: 23 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 59,
+            frames: 23,
+        };
         let next = increment_timecode(&tc, 23.976, true);
         assert_eq!(next.minutes, 1);
         assert_eq!(next.seconds, 0);
@@ -491,7 +672,12 @@ mod tests {
     fn test_increment_2h_2997_df_no_drift() {
         let fps = 29.97;
         let num_frames = (7200.0_f64 * fps).round() as u64; // 215,784
-        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
+        let mut tc = Timecode {
+            hours: 10,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         for _ in 0..num_frames {
             tc = increment_timecode(&tc, fps, true);
         }
@@ -505,32 +691,58 @@ mod tests {
 
     #[test]
     fn test_frame_output_length() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 1920; // 48kHz / 25fps
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 0.5, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 0.5,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         assert_eq!(buf.len(), total_samples * 2);
     }
 
     #[test]
     fn test_frame_output_not_all_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 640; // 16kHz / 25fps
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         let has_energy = buf.iter().any(|&s| s.abs() > 0.5);
         assert!(has_energy, "frame should contain non-trivial signal");
@@ -540,37 +752,66 @@ mod tests {
 
     #[test]
     fn test_frame_channel_both() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 640;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
         assert!(left_energy > 0.0, "left channel should have signal");
         assert!(right_energy > 0.0, "right channel should have signal");
         let diff = (left_energy - right_energy).abs();
-        assert!(diff < left_energy * 0.01, "both channels should be nearly equal");
+        assert!(
+            diff < left_energy * 0.01,
+            "both channels should be nearly equal"
+        );
     }
 
     #[test]
     fn test_frame_channel_left_only() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 640;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Left },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Left,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
@@ -580,16 +821,29 @@ mod tests {
 
     #[test]
     fn test_frame_channel_right_only() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 640;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Right },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Right,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
@@ -601,16 +855,29 @@ mod tests {
 
     #[test]
     fn test_frame_volume_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 640;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 0.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 0.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         let max_amp = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(max_amp < 1e-10, "zero volume should produce silence");
@@ -618,64 +885,118 @@ mod tests {
 
     #[test]
     fn test_frame_volume_max_amplitude_bound() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 640;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         let max_amp = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-        assert!(max_amp <= 1.0, "amplitude should not exceed 1.0, got {}", max_amp);
+        assert!(
+            max_amp <= 1.0,
+            "amplitude should not exceed 1.0, got {}",
+            max_amp
+        );
     }
 
     // ── generate_ltc_frame_stereo: level continuity ───────────────────────
 
     #[test]
     fn test_frame_level_continuity() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 640;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         // After one frame, level.0 (current_level) should be inverted from start
         // Start: 1.0. First bit always toggles: -1.0. After 80 bits (40 toggles = even), back to 1.0.
         // Actually each bit: first toggle is unconditional (current_level = -current_level),
         // then if bit==1, another toggle. So net toggles per bit = 1 + bit_value.
         // Over 80 bits: sum(bits) toggles in addition to the 80 base toggles. Even + even = even → back to 1.0.
-        assert!((level.0 - 1.0).abs() < 0.01 || (level.0 + 1.0).abs() < 0.01,
-            "level should be ±1, got {}", level.0);
+        assert!(
+            (level.0 - 1.0).abs() < 0.01 || (level.0 + 1.0).abs() < 0.01,
+            "level should be ±1, got {}",
+            level.0
+        );
     }
 
     #[test]
     fn test_frame_continuity_carries_across_calls() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 640;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf1 = vec![0.0f32; total_samples * 2];
         let mut buf2 = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf1
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf1,
+        );
         let last_sample_frame1 = buf1[buf1.len() - 2]; // left channel, last sample
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf2
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf2,
+        );
         let first_sample_frame2 = buf2[0]; // left channel, first sample
 
         // The last sample of frame 1 and first sample of frame 2 should be close
@@ -683,7 +1004,8 @@ mod tests {
         assert!(
             (last_sample_frame1.signum() - first_sample_frame2.signum()).abs() < 0.1,
             "sign should be continuous across frames: last={} first={}",
-            last_sample_frame1, first_sample_frame2
+            last_sample_frame1,
+            first_sample_frame2
         );
     }
 
@@ -701,7 +1023,12 @@ mod tests {
 
         // Create a frame where bit 1 is 0 and bit 2 is 1
         // bit 0 is sync bit (bits[64] = 0), so let's look at bits 0-2 of a known TC
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 }; // frame units = 0
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        }; // frame units = 0
         let bits = get_ltc_bits(&tc, false);
         // bits[0..3] are the frame unit bits: 0,0,0,0
 
@@ -720,57 +1047,105 @@ mod tests {
     #[test]
     fn test_frame_no_gaps_in_sample_coverage() {
         // Verify every sample position from 0 to total_samples-1 is written
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 1920;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![-1.0f32; total_samples * 2]; // init with sentinel
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         // All samples should have been overwritten (not -1.0)
         // Actually some may be exactly 0.0, but the sentinel should not remain
         let sentinel_count = buf.iter().filter(|&&s| s == -1.0).count();
-        assert_eq!(sentinel_count, 0, "all {} samples should be written", buf.len());
+        assert_eq!(
+            sentinel_count,
+            0,
+            "all {} samples should be written",
+            buf.len()
+        );
     }
 
     // ── generate_ltc_frame_stereo: DC offset ──────────────────────────────
 
     #[test]
     fn test_frame_dc_offset_near_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 1920;
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         let mean: f32 = buf.iter().sum::<f32>() / buf.len() as f32;
         // Bi-phase is DC-free, so mean should be very close to 0
-        assert!(mean.abs() < 0.02, "DC offset should be near zero, got {}", mean);
+        assert!(
+            mean.abs() < 0.02,
+            "DC offset should be near zero, got {}",
+            mean
+        );
     }
 
     // ── generate_ltc_frame_stereo: 44kHz and 48kHz ────────────────────────
 
     #[test]
     fn test_frame_44khz() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 1764; // 44100/25
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 0.5, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 0.5,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         assert_eq!(buf.len(), total_samples * 2);
         let has_energy = buf.iter().any(|&s| s.abs() > 0.1);
@@ -779,16 +1154,29 @@ mod tests {
 
     #[test]
     fn test_frame_48khz() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let total_samples = 1920; // 48000/25
         let samples_per_bit = total_samples as f32 / 80.0;
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 0.5, channel: ChannelSel::Both },
-        &mut level,
-        &mut buf
-    );
+        generate_ltc_frame_stereo(
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 0.5,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
 
         assert_eq!(buf.len(), total_samples * 2);
         let has_energy = buf.iter().any(|&s| s.abs() > 0.1);
@@ -810,7 +1198,10 @@ mod tests {
         let left_energy: f32 = samples.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = samples.iter().skip(1).step_by(2).map(|s| s * s).sum();
         assert!(left_energy > 0.0);
-        assert!(right_energy < 1e-10, "right channel silent for left-only beep");
+        assert!(
+            right_energy < 1e-10,
+            "right channel silent for left-only beep"
+        );
     }
 
     #[test]
@@ -818,7 +1209,10 @@ mod tests {
         let samples = generate_beep_samples(48000, 1000.0, 0.1, 0.5, ChannelSel::Right);
         let left_energy: f32 = samples.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = samples.iter().skip(1).step_by(2).map(|s| s * s).sum();
-        assert!(left_energy < 1e-10, "left channel silent for right-only beep");
+        assert!(
+            left_energy < 1e-10,
+            "left channel silent for right-only beep"
+        );
         assert!(right_energy > 0.0);
     }
 
@@ -860,7 +1254,12 @@ mod tests {
         let fps = 29.97;
         let exact_spf = sample_rate as f64 / fps;
         let base = exact_spf.floor() as usize;
-        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
+        let mut tc = Timecode {
+            hours: 10,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let mut last_level = (1.0f32, 1.0f32);
         let mut total_generated: u64 = 0;
         let mut accumulator = 0.0_f64;
@@ -871,10 +1270,18 @@ mod tests {
         for _ in 0..num_frames {
             let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
             frame_buf[..samples * 2].fill(0.0);
-            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples, samples_per_bit: spb, volume: 0.5, channel: ChannelSel::Both },
-        &mut last_level,
-        &mut frame_buf[..samples * 2]
-    );
+            generate_ltc_frame_stereo(
+                crate::ltc_encoder::LtcFrameParams {
+                    tc: &tc,
+                    drop_frame: false,
+                    total_samples: samples,
+                    samples_per_bit: spb,
+                    volume: 0.5,
+                    channel: ChannelSel::Both,
+                },
+                &mut last_level,
+                &mut frame_buf[..samples * 2],
+            );
             total_generated += samples as u64;
             tc = increment_timecode(&tc, fps, false);
             accumulator = new_acc;
@@ -896,7 +1303,12 @@ mod tests {
         let fps = 29.97;
         let exact_spf = sample_rate as f64 / fps;
         let base = exact_spf.floor() as usize;
-        let mut tc = Timecode { hours: 10, minutes: 0, seconds: 0, frames: 0 };
+        let mut tc = Timecode {
+            hours: 10,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let mut last_level = (1.0f32, 1.0f32);
         let mut total_generated: u64 = 0;
         let mut accumulator = 0.0_f64;
@@ -906,10 +1318,18 @@ mod tests {
         for _ in 0..num_frames {
             let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
             frame_buf[..samples * 2].fill(0.0);
-            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples, samples_per_bit: spb, volume: 0.5, channel: ChannelSel::Both },
-        &mut last_level,
-        &mut frame_buf[..samples * 2]
-    );
+            generate_ltc_frame_stereo(
+                crate::ltc_encoder::LtcFrameParams {
+                    tc: &tc,
+                    drop_frame: false,
+                    total_samples: samples,
+                    samples_per_bit: spb,
+                    volume: 0.5,
+                    channel: ChannelSel::Both,
+                },
+                &mut last_level,
+                &mut frame_buf[..samples * 2],
+            );
             total_generated += samples as u64;
             tc = increment_timecode(&tc, fps, false);
             accumulator = new_acc;
@@ -945,7 +1365,11 @@ mod tests {
     #[test]
     fn test_map_volume_quadratic() {
         let result = map_volume(0.7);
-        assert!((result - 0.49).abs() < 1e-6, "map_volume(0.7) should be ~0.49, got {}", result);
+        assert!(
+            (result - 0.49).abs() < 1e-6,
+            "map_volume(0.7) should be ~0.49, got {}",
+            result
+        );
     }
 
     #[test]
@@ -996,7 +1420,12 @@ mod tests {
     }
 
     fn mk_tc(hours: u32, minutes: u32, seconds: u32, frames: u32) -> Timecode {
-        Timecode { hours, minutes, seconds, frames }
+        Timecode {
+            hours,
+            minutes,
+            seconds,
+            frames,
+        }
     }
 
     /// Absolute frame number in the integer frame-number space used by
@@ -1068,7 +1497,12 @@ mod tests {
     fn test_bcd_field_positions_and_widths() {
         for v in 0u32..=9 {
             let t = mk_tc(0, 0, 0, v);
-            assert_eq!(bits_to_u8(&get_ltc_bits(&t, false)[0..4]), v as u8, "frame units {}", v);
+            assert_eq!(
+                bits_to_u8(&get_ltc_bits(&t, false)[0..4]),
+                v as u8,
+                "frame units {}",
+                v
+            );
         }
         for v in 0u32..=2 {
             let t = mk_tc(0, 0, 0, v * 10 + 3);
@@ -1129,7 +1563,14 @@ mod tests {
             let decoded = roundtrip(&t, false);
             assert_eq!(decoded, t, "frame {} must round-trip", i);
             let n = tc_frame_number(&decoded, fps);
-            assert_eq!(n, prev + 1, "frame {} must advance exactly +1 ({} -> {})", i, prev, n);
+            assert_eq!(
+                n,
+                prev + 1,
+                "frame {} must advance exactly +1 ({} -> {})",
+                i,
+                prev,
+                n
+            );
             prev = n;
         }
         assert_eq!(t, mk_tc(12, 0, 0, 0));
@@ -1146,7 +1587,13 @@ mod tests {
                 let decoded = roundtrip(&t, false);
                 assert_eq!(decoded, t, "fps={} frame {} must round-trip", fps, i);
                 let n = tc_frame_number(&decoded, fps);
-                assert_eq!(n, prev + 1, "fps={} frame {} must advance exactly +1", fps, i);
+                assert_eq!(
+                    n,
+                    prev + 1,
+                    "fps={} frame {} must advance exactly +1",
+                    fps,
+                    i
+                );
                 prev = n;
             }
             assert_eq!(t, mk_tc(12, 0, 0, 0), "fps={} must land on +2h", fps);
@@ -1167,11 +1614,22 @@ mod tests {
             t = increment_timecode(&t, fps, true);
             if t.frames == 2 && prev_frames == 29 {
                 skipped += 1;
-                assert_ne!(t.minutes % 10, 0, "frames may only be dropped in non-tenth minutes");
+                assert_ne!(
+                    t.minutes % 10,
+                    0,
+                    "frames may only be dropped in non-tenth minutes"
+                );
             }
         }
-        assert_eq!(skipped, 108, "54 drop events per hour (2 frames each) = 108 over 2h");
-        assert_eq!(t, mk_tc(12, 0, 0, 0), "frame accounting must land exactly on +2h");
+        assert_eq!(
+            skipped, 108,
+            "54 drop events per hour (2 frames each) = 108 over 2h"
+        );
+        assert_eq!(
+            t,
+            mk_tc(12, 0, 0, 0),
+            "frame accounting must land exactly on +2h"
+        );
     }
 
     #[test]
@@ -1200,7 +1658,12 @@ mod tests {
             let decoded = roundtrip(&t, false);
             assert_eq!(decoded, t, "frame {} must round-trip", i);
             let n = tc_frame_number(&decoded, fps);
-            assert_eq!(n, (prev + 1) % day_frames, "frame {} must advance exactly +1", i);
+            assert_eq!(
+                n,
+                (prev + 1) % day_frames,
+                "frame {} must advance exactly +1",
+                i
+            );
             prev = n;
             t = increment_timecode(&t, fps, false);
         }
@@ -1234,54 +1697,104 @@ mod tests {
         for _ in 0..num_frames {
             let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
             frame_buf[..samples * 2].fill(0.0);
-            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples, samples_per_bit: spb, volume: 0.8, channel: ChannelSel::Both },
-        &mut last_level,
-        &mut frame_buf[..samples * 2]
-    );
+            generate_ltc_frame_stereo(
+                crate::ltc_encoder::LtcFrameParams {
+                    tc: &tc,
+                    drop_frame: false,
+                    total_samples: samples,
+                    samples_per_bit: spb,
+                    volume: 0.8,
+                    channel: ChannelSel::Both,
+                },
+                &mut last_level,
+                &mut frame_buf[..samples * 2],
+            );
             audio.extend(frame_buf[..samples * 2].iter().step_by(2).copied());
             expected.push(tc);
             accumulator = new_acc;
             tc = increment_timecode(&tc, fps, false);
         }
-        assert_eq!(tc, mk_tc(10, 0, 42, 0), "generation must end at expected TC");
+        assert_eq!(
+            tc,
+            mk_tc(10, 0, 42, 0),
+            "generation must end at expected TC"
+        );
 
         let result = crate::ltc_decoder::decode_ltc_samples(
-            &audio, sample_rate, 1, fps, false, std::time::Instant::now(), None,
+            &audio,
+            sample_rate,
+            1,
+            fps,
+            false,
+            std::time::Instant::now(),
+            None,
         )
         .expect("decode of generated audio must succeed");
-        assert!(matches!(result.status, crate::ltc_decoder::LtcDecodeStatus::Success),
-            "status must be Success, got {:?}", result.status);
+        assert!(
+            matches!(result.status, crate::ltc_decoder::LtcDecodeStatus::Success),
+            "status must be Success, got {:?}",
+            result.status
+        );
         assert_eq!(result.sample_rate, sample_rate);
-        assert!((result.detected_fps - 25.0).abs() < 0.01, "detected fps 25, got {}", result.detected_fps);
+        assert!(
+            (result.detected_fps - 25.0).abs() < 0.01,
+            "detected fps 25, got {}",
+            result.detected_fps
+        );
 
         let decoded: Vec<Timecode> = result.timecodes.iter().map(|f| f.timecode).collect();
-        assert_eq!(decoded.len(), expected.len(),
-            "every generated frame must decode: {} of {}", decoded.len(), expected.len());
-        assert_eq!(decoded[0], expected[0],
-            "first decoded frame must be the start TC, got {:?}", decoded[0]);
-        assert_eq!(decoded.last().unwrap(), expected.last().unwrap(),
-            "last decoded frame must be the final generated frame, got {:?}", decoded.last().unwrap());
+        assert_eq!(
+            decoded.len(),
+            expected.len(),
+            "every generated frame must decode: {} of {}",
+            decoded.len(),
+            expected.len()
+        );
+        assert_eq!(
+            decoded[0], expected[0],
+            "first decoded frame must be the start TC, got {:?}",
+            decoded[0]
+        );
+        assert_eq!(
+            decoded.last().unwrap(),
+            expected.last().unwrap(),
+            "last decoded frame must be the final generated frame, got {:?}",
+            decoded.last().unwrap()
+        );
 
         let start_idx = expected.iter().position(|t| *t == decoded[0]).unwrap();
         for (i, frame) in decoded.iter().enumerate() {
-            assert_eq!(*frame, expected[start_idx + i],
-                "decoded frame {} must be the expected +1 successor (gap or jump at index {})", i, i);
+            assert_eq!(
+                *frame,
+                expected[start_idx + i],
+                "decoded frame {} must be the expected +1 successor (gap or jump at index {})",
+                i,
+                i
+            );
         }
 
-        for boundary in [
-            mk_tc(9, 59, 40, 0),
-            mk_tc(10, 0, 0, 0),
-            mk_tc(10, 0, 40, 0),
-        ] {
-            assert!(decoded.contains(&boundary), "boundary {:?} must be decoded", boundary);
+        for boundary in [mk_tc(9, 59, 40, 0), mk_tc(10, 0, 0, 0), mk_tc(10, 0, 40, 0)] {
+            assert!(
+                decoded.contains(&boundary),
+                "boundary {:?} must be decoded",
+                boundary
+            );
         }
 
         if let Some(q) = &result.quality {
             assert_eq!(q.gap_count, 0, "no gaps allowed: {}", q.summary);
             assert_eq!(q.glitch_count, 0, "no glitches allowed: {}", q.summary);
             assert_eq!(q.edit_count, 0, "no edit points allowed: {}", q.summary);
-            assert_eq!(q.missing_frames, 0, "every frame must be decoded: {}", q.summary);
-            assert!(q.max_drift_secs < 0.1, "drift must be negligible: {}", q.max_drift_secs);
+            assert_eq!(
+                q.missing_frames, 0,
+                "every frame must be decoded: {}",
+                q.summary
+            );
+            assert!(
+                q.max_drift_secs < 0.1,
+                "drift must be negligible: {}",
+                q.max_drift_secs
+            );
         }
     }
 }

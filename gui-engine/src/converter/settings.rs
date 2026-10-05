@@ -12,9 +12,7 @@ use super::capabilities::ResolvedHwDevice;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ConversionPipeline {
-    AudioOnly {
-        generate_synthetic_video: bool,
-    },
+    AudioOnly { generate_synthetic_video: bool },
     VideoPassthrough,
     MetadataOnly,
 }
@@ -74,9 +72,17 @@ impl ConverterSettings {
         self.output_path_for_file(kind, 0, index, extension)
     }
 
-    pub fn output_path_for_file_checked(&self, kind: &str, file_idx: usize, index: usize, extension: &str) -> (PathBuf, PathBuf) {
+    pub fn output_path_for_file_checked(
+        &self,
+        kind: &str,
+        file_idx: usize,
+        index: usize,
+        extension: &str,
+    ) -> (PathBuf, PathBuf) {
         let naming_ctx = naming::NamingContext {
-            filename: self.input_files.get(file_idx)
+            filename: self
+                .input_files
+                .get(file_idx)
                 .and_then(|p| p.file_stem())
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
@@ -113,8 +119,15 @@ impl ConverterSettings {
         }
     }
 
-    pub fn output_path_for_file(&self, kind: &str, file_idx: usize, index: usize, extension: &str) -> PathBuf {
-        self.output_path_for_file_checked(kind, file_idx, index, extension).0
+    pub fn output_path_for_file(
+        &self,
+        kind: &str,
+        file_idx: usize,
+        index: usize,
+        extension: &str,
+    ) -> PathBuf {
+        self.output_path_for_file_checked(kind, file_idx, index, extension)
+            .0
     }
 
     pub fn merged_audio_output_path(&self, extension: &str) -> PathBuf {
@@ -136,12 +149,12 @@ impl ConverterSettings {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use super::*;
     use crate::converter::test_fixtures::*;
     use crate::converter::ChannelMap;
     use crate::converter::DEFAULT_AUDIO_SUFFIX;
     use crate::converter::DEFAULT_VIDEO_SUFFIX;
-    use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_output_path_for_index_audio_01d() {
@@ -154,7 +167,10 @@ mod tests {
         let path = s.output_path_for_index("audio", 1, "wav");
         let expected_dir = std::env::temp_dir();
         assert_eq!(path.parent(), Some(expected_dir.as_path()));
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), "output_audio_track1.wav");
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "output_audio_track1.wav"
+        );
     }
 
     #[test]
@@ -168,7 +184,10 @@ mod tests {
         let path = s.output_path_for_index("audio", 10, "wav");
         let expected_dir = std::env::temp_dir();
         assert_eq!(path.parent(), Some(expected_dir.as_path()));
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), "output_audio_track10.wav");
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "output_audio_track10.wav"
+        );
     }
 
     #[test]
@@ -182,14 +201,29 @@ mod tests {
         let path = s.output_path_for_index("video", 2, "mov");
         let expected_dir = std::env::temp_dir();
         assert_eq!(path.parent(), Some(expected_dir.as_path()));
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), "output_video_clip01.mov");
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "output_video_clip01.mov"
+        );
     }
 
     #[test]
     fn test_conversion_pipeline_audio_only_default() {
-        let p = ConversionPipeline::AudioOnly { generate_synthetic_video: false };
-        assert_eq!(p, ConversionPipeline::AudioOnly { generate_synthetic_video: false });
-        assert_ne!(p, ConversionPipeline::AudioOnly { generate_synthetic_video: true });
+        let p = ConversionPipeline::AudioOnly {
+            generate_synthetic_video: false,
+        };
+        assert_eq!(
+            p,
+            ConversionPipeline::AudioOnly {
+                generate_synthetic_video: false
+            }
+        );
+        assert_ne!(
+            p,
+            ConversionPipeline::AudioOnly {
+                generate_synthetic_video: true
+            }
+        );
     }
 
     #[test]
@@ -244,10 +278,19 @@ mod tests {
         s.ltc_track_channel_index = 1;
         s.channel_map = ChannelMap::identity(4);
         // With identity map: output_idx == ltc_track_channel_index → matches
-        assert!(!s.is_ltc_output_track(0), "output 0 is input 0, not LTC input 1");
+        assert!(
+            !s.is_ltc_output_track(0),
+            "output 0 is input 0, not LTC input 1"
+        );
         assert!(s.is_ltc_output_track(1), "output 1 is input 1 = LTC input");
-        assert!(!s.is_ltc_output_track(2), "output 2 is input 2, not LTC input");
-        assert!(!s.is_ltc_output_track(3), "output 3 is input 3, not LTC input");
+        assert!(
+            !s.is_ltc_output_track(2),
+            "output 2 is input 2, not LTC input"
+        );
+        assert!(
+            !s.is_ltc_output_track(3),
+            "output 3 is input 3, not LTC input"
+        );
     }
 
     #[test]
@@ -255,15 +298,21 @@ mod tests {
         let mut s = make_settings_audio_only();
         s.drop_ltc_track = true;
         s.ltc_track_channel_index = 1; // file idx 1 = input 1 is LTC
-        // mapping: [1, 0, 2, 3] → input 1 feeds output 0; input 0 feeds output 1
+                                       // mapping: [1, 0, 2, 3] → input 1 feeds output 0; input 0 feeds output 1
         s.channel_map = ChannelMap::from_mapping(vec![1, 0, 2, 3]);
         // output 0 originates from input 1 (LTC) → should be dropped
-        assert!(s.is_ltc_output_track(0),
-            "output 0 comes from input 1 (LTC) via permuted map");
-        assert!(!s.is_ltc_output_track(1),
-            "output 1 comes from input 0, not LTC");
-        assert!(!s.is_ltc_output_track(2),
-            "output 2 comes from input 2, not LTC");
+        assert!(
+            s.is_ltc_output_track(0),
+            "output 0 comes from input 1 (LTC) via permuted map"
+        );
+        assert!(
+            !s.is_ltc_output_track(1),
+            "output 1 comes from input 0, not LTC"
+        );
+        assert!(
+            !s.is_ltc_output_track(2),
+            "output 2 comes from input 2, not LTC"
+        );
     }
 
     #[test]
@@ -272,7 +321,10 @@ mod tests {
         s.drop_ltc_track = false;
         s.ltc_track_channel_index = 1;
         s.channel_map = ChannelMap::identity(4);
-        assert!(!s.is_ltc_output_track(1), "drop_ltc_track is false, nothing is dropped");
+        assert!(
+            !s.is_ltc_output_track(1),
+            "drop_ltc_track is false, nothing is dropped"
+        );
     }
 
     #[test]
@@ -287,7 +339,10 @@ mod tests {
             ..make_settings_audio_only()
         };
         let guarded = s.output_path_for_file("audio", 0, 0, "wav");
-        assert_eq!(guarded.file_name().unwrap(), "input1_conv.wav",
-            "collision with input file should append _conv");
+        assert_eq!(
+            guarded.file_name().unwrap(),
+            "input1_conv.wav",
+            "collision with input file should append _conv"
+        );
     }
 }
