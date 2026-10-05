@@ -156,10 +156,19 @@ pub fn decode_ltc_chunked(
         .unwrap_or(4)
         .min(num_chunks);
 
+    let job = ChunkJob {
+        path,
+        decoder,
+        sample_rate: plan.sample_rate,
+        fps,
+        drop_frame,
+        active_channel: plan.active_channel,
+        cancel_flag: &progress.cancel_flag,
+    };
     let mut chunk_results = if num_workers <= 1 {
-        run_sequential(path, &plan, decoder, fps, drop_frame, progress)
+        run_sequential(&job, &plan, progress)
     } else {
-        run_parallel(path, &plan, decoder, fps, drop_frame, progress, num_workers)
+        run_parallel(&job, &plan, progress, num_workers)
     };
 
     chunk_results.sort_by_key(|cr| cr.chunk_idx);
@@ -215,25 +224,14 @@ struct ChunkResult {
 }
 
 /// Decode chunks strictly in order, honoring cancellation between chunks.
-fn run_sequential(
-    path: &Path,
-    plan: &ChunkPlan,
-    decoder: &dyn LtcDecoder,
-    fps: f64,
-    drop_frame: bool,
-    progress: &DecodeProgress,
-) -> Vec<ChunkResult> {
-    let cancel_flag = &progress.cancel_flag;
+fn run_sequential(job: &ChunkJob<'_>, plan: &ChunkPlan, progress: &DecodeProgress) -> Vec<ChunkResult> {
     let mut results = Vec::with_capacity(plan.boundaries.len());
     for (chunk_idx, &(start_sample, end_sample)) in plan.boundaries.iter().enumerate() {
-        if cancel_flag.load(Ordering::Relaxed) {
+        if job.cancel_flag.load(Ordering::Relaxed) {
             info!("decode_ltc_chunked: cancel requested, stopping at chunk {}", chunk_idx);
             break;
         }
-        let r = decode_one_chunk(
-            path, decoder, chunk_idx, start_sample, end_sample,
-            plan.sample_rate, fps, drop_frame, cancel_flag, plan.active_channel,
-        );
+        let r = decode_one_chunk(job, chunk_idx, start_sample, end_sample);
         progress.chunks_completed.fetch_add(1, Ordering::Relaxed);
         results.push(r);
     }
@@ -243,16 +241,13 @@ fn run_sequential(
 /// Decode chunks across `num_workers` threads; every chunk slot is filled —
 /// workers bail on cancellation, leaving `LtcDecodeError::Cancelled` placeholders.
 fn run_parallel(
-    path: &Path,
+    job: &ChunkJob<'_>,
     plan: &ChunkPlan,
-    decoder: &dyn LtcDecoder,
-    fps: f64,
-    drop_frame: bool,
     progress: &DecodeProgress,
     num_workers: usize,
 ) -> Vec<ChunkResult> {
     let num_chunks = plan.boundaries.len();
-    let cancel_flag = progress.cancel_flag.clone();
+    let cancel_flag = job.cancel_flag;
     let progress_completed = progress.chunks_completed.clone();
     let chunks = Arc::new(plan.boundaries.clone());
     let results: Arc<[Mutex<Option<ChunkResult>>]> = (0..num_chunks)
@@ -266,17 +261,13 @@ fn run_parallel(
             let results = Arc::clone(&results);
             let next_chunk = Arc::clone(&next_chunk);
             let chunks = Arc::clone(&chunks);
-            let cancel_flag = cancel_flag.clone();
             let progress_completed = progress_completed.clone();
             s.spawn(move || loop {
                 let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                 if idx >= num_chunks { break; }
                 if cancel_flag.load(Ordering::Relaxed) { break; }
                 let (start_sample, end_sample) = chunks[idx];
-                let result = decode_one_chunk(
-                    path, decoder, idx, start_sample, end_sample,
-                    plan.sample_rate, fps, drop_frame, &cancel_flag, plan.active_channel,
-                );
+                let result = decode_one_chunk(job, idx, start_sample, end_sample);
                 if cancel_flag.load(Ordering::Relaxed) { break; }
                 progress_completed.fetch_add(1, Ordering::Relaxed);
                 *results[idx].lock().unwrap() = Some(result);
@@ -465,28 +456,27 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
     }
 }
 
-/// Decode a single chunk of a WAV file in a worker thread.
-// One worker's full decode request (path, window, format, decoder, cancel).
-#[allow(clippy::too_many_arguments)]
-fn decode_one_chunk(
-    path: &Path,
-    decoder: &dyn LtcDecoder,
-    chunk_idx: usize,
-    start_sample: usize,
-    end_sample: usize,
+/// Everything the chunk runners share across the whole pass: source file,
+/// decoder backend and the decode settings common to every chunk.
+struct ChunkJob<'a> {
+    path: &'a Path,
+    decoder: &'a dyn LtcDecoder,
     sample_rate: u32,
     fps: f64,
     drop_frame: bool,
-    cancel_flag: &AtomicBool,
     active_channel: usize,
-) -> ChunkResult {
+    cancel_flag: &'a AtomicBool,
+}
+
+/// Decode a single chunk of a WAV file in a worker thread.
+fn decode_one_chunk(job: &ChunkJob<'_>, chunk_idx: usize, start_sample: usize, end_sample: usize) -> ChunkResult {
     let num_samples = end_sample - start_sample;
 
-    if cancel_flag.load(Ordering::Relaxed) {
+    if job.cancel_flag.load(Ordering::Relaxed) {
         return ChunkResult { chunk_idx, result: Err(LtcDecodeError::Cancelled) };
     }
 
-    let mut local_reader = match WavChunkReader::open_with_channel(path, active_channel) {
+    let mut local_reader = match WavChunkReader::open_with_channel(job.path, job.active_channel) {
         Ok((r, _)) => r,
         Err(e) => return ChunkResult {
             chunk_idx,
@@ -495,12 +485,20 @@ fn decode_one_chunk(
     };
 
     let chunk_start = Instant::now();
-    let result = decoder.decode_chunk(
-        path, &mut local_reader, chunk_idx, start_sample, num_samples,
-        sample_rate, fps, drop_frame, chunk_start, cancel_flag,
-    );
+    let result = job.decoder.decode_chunk(crate::decoder::ChunkDecodeReq {
+        path: job.path,
+        reader: &mut local_reader,
+        chunk_idx,
+        start: start_sample,
+        len: num_samples,
+        sample_rate: job.sample_rate,
+        fps: job.fps,
+        drop_frame: job.drop_frame,
+        start_time: chunk_start,
+        cancel: job.cancel_flag,
+    });
     let elapsed = chunk_start.elapsed();
-    debug!("Chunk {} decoded ({}): {:.1}ms", chunk_idx + 1, decoder.name(), elapsed.as_secs_f64() * 1000.0);
+    debug!("Chunk {} decoded ({}): {:.1}ms", chunk_idx + 1, job.decoder.name(), elapsed.as_secs_f64() * 1000.0);
     ChunkResult { chunk_idx, result }
 }
 
@@ -779,9 +777,8 @@ mod tests {
             Err(LtcDecodeError::Failed("mock: decode_wav not supported".to_string()))
         }
 
-        fn decode_chunk(&self, _path: &Path, _reader: &mut WavChunkReader, chunk_idx: usize,
-                        _start: usize, _len: usize, _sample_rate: u32, _fps: f64, _drop: bool,
-                        _start_time: Instant, _cancel: &AtomicBool) -> Result<LtcDetectionResult, LtcDecodeError> {
+        fn decode_chunk(&self, req: crate::decoder::ChunkDecodeReq<'_>) -> Result<LtcDetectionResult, LtcDecodeError> {
+            let chunk_idx = req.chunk_idx;
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if let (Some(flag), Some(after)) = (&self.cancel_flag, self.cancel_after_calls) {
                 if n + 1 >= after {
@@ -829,12 +826,28 @@ mod tests {
         let dir = write_mock_wav();
         let path = dir.path().join("mock.wav");
 
-        let seq_results = run_sequential(
-            &path, &plan, &MockDecoder::new(five_ok_results()), 25.0, false, &DecodeProgress::new(5),
-        );
-        let par_results = run_parallel(
-            &path, &plan, &MockDecoder::new(five_ok_results()), 25.0, false, &DecodeProgress::new(5), 3,
-        );
+        let seq_progress = DecodeProgress::new(5);
+        let par_progress = DecodeProgress::new(5);
+        let seq_job = ChunkJob {
+            path: &path,
+            decoder: &MockDecoder::new(five_ok_results()),
+            sample_rate: plan.sample_rate,
+            fps: 25.0,
+            drop_frame: false,
+            active_channel: plan.active_channel,
+            cancel_flag: &seq_progress.cancel_flag,
+        };
+        let par_job = ChunkJob {
+            path: &path,
+            decoder: &MockDecoder::new(five_ok_results()),
+            sample_rate: plan.sample_rate,
+            fps: 25.0,
+            drop_frame: false,
+            active_channel: plan.active_channel,
+            cancel_flag: &par_progress.cancel_flag,
+        };
+        let seq_results = run_sequential(&seq_job, &plan, &seq_progress);
+        let par_results = run_parallel(&par_job, &plan, &par_progress, 3);
 
         let mut seq = seq_results;
         seq.sort_by_key(|cr| cr.chunk_idx);
@@ -868,9 +881,16 @@ mod tests {
         let progress = DecodeProgress::new(5);
         progress.cancel();
 
-        let results = run_parallel(
-            &path, &plan, &MockDecoder::new(five_ok_results()), 25.0, false, &progress, 3,
-        );
+        let job = ChunkJob {
+            path: &path,
+            decoder: &MockDecoder::new(five_ok_results()),
+            sample_rate: plan.sample_rate,
+            fps: 25.0,
+            drop_frame: false,
+            active_channel: plan.active_channel,
+            cancel_flag: &progress.cancel_flag,
+        };
+        let results = run_parallel(&job, &plan, &progress, 3);
         assert_eq!(results.len(), 5);
         for cr in &results {
             assert_eq!(cr.result.as_ref().unwrap_err(), &LtcDecodeError::Cancelled);
@@ -892,7 +912,16 @@ mod tests {
         // invariant: at most the first call's result is stored, every slot
         // is filled, and progress counts exactly the stored results.
         let mock = MockDecoder::bailing(five_ok_results(), progress.cancel_flag.clone(), 2);
-        let results = run_parallel(&path, &plan, &mock, 25.0, false, &progress, 3);
+        let job = ChunkJob {
+            path: &path,
+            decoder: &mock,
+            sample_rate: plan.sample_rate,
+            fps: 25.0,
+            drop_frame: false,
+            active_channel: plan.active_channel,
+            cancel_flag: &progress.cancel_flag,
+        };
+        let results = run_parallel(&job, &plan, &progress, 3);
 
         assert_eq!(results.len(), 5);
         let completed = results.iter().filter(|cr| cr.result.is_ok()).count();
@@ -914,9 +943,16 @@ mod tests {
         let progress = DecodeProgress::new(5);
         progress.cancel();
 
-        let results = run_sequential(
-            &path, &plan, &MockDecoder::new(five_ok_results()), 25.0, false, &progress,
-        );
+        let job = ChunkJob {
+            path: &path,
+            decoder: &MockDecoder::new(five_ok_results()),
+            sample_rate: plan.sample_rate,
+            fps: 25.0,
+            drop_frame: false,
+            active_channel: plan.active_channel,
+            cancel_flag: &progress.cancel_flag,
+        };
+        let results = run_sequential(&job, &plan, &progress);
         assert!(results.is_empty());
         assert_eq!(progress.chunks_completed.load(Ordering::Relaxed), 0);
     }
@@ -1623,10 +1659,17 @@ mod tests {
         let decoder = crate::decoder::decoder_for(false);
         let plan = plan_chunks(&WavChunkReader::open(&path).unwrap().0, &config);
         for (idx, &(start, end)) in plan.boundaries.iter().enumerate() {
-            let standalone = decode_one_chunk(
-                &path, decoder, idx, start, end,
-                sample_rate, fps, false, &AtomicBool::new(false), 0,
-            );
+            let cancel = AtomicBool::new(false);
+            let job = ChunkJob {
+                path: &path,
+                decoder,
+                sample_rate,
+                fps,
+                drop_frame: false,
+                active_channel: 0,
+                cancel_flag: &cancel,
+            };
+            let standalone = decode_one_chunk(&job, idx, start, end);
             let s = standalone.result.expect("standalone chunk decode must succeed");
             let summary = &chunked.chunk_summaries[idx];
             assert_eq!(summary.error, None, "chunk {} failed in the full run", idx);

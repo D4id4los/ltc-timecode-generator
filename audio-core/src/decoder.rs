@@ -24,27 +24,28 @@ pub trait LtcDecoder: Send + Sync {
         cancel: Option<&AtomicBool>,
     ) -> Result<LtcDetectionResult, LtcDecodeError>;
 
-    /// Decode the chunk `[start, start+len)` (mono-sample units) of `path`
-    /// via `reader`. Each backend reads its own preferred sample format —
+    /// Decode the chunk `[start, start+len)` (mono-sample units) via
+    /// `req.reader`. Each backend reads its own preferred sample format —
     /// f32 for builtin, i16 for libltc (whose "requires 16-bit int PCM"
     /// failure surfaces as the existing `Failed to read chunk N` error).
-    /// `chunk_idx` only formats into that prose message; cancellation is
+    /// `req.chunk_idx` only formats into that prose message; cancellation is
     /// carried by `LtcDecodeError::Cancelled`, not by this wrapper.
-    // Cohesive decode request: path/reader/window/backend decode one chunk.
-    #[allow(clippy::too_many_arguments)]
-    fn decode_chunk(
-        &self,
-        path: &Path,
-        reader: &mut WavChunkReader,
-        chunk_idx: usize,
-        start: usize,
-        len: usize,
-        sample_rate: u32,
-        fps: f64,
-        drop_frame: bool,
-        start_time: Instant,
-        cancel: &AtomicBool,
-    ) -> Result<LtcDetectionResult, LtcDecodeError>;
+    fn decode_chunk(&self, req: ChunkDecodeReq<'_>) -> Result<LtcDetectionResult, LtcDecodeError>;
+}
+
+/// One chunk decode request: the WAV window plus the decode settings shared
+/// by every chunk of the pass.
+pub struct ChunkDecodeReq<'a> {
+    pub path: &'a Path,
+    pub reader: &'a mut WavChunkReader,
+    pub chunk_idx: usize,
+    pub start: usize,
+    pub len: usize,
+    pub sample_rate: u32,
+    pub fps: f64,
+    pub drop_frame: bool,
+    pub start_time: Instant,
+    pub cancel: &'a AtomicBool,
 }
 
 /// Pure-Rust builtin decoder (f32 samples, chunked parallel decode support).
@@ -68,19 +69,19 @@ impl LtcDecoder for BuiltinDecoder {
         decode_ltc_from_wav(path, fps, drop_frame, cancel)
     }
 
-    fn decode_chunk(
-        &self,
-        _path: &Path,
-        reader: &mut WavChunkReader,
-        chunk_idx: usize,
-        start: usize,
-        len: usize,
-        sample_rate: u32,
-        fps: f64,
-        drop_frame: bool,
-        start_time: Instant,
-        cancel: &AtomicBool,
-    ) -> Result<LtcDetectionResult, LtcDecodeError> {
+    fn decode_chunk(&self, req: ChunkDecodeReq<'_>) -> Result<LtcDetectionResult, LtcDecodeError> {
+        let ChunkDecodeReq {
+            reader,
+            chunk_idx,
+            start,
+            len,
+            sample_rate,
+            fps,
+            drop_frame,
+            start_time,
+            cancel,
+            ..
+        } = req;
         match reader.read_mono_samples_f32(start, len) {
             Ok(samples) => decode_ltc_samples(
                 &samples, sample_rate, 1, fps, drop_frame, start_time, Some(cancel),
@@ -105,19 +106,19 @@ impl LtcDecoder for LibltcDecoder {
         decode_ltc_from_wav_libltc(path, fps, drop_frame, cancel)
     }
 
-    fn decode_chunk(
-        &self,
-        _path: &Path,
-        reader: &mut WavChunkReader,
-        chunk_idx: usize,
-        start: usize,
-        len: usize,
-        sample_rate: u32,
-        fps: f64,
-        drop_frame: bool,
-        start_time: Instant,
-        cancel: &AtomicBool,
-    ) -> Result<LtcDetectionResult, LtcDecodeError> {
+    fn decode_chunk(&self, req: ChunkDecodeReq<'_>) -> Result<LtcDetectionResult, LtcDecodeError> {
+        let ChunkDecodeReq {
+            reader,
+            chunk_idx,
+            start,
+            len,
+            sample_rate,
+            fps,
+            drop_frame,
+            start_time,
+            cancel,
+            ..
+        } = req;
         match reader.read_mono_samples_i16(start, len) {
             Ok(samples) => decode_ltc_samples_libltc(
                 &samples, 1, sample_rate, fps, drop_frame, start_time, Some(cancel),
