@@ -489,6 +489,45 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
    passed only on retry. Locally, `cargo nextest run --retries 10 -E 'test(...)'`
    ruthlessly shakes out timing flakes in a target test.
 
+### Property-Based Testing (proptest)
+
+`proptest` is a dev-dependency of `audio-core` and `gui-engine` (pinned `=1.8.0` to honor the
+workspace `rust-version` 1.77.2). Adopted **targetedly**, not globally:
+
+1. **Where properties are the tool**: arbitrary-input string parsers (`naming.rs` template
+   engine — generated segment ASTs and raw brace/placeholder token strings; `converter/timecode.rs`
+   native `HH:MM:SS:FF` round-trip) and generative decoder-degradation testing
+   (`ltc_decoder.rs` `mod prop`: `PropSignal` bundles start TC, fps/DF pair, sample rate,
+   duration, volume, noise/dc/impulse/drift parameters and their LCG seeds — all seeds are part
+   of the generated input, so failures shrink and persist deterministically).
+2. **Where exhaustive sweeps remain the tool**: finite timecode/chunk domains
+   (`test_roundtrip_exhaustive_25fps`, `test_roundtrip_sweep_other_fps`,
+   `test_count_chunks_equals_plan_len_across_sizes`) — sampling cannot beat exhaustive
+   coverage of a small finite space; do not convert these.
+3. **Oracle discipline**: properties use independent oracles — literal/sentinel concatenation,
+   marker-delimited digit spans (value + shape), differential encoder-vs-decoder sequence
+   checks, positional decode checks (every decoded frame must carry the expected sequence value
+   at its absolute time; the two documented reporting artifacts — head/tail frame loss on
+   lead-in-free signals and the corruption-boundary repeat — are explicitly tolerated, wrong
+   values never). Never re-derive expected values with production code; never write a
+   "validate agrees with parse" property when `validate_template` delegates to
+   `NameTemplate::parse` (vacuous).
+4. **Regressions-file policy**: `audio-core/proptest-regressions/` and
+   `gui-engine/proptest-regressions/` are **committed when present, never gitignored**. nextest
+   retries (`--profile ci`) run fresh processes that replay the persisted seeds first, so
+   genuine failures stay deterministic across retries instead of being masked as flaky. Stale
+   entries whose inputs moved out of a property's claimed envelope are pruned when the envelope
+   changes, with the counterexamples recorded in a `reports/` doc.
+5. **Case budgets**: 64 (`ProptestConfig::with_cases(64)`) for decode properties, default 256
+   for pure-string properties; decode properties must stay within the runtime budget
+   (≤ 15 s debug) — lower `with_cases`, never the floors, if exceeded.
+6. **Floor calibration**: degradation floors are set from deterministic random-seed sweeps
+   (hundreds of cases), from observed margins minus tolerance — never equalities, never from a
+   single hand-picked seed. If a calibrated floor lands close to observed margins, that is
+   decoder-headroom signal to feed back into the WP-DR direction, not a reason to loosen the
+   floor. A property that finds a genuine bug stays failing per the Test Quality Rules; the
+   triggering regressions file is committed alongside (see `reports/` for live examples).
+
 ### Test Quality Rules
 
 A test must fail when behavior regresses and pass when behavior improves.
