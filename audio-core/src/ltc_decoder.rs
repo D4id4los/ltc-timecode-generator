@@ -1713,31 +1713,74 @@ fn estimate_noise_floor(samples: &[f32]) -> f32 {
 
 // ── Zero-crossing detection ──────────────────────────────────────────────────
 
+/// Minimum length of a sub-threshold opposite-polarity excursion for it to
+/// count as a genuine transition instead of a noise dip. A real excursion
+/// spans at least half a bit — ≥ 9 samples at every supported rate/fps
+/// combination (floor: 44100 Hz / 30 fps); uncorrelated noise dips are
+/// 1–3 samples and even sustained noise runs of ≥ 8 sub-threshold
+/// opposite-sign samples are vanishingly rare.
+const MIN_SUBTHRESHOLD_EXCURSION: usize = 8;
+
 fn find_zero_crossings(samples: &[f32], threshold: f32) -> Vec<usize> {
     let mut crossings = Vec::new();
+    // `prev_sign` is the last sign whose transition has been consumed.
+    // Sub-threshold samples (dead zone) are not decisive on their own, but a
+    // *sustained* opposite-polarity excursion is a genuine transition whose
+    // crossings must not be lost: baseline offsets (conditioning ringing,
+    // DC wander, asymmetric fading) can crush one polarity of the bi-phase
+    // alternation below the detection threshold, and treating the excursion
+    // as invisible corrupts the bitstream around it. Short opposite-sign
+    // dips are noise and stay invisible, as before.
     let mut prev_sign = 0i8;
-    let hysteresis_scale = 2.0;
-    let mut effective_threshold = threshold;
-
+    // Start index of the current sub-threshold opposite-sign episode, if any.
+    let mut exc_start: Option<usize> = None;
+    let mut exc_len = 0usize;
     for (i, &s) in samples.iter().enumerate() {
-        let cur_sign = if s.abs() >= effective_threshold {
-            if s > 0.0 { 1 } else { -1 }
+        let raw_sign = if s > 0.0 {
+            1
+        } else if s < 0.0 {
+            -1
         } else {
-            0
+            prev_sign
         };
+        let above = s.abs() >= threshold;
 
-        if prev_sign != 0 && cur_sign != 0 && prev_sign != cur_sign {
-            crossings.push(i);
-            effective_threshold = threshold * hysteresis_scale;
+        if prev_sign == 0 {
+            prev_sign = raw_sign;
+            continue;
         }
 
-        if cur_sign != 0 {
-            if cur_sign != prev_sign {
-                effective_threshold = threshold;
+        if raw_sign != prev_sign && raw_sign != 0 {
+            if above {
+                // Decisive opposite-polarity sample: a normal crossing,
+                // whether it follows a slewed dead-zone traversal or a
+                // (short, noise) dip. Any open dip episode is resolved by
+                // this crossing and must not leak a stale start index into
+                // later pushes (crossings must stay strictly increasing).
+                crossings.push(i);
+                prev_sign = raw_sign;
+                exc_start = None;
+                exc_len = 0;
+            } else {
+                if exc_start.is_none() {
+                    exc_start = Some(i);
+                }
+                exc_len += 1;
+                if exc_len == MIN_SUBTHRESHOLD_EXCURSION {
+                    // Sustained excursion: the transition at its start is
+                    // real; consume the new polarity so the eventual
+                    // re-establishment above threshold reports the return
+                    // crossing, not a duplicate.
+                    crossings.push(exc_start.expect("just set"));
+                    prev_sign = raw_sign;
+                    exc_start = None;
+                }
             }
-            prev_sign = cur_sign;
         } else {
-            effective_threshold = threshold;
+            // Same polarity as the consumed sign (or a zero sample): any
+            // open episode was a noise wiggle, restart it.
+            exc_start = None;
+            exc_len = 0;
         }
     }
 
@@ -2580,6 +2623,49 @@ mod tests {
     fn test_find_zero_crossings_stays_positive() {
         let samples = vec![0.5f32, 0.3, 0.1, -0.2, -0.4];
         let crossings = find_zero_crossings(&samples, 0.05);
+        assert_eq!(crossings, vec![3]);
+    }
+
+    /// A sustained polarity reversal whose excursion stays below the
+    /// detection threshold must be reported (crossing at the excursion
+    /// start) and must re-arm the detector so the return to the original
+    /// polarity is reported too. Regression net for the conditioning-ringing
+    /// failure where one polarity of the bi-phase alternation was crushed
+    /// below threshold and its mid-bit crossings vanished from the bitstream
+    /// (proptest P5, seed
+    /// daa0e0faed9d952ee68f8163887f731d7ed720e70843f327f4ded3238869de6d).
+    #[test]
+    fn test_find_zero_crossings_subthreshold_excursion_arms_crossing() {
+        // -0.69 (established) → +0.18×9 (sustained dead-zone excursion,
+        // half-bit-like) → -0.70 → +0.18×9 → -0.70: every reversal is a
+        // real transition.
+        let mut samples = vec![-0.69f32];
+        samples.extend(std::iter::repeat(0.18).take(9));
+        samples.push(-0.70);
+        samples.extend(std::iter::repeat(0.18).take(9));
+        samples.push(-0.70);
+        let crossings = find_zero_crossings(&samples, 0.196);
+        assert_eq!(crossings, vec![1, 10, 11, 20]);
+    }
+
+    /// A sub-threshold opposite-polarity dip shorter than the sustained
+    /// gate is a noise dip, not a transition: no crossing may be fabricated
+    /// for it or its return.
+    #[test]
+    fn test_find_zero_crossings_short_subthreshold_dip_ignored() {
+        let mut samples = vec![-0.69f32];
+        samples.extend(std::iter::repeat(0.18).take(5));
+        samples.extend(std::iter::repeat(-0.70).take(2));
+        let crossings = find_zero_crossings(&samples, 0.196);
+        assert!(crossings.is_empty());
+    }
+
+    /// A slewed traversal of the dead zone (both flip samples below
+    /// threshold) reports one crossing, at the re-establishment sample.
+    #[test]
+    fn test_find_zero_crossings_slewed_dead_zone_single_crossing() {
+        let samples = vec![0.3f32, 0.05, -0.05, -0.3, -0.3];
+        let crossings = find_zero_crossings(&samples, 0.19);
         assert_eq!(crossings, vec![3]);
     }
 
@@ -4619,7 +4705,11 @@ mod tests {
 
     /// Box-Muller Gaussian sample using LCG as source of uniform randomness.
     fn gaussian_lcg(state: &mut u64) -> f32 {
-        let u1 = lcg_next(state);
+        // `lcg_next` can yield exactly 0.0; `ln(0)` would inject an inf
+        // sample into the signal (silent → threshold = inf → decode error).
+        // Floor u1 at one LCG step so the worst case is a large-but-finite
+        // tail draw instead of a non-finite value.
+        let u1 = lcg_next(state).max(1.0 / 32768.0);
         let u2 = lcg_next(state);
         let r = (-2.0 * u1.ln()).sqrt();
         r * (2.0 * std::f32::consts::PI * u2).cos()

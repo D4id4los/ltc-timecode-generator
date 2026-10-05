@@ -11,9 +11,13 @@
 //!   sits exactly between them (`prev+1 → suspect → prev+2`), else drop.
 //! - **DR2 `repair_single_frame_outliers`** — a single frame whose value is
 //!   wrong while both neighbours stay on the `prev+1 / prev+2` grid is
-//!   reconstructed to `prev+1`. Segment boundaries and forward jumps (edit
-//!   points) are never touched; two consecutive corrupt frames are left
-//!   alone (no safe evidence).
+//!   reconstructed to `prev+1`. Interior segment boundaries and forward
+//!   jumps (edit points) are never touched; two consecutive corrupt frames
+//!   are left alone (no safe evidence). Unverifiable *edge* frames —
+//!   trailing and leading frames that break continuity with their single
+//!   neighbour — are dropped: no left context exists to reconstruct them
+//!   and a lone unverifiable value is useless (and poisonous for head-frame
+//!   re-anchoring) for sync.
 //!
 //! Confidence math is deliberately untouched: `valid_frames` /
 //! `avg_confidence` keep counting sync-matched frames; these passes only
@@ -159,6 +163,22 @@ pub(crate) fn repair_single_frame_outliers(
             break;
         }
         tcs.pop();
+        stats.bcd_dropped += 1;
+    }
+    // Leading counterpart of the trailing rule: the head frame is the least
+    // reliable of the stream (on lead-in-free signals the zero-crossing
+    // anchor has no transition before the first bit boundary), and it has no
+    // left neighbour to reconstruct it from. A head frame that breaks
+    // continuity with its successor is unverifiable — drop it until the
+    // head sits on the successor's grid. Downstream re-anchoring
+    // (`start_timecode_from_ltc` + `shift_timecode_back`) already tolerates
+    // a missing head frame.
+    while tcs.len() >= 2 {
+        let expected = increment_timecode(&tcs[0].timecode, fps, drop_frame);
+        if tcs[1].timecode == expected {
+            break;
+        }
+        tcs.remove(0);
         stats.bcd_dropped += 1;
     }
     stats
@@ -361,15 +381,57 @@ mod tests {
 
     #[test]
     fn test_outlier_at_segment_boundary_not_touched() {
+        // Two segments separated by an audio gap (dropout). The first frame
+        // of each segment has no left neighbour inside its segment and the
+        // last has no coherent right one: the outlier loop never fabricates
+        // values at segment edges. (Head frames that *break continuity*
+        // with their successor are handled by the leading-drop rule — see
+        // test_unverifiable_head_frame_dropped.)
         let mut tcs = clean_run(10);
-        // The first frame has no left neighbour, so no repair context.
-        // (The last frame is covered by the trailing-drop rule — see
-        // test_trailing_corrupt_frame_dropped.)
-        tcs[0].timecode = tc(1, 0, 0, 4);
+        for t in tcs.iter_mut().skip(5) {
+            t.timecode_secs += 2.0; // audio gap → segment boundary
+        }
+        // Last frame of segment 1: garbage with no right context.
+        tcs[4].timecode = tc(1, 0, 0, 24);
+        // First frame of segment 2: garbage with no left context.
+        tcs[5].timecode = tc(1, 0, 4, 0);
         let stats = repair_single_frame_outliers(&mut tcs, FPS, false);
         assert_stats(stats, 0);
-        assert_eq!(tcs[0].timecode, tc(1, 0, 0, 4));
+        assert_eq!(tcs[4].timecode, tc(1, 0, 0, 24));
+        assert_eq!(tcs[5].timecode, tc(1, 0, 4, 0));
         assert_eq!(tcs.len(), 10);
+    }
+
+    /// The leading counterpart of `test_trailing_corrupt_frame_dropped`:
+    /// a head frame that breaks continuity with its successor is
+    /// unverifiable (no left neighbour to reconstruct it, and the
+    /// zero-crossing boundary makes the head the least reliable frame of a
+    /// lead-in-free signal) and is dropped until the head sits on the
+    /// successor's grid.
+    #[test]
+    fn test_unverifiable_head_frame_dropped() {
+        let mut tcs = clean_run(10);
+        // Garbage head (BCD-valid, continuity-broken): dropped.
+        tcs[0].timecode = tc(9, 10, 0, 1);
+        let stats = repair_single_frame_outliers(&mut tcs, FPS, false);
+        assert_eq!(stats.bcd_dropped, 1, "unverifiable head frame dropped");
+        assert_eq!(tcs.len(), 9);
+        assert_eq!(tcs[0].timecode, tc(1, 0, 0, 1));
+        // A continuity-consistent head is never touched.
+        let mut tcs = clean_run(10);
+        let stats = repair_single_frame_outliers(&mut tcs, FPS, false);
+        assert_eq!(stats, RepairStats::default());
+        assert_eq!(tcs.len(), 10);
+        // Two mutually consistent garbage heads survive: they are
+        // indistinguishable from real content at this layer (no safe
+        // evidence) — the exact mirror of the trailing rule's behaviour
+        // for a consistent garbage pair at the tail.
+        let mut tcs = clean_run(10);
+        tcs[0].timecode = tc(5, 5, 5, 5);
+        tcs[1].timecode = tc(5, 5, 5, 6);
+        let stats = repair_single_frame_outliers(&mut tcs, FPS, false);
+        assert_eq!(stats.bcd_dropped, 0);
+        assert_eq!(tcs[0].timecode, tc(5, 5, 5, 5));
     }
 
     #[test]
