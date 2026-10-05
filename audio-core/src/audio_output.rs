@@ -3,7 +3,8 @@ use crate::{AudioDeviceInfo, AudioEvent, ChannelSel, Timecode};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use keepawake::{Builder as WakeBuilder, KeepAwake};
 use log::{error, info, warn};
-use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
+use ringbuf::traits::{Consumer as _, Producer as _, Split as _};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,9 +37,9 @@ struct LtcStreamState {
 }
 
 struct AudioOutputState {
-    ltc_producer: Arc<Mutex<HeapProducer<f32>>>,
+    ltc_producer: Arc<Mutex<HeapProd<f32>>>,
     stream: cpal::Stream,
-    beep_producer: Arc<Mutex<HeapProducer<f32>>>,
+    beep_producer: Arc<Mutex<HeapProd<f32>>>,
     ltc: Arc<Mutex<LtcStreamState>>,
     streaming: Arc<AtomicBool>,
     underrun_count: Arc<AtomicU64>,
@@ -717,8 +718,8 @@ fn build_stream_for_format(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
-    ltc_consumer: HeapConsumer<f32>,
-    beep_consumer: HeapConsumer<f32>,
+    ltc_consumer: HeapCons<f32>,
+    beep_consumer: HeapCons<f32>,
     ctx: StreamContext,
 ) -> Result<cpal::Stream, String> {
     match sample_format {
@@ -741,8 +742,8 @@ fn build_stream_for_format(
 fn build_stream_generic<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mut ltc_consumer: HeapConsumer<f32>,
-    mut beep_consumer: HeapConsumer<f32>,
+    mut ltc_consumer: HeapCons<f32>,
+    mut beep_consumer: HeapCons<f32>,
     ctx: StreamContext,
 ) -> Result<cpal::Stream, String>
 where
@@ -762,14 +763,14 @@ where
 
                 let mut underrun_this_block = false;
                 for sample in data.iter_mut() {
-                    let ltc_val = match ltc_consumer.pop() {
+                    let ltc_val = match ltc_consumer.try_pop() {
                         Some(v) => v,
                         None => {
                             underrun_this_block = true;
                             0.0
                         }
                     };
-                    let beep_val = beep_consumer.pop().unwrap_or(0.0);
+                    let beep_val = beep_consumer.try_pop().unwrap_or(0.0);
                     *sample = T::from_sample(ltc_val + beep_val);
                 }
 
@@ -1174,7 +1175,7 @@ struct FramePushStats {
 /// if any (`FramesDropped { total }` every 100 cumulative drops). Works on a
 /// plain `HeapRb` — no device needed.
 fn push_frame(
-    producer: &mut HeapProducer<f32>,
+    producer: &mut HeapProd<f32>,
     frame: &[f32],
     stats: &mut FramePushStats,
 ) -> Option<AudioEvent> {
@@ -1276,7 +1277,7 @@ fn detect_underruns(
 /// Generate one stereo LTC frame into `frame_buf` and push it into the ring.
 /// Returns `false` when the producer mutex is poisoned (thread must exit).
 fn generate_and_push_frame(
-    ltc_producer: &Arc<Mutex<HeapProducer<f32>>>,
+    ltc_producer: &Arc<Mutex<HeapProd<f32>>>,
     frame_buf: &mut Vec<f32>,
     needed: usize,
     params: crate::ltc_encoder::LtcFrameParams<'_>,
@@ -1314,7 +1315,7 @@ fn generate_and_push_frame(
 }
 
 fn ltc_scheduler_thread(
-    ltc_producer: Arc<Mutex<HeapProducer<f32>>>,
+    ltc_producer: Arc<Mutex<HeapProd<f32>>>,
     ltc: Arc<Mutex<LtcStreamState>>,
     stop_signal: Arc<AtomicBool>,
     underrun_count: Arc<AtomicU64>,
