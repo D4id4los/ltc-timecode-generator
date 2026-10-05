@@ -194,6 +194,9 @@ pub fn decode_ltc_chunked(
         chunk_summaries,
     };
 
+    // WP-DR value integrity re-run over the merged stream: continuity
+    // repairs can span chunk borders that per-chunk passes could not see.
+    crate::ltc_integrity::apply_value_integrity(&mut result);
     apply_coherent_first_timecode(&mut result);
     result.quality = compute_ltc_quality(&result);
     let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;

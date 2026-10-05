@@ -844,6 +844,10 @@ let mut result = match best_result {
         }
     };
 
+    // WP-DR value integrity (DR1 BCD validation + DR2 continuity repair)
+    // runs before the coherent-start trim so garbage values cannot become
+    // the anchor.
+    crate::ltc_integrity::apply_value_integrity(&mut result);
     apply_coherent_first_timecode(&mut result);
     result.quality = compute_ltc_quality(&result);
     Ok(result)
@@ -1124,7 +1128,7 @@ fn quality_inputs(result: &LtcDetectionResult) -> Option<QualityInputs> {
 
 /// Find contiguous segments by comparing LTC timecode values,
 /// NOT frame_index (which gets re-indexed by chunked merge).
-fn split_segments(ltc_secs: &[f64], fps: f64) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn split_segments(ltc_secs: &[f64], fps: f64) -> Vec<std::ops::Range<usize>> {
     let frame_duration = 1.0 / fps;
     let gap_threshold = frame_duration * 2.0;
 
@@ -1194,7 +1198,11 @@ fn analyze_drift(
         if b.accum_frames > worst_block_drift_frames {
             worst_block_drift_frames = b.accum_frames;
         }
-        let usable = b.duration >= min_block_duration && b.accum_frames <= 1.0;
+        // A single-frame block is never usable: with zero span it can
+        // establish neither sync nor drift (degenerate decodes — e.g. an
+        // fps mismatch reduced to one frame by the integrity pass — must
+        // not score as usable).
+        let usable = b.frames >= 2 && b.duration >= min_block_duration && b.accum_frames <= 1.0;
         if usable {
             usable_frames += b.frames;
             if b.accum_frames > 0.5 {
@@ -4371,12 +4379,20 @@ mod tests {
         // Regression: a false sync-word match late in a heavily corrupted
         // signal made backfill_leading_frames compute a sample offset past
         // the end of the buffer and slice out of range. Decoding garbage
-        // must degrade gracefully, never panic.
+        // must degrade gracefully, never panic. The value-integrity pass
+        // (WP-DR) may drop garbage frames from `timecodes`, so the length
+        // can fall below the sync-matched `valid_frames`; the result must
+        // stay well-formed either way.
         let signal = add_impulse_noise(&base_signal(), 0.4, 1.0, 42);
         let result = base_decode(&signal);
         // No frame-count floor — heavily corrupted input may decode
         // nothing. The contract is: no panic, and a well-formed result.
-        assert_eq!(result.timecodes.len(), result.valid_frames as usize);
+        assert!(result.timecodes.len() <= result.valid_frames as usize,
+            "timecodes ({}) cannot exceed sync-matched valid_frames ({})",
+            result.timecodes.len(), result.valid_frames);
+        for (i, ftc) in result.timecodes.iter().enumerate() {
+            assert_eq!(ftc.frame_index, i as u32, "frame indices stay contiguous");
+        }
     }
 
     // ── 3. DC offset ─────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ pub mod audio_output;
 pub mod chunked_decode;
 pub mod decoder;
 pub mod ltc_decoder;
+pub(crate) mod ltc_integrity;
 pub mod ltc_decoder_libltc;
 pub mod ltc_encoder;
 pub mod types;
