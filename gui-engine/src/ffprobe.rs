@@ -483,52 +483,64 @@ pub fn extract_audio_channel_with_progress(
     cancel: Option<&AtomicBool>,
     on_frac: &impl Fn(f32),
 ) -> Result<(), ExtractError> {
+    let mut spawner = |args: &[String]| {
+        no_window_command("ffmpeg")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+    };
     extract_audio_channel_with_progress_with(
         path,
         absolute_stream_index,
         channel_index,
         output_wav,
         total_duration_secs,
-        cancel,
         on_frac,
-        &mut |args: &[String]| {
-            no_window_command("ffmpeg")
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
+        &mut ExtractSeam {
+            cancel,
+            stall: FFMPEG_STALL_TIMEOUT,
+            spawner: &mut spawner,
         },
-        FFMPEG_STALL_TIMEOUT,
     )
 }
 
-/// Injectable-spawner variant of [`extract_audio_channel_with_progress`] for
+/// Injection surface of the extraction runner (testability seam):
+/// cancellation flag, no-output stall timeout, and the process spawner.
+/// The public variant wires the real ffmpeg spawner and
+/// [`FFMPEG_STALL_TIMEOUT`]; tests construct a fake seam.
+pub struct ExtractSeam<'a> {
+    pub cancel: Option<&'a AtomicBool>,
+    pub stall: Duration,
+    pub spawner: &'a mut dyn FnMut(&[String]) -> std::io::Result<Child>,
+}
+
+/// Injectable-seam variant of [`extract_audio_channel_with_progress`] for
 /// testability.
 ///
-/// `spawner` receives the full argument list (including the input path and
-/// output WAV path, plus `-progress` / `pipe:2` flags) and must return the
-/// spawned child with stderr piped. `stall` is the no-output timeout; the
-/// public variant uses [`FFMPEG_STALL_TIMEOUT`] (30 s).
+/// `seam.spawner` receives the full argument list (including the input path
+/// and output WAV path, plus `-progress` / `pipe:2` flags) and must return
+/// the spawned child with stderr piped. `seam.stall` is the no-output
+/// timeout; the public variant uses [`FFMPEG_STALL_TIMEOUT`] (30 s).
 pub fn extract_audio_channel_with_progress_with(
     path: &Path,
     absolute_stream_index: usize,
     channel_index: usize,
     output_wav: &Path,
     total_duration_secs: Option<f64>,
-    cancel: Option<&AtomicBool>,
     on_frac: &impl Fn(f32),
-    spawner: &mut dyn FnMut(&[String]) -> std::io::Result<Child>,
-    stall: Duration,
+    seam: &mut ExtractSeam<'_>,
 ) -> Result<(), ExtractError> {
+    let ExtractSeam { cancel, stall, spawner } = seam;
     let mut args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
     args.push("-progress".to_string());
     args.push("pipe:2".to_string());
 
     let run = run_ffmpeg_collect_stderr(
-        spawner,
+        *spawner,
         &args,
-        stall,
-        cancel,
+        *stall,
+        *cancel,
         &mut |line| {
             if let Some(secs) = parse_out_time_us(line) {
                 if let Some(duration) = total_duration_secs {
@@ -1178,13 +1190,15 @@ mod tests {
             0,
             out,
             None,
-            Some(&cancel),
             &|f| {
                 let mut p = fracs.lock().unwrap();
                 p.push(f);
             },
-            &mut spawn_silent_child,
-            Duration::from_secs(30),
+            &mut ExtractSeam {
+                cancel: Some(&cancel),
+                stall: Duration::from_secs(30),
+                spawner: &mut spawn_silent_child,
+            },
         );
         let elapsed = start.elapsed();
         assert!(
@@ -1207,10 +1221,12 @@ mod tests {
             0,
             out,
             None,
-            None,
             &|_| {},
-            &mut spawn_silent_child,
-            Duration::from_millis(200),
+            &mut ExtractSeam {
+                cancel: None,
+                stall: Duration::from_millis(200),
+                spawner: &mut spawn_silent_child,
+            },
         );
         let elapsed = start.elapsed();
         assert!(
@@ -1249,13 +1265,15 @@ mod tests {
             0,
             out,
             Some(10.0),
-            None,
             &|f| {
                 let mut p = fracs.lock().unwrap();
                 p.push(f);
             },
-            &mut spawner,
-            Duration::from_secs(5),
+            &mut ExtractSeam {
+                cancel: None,
+                stall: Duration::from_secs(5),
+                spawner: &mut spawner,
+            },
         );
 
         // Child exits 0 → success
