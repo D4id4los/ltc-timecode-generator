@@ -2000,10 +2000,40 @@ struct FrameScan {
 }
 
 fn find_frames(bits: &[u8], fps: f64, drop_frame: bool) -> FrameScan {
-    let mut sync_positions = Vec::new();
     if bits.len() < 16 {
         return FrameScan { valid_frames: 0, grid_valid: 0, total_possible: 0, frame_starts: Vec::new() };
     }
+    let sync_positions = scan_sync_positions(bits);
+    if sync_positions.is_empty() {
+        return FrameScan { valid_frames: 0, grid_valid: 0, total_possible: 0, frame_starts: Vec::new() };
+    }
+    let Some(alignment) = dominant_alignment(&sync_positions) else {
+        return FrameScan { valid_frames: 0, grid_valid: 0, total_possible: 0, frame_starts: Vec::new() };
+    };
+    let total_possible = if bits.len() > alignment {
+        ((bits.len() - alignment) / 80) as u32
+    } else {
+        0
+    };
+
+    let grid_starts = grid_walk_starts(bits, alignment);
+    let chain_starts = chain_relock_starts(bits, &sync_positions, fps, drop_frame);
+    let chain_starts = dedupe_near_duplicates(chain_starts);
+    let merged = merge_grid_and_chains(grid_starts.clone(), chain_starts);
+
+    FrameScan {
+        valid_frames: merged.len() as u32,
+        grid_valid: grid_starts.len() as u32,
+        total_possible,
+        frame_starts: merged,
+    }
+}
+
+/// Tolerance-based sync-word scan: every position whose 16-bit window is
+/// within `SYNC_MATCH_TOLERANCE` of the sync pattern starts a candidate;
+/// after a hit the scan jumps a full frame.
+fn scan_sync_positions(bits: &[u8]) -> Vec<usize> {
+    let mut sync_positions = Vec::new();
     let max_start = bits.len() - 16;
     let mut i = 0;
     while i <= max_start {
@@ -2015,49 +2045,45 @@ fn find_frames(bits: &[u8], fps: f64, drop_frame: bool) -> FrameScan {
             i += 1;
         }
     }
+    sync_positions
+}
 
-    if sync_positions.is_empty() {
-        return FrameScan { valid_frames: 0, grid_valid: 0, total_possible: 0, frame_starts: Vec::new() };
-    }
-
-    // Alignment histogram: keeps the legacy total-possible denominator (the
-    // dominant-alignment grid estimate). Frame *detection* below no longer
-    // decodes along that grid: a single real-world disturbance shifts the
-    // extracted bitstream, and grid decoding lost everything after the shift
-    // (the WP-RW A2/A3 long-file collapse — chunk 0 of a 49-min recording
-    // decoded 62% while its 120 s slices decoded 94–100%). Instead each
-    // detected sync word re-locks its own frame at `sp - SYNC_OFFSET`.
+/// Alignment histogram: keeps the legacy total-possible denominator (the
+/// dominant-alignment grid estimate). Frame *detection* below no longer
+/// decodes along that grid: a single real-world disturbance shifts the
+/// extracted bitstream, and grid decoding lost everything after the shift
+/// (the WP-RW A2/A3 long-file collapse — chunk 0 of a 49-min recording
+/// decoded 62% while its 120 s slices decoded 94–100%). Instead each
+/// detected sync word re-locks its own frame at `sp - SYNC_OFFSET`.
+/// Returns `None` when no sync sits at or after `SYNC_OFFSET` (empty
+/// histogram) — the all-zero case of the legacy guard.
+fn dominant_alignment(sync_positions: &[usize]) -> Option<usize> {
     let mut alignment_scores = vec![0u32; 80];
-    for &sp in &sync_positions {
+    for &sp in sync_positions {
         if sp >= SYNC_OFFSET {
             let alignment = (sp - SYNC_OFFSET) % 80;
             alignment_scores[alignment] += 1;
         }
     }
-
-    let (best_alignment, _best_count_value) = alignment_scores
+    let (best, count) = alignment_scores
         .iter()
         .enumerate()
         .max_by_key(|&(_, &c)| c)
         .unwrap_or((0, &0));
-
-    if alignment_scores[0] == 0 && alignment_scores.iter().all(|&c| c == 0) {
-        return FrameScan { valid_frames: 0, grid_valid: 0, total_possible: 0, frame_starts: Vec::new() };
-    }
-
-    let total_possible = if bits.len() > best_alignment {
-        ((bits.len() - best_alignment) / 80) as u32
+    if *count == 0 {
+        None
     } else {
-        0
-    };
+        Some(best)
+    }
+}
 
-    // Legacy dominant-grid walk (acceptance unchanged). Chains below extend
-    // this; grid frames remain the noise-regime baseline.
+/// Legacy dominant-grid walk (acceptance unchanged). Chains below extend
+/// this; grid frames remain the noise-regime baseline.
+fn grid_walk_starts(bits: &[u8], alignment: usize) -> Vec<usize> {
     let mut grid_starts: Vec<usize> = Vec::new();
-    let align = best_alignment;
     let mut idx = 0usize;
     loop {
-        let frame_start = align + idx * 80;
+        let frame_start = alignment + idx * 80;
         if frame_start + 80 > bits.len() {
             break;
         }
@@ -2069,64 +2095,78 @@ fn find_frames(bits: &[u8], fps: f64, drop_frame: bool) -> FrameScan {
         }
         idx += 1;
     }
-    // Chain re-lock (WP-RW A2/A3): a real-world disturbance shifts the
-    // extracted bitstream, so every frame after it sits off the dominant
-    // grid and the legacy walk loses the rest of the stream. A shifted (or
-    // dominant-but-outvoted) segment is a run of consecutive sync words
-    // spaced exactly 80 bits. Accept a run when it carries a consecutive-TC
-    // pair: a true chain decodes to incrementing timecodes, while
-    // noise-induced false syncs chained 80 bits apart decode to garbage.
-    // Grid frames are unaffected (the walk above stays the noise-regime
-    // baseline); dedup removes the overlap where both accept a frame.
-    let flush_run = |run: &Vec<usize>, chain_starts: &mut Vec<usize>| {
-        // ≥5 members: any real desync strands at least a fraction of a
-        // second of frames (25/s), while noise-induced chance chains never
-        // stack four exact 80-bit hops *and* a consecutive-TC pair.
-        if run.len() < 5 {
-            return;
-        }
-        let tcs: Vec<Option<Timecode>> = run
-            .iter()
-            .map(|&sp| {
-                sp.checked_sub(SYNC_OFFSET)
-                    .filter(|&fs| fs + 80 <= bits.len())
-                    .map(|fs| decode_timecode_from_bits(bits, fs))
-            })
-            .collect();
-        let sequential = tcs.windows(2).any(|w| {
-            matches!(
-                (&w[0], &w[1]),
-                (Some(a), Some(b)) if crate::increment_timecode(a, fps, drop_frame) == *b
-            )
-        });
-        if sequential {
-            for &sp in run {
-                if let Some(fs) = sp.checked_sub(SYNC_OFFSET) {
-                    chain_starts.push(fs);
-                }
-            }
-        }
-    };
+    grid_starts
+}
+
+/// Chain re-lock (WP-RW A2/A3): a real-world disturbance shifts the
+/// extracted bitstream, so every frame after it sits off the dominant
+/// grid and the legacy walk loses the rest of the stream. A shifted (or
+/// dominant-but-outvoted) segment is a run of consecutive sync words
+/// spaced exactly 80 bits. Accept a run when it carries a consecutive-TC
+/// pair: a true chain decodes to incrementing timecodes, while
+/// noise-induced false syncs chained 80 bits apart decode to garbage.
+/// Grid frames are unaffected (the walk above stays the noise-regime
+/// baseline); dedup removes the overlap where both accept a frame.
+fn chain_relock_starts(
+    bits: &[u8],
+    sync_positions: &[usize],
+    fps: f64,
+    drop_frame: bool,
+) -> Vec<usize> {
     let mut chain_starts: Vec<usize> = Vec::new();
     let mut run: Vec<usize> = Vec::new();
     for i in 0..=sync_positions.len() {
         if i < sync_positions.len() {
             if let Some(&last) = run.last() {
                 if sync_positions[i] != last + 80 {
-                    flush_run(&run, &mut chain_starts);
+                    chain_starts.extend(flush_chain_run(&run, bits, fps, drop_frame));
                     run.clear();
                 }
             }
             run.push(sync_positions[i]);
         } else {
-            flush_run(&run, &mut chain_starts);
+            chain_starts.extend(flush_chain_run(&run, bits, fps, drop_frame));
         }
     }
-    // Near-duplicate chains: a noise-shifted sync match can spawn a second
-    // chain 1–2 bits off a first one; both decode to the same frame values.
-    // Cluster chain starts closer than half a frame (40 bits), keeping the
-    // first of each cluster. (Distinct true frames sit exactly 80 bits
-    // apart, so the cluster radius cannot merge neighbours.)
+    chain_starts
+}
+
+/// Accept a single 80-bit-spaced sync run iff it has ≥5 members and a
+/// consecutive-timecode pair. ≥5 members: any real desync strands at least
+/// a fraction of a second of frames (25/s), while noise-induced chance
+/// chains never stack four exact 80-bit hops *and* a consecutive-TC pair.
+fn flush_chain_run(run: &[usize], bits: &[u8], fps: f64, drop_frame: bool) -> Vec<usize> {
+    if run.len() < 5 {
+        return Vec::new();
+    }
+    let tcs: Vec<Option<Timecode>> = run
+        .iter()
+        .map(|&sp| {
+            sp.checked_sub(SYNC_OFFSET)
+                .filter(|&fs| fs + 80 <= bits.len())
+                .map(|fs| decode_timecode_from_bits(bits, fs))
+        })
+        .collect();
+    let sequential = tcs.windows(2).any(|w| {
+        matches!(
+            (&w[0], &w[1]),
+            (Some(a), Some(b)) if crate::increment_timecode(a, fps, drop_frame) == *b
+        )
+    });
+    if !sequential {
+        return Vec::new();
+    }
+    run.iter()
+        .filter_map(|&sp| sp.checked_sub(SYNC_OFFSET))
+        .collect()
+}
+
+/// Near-duplicate chains: a noise-shifted sync match can spawn a second
+/// chain 1–2 bits off a first one; both decode to the same frame values.
+/// Cluster chain starts closer than half a frame (40 bits), keeping the
+/// first of each cluster. (Distinct true frames sit exactly 80 bits
+/// apart, so the cluster radius cannot merge neighbours.)
+fn dedupe_near_duplicates(mut chain_starts: Vec<usize>) -> Vec<usize> {
     chain_starts.sort_unstable();
     let mut clustered: Vec<usize> = Vec::with_capacity(chain_starts.len());
     for &c in &chain_starts {
@@ -2137,34 +2177,28 @@ fn find_frames(bits: &[u8], fps: f64, drop_frame: bool) -> FrameScan {
             clustered.push(c);
         }
     }
-    let chain_starts = clustered;
-    // Duplicate resolution, grid-preferred: in fading or impulse noise a
-    // noise-shifted sync match can spawn a chain copy of a frame the grid
-    // already accepted — its payload crosses bit boundaries differently and
-    // decodes wrong where the grid copy decoded right, and keeping both
-    // yields duplicated timecode values. A chain start within half a frame
-    // (40 bits) of a grid start is the same frame; the grid copy wins.
-    // Chains matter exactly where the grid is dark — the shifted segment
-    // after a desync — and those have no grid neighbour.
-    let mut merged: Vec<usize> = grid_starts.clone();
-    for c in chain_starts {
-        let superseded = merged.iter().any(|&g| {
-            let d = c.abs_diff(g);
-            d < 40
-        });
+    clustered
+}
+
+/// Duplicate resolution, grid-preferred: in fading or impulse noise a
+/// noise-shifted sync match can spawn a chain copy of a frame the grid
+/// already accepted — its payload crosses bit boundaries differently and
+/// decodes wrong where the grid copy decoded right, and keeping both
+/// yields duplicated timecode values. A chain start within half a frame
+/// (40 bits) of a grid start is the same frame; the grid copy wins.
+/// Chains matter exactly where the grid is dark — the shifted segment
+/// after a desync — and those have no grid neighbour.
+fn merge_grid_and_chains(mut grid: Vec<usize>, chains: Vec<usize>) -> Vec<usize> {
+    let mut merged = std::mem::take(&mut grid);
+    for c in chains {
+        let superseded = merged.iter().any(|&g| c.abs_diff(g) < 40);
         if !superseded {
             merged.push(c);
         }
     }
     merged.sort_unstable();
     merged.dedup();
-
-    FrameScan {
-        valid_frames: merged.len() as u32,
-        grid_valid: grid_starts.len() as u32,
-        total_possible,
-        frame_starts: merged,
-    }
+    merged
 }
 
 // ── Timecode decoding ────────────────────────────────────────────────────────
@@ -5752,6 +5786,82 @@ mod tests {
             ScoredCandidate::TooShort => {}
             other => panic!("expected TooShort, got {:?}", other),
         }
+    }
+
+    // ── find_frames phase helpers ─────────────────────────────────────
+
+    fn chain_frame_bits(tcs: &[Timecode]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        for tc in tcs {
+            bits.extend(crate::get_ltc_bits(tc, false));
+        }
+        bits
+    }
+
+    #[test]
+    fn chain_relock_accepts_run_with_consecutive_timecode_pair() {
+        let tcs: Vec<Timecode> = (0..6)
+            .map(|i| Timecode { hours: 1, minutes: 0, seconds: 0, frames: i })
+            .collect();
+        let bits = chain_frame_bits(&tcs);
+        let sync_positions = scan_sync_positions(&bits);
+        assert_eq!(sync_positions.len(), 6);
+
+        let starts = chain_relock_starts(&bits, &sync_positions, 25.0, false);
+        assert_eq!(starts.len(), 6, "every real frame must re-lock");
+        assert!(starts.windows(2).all(|w| w[1] == w[0] + 80), "{:?}", starts);
+    }
+
+    #[test]
+    fn chain_relock_rejects_noise_chain_without_consecutive_timecodes() {
+        // Five sync words spaced exactly 80 bits over a zero payload: the
+        // spacing alone is not enough — the run must carry a consecutive-TC
+        // pair, and an all-zero payload decodes to identical timecodes.
+        let mut bits = vec![0u8; 6 * 80];
+        for k in 0..6u8 {
+            bits[(k as usize) * 80 + SYNC_OFFSET..(k as usize) * 80 + SYNC_OFFSET + 16]
+                .copy_from_slice(&SYNC_WORD);
+        }
+        let sync_positions: Vec<usize> = (0..6).map(|k| k * 80 + SYNC_OFFSET).collect();
+
+        let starts = chain_relock_starts(&bits, &sync_positions, 25.0, false);
+        assert!(starts.is_empty(), "garbage-payload chain must be rejected: {:?}", starts);
+    }
+
+    #[test]
+    fn chain_relock_rejects_runs_shorter_than_five_members() {
+        let tcs: Vec<Timecode> = (0..3)
+            .map(|i| Timecode { hours: 1, minutes: 0, seconds: 0, frames: i })
+            .collect();
+        let bits = chain_frame_bits(&tcs);
+        let sync_positions = scan_sync_positions(&bits);
+        assert_eq!(sync_positions.len(), 3);
+
+        let starts = chain_relock_starts(&bits, &sync_positions, 25.0, false);
+        assert!(starts.is_empty(), "sub-threshold run must be rejected: {:?}", starts);
+    }
+
+    #[test]
+    fn dedupe_near_duplicates_clusters_within_40_bits_keeping_first() {
+        // Clustering is relative to the last *kept* start: 139/141-style
+        // 1-2-bit strays of a kept start collapse into it; anything ≥40
+        // bits past the last kept start opens a new cluster.
+        let starts = vec![220, 100, 142, 139];
+        assert_eq!(dedupe_near_duplicates(starts), vec![100, 142, 220]);
+    }
+
+    #[test]
+    fn dedupe_near_duplicates_keeps_distinct_80_bit_frames() {
+        let starts: Vec<usize> = (0..5).map(|k| k * 80).collect();
+        assert_eq!(dedupe_near_duplicates(starts), (0..5).map(|k| k * 80).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn merge_grid_and_chains_prefers_grid_copy_within_40_bits() {
+        // Chain start 10 is the same frame as grid start 0 — the grid copy
+        // wins; chain start 200 has no grid neighbour and is kept.
+        let merged = merge_grid_and_chains(vec![0, 80], vec![10, 200]);
+        assert_eq!(merged, vec![0, 80, 200]);
     }
 
     // ── compute_ltc_quality sub-analyzers ─────────────────────────────
