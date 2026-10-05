@@ -4724,30 +4724,34 @@ mod tests {
 
     #[test]
     fn test_noise_gaussian_max_decodable() {
-        // Worst-seed strict cliff: std 0.180 (SNR ≈ +8 dB). Beyond it the
-        // decoder still reports Success — but with wrong timecode values.
+        // Post-WP-DR worst-seed strict cliff: std 0.314 (SNR ≈ +4 dB; was
+        // 0.180 pre-integrity-pass). Beyond it the decoder still reports
+        // Success — but with wrong timecode values.
         let tcs = sequential_timecodes(50);
-        let signal = add_gaussian_noise(&sequential_signal(), 0.17, 42);
+        let signal = add_gaussian_noise(&sequential_signal(), 0.25, 42);
         let result = base_decode(&signal);
         assert_ltc_fully_decoded(&result, 40, &tcs);
     }
 
     #[test]
     fn test_noise_impulse_max_decodable() {
-        // Worst-seed strict cliff: p = 0.0041 (a single click on a critical
-        // BCD sample flips that frame's value; the loose bar holds to ≈ 0.21).
+        // Post-WP-DR worst-seed strict cliff: p = 0.056 (was 0.0041 — the
+        // median pre-filter removes click runs the 2-point bit sampler
+        // used to trip over); the loose bar holds to ≈ 0.27.
         let tcs = sequential_timecodes(50);
-        let signal = add_impulse_noise(&sequential_signal(), 0.0035, 1.0, 42);
+        let signal = add_impulse_noise(&sequential_signal(), 0.045, 1.0, 42);
         let result = base_decode(&signal);
         assert_ltc_fully_decoded(&result, 40, &tcs);
     }
 
     #[test]
     fn test_noise_dc_offset_max_decodable() {
-        // Strict cliff at 0.492 ≈ the signal amplitude: beyond it the
-        // waveform no longer crosses zero and detection ends with an Error.
+        // Pre-WP-DR strict cliff: 0.492 ≈ the signal amplitude. The DC
+        // blocker made the dimension frontend-immune — the strict bar now
+        // holds to the sweep harness cap of 8.0 (12× the old cliff); the
+        // pin sits at ~6 with margin below the cap.
         let tcs = sequential_timecodes(50);
-        let signal = add_dc_offset(&sequential_signal(), 0.42);
+        let signal = add_dc_offset(&sequential_signal(), 6.0);
         let result = base_decode(&signal);
         assert_ltc_fully_decoded(&result, 40, &tcs);
     }
@@ -4772,18 +4776,20 @@ mod tests {
 
     #[test]
     fn test_noise_hum_50hz_max_decodable() {
-        // Strict cliff at hum amplitude ≈ 0.50 = signal amplitude (the hum
-        // swamps the bi-phase transitions).
+        // Pre-WP-DR strict cliff: hum amplitude ≈ 0.50 = signal amplitude.
+        // The mains notch made the dimension frontend-immune — the strict
+        // bar now holds to the sweep harness cap of 8.0; pinned at ~6.
         let tcs = sequential_timecodes(50);
-        let signal = add_hum(&sequential_signal(), 48000, 0.42, 50.0);
+        let signal = add_hum(&sequential_signal(), 48000, 6.0, 50.0);
         let result = base_decode(&signal);
-        assert_ltc_fully_decoded(&result, 40, &tcs);
+        assert_ltc_fully_decoded(&result, 35, &tcs);
     }
 
     #[test]
     fn test_noise_hum_60hz_max_decodable() {
+        // Same post-notch immunity as the 50 Hz dimension.
         let tcs = sequential_timecodes(50);
-        let signal = add_hum(&sequential_signal(), 48000, 0.42, 60.0);
+        let signal = add_hum(&sequential_signal(), 48000, 6.0, 60.0);
         let result = base_decode(&signal);
         assert_ltc_fully_decoded(&result, 40, &tcs);
     }
@@ -4826,11 +4832,11 @@ mod tests {
 
     #[test]
     fn test_noise_min_volume_max_attenuation() {
-        // Strict cliff at volume 0.0104, set by the 0.005 absolute
-        // zero-crossing threshold floor (bit amplitude = volume/2 crosses it
-        // below ~0.01). Pinned with ~15 % margin.
+        // Post-WP-DR cliff: volume 0.0041 (was 0.0104, set by the 0.005
+        // absolute zero-crossing threshold floor). The peak-relative floor
+        // follows the signal down; pinned with ~15 % margin.
         let tcs = sequential_timecodes(50);
-        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.012);
+        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.0035);
         let result = base_decode(&signal);
         assert_ltc_fully_decoded(&result, 40, &tcs);
     }
@@ -5899,7 +5905,7 @@ mod tests {
                 let sig = synthesize_ltc_signal(&tcs, 25.0, false, 48000, vol as f32);
                 evaluate_gate(&sig, &tcs)
             };
-            let (limit, _) = bisect_min_pass(probe, 0.12, 1.0, 0.01, 0.002, 0.0005, strict);
+            let (limit, _) = bisect_min_pass(probe, 0.12, 1.0, 0.004, 0.0002, 0.0002, strict);
             let fail_mode = describe_failure(&evaluate_gate(
                 &synthesize_ltc_signal(&tcs, 25.0, false, 48000, (limit / 1.5).max(0.0002) as f32),
                 &tcs,
