@@ -3,11 +3,39 @@
 
 * Unreleased
 
-Main feature is a step change in the builtin LTC decoder's robustness
-(WP-DR): it used to keep reporting a confident decode well after noise
-had corrupted the decoded timecode *values*, and it lost the signal
-entirely to DC offsets and mains hum at amplitudes equal to the signal
-itself. Both gaps are closed.
+Main features are a permanent real-world decode-test asset (WP-RW) — a
+corpus sweep harness plus committed fixtures covering signal classes no
+synthetic test can produce — and the decoder fix the corpus immediately
+paid for: frame detection now re-locks after bitstream shifts, which
+cures a collapse class where long or disturbed recordings lost
+everything after the first glitch.
+
+List of Changes:
+- Decoder: glitch-recovery - frame detection decodes along the dominant
+  80-bit alignment grid only, so a single drop-out or noise burst that
+  shifted the extracted bitstream permanently orphaned every later
+  frame. Accepted sync words now chain re-lock (80-bit-spaced runs with
+  consecutive timecodes), grid decoding stays as the noise baseline,
+  and the fast-path gate uses grid-only confidence so chain-recovered
+  counts cannot skip the detailed decode. On the 49-minute real-world
+  reference recording: chunked decode 92.2% to 99.9%, worst degraded
+  chunk 62.4% to 99.6%, --single-pass 58.7% (first 4 minutes lost,
+  LowConfidence) to 99.9% Success with the full span; the whole-corpus
+  sweep's worst file went from 68.8% LowConfidence to 99.3% Success
+  and all five recording days now pass the timeline oracle cleanly.
+  All WP-DR robustness cliff pins pass unchanged.
+- Testing: a corpus sweep example harness (ltc-corpus-sweep) decodes
+  the local recording corpus end to end, classifies every file by
+  filename pattern, checks per-day cross-device timeline consistency
+  (measurement only — exit 0 on a completed sweep), and emits version-
+  diffable JSON. The committed corpus fixtures pin the field signal
+  classes at every test layer: 24-bit PCM WAV, 16-bit big-endian LPCM
+  in MP4, lossy AAC LTC in m4v, and a real mic track as non-LTC
+  negative (LTC must survive lossy coding — previously unassertable).
+  Known limitation surfaced and pinned: libltc's binding is 16-bit-
+  only, so it cannot decode the 24-bit fixtures or the video
+  extraction pipeline's 24-bit output; cross-backend agreement is
+  asserted on 16-bit material.
 
 List of Changes:
 - Decoder: wrong-value robustness up 2x+ - a new value-integrity pass
