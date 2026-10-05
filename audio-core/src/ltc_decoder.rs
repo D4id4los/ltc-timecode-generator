@@ -6302,49 +6302,50 @@ mod tests {
 
         println!("\n=== sweep complete ===");
     }
-}
 
-// ── evaluate_on_slice decomposition (pure variant math) ─────────────────
 
-#[test]
-fn spb_variants_low_resolution_is_nominal_only() {
-    // Below the 8.0 spb threshold there is no drift window — only nominal.
-    assert_eq!(spb_variants(4.0), vec![4.0]);
-    assert_eq!(spb_variants(7.999), vec![7.999]);
-}
+    // ── evaluate_on_slice decomposition (pure variant math) ─────────────────
 
-#[test]
-fn spb_variants_high_resolution_spans_half_percent_in_five_steps() {
-    let v = spb_variants(100.0);
-    assert_eq!(v.len(), 5);
-    // half_range = 100 * 0.004 = 0.4 → ±0.4 around nominal, symmetric.
-    assert!((v[0] - 99.6).abs() < 1e-9, "first variant {}", v[0]);
-    assert!((v[2] - 100.0).abs() < 1e-9, "middle variant is nominal");
-    assert!((v[4] - 100.4).abs() < 1e-9, "last variant {}", v[4]);
-    assert!(v.windows(2).all(|w| w[0] < w[1]), "variants must ascend");
-}
+    #[test]
+    fn spb_variants_low_resolution_is_nominal_only() {
+        // Below the 8.0 spb threshold there is no drift window — only nominal.
+        assert_eq!(spb_variants(4.0), vec![4.0]);
+        assert_eq!(spb_variants(7.999), vec![7.999]);
+    }
 
-#[test]
-fn spb_variants_small_spb_keeps_minimum_half_range() {
-    // half_range floors at 0.05 so tiny-but-high-resolution spb still
-    // gets a usable search window.
-    let v = spb_variants(8.0);
-    assert_eq!(v.len(), 5);
-    assert!((v[0] - (8.0 - 0.05)).abs() < 1e-9, "first variant {}", v[0]);
-    assert!((v[4] - (8.0 + 0.05)).abs() < 1e-9, "last variant {}", v[4]);
-}
+    #[test]
+    fn spb_variants_high_resolution_spans_half_percent_in_five_steps() {
+        let v = spb_variants(100.0);
+        assert_eq!(v.len(), 5);
+        // half_range = 100 * 0.004 = 0.4 → ±0.4 around nominal, symmetric.
+        assert!((v[0] - 99.6).abs() < 1e-9, "first variant {}", v[0]);
+        assert!((v[2] - 100.0).abs() < 1e-9, "middle variant is nominal");
+        assert!((v[4] - 100.4).abs() < 1e-9, "last variant {}", v[4]);
+        assert!(v.windows(2).all(|w| w[0] < w[1]), "variants must ascend");
+    }
 
-#[test]
-fn phase_window_clamps_quarter_spb_into_5_to_12() {
-    assert_eq!(phase_window(8.0), 5, "8/4 = 2 → clamped up to 5");
-    assert_eq!(phase_window(16.0), 5, "16/4 = 4 → clamped up to 5");
-    assert_eq!(phase_window(24.0), 6, "24/4 = 6 → exact");
-    assert_eq!(phase_window(100.0), 12, "100/4 = 25 → clamped down to 12");
-    assert_eq!(phase_window(1000.0), 12);
-}
+    #[test]
+    fn spb_variants_small_spb_keeps_minimum_half_range() {
+        // half_range floors at 0.05 so tiny-but-high-resolution spb still
+        // gets a usable search window.
+        let v = spb_variants(8.0);
+        assert_eq!(v.len(), 5);
+        assert!((v[0] - (8.0 - 0.05)).abs() < 1e-9, "first variant {}", v[0]);
+        assert!((v[4] - (8.0 + 0.05)).abs() < 1e-9, "last variant {}", v[4]);
+    }
 
-#[test]
-fn phase_window_rounds_quarter_spb_before_clamping() {
-    // 30/4 = 7.5 → rounds to 8 (banker's-unaware round-half-away).
-    assert_eq!(phase_window(30.0), 8);
+    #[test]
+    fn phase_window_clamps_quarter_spb_into_5_to_12() {
+        assert_eq!(phase_window(8.0), 5, "8/4 = 2 → clamped up to 5");
+        assert_eq!(phase_window(16.0), 5, "16/4 = 4 → clamped up to 5");
+        assert_eq!(phase_window(24.0), 6, "24/4 = 6 → exact");
+        assert_eq!(phase_window(100.0), 12, "100/4 = 25 → clamped down to 12");
+        assert_eq!(phase_window(1000.0), 12);
+    }
+
+    #[test]
+    fn phase_window_rounds_quarter_spb_before_clamping() {
+        // 30/4 = 7.5 → rounds to 8 (banker's-unaware round-half-away).
+        assert_eq!(phase_window(30.0), 8);
+    }
 }
