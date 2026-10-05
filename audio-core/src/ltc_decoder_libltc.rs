@@ -96,8 +96,16 @@ pub(crate) fn decode_ltc_samples_libltc(
     );
 
     let result = assemble_result(
-        timecodes, fps, drop_frame, total_duration, sample_rate,
-        initial_apv, decoder.queue_length(), start.elapsed(),
+        timecodes,
+        &AssembleStats {
+            fps,
+            drop_frame,
+            total_duration,
+            sample_rate,
+            initial_apv,
+            queue_length: decoder.queue_length(),
+            processing_time: start.elapsed(),
+        },
     );
 
     info!(
@@ -191,12 +199,9 @@ fn decode_all_chunks(
     Ok(timecodes)
 }
 
-/// Build the final [`LtcDetectionResult`] from the decoded timecodes:
-/// confidence on the 0.0–1.0 fraction scale (same as the builtin decoder),
-/// thresholded status, detail lines, coherent-first-timecode alignment and
-/// the quality report.
-fn assemble_result(
-    timecodes: Vec<FrameTimecode>,
+/// Decoder pass statistics threaded into `assemble_result` alongside the
+/// decoded timecodes.
+struct AssembleStats {
     fps: f64,
     drop_frame: bool,
     total_duration: f64,
@@ -204,7 +209,14 @@ fn assemble_result(
     initial_apv: i32,
     queue_length: i32,
     processing_time: Duration,
-) -> LtcDetectionResult {
+}
+
+/// Build the final [`LtcDetectionResult`] from the decoded timecodes:
+/// confidence on the 0.0–1.0 fraction scale (same as the builtin decoder),
+/// thresholded status, detail lines, coherent-first-timecode alignment and
+/// the quality report.
+fn assemble_result(timecodes: Vec<FrameTimecode>, stats: &AssembleStats) -> LtcDetectionResult {
+    let AssembleStats { fps, drop_frame, total_duration, sample_rate, initial_apv, queue_length, processing_time } = *stats;
     let processing_time_ms = processing_time.as_secs_f64() * 1000.0;
 
     info!("LTC decode (+{:.1}s): using specified FPS {:.2} (drop_frame={})",
@@ -523,7 +535,16 @@ mod tests {
             timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: i },
             timecode_secs: i as f64 / 25.0,
         }).collect();
-        let r = assemble_result(tcs, 25.0, false, 1.0, 48_000, 1920, 0, Duration::from_millis(5));
+        let stats = AssembleStats {
+            fps: 25.0,
+            drop_frame: false,
+            total_duration: 1.0,
+            sample_rate: 48_000,
+            initial_apv: 1920,
+            queue_length: 0,
+            processing_time: Duration::from_millis(5),
+        };
+        let r = assemble_result(tcs, &stats);
         assert!(matches!(r.status, LtcDecodeStatus::Success), "got {:?}", r.status);
         assert_eq!(r.valid_frames, 24);
         assert_eq!(r.total_possible_frames, 25);
@@ -536,7 +557,16 @@ mod tests {
 
     #[test]
     fn assemble_result_empty_timecodes_is_nosyncword_with_quality() {
-        let r = assemble_result(Vec::new(), 25.0, true, 1.0, 48_000, 1920, 3, Duration::from_millis(1));
+        let stats = AssembleStats {
+            fps: 25.0,
+            drop_frame: true,
+            total_duration: 1.0,
+            sample_rate: 48_000,
+            initial_apv: 1920,
+            queue_length: 3,
+            processing_time: Duration::from_millis(1),
+        };
+        let r = assemble_result(Vec::new(), &stats);
         assert!(matches!(r.status, LtcDecodeStatus::NoSyncWord), "got {:?}", r.status);
         assert_eq!(r.valid_frames, 0);
         assert_eq!(r.first_ltc_timecode_secs, 0.0);
