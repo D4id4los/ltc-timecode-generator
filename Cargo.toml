@@ -7,7 +7,7 @@ members = [
   "ltc-slint"
 ]
 [workspace.package]
-version = "0.5.1"
+version = "0.5.2"
 
 [workspace.lints.clippy]
 # Levels for selected clippy lint groups. Add per-lint overrides here.
