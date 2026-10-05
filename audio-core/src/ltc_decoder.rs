@@ -3443,6 +3443,106 @@ mod tests {
         );
     }
 
+    // ── Real-world corpus fixtures (WP-RW) ───────────────────────────────
+    // Committed cuts from the 5-day recording corpus; see
+    // reports/ltc-chunked-decode-anomalies-2026-10.md. Floors are
+    // measured −10 % (measurement date 2026-10-05, decoder post-RW2).
+
+    fn real_world_fixture(name: &str) -> std::path::PathBuf {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("CARGO_MANIFEST_DIR parent")
+            .join("test-data")
+            .join(name);
+        assert!(
+            path.exists(),
+            "committed real-world fixture missing at: {}",
+            path.display()
+        );
+        path
+    }
+
+    /// 24-bit PCM WAV (TASCAM S2 track, cut at 1650 s of the 49-min
+    /// recording) — the 24-bit decode path no synthetic test covers
+    /// (synthetic fixtures are 16-bit).
+    #[test]
+    fn test_wav_real_world_tascam_s2_clean() {
+        let wav_path = real_world_fixture("ltc-rw-tascam-s2-clean-20s.wav");
+
+        let result = decode_ltc_from_wav(&wav_path, 25.0, false, None).unwrap();
+
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for the clean TASCAM fixture, got {:?} (valid={}/{})",
+            result.status, result.valid_frames, result.total_possible_frames,
+        );
+        // Measured 500/500 (2026-10-05); floor = measured − 10 %.
+        assert!(
+            result.valid_frames >= 450,
+            "expected ≥450 valid frames, got {}",
+            result.valid_frames,
+        );
+        // SMPTE values are the contract: measured first/last TC.
+        assert_eq!(
+            result.timecodes.first().map(|t| t.timecode),
+            Some(Timecode { hours: 1, minutes: 48, seconds: 34, frames: 24 }),
+            "first TC must match the measured corpus value",
+        );
+        assert_eq!(
+            result.timecodes.last().map(|t| t.timecode),
+            Some(Timecode { hours: 1, minutes: 48, seconds: 54, frames: 23 }),
+            "last TC must match the measured corpus value",
+        );
+        let secs_spanned = result.timecodes.last().map(|t| t.timecode_secs).unwrap_or(0.0)
+            - result.timecodes.first().map(|t| t.timecode_secs).unwrap_or(0.0);
+        assert!(
+            secs_spanned > 18.0,
+            "20 s fixture must span >18 s of timecode, got {:.2}s",
+            secs_spanned,
+        );
+    }
+
+    /// Mic track (TASCAM S1, loudest 15 s window, max_volume −11.4 dB) —
+    /// voice must not decode as LTC. The sweep's 49-minute version measures
+    /// `NoSyncWord`; any Success here is a false-positive regression.
+    #[test]
+    fn test_wav_real_world_tascam_s1_mic_negative() {
+        let wav_path = real_world_fixture("ltc-rw-tascam-s1-mic-15s.wav");
+
+        let result = decode_ltc_from_wav(&wav_path, 25.0, false, None).unwrap();
+
+        assert!(
+            !matches!(result.status, LtcDecodeStatus::Success),
+            "mic track must not decode to Success, got {:?} (valid={}/{})",
+            result.status, result.valid_frames, result.total_possible_frames,
+        );
+    }
+
+    /// Backend support contract on the 24-bit corpus fixture: the builtin
+    /// decoder decodes it (see `test_wav_real_world_tascam_s2_clean`);
+    /// libltc's binding is 16-bit-only and must reject it with the typed
+    /// `UnsupportedBitDepth` error (pre-existing libltc limitation — corpus
+    /// cross-backend agreement is asserted through the 16-bit mp4 fixture
+    /// in `gui-engine/tests/real_world_fixtures.rs`, whose extraction path
+    /// produces 16-bit PCM both backends read).
+    #[test]
+    fn test_decoder_contract_real_world_fixtures() {
+        let wav_path = real_world_fixture("ltc-rw-tascam-s2-clean-20s.wav");
+
+        let builtin = decode_ltc_from_wav(&wav_path, 25.0, false, None).expect("builtin decode");
+        assert!(matches!(builtin.status, LtcDecodeStatus::Success));
+
+        let libltc = crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(
+            &wav_path, 25.0, false, None,
+        )
+        .expect_err("libltc must reject 24-bit PCM");
+        assert_eq!(
+            libltc,
+            crate::LtcDecodeError::UnsupportedBitDepth { bits: 24 },
+            "libltc binding must reject 24-bit PCM with the typed error",
+        );
+    }
+
     // ── Cross-decoder confidence contract ────────────────────────────────
 
     /// Both decoders must publish `avg_confidence` on the same 0.0–1.0
