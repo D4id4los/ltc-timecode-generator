@@ -246,19 +246,19 @@ mod native {
         let version = rel_payload[0];
         let _flags = read_be_u24(&rel_payload[1..4]);
 
-        let timescale;
-        let duration;
-        let next_track_id_off;
-
-        if version == 0 {
-            timescale = read_be_u32(&rel_payload[12..16]) as u64;
-            duration = read_be_u32(&rel_payload[16..20]) as u64;
-            next_track_id_off = 16 + 4 + 4 + 2 + 10 + 36 + 24; // 96
+        let (timescale, duration, next_track_id_off) = if version == 0 {
+            (
+                read_be_u32(&rel_payload[12..16]) as u64,
+                read_be_u32(&rel_payload[16..20]) as u64,
+                16 + 4 + 4 + 2 + 10 + 36 + 24, // 96
+            )
         } else {
-            timescale = read_be_u32(&rel_payload[20..24]) as u64;
-            duration = read_be_u64(&rel_payload[24..32]);
-            next_track_id_off = 32 + 4 + 2 + 10 + 36 + 24; // shifted
-        }
+            (
+                read_be_u32(&rel_payload[20..24]) as u64,
+                read_be_u64(&rel_payload[24..32]),
+                32 + 4 + 2 + 10 + 36 + 24, // shifted
+            )
+        };
         if timescale == 0 {
             return Err("mvhd timescale is 0".to_string());
         }

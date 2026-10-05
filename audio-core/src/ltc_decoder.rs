@@ -5751,8 +5751,6 @@ mod tests {
             .map(|i| Timecode { hours: 0, minutes: 0, seconds: 0, frames: i })
             .collect();
         let samples = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5);
-        let threshold = 0.005f32; // extract_bits ignores the threshold
-
         // Nominal branch, beats best_valid=0.
         match score_candidate(&mk_ctx(&samples, &[]), 24.0, 0, false, 0) {
             ScoredCandidate::Beat(r) => {

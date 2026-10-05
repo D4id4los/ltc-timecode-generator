@@ -136,14 +136,12 @@ pub fn copy_mode_container_for_input(path: &Path) -> &'static str {
     crate::media_ext::container_for_input(&ext)
 }
 
+/// The output file extension for a container name. Identity by contract:
+/// every supported container name doubles as its file extension, so the
+/// container name is passed through unchanged. Kept as the named extension
+/// source of truth so the mapping has a single home.
 pub fn extension_for_container(container: &str) -> &str {
-    match container {
-        "mov" => "mov",
-        "mkv" => "mkv",
-        "mp4" => "mp4",
-        "mxf" => "mxf",
-        _ => container,
-    }
+    container
 }
 
 pub fn audio_encoder_to_output_format(encoder: &str) -> (&str, &str) {
