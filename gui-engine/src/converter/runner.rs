@@ -1294,37 +1294,24 @@ fn extract_per_file_audio(
             let use_split =
                 settings.split_tracks && settings.channel_map.num_channels() > 0;
 
+            let fx = FileExtraction {
+                settings,
+                probe,
+                file_idx,
+                input_path,
+                channels: &channels,
+                fmt,
+                aext,
+                report,
+                ledger,
+            };
             if use_split {
-                let emitted = extract_split_channels_for_file(
-                    settings,
-                    probe,
-                    file_idx,
-                    input_path,
-                    &channels,
-                    fmt,
-                    aext,
-                    report,
-                    ledger,
-                    total_actual,
-                    &mut cursor,
-                )?;
+                let emitted = extract_split_channels_for_file(fx, total_actual, &mut cursor)?;
                 if emitted == 0 {
                     report.advance_step();
                 }
             } else {
-                extract_merged_audio_for_file(
-                    settings,
-                    probe,
-                    file_idx,
-                    input_path,
-                    &channels,
-                    fmt,
-                    aext,
-                    report,
-                    ledger,
-                    total_actual,
-                    &mut cursor,
-                )?;
+                extract_merged_audio_for_file(fx, total_actual, &mut cursor)?;
             }
         } else if !is_video {
             report.advance_step();
@@ -1333,24 +1320,40 @@ fn extract_per_file_audio(
     Some(())
 }
 
+/// Per-file extraction context: the converter settings, the probed clip
+/// and its naming/format targets, shared by the split and merged
+/// extraction helpers.
+struct FileExtraction<'a, R: ConversionReport + ?Sized> {
+    settings: &'a ConverterSettings,
+    probe: &'a crate::ffprobe::VideoAudioProbe,
+    file_idx: usize,
+    input_path: &'a Path,
+    channels: &'a [(usize, usize)],
+    fmt: &'a str,
+    aext: &'a str,
+    report: &'a R,
+    ledger: &'a mut FailureLedger,
+}
+
 /// Per-file split extraction: one output per surviving (stream, channel)
 /// pair of `channels`. Returns the number of emitted outputs, or `None`
 /// on cancellation. Advances `cursor` past every attempted step.
-// One file's split-extraction request over the surviving channel pairs.
-#[allow(clippy::too_many_arguments)]
-fn extract_split_channels_for_file(
-    settings: &ConverterSettings,
-    probe: &crate::ffprobe::VideoAudioProbe,
-    file_idx: usize,
-    input_path: &Path,
-    channels: &[(usize, usize)],
-    fmt: &str,
-    aext: &str,
-    report: &impl ConversionReport,
-    ledger: &mut FailureLedger,
+fn extract_split_channels_for_file<R: ConversionReport>(
+    fx: FileExtraction<'_, R>,
     total_actual: usize,
     cursor: &mut usize,
 ) -> Option<usize> {
+    let FileExtraction {
+        settings,
+        probe,
+        file_idx,
+        input_path,
+        channels,
+        fmt,
+        aext,
+        report,
+        ledger,
+    } = fx;
     let mut emitted = 0usize;
     for sel in selected_channel_pairs(settings, channels) {
         if check_cancelled(report) {
@@ -1380,21 +1383,22 @@ fn extract_split_channels_for_file(
 
 /// Per-file merged extraction: a single output starting from the first
 /// audio channel of the clip. Returns `None` on cancellation.
-// One file's merged-extraction request; parameters travel together.
-#[allow(clippy::too_many_arguments)]
-fn extract_merged_audio_for_file(
-    settings: &ConverterSettings,
-    probe: &crate::ffprobe::VideoAudioProbe,
-    file_idx: usize,
-    input_path: &Path,
-    channels: &[(usize, usize)],
-    fmt: &str,
-    aext: &str,
-    report: &impl ConversionReport,
-    ledger: &mut FailureLedger,
+fn extract_merged_audio_for_file<R: ConversionReport>(
+    fx: FileExtraction<'_, R>,
     total_actual: usize,
     cursor: &mut usize,
 ) -> Option<()> {
+    let FileExtraction {
+        settings,
+        probe,
+        file_idx,
+        input_path,
+        channels,
+        fmt,
+        aext,
+        report,
+        ledger,
+    } = fx;
     let output_path = settings.merged_audio_output_path(aext);
     let (stream_idx, ch_idx) = channels.first().copied().unwrap_or((0, 0));
     let sample_rate = sample_rate_for_stream(probe, stream_idx);

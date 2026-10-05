@@ -297,16 +297,10 @@ mod tests {
 
         for tc in timecodes {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(
-                tc,
-                drop_frame,
-                samples_per_frame,
-                samples_per_bit,
-                volume,
-                ChannelSel::Left,
-                &mut last_level,
-                &mut frame_buf,
-            );
+            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume, channel: ChannelSel::Left },
+        &mut last_level,
+        &mut frame_buf
+    );
             // Extract left channel (even indices in stereo interleaved buffer)
             for ch in frame_buf.chunks(2) {
                 let clamped = ch[0].clamp(-1.0, 1.0);

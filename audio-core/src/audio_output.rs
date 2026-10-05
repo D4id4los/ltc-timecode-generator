@@ -174,10 +174,12 @@ impl AudioCore {
             sample_format,
             ltc_consumer,
             beep_consumer,
-            streaming.clone(),
-            underrun_count.clone(),
-            callback_counter.clone(),
-            err_handler,
+            StreamContext {
+                streaming: streaming.clone(),
+                underrun_count: underrun_count.clone(),
+                callback_counter: callback_counter.clone(),
+                err_handler: Box::new(err_handler),
+            },
         )?;
 
         let playing = Arc::new(AtomicBool::new(false));
@@ -264,16 +266,10 @@ impl AudioCore {
                 .map_err(|e| format!("Producer lock error: {}", e))?;
             for _ in 0..prefill_count {
                 frame_buf.fill(0.0);
-                generate_ltc_frame_stereo(
-                    &prefill_tc,
-                    drop_frame,
-                    prefill_total,
-                    prefill_spb,
-                    ltc_volume,
-                    ltc_channel,
-                    &mut prefill_level,
-                    &mut frame_buf[..prefill_total * 2],
-                );
+                generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &prefill_tc, drop_frame, total_samples: prefill_total, samples_per_bit: prefill_spb, volume: ltc_volume, channel: ltc_channel },
+        &mut prefill_level,
+        &mut frame_buf[..prefill_total * 2]
+    );
                 let pushed = producer.push_slice(&frame_buf[..prefill_total * 2]);
                 if pushed < prefill_total * 2 {
                     warn!(
@@ -663,43 +659,49 @@ fn select_best_config(
         .ok_or_else(|| "No supported audio output config found for this device".to_string())
 }
 
-// Stream-build request: device/config/stream-kind descriptors stay flat.
-#[allow(clippy::too_many_arguments)]
+/// Everything the audio callback and its bookkeeping need: the shared
+/// flags/counters and the error handler, threaded into both stream builders
+/// as one request.
+struct StreamContext {
+    streaming: Arc<AtomicBool>,
+    underrun_count: Arc<AtomicU64>,
+    callback_counter: Arc<AtomicU64>,
+    err_handler: Box<dyn Fn(cpal::Error) + Send>,
+}
+
 fn build_stream_for_format(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
     ltc_consumer: HeapConsumer<f32>,
     beep_consumer: HeapConsumer<f32>,
-    streaming: Arc<AtomicBool>,
-    underrun_count: Arc<AtomicU64>,
-    callback_counter: Arc<AtomicU64>,
-    err_handler: impl Fn(cpal::Error) + Send + 'static,
+    ctx: StreamContext,
 ) -> Result<cpal::Stream, String> {
     match sample_format {
-        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, ltc_consumer, beep_consumer, streaming, underrun_count, callback_counter, err_handler),
-        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, ltc_consumer, beep_consumer, streaming, underrun_count, callback_counter, err_handler),
-        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, ltc_consumer, beep_consumer, streaming, underrun_count, callback_counter, err_handler),
-        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, ltc_consumer, beep_consumer, streaming, underrun_count, callback_counter, err_handler),
+        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, ltc_consumer, beep_consumer, ctx),
+        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, ltc_consumer, beep_consumer, ctx),
+        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, ltc_consumer, beep_consumer, ctx),
+        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, ltc_consumer, beep_consumer, ctx),
         other => Err(format!("Unsupported sample format: {:?}", other)),
     }
 }
 
-// Generic stream-build core mirrors build_stream_for_format's shape.
-#[allow(clippy::too_many_arguments)]
 fn build_stream_generic<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mut ltc_consumer: HeapConsumer<f32>,
     mut beep_consumer: HeapConsumer<f32>,
-    streaming: Arc<AtomicBool>,
-    underrun_count: Arc<AtomicU64>,
-    callback_counter: Arc<AtomicU64>,
-    err_handler: impl Fn(cpal::Error) + Send + 'static,
+    ctx: StreamContext,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
+    let StreamContext {
+        streaming,
+        underrun_count,
+        callback_counter,
+        err_handler,
+    } = ctx;
     let stream = device
         .build_output_stream::<T, _, _>(
             *config,
@@ -1180,17 +1182,11 @@ fn detect_underruns(
 
 /// Generate one stereo LTC frame into `frame_buf` and push it into the ring.
 /// Returns `false` when the producer mutex is poisoned (thread must exit).
-// One scheduler tick: frame buffer, ring, timecode and mute state.
-#[allow(clippy::too_many_arguments)]
 fn generate_and_push_frame(
     ltc_producer: &Arc<Mutex<HeapProducer<f32>>>,
     frame_buf: &mut Vec<f32>,
     needed: usize,
-    tc: &crate::types::Timecode,
-    drop_frame: bool,
-    samples_per_bit: f32,
-    ltc_volume: f32,
-    ltc_channel: ChannelSel,
+    params: crate::ltc_encoder::LtcFrameParams<'_>,
     last_level: &mut (f32, f32),
     push_stats: &mut FramePushStats,
     events: &Arc<Mutex<Vec<AudioEvent>>>,
@@ -1198,12 +1194,7 @@ fn generate_and_push_frame(
     frame_buf.resize(needed, 0.0);
 
     generate_ltc_frame_stereo(
-        tc,
-        drop_frame,
-        needed / 2,
-        samples_per_bit,
-        ltc_volume,
-        ltc_channel,
+        crate::ltc_encoder::LtcFrameParams { total_samples: needed / 2, ..params },
         last_level,
         &mut frame_buf[..needed],
     );
@@ -1313,9 +1304,16 @@ fn ltc_scheduler_thread(
         // ── Generate LTC frame + push into the ring buffer ──
         let needed = total_samples * 2;
         if !generate_and_push_frame(
-            &ltc_producer, &mut frame_buf, needed, &tc, drop_frame,
-            samples_per_bit, ltc_volume, ltc_channel, &mut last_level,
-            &mut push_stats, &events,
+            &ltc_producer, &mut frame_buf, needed,
+            crate::ltc_encoder::LtcFrameParams {
+                tc: &tc,
+                drop_frame,
+                total_samples: needed / 2,
+                samples_per_bit,
+                volume: ltc_volume,
+                channel: ltc_channel,
+            },
+            &mut last_level, &mut push_stats, &events,
         ) {
             return;
         }

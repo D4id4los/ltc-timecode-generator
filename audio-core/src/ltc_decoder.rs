@@ -601,8 +601,19 @@ fn score_candidate(
     };
 
     ScoredCandidate::Beat(ScoredResult::from_frame_starts(
-        ctx.fps, ctx.drop_frame, spb, phase, total_possible, &bits, frame_starts, ctx.sample_rate,
-        details_entry, adaptive, grid_valid,
+        CandidateTiming {
+            fps: ctx.fps,
+            drop_frame: ctx.drop_frame,
+            sample_rate: ctx.sample_rate,
+            spb,
+            phase,
+        },
+        total_possible,
+        &bits,
+        frame_starts,
+        details_entry,
+        adaptive,
+        grid_valid,
     ))
 }
 
@@ -1379,10 +1390,9 @@ fn quality_score(
     score.clamp(0.0, 1.0)
 }
 
-/// Human-readable summary of issues found.
-// Quality-report inputs: frame scan, spans and glitches of one decode.
-#[allow(clippy::too_many_arguments)]
-fn quality_summary(
+/// Issue counters and drift spans of one decode, feeding the
+/// human-readable quality summary.
+struct QualityIssueStats {
     usable_coverage: f64,
     block_count: usize,
     edit_count: u32,
@@ -1391,8 +1401,20 @@ fn quality_summary(
     missing_frames: u32,
     worst_block_drift_frames: f64,
     worst_slope: f64,
-    fps: f64,
-) -> String {
+}
+
+/// Human-readable summary of issues found.
+fn quality_summary(stats: QualityIssueStats, fps: f64) -> String {
+    let QualityIssueStats {
+        usable_coverage,
+        block_count,
+        edit_count,
+        backward_jump_count,
+        glitch_count,
+        missing_frames,
+        worst_block_drift_frames,
+        worst_slope,
+    } = stats;
     let mut parts: Vec<String> = Vec::new();
     if edit_count > 0 || backward_jump_count > 0 {
         parts.push(format!("{} TC jump(s) ({} backward)", edit_count, backward_jump_count));
@@ -1452,14 +1474,16 @@ pub fn compute_ltc_quality(result: &LtcDetectionResult) -> Option<LtcQualityRepo
     let grade = QualityGrade::from_score(score);
 
     let summary = quality_summary(
-        drift.usable_coverage,
-        drift.blocks.len(),
-        gaps.edit_count,
-        gaps.backward_jump_count,
-        glitches.glitch_count,
-        missing_frames,
-        drift.worst_block_drift_frames,
-        drift.worst_slope,
+        QualityIssueStats {
+            usable_coverage: drift.usable_coverage,
+            block_count: drift.blocks.len(),
+            edit_count: gaps.edit_count,
+            backward_jump_count: gaps.backward_jump_count,
+            glitch_count: glitches.glitch_count,
+            missing_frames,
+            worst_block_drift_frames: drift.worst_block_drift_frames,
+            worst_slope: drift.worst_slope,
+        },
         fps,
     );
 
@@ -1854,7 +1878,18 @@ fn try_decode_via_zc_intervals(
     );
 
     Some(ScoredResult::from_frame_starts(
-        fps, drop_frame, spb, zc[0], total_possible, &bits, frame_starts, sample_rate, details_entry, false,
+        CandidateTiming {
+            fps,
+            drop_frame,
+            sample_rate,
+            spb,
+            phase: zc[0],
+        },
+        total_possible,
+        &bits,
+        frame_starts,
+        details_entry,
+        false,
         grid_valid,
     ))
 }
@@ -2260,24 +2295,35 @@ struct ScoredResult {
     grid_valid: u32,
 }
 
+/// Decode settings plus the candidate alignment identity (spb/phase)
+/// shared by every `ScoredResult::from_frame_starts` construction site.
+struct CandidateTiming {
+    fps: f64,
+    drop_frame: bool,
+    sample_rate: u32,
+    spb: f64,
+    phase: usize,
+}
+
 impl ScoredResult {
     /// Single home of the `(phase + start·spb)/sample_rate` timing and the
     /// frame_index renumbering — previously 4 near-copies.
-    // Single home of the ScoredResult construction parameter block.
-    #[allow(clippy::too_many_arguments)]
     fn from_frame_starts(
-        fps: f64,
-        drop_frame: bool,
-        spb: f64,
-        phase: usize,
+        timing: CandidateTiming,
         total_possible: u32,
         bits: &[u8],
         frame_starts: Vec<usize>,
-        sample_rate: u32,
         details_entry: String,
         adaptive: bool,
         grid_valid: u32,
     ) -> ScoredResult {
+        let CandidateTiming {
+            fps,
+            drop_frame,
+            sample_rate,
+            spb,
+            phase,
+        } = timing;
         let valid_frames = frame_starts.len() as u32;
         let timecodes: Vec<FrameTimecode> = frame_starts
             .iter()
@@ -2370,8 +2416,18 @@ fn decode_full_file(
     );
     let grid_valid = if use_adaptive { scan_adaptive.grid_valid } else { scan_nominal.grid_valid };
     ScoredResult::from_frame_starts(
-        params.fps, params.drop_frame, params.spb, absolute_phase, total_possible,
-        &bits, frame_starts, sample_rate, details_entry, use_adaptive,
+        CandidateTiming {
+            fps: params.fps,
+            drop_frame: params.drop_frame,
+            sample_rate,
+            spb: params.spb,
+            phase: absolute_phase,
+        },
+        total_possible,
+        &bits,
+        frame_starts,
+        details_entry,
+        use_adaptive,
         grid_valid,
     )
 }
@@ -2754,10 +2810,10 @@ mod tests {
         let mut out = Vec::with_capacity(total_frames * samples_per_frame);
         for _ in 0..total_frames {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(
-                &tc, false, samples_per_frame, samples_per_bit, volume,
-                ChannelSel::Left, &mut last_level, &mut frame_buf,
-            );
+            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples_per_frame, samples_per_bit, volume, channel: ChannelSel::Left },
+        &mut last_level,
+        &mut frame_buf
+    );
             out.extend(frame_buf.iter().step_by(2).copied());
             tc = crate::increment_timecode(&tc, fps, false);
         }
@@ -2813,11 +2869,8 @@ mod tests {
     fn decode_ltc_from_wav_pre_cancelled_returns_cancelled_error() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("pre-cancelled.wav");
-        generate_test_wav(
-            &path,
-            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, ChannelSel::Both, 0.5, 48000, 1.0,
-        );
+        let spec = TestSignalSpec { fps: 25.0, drop_frame: false, sample_rate: 48000, channel: ChannelSel::Both, volume: 0.5 };
+        generate_test_wav(&path, &spec, Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, 1.0);
         let cancel = AtomicBool::new(true);
         let err = decode_ltc_from_wav(&path, 25.0, false, Some(&cancel))
             .expect_err("pre-cancelled decode must not produce a result");
@@ -2826,18 +2879,18 @@ mod tests {
 
     // ── WAV generation helper ────────────────────────────────────────────
 
-    // Test-fixture render request: timecodes, rate, level, drift, path.
-    #[allow(clippy::too_many_arguments)]
-    fn generate_test_wav(
-        path: &Path,
-        start_tc: Timecode,
+    /// Signal spec of a generated test WAV: rate, frame shape, routing and
+    /// level, shared by both WAV generation helpers.
+    struct TestSignalSpec {
         fps: f64,
         drop_frame: bool,
+        sample_rate: u32,
         channel: ChannelSel,
         volume: f32,
-        sample_rate: u32,
-        duration_secs: f64,
-    ) {
+    }
+
+    fn generate_test_wav(path: &Path, spec: &TestSignalSpec, start_tc: Timecode, duration_secs: f64) {
+        let TestSignalSpec { fps, drop_frame, sample_rate, channel, volume } = *spec;
         let total_frames = (duration_secs * fps).ceil() as u64;
         let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
         let samples_per_bit = samples_per_frame as f32 / 80.0;
@@ -2856,16 +2909,10 @@ mod tests {
 
         for _ in 0..total_frames {
             frame_buf.fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc,
-                drop_frame,
-                samples_per_frame,
-                samples_per_bit,
-                volume,
-                channel,
-                &mut last_level,
-                &mut frame_buf[..samples_per_frame * 2],
-            );
+            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume, channel },
+        &mut last_level,
+        &mut frame_buf[..samples_per_frame * 2]
+    );
 
             for &sample in &frame_buf[..samples_per_frame * 2] {
                 let clamped = sample.clamp(-1.0, 1.0);
@@ -2879,19 +2926,16 @@ mod tests {
         writer.finalize().unwrap();
     }
 
-    // Prefixed variant mirrors generate_test_wav's parameter shape.
-    #[allow(clippy::too_many_arguments)]
+    // Prefixed variant: silent_prefix_secs travels separately, the rest is
+    // the shared TestSignalSpec.
     fn generate_test_wav_with_prefix(
         path: &Path,
+        spec: &TestSignalSpec,
         silent_prefix_secs: f64,
         start_tc: Timecode,
-        fps: f64,
-        drop_frame: bool,
-        channel: ChannelSel,
-        volume: f32,
-        sample_rate: u32,
         duration_secs: f64,
     ) {
+        let TestSignalSpec { fps, drop_frame, sample_rate, channel, volume } = *spec;
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate,
@@ -2916,16 +2960,10 @@ mod tests {
 
         for _ in 0..total_frames {
             frame_buf.fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc,
-                drop_frame,
-                samples_per_frame,
-                samples_per_bit,
-                volume,
-                channel,
-                &mut last_level,
-                &mut frame_buf[..samples_per_frame * 2],
-            );
+            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume, channel },
+        &mut last_level,
+        &mut frame_buf[..samples_per_frame * 2]
+    );
 
             for &sample in &frame_buf[..samples_per_frame * 2] {
                 let clamped = sample.clamp(-1.0, 1.0);
@@ -2954,7 +2992,8 @@ mod tests {
     ) -> LtcDetectionResult {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("test_ltc.wav");
-        generate_test_wav(&path, start_tc, fps, drop_frame, channel, volume, sample_rate, duration_secs);
+        let spec = TestSignalSpec { fps, drop_frame, sample_rate, channel, volume };
+        generate_test_wav(&path, &spec, start_tc, duration_secs);
         decode_ltc_from_wav(&path, fps, drop_frame, None).unwrap()
     }
 
@@ -3144,10 +3183,10 @@ mod tests {
         let mut frame_buf = vec![0.0f32; samples_per_frame * 2];
         for _ in 0..50 {
             frame_buf.fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc, false, samples_per_frame, samples_per_bit, 0.5,
-                ChannelSel::Right, &mut last_level, &mut frame_buf,
-            );
+            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples_per_frame, samples_per_bit, volume: 0.5, channel: ChannelSel::Right },
+        &mut last_level,
+        &mut frame_buf
+    );
             for (i, &sample) in frame_buf.iter().enumerate() {
                 let s = if i % 2 == 0 {
                     // ch0: low-level noise, deterministic, peak ~0.05
@@ -3203,12 +3242,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("mid_signal.wav");
 
-        generate_test_wav_with_prefix(
-            &path,
-            0.5,
-            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, ChannelSel::Both, 0.5, 48000, 1.5,
-        );
+        let spec = TestSignalSpec { fps: 25.0, drop_frame: false, sample_rate: 48000, channel: ChannelSel::Both, volume: 0.5 };
+        generate_test_wav_with_prefix(&path, &spec, 0.5, Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, 1.5);
 
         let result = decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Success),
@@ -3231,12 +3266,8 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("offset_test.wav");
 
-            generate_test_wav_with_prefix(
-                &path,
-                silent_secs,
-                Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 },
-                25.0, false, ChannelSel::Both, 0.5, 48000, 1.0,
-            );
+            let spec = TestSignalSpec { fps: 25.0, drop_frame: false, sample_rate: 48000, channel: ChannelSel::Both, volume: 0.5 };
+            generate_test_wav_with_prefix(&path, &spec, silent_secs, Timecode { hours: 2, minutes: 0, seconds: 0, frames: 0 }, 1.0);
 
             let result = decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
             assert!(matches!(result.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence),
@@ -3390,11 +3421,8 @@ mod tests {
     fn test_decode_ltc_from_wav_valid_status() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("valid_check.wav");
-        generate_test_wav(
-            &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, ChannelSel::Both, 0.5, 48000, 1.0,
-        );
+        let spec = TestSignalSpec { fps: 25.0, drop_frame: false, sample_rate: 48000, channel: ChannelSel::Both, volume: 0.5 };
+        generate_test_wav(&path, &spec, Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 }, 1.0);
         let result = decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
         assert!(
             matches!(result.status, LtcDecodeStatus::Success),
@@ -5680,8 +5708,19 @@ mod tests {
         bits.extend_from_slice(&frame_bits); // two frames worth
 
         let r = ScoredResult::from_frame_starts(
-            25.0, false, 24.0, 480, 5, &bits, vec![0, 80], 48000,
-            "details".to_string(), false, 2,
+            CandidateTiming {
+                fps: 25.0,
+                drop_frame: false,
+                sample_rate: 48000,
+                spb: 24.0,
+                phase: 480,
+            },
+            5,
+            &bits,
+            vec![0, 80],
+            "details".to_string(),
+            false,
+            2,
         );
 
         assert_eq!(r.valid_frames, 2, "valid_frames == frame_starts.len()");

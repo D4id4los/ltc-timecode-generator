@@ -579,16 +579,10 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     for frame_num in 0..total_frames {
         frame_buf.fill(0.0);
-        generate_ltc_frame_stereo(
-            &tc,
-            drop_frame,
-            samples_per_frame,
-            samples_per_bit,
-            volume,
-            channel,
-            &mut last_level,
-            &mut frame_buf[..samples_per_frame * 2],
-        );
+        generate_ltc_frame_stereo(audio_core::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume, channel },
+        &mut last_level,
+        &mut frame_buf[..samples_per_frame * 2]
+    );
 
         for &sample in &frame_buf[..samples_per_frame * 2] {
             let clamped = sample.clamp(-1.0, 1.0);

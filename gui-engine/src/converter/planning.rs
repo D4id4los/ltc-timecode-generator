@@ -312,8 +312,6 @@ fn fallback_per_clip_steps(
 
 /// One AudioChannelConcat output per surviving channel-map slot, carrying
 /// that track's segments across all clips.
-// Concat plan inputs: clips, channel pair, naming and prefix as one call.
-#[allow(clippy::too_many_arguments)]
 fn concat_steps_for(
     settings: &ConverterSettings,
     reference: &[(usize, usize)],

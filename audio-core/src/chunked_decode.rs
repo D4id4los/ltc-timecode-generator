@@ -1320,16 +1320,10 @@ mod tests {
 
         for _ in 0..num_frames {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(
-                &tc,
-                drop_frame,
-                samples_per_frame,
-                samples_per_bit,
-                0.5,
-                channel,
-                &mut last_level,
-                &mut frame_buf[..samples_per_frame * 2],
-            );
+            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume: 0.5, channel },
+        &mut last_level,
+        &mut frame_buf[..samples_per_frame * 2]
+    );
 
             for &sample in &frame_buf[..samples_per_frame * 2] {
                 let clamped = sample.clamp(-1.0, 1.0);
@@ -1369,16 +1363,10 @@ mod tests {
 
         for _ in 0..num_frames {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(
-                &tc,
-                drop_frame,
-                samples_per_frame,
-                samples_per_bit,
-                0.5,
-                ChannelSel::Both,
-                &mut last_level,
-                &mut frame_buf[..samples_per_frame * 2],
-            );
+            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume: 0.5, channel: ChannelSel::Both },
+        &mut last_level,
+        &mut frame_buf[..samples_per_frame * 2]
+    );
 
             for &sample in &frame_buf[..samples_per_frame * 2] {
                 let clamped = sample.clamp(-1.0, 1.0);
@@ -1713,10 +1701,10 @@ mod tests {
         let mut out = Vec::with_capacity(total_frames * samples_per_frame);
         for _ in 0..total_frames {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(
-                &tc, false, samples_per_frame, samples_per_bit, volume,
-                ChannelSel::Left, &mut last_level, &mut frame_buf,
-            );
+            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples_per_frame, samples_per_bit, volume, channel: ChannelSel::Left },
+        &mut last_level,
+        &mut frame_buf
+    );
             out.extend(frame_buf.iter().step_by(2).copied());
             tc = crate::increment_timecode(&tc, fps, false);
         }

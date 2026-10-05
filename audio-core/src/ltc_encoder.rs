@@ -152,6 +152,17 @@ pub fn compute_frame_sample_count(
 }
 
 // ── LTC audio frame generation ─────────────────────────────────────────────
+/// Parameters of one LTC frame render: the frame's timecode content, the
+/// output timing, and the channel routing/level.
+pub struct LtcFrameParams<'a> {
+    pub tc: &'a Timecode,
+    pub drop_frame: bool,
+    pub total_samples: usize,
+    pub samples_per_bit: f32,
+    pub volume: f32,
+    pub channel: ChannelSel,
+}
+
 
 /// Generate one stereo LTC audio frame (bi-phase mark modulation).
 ///
@@ -163,21 +174,22 @@ pub fn compute_frame_sample_count(
 /// low-pass-filtered output value, and **must** be passed between successive
 /// frames for glitch-free continuous output.
 ///
-/// `channel` selects which stereo outputs carry the signal.
-///
-/// `stereo_out` must be at least `total_samples * 2` elements.
-// Cohesive render request: rate, timecode, routing, level, carry state.
-#[allow(clippy::too_many_arguments)]
+/// The frame's content, timing and routing as one render request; the
+/// mutable carry state (`last_level`) and the output buffer stay explicit
+/// parameters. `stereo_out` must be at least `total_samples * 2` elements.
 pub fn generate_ltc_frame_stereo(
-    tc: &Timecode,
-    drop_frame: bool,
-    total_samples: usize,
-    samples_per_bit: f32,
-    volume: f32,
-    channel: ChannelSel,
+    params: LtcFrameParams<'_>,
     last_level: &mut (f32, f32),
     stereo_out: &mut [f32],
 ) {
+    let LtcFrameParams {
+        tc,
+        drop_frame,
+        total_samples,
+        samples_per_bit,
+        volume,
+        channel,
+    } = params;
     let bits = get_ltc_bits(tc, drop_frame);
     let play_left = matches!(channel, ChannelSel::Both | ChannelSel::Left);
     let play_right = matches!(channel, ChannelSel::Both | ChannelSel::Right);
@@ -499,7 +511,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 0.5, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         assert_eq!(buf.len(), total_samples * 2);
     }
@@ -512,7 +527,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         let has_energy = buf.iter().any(|&s| s.abs() > 0.5);
         assert!(has_energy, "frame should contain non-trivial signal");
@@ -528,7 +546,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
@@ -546,7 +567,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Left, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Left },
+        &mut level,
+        &mut buf
+    );
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
@@ -562,7 +586,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Right, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Right },
+        &mut level,
+        &mut buf
+    );
 
         let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
@@ -580,7 +607,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.0, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 0.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         let max_amp = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(max_amp < 1e-10, "zero volume should produce silence");
@@ -594,7 +624,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         let max_amp = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(max_amp <= 1.0, "amplitude should not exceed 1.0, got {}", max_amp);
@@ -610,7 +643,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         // After one frame, level.0 (current_level) should be inverted from start
         // Start: 1.0. First bit always toggles: -1.0. After 80 bits (40 toggles = even), back to 1.0.
@@ -630,10 +666,16 @@ mod tests {
         let mut buf2 = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf1);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf1
+    );
         let last_sample_frame1 = buf1[buf1.len() - 2]; // left channel, last sample
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf2);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf2
+    );
         let first_sample_frame2 = buf2[0]; // left channel, first sample
 
         // The last sample of frame 1 and first sample of frame 2 should be close
@@ -684,7 +726,10 @@ mod tests {
         let mut buf = vec![-1.0f32; total_samples * 2]; // init with sentinel
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         // All samples should have been overwritten (not -1.0)
         // Actually some may be exactly 0.0, but the sentinel should not remain
@@ -702,7 +747,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 1.0, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 1.0, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         let mean: f32 = buf.iter().sum::<f32>() / buf.len() as f32;
         // Bi-phase is DC-free, so mean should be very close to 0
@@ -719,7 +767,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 0.5, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         assert_eq!(buf.len(), total_samples * 2);
         let has_energy = buf.iter().any(|&s| s.abs() > 0.1);
@@ -734,7 +785,10 @@ mod tests {
         let mut buf = vec![0.0f32; total_samples * 2];
         let mut level = (1.0f32, 1.0f32);
 
-        generate_ltc_frame_stereo(&tc, false, total_samples, samples_per_bit, 0.5, ChannelSel::Both, &mut level, &mut buf);
+        generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples, samples_per_bit, volume: 0.5, channel: ChannelSel::Both },
+        &mut level,
+        &mut buf
+    );
 
         assert_eq!(buf.len(), total_samples * 2);
         let has_energy = buf.iter().any(|&s| s.abs() > 0.1);
@@ -817,10 +871,10 @@ mod tests {
         for _ in 0..num_frames {
             let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
             frame_buf[..samples * 2].fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc, false, samples, spb,
-                0.5, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
-            );
+            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples, samples_per_bit: spb, volume: 0.5, channel: ChannelSel::Both },
+        &mut last_level,
+        &mut frame_buf[..samples * 2]
+    );
             total_generated += samples as u64;
             tc = increment_timecode(&tc, fps, false);
             accumulator = new_acc;
@@ -852,10 +906,10 @@ mod tests {
         for _ in 0..num_frames {
             let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
             frame_buf[..samples * 2].fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc, false, samples, spb,
-                0.5, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
-            );
+            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples, samples_per_bit: spb, volume: 0.5, channel: ChannelSel::Both },
+        &mut last_level,
+        &mut frame_buf[..samples * 2]
+    );
             total_generated += samples as u64;
             tc = increment_timecode(&tc, fps, false);
             accumulator = new_acc;
@@ -1180,10 +1234,10 @@ mod tests {
         for _ in 0..num_frames {
             let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
             frame_buf[..samples * 2].fill(0.0);
-            generate_ltc_frame_stereo(
-                &tc, false, samples, spb,
-                0.8, ChannelSel::Both, &mut last_level, &mut frame_buf[..samples * 2],
-            );
+            generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples, samples_per_bit: spb, volume: 0.8, channel: ChannelSel::Both },
+        &mut last_level,
+        &mut frame_buf[..samples * 2]
+    );
             audio.extend(frame_buf[..samples * 2].iter().step_by(2).copied());
             expected.push(tc);
             accumulator = new_acc;
