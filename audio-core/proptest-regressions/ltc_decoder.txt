@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 07defcb8c6502fd2122d22d7798f4a6f6ddd820ec319b8e95c22875fc4c2ba71 # shrinks to sig = PropSignal { start_tc: Timecode { hours: 0, minutes: 0, seconds: 40, frames: 0 }, fps: 24.0, drop_frame: false, sample_rate: 44100, frames: 8, volume: 0.2, noise_std: 0.0, noise_seed: 0, dc_offset: 0.0, impulse_prob: 0.0, impulse_amp: 1.0, impulse_seed: 0, drift_ppm: 0.0, hum_amp: 0.0, hum_freq: 50.0 }
+cc daa0e0faed9d952ee68f8163887f731d7ed720e70843f327f4ded3238869de6d # shrinks to sig = PropSignal { start_tc: Timecode { hours: 20, minutes: 23, seconds: 19, frames: 20 }, fps: 25.0, drop_frame: false, sample_rate: 44100, frames: 23, volume: 0.4389396, noise_std: 0.0, noise_seed: 0, dc_offset: 0.0, impulse_prob: 0.0, impulse_amp: 1.0, impulse_seed: 0, drift_ppm: 0.0, hum_amp: 0.0, hum_freq: 50.0 }

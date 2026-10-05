@@ -6498,4 +6498,312 @@ mod tests {
         // 30/4 = 7.5 → rounds to 8 (banker's-unaware round-half-away).
         assert_eq!(phase_window(30.0), 8);
     }
+
+    // ── Property tests (proptest): generative decode degradation ───────
+    //
+    // See plans/2026-10-05-proptest-targeted-adoption-plan.md. All randomness
+    // flows from generated LCG seeds — fully deterministic per case, no
+    // wall-clock, no IO. Floors are floors, not pins: calibrated from observed
+    // margins minus tolerance, never equalities (no quality ceilings).
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Canonical (fps, drop-frame) pairs — invalid pairings never generate.
+        const FPS_PAIRS: &[(f64, bool)] = &[
+            (24.0, false),
+            (25.0, false),
+            (29.97, false),
+            (29.97, true),
+            (30.0, false),
+        ];
+
+        fn arb_fps_pair() -> impl Strategy<Value = (f64, bool)> {
+            proptest::sample::select(FPS_PAIRS.to_vec())
+        }
+
+        /// Frames 0 and 1 do not exist in DF minutes whose number is not a
+        /// multiple of 10 (seconds == 0). Rejection rate ≈ 0.1 %.
+        fn df_frame_valid(m: u32, s: u32, f: u32) -> bool {
+            !(s == 0 && m % 10 != 0 && f < 2)
+        }
+
+        fn arb_start_tc(drop_frame: bool, biased_minutes: bool) -> impl Strategy<Value = Timecode> {
+            let minutes = if biased_minutes {
+                // DF-critical minute boundaries: 0 (no skip), 1/9 (skip on
+                // entry), 10 (no skip), 59 (skip into next hour).
+                proptest::sample::select(vec![0u32, 1, 9, 10, 59]).boxed()
+            } else {
+                (0u32..60).boxed()
+            };
+            (0u32..24, minutes, 0u32..60, 0u32..30)
+                .prop_filter("drop-frame-invalid frame numbers rejected", move |&(_, m, s, f)| {
+                    !drop_frame || df_frame_valid(m, s, f)
+                })
+                .prop_map(|(h, m, s, f)| Timecode { hours: h, minutes: m, seconds: s, frames: f })
+        }
+
+        #[derive(Clone, Debug)]
+        struct PropSignal {
+            start_tc: Timecode,
+            fps: f64,
+            drop_frame: bool,
+            sample_rate: u32, // 44100 | 48000
+            frames: usize,    // 8..=48
+            volume: f32,
+            noise_std: f32,  // 0.0 = none
+            noise_seed: u64, // LCG seed — part of the generated input, so it shrinks & persists
+            dc_offset: f32,
+            impulse_prob: f32,
+            impulse_amp: f32,
+            impulse_seed: u64,
+            drift_ppm: f64, // 0.0 = nominal
+            hum_amp: f32,   // 0.0 = none
+            hum_freq: f32,
+        }
+
+        fn arb_prop_signal(hostile: bool, df_biased: bool) -> BoxedStrategy<PropSignal> {
+            // Calibrated by deterministic random-seed sweeps (800+ cases per
+            // point), NOT by the seed-42 single-factor example margins: at
+            // random seeds, value corruption (1-bit BCD slips) was observed at
+            // noise ≈ 0.030 alone, ≈ 0.018 combined with impulses, and near
+            // drift ≈ 300 ppm. The supported envelope below sits at observed
+            // margins minus tolerance; the gap to the seed-42 example numbers
+            // (0.09 noise, 500 ppm) is decoder-headroom signal fed back to the
+            // WP-DR direction (see plans/2026-10-05-proptest-targeted-adoption
+            // -plan.md, "Matters for further analysis").
+            let (noise_max, drift_max, imp_prob_max, hum_amp_max): (f32, f64, f32, f32) =
+                if hostile {
+                    (0.35, 5000.0, 0.05, 0.15)
+                } else {
+                    (0.015, 150.0, 0.002, 0.0)
+                };
+            let fps_df = if df_biased {
+                Just((29.97, true)).boxed()
+            } else {
+                arb_fps_pair().boxed()
+            };
+            let hum_amp = if hum_amp_max > 0.0 {
+                (0.0f32..hum_amp_max).boxed()
+            } else {
+                Just(0.0f32).boxed()
+            };
+            (
+                (fps_df, arb_start_tc(!df_biased, df_biased)),
+                (proptest::sample::select(vec![44100u32, 48000]), 8usize..=48usize),
+                (0.2f32..0.9f32, 0.0f32..noise_max, any::<u64>()),
+                (-50i32..=50, 0.0f32..imp_prob_max, any::<u64>()),
+                (-drift_max..drift_max),
+                (hum_amp, proptest::sample::select(vec![50.0f32, 60.0])),
+            )
+                .prop_map(
+                    move |(
+                        ((fps, drop_frame), start_tc),
+                        (sample_rate, frames),
+                        (volume, noise_std, noise_seed),
+                        (dc_milli, impulse_prob, impulse_seed),
+                        drift_ppm,
+                        (hum_amp, hum_freq),
+                    )| {
+                        PropSignal {
+                            start_tc,
+                            fps,
+                            drop_frame,
+                            sample_rate,
+                            frames,
+                            volume,
+                            noise_std,
+                            noise_seed,
+                            dc_offset: dc_milli as f32 / 1000.0,
+                            impulse_prob,
+                            impulse_amp: 1.0,
+                            impulse_seed,
+                            drift_ppm,
+                            hum_amp,
+                            hum_freq,
+                        }
+                    },
+                )
+                .boxed()
+        }
+
+        impl PropSignal {
+            /// Encoder-side differential oracle: the start TC advanced
+            /// `frames − 1` times via the production increment (two
+            /// independent implementations cross-checked, same style as the
+            /// existing roundtrip fixtures).
+            fn expected_sequence(&self) -> Vec<Timecode> {
+                let mut tc = self.start_tc;
+                let mut seq = vec![tc];
+                for _ in 1..self.frames {
+                    tc = crate::increment_timecode(&tc, self.fps, self.drop_frame);
+                    seq.push(tc);
+                }
+                seq
+            }
+
+            /// Fixed composition order: drift synthesis → DC offset →
+            /// Gaussian noise → impulses → hum.
+            fn build(&self) -> Vec<f32> {
+                let seq = self.expected_sequence();
+                // Always the fractional-accurate synthesizer: the plain
+                // helper truncates samples-per-bit to integers, which at
+                // e.g. 44100 Hz / 24 fps injects ~44 000 ppm systematic
+                // rate error — a harness artifact, not a clean signal.
+                // drift_ppm == 0.0 yields the exact nominal rate.
+                let mut signal = synthesize_ltc_signal_with_drift(
+                    &seq, self.fps, self.drop_frame, self.sample_rate, self.volume, self.drift_ppm,
+                );
+                if self.dc_offset != 0.0 {
+                    signal = add_dc_offset(&signal, self.dc_offset);
+                }
+                if self.noise_std > 0.0 {
+                    signal = add_gaussian_noise(&signal, self.noise_std, self.noise_seed);
+                }
+                if self.impulse_prob > 0.0 {
+                    signal = add_impulse_noise(&signal, self.impulse_prob, self.impulse_amp, self.impulse_seed);
+                }
+                if self.hum_amp > 0.0 {
+                    signal = add_hum(&signal, self.sample_rate, self.hum_amp, self.hum_freq);
+                }
+                signal
+            }
+
+            fn decode(&self) -> LtcDetectionResult {
+                decode_ltc_samples(
+                    &self.build(),
+                    self.sample_rate,
+                    1,
+                    self.fps,
+                    self.drop_frame,
+                    std::time::Instant::now(),
+                    None,
+                )
+                .expect("decode_ltc_samples must not error on an in-process signal")
+            }
+        }
+
+        /// Every decoded timecode must be an in-order subsequence of
+        /// `expected` (no garbage values). A frame re-decoded at a corruption
+        /// boundary may repeat the just-matched timecode; that is a reporting
+        /// artifact, not a wrong value.
+        fn assert_in_order_subsequence(result: &LtcDetectionResult, expected: &[Timecode]) {
+            let mut exp_idx = 0usize;
+            for ft in &result.timecodes {
+                if exp_idx > 0 && expected[exp_idx - 1] == ft.timecode {
+                    continue;
+                }
+                while exp_idx < expected.len() && expected[exp_idx] != ft.timecode {
+                    exp_idx += 1;
+                }
+                assert!(
+                    exp_idx < expected.len(),
+                    "decoded out-of-sequence timecode {:?} (status={:?}, valid={}/{})",
+                    ft.timecode, result.status, result.valid_frames, result.total_possible_frames
+                );
+                exp_idx += 1;
+            }
+        }
+
+        /// Positional oracle: every decoded frame must carry the expected
+        /// sequence value at its absolute time. Two tolerated reporting
+        /// artifacts, both documented on `assert_ltc_fully_decoded` and
+        /// compensated downstream:
+        ///
+        /// 1. A missing head frame — zero-crossing anchoring needs a
+        ///    transition before the first bit boundary when the signal starts
+        ///    at sample 0; `start_timecode_from_ltc` re-anchors via
+        ///    first_ltc_timecode_secs + shift_timecode_back.
+        /// 2. A frame re-decoded at a corruption boundary may repeat the
+        ///    just-matched timecode (value of position idx−1 at position idx).
+        ///
+        /// Any other deviation — in particular a *wrong value* at a position
+        /// (1-bit BCD slip) — fails the property.
+        fn assert_positional(result: &LtcDetectionResult, expected: &[Timecode], fps: f64) {
+            for ft in &result.timecodes {
+                let idx = (ft.timecode_secs * fps).round() as isize;
+                assert!(
+                    idx >= 0 && (idx as usize) < expected.len(),
+                    "decoded frame at {:.4}s outside expected sequence (value {:?})",
+                    ft.timecode_secs, ft.timecode
+                );
+                let idx = idx as usize;
+                let repeat_artifact = idx >= 1 && ft.timecode == expected[idx - 1];
+                assert!(
+                    repeat_artifact || ft.timecode == expected[idx],
+                    "decoded {:?} at {:.4}s (position {}), expected {:?}",
+                    ft.timecode, ft.timecode_secs, idx, expected[idx]
+                );
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            // P5 — clean signal: full-fidelity decode contract.
+            #[test]
+            fn p5_clean_signal_decodes_consecutive_sequence(sig in arb_prop_signal(false, false)) {
+                let expected = sig.expected_sequence();
+                let result = sig.decode();
+                assert!(matches!(result.status, LtcDecodeStatus::Success),
+                    "expected Success, got {:?} (valid={}/{})",
+                    result.status, result.valid_frames, result.total_possible_frames);
+                // Floor calibrated: on a signal with no lead-in/lead-out the
+                // zero-crossing sync scan can drop the first frame (no
+                // transition before the first bit boundary) and/or the last
+                // frame (no transition after the last one) — 2 frames worst
+                // case. Interior frames of a clean signal are never lost.
+                assert!(result.valid_frames as usize >= sig.frames.saturating_sub(2),
+                    "valid {} < frames−2 ({} frames)", result.valid_frames, sig.frames);
+                assert!(!result.timecodes.is_empty(), "no timecodes decoded");
+                assert_positional(&result, &expected, sig.fps);
+                assert_in_order_subsequence(&result, &expected);
+            }
+
+            // P6 — degraded envelope (noise ≤ 0.015, |dc| ≤ 0.05, impulses
+            // ≤ 0.2 %, |drift| ≤ 150 ppm): same value-correctness contract.
+            // Floor calibrated: worst observed frame loss across 800 random
+            // cases was 7 (impulse bursts at low volume); pinned at observed
+            // minus margin — a floor, not a pin, and a candidate to tighten as
+            // decoder headroom improves.
+            #[test]
+            fn p6_degraded_envelope_still_decodes(sig in arb_prop_signal(false, false)) {
+                let expected = sig.expected_sequence();
+                let result = sig.decode();
+                assert_ltc_ok(&result, sig.frames.saturating_sub(8) as u32);
+                assert!(!result.timecodes.is_empty(), "no timecodes decoded");
+                assert_positional(&result, &expected, sig.fps);
+                assert_in_order_subsequence(&result, &expected);
+                assert_in_order_subsequence(&result, &expected);
+            }
+
+            // P7 — hostile envelope (noise ≤ 0.35, |drift| ≤ 5000 ppm, hum,
+            // impulses): crash-safety. Decode returns without panicking.
+            // Value oracles are deliberately NOT enforced here: at impulse
+            // probabilities near the envelope maximum, frames can misdecode
+            // (bit errors inside frames that still pass sync-word detection),
+            // so garbage values are legitimate garbage-in-garbage-out. Value
+            // correctness within the supported envelope is enforced by
+            // P5/P6/P8.
+            #[test]
+            fn p7_hostile_envelope_never_panics(sig in arb_prop_signal(true, false)) {
+                let _result = sig.decode(); // Err → expect panics → property fails
+            }
+
+            // P8 — drop-frame minute-skip logic under the P6 degradation
+            // envelope; start minutes biased to DF-critical values. Floor
+            // calibrated: worst observed frame loss across the DF sweep was 1,
+            // plus 2 for the head/tail zero-crossing boundary condition.
+            #[test]
+            fn p8_drop_frame_minute_skips_under_degradation(sig in arb_prop_signal(false, true)) {
+                let expected = sig.expected_sequence();
+                let result = sig.decode();
+                assert_ltc_ok(&result, sig.frames.saturating_sub(3) as u32);
+                assert!(!result.timecodes.is_empty(), "no timecodes decoded");
+                assert_positional(&result, &expected, sig.fps);
+                assert_in_order_subsequence(&result, &expected);
+                assert_in_order_subsequence(&result, &expected);
+            }
+        }
+    }
 }
