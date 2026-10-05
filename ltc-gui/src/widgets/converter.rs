@@ -1631,7 +1631,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                 render_copy_video_checkbox(ui, state);
                 ui.add_space(4.0);
             }
-            render_video_format_rows(ui, state, !copy_mode_active(state), &cur_container, &containers, &cur_video_encoder, &video_encoders, &colors);
+            render_video_format_rows(ui, state, !copy_mode_active(state), &cur_container, &containers, &cur_video_encoder, &video_encoders);
 
             if state.latest.converter.selected_recording_type() == Some(RecordingType::MultiTrackAudio) {
                 render_generate_synthetic_checkbox(ui, state, "Generate synthetic video (blue background)");
@@ -1655,7 +1655,7 @@ fn render_output_format(ui: &mut Ui, state: &mut AppState, sanity: Option<&Resul
                 render_video_format_rows(
                     ui, state,
                     !copy_mode_active(state) && !*state.sh.conv.metadata_only.value(),
-                    &cur_container, &containers, &cur_video_encoder, &video_encoders, &colors,
+                    &cur_container, &containers, &cur_video_encoder, &video_encoders,
                 );
                 if state.latest.converter.selected_recording_type() == Some(RecordingType::MultiTrackAudio) {
                     render_generate_synthetic_checkbox(ui, state, "Generate synthetic video");
@@ -1772,8 +1772,8 @@ fn render_video_format_rows(
     containers: &[(String, String)],
     cur_video_encoder: &str,
     video_encoders: &[(String, String)],
-    colors: &crate::theme::ThemeColors,
 ) {
+    let colors = state.theme.colors();
     ui.label(RichText::new("VIDEO FORMAT").font(FontId::proportional(10.0)).color(colors.text_title).strong());
     ui.add_space(4.0);
     ui.add_enabled_ui(enabled, |ui| {
@@ -1790,7 +1790,7 @@ fn render_video_format_rows(
                 // Encoder re-selection for the new container is done
                 // engine-side (apply_available_defaults on SetContainer).
             };
-            render_format_row(ui, "Container", cur_container, containers, &mut update_container, colors);
+            render_format_row(ui, "Container", cur_container, containers, &mut update_container, &colors);
         }
         {
             let video_truth = state.latest.converter.settings.video_encoder.clone();
@@ -1803,7 +1803,7 @@ fn render_video_format_rows(
                     |c| GuiCommand::Converter(ConverterCommand::SetVideoCodec(c)),
                 );
             };
-            render_format_row(ui, "Video codec", cur_video_encoder, video_encoders, &mut update_video, colors);
+            render_format_row(ui, "Video codec", cur_video_encoder, video_encoders, &mut update_video, &colors);
         }
     });
 }
