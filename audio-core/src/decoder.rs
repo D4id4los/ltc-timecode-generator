@@ -30,6 +30,7 @@ pub trait LtcDecoder: Send + Sync {
     /// failure surfaces as the existing `Failed to read chunk N` error).
     /// `chunk_idx` only formats into that prose message; cancellation is
     /// carried by `LtcDecodeError::Cancelled`, not by this wrapper.
+    // Cohesive decode request: path/reader/window/backend decode one chunk.
     #[allow(clippy::too_many_arguments)]
     fn decode_chunk(
         &self,

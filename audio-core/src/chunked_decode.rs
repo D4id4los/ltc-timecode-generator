@@ -466,6 +466,7 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
 }
 
 /// Decode a single chunk of a WAV file in a worker thread.
+// One worker's full decode request (path, window, format, decoder, cancel).
 #[allow(clippy::too_many_arguments)]
 fn decode_one_chunk(
     path: &Path,

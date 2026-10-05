@@ -304,7 +304,7 @@ Conversion execution runs in the engine thread via `StartConversion` which calls
   - `plan_video_outputs()` → ordered `VideoOutputStep` list (`VideoOnly`, `VideoMux` with `AudioKeep`, `AudioChannel` extraction — each carrying a `naming_index` for collision-guarded path recovery); caller executes each step.
   - `selected_channel_pairs()` is the single home of the channel-map/drop iteration (output-slot order, unmapped/out-of-bounds slots skipped, LTC dropped per recording type); `preview_output_files` and `output_collision_warning` are projections of `plan_output_paths()`, the one enumeration of produced files for all three pipelines (its `PlannedOutput` carries both the collision-guarded and unguarded paths).
   - `spawn_conversion()` takes `caps: Option<&FfmpegCapabilities>`, resolves the codec into an ordered encoder chain, and runs the steps on a background thread, publishing progress via the `ConversionReport` trait; cancellation via `CancelToken`. Failures are classified as `StepFailure::EncoderInit` (no output produced → retry with next encoder in the chain) or `StepFailure::Fatal`; failed encoders are memoized for the rest of the run and the first successful one is pinned (reported as `Video encoder used: …` in the log).
-  - **Stream-copy mode** (`copy_video`, UI: "Leave Video Encoding Untouched", VideoPassthrough only): video is remuxed with `-c:v copy` — no encoder chain, no `-r`; muxed audio is `-c:a copy` unless channel filtering forces an audio-only re-encode. `prepare_copy_mode()` derives the output container from the input (`copy_mode_container_for_input()`: mp4/m4v→mp4, mov→mov, mkv→mkv, mxf→mxf, mts/m2ts/ts→mp4, else mkv), snaps each trim offset to the nearest video keyframe at-or-before it (`ffprobe::snap_trim_to_keyframe()` packet scan), and re-anchors the start timecode via `shift_timecode_back()` (DF-aware, inverse of `audio_core::increment_timecode`) so the embedded TC matches the actual first video frame. Sanity check: `conversion_sanity_check_with_naming(…, copy_video)` / `conversion_sanity_check_copy()` skip video-codec validation in this mode.
+  - **Stream-copy mode** (`copy_video`, UI: "Leave Video Encoding Untouched", VideoPassthrough only): video is remuxed with `-c:v copy` — no encoder chain, no `-r`; muxed audio is `-c:a copy` unless channel filtering forces an audio-only re-encode. `prepare_copy_mode()` derives the output container from the input (`copy_mode_container_for_input()`: mp4/m4v→mp4, mov→mov, mkv→mkv, mxf→mxf, mts/m2ts/ts→mp4, else mkv), snaps each trim offset to the nearest video keyframe at-or-before it (`ffprobe::snap_trim_to_keyframe()` packet scan), and re-anchors the start timecode via `shift_timecode_back()` (DF-aware, inverse of `audio_core::increment_timecode`) so the embedded TC matches the actual first video frame. Sanity check: `conversion_sanity_check(SanityCheckInput { copy_video: true, .. })` / `conversion_sanity_check_pure(…)` skip video-codec validation in this mode.
   - `evaluate_readiness()` / `ConvertBlocker` / `conversion_sanity_check()` — preflight validation surfaced in the UI before starting.
   - `format_ffmpeg_timecode()` (HH:MM:SS:FF or HH:MM:SS;FF), `find_timecode_at_offset()` (maps decode results → per-file start TC).
   - **`push_metadata_args()`** (`converter/args.rs`) — adds camera metadata to ffmpeg arg lists: `-metadata make/model` (or `com.apple.quicktime.*` for MOV) on video outputs; the WAV `-write_bext 1` + originator/date/description block comes from `bext_meta::push_wav_bext_args`. Gated by `embed_camera_metadata`. Originator defaults to `"LTC Timecode Generator"` when no camera is detected. Origination date falls back to file mtime via `chrono`.
@@ -522,6 +522,23 @@ A test must fail when behavior regresses and pass when behavior improves.
   predicate with a deadline (see Flaky-Test Methodology), join handles, or
   inject a clock/runner seam. Never assert on wall-clock elapsed time or on
   observing a transient intermediate state; assert terminal state instead.
+
+### Lint policy (2026-10-05)
+
+`clippy::too_many_arguments` is **denied** at workspace level (threshold 7, parity with
+Sonar `S107` — change both in lockstep or neither). The early-phase blanket allow is
+retired. Fix shape: group cohesive parameters into a context/input struct
+(`DecodeCtx`, `SanityCheckInput`, `ExtractSeam`, `AssembleStats` precedent); never a
+kitchen-sink bag. A local `#[allow(clippy::too_many_arguments)]` requires an inline
+justification comment naming the cohesive reason (same style as
+`// test-lint: allow(...)`).
+
+**`rust:S1612` (Sonar) / `redundant_closure_for_method_calls` (clippy): won't-fix.**
+The workspace deliberately enables only the style/correctness/complexity/perf clippy
+groups; this pedantic rule is cosmetic-only and the closure form (`|e| e.to_str()`) is
+preferred for readability. The 48 open S1612 issues were bulk-resolved as Won't Fix in
+SonarCloud (2026-10-05); new ones will be resolved the same way. Do not rewrite call
+sites to satisfy it.
 
 ### Test-Lint Guardrails (CI)
 

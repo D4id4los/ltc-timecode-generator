@@ -166,6 +166,7 @@ pub fn compute_frame_sample_count(
 /// `channel` selects which stereo outputs carry the signal.
 ///
 /// `stereo_out` must be at least `total_samples * 2` elements.
+// Cohesive render request: rate, timecode, routing, level, carry state.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_ltc_frame_stereo(
     tc: &Timecode,

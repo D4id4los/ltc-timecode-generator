@@ -1336,6 +1336,7 @@ fn extract_per_file_audio(
 /// Per-file split extraction: one output per surviving (stream, channel)
 /// pair of `channels`. Returns the number of emitted outputs, or `None`
 /// on cancellation. Advances `cursor` past every attempted step.
+// One file's split-extraction request over the surviving channel pairs.
 #[allow(clippy::too_many_arguments)]
 fn extract_split_channels_for_file(
     settings: &ConverterSettings,
@@ -1379,6 +1380,7 @@ fn extract_split_channels_for_file(
 
 /// Per-file merged extraction: a single output starting from the first
 /// audio channel of the clip. Returns `None` on cancellation.
+// One file's merged-extraction request; parameters travel together.
 #[allow(clippy::too_many_arguments)]
 fn extract_merged_audio_for_file(
     settings: &ConverterSettings,

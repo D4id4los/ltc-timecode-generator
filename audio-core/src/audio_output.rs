@@ -663,6 +663,7 @@ fn select_best_config(
         .ok_or_else(|| "No supported audio output config found for this device".to_string())
 }
 
+// Stream-build request: device/config/stream-kind descriptors stay flat.
 #[allow(clippy::too_many_arguments)]
 fn build_stream_for_format(
     device: &cpal::Device,
@@ -684,6 +685,7 @@ fn build_stream_for_format(
     }
 }
 
+// Generic stream-build core mirrors build_stream_for_format's shape.
 #[allow(clippy::too_many_arguments)]
 fn build_stream_generic<T>(
     device: &cpal::Device,
@@ -1178,6 +1180,7 @@ fn detect_underruns(
 
 /// Generate one stereo LTC frame into `frame_buf` and push it into the ring.
 /// Returns `false` when the producer mutex is poisoned (thread must exit).
+// One scheduler tick: frame buffer, ring, timecode and mute state.
 #[allow(clippy::too_many_arguments)]
 fn generate_and_push_frame(
     ltc_producer: &Arc<Mutex<HeapProducer<f32>>>,

@@ -1380,6 +1380,7 @@ fn quality_score(
 }
 
 /// Human-readable summary of issues found.
+// Quality-report inputs: frame scan, spans and glitches of one decode.
 #[allow(clippy::too_many_arguments)]
 fn quality_summary(
     usable_coverage: f64,
@@ -2262,6 +2263,7 @@ struct ScoredResult {
 impl ScoredResult {
     /// Single home of the `(phase + start·spb)/sample_rate` timing and the
     /// frame_index renumbering — previously 4 near-copies.
+    // Single home of the ScoredResult construction parameter block.
     #[allow(clippy::too_many_arguments)]
     fn from_frame_starts(
         fps: f64,
@@ -2824,6 +2826,7 @@ mod tests {
 
     // ── WAV generation helper ────────────────────────────────────────────
 
+    // Test-fixture render request: timecodes, rate, level, drift, path.
     #[allow(clippy::too_many_arguments)]
     fn generate_test_wav(
         path: &Path,
@@ -2876,6 +2879,7 @@ mod tests {
         writer.finalize().unwrap();
     }
 
+    // Prefixed variant mirrors generate_test_wav's parameter shape.
     #[allow(clippy::too_many_arguments)]
     fn generate_test_wav_with_prefix(
         path: &Path,
