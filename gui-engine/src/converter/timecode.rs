@@ -485,3 +485,34 @@ mod tests {
         assert_eq!(tc.frames, 59);
     }
 }
+
+// ── Property tests (proptest) ────────────────────────────────────────────
+// Scope note (recorded during the proptest adoption, see
+// plans/2026-10-05-proptest-targeted-adoption-plan.md): format_ffmpeg_timecode(_, true)
+// emits `;` as the frame separator while parse_native_timecode splits on `:`
+// only — drop-frame strings do NOT round-trip. This is a pre-existing
+// asymmetry surfaced by designing the property; it is deliberately not fixed
+// here. The property below is therefore scoped to non-drop-frame strings.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // P3 — every valid Timecode survives format → parse round-trip when
+        // formatted non-drop-frame.
+        #[test]
+        fn p3_native_timecode_roundtrip(
+            h in 0u32..24,
+            m in 0u32..60,
+            s in 0u32..60,
+            f in 0u32..30,
+        ) {
+            let tc = Timecode { hours: h, minutes: m, seconds: s, frames: f };
+            prop_assert_eq!(
+                parse_native_timecode(&format_ffmpeg_timecode(&tc, false)),
+                Some(tc)
+            );
+        }
+    }
+}
