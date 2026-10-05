@@ -66,6 +66,16 @@ jobs:
       - name: Generate LCOV coverage report for Sonar
         run: cargo llvm-cov report --lcov --output-path lcov.info
 
+      - name: gui-engine tests under extreme timezone (UTC+14)
+        # CI runners are TZ=UTC; the chrono Local sites (offload ISO-date
+        # folders, log timestamps, clock display) never cross a date
+        # boundary there. Uses the llvm-cov variant to reuse the
+        # instrumented build (no rebuild). MUST stay after the LCOV report
+        # step: cargo-llvm-cov resets coverage data on every run.
+        env:
+          TZ: Pacific/Kiritimati
+        run: cargo llvm-cov nextest -p gui-engine --profile ci
+
       - name: Cache SonarQube packages
         uses: actions/cache@v6
         with:
