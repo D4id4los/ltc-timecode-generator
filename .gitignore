@@ -26,3 +26,6 @@ plans/
 
 # Local static-libltc prefixes built by build-all-rust-targets.sh
 /libltc-prefix/
+
+# Maintainer-local deploy commands (never commit)
+/command_list.org
