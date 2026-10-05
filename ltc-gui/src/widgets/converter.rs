@@ -9,7 +9,7 @@ use gui_engine::converter::{
     available_containers,
     conversion_sanity_check, conversion_sanity_check_metadata_only,
     conversion_sanity_check_pure, conversion_sanity_check_metadata_only_pure,
-    ConversionCheckError, SanityCheckInput,
+    ConversionCheckError, SanityCheckInput, ChannelMap,
     evaluate_readiness,
     format_blockers,
     preview_output_files, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
@@ -22,7 +22,7 @@ use gui_engine::file_pattern::{group_display_key, MatchedGroup};
 use gui_engine::timecode::{self, FPS_OPTIONS};
 
 use crate::app::AppState;
-use crate::theme::ACCENT;
+use crate::theme::{ACCENT, ThemeColors};
 use super::bound;
 
 pub fn render(ui: &mut Ui, state: &mut AppState) {
@@ -1359,7 +1359,23 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
     let (response, painter) = ui.allocate_painter(egui::vec2(layout.total_width, layout.total_height), egui::Sense::hover());
     let origin = response.rect.left_top();
 
-    // Draw headers
+    draw_matrix_headers(ui, &painter, origin, &layout, &colors);
+    let map = state.sh.conv.channel_map.value().clone();
+    draw_matrix_cells(&painter, origin, &layout, &colors, &map);
+
+    // Handle clicks (separate from painter)
+    drop(painter);
+    handle_matrix_clicks(ui, state, origin, &layout, &map);
+}
+
+/// Header text and row labels (LTC row highlighted with accent).
+fn draw_matrix_headers(
+    _ui: &Ui,
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    layout: &MatrixLayout,
+    colors: &ThemeColors,
+) {
     for (x, y, text) in &layout.headers {
         painter.text(
             egui::pos2(origin.x + x, origin.y + y),
@@ -1370,7 +1386,6 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
         );
     }
 
-    // Draw row labels (LTC row highlighted with accent)
     for (i, (x, y, text)) in layout.row_labels.iter().enumerate() {
         let color = if layout.row_is_ltc[i] { ACCENT } else { colors.text_title };
         let prefix = if layout.row_is_ltc[i] { "● " } else { "  " };
@@ -1382,9 +1397,16 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
             color,
         );
     }
+}
 
-    // Draw radio buttons
-    let map = state.sh.conv.channel_map.value().clone();
+/// The radio-button circles; selection and LTC-row highlighting.
+fn draw_matrix_cells(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    layout: &MatrixLayout,
+    colors: &ThemeColors,
+    map: &ChannelMap,
+) {
     for cell in &layout.cells {
         let cx = origin.x + cell.cx;
         let cy = origin.y + cell.cy;
@@ -1409,9 +1431,17 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
         painter.circle_stroke(egui::pos2(cx, cy), radius, stroke);
         painter.circle_filled(egui::pos2(cx, cy), radius - 2.0, fill_color);
     }
+}
 
-    // Handle clicks (separate from painter)
-    drop(painter);
+/// Click-to-swap: clicking an unselected cell swaps its input channel (row)
+/// with the channel currently mapped to that output (column).
+fn handle_matrix_clicks(
+    ui: &mut Ui,
+    state: &mut AppState,
+    origin: egui::Pos2,
+    layout: &MatrixLayout,
+    map: &ChannelMap,
+) {
     for cell in &layout.cells {
         let cx = origin.x + cell.cx;
         let cy = origin.y + cell.cy;
