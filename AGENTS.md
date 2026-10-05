@@ -441,7 +441,7 @@ envelopes must pairwise overlap; per-file TC span ≈ audio duration). **Measure
 on a completed sweep regardless of decode outcomes — pass/fail assertions live solely in the
 committed fixture tests (`ltc-rw-*`). JSON artifacts land in `reports/corpus-sweep/` (gitignored);
 re-run after every decoder-touching WP and diff — this is the decoder's field-regression net (the
-WP-DR cliffs are the synthetic one). Analysis background: `reports/ltc-chunked-decode-anomalies-2026-10.md`.
+WP-DR cliffs are the synthetic one). Analysis background: `reports/2026-10-05-ltc-chunked-decode-anomalies-report.md`.
 
 ### Flaky-Test Methodology
 
@@ -577,7 +577,7 @@ Golden vectors for the web LTC generator live in `src/ltcGoldenVectors.ts`.
 ## Error-Handling Policy
 
 Normative rules for error types and `Result<_, String>` (G6, 2026-10; full
-inventory and rationale live in the local `reports/error-boundary-policy-*.md` —
+inventory and rationale live in the local `reports/2026-10-04-error-boundary-policy-report.md` —
 this section deliberately carries no inventories):
 
 - **R1 — Typed at decision points.** Any error the code branches on (retry/fallback classification, cancel-vs-fail, readiness gating, step orchestration) is an enum with matchable variants. Exemplar: `StepFailure` (`converter/process.rs`).
@@ -592,8 +592,23 @@ this section deliberately carries no inventories):
 
 ## Planning & Analysis
 
-- Place any analysis reports or the like in `reports/` (local dir, not commited)
-- Place any planning artefacts (Work Packages, Implementation Plans, etc.) in `plans/` (local dir, not commited)
+All AI-generated non-code artifacts live in two local, gitignored parent dirs at the repo root — never dump notes, analyses, or specs into the root or source folders:
+
+- `plans/` — forward-looking implementation specs, work packages, roadmaps. Generated *before* multi-file refactors, complex features, or architectural changes; they give reviewers visibility into agent intent and serve as execution state across context resets.
+- `reports/` — backward-looking analysis, benchmark results, test summaries, diagnostics, audits; historical context for future agent sessions. Script-generated subdirs (`reports/sonar/`, `reports/corpus-sweep/`) keep their own names.
+
+**Naming** — strict `YYYY-MM-DD` ISO-8601 date prefix (the file's creation date; lexicographic sort = chronological), then lower-case kebab-case topic:
+
+- Plans: `YYYY-MM-DD-<kebab-case-topic>-plan.md` — e.g. `2026-10-04-phase5-animation-ownership-plan.md`
+- A plan split into phases of one overall plan: `YYYY-MM-DD-<overall-plan-name>-phase<N>-<phase-name>-plan.md`
+- Reports: `YYYY-MM-DD-<kebab-case-topic>-report.md` — e.g. `2026-10-05-ltc-chunked-decode-anomalies-report.md`
+
+**Plan structure**: `# [Plan] Title` + header block (Date / Target Crates / Branch — feature branches per the merge policy below / Goal), then sections: Context & Objectives; Proposed Changes (file/type checklist); Step-by-Step Implementation Sequence; Not Touched / Out-of-Scope; Verification, Testing & Acceptance Strategy (commands + acceptance goals).
+
+**Report structure**: `# [Report] Title` + header block (Date / Author-Agent / Scope), then sections: Executive Summary; Diagnostics & Data Findings (raw data blocks welcome); Architectural Impact; Recommended Action Items; Matters for Further Analysis/Work (incl. suspected bugs out of scope here); Additional Notes / Caveats.
+
+**Handoff discipline**: when instructing an agent to execute or continue work, reference prior artifacts by exact filename (e.g. "Read `plans/2026-10-05-wp-dr-decoder-robustness-improvements-plan.md` and execute steps 1–3") — never let the model re-invent the sequence.
+
 - When planning PRs/Commits, use the project's commit msg style of `<type>(<module>): <short_desc>` and include a body detailing the changes made.
 - When planning work packages or the like, plan to create a feature branch for all associated commits/PRs.
 - The project merges completed feature branches into main through the double rebase style: rebase `feature_x` on `main`, fix any merge conflicts that arise, run tests again if you needed code changes, then rebase `main` on `feature_x`. This way no merge-commits end up in the `main` branch.

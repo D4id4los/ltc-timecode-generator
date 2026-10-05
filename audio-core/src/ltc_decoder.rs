@@ -3497,7 +3497,7 @@ mod tests {
 
     // ── Real-world corpus fixtures (WP-RW) ───────────────────────────────
     // Committed cuts from the 5-day recording corpus; see
-    // reports/ltc-chunked-decode-anomalies-2026-10.md. Floors are
+    // reports/2026-10-05-ltc-chunked-decode-anomalies-report.md. Floors are
     // measured −10 % (measurement date 2026-10-05, decoder post-RW2).
 
     fn real_world_fixture(name: &str) -> std::path::PathBuf {

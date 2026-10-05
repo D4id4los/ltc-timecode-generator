@@ -6,7 +6,7 @@
 //! big-endian LPCM in MP4 (Sony A6100), lossy AAC LTC (m4v), and 24-bit PCM
 //! WAV (TASCAM). Measured expectations and floors (measured −10 %) are
 //! recorded in the assertions; measurement date 2026-10-05, decoder post-RW2
-//! (see `reports/ltc-chunked-decode-anomalies-2026-10.md`).
+//! (see `reports/2026-10-05-ltc-chunked-decode-anomalies-report.md`).
 //!
 //! Video fixtures need ffmpeg/ffprobe (loud-skip without, mirroring
 //! `cli_decode.rs` / `video_extraction.rs`); the WAV dispatch test needs no
