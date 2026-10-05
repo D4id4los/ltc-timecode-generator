@@ -101,5 +101,8 @@ done
 
 git -C "$ROOT" add Cargo.toml Cargo.lock
 git -C "$ROOT" commit -m "$COMMIT_MSG"
-git -C "$ROOT" tag "$TAG"
+# Annotated tag: `git push --follow-tags` (and tools with the same
+# convention) only push annotated tag objects — a lightweight tag here
+# would be silently skipped and the release workflow never fires.
+git -C "$ROOT" tag -a "$TAG" -m "$TAG"
 echo "done: $COMMIT_MSG ($TAG)"
