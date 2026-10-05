@@ -1,0 +1,23 @@
+# RustSec advisory gate. Advisories only: licenses/bans/sources are
+# deliberately not enforced for a one-maintainer desktop tool (revisit
+# only if a concrete need appears). Schema v2 requires cargo-deny >= 0.15;
+# verify keys against the installed version at execution time.
+[advisories]
+version = 2
+yanked = "deny"
+# Entries here MUST carry a justification comment (link to advisory +
+# why unaffected) and a revisit date.
+ignore = [
+    # RUSTSEC-2024-0436 — paste is archived/unmaintained. Transitive
+    # (egui/slint macro stack); no safe upgrade available. Build-time proc
+    # macro only, no runtime attack surface. Revisit: when egui/slint drop it.
+    "RUSTSEC-2024-0436",
+    # RUSTSEC-2026-0206 — rustybuzz unmaintained (successor: harfrust).
+    # Transitive via the Slint text stack; advisory states no safe upgrade.
+    # Revisit: next slint bump (switch to harfrust when available).
+    "RUSTSEC-2026-0206",
+    # RUSTSEC-2026-0192 — ttf-parser unmaintained (successor: skrifa).
+    # Transitive via the Slint text stack; advisory states no safe upgrade.
+    # Revisit: next slint bump.
+    "RUSTSEC-2026-0192",
+]
