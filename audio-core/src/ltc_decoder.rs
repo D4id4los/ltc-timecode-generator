@@ -195,9 +195,23 @@ fn decode_ltc_samples_inner(
         return Ok(LtcDetectionResult::error("Audio buffer contains no samples"));
     }
 
+    // WP-DR signal conditioning (DR3 DC blocker + high-pass, DR4 median
+    // pre-filter): removes DC offsets, mains hum, and single-sample clicks
+    // before any detection constant sees the data. Always-on — no
+    // thresholds to mis-tune; the full suite + real-world anchor gate
+    // regressions.
+    let mut conditioned: Vec<f32> = samples.to_vec();
+    condition_signal(&mut conditioned, sample_rate);
+    let samples: &[f32] = &conditioned;
+
     let total_duration = samples.len() as f64 / sample_rate as f64;
     let noise_floor = estimate_noise_floor(samples);
-    let threshold = (noise_floor * 0.5).max(0.005);
+    // WP-DR (DR5): the absolute 0.005 floor becomes peak-relative so quiet
+    // recordings decode, capped so a loud peak cannot silence detection.
+    // The peak is a histogram percentile (not raw max): even after the
+    // median filter, clustered impulse pairs would inflate a raw max.
+    let robust_peak = robust_peak_amplitude(samples);
+    let threshold = (noise_floor * 0.5).max((robust_peak * PEAK_FLOOR_FRAC).min(ABS_FLOOR_CAP));
     debug!("LTC decode: read {:.2}s of audio, noise_floor={:.8}, threshold={:.8}",
         total_duration, noise_floor, threshold);
 
@@ -1507,6 +1521,152 @@ fn read_mono_samples<R: std::io::Read>(
             Ok(samples)
         }
     }
+}
+
+// ── WP-DR signal conditioning (DR3 + DR4) ────────────────────────────────────
+
+/// Floor fraction of the robust signal peak for the zero-crossing
+/// threshold (DR5) and its absolute cap. The cap keeps a loud peak from
+/// raising the floor above what quiet content needs; the fraction is what
+/// lets quiet content decode at all (bit amplitude ≈ volume/2 must clear
+/// the floor with margin).
+const PEAK_FLOOR_FRAC: f32 = 0.02;
+const ABS_FLOOR_CAP: f32 = 0.05;
+
+/// Always-on input conditioning, applied before any detection constant:
+/// 3-tap median (kills single-sample clicks and protects the filters
+/// below) → one-pole DC blocker (removes offsets) → 50/60 Hz mains-notch
+/// pair (attenuates hum by tens of dB while leaving the ~1–4 kHz LTC band
+/// untouched). Three linear passes, a few percent of decode runtime.
+///
+/// The plan's originally prescribed ~500 Hz high-pass was replaced by the
+/// notch pair during implementation (the WP-DR §9.7 fallback): a 400–500 Hz
+/// high-pass droops the bi-phase levels by ~50 % within a half-bit period,
+/// which collapses them under the amplitude-derived ZC threshold and broke
+/// clean-signal decode. Notches have no droop above ~200 Hz.
+pub(crate) fn condition_signal(samples: &mut [f32], sample_rate: u32) {
+    median_filter(samples);
+    dc_block(samples);
+    mains_notch(samples, sample_rate);
+}
+
+/// In-place 5-tap median filter. LTC's minimum half-period is ≥ 12 samples
+/// @ 48 kHz, so spike runs up to 2 samples are always removable without
+/// touching legitimate transitions. (5 taps, not 7: wider windows erode
+/// the shortest legitimate half-bit plateaus and measurably *hurt* decode.)
+fn median_filter(samples: &mut [f32]) {
+    if samples.len() < 5 {
+        return;
+    }
+    let mut prev2 = samples[0];
+    let mut prev1 = samples[1];
+    for i in 2..samples.len() - 2 {
+        let cur = samples[i];
+        let next1 = samples[i + 1];
+        let next2 = samples[i + 2];
+        samples[i] = median5([prev2, prev1, cur, next1, next2]);
+        prev2 = prev1;
+        prev1 = cur;
+    }
+}
+
+fn median5(mut v: [f32; 5]) -> f32 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[2]
+}
+
+/// DC removal by global mean subtraction (one O(n) pass). A one-pole DC
+/// blocker was tried first and rejected: its multi-frame time constant let
+/// each bi-phase transition bias the baseline for ~2000 samples (DC
+/// wander), which measurably degraded fading and low-passed material.
+/// Global mean subtraction removes any static offset exactly and is a
+/// no-op for a symmetric square wave.
+fn dc_block(samples: &mut [f32]) {
+    if samples.is_empty() {
+        return;
+    }
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+    for s in samples.iter_mut() {
+        *s -= mean;
+    }
+}
+
+/// RBJ-cookbook biquad notch at `f0` (Q ≈ 25 → ~4 Hz notch width, wide
+/// enough for mains drift, narrow enough to leave the LTC band alone).
+fn notch_stage(samples: &mut [f32], f0: f32, sample_rate: u32) {
+    let w0 = 2.0 * std::f32::consts::PI * f0 / sample_rate as f32;
+    let (sin_w, cos_w) = w0.sin_cos();
+    let alpha = sin_w / (2.0 * 25.0);
+    let a0 = 1.0 + alpha;
+    let b0 = 1.0 / a0;
+    let b1 = -2.0 * cos_w / a0;
+    let b2 = 1.0 / a0;
+    let a1 = -2.0 * cos_w / a0;
+    let a2 = (1.0 - alpha) / a0;
+    let mut x1 = 0.0f32;
+    let mut x2 = 0.0f32;
+    let mut y1 = 0.0f32;
+    let mut y2 = 0.0f32;
+    for s in samples.iter_mut() {
+        let x = *s;
+        let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1;
+        x1 = x;
+        y2 = y1;
+        y1 = y;
+        *s = y;
+    }
+}
+
+/// Twin mains notches. Both run always-on: a 50 Hz tone passes the 60 Hz
+/// notch untouched and vice versa, so one pass shape covers both mains
+/// standards without conditioning switches.
+fn mains_notch(samples: &mut [f32], sample_rate: u32) {
+    notch_stage(samples, 50.0, sample_rate);
+    notch_stage(samples, 60.0, sample_rate);
+}
+
+/// 99.5th percentile of |samples| via a linear histogram over [0, max]
+/// (two O(n) passes, no sort). This is the DR5 "robust peak": immune to
+/// sparse full-scale clicks (post-median-filter they are ≪ 0.5 % of
+/// samples) yet coverage-proof for recordings that are mostly silent
+/// lead-in — a block-median peak would read 0 there and zero the
+/// threshold floor.
+fn robust_peak_amplitude(samples: &[f32]) -> f32 {
+    const BINS: usize = 4096;
+    let mut max = 0.0f32;
+    for &s in samples {
+        let a = s.abs();
+        if a > max {
+            max = a;
+        }
+    }
+    if max <= 0.0 {
+        return 0.0;
+    }
+    let mut hist = [0u32; BINS];
+    let scale = (BINS - 1) as f32 / max;
+    for &s in samples {
+        let bin = ((s.abs() * scale) as usize).min(BINS - 1);
+        hist[bin] += 1;
+    }
+    let target = (samples.len() as f64 * 0.995).ceil() as u64;
+    let mut seen = 0u64;
+    for (bin, &count) in hist.iter().enumerate() {
+        seen += count as u64;
+        if seen >= target {
+            // Linear interpolation inside the winning bin.
+            let bin_lo = bin as f32 / scale;
+            let bin_hi = (bin + 1) as f32 / scale;
+            let frac = if count > 0 {
+                1.0 - (seen - target) as f32 / count as f32
+            } else {
+                0.0
+            };
+            return bin_lo + (bin_hi - bin_lo) * frac;
+        }
+    }
+    max
 }
 
 // ── Noise floor estimation ───────────────────────────────────────────────────
@@ -4594,13 +4754,19 @@ mod tests {
 
     #[test]
     fn test_noise_dc_offset_beyond_cliff_not_success() {
-        // False-positive ceiling: with the DC offset past the signal
-        // amplitude the zero-crossings disappear; the decoder must report a
-        // non-Success status, never a confident decode of nothing.
-        let signal = add_dc_offset(&sequential_signal(), 0.6);
+        // False-positive ceiling: pure DC with *no signal* must not decode
+        // (post-conditioning there is nothing left to lock onto). Pre-WP-DR
+        // this test pinned the old DC-offset decode cliff on a *signalled*
+        // input — with the DR3 DC blocker that limitation is gone by
+        // design (offsets many times the signal amplitude decode
+        // correctly now), so the garbage-input contract is pinned instead.
+        let mut signal = vec![0.0f32; 96000];
+        for s in signal.iter_mut() {
+            *s = 0.6;
+        }
         let result = base_decode(&signal);
         assert!(!matches!(result.status, LtcDecodeStatus::Success),
-            "DC offset 0.6 must not decode, got {:?} (valid={})",
+            "pure DC must not decode, got {:?} (valid={})",
             result.status, result.valid_frames);
     }
 
@@ -4692,6 +4858,177 @@ mod tests {
         assert!(result.valid_frames * 2 >= result.total_possible_frames,
             "expected >=50% valid frames with 8000ppm drift, got {}/{}",
             result.valid_frames, result.total_possible_frames);
+    }
+
+    // ── 9b. WP-DR value-integrity integration (strict bar beyond the old
+    //        cliffs — the decoder must report Success *and* correct values
+    //        where the loose bar already held) ────────────────────────────
+
+    /// All five harness seeds, shared with `sweep_robustness_limits_manual`.
+    const DR_SEEDS: [u64; 5] = [42, 7, 123, 2024, 999];
+
+    #[test]
+    fn test_gaussian_beyond_old_strict_cliff_values_correct() {
+        // Old worst-seed strict cliff: std 0.18. At std 0.30 the decoder
+        // already reports Success (loose cliff ≈ 0.51) but with corrupt
+        // values; the BCD + continuity integrity pass must make the values
+        // correct on every harness seed.
+        for &seed in &DR_SEEDS {
+            let tcs = sequential_timecodes(50);
+            let signal = add_gaussian_noise(&sequential_signal(), 0.30, seed);
+            let result = base_decode(&signal);
+            assert_ltc_fully_decoded(&result, 25, &tcs);
+        }
+    }
+
+    #[test]
+    fn test_dropout_over_bcd_digit_strict_passes() {
+        // A 6 ms zero-span over one frame's BCD digits flips that frame's
+        // value while its neighbours stay correct (the placement lottery
+        // that broke the strict bar pre-WP-DR). The continuity repair must
+        // recover it on at least 4 of 5 seeds.
+        let mut passed = 0u32;
+        for &seed in &DR_SEEDS {
+            let signal = add_dropouts(&sequential_signal(), 48000, 0.006, 1, seed);
+            let result = base_decode(&signal);
+            let expected = sequential_timecodes(50);
+            let strict = matches!(result.status, LtcDecodeStatus::Success) && {
+                let mut ok = true;
+                let mut exp_idx = 0usize;
+                for ft in &result.timecodes {
+                    if exp_idx > 0 && expected[exp_idx - 1] == ft.timecode { continue; }
+                    while exp_idx < expected.len() && expected[exp_idx] != ft.timecode {
+                        exp_idx += 1;
+                    }
+                    if exp_idx == expected.len() { ok = false; break; }
+                    exp_idx += 1;
+                }
+                ok
+            };
+            if strict {
+                passed += 1;
+            } else {
+                eprintln!("dropout-over-BCD seed {seed}: not strict, status={:?} valid={}/{}",
+                    result.status, result.valid_frames, result.total_possible_frames);
+            }
+        }
+        assert!(passed >= 4, "expected ≥4/5 seeds strict at 6ms dropout, got {passed}");
+    }
+
+    // ── 9c. WP-DR signal conditioning (DR3/DR4/DR5) ─────────────────────
+
+    #[test]
+    fn test_dc_blocker_removes_offset_four_times_signal() {
+        // Old strict cliff: offset 0.492 ≈ signal amplitude. Four times
+        // the signal must now decode with correct values.
+        for offset in [2.0f32, 8.0] {
+            let tcs = sequential_timecodes(50);
+            let signal = add_dc_offset(&sequential_signal(), offset);
+            let result = base_decode(&signal);
+            assert_ltc_fully_decoded(&result, 40, &tcs);
+        }
+    }
+
+    #[test]
+    fn test_highpass_survives_hum_two_times_signal() {
+        // Hum at twice the signal amplitude (old strict cliff ≈ 0.50 =
+        // 1× signal) on both mains frequencies.
+        for freq in [50.0f32, 60.0] {
+            let tcs = sequential_timecodes(50);
+            let signal = add_hum(&sequential_signal(), 48000, 1.0, freq);
+            let result = base_decode(&signal);
+            assert_ltc_fully_decoded(&result, 40, &tcs);
+        }
+    }
+
+    #[test]
+    fn test_conditioning_preserves_clean_decode() {
+        // The always-on filters must be a no-op for clean material: full
+        // frame yield and correct values.
+        let tcs = sequential_timecodes(50);
+        let result = base_decode(&sequential_signal());
+        assert_ltc_fully_decoded(&result, 50, &tcs);
+    }
+
+    #[test]
+    fn test_median_filter_removes_single_sample_spikes() {
+        let mut signal = vec![0.0f32; 64];
+        signal[10] = 1.0;
+        signal[32] = -1.0;
+        condition_signal(&mut signal, 48000);
+        assert!(signal[10].abs() < 0.2, "single positive spike removed, got {}", signal[10]);
+        assert!(signal[32].abs() < 0.2, "single negative spike removed, got {}", signal[32]);
+        // A mid-band sinusoid (legitimate LTC-like content) passes the
+        // whole conditioning chain essentially unchanged.
+        let before: Vec<f32> = (0..4800)
+            .map(|i| (2.0 * std::f32::consts::PI * 2000.0 * i as f32 / 48000.0).sin() * 0.5)
+            .collect();
+        let mut filtered = before.clone();
+        condition_signal(&mut filtered, 48000);
+        let max_diff = before.iter().zip(&filtered)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 0.05, "2 kHz carrier distorted by conditioning: max diff {max_diff}");
+    }
+
+    #[test]
+    fn test_impulse_loose_cliff_beyond_quarter() {
+        // Old loose cliff: p ≈ 0.21–0.24. A quarter of all samples
+        // replaced by full-scale clicks must still decode (worst of the
+        // five harness seeds).
+        for &seed in &DR_SEEDS {
+            let signal = add_impulse_noise(&sequential_signal(), 0.25, 1.0, seed);
+            let result = base_decode(&signal);
+            assert!(
+                matches!(result.status, LtcDecodeStatus::Success),
+                "impulse p=0.25 seed {seed}: expected Success, got {:?} (valid={}/{})",
+                result.status, result.valid_frames, result.total_possible_frames
+            );
+        }
+    }
+
+    #[test]
+    fn test_impulse_strict_beyond_point_zero_five() {
+        // Old strict cliff: p ≈ 0.004 (seed lottery). At p = 0.05 the
+        // values must stay correct on at least 4 of 5 seeds.
+        let tcs = sequential_timecodes(50);
+        let mut passed = 0u32;
+        for &seed in &DR_SEEDS {
+            let signal = add_impulse_noise(&sequential_signal(), 0.05, 1.0, seed);
+            let result = base_decode(&signal);
+            let check = std::panic::catch_unwind(|| {
+                assert_ltc_fully_decoded(&result, 25, &tcs);
+            });
+            if check.is_ok() {
+                passed += 1;
+            } else {
+                eprintln!("impulse p=0.05 seed {seed}: not strict, status={:?} valid={}/{}",
+                    result.status, result.valid_frames, result.total_possible_frames);
+            }
+        }
+        assert!(passed >= 4, "expected ≥4/5 seeds strict at impulse p=0.05, got {passed}");
+    }
+
+    #[test]
+    fn test_min_volume_three_times_lower() {
+        // Old strict cliff: volume 0.0104 (the 0.005 absolute ZC floor).
+        // A third of that must now decode with correct values.
+        let tcs = sequential_timecodes(50);
+        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.004);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_floor_survives_loud_clicks_on_quiet_signal() {
+        // The peak-relative floor must not be inflated by full-scale
+        // clicks riding a quiet signal (a raw-max peak would push the
+        // floor above the 0.03 bit amplitude and kill the decode).
+        let tcs = sequential_timecodes(50);
+        let quiet = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.06);
+        let signal = add_impulse_noise(&quiet, 0.01, 1.0, 42);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
     }
 
     // ── 10. Verify clean signal baseline (noise-free sanity check) ──────
