@@ -998,7 +998,11 @@ fn backfill_leading_frames(
         if offset_f < 0.0 {
             break;
         }
-        let bits = extract_bits(&samples[offset_f as usize..], r.spb, 0, threshold, None);
+        let offset = offset_f as usize;
+        if offset >= samples.len() {
+            break;
+        }
+        let bits = extract_bits(&samples[offset..], r.spb, 0, threshold, None);
         if bits.len() < 80 {
             break;
         }
@@ -4107,6 +4111,51 @@ mod tests {
             min_valid, result.valid_frames, result.status);
     }
 
+    /// Properly wrapped sequential timecodes (00:00:00:00, 00:00:00:01, …).
+    /// `make_timecodes` yields invalid values for frames >= fps, which breaks
+    /// timecode-value comparison.
+    fn sequential_timecodes(count: u32) -> Vec<Timecode> {
+        (0..count)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: (i / 25),
+                frames: (i % 25),
+            })
+            .collect()
+    }
+
+    fn sequential_signal() -> Vec<f32> {
+        let tcs = sequential_timecodes(50);
+        synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5)
+    }
+
+    /// The strict robustness bar used by the *_max_decodable tests:
+    /// Success, at least `min_valid` frames, and every decoded timecode is
+    /// an in-order subsequence of `expected` (no garbage values). Values
+    /// were measured with `sweep_robustness_limits_manual`.
+    fn assert_ltc_fully_decoded(result: &LtcDetectionResult, min_valid: u32, expected: &[Timecode]) {
+        assert_ltc_ok(result, min_valid);
+        let mut exp_idx = 0usize;
+        for ft in &result.timecodes {
+            // A frame re-decoded at a corruption boundary may repeat the
+            // just-matched timecode; that is a reporting artifact, not a
+            // wrong value, so it does not break the check.
+            if exp_idx > 0 && expected[exp_idx - 1] == ft.timecode {
+                continue;
+            }
+            while exp_idx < expected.len() && expected[exp_idx] != ft.timecode {
+                exp_idx += 1;
+            }
+            assert!(
+                exp_idx < expected.len(),
+                "decoded out-of-sequence timecode {:?} (status={:?}, valid={}/{})",
+                ft.timecode, result.status, result.valid_frames, result.total_possible_frames
+            );
+            exp_idx += 1;
+        }
+    }
+
     // ── decode_ltc_samples ────────────────────────────────────────────
 
     #[test]
@@ -4317,6 +4366,19 @@ mod tests {
             result.status);
     }
 
+    #[test]
+    fn test_decode_impulse_noise_extreme_does_not_panic() {
+        // Regression: a false sync-word match late in a heavily corrupted
+        // signal made backfill_leading_frames compute a sample offset past
+        // the end of the buffer and slice out of range. Decoding garbage
+        // must degrade gracefully, never panic.
+        let signal = add_impulse_noise(&base_signal(), 0.4, 1.0, 42);
+        let result = base_decode(&signal);
+        // No frame-count floor — heavily corrupted input may decode
+        // nothing. The contract is: no panic, and a well-formed result.
+        assert_eq!(result.timecodes.len(), result.valid_frames as usize);
+    }
+
     // ── 3. DC offset ─────────────────────────────────────────────────────
 
     #[test]
@@ -4476,7 +4538,147 @@ mod tests {
             result.status);
     }
 
-    // ── 9. Verify clean signal baseline (noise-free sanity check) ──────
+    // ── 9. Measured maximum-tolerable corruption ("*_max_decodable") ────
+    //
+    // Values below were measured by `sweep_robustness_limits_manual`
+    // (bisecting each corruption parameter until the strict bar breaks:
+    // Success + all decoded timecode values correct). Pins carry ~15–20 %
+    // margin below the worst-seed cliff. Run the sweep again whenever the
+    // decoder's detection constants change.
+
+    #[test]
+    fn test_noise_gaussian_max_decodable() {
+        // Worst-seed strict cliff: std 0.180 (SNR ≈ +8 dB). Beyond it the
+        // decoder still reports Success — but with wrong timecode values.
+        let tcs = sequential_timecodes(50);
+        let signal = add_gaussian_noise(&sequential_signal(), 0.17, 42);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_noise_impulse_max_decodable() {
+        // Worst-seed strict cliff: p = 0.0041 (a single click on a critical
+        // BCD sample flips that frame's value; the loose bar holds to ≈ 0.21).
+        let tcs = sequential_timecodes(50);
+        let signal = add_impulse_noise(&sequential_signal(), 0.0035, 1.0, 42);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_noise_dc_offset_max_decodable() {
+        // Strict cliff at 0.492 ≈ the signal amplitude: beyond it the
+        // waveform no longer crosses zero and detection ends with an Error.
+        let tcs = sequential_timecodes(50);
+        let signal = add_dc_offset(&sequential_signal(), 0.42);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_noise_dc_offset_beyond_cliff_not_success() {
+        // False-positive ceiling: with the DC offset past the signal
+        // amplitude the zero-crossings disappear; the decoder must report a
+        // non-Success status, never a confident decode of nothing.
+        let signal = add_dc_offset(&sequential_signal(), 0.6);
+        let result = base_decode(&signal);
+        assert!(!matches!(result.status, LtcDecodeStatus::Success),
+            "DC offset 0.6 must not decode, got {:?} (valid={})",
+            result.status, result.valid_frames);
+    }
+
+    #[test]
+    fn test_noise_hum_50hz_max_decodable() {
+        // Strict cliff at hum amplitude ≈ 0.50 = signal amplitude (the hum
+        // swamps the bi-phase transitions).
+        let tcs = sequential_timecodes(50);
+        let signal = add_hum(&sequential_signal(), 48000, 0.42, 50.0);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_noise_hum_60hz_max_decodable() {
+        let tcs = sequential_timecodes(50);
+        let signal = add_hum(&sequential_signal(), 48000, 0.42, 60.0);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_noise_fading_max_decodable() {
+        // Strict cliff at depth 0.909 (envelope dips to ~5 % amplitude);
+        // the loose bar holds even at depth 1.0 (momentary full silence).
+        let tcs = sequential_timecodes(50);
+        let signal = apply_fading(&sequential_signal(), 48000, 1.0, 0.8);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_noise_dropouts_max_loss() {
+        // Loose-bar cliff (plain Success): a single zero-filled span of
+        // ~0.60 s (30 % of this 2 s signal) across all tested placements;
+        // pinned at 0.50 s. The strict bar has no meaningful single-number
+        // cliff for dropouts — placement is a lottery: even a 6 ms gap over
+        // one frame's BCD digits can flip that frame's value (:04 read as
+        // :00) while all neighbours stay correct.
+        let signal = add_dropouts(&sequential_signal(), 48000, 0.50, 1, 42);
+        let result = base_decode(&signal);
+        assert_ltc_ok(&result, 25);
+    }
+
+    #[test]
+    fn test_noise_lowpass_max_decodable() {
+        // Measured cliff: below factor ≈ 0.04 the one-pole low-pass erases
+        // the bi-phase transitions (0.03 → LowConfidence, 0.02 → no sync
+        // word); strict-bar behaviour is non-monotonic just above it
+        // (bisection measures ≈ 0.061). 0.08 pinned; values must stay
+        // correct.
+        let tcs = sequential_timecodes(50);
+        let signal = apply_lowpass(&sequential_signal(), 0.08);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_noise_min_volume_max_attenuation() {
+        // Strict cliff at volume 0.0104, set by the 0.005 absolute
+        // zero-crossing threshold floor (bit amplitude = volume/2 crosses it
+        // below ~0.01). Pinned with ~15 % margin.
+        let tcs = sequential_timecodes(50);
+        let signal = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.012);
+        let result = base_decode(&signal);
+        assert_ltc_fully_decoded(&result, 40, &tcs);
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_clock_drift_max() {
+        // Measured limit (24 s / 600 frames): the decoder locks up to
+        // ≈ +11 400 ppm / −10 200 ppm speed error (≈ ±1 %) — far beyond the
+        // ±0.4 % spb search lattice, carried by adaptive zero-crossing
+        // snapping. Pinned at 8 000 ppm with ~20 % margin. The 100 ppm test
+        // above is the comfortable anchor.
+        let tcs: Vec<Timecode> = (0..600)
+            .map(|i| Timecode {
+                hours: (i / (25 * 60)) as u32,
+                minutes: ((i / 25) % 60) as u32,
+                seconds: (i % 25) as u32,
+                frames: 0,
+            })
+            .collect();
+        let signal = synthesize_ltc_signal_with_drift(&tcs, 25.0, false, 48000, 0.5, 8000.0);
+        let result = decode_ltc_samples(&signal, 48000, 1, 25.0, false, std::time::Instant::now(), None).unwrap();
+        assert!(matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for 24s LTC with 8000ppm drift, got {:?} (valid={}/{})",
+            result.status, result.valid_frames, result.total_possible_frames);
+        assert!(result.valid_frames * 2 >= result.total_possible_frames,
+            "expected >=50% valid frames with 8000ppm drift, got {}/{}",
+            result.valid_frames, result.total_possible_frames);
+    }
+
+    // ── 10. Verify clean signal baseline (noise-free sanity check) ──────
 
     #[test]
     fn test_noise_baseline_clean() {
@@ -4976,6 +5178,416 @@ mod tests {
         let (missing, ratio) = missing_in_span(&hole, 25.0);
         assert_eq!(missing, 1);
         assert!(ratio > 0.0 && ratio < 0.05, "1 missing of ~50 is {:.3}", ratio);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Robustness-limit measurement harness (manual calibration sweep)
+    //
+    //  Not part of the regular suite (`#[ignore]`): bisects each corruption
+    //  parameter to find the decoder's actual breaking point. Run with:
+    //    cargo test -p audio-core --lib sweep_robustness -- --ignored --nocapture
+    //  Re-run whenever the decoder's detection constants change.
+    // ═══════════════════════════════════════════════════════════════════
+
+    struct GateOutcome {
+        /// Success + decoded TCs are an in-order subsequence of the
+        /// synthesized source sequence (no garbage values). Success already
+        /// enforces >= 70% valid frames via the confidence gate.
+        strict: bool,
+        /// The decoder's own Success verdict (confidence >= 0.70 gate).
+        loose: bool,
+        valid: u32,
+        total: u32,
+        confidence: f32,
+        quality: f64,
+        status_desc: String,
+    }
+
+    /// Decode a (possibly corrupted) signal and evaluate both gates.
+    fn evaluate_gate(signal: &[f32], expected_tcs: &[Timecode]) -> GateOutcome {
+        let result = base_decode(signal);
+        let loose = matches!(result.status, LtcDecodeStatus::Success);
+        // Two-pointer subsequence check: every decoded timecode must appear
+        // in the expected sequence, in order, with no out-of-sequence values.
+        let mut exp_idx = 0usize;
+        let mut tc_ok = true;
+        for ft in &result.timecodes {
+            // A frame re-decoded at a corruption boundary may repeat the
+            // just-matched timecode; that is a reporting artifact, not a
+            // wrong value, so it does not break the check.
+            if exp_idx > 0 && expected_tcs[exp_idx - 1] == ft.timecode {
+                continue;
+            }
+            while exp_idx < expected_tcs.len() && expected_tcs[exp_idx] != ft.timecode {
+                exp_idx += 1;
+            }
+            if exp_idx == expected_tcs.len() {
+                tc_ok = false;
+                break;
+            }
+            exp_idx += 1;
+        }
+        GateOutcome {
+            strict: loose && tc_ok,
+            loose,
+            valid: result.valid_frames,
+            total: result.total_possible_frames,
+            confidence: result.avg_confidence,
+            quality: result.quality.as_ref().map(|q| q.score).unwrap_or(0.0),
+            status_desc: format!("{:?}", result.status),
+        }
+    }
+
+    fn gate_passes(g: &GateOutcome, strict: bool) -> bool {
+        if strict { g.strict } else { g.loose }
+    }
+
+    /// Bisect for the maximum parameter value that still passes. Both bounds
+    /// auto-widen until they bracket the cliff: `lo` halves toward `lo_floor`
+    /// until it passes, `hi` doubles toward `hi_cap` until it fails.
+    /// Returns `(limit, probe_count)`.
+    fn bisect_max_pass(
+        mut probe: impl FnMut(f64) -> GateOutcome,
+        lo0: f64,
+        lo_floor: f64,
+        hi0: f64,
+        hi_cap: f64,
+        tol: f64,
+        strict: bool,
+    ) -> (f64, usize) {
+        let mut lo = lo0;
+        let mut probes = 0;
+        let mut first = probe(lo);
+        probes += 1;
+        while !gate_passes(&first, strict) && lo > lo_floor {
+            lo = (lo / 2.0).max(lo_floor);
+            first = probe(lo);
+            probes += 1;
+        }
+        assert!(
+            gate_passes(&first, strict),
+            "no passing lo bound between {} and {}: {}",
+            lo0,
+            lo_floor,
+            describe_failure(&first)
+        );
+        let mut hi = hi0;
+        let mut out = probe(hi);
+        probes += 1;
+        while gate_passes(&out, strict) && hi < hi_cap {
+            lo = hi;
+            hi = (hi * 2.0).min(hi_cap);
+            out = probe(hi);
+            probes += 1;
+        }
+        if gate_passes(&out, strict) {
+            return (hi_cap, probes);
+        }
+        while hi - lo > tol.max(lo * 1e-3) {
+            let mid = (lo + hi) / 2.0;
+            probes += 1;
+            if gate_passes(&probe(mid), strict) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo, probes)
+    }
+
+    /// Bisect for the minimum parameter value that still passes (for
+    /// dimensions where smaller = worse). Bounds auto-widen: `hi` doubles
+    /// toward `hi_cap` until it passes, `lo` halves toward `lo_floor` until
+    /// it fails.
+    fn bisect_min_pass(
+        mut probe: impl FnMut(f64) -> GateOutcome,
+        hi0: f64,
+        hi_cap: f64,
+        lo0: f64,
+        lo_floor: f64,
+        tol: f64,
+        strict: bool,
+    ) -> (f64, usize) {
+        let mut hi = hi0;
+        let mut probes = 0;
+        let mut first = probe(hi);
+        probes += 1;
+        while !gate_passes(&first, strict) && hi < hi_cap {
+            hi = (hi * 2.0).min(hi_cap);
+            first = probe(hi);
+            probes += 1;
+        }
+        assert!(
+            gate_passes(&first, strict),
+            "no passing hi bound between {} and {}: {}",
+            hi0,
+            hi_cap,
+            describe_failure(&first)
+        );
+        let mut lo = lo0;
+        let mut out = probe(lo);
+        probes += 1;
+        while !gate_passes(&out, strict) && lo > lo_floor {
+            hi = lo;
+            lo = (lo / 2.0).max(lo_floor);
+            out = probe(lo);
+            probes += 1;
+        }
+        if !gate_passes(&out, strict) {
+            return (lo_floor, probes);
+        }
+        while hi - lo > tol.max(hi * 1e-3) {
+            let mid = (lo + hi) / 2.0;
+            probes += 1;
+            if gate_passes(&probe(mid), strict) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        (hi, probes)
+    }
+
+    /// Re-probe a value, keeping the outcome for failure-mode reporting.
+    fn snr_db(signal_power: f64, std_dev: f64) -> f64 {
+        10.0 * (signal_power / (std_dev * std_dev)).log10()
+    }
+
+    fn describe_failure(g: &GateOutcome) -> String {
+        format!(
+            "just past cliff: {} valid={}/{} conf={:.2} quality={:.2}",
+            g.status_desc, g.valid, g.total, g.confidence, g.quality
+        )
+    }
+
+    #[test]
+    #[ignore = "manual calibration harness — run with: cargo test -p audio-core --lib sweep_robustness -- --ignored --nocapture"]
+    fn sweep_robustness_limits_manual() {
+        let seeds: [u64; 5] = [42, 7, 123, 2024, 999];
+        // Proper sequential timecodes (make_timecodes() yields invalid
+        // frames ≥ fps, which breaks TC-value comparison in the gate).
+        let tcs: Vec<Timecode> = (0..50)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: (i / 25),
+                frames: (i % 25),
+            })
+            .collect();
+        let clean = synthesize_ltc_signal(&tcs, 25.0, false, 48000, 0.5);
+        let sig_power = 0.25f64; // square wave amplitude 0.5 → mean square 0.25
+
+        println!("\n=== Robustness limit sweep ===");
+        println!("base signal: 50 frames @ 25 fps, 48 kHz, volume 0.5 (2.0 s)");
+        println!("strict bar = Success + all decoded TCs correct;  loose bar = plain Success\n");
+
+        let clean_gate = evaluate_gate(&clean, &tcs);
+        println!(
+            "clean baseline gate: strict={} loose={} valid={}/{} conf={:.2}",
+            clean_gate.strict, clean_gate.loose, clean_gate.valid, clean_gate.total, clean_gate.confidence
+        );
+        let near_clean = evaluate_gate(&add_gaussian_noise(&clean, 0.001, 42), &tcs);
+        println!(
+            "gaussian std=0.001 gate: strict={} valid={}/{} conf={:.2} status={}",
+            near_clean.strict, near_clean.valid, near_clean.total, near_clean.confidence, near_clean.status_desc
+        );
+
+        // ── 1. Additive Gaussian noise ────────────────────────────────
+        for (bar, strict) in [("strict", true), ("loose", false)] {
+            let mut cliffs = Vec::new();
+            for &seed in &seeds {
+                let probe = |std: f64| {
+                    let sig = add_gaussian_noise(&clean, std as f32, seed);
+                    evaluate_gate(&sig, &tcs)
+                };
+                let (limit, _) = bisect_max_pass(probe, 0.05, 0.001, 0.5, 4.0, 0.005, strict);
+                cliffs.push(limit);
+            }
+            // failure mode at worst-seed cliff
+            let worst = cliffs
+                .iter()
+                .cloned()
+                .filter(|c| c.is_finite())
+                .fold(f64::INFINITY, f64::min);
+            let worst_seed = seeds
+                [cliffs.iter().position(|c| *c == worst).unwrap_or(0)];
+            let fail_mode = describe_failure(&evaluate_gate(
+                &add_gaussian_noise(&clean, ((worst * 1.1).min(4.0)) as f32, worst_seed),
+                &tcs,
+            ));
+            let snrs: Vec<String> = cliffs
+                .iter()
+                .map(|c| format!("{:.1}dB", snr_db(sig_power, *c)))
+                .collect();
+            println!(
+                "gaussian noise  [{bar}] std per seed: {:?}  (SNR: {:?})  worst std={:.3} @seed {}  {}",
+                cliffs, snrs, worst, worst_seed, fail_mode
+            );
+        }
+
+        // ── 2. Impulse (click) noise, amplitude 1.0 ───────────────────
+        for (bar, strict) in [("strict", true), ("loose", false)] {
+            let mut cliffs = Vec::new();
+            for &seed in &seeds {
+                let probe = |p: f64| {
+                    let sig = add_impulse_noise(&clean, p as f32, 1.0, seed);
+                    evaluate_gate(&sig, &tcs)
+                };
+                let (limit, _) = bisect_max_pass(probe, 0.001, 0.00001, 0.05, 0.95, 0.001, strict);
+                cliffs.push(limit);
+            }
+            let worst = cliffs
+                .iter()
+                .cloned()
+                .filter(|c| c.is_finite())
+                .fold(f64::INFINITY, f64::min);
+            let worst_seed = seeds
+                [cliffs.iter().position(|c| *c == worst).unwrap_or(0)];
+            let fail_mode = describe_failure(&evaluate_gate(
+                &add_impulse_noise(&clean, (worst * 1.1).min(0.95) as f32, 1.0, worst_seed),
+                &tcs,
+            ));
+            println!(
+                "impulse noise   [{bar}] p per seed: {:?}  worst p={:.4} @seed {}  {}",
+                cliffs, worst, worst_seed, fail_mode
+            );
+        }
+
+        // ── 3. DC offset (deterministic) ──────────────────────────────
+        for (bar, strict) in [("strict", true), ("loose", false)] {
+            let probe = |off: f64| {
+                let sig = add_dc_offset(&clean, off as f32);
+                evaluate_gate(&sig, &tcs)
+            };
+            let (limit, _) = bisect_max_pass(probe, 0.01, 0.0001, 0.5, 8.0, 0.005, strict);
+            let fail_mode = describe_failure(&evaluate_gate(
+                &add_dc_offset(&clean, (limit * 1.1).min(8.0) as f32),
+                &tcs,
+            ));
+            println!("dc offset       [{bar}] max={:.3}  {}", limit, fail_mode);
+        }
+
+        // ── 4. Mains hum (deterministic) ──────────────────────────────
+        for freq in [50.0f32, 60.0] {
+            for (bar, strict) in [("strict", true), ("loose", false)] {
+                let probe = |amp: f64| {
+                    let sig = add_hum(&clean, 48000, amp as f32, freq);
+                    evaluate_gate(&sig, &tcs)
+                };
+                let (limit, _) = bisect_max_pass(probe, 0.05, 0.0001, 0.5, 8.0, 0.005, strict);
+                let fail_mode = describe_failure(&evaluate_gate(
+                    &add_hum(&clean, 48000, (limit * 1.1).min(8.0) as f32, freq),
+                    &tcs,
+                ));
+                println!("hum {:.0} Hz     [{bar}] max amp={:.3}  {}", freq, limit, fail_mode);
+            }
+        }
+
+        // ── 5. Amplitude fading (deterministic, 1 Hz modulation) ──────
+        for (bar, strict) in [("strict", true), ("loose", false)] {
+            let probe = |depth: f64| {
+                let sig = apply_fading(&clean, 48000, 1.0, depth as f32);
+                evaluate_gate(&sig, &tcs)
+            };
+            let (limit, _) = bisect_max_pass(probe, 0.3, 0.05, 0.6, 1.0, 0.005, strict);
+            let fail_mode = describe_failure(&evaluate_gate(
+                &apply_fading(&clean, 48000, 1.0, (limit * 1.05).min(1.0) as f32),
+                &tcs,
+            ));
+            println!("fading 1Hz      [{bar}] max depth={:.3}  {}", limit, fail_mode);
+        }
+
+        // ── 6. Dropouts: one zero-filled span, bisect duration ────────
+        for (bar, strict) in [("strict", true), ("loose", false)] {
+            let mut cliffs = Vec::new();
+            for &seed in &seeds {
+                let probe = |secs: f64| {
+                    let sig = add_dropouts(&clean, 48000, secs as f32, 1, seed);
+                    evaluate_gate(&sig, &tcs)
+                };
+                let (limit, _) = bisect_max_pass(probe, 0.05, 0.005, 0.4, 1.9, 0.005, strict);
+                cliffs.push(limit);
+            }
+            let worst = cliffs
+                .iter()
+                .cloned()
+                .filter(|c| c.is_finite())
+                .fold(f64::INFINITY, f64::min);
+            let worst_seed = seeds
+                [cliffs.iter().position(|c| *c == worst).unwrap_or(0)];
+            let fail_mode = describe_failure(&evaluate_gate(
+                &add_dropouts(&clean, 48000, (worst * 1.1).min(1.9) as f32, 1, worst_seed),
+                &tcs,
+            ));
+            let pct: Vec<String> = cliffs.iter().map(|c| format!("{:.0}%", c * 50.0)).collect();
+            println!(
+                "dropout span    [{bar}] secs per seed: {:?} (of 2.0s = {:?} loss)  worst={:.3}s @seed {}  {}",
+                cliffs, pct, worst, worst_seed, fail_mode
+            );
+        }
+
+        // ── 7. Low-pass (bandwidth-limited link; smaller = worse) ─────
+        for (bar, strict) in [("strict", true), ("loose", false)] {
+            let probe = |factor: f64| {
+                let sig = apply_lowpass(&clean, factor as f32);
+                evaluate_gate(&sig, &tcs)
+            };
+            let (limit, _) = bisect_min_pass(probe, 0.3, 0.9, 0.06, 0.002, 0.001, strict);
+            let fail_mode = describe_failure(&evaluate_gate(
+                &apply_lowpass(&clean, (limit / 1.5).max(0.0005) as f32),
+                &tcs,
+            ));
+            println!("lowpass factor  [{bar}] min={:.4}  {}", limit, fail_mode);
+        }
+
+        // ── 8. Minimum volume (ZC-threshold floor; smaller = worse) ───
+        for (bar, strict) in [("strict", true), ("loose", false)] {
+            let probe = |vol: f64| {
+                let sig = synthesize_ltc_signal(&tcs, 25.0, false, 48000, vol as f32);
+                evaluate_gate(&sig, &tcs)
+            };
+            let (limit, _) = bisect_min_pass(probe, 0.12, 1.0, 0.01, 0.002, 0.0005, strict);
+            let fail_mode = describe_failure(&evaluate_gate(
+                &synthesize_ltc_signal(&tcs, 25.0, false, 48000, (limit / 1.5).max(0.0002) as f32),
+                &tcs,
+            ));
+            println!("min volume      [{bar}] min={:.4}  {}", limit, fail_mode);
+        }
+
+        // ── 9. Clock drift on a 24 s / 600-frame signal (both signs) ──
+        let tcs_long: Vec<Timecode> = (0..600)
+            .map(|i| Timecode {
+                hours: (i / (25 * 60)) as u32,
+                minutes: ((i / 25) % 60) as u32,
+                seconds: (i % 25) as u32,
+                frames: 0,
+            })
+            .collect();
+        for sign in [1.0f64, -1.0] {
+            for (bar, strict) in [("strict", true), ("loose", false)] {
+                let probe = |ppm: f64| {
+                    let sig = synthesize_ltc_signal_with_drift(
+                        &tcs_long, 25.0, false, 48000, 0.5, sign * ppm,
+                    );
+                    evaluate_gate(&sig, &tcs_long)
+                };
+                let (limit, _) = bisect_max_pass(probe, 100.0, 1.0, 1000.0, 200_000.0, 100.0, strict);
+                let fail_mode = describe_failure(&evaluate_gate(
+                    &synthesize_ltc_signal_with_drift(
+                        &tcs_long, 25.0, false, 48000, 0.5, sign * limit * 1.2,
+                    ),
+                    &tcs_long,
+                ));
+                println!(
+                    "drift {}      [{bar}] max={:.0}ppm  {}",
+                    if sign > 0.0 { "+ppm" } else { "-ppm" },
+                    limit,
+                    fail_mode
+                );
+            }
+        }
+
+        println!("\n=== sweep complete ===");
     }
 }
 
