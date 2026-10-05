@@ -9,7 +9,7 @@ use gui_engine::converter::{
     available_containers,
     conversion_sanity_check, conversion_sanity_check_metadata_only,
     conversion_sanity_check_pure, conversion_sanity_check_metadata_only_pure,
-    ConversionCheckError,
+    ConversionCheckError, SanityCheckInput,
     evaluate_readiness,
     format_blockers,
     preview_output_files, start_timecode_from_ltc, supported_audio_encoders, supported_containers,
@@ -49,18 +49,18 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             ))
         } else if state.latest.converter.selected_group_idx.is_some() {
             let input_files = selected_input_files(state);
-            Some(conversion_sanity_check_pure(
-                conv.container.value(),
-                conv.video_encoder.value(),
-                conv.audio_encoder.value(),
-                &input_files,
-                &output_folder,
-                &filename_prefix,
+            Some(conversion_sanity_check_pure(SanityCheckInput {
+                container: conv.container.value(),
+                video_codec: conv.video_encoder.value(),
+                audio_encoder: conv.audio_encoder.value(),
+                input_files: &input_files,
+                output_folder: &output_folder,
+                filename_prefix: &filename_prefix,
                 caps,
-                Some(&audio_suffix),
-                Some(&video_suffix),
-                copy_mode_active(state),
-            ))
+                audio_suffix: Some(&audio_suffix),
+                video_suffix: Some(&video_suffix),
+                copy_video: copy_mode_active(state),
+            }))
         } else {
             None
         }
@@ -2266,18 +2266,18 @@ fn start_conversion(state: &mut AppState) {
                 Some(&video_suffix),
             )
         } else {
-            conversion_sanity_check(
-                conv.container.value(),
-                conv.video_encoder.value(),
-                conv.audio_encoder.value(),
-                &input_files,
-                &output_folder,
-                &filename_prefix,
+            conversion_sanity_check(SanityCheckInput {
+                container: conv.container.value(),
+                video_codec: conv.video_encoder.value(),
+                audio_encoder: conv.audio_encoder.value(),
+                input_files: &input_files,
+                output_folder: &output_folder,
+                filename_prefix: &filename_prefix,
                 caps,
-                Some(&audio_suffix),
-                Some(&video_suffix),
-                copy_mode_active(state),
-            )
+                audio_suffix: Some(&audio_suffix),
+                video_suffix: Some(&video_suffix),
+                copy_video: copy_mode_active(state),
+            })
         };
         if let Err(e) = r {
             log::error!("Conversion refused by preflight check: {}", e);

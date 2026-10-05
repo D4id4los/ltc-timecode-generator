@@ -110,22 +110,41 @@ impl fmt::Display for ConversionCheckError {
 
 impl std::error::Error for ConversionCheckError {}
 
+/// Borrowed view of the converter settings fields the sanity checks
+/// validate. Both `conversion_sanity_check*` entry points take one of these
+/// instead of ten loose parameters; build it from the settings snapshot.
+pub struct SanityCheckInput<'a> {
+    pub container: &'a str,
+    pub video_codec: &'a str,
+    pub audio_encoder: &'a str,
+    pub input_files: &'a [PathBuf],
+    pub output_folder: &'a Path,
+    pub filename_prefix: &'a str,
+    pub caps: &'a FfmpegCapabilities,
+    pub audio_suffix: Option<&'a str>,
+    pub video_suffix: Option<&'a str>,
+    pub copy_video: bool,
+}
+
 /// Pure validation: checks templates, caps, codec/container compatibility.
 /// Does **not** access the filesystem (no `exists()` on files or folders).
 /// Use for per-frame UI display; use `conversion_sanity_check` (which
 /// additionally calls `validate_conversion_paths`) before spawning work.
 pub fn conversion_sanity_check_pure(
-    container: &str,
-    video_codec: &str,
-    audio_encoder: &str,
-    input_files: &[PathBuf],
-    _output_folder: &Path,
-    filename_prefix: &str,
-    caps: &FfmpegCapabilities,
-    audio_suffix: Option<&str>,
-    video_suffix: Option<&str>,
-    copy_video: bool,
+    input: SanityCheckInput<'_>,
 ) -> Result<(), ConversionCheckError> {
+    let SanityCheckInput {
+        container,
+        video_codec,
+        audio_encoder,
+        input_files,
+        output_folder: _output_folder,
+        filename_prefix,
+        caps,
+        audio_suffix,
+        video_suffix,
+        copy_video,
+    } = input;
     if !caps.has_ffmpeg {
         return Err(ConversionCheckError::FfmpegUnavailable(None));
     }
@@ -239,22 +258,13 @@ pub fn validate_conversion_paths(
 
 /// Full sanity check: pure validation + filesystem existence checks.
 /// Use this before actually starting a conversion.
-pub fn conversion_sanity_check(
-    container: &str,
-    video_codec: &str,
-    audio_encoder: &str,
-    input_files: &[PathBuf],
-    output_folder: &Path,
-    filename_prefix: &str,
-    caps: &FfmpegCapabilities,
-    audio_suffix: Option<&str>,
-    video_suffix: Option<&str>,
-    copy_video: bool,
-) -> Result<(), ConversionCheckError> {
-    conversion_sanity_check_pure(
-        container, video_codec, audio_encoder, input_files, output_folder,
-        filename_prefix, caps, audio_suffix, video_suffix, copy_video,
-    )?;
+pub fn conversion_sanity_check(input: SanityCheckInput<'_>) -> Result<(), ConversionCheckError> {
+    let SanityCheckInput {
+        input_files,
+        output_folder,
+        ..
+    } = input;
+    conversion_sanity_check_pure(input)?;
     validate_conversion_paths(input_files, output_folder)
 }
 
@@ -406,11 +416,18 @@ mod tests {
         encs.insert("pcm_s24le");
         let caps = make_caps(true, encs, fmts);
         let files = vec![PathBuf::from("/nonexistent/file.wav")];
-        let result = conversion_sanity_check_pure(
-            "mov", "h264", "pcm_s24le",
-            &files, Path::new("/nonexistent/out"),
-            "test", &caps, Some("_audio"), Some("_video"), true,
-        );
+        let result = conversion_sanity_check_pure(SanityCheckInput {
+            container: "mov",
+            video_codec: "h264",
+            audio_encoder: "pcm_s24le",
+            input_files: &files,
+            output_folder: Path::new("/nonexistent/out"),
+            filename_prefix: "test",
+            caps: &caps,
+            audio_suffix: Some("_audio"),
+            video_suffix: Some("_video"),
+            copy_video: true,
+        });
         assert!(result.is_ok(), "pure check should not fail on nonexistent paths: {:?}", result);
     }
 
@@ -422,11 +439,18 @@ mod tests {
         encs.insert("pcm_s24le");
         let caps = make_caps(true, encs, fmts);
         let files = vec![PathBuf::from("/nonexistent/file.wav")];
-        let result = conversion_sanity_check(
-            "mov", "h264", "pcm_s24le",
-            &files, Path::new("/nonexistent/out"),
-            "test", &caps, Some("_audio"), Some("_video"), true,
-        );
+        let result = conversion_sanity_check(SanityCheckInput {
+            container: "mov",
+            video_codec: "h264",
+            audio_encoder: "pcm_s24le",
+            input_files: &files,
+            output_folder: Path::new("/nonexistent/out"),
+            filename_prefix: "test",
+            caps: &caps,
+            audio_suffix: Some("_audio"),
+            video_suffix: Some("_video"),
+            copy_video: true,
+        });
         match result {
             Err(ConversionCheckError::MissingInput(p)) => {
                 assert_eq!(p, PathBuf::from("/nonexistent/file.wav"));
@@ -438,11 +462,18 @@ mod tests {
     #[test]
     fn test_pure_fails_on_empty_input() {
         let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
-        let result = conversion_sanity_check_pure(
-            "mov", "h265", "pcm_s24le",
-            &[], Path::new("/tmp"),
-            "test", &caps, Some("_audio"), Some("_video"), false,
-        );
+        let result = conversion_sanity_check_pure(SanityCheckInput {
+            container: "mov",
+            video_codec: "h265",
+            audio_encoder: "pcm_s24le",
+            input_files: &[],
+            output_folder: Path::new("/tmp"),
+            filename_prefix: "test",
+            caps: &caps,
+            audio_suffix: Some("_audio"),
+            video_suffix: Some("_video"),
+            copy_video: false,
+        });
         assert_eq!(result, Err(ConversionCheckError::NoInputFiles));
     }
 

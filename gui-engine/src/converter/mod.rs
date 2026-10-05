@@ -41,8 +41,8 @@ pub use checks::{
     conversion_sanity_check, conversion_sanity_check_metadata_only,
     conversion_sanity_check_pure, conversion_sanity_check_metadata_only_pure,
     validate_conversion_paths,
-    ConversionCheckError, ConvertBlocker, ConvertReadiness, evaluate_readiness,
-    format_blockers,
+    ConversionCheckError, ConvertBlocker, ConvertReadiness, SanityCheckInput,
+    evaluate_readiness, format_blockers,
 };
 
 pub(crate) mod args;
