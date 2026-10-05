@@ -1,0 +1,44 @@
+name: cargo-mutants
+
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays 04:05 UTC — weekly suite audit
+  workflow_dispatch:
+
+jobs:
+  mutants-audio-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies (alsa, pipewire, pulse, fontconfig, libltc, libclang)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libltc-dev libclang-dev
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants-audio-core
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Run cargo-mutants (audio-core)
+        run: cargo mutants -p audio-core -o mutants.out
+
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-audio-core
+          path: mutants.out
+          retention-days: 30
