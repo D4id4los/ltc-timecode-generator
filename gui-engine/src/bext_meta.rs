@@ -41,20 +41,22 @@ pub fn bext_description(camera: Option<&CameraInfo>) -> Option<String> {
 /// `creation_date`, falling back to the file's mtime formatted `%Y-%m-%d`
 /// (chrono). `None` when neither source exists.
 pub fn bext_origination_date(camera: Option<&CameraInfo>, file: Option<&Path>) -> Option<String> {
-    camera
-        .and_then(|c| c.creation_date.clone())
-        .or_else(|| {
-            let file = file?;
-            let meta = std::fs::metadata(file).ok()?;
-            let mtime = meta.modified().ok()?;
-            let dt: chrono::DateTime<chrono::Local> = mtime.into();
-            Some(dt.format("%Y-%m-%d").to_string())
-        })
+    camera.and_then(|c| c.creation_date.clone()).or_else(|| {
+        let file = file?;
+        let meta = std::fs::metadata(file).ok()?;
+        let mtime = meta.modified().ok()?;
+        let dt: chrono::DateTime<chrono::Local> = mtime.into();
+        Some(dt.format("%Y-%m-%d").to_string())
+    })
 }
 
 /// The `-write_bext 1` + `-metadata originator/origination_date/description`
 /// argument block for WAV outputs (format checked by the caller).
-pub fn push_wav_bext_args(args: &mut Vec<String>, camera: Option<&CameraInfo>, file: Option<&Path>) {
+pub fn push_wav_bext_args(
+    args: &mut Vec<String>,
+    camera: Option<&CameraInfo>,
+    file: Option<&Path>,
+) {
     args.push("-write_bext".to_string());
     args.push("1".to_string());
     args.push("-metadata".to_string());
@@ -92,9 +94,18 @@ mod tests {
     #[test]
     fn test_originator_variants() {
         assert_eq!(bext_originator(None), BEXT_DEFAULT_ORIGINATOR);
-        assert_eq!(bext_originator(Some(&camera(Some("Sony"), Some("FS100"), None))), "Sony FS100");
-        assert_eq!(bext_originator(Some(&camera(None, Some("GH6"), None))), "GH6");
-        assert_eq!(bext_originator(Some(&camera(Some("Canon"), None, None))), "Canon");
+        assert_eq!(
+            bext_originator(Some(&camera(Some("Sony"), Some("FS100"), None))),
+            "Sony FS100"
+        );
+        assert_eq!(
+            bext_originator(Some(&camera(None, Some("GH6"), None))),
+            "GH6"
+        );
+        assert_eq!(
+            bext_originator(Some(&camera(Some("Canon"), None, None))),
+            "Canon"
+        );
         assert_eq!(
             bext_originator(Some(&camera(Some(""), Some(""), None))),
             BEXT_DEFAULT_ORIGINATOR
@@ -104,7 +115,10 @@ mod tests {
     #[test]
     fn test_description_variants() {
         assert_eq!(bext_description(None), None);
-        assert_eq!(bext_description(Some(&camera(Some("Sony"), None, None))), None);
+        assert_eq!(
+            bext_description(Some(&camera(Some("Sony"), None, None))),
+            None
+        );
         assert_eq!(
             bext_description(Some(&camera(Some("Sony"), Some("FS100"), Some("18-105mm")))),
             Some("FS100 / 18-105mm".to_string())
@@ -135,9 +149,14 @@ mod tests {
         let path = dir.path().join("clip.wav");
         std::fs::write(&path, b"x").unwrap();
 
-        assert!(bext_origination_date(None, Some(&path)).is_some(),
-            "mtime fallback produces a date");
-        assert_eq!(bext_origination_date(None, Some(&dir.path().join("missing.wav"))), None);
+        assert!(
+            bext_origination_date(None, Some(&path)).is_some(),
+            "mtime fallback produces a date"
+        );
+        assert_eq!(
+            bext_origination_date(None, Some(&dir.path().join("missing.wav"))),
+            None
+        );
         assert_eq!(bext_origination_date(None, None), None);
     }
 

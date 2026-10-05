@@ -35,7 +35,10 @@ pub fn read_wav_sample_rate_from_file(file: &mut std::fs::File) -> Option<u32> {
             let mut fmt_data = [0u8; 8];
             file.read_exact(&mut fmt_data).ok()?;
             return Some(u32::from_le_bytes([
-                fmt_data[4], fmt_data[5], fmt_data[6], fmt_data[7],
+                fmt_data[4],
+                fmt_data[5],
+                fmt_data[6],
+                fmt_data[7],
             ]));
         }
         offset += 8 + chunk_size;
@@ -73,7 +76,12 @@ fn decrement_timecode_frame(tc: &Timecode, fps: f64, drop_frame: bool) -> Timeco
             m = 59;
             h = if h == 0 { 23 } else { h - 1 };
         }
-        return Timecode { hours: h, minutes: m, seconds: 59, frames: max_frames - 1 };
+        return Timecode {
+            hours: h,
+            minutes: m,
+            seconds: 59,
+            frames: max_frames - 1,
+        };
     }
 
     if f > 0 {
@@ -92,7 +100,12 @@ fn decrement_timecode_frame(tc: &Timecode, fps: f64, drop_frame: bool) -> Timeco
         f = max_frames - 1;
     }
 
-    Timecode { hours: h, minutes: m, seconds: s, frames: f }
+    Timecode {
+        hours: h,
+        minutes: m,
+        seconds: s,
+        frames: f,
+    }
 }
 
 pub fn shift_timecode_back(tc: &Timecode, delta_secs: f64, fps: f64, drop_frame: bool) -> Timecode {
@@ -108,9 +121,14 @@ pub fn shift_timecode_back(tc: &Timecode, delta_secs: f64, fps: f64, drop_frame:
     out
 }
 
-pub fn start_timecode_from_ltc(result: &audio_core::LtcDetectionResult) -> Option<TimecodeMetadata> {
+pub fn start_timecode_from_ltc(
+    result: &audio_core::LtcDetectionResult,
+) -> Option<TimecodeMetadata> {
     use audio_core::LtcDecodeStatus;
-    if !matches!(result.status, LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence) {
+    if !matches!(
+        result.status,
+        LtcDecodeStatus::Success | LtcDecodeStatus::LowConfidence
+    ) {
         return None;
     }
     if result.timecodes.is_empty() || result.detected_fps <= 0.0 {
@@ -123,9 +141,8 @@ pub fn start_timecode_from_ltc(result: &audio_core::LtcDetectionResult) -> Optio
     } else {
         first.timecode_secs
     };
-    let secure = audio_core::find_first_coherent_index(
-        &result.timecodes, fps, result.drop_frame,
-    ) == Some(0);
+    let secure =
+        audio_core::find_first_coherent_index(&result.timecodes, fps, result.drop_frame) == Some(0);
     if !secure {
         warn!(
             "start_timecode_from_ltc: first timecode at {:.3}s is not part of a secure coherent \
@@ -134,15 +151,20 @@ pub fn start_timecode_from_ltc(result: &audio_core::LtcDetectionResult) -> Optio
         );
     }
     let start = shift_timecode_back(&first.timecode, offset, fps, result.drop_frame);
-    Some(TimecodeMetadata { start, fps, drop_frame: result.drop_frame })
+    Some(TimecodeMetadata {
+        start,
+        fps,
+        drop_frame: result.drop_frame,
+    })
 }
 
 pub fn build_per_file_start_timecodes(
     results: &[Option<&audio_core::LtcDetectionResult>],
 ) -> Vec<Option<TimecodeMetadata>> {
-    results.iter().map(|r| {
-        r.and_then(start_timecode_from_ltc)
-    }).collect()
+    results
+        .iter()
+        .map(|r| r.and_then(start_timecode_from_ltc))
+        .collect()
 }
 
 pub fn build_per_file_trim_and_timecode(
@@ -153,7 +175,13 @@ pub fn build_per_file_trim_and_timecode(
 
     for result_opt in results {
         match result_opt {
-            Some(r) if matches!(r.status, audio_core::LtcDecodeStatus::Success | audio_core::LtcDecodeStatus::LowConfidence) => {
+            Some(r)
+                if matches!(
+                    r.status,
+                    audio_core::LtcDecodeStatus::Success
+                        | audio_core::LtcDecodeStatus::LowConfidence
+                ) =>
+            {
                 let trim = r.first_ltc_timecode_secs;
                 let meta = find_timecode_at_offset(&r.timecodes, trim).map(|tc| TimecodeMetadata {
                     start: tc,
@@ -187,13 +215,15 @@ pub fn parse_native_timecode(s: &str) -> Option<Timecode> {
     if hours >= 24 || minutes >= 60 || seconds >= 60 || frames >= 60 {
         return None;
     }
-    Some(Timecode { hours: hours as u32, minutes: minutes as u32, seconds: seconds as u32, frames: frames as u32 })
+    Some(Timecode {
+        hours: hours as u32,
+        minutes: minutes as u32,
+        seconds: seconds as u32,
+        frames: frames as u32,
+    })
 }
 
-pub fn find_timecode_at_offset(
-    timecodes: &[FrameTimecode],
-    offset_secs: f64,
-) -> Option<Timecode> {
+pub fn find_timecode_at_offset(timecodes: &[FrameTimecode], offset_secs: f64) -> Option<Timecode> {
     if timecodes.is_empty() {
         return None;
     }
@@ -219,10 +249,15 @@ pub fn time_reference_samples(tc: &TimecodeMetadata, sample_rate: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use audio_core::{FrameTimecode, LtcDecodeStatus, Timecode};
     use super::*;
+    use audio_core::{FrameTimecode, LtcDecodeStatus, Timecode};
 
-    fn make_test_result(timecodes: Vec<FrameTimecode>, fps: f32, first_secs: f64, status: audio_core::LtcDecodeStatus) -> audio_core::LtcDetectionResult {
+    fn make_test_result(
+        timecodes: Vec<FrameTimecode>,
+        fps: f32,
+        first_secs: f64,
+        status: audio_core::LtcDecodeStatus,
+    ) -> audio_core::LtcDetectionResult {
         audio_core::LtcDetectionResult {
             status,
             detected_fps: fps,
@@ -243,43 +278,119 @@ mod tests {
 
     #[test]
     fn test_format_ffmpeg_timecode_non_drop() {
-        let tc = Timecode { hours: 1, minutes: 23, seconds: 45, frames: 16 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 23,
+            seconds: 45,
+            frames: 16,
+        };
         assert_eq!(format_ffmpeg_timecode(&tc, false), "01:23:45:16");
     }
 
     #[test]
     fn test_format_ffmpeg_timecode_drop() {
-        let tc = Timecode { hours: 23, minutes: 59, seconds: 59, frames: 29 };
+        let tc = Timecode {
+            hours: 23,
+            minutes: 59,
+            seconds: 59,
+            frames: 29,
+        };
         assert_eq!(format_ffmpeg_timecode(&tc, true), "23:59:59;29");
     }
 
     #[test]
     fn test_format_ffmpeg_timecode_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         assert_eq!(format_ffmpeg_timecode(&tc, false), "00:00:00:00");
         assert_eq!(format_ffmpeg_timecode(&tc, true), "00:00:00;00");
     }
 
     #[test]
     fn test_find_timecode_at_offset_exact() {
-        let tc = Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let tcs = vec![
-            FrameTimecode { frame_index: 0, timecode: tc, timecode_secs: 0.0 },
-            FrameTimecode { frame_index: 25, timecode: Timecode { hours: 1, minutes: 0, seconds: 1, frames: 0 }, timecode_secs: 1.0 },
-            FrameTimecode { frame_index: 50, timecode: Timecode { hours: 1, minutes: 0, seconds: 2, frames: 0 }, timecode_secs: 2.0 },
+            FrameTimecode {
+                frame_index: 0,
+                timecode: tc,
+                timecode_secs: 0.0,
+            },
+            FrameTimecode {
+                frame_index: 25,
+                timecode: Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 1,
+                    frames: 0,
+                },
+                timecode_secs: 1.0,
+            },
+            FrameTimecode {
+                frame_index: 50,
+                timecode: Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 2,
+                    frames: 0,
+                },
+                timecode_secs: 2.0,
+            },
         ];
         let found = find_timecode_at_offset(&tcs, 1.0).unwrap();
-        assert_eq!(found, Timecode { hours: 1, minutes: 0, seconds: 1, frames: 0 });
+        assert_eq!(
+            found,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 1,
+                frames: 0
+            }
+        );
     }
 
     #[test]
     fn test_find_timecode_at_offset_closest() {
         let tcs = vec![
-            FrameTimecode { frame_index: 0, timecode: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 0.0 },
-            FrameTimecode { frame_index: 50, timecode: Timecode { hours: 1, minutes: 0, seconds: 2, frames: 0 }, timecode_secs: 2.0 },
+            FrameTimecode {
+                frame_index: 0,
+                timecode: Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                timecode_secs: 0.0,
+            },
+            FrameTimecode {
+                frame_index: 50,
+                timecode: Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 2,
+                    frames: 0,
+                },
+                timecode_secs: 2.0,
+            },
         ];
         let found = find_timecode_at_offset(&tcs, 1.5).unwrap();
-        assert_eq!(found, Timecode { hours: 1, minutes: 0, seconds: 2, frames: 0 });
+        assert_eq!(
+            found,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 2,
+                frames: 0
+            }
+        );
     }
 
     #[test]
@@ -289,18 +400,44 @@ mod tests {
 
     #[test]
     fn test_find_timecode_at_offset_before_first() {
-        let tcs = vec![
-            FrameTimecode { frame_index: 125, timecode: Timecode { hours: 1, minutes: 0, seconds: 5, frames: 0 }, timecode_secs: 5.0 },
-        ];
+        let tcs = vec![FrameTimecode {
+            frame_index: 125,
+            timecode: Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 5,
+                frames: 0,
+            },
+            timecode_secs: 5.0,
+        }];
         let found = find_timecode_at_offset(&tcs, 0.0).unwrap();
-        assert_eq!(found, Timecode { hours: 1, minutes: 0, seconds: 5, frames: 0 });
+        assert_eq!(
+            found,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 5,
+                frames: 0
+            }
+        );
     }
 
     #[test]
     fn test_build_per_file_trim_and_timecode_all_success() {
         let r = make_test_result(
-            vec![FrameTimecode { frame_index: 50, timecode: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 2.0 }],
-            25.0, 2.0, LtcDecodeStatus::Success,
+            vec![FrameTimecode {
+                frame_index: 50,
+                timecode: Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                timecode_secs: 2.0,
+            }],
+            25.0,
+            2.0,
+            LtcDecodeStatus::Success,
         );
         let (trims, metas) = build_per_file_trim_and_timecode(&[Some(&r)]);
         assert!((trims[0] - 2.0).abs() < 0.001);
@@ -325,35 +462,84 @@ mod tests {
 
     #[test]
     fn test_shift_timecode_back_ndf() {
-        let tc = Timecode { hours: 1, minutes: 0, seconds: 5, frames: 0 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 5,
+            frames: 0,
+        };
         let shifted = shift_timecode_back(&tc, 2.0, 25.0, false);
-        assert_eq!(shifted, Timecode { hours: 1, minutes: 0, seconds: 3, frames: 0 });
+        assert_eq!(
+            shifted,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 3,
+                frames: 0
+            }
+        );
     }
 
     #[test]
     fn test_shift_timecode_back_zero_is_identity() {
-        let tc = Timecode { hours: 1, minutes: 0, seconds: 5, frames: 0 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 5,
+            frames: 0,
+        };
         let shifted = shift_timecode_back(&tc, 0.0, 25.0, false);
         assert_eq!(shifted, tc);
     }
 
     #[test]
     fn test_shift_timecode_back_drop_frame_skips_nonexistent() {
-        let tc = Timecode { hours: 1, minutes: 1, seconds: 0, frames: 2 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 1,
+            seconds: 0,
+            frames: 2,
+        };
         let shifted = shift_timecode_back(&tc, 2.0 / 29.97, 29.97, true);
-        assert_eq!(shifted, Timecode { hours: 1, minutes: 0, seconds: 59, frames: 29 });
+        assert_eq!(
+            shifted,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 59,
+                frames: 29
+            }
+        );
     }
 
     #[test]
     fn test_shift_timecode_back_wraps_midnight() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 1 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 1,
+        };
         let shifted = shift_timecode_back(&tc, 2.0 / 25.0, 25.0, false);
-        assert_eq!(shifted, Timecode { hours: 23, minutes: 59, seconds: 59, frames: 24 });
+        assert_eq!(
+            shifted,
+            Timecode {
+                hours: 23,
+                minutes: 59,
+                seconds: 59,
+                frames: 24
+            }
+        );
     }
 
     #[test]
     fn test_shift_timecode_back_roundtrip_with_increment() {
-        let start = Timecode { hours: 10, minutes: 30, seconds: 15, frames: 12 };
+        let start = Timecode {
+            hours: 10,
+            minutes: 30,
+            seconds: 15,
+            frames: 12,
+        };
         let mut advanced = start;
         for _ in 0..5 {
             advanced = audio_core::increment_timecode(&advanced, 25.0, false);
@@ -365,8 +551,19 @@ mod tests {
     #[test]
     fn test_start_timecode_from_ltc_ndf() {
         let r = make_test_result(
-            vec![FrameTimecode { frame_index: 50, timecode: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 2.0 }],
-            25.0, 2.0, LtcDecodeStatus::Success,
+            vec![FrameTimecode {
+                frame_index: 50,
+                timecode: Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                timecode_secs: 2.0,
+            }],
+            25.0,
+            2.0,
+            LtcDecodeStatus::Success,
         );
         let meta = start_timecode_from_ltc(&r);
         assert!(meta.is_some());
@@ -378,15 +575,33 @@ mod tests {
     #[test]
     fn test_start_timecode_from_ltc_wraps_midnight() {
         let r = make_test_result(
-            vec![FrameTimecode { frame_index: 50, timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 2.0 }],
-            25.0, 2.0, LtcDecodeStatus::Success,
+            vec![FrameTimecode {
+                frame_index: 50,
+                timecode: Timecode {
+                    hours: 0,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                timecode_secs: 2.0,
+            }],
+            25.0,
+            2.0,
+            LtcDecodeStatus::Success,
         );
         assert!(start_timecode_from_ltc(&r).is_some());
     }
 
     #[test]
     fn test_start_timecode_from_ltc_none_failed_status() {
-        let r = make_test_result(vec![], 0.0, 0.0, LtcDecodeStatus::Error { message: "no signal".into() });
+        let r = make_test_result(
+            vec![],
+            0.0,
+            0.0,
+            LtcDecodeStatus::Error {
+                message: "no signal".into(),
+            },
+        );
         assert!(start_timecode_from_ltc(&r).is_none());
     }
 
@@ -405,19 +620,44 @@ mod tests {
     #[test]
     fn test_start_timecode_from_ltc_low_confidence() {
         let mut r = make_test_result(
-            vec![FrameTimecode { frame_index: 50, timecode: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 2.0 }],
-            25.0, 2.0, LtcDecodeStatus::LowConfidence,
+            vec![FrameTimecode {
+                frame_index: 50,
+                timecode: Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                timecode_secs: 2.0,
+            }],
+            25.0,
+            2.0,
+            LtcDecodeStatus::LowConfidence,
         );
         r.avg_confidence = 0.3;
         let meta = start_timecode_from_ltc(&r);
-        assert!(meta.is_some(), "LowConfidence should still produce metadata");
+        assert!(
+            meta.is_some(),
+            "LowConfidence should still produce metadata"
+        );
     }
 
     #[test]
     fn test_build_per_file_start_timecodes_all_success() {
         let r = make_test_result(
-            vec![FrameTimecode { frame_index: 50, timecode: Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 }, timecode_secs: 2.0 }],
-            25.0, 2.0, LtcDecodeStatus::Success,
+            vec![FrameTimecode {
+                frame_index: 50,
+                timecode: Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                },
+                timecode_secs: 2.0,
+            }],
+            25.0,
+            2.0,
+            LtcDecodeStatus::Success,
         );
         let results = build_per_file_start_timecodes(&[Some(&r), Some(&r)]);
         assert_eq!(results.len(), 2);

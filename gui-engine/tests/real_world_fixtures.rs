@@ -58,7 +58,9 @@ fn test_real_world_mp4_lpcm_fixture() {
     assert!(
         matches!(result.status, LtcDecodeStatus::Success),
         "expected Success for the LPCM fixture, got {:?} (valid={}/{})",
-        result.status, result.valid_frames, result.total_possible_frames,
+        result.status,
+        result.valid_frames,
+        result.total_possible_frames,
     );
     // Measured 499/499; floor = measured − 10 %.
     assert!(
@@ -68,7 +70,12 @@ fn test_real_world_mp4_lpcm_fixture() {
     );
     assert_eq!(
         result.timecodes.first().map(|t| t.timecode),
-        Some(Timecode { hours: 1, minutes: 22, seconds: 6, frames: 16 }),
+        Some(Timecode {
+            hours: 1,
+            minutes: 22,
+            seconds: 6,
+            frames: 16
+        }),
         "first TC must match the measured corpus value",
     );
 }
@@ -91,7 +98,9 @@ fn test_real_world_m4v_aac_fixture() {
     assert!(
         matches!(result.status, LtcDecodeStatus::Success),
         "expected Success for the AAC fixture, got {:?} (valid={}/{})",
-        result.status, result.valid_frames, result.total_possible_frames,
+        result.status,
+        result.valid_frames,
+        result.total_possible_frames,
     );
     assert!(
         result.valid_frames >= 450,
@@ -100,7 +109,12 @@ fn test_real_world_m4v_aac_fixture() {
     );
     assert_eq!(
         result.timecodes.first().map(|t| t.timecode),
-        Some(Timecode { hours: 1, minutes: 6, seconds: 49, frames: 9 }),
+        Some(Timecode {
+            hours: 1,
+            minutes: 6,
+            seconds: 49,
+            frames: 9
+        }),
         "first TC must match the measured corpus value",
     );
 }
@@ -153,8 +167,8 @@ fn test_real_world_fixtures_wav_via_engine() {
     )
     .expect("engine WAV dispatch");
 
-    let direct = audio_core::decode_ltc_from_wav(&path, 25.0, false, None)
-        .expect("audio-core decode");
+    let direct =
+        audio_core::decode_ltc_from_wav(&path, 25.0, false, None).expect("audio-core decode");
     assert_eq!(
         outcome.result.timecodes.first().map(|t| t.timecode),
         direct.timecodes.first().map(|t| t.timecode),

@@ -2,7 +2,9 @@ use std::path::Path;
 use std::process::Stdio;
 
 use crate::converter::RecordingType;
-use crate::subprocess::{no_window_command, run_output_with_timeout, SubprocessFailure, PROBE_TIMEOUT};
+use crate::subprocess::{
+    no_window_command, run_output_with_timeout, SubprocessFailure, PROBE_TIMEOUT,
+};
 
 /// Read the duration (seconds) of an audio/video file.
 /// WAV files use a fast header-only parse via `hound`; other files use ffprobe.
@@ -29,9 +31,15 @@ where
 /// Returns `None` when every file's duration is unknown, or when the
 /// aggregate is zero (a zero-length aggregate is treated as unknown, not
 /// as data).
-pub fn group_duration_secs(recording_type: &RecordingType, durations: &[Option<f64>]) -> Option<f64> {
+pub fn group_duration_secs(
+    recording_type: &RecordingType,
+    durations: &[Option<f64>],
+) -> Option<f64> {
     let aggregate = match recording_type {
-        RecordingType::MultiTrackAudio => durations.iter().filter_map(|&d| d).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+        RecordingType::MultiTrackAudio => durations
+            .iter()
+            .filter_map(|&d| d)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
         RecordingType::VideoClipSequence => {
             let sum: f64 = durations.iter().filter_map(|&d| d).sum();
             Some(sum)
@@ -76,10 +84,8 @@ fn run_ffprobe_duration(path: &Path) -> Option<f64> {
         "json".into(),
         path_str,
     ];
-    let parsed = match crate::ffprobe::run_ffprobe_json_with(
-        &args,
-        PROBE_TIMEOUT,
-        &mut |a: &[String]| {
+    let parsed =
+        match crate::ffprobe::run_ffprobe_json_with(&args, PROBE_TIMEOUT, &mut |a: &[String]| {
             run_output_with_timeout(
                 no_window_command("ffprobe")
                     .args(a)
@@ -87,19 +93,18 @@ fn run_ffprobe_duration(path: &Path) -> Option<f64> {
                     .stderr(Stdio::null()),
                 PROBE_TIMEOUT,
             )
-        },
-    ) {
-        Ok(v) => v,
-        Err(SubprocessFailure::TimedOut) => {
-            log::warn!(
-                "ffprobe duration probe timed out after {:.0}s for '{}'",
-                PROBE_TIMEOUT.as_secs_f64(),
-                path.display(),
-            );
-            return None;
-        }
-        Err(_) => return None,
-    };
+        }) {
+            Ok(v) => v,
+            Err(SubprocessFailure::TimedOut) => {
+                log::warn!(
+                    "ffprobe duration probe timed out after {:.0}s for '{}'",
+                    PROBE_TIMEOUT.as_secs_f64(),
+                    path.display(),
+                );
+                return None;
+            }
+            Err(_) => return None,
+        };
 
     parsed
         .get("format")
@@ -116,7 +121,14 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
-    fn write_test_wav(dir: &TempDir, name: &str, sample_rate: u32, channels: u16, bits_per_sample: u16, num_samples: u64) -> std::path::PathBuf {
+    fn write_test_wav(
+        dir: &TempDir,
+        name: &str,
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u16,
+        num_samples: u64,
+    ) -> std::path::PathBuf {
         let path = dir.path().join(name);
         let spec = hound::WavSpec {
             channels,
@@ -255,7 +267,10 @@ mod tests {
         // A real recording is never 0 s long — an all-zero aggregate means
         // the probes yielded no usable durations, i.e. "unknown". The rule
         // is unified across both recording types.
-        for rt in [RecordingType::MultiTrackAudio, RecordingType::VideoClipSequence] {
+        for rt in [
+            RecordingType::MultiTrackAudio,
+            RecordingType::VideoClipSequence,
+        ] {
             for durs in [[None, Some(0.0)], [Some(0.0), Some(0.0)]] {
                 let result = group_duration_secs(&rt, &durs);
                 assert!(result.is_none(), "{:?} with {:?} must be unknown", rt, durs);

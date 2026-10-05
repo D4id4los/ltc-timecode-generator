@@ -141,7 +141,10 @@ impl Shadows {
             auto_increment: EditState::new(s.clapper.auto_increment_take),
             fps_index: EditState::new(s.fps_index),
             sample_rate: EditState::new(
-                SAMPLE_RATE_OPTIONS.iter().position(|&r| r == s.sample_rate).unwrap_or(0),
+                SAMPLE_RATE_OPTIONS
+                    .iter()
+                    .position(|&r| r == s.sample_rate)
+                    .unwrap_or(0),
             ),
             ltc_volume: EditState::new(s.ltc_volume),
             beep_volume: EditState::new(s.beep_volume),

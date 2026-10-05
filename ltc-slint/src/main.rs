@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gui_engine::command::{ConverterCommand, GuiCommand, OffloadCommand};
-use gui_engine::{AudioEvent, ChannelSel};
 use gui_engine::config;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::{ArcSwap, JobKind, SAMPLE_RATE_OPTIONS};
+use gui_engine::{AudioEvent, ChannelSel};
 use log::info;
 use slint::{ModelRc, SharedString, VecModel};
 
@@ -39,14 +39,19 @@ const CHANNEL_CHOICES: [ChannelSel; 3] = [ChannelSel::Left, ChannelSel::Right, C
 
 /// fps×100 value sent by settings.slint → FPS_OPTIONS index.
 fn fps_index_for(fps_x100: f64) -> Option<usize> {
-    FPS_OPTIONS.iter().position(|o| (o.fps - fps_x100).abs() < 0.01)
+    FPS_OPTIONS
+        .iter()
+        .position(|o| (o.fps - fps_x100).abs() < 0.01)
 }
 
 /// Sample-rate option label ("48000 Hz") → (rate, option index).
 fn sample_rate_index_for(val: &str) -> Option<(u32, usize)> {
     let rate_str = val.split_whitespace().next()?;
     let rate = rate_str.parse::<u32>().ok()?;
-    let idx = SAMPLE_RATE_OPTIONS.iter().position(|&r| r == rate).unwrap_or(0);
+    let idx = SAMPLE_RATE_OPTIONS
+        .iter()
+        .position(|&r| r == rate)
+        .unwrap_or(0);
     Some((rate, idx))
 }
 
@@ -104,8 +109,14 @@ fn build_ltc_report(result: &gui_engine::LtcDetectionResult) -> String {
     ));
     report.push_str(&format!("Timecode range:  {}\n", tc_range));
     report.push_str(&format!("Sample rate:     {} Hz\n", result.sample_rate));
-    report.push_str(&format!("Audio duration:  {:.2}s\n", result.total_audio_duration_secs));
-    report.push_str(&format!("Processing time: {:.1}ms\n", result.processing_time_ms));
+    report.push_str(&format!(
+        "Audio duration:  {:.2}s\n",
+        result.total_audio_duration_secs
+    ));
+    report.push_str(&format!(
+        "Processing time: {:.1}ms\n",
+        result.processing_time_ms
+    ));
 
     if let Some(ref q) = result.quality {
         report.push_str(&format!(
@@ -114,7 +125,9 @@ fn build_ltc_report(result: &gui_engine::LtcDetectionResult) -> String {
         ));
         report.push_str(&format!(
             "  Usable:        {:.1}% ({} block(s), {} backward jump(s))\n",
-            q.usable_coverage * 100.0, q.block_count, q.backward_jump_count
+            q.usable_coverage * 100.0,
+            q.block_count,
+            q.backward_jump_count
         ));
         report.push_str(&format!(
             "  Missing:       {} frames, {} gap(s), {} glitch(es), {} edit point(s)\n",
@@ -150,9 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match gui_engine::cli::process_cli(cli) {
         gui_engine::cli::CliOutcome::Done => Ok(()),
-        gui_engine::cli::CliOutcome::RunGui { cmd_tx, state, event_rx } => {
-            _run_gui(cmd_tx, state, event_rx)
-        }
+        gui_engine::cli::CliOutcome::RunGui {
+            cmd_tx,
+            state,
+            event_rx,
+        } => _run_gui(cmd_tx, state, event_rx),
     }
 }
 
@@ -185,9 +200,7 @@ fn populate_static_models(ui: &AppWindow, rt: &GuiRuntime) {
                 )));
                 // Auto-select first recording — deferred by the engine until
                 // the async folder scan completes, then applied race-free.
-                sink.send(GuiCommand::Converter(
-                    ConverterCommand::SelectRecording(0),
-                ));
+                sink.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0)));
             }
         }
     }
@@ -214,7 +227,9 @@ fn populate_static_models(ui: &AppWindow, rt: &GuiRuntime) {
             .iter()
             .map(|opt| SharedString::from(opt.name))
             .collect();
-        ui.set_decode_fps_options(ModelRc::new(VecModel::<SharedString>::from(decode_fps_names)));
+        ui.set_decode_fps_options(ModelRc::new(VecModel::<SharedString>::from(
+            decode_fps_names,
+        )));
     }
 
     // ── Populate sample rate options ────────────────────────────────────────
@@ -231,14 +246,26 @@ fn populate_static_models(ui: &AppWindow, rt: &GuiRuntime) {
     // ── Populate converter format options ────────────────────────────────────
     {
         let container_options: Vec<SharedString> = gui_engine::converter::supported_containers()
-            .iter().map(|(key, _)| SharedString::from(*key)).collect();
-        ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(container_options)));
+            .iter()
+            .map(|(key, _)| SharedString::from(*key))
+            .collect();
+        ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(
+            container_options,
+        )));
         let video_options: Vec<SharedString> = gui_engine::video_codecs::supported_video_codecs()
-            .iter().map(|(key, desc)| SharedString::from(format!("{} — {}", key, desc))).collect();
-        ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(video_options)));
+            .iter()
+            .map(|(key, desc)| SharedString::from(format!("{} — {}", key, desc)))
+            .collect();
+        ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(
+            video_options,
+        )));
         let audio_options: Vec<SharedString> = gui_engine::converter::supported_audio_encoders()
-            .iter().map(|(key, _)| SharedString::from(*key)).collect();
-        ui.set_conv_audio_encoder_options(ModelRc::new(VecModel::<SharedString>::from(audio_options)));
+            .iter()
+            .map(|(key, _)| SharedString::from(*key))
+            .collect();
+        ui.set_conv_audio_encoder_options(ModelRc::new(VecModel::<SharedString>::from(
+            audio_options,
+        )));
     }
 }
 
@@ -257,7 +284,8 @@ fn register_refresh_devices(ui: &AppWindow, rt: &GuiRuntime) {
             Some(u) => u,
             None => return,
         };
-        let device_names: Vec<SharedString> = s.devices
+        let device_names: Vec<SharedString> = s
+            .devices
             .iter()
             .map(|d| {
                 if d.is_default {
@@ -269,13 +297,21 @@ fn register_refresh_devices(ui: &AppWindow, rt: &GuiRuntime) {
             .collect();
         ui.set_device_names(ModelRc::new(VecModel::<SharedString>::from(device_names)));
         ui.set_device_count(s.devices.len() as i32);
-        let dev_idx = s.selected_device.as_ref()
+        let dev_idx = s
+            .selected_device
+            .as_ref()
             .and_then(|id| s.devices.iter().position(|d| &d.id == id))
             .map(|i| i as i32)
             .unwrap_or(-1);
         ui.set_device_index(dev_idx);
         if !s.devices.is_empty() {
-            push_toast(&toasts_clone, &next_id, &ui, &format!("{} devices found", s.devices.len()), "info");
+            push_toast(
+                &toasts_clone,
+                &next_id,
+                &ui,
+                &format!("{} devices found", s.devices.len()),
+                "info",
+            );
         }
     };
 
@@ -302,8 +338,10 @@ fn register_theme_and_debug(ui: &AppWindow, rt: &GuiRuntime) {
                 u.set_show_debug_log(new_val);
                 if new_val {
                     let entries: Vec<SharedString> = log_buffer_clone
-                        .lock().unwrap()
-                        .entries.iter()
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .iter()
                         .map(|s| SharedString::from(s.as_str()))
                         .collect();
                     u.set_debug_log_entries(ModelRc::new(VecModel::<SharedString>::from(entries)));
@@ -330,25 +368,35 @@ fn register_theme_and_debug(ui: &AppWindow, rt: &GuiRuntime) {
 fn register_transport(ui: &AppWindow, rt: &GuiRuntime) {
     {
         let cmd = rt.sink.clone();
-        ui.on_start_ltc(move || { let _ = cmd.send(GuiCommand::StartLtc); });
+        ui.on_start_ltc(move || {
+            let _ = cmd.send(GuiCommand::StartLtc);
+        });
     }
     {
         let cmd = rt.sink.clone();
-        ui.on_stop_ltc(move || { let _ = cmd.send(GuiCommand::StopLtc); });
+        ui.on_stop_ltc(move || {
+            let _ = cmd.send(GuiCommand::StopLtc);
+        });
     }
     {
         let cmd = rt.sink.clone();
-        ui.on_reset_tc(move || { let _ = cmd.send(GuiCommand::Reset); });
+        ui.on_reset_tc(move || {
+            let _ = cmd.send(GuiCommand::Reset);
+        });
     }
     {
         let cmd = rt.sink.clone();
-        ui.on_toggle_lock(move || { let _ = cmd.send(GuiCommand::ToggleLock); });
+        ui.on_toggle_lock(move || {
+            let _ = cmd.send(GuiCommand::ToggleLock);
+        });
     }
 
     // ── Clapper ─────────────────────────────────────────────────────────────
     {
         let cmd = rt.sink.clone();
-        ui.on_clap_beep(move || { let _ = cmd.send(GuiCommand::Clap); });
+        ui.on_clap_beep(move || {
+            let _ = cmd.send(GuiCommand::Clap);
+        });
     }
 }
 
@@ -356,26 +404,38 @@ fn register_clapper_metadata(ui: &AppWindow, rt: &GuiRuntime) {
     // ── Scene / Take / Roll ────────────────────────────────────────────────
     {
         let cmd = rt.sink.clone();
-        ui.on_scene_up(move || { let _ = cmd.send(GuiCommand::SceneUp); });
+        ui.on_scene_up(move || {
+            let _ = cmd.send(GuiCommand::SceneUp);
+        });
     }
     {
         let cmd = rt.sink.clone();
-        ui.on_scene_down(move || { let _ = cmd.send(GuiCommand::SceneDown); });
+        ui.on_scene_down(move || {
+            let _ = cmd.send(GuiCommand::SceneDown);
+        });
     }
     {
         let cmd = rt.sink.clone();
-        ui.on_take_up(move || { let _ = cmd.send(GuiCommand::TakeUp); });
+        ui.on_take_up(move || {
+            let _ = cmd.send(GuiCommand::TakeUp);
+        });
     }
     {
         let cmd = rt.sink.clone();
-        ui.on_take_down(move || { let _ = cmd.send(GuiCommand::TakeDown); });
+        ui.on_take_down(move || {
+            let _ = cmd.send(GuiCommand::TakeDown);
+        });
     }
     {
         let sink = rt.sink.clone();
         let shadows = rt.shadows.clone();
         ui.on_roll_changed(move |val| {
             let seq = sink.send(GuiCommand::SetRoll(val.to_string()));
-            shadows.lock().unwrap().roll.send_and_mark(val.to_string(), seq, Instant::now());
+            shadows
+                .lock()
+                .unwrap()
+                .roll
+                .send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
     {
@@ -405,9 +465,16 @@ fn register_clapper_metadata(ui: &AppWindow, rt: &GuiRuntime) {
         let ui_weak = ui.as_weak();
         ui.on_copy_logs(move || {
             let s = state.load();
-            let text = s.clapper.logs
+            let text = s
+                .clapper
+                .logs
                 .iter()
-                .map(|l| format!("[{}] LTC: {} | MS: {} | {}", l.timestamp, l.timecode, l.milliseconds, l.note))
+                .map(|l| {
+                    format!(
+                        "[{}] LTC: {} | MS: {} | {}",
+                        l.timestamp, l.timecode, l.milliseconds, l.note
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             if let Ok(mut ctx) = arboard::Clipboard::new() {
@@ -463,26 +530,42 @@ fn register_timecode_steppers(ui: &AppWindow, rt: &GuiRuntime) {
     {
         let cmd = rt.sink.clone();
         let cmd2 = rt.sink.clone();
-        ui.on_hour_up(move || { let _ = cmd.send(GuiCommand::HourUp); });
-        ui.on_hour_down(move || { let _ = cmd2.send(GuiCommand::HourDown); });
+        ui.on_hour_up(move || {
+            let _ = cmd.send(GuiCommand::HourUp);
+        });
+        ui.on_hour_down(move || {
+            let _ = cmd2.send(GuiCommand::HourDown);
+        });
     }
     {
         let cmd = rt.sink.clone();
         let cmd2 = rt.sink.clone();
-        ui.on_minute_up(move || { let _ = cmd.send(GuiCommand::MinuteUp); });
-        ui.on_minute_down(move || { let _ = cmd2.send(GuiCommand::MinuteDown); });
+        ui.on_minute_up(move || {
+            let _ = cmd.send(GuiCommand::MinuteUp);
+        });
+        ui.on_minute_down(move || {
+            let _ = cmd2.send(GuiCommand::MinuteDown);
+        });
     }
     {
         let cmd = rt.sink.clone();
         let cmd2 = rt.sink.clone();
-        ui.on_second_up(move || { let _ = cmd.send(GuiCommand::SecondUp); });
-        ui.on_second_down(move || { let _ = cmd2.send(GuiCommand::SecondDown); });
+        ui.on_second_up(move || {
+            let _ = cmd.send(GuiCommand::SecondUp);
+        });
+        ui.on_second_down(move || {
+            let _ = cmd2.send(GuiCommand::SecondDown);
+        });
     }
     {
         let cmd = rt.sink.clone();
         let cmd2 = rt.sink.clone();
-        ui.on_frame_up(move || { let _ = cmd.send(GuiCommand::FrameUp); });
-        ui.on_frame_down(move || { let _ = cmd2.send(GuiCommand::FrameDown); });
+        ui.on_frame_up(move || {
+            let _ = cmd.send(GuiCommand::FrameUp);
+        });
+        ui.on_frame_down(move || {
+            let _ = cmd2.send(GuiCommand::FrameDown);
+        });
     }
 }
 
@@ -560,8 +643,14 @@ fn register_settings_selections(ui: &AppWindow, rt: &GuiRuntime) {
         let ui_weak = ui.as_weak();
         ui.on_ltc_volume_changed(move |val| {
             let seq = sink.send(GuiCommand::SetLtcVolume(val));
-            shadows.lock().unwrap().ltc_volume.send_and_mark(val, seq, Instant::now());
-            if let Some(u) = ui_weak.upgrade() { u.set_ltc_volume(val); }
+            shadows
+                .lock()
+                .unwrap()
+                .ltc_volume
+                .send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_ltc_volume(val);
+            }
         });
     }
     {
@@ -570,8 +659,14 @@ fn register_settings_selections(ui: &AppWindow, rt: &GuiRuntime) {
         let ui_weak = ui.as_weak();
         ui.on_beep_volume_changed(move |val| {
             let seq = sink.send(GuiCommand::SetBeepVolume(val));
-            shadows.lock().unwrap().beep_volume.send_and_mark(val, seq, Instant::now());
-            if let Some(u) = ui_weak.upgrade() { u.set_beep_volume(val); }
+            shadows
+                .lock()
+                .unwrap()
+                .beep_volume
+                .send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_beep_volume(val);
+            }
         });
     }
     {
@@ -580,8 +675,14 @@ fn register_settings_selections(ui: &AppWindow, rt: &GuiRuntime) {
         let ui_weak = ui.as_weak();
         ui.on_beep_frequency_changed(move |val| {
             let seq = sink.send(GuiCommand::SetBeepFrequency(val));
-            shadows.lock().unwrap().beep_frequency.send_and_mark(val, seq, Instant::now());
-            if let Some(u) = ui_weak.upgrade() { u.set_beep_frequency(val); }
+            shadows
+                .lock()
+                .unwrap()
+                .beep_frequency
+                .send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_beep_frequency(val);
+            }
         });
     }
     {
@@ -590,8 +691,14 @@ fn register_settings_selections(ui: &AppWindow, rt: &GuiRuntime) {
         let ui_weak = ui.as_weak();
         ui.on_beep_duration_changed(move |val| {
             let seq = sink.send(GuiCommand::SetBeepDuration(val));
-            shadows.lock().unwrap().beep_duration.send_and_mark(val, seq, Instant::now());
-            if let Some(u) = ui_weak.upgrade() { u.set_beep_duration(val); }
+            shadows
+                .lock()
+                .unwrap()
+                .beep_duration
+                .send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_beep_duration(val);
+            }
         });
     }
 }
@@ -627,9 +734,9 @@ fn register_converter_actions(ui: &AppWindow, rt: &GuiRuntime) {
     {
         let cmd = rt.sink.clone();
         ui.on_conv_map_cell_clicked(move |row, col| {
-            let _ = cmd.send(GuiCommand::Converter(ConverterCommand::SwapChannelMapCells(
-                row as usize, col as usize,
-            )));
+            let _ = cmd.send(GuiCommand::Converter(
+                ConverterCommand::SwapChannelMapCells(row as usize, col as usize),
+            ));
         });
     }
     {
@@ -676,8 +783,15 @@ fn register_converter_actions(ui: &AppWindow, rt: &GuiRuntime) {
         let ui_weak = ui.as_weak();
         ui.on_ltc_file_selected(move |idx| {
             let idx = idx as usize;
-            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(idx)));
-            shadows.lock().unwrap().conv.ltc_file_idx.send_and_mark(idx, seq, Instant::now());
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(
+                idx,
+            )));
+            shadows
+                .lock()
+                .unwrap()
+                .conv
+                .ltc_file_idx
+                .send_and_mark(idx, seq, Instant::now());
             if let Some(u) = ui_weak.upgrade() {
                 u.set_ltc_file_idx(idx as i32);
             }
@@ -723,8 +837,12 @@ fn register_converter_toggles(ui: &AppWindow, rt: &GuiRuntime) {
             let Some(u) = ui_weak.upgrade() else { return };
             let mut sh = shadows.lock().unwrap();
             let val = !*sh.conv.embed_camera_metadata.value();
-            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetEmbedCameraMetadata(val)));
-            sh.conv.embed_camera_metadata.send_and_mark(val, seq, Instant::now());
+            let seq = sink.send(GuiCommand::Converter(
+                ConverterCommand::SetEmbedCameraMetadata(val),
+            ));
+            sh.conv
+                .embed_camera_metadata
+                .send_and_mark(val, seq, Instant::now());
             u.set_conv_embed_camera_meta(val);
         });
     }
@@ -736,8 +854,12 @@ fn register_converter_toggles(ui: &AppWindow, rt: &GuiRuntime) {
             let Some(u) = ui_weak.upgrade() else { return };
             let mut sh = shadows.lock().unwrap();
             let val = !*sh.conv.set_start_from_ltc.value();
-            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetStartFromLtc(val)));
-            sh.conv.set_start_from_ltc.send_and_mark(val, seq, Instant::now());
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetStartFromLtc(
+                val,
+            )));
+            sh.conv
+                .set_start_from_ltc
+                .send_and_mark(val, seq, Instant::now());
             u.set_set_start_from_ltc(val);
         });
     }
@@ -762,8 +884,12 @@ fn register_converter_toggles(ui: &AppWindow, rt: &GuiRuntime) {
             let Some(u) = ui_weak.upgrade() else { return };
             let mut sh = shadows.lock().unwrap();
             let val = !*sh.conv.drop_ltc_track.value();
-            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(val)));
-            sh.conv.drop_ltc_track.send_and_mark(val, seq, Instant::now());
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(
+                val,
+            )));
+            sh.conv
+                .drop_ltc_track
+                .send_and_mark(val, seq, Instant::now());
             u.set_conv_drop_ltc_track(val);
         });
     }
@@ -788,8 +914,12 @@ fn register_converter_toggles(ui: &AppWindow, rt: &GuiRuntime) {
             let Some(u) = ui_weak.upgrade() else { return };
             let mut sh = shadows.lock().unwrap();
             let val = !*sh.conv.generate_synthetic_video.value();
-            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(val)));
-            sh.conv.generate_synthetic_video.send_and_mark(val, seq, Instant::now());
+            let seq = sink.send(GuiCommand::Converter(
+                ConverterCommand::SetGenerateSyntheticVideo(val),
+            ));
+            sh.conv
+                .generate_synthetic_video
+                .send_and_mark(val, seq, Instant::now());
             u.set_conv_generate_synthetic_video(val);
         });
     }
@@ -814,8 +944,12 @@ fn register_converter_toggles(ui: &AppWindow, rt: &GuiRuntime) {
             let Some(u) = ui_weak.upgrade() else { return };
             let mut sh = shadows.lock().unwrap();
             let val = !*sh.conv.metadata_only.value();
-            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetMetadataOnly(val)));
-            sh.conv.metadata_only.send_and_mark(val, seq, Instant::now());
+            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetMetadataOnly(
+                val,
+            )));
+            sh.conv
+                .metadata_only
+                .send_and_mark(val, seq, Instant::now());
             u.set_conv_metadata_only(val);
         });
     }
@@ -837,36 +971,60 @@ fn register_converter_toggles(ui: &AppWindow, rt: &GuiRuntime) {
                 u.set_conv_generate_synthetic_video(false);
                 u.set_conv_copy_video(false);
             }
-            mark_bool(&mut sh.conv.metadata_only,
-                GuiCommand::Converter(ConverterCommand::SetMetadataOnly(false)));
-            mark_bool(&mut sh.conv.split_tracks,
-                GuiCommand::Converter(ConverterCommand::SetSplitTracks(false)));
-            mark_bool(&mut sh.conv.drop_ltc_track,
-                GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(false)));
-            mark_bool(&mut sh.conv.concat_audio,
-                GuiCommand::Converter(ConverterCommand::SetConcatAudio(false)));
-            mark_bool(&mut sh.conv.generate_synthetic_video,
-                GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(false)));
-            mark_bool(&mut sh.conv.copy_video,
-                GuiCommand::Converter(ConverterCommand::SetCopyVideo(false)));
+            mark_bool(
+                &mut sh.conv.metadata_only,
+                GuiCommand::Converter(ConverterCommand::SetMetadataOnly(false)),
+            );
+            mark_bool(
+                &mut sh.conv.split_tracks,
+                GuiCommand::Converter(ConverterCommand::SetSplitTracks(false)),
+            );
+            mark_bool(
+                &mut sh.conv.drop_ltc_track,
+                GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(false)),
+            );
+            mark_bool(
+                &mut sh.conv.concat_audio,
+                GuiCommand::Converter(ConverterCommand::SetConcatAudio(false)),
+            );
+            mark_bool(
+                &mut sh.conv.generate_synthetic_video,
+                GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(false)),
+            );
+            mark_bool(
+                &mut sh.conv.copy_video,
+                GuiCommand::Converter(ConverterCommand::SetCopyVideo(false)),
+            );
             {
-                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(String::new())));
-                sh.conv.filename_prefix.send_and_mark(String::new(), seq, Instant::now());
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(
+                    String::new(),
+                )));
+                sh.conv
+                    .filename_prefix
+                    .send_and_mark(String::new(), seq, Instant::now());
             }
             {
-                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(
-                    gui_engine::naming::DEFAULT_AUDIO_SUFFIX.to_string(),
-                )));
+                let seq = sink.send(GuiCommand::Converter(
+                    ConverterCommand::SetAudioSuffixTemplate(
+                        gui_engine::naming::DEFAULT_AUDIO_SUFFIX.to_string(),
+                    ),
+                ));
                 sh.conv.audio_suffix_template.send_and_mark(
-                    gui_engine::naming::DEFAULT_AUDIO_SUFFIX.to_string(), seq, Instant::now(),
+                    gui_engine::naming::DEFAULT_AUDIO_SUFFIX.to_string(),
+                    seq,
+                    Instant::now(),
                 );
             }
             {
-                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(
-                    gui_engine::naming::DEFAULT_VIDEO_SUFFIX.to_string(),
-                )));
+                let seq = sink.send(GuiCommand::Converter(
+                    ConverterCommand::SetVideoSuffixTemplate(
+                        gui_engine::naming::DEFAULT_VIDEO_SUFFIX.to_string(),
+                    ),
+                ));
                 sh.conv.video_suffix_template.send_and_mark(
-                    gui_engine::naming::DEFAULT_VIDEO_SUFFIX.to_string(), seq, Instant::now(),
+                    gui_engine::naming::DEFAULT_VIDEO_SUFFIX.to_string(),
+                    seq,
+                    Instant::now(),
                 );
             }
         });
@@ -882,8 +1040,14 @@ fn register_converter_dropdowns(ui: &AppWindow, rt: &GuiRuntime) {
             let options = gui_engine::converter::supported_containers();
             if idx >= 0 && (idx as usize) < options.len() {
                 let key = options[idx as usize].0.to_string();
-                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetContainer(key.clone())));
-                shadows.lock().unwrap().conv.container.send_and_mark(key.clone(), seq, Instant::now());
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetContainer(
+                    key.clone(),
+                )));
+                shadows.lock().unwrap().conv.container.send_and_mark(
+                    key.clone(),
+                    seq,
+                    Instant::now(),
+                );
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_container(SharedString::from(key));
                 }
@@ -898,8 +1062,14 @@ fn register_converter_dropdowns(ui: &AppWindow, rt: &GuiRuntime) {
             let options = gui_engine::video_codecs::supported_video_codecs();
             if idx >= 0 && (idx as usize) < options.len() {
                 let key = options[idx as usize].0.to_string();
-                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetVideoCodec(key.clone())));
-                shadows.lock().unwrap().conv.video_encoder.send_and_mark(key.clone(), seq, Instant::now());
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetVideoCodec(
+                    key.clone(),
+                )));
+                shadows.lock().unwrap().conv.video_encoder.send_and_mark(
+                    key.clone(),
+                    seq,
+                    Instant::now(),
+                );
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_video_encoder(SharedString::from(key));
                 }
@@ -914,8 +1084,14 @@ fn register_converter_dropdowns(ui: &AppWindow, rt: &GuiRuntime) {
             let options = gui_engine::converter::supported_audio_encoders();
             if idx >= 0 && (idx as usize) < options.len() {
                 let key = options[idx as usize].0.to_string();
-                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetAudioEncoder(key.clone())));
-                shadows.lock().unwrap().conv.audio_encoder.send_and_mark(key.clone(), seq, Instant::now());
+                let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetAudioEncoder(
+                    key.clone(),
+                )));
+                shadows.lock().unwrap().conv.audio_encoder.send_and_mark(
+                    key.clone(),
+                    seq,
+                    Instant::now(),
+                );
                 if let Some(u) = ui_weak.upgrade() {
                     u.set_conv_audio_encoder(SharedString::from(key));
                 }
@@ -929,27 +1105,41 @@ fn register_converter_dropdowns(ui: &AppWindow, rt: &GuiRuntime) {
             let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(
                 val.to_string(),
             )));
-            shadows.lock().unwrap().conv.filename_prefix.send_and_mark(val.to_string(), seq, Instant::now());
+            shadows.lock().unwrap().conv.filename_prefix.send_and_mark(
+                val.to_string(),
+                seq,
+                Instant::now(),
+            );
         });
     }
     {
         let sink = rt.sink.clone();
         let shadows = rt.shadows.clone();
         ui.on_conv_audio_suffix_changed(move |val| {
-            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(
-                val.to_string(),
-            )));
-            shadows.lock().unwrap().conv.audio_suffix_template.send_and_mark(val.to_string(), seq, Instant::now());
+            let seq = sink.send(GuiCommand::Converter(
+                ConverterCommand::SetAudioSuffixTemplate(val.to_string()),
+            ));
+            shadows
+                .lock()
+                .unwrap()
+                .conv
+                .audio_suffix_template
+                .send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
     {
         let sink = rt.sink.clone();
         let shadows = rt.shadows.clone();
         ui.on_conv_video_suffix_changed(move |val| {
-            let seq = sink.send(GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(
-                val.to_string(),
-            )));
-            shadows.lock().unwrap().conv.video_suffix_template.send_and_mark(val.to_string(), seq, Instant::now());
+            let seq = sink.send(GuiCommand::Converter(
+                ConverterCommand::SetVideoSuffixTemplate(val.to_string()),
+            ));
+            shadows
+                .lock()
+                .unwrap()
+                .conv
+                .video_suffix_template
+                .send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
 }
@@ -963,22 +1153,33 @@ fn register_decode(ui: &AppWindow, rt: &GuiRuntime) {
         ui.on_ltc_detect(move || {
             let s = detect_engine_state.load();
             let sel_idx = s.converter.selected_group_idx;
-            if sel_idx.is_none() { return; }
+            if sel_idx.is_none() {
+                return;
+            }
             let idx = sel_idx.unwrap();
             let groups = &s.converter.groups;
-            if idx >= groups.len() { return; }
+            if idx >= groups.len() {
+                return;
+            }
             let group = &groups[idx];
-            let folder_str = s.converter.groups_folder.clone()
+            let folder_str = s
+                .converter
+                .groups_folder
+                .clone()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
             let files = &group.files;
-            if files.is_empty() { return; }
+            if files.is_empty() {
+                return;
+            }
             // Use the UI-selected LTC file index (for audio groups)
-            let ltc_idx = ui_weak.upgrade()
+            let ltc_idx = ui_weak
+                .upgrade()
                 .map(|u| u.get_ltc_file_idx() as usize)
                 .unwrap_or(0)
                 .min(files.len().saturating_sub(1));
-            let file_name = files[ltc_idx].file_name()
+            let file_name = files[ltc_idx]
+                .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
@@ -990,13 +1191,20 @@ fn register_decode(ui: &AppWindow, rt: &GuiRuntime) {
             }
             let is_video = gui_engine::ffprobe::path_is_video(&full_path);
             if is_video {
-                let flat_idx = ui_weak.upgrade()
+                let flat_idx = ui_weak
+                    .upgrade()
                     .map(|u| u.get_ltc_selected_channel() as usize)
                     .unwrap_or(0);
-                let (stream_idx, channel_idx) = resolve_flat_channel(s.decode.probe.as_ref(), flat_idx)
-                    .unwrap_or((0, 0));
-                let paths: Vec<String> = files.iter()
-                    .map(|filename| std::path::PathBuf::from(&folder_str).join(filename).to_string_lossy().to_string())
+                let (stream_idx, channel_idx) =
+                    resolve_flat_channel(s.decode.probe.as_ref(), flat_idx).unwrap_or((0, 0));
+                let paths: Vec<String> = files
+                    .iter()
+                    .map(|filename| {
+                        std::path::PathBuf::from(&folder_str)
+                            .join(filename)
+                            .to_string_lossy()
+                            .to_string()
+                    })
                     .collect();
                 let _ = cmd.send(GuiCommand::DecodeLtcVideoGroup {
                     paths,
@@ -1034,7 +1242,11 @@ fn register_decode(ui: &AppWindow, rt: &GuiRuntime) {
         ui.on_decode_fps_selected(move |index| {
             let idx = index as usize;
             let seq = sink.send(GuiCommand::SetDecodeFpsIndex(idx));
-            shadows.lock().unwrap().decode_fps_index.send_and_mark(idx, seq, Instant::now());
+            shadows
+                .lock()
+                .unwrap()
+                .decode_fps_index
+                .send_and_mark(idx, seq, Instant::now());
             if let Some(u) = ui_weak.upgrade() {
                 u.set_decode_fps_index(idx as i32);
             }
@@ -1075,14 +1287,19 @@ fn register_offload(ui: &AppWindow, rt: &GuiRuntime) {
             let seq = sink.send(GuiCommand::Offload(OffloadCommand::SetParentName(
                 val.to_string(),
             )));
-            shadows.lock().unwrap().parent_name.send_and_mark(val.to_string(), seq, Instant::now());
+            shadows
+                .lock()
+                .unwrap()
+                .parent_name
+                .send_and_mark(val.to_string(), seq, Instant::now());
         });
     }
     {
         let cmd = rt.sink.clone();
         ui.on_off_card_name_changed(move |idx, val| {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetDeviceName(
-                idx as usize, val.to_string(),
+                idx as usize,
+                val.to_string(),
             )));
         });
     }
@@ -1108,7 +1325,9 @@ fn register_offload(ui: &AppWindow, rt: &GuiRuntime) {
         let cmd = rt.sink.clone();
         ui.on_off_file_toggled(move |card_idx, file_idx, sel| {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetFileSelected(
-                card_idx as usize, file_idx as usize, sel,
+                card_idx as usize,
+                file_idx as usize,
+                sel,
             )));
         });
     }
@@ -1116,7 +1335,8 @@ fn register_offload(ui: &AppWindow, rt: &GuiRuntime) {
         let cmd = rt.sink.clone();
         ui.on_off_select_all_files(move |card_idx, sel| {
             let _ = cmd.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(
-                card_idx as usize, sel,
+                card_idx as usize,
+                sel,
             )));
         });
     }
@@ -1135,9 +1355,8 @@ fn _run_gui(
     engine_state: Arc<ArcSwap<AppStateSnapshot>>,
     event_rx: std::sync::mpsc::Receiver<AudioEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let log_buffer = gui_engine::log_buffer::init_logger(
-        gui_engine::log_buffer::DEFAULT_LOG_FILTER,
-    )?;
+    let log_buffer =
+        gui_engine::log_buffer::init_logger(gui_engine::log_buffer::DEFAULT_LOG_FILTER)?;
 
     info!("LTC Slint GUI v{} starting...", APP_VERSION);
     let os_name = std::env::consts::OS.to_uppercase();
@@ -1187,7 +1406,10 @@ fn _run_gui(
         ui.set_buffer_size(buffer_smp);
         let tc_str = timecode::timecode_to_string(s.current_timecode, s.drop_frame());
         set_tc_segments(&ui, &tc_str);
-        ui.set_ms_text(SharedString::from(timecode::timecode_to_ms_string(s.current_timecode, s.fps())));
+        ui.set_ms_text(SharedString::from(timecode::timecode_to_ms_string(
+            s.current_timecode,
+            s.fps(),
+        )));
         ui.set_fps_name(SharedString::from(FPS_OPTIONS[s.fps_index].name));
         ui.set_decode_fps_index(s.decode.fps_index as i32);
     }
@@ -1300,7 +1522,12 @@ mod tests {
         r.processing_time_ms = 10.0;
         r.timecodes.push(gui_engine::FrameTimecode {
             frame_index: 0,
-            timecode: gui_engine::Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            timecode: gui_engine::Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
             timecode_secs: 0.0,
         });
         r

@@ -26,14 +26,12 @@ fn path_ext_lower(path: &Path) -> Option<String> {
 
 /// True if `path` has a video extension from [`VIDEO_EXTENSIONS`].
 pub fn is_video(path: &Path) -> bool {
-    path_ext_lower(path)
-        .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.as_str()))
+    path_ext_lower(path).is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.as_str()))
 }
 
 /// True if `path` has an audio extension from [`AUDIO_EXTENSIONS`].
 pub fn is_audio(path: &Path) -> bool {
-    path_ext_lower(path)
-        .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.as_str()))
+    path_ext_lower(path).is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.as_str()))
 }
 
 /// Map an input container extension to the output container used when

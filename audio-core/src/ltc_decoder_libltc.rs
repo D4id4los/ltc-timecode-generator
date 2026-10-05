@@ -5,14 +5,22 @@ use std::time::{Duration, Instant};
 use libltc_rs::prelude::*;
 use log::{debug, info, warn};
 
+use crate::ltc_decoder::{
+    apply_coherent_first_timecode, compute_ltc_quality, FrameTimecode, LtcDecodeStatus,
+    LtcDetectionResult, CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD,
+};
 use crate::LtcDecodeError;
-use crate::ltc_decoder::{apply_coherent_first_timecode, compute_ltc_quality, CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, FrameTimecode, LtcDecodeStatus, LtcDetectionResult};
 use crate::Timecode;
 
 /// Decode LTC from a WAV file via the libltc binding.
 /// If channel 0 is (near-)silent, the channel carrying signal is decoded
 /// instead; a non-silent channel 0 is always kept.
-pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, LtcDecodeError> {
+pub fn decode_ltc_from_wav_libltc(
+    path: &Path,
+    fps: f64,
+    drop_frame: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     let start = Instant::now();
 
     let mut reader = hound::WavReader::open(path)
@@ -31,7 +39,9 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cance
     if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
         return if spec.sample_format == hound::SampleFormat::Int {
             // Typed payload; Display renders the former prose byte-identically.
-            Err(LtcDecodeError::UnsupportedBitDepth { bits: spec.bits_per_sample })
+            Err(LtcDecodeError::UnsupportedBitDepth {
+                bits: spec.bits_per_sample,
+            })
         } else {
             Err(LtcDecodeError::Failed(format!(
                 "libltc decoder requires 16-bit integer PCM WAV (got {} bit {:?})",
@@ -50,11 +60,22 @@ pub fn decode_ltc_from_wav_libltc(path: &Path, fps: f64, drop_frame: bool, cance
     let total_samples = sample_data.len() / channels;
 
     if total_samples == 0 {
-        warn!("LTC decode (libltc): audio file contains no samples: {}", path.display());
+        warn!(
+            "LTC decode (libltc): audio file contains no samples: {}",
+            path.display()
+        );
         return Ok(LtcDetectionResult::error("Audio file contains no samples"));
     }
 
-    decode_ltc_samples_libltc(&sample_data, channels, sample_rate, fps, drop_frame, start, cancel)
+    decode_ltc_samples_libltc(
+        &sample_data,
+        channels,
+        sample_rate,
+        fps,
+        drop_frame,
+        start,
+        cancel,
+    )
 }
 
 pub(crate) fn decode_ltc_samples_libltc(
@@ -68,7 +89,9 @@ pub(crate) fn decode_ltc_samples_libltc(
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
     let total_samples = sample_data.len() / channels;
     if total_samples == 0 {
-        return Ok(LtcDetectionResult::error("Audio buffer contains no samples"));
+        return Ok(LtcDetectionResult::error(
+            "Audio buffer contains no samples",
+        ));
     }
 
     // If channel 0 is (near-)silent, the channel carrying signal is decoded
@@ -86,7 +109,12 @@ pub(crate) fn decode_ltc_samples_libltc(
         .map_err(|e| LtcDecodeError::Failed(format!("Failed to create libltc decoder: {:?}", e)))?;
 
     let timecodes = decode_all_chunks(
-        &mut decoder, sample_data, channels, active_channel, sample_rate, cancel,
+        &mut decoder,
+        sample_data,
+        channels,
+        active_channel,
+        sample_rate,
+        cancel,
     )?;
 
     let total_duration = total_samples as f64 / sample_rate as f64;
@@ -136,13 +164,20 @@ fn find_active_channel(sample_data: &[i16], channels: usize) -> usize {
     }
     let picked = crate::ltc_decoder::pick_active_channel(&peaks);
     if picked != 0 {
-        info!("libltc decode: channel 0 is silent, decoding channel {}", picked);
+        info!(
+            "libltc decode: channel 0 is silent, decoding channel {}",
+            picked
+        );
     }
     picked
 }
 
 /// Convert one libltc extended frame into our [`FrameTimecode`].
-fn frame_timecode_from(frame_ext: &LTCFrameExt, frame_index: u32, sample_rate: u32) -> FrameTimecode {
+fn frame_timecode_from(
+    frame_ext: &LTCFrameExt,
+    frame_index: u32,
+    sample_rate: u32,
+) -> FrameTimecode {
     let ltc = frame_ext.ltc();
     let tc = ltc.to_timecode(LtcBgFlags::default());
     FrameTimecode {
@@ -181,7 +216,10 @@ fn decode_all_chunks(
         }
         let chunk_end = (chunk_start + CHUNK_SIZE * channels).min(sample_data.len());
         let raw_chunk = &sample_data[chunk_start..chunk_end];
-        let mono: Vec<i16> = raw_chunk.chunks(channels).map(|ch| ch[active_channel]).collect();
+        let mono: Vec<i16> = raw_chunk
+            .chunks(channels)
+            .map(|ch| ch[active_channel])
+            .collect();
         decoder.write_i16(&mono, sample_pos);
         sample_pos += mono.len() as i64;
         while let Some(frame_ext) = decoder.read() {
@@ -216,11 +254,23 @@ struct AssembleStats {
 /// thresholded status, detail lines, coherent-first-timecode alignment and
 /// the quality report.
 fn assemble_result(timecodes: Vec<FrameTimecode>, stats: &AssembleStats) -> LtcDetectionResult {
-    let AssembleStats { fps, drop_frame, total_duration, sample_rate, initial_apv, queue_length, processing_time } = *stats;
+    let AssembleStats {
+        fps,
+        drop_frame,
+        total_duration,
+        sample_rate,
+        initial_apv,
+        queue_length,
+        processing_time,
+    } = *stats;
     let processing_time_ms = processing_time.as_secs_f64() * 1000.0;
 
-    info!("LTC decode (+{:.1}s): using specified FPS {:.2} (drop_frame={})",
-        processing_time.as_secs_f64(), fps, drop_frame);
+    info!(
+        "LTC decode (+{:.1}s): using specified FPS {:.2} (drop_frame={})",
+        processing_time.as_secs_f64(),
+        fps,
+        drop_frame
+    );
 
     let valid_count = timecodes.len() as u32;
     let total_possible_frames = (total_duration * fps).round() as u32;
@@ -240,10 +290,7 @@ fn assemble_result(timecodes: Vec<FrameTimecode>, stats: &AssembleStats) -> LtcD
         LtcDecodeStatus::NoSyncWord
     };
 
-    let first_secs = timecodes
-        .first()
-        .map(|ft| ft.timecode_secs)
-        .unwrap_or(0.0);
+    let first_secs = timecodes.first().map(|ft| ft.timecode_secs).unwrap_or(0.0);
 
     let details = vec![
         format!("libltc decoder: using {:.2} fps", fps),
@@ -275,8 +322,8 @@ fn assemble_result(timecodes: Vec<FrameTimecode>, stats: &AssembleStats) -> LtcD
 
 #[cfg(test)]
 mod tests {
-    use crate::ChannelSel;
     use super::*;
+    use crate::ChannelSel;
 
     // ── Helper: generate synthetic LTC samples for testing ──────────────
 
@@ -297,10 +344,18 @@ mod tests {
 
         for tc in timecodes {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume, channel: ChannelSel::Left },
-        &mut last_level,
-        &mut frame_buf
-    );
+            crate::generate_ltc_frame_stereo(
+                crate::ltc_encoder::LtcFrameParams {
+                    tc,
+                    drop_frame,
+                    total_samples: samples_per_frame,
+                    samples_per_bit,
+                    volume,
+                    channel: ChannelSel::Left,
+                },
+                &mut last_level,
+                &mut frame_buf,
+            );
             // Extract left channel (even indices in stereo interleaved buffer)
             for ch in frame_buf.chunks(2) {
                 let clamped = ch[0].clamp(-1.0, 1.0);
@@ -315,7 +370,12 @@ mod tests {
     #[test]
     fn test_error_result_contains_message() {
         let r = LtcDetectionResult::error("test error");
-        assert_eq!(r.status, LtcDecodeStatus::Error { message: "test error".to_string() });
+        assert_eq!(
+            r.status,
+            LtcDecodeStatus::Error {
+                message: "test error".to_string()
+            }
+        );
     }
 
     #[test]
@@ -343,16 +403,26 @@ mod tests {
     #[test]
     fn test_error_result_from_string() {
         let r = LtcDetectionResult::error("permission denied".to_string());
-        assert_eq!(r.status, LtcDecodeStatus::Error { message: "permission denied".to_string() });
+        assert_eq!(
+            r.status,
+            LtcDecodeStatus::Error {
+                message: "permission denied".to_string()
+            }
+        );
     }
 
     #[test]
     fn decode_ltc_from_wav_libltc_pre_cancelled_returns_cancelled_error() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("pre-cancelled.wav");
-        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
-            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
-        }).collect();
+        let tcs: Vec<Timecode> = (0..25)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect();
         let samples = synthesize_ltc_samples_i16(&tcs, 25.0, false, 48000, 0.5);
         let spec = hound::WavSpec {
             channels: 1,
@@ -377,32 +447,53 @@ mod tests {
     #[test]
     fn test_decode_ltc_samples_libltc_empty_buffer() {
         let samples = vec![];
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
+        let result =
+            decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None)
+                .unwrap();
         assert!(matches!(result.status, LtcDecodeStatus::Error { .. }));
     }
 
     #[test]
     fn test_decode_ltc_samples_libltc_mono_25fps() {
-        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
-            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
-        }).collect();
+        let tcs: Vec<Timecode> = (0..25)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect();
         let samples = synthesize_ltc_samples_i16(&tcs, 25.0, false, 48000, 0.5);
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
-        assert!(matches!(result.status, LtcDecodeStatus::Success),
-            "expected Success for 25fps mono, got {:?} (valid={})", result.status, result.valid_frames);
+        let result =
+            decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None)
+                .unwrap();
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for 25fps mono, got {:?} (valid={})",
+            result.status,
+            result.valid_frames
+        );
         // 25 synthesized frames; libltc loses only the final frame (tail
         // validation) → 24 is the measured steady state. Deliberately a
         // floor, not an equality: a decoder improvement (decoding the tail)
         // must keep this green.
-        assert!(result.valid_frames >= 24,
-            "expected at least 24 valid frames, got {}", result.valid_frames);
+        assert!(
+            result.valid_frames >= 24,
+            "expected at least 24 valid frames, got {}",
+            result.valid_frames
+        );
     }
 
     #[test]
     fn test_decode_ltc_samples_libltc_stereo_extracts_left() {
-        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
-            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
-        }).collect();
+        let tcs: Vec<Timecode> = (0..25)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect();
         // Generate mono LTC samples
         let mono = synthesize_ltc_samples_i16(&tcs, 25.0, false, 48000, 0.5);
         // Interleave with silence on right channel
@@ -411,88 +502,147 @@ mod tests {
             stereo.push(s);
             stereo.push(0i16); // right channel silence
         }
-        let result = decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now(), None).unwrap();
-        assert!(matches!(result.status, LtcDecodeStatus::Success),
-            "expected Success for stereo LTC, got {:?}", result.status);
+        let result =
+            decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now(), None)
+                .unwrap();
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for stereo LTC, got {:?}",
+            result.status
+        );
         // 25 synthesized frames; libltc loses only the final frame (tail
         // validation) → 24 is the measured steady state. Deliberately a
         // floor, not an equality: a decoder improvement (decoding the tail)
         // must keep this green.
-        assert!(result.valid_frames >= 24,
-            "expected at least 24 valid frames from stereo, got {}", result.valid_frames);
+        assert!(
+            result.valid_frames >= 24,
+            "expected at least 24 valid frames from stereo, got {}",
+            result.valid_frames
+        );
     }
 
     #[test]
     fn test_decode_ltc_samples_libltc_stereo_extracts_right() {
         // Mirror of ..._extracts_left: mono LTC on the *right*, silence on
         // the left — the silent ch0 must not prevent decoding.
-        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
-            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
-        }).collect();
+        let tcs: Vec<Timecode> = (0..25)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect();
         let mono = synthesize_ltc_samples_i16(&tcs, 25.0, false, 48000, 0.5);
         let mut stereo = Vec::with_capacity(mono.len() * 2);
         for &s in &mono {
             stereo.push(0i16); // left channel silence
             stereo.push(s);
         }
-        let result = decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now(), None).unwrap();
-        assert!(matches!(result.status, LtcDecodeStatus::Success),
-            "expected Success for right-channel LTC, got {:?}", result.status);
+        let result =
+            decode_ltc_samples_libltc(&stereo, 2, 48000, 25.0, false, Instant::now(), None)
+                .unwrap();
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for right-channel LTC, got {:?}",
+            result.status
+        );
         // 25 synthesized frames; libltc loses only the final frame (tail
         // validation) → 24 is the measured steady state. Deliberately a
         // floor, not an equality: a decoder improvement (decoding the tail)
         // must keep this green.
-        assert!(result.valid_frames >= 24,
-            "expected at least 24 valid frames from right channel, got {}", result.valid_frames);
+        assert!(
+            result.valid_frames >= 24,
+            "expected at least 24 valid frames from right channel, got {}",
+            result.valid_frames
+        );
     }
 
     #[test]
     fn test_decode_ltc_samples_libltc_too_short() {
         // Only 100 samples — not enough to form a full frame
         let samples: Vec<i16> = vec![1000, -1000, 500, -500, 200, -200];
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
-        assert!(matches!(result.status, LtcDecodeStatus::NoSyncWord),
-            "expected NoSyncWord for too-short buffer, got {:?}", result.status);
+        let result =
+            decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None)
+                .unwrap();
+        assert!(
+            matches!(result.status, LtcDecodeStatus::NoSyncWord),
+            "expected NoSyncWord for too-short buffer, got {:?}",
+            result.status
+        );
         assert_eq!(result.valid_frames, 0);
     }
 
     #[test]
     fn test_decode_ltc_samples_libltc_24fps() {
-        let tcs: Vec<Timecode> = (0..24).map(|i| Timecode {
-            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
-        }).collect();
+        let tcs: Vec<Timecode> = (0..24)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect();
         let samples = synthesize_ltc_samples_i16(&tcs, 24.0, false, 48000, 0.5);
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 24.0, false, Instant::now(), None).unwrap();
-        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
-            "expected no Error for 24fps, got {:?}", result.status);
+        let result =
+            decode_ltc_samples_libltc(&samples, 1, 48000, 24.0, false, Instant::now(), None)
+                .unwrap();
+        assert!(
+            !matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "expected no Error for 24fps, got {:?}",
+            result.status
+        );
     }
 
     #[test]
     fn test_decode_ltc_samples_libltc_44100hz() {
-        let tcs: Vec<Timecode> = (0..25).map(|i| Timecode {
-            hours: 0, minutes: 0, seconds: 0, frames: i as u32,
-        }).collect();
+        let tcs: Vec<Timecode> = (0..25)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect();
         let samples = synthesize_ltc_samples_i16(&tcs, 25.0, false, 44100, 0.5);
-        let result = decode_ltc_samples_libltc(&samples, 1, 44100, 25.0, false, Instant::now(), None).unwrap();
-        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
-            "expected no Error at 44.1kHz, got {:?}", result.status);
+        let result =
+            decode_ltc_samples_libltc(&samples, 1, 44100, 25.0, false, Instant::now(), None)
+                .unwrap();
+        assert!(
+            !matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "expected no Error at 44.1kHz, got {:?}",
+            result.status
+        );
     }
 
     #[test]
     fn test_decode_ltc_samples_libltc_different_start_tc() {
-        let tcs = [Timecode { hours: 10, minutes: 15, seconds: 30, frames: 12 }];
+        let tcs = [Timecode {
+            hours: 10,
+            minutes: 15,
+            seconds: 30,
+            frames: 12,
+        }];
         // Need enough samples for libltc to detect (just 1 frame may not be enough)
         // Repeat the same timecode a few times
         let tcs_rep: Vec<Timecode> = std::iter::repeat(tcs[0]).take(10).collect();
         let samples = synthesize_ltc_samples_i16(&tcs_rep, 25.0, false, 48000, 0.5);
-        let result = decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None).unwrap();
-        assert!(matches!(result.status, LtcDecodeStatus::Success),
-            "expected Success, got {:?}", result.status);
+        let result =
+            decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None)
+                .unwrap();
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success, got {:?}",
+            result.status
+        );
         assert!(!result.timecodes.is_empty(), "frames must be decoded");
         // The fixture repeats one TC ×10; every decoded frame must carry it.
         for ftc in &result.timecodes {
-            assert_eq!(ftc.timecode, tcs[0],
-                "decoded frame {} must equal the synthesized start TC", ftc.frame_index);
+            assert_eq!(
+                ftc.timecode, tcs[0],
+                "decoded frame {} must equal the synthesized start TC",
+                ftc.frame_index
+            );
         }
     }
 
@@ -524,11 +674,18 @@ mod tests {
     #[test]
     fn assemble_result_thresholds_confidence_into_status() {
         // 24 valid of 25 possible = 96% ≥ success threshold.
-        let tcs: Vec<FrameTimecode> = (0..24u32).map(|i| FrameTimecode {
-            frame_index: i,
-            timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: i },
-            timecode_secs: i as f64 / 25.0,
-        }).collect();
+        let tcs: Vec<FrameTimecode> = (0..24u32)
+            .map(|i| FrameTimecode {
+                frame_index: i,
+                timecode: Timecode {
+                    hours: 0,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: i,
+                },
+                timecode_secs: i as f64 / 25.0,
+            })
+            .collect();
         let stats = AssembleStats {
             fps: 25.0,
             drop_frame: false,
@@ -539,7 +696,11 @@ mod tests {
             processing_time: Duration::from_millis(5),
         };
         let r = assemble_result(tcs, &stats);
-        assert!(matches!(r.status, LtcDecodeStatus::Success), "got {:?}", r.status);
+        assert!(
+            matches!(r.status, LtcDecodeStatus::Success),
+            "got {:?}",
+            r.status
+        );
         assert_eq!(r.valid_frames, 24);
         assert_eq!(r.total_possible_frames, 25);
         assert!(r.avg_confidence > 0.9);
@@ -561,7 +722,11 @@ mod tests {
             processing_time: Duration::from_millis(1),
         };
         let r = assemble_result(Vec::new(), &stats);
-        assert!(matches!(r.status, LtcDecodeStatus::NoSyncWord), "got {:?}", r.status);
+        assert!(
+            matches!(r.status, LtcDecodeStatus::NoSyncWord),
+            "got {:?}",
+            r.status
+        );
         assert_eq!(r.valid_frames, 0);
         assert_eq!(r.first_ltc_timecode_secs, 0.0);
         assert!(r.drop_frame);

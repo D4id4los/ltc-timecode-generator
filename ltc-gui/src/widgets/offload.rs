@@ -1,25 +1,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use egui::{FontId, RichText, Ui, Color32, Vec2};
-use gui_engine::command::{
-    GuiCommand,
-    OffloadCommand,
-};
+use egui::{Color32, FontId, RichText, Ui, Vec2};
+use gui_engine::command::{GuiCommand, OffloadCommand};
 use gui_engine::duration::format_duration_secs;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::{JobKind, UnitState};
 
+use super::bound;
 use crate::app::AppState;
 use crate::theme::{ThemeColors, ACCENT};
-use super::bound;
 
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let _s = &state.latest;
 
-    let frame = egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::symmetric(16, 12));
+    let frame = egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(16, 12));
     frame.show(ui, |ui| {
         ui.vertical(|ui| {
             step_header(ui, "1", "SELECT PARENT FOLDER", &colors);
@@ -62,7 +58,11 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
     let display = folder_label;
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Parent:  ").font(FontId::monospace(12.0)).color(colors.text_muted));
+        ui.label(
+            RichText::new("Parent:  ")
+                .font(FontId::monospace(12.0))
+                .color(colors.text_muted),
+        );
         // Show current path + Browse button
         let label = if display.is_empty() {
             "Select Folder…".to_string()
@@ -78,7 +78,11 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
                 state.send(GuiCommand::Offload(OffloadCommand::SetParentFolder(path)));
             }
         }
-        ui.label(RichText::new(label).font(FontId::monospace(11.0)).color(colors.text_main));
+        ui.label(
+            RichText::new(label)
+                .font(FontId::monospace(11.0))
+                .color(colors.text_main),
+        );
     });
 
     ui.add_space(4.0);
@@ -86,16 +90,25 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
     // Editable parent name (ISO date) — bound shadow; sends on each change
     // with a non-empty value.
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Subfolder: ").font(FontId::monospace(12.0)).color(colors.text_muted));
+        ui.label(
+            RichText::new("Subfolder: ")
+                .font(FontId::monospace(12.0))
+                .color(colors.text_muted),
+        );
         let truth = state.latest.offload.parent_name.clone();
         bound::text(
-            ui, state,
+            ui,
+            state,
             |s| &mut s.sh.parent_name,
             &truth,
             |v| GuiCommand::Offload(OffloadCommand::SetParentName(v)),
             |edit| edit.font(FontId::monospace(14.0)).desired_width(160.0),
         );
-        ui.label(RichText::new("(date subfolder)").font(FontId::monospace(10.0)).color(colors.text_muted));
+        ui.label(
+            RichText::new("(date subfolder)")
+                .font(FontId::monospace(10.0))
+                .color(colors.text_muted),
+        );
     });
 }
 
@@ -113,9 +126,11 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
 
     if off.cards.is_empty() && !scanning {
-        ui.label(RichText::new("No removable media detected. Insert an SD card and click Rescan.")
-            .font(FontId::monospace(11.0))
-            .color(colors.text_muted));
+        ui.label(
+            RichText::new("No removable media detected. Insert an SD card and click Rescan.")
+                .font(FontId::monospace(11.0))
+                .color(colors.text_muted),
+        );
     }
 
     for (idx, card) in off.cards.iter().enumerate() {
@@ -154,13 +169,17 @@ fn render_card(
             .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("💾 {}", card.mount.display()))
-                        .font(FontId::monospace(11.0))
-                        .color(colors.text_muted));
+                    ui.label(
+                        RichText::new(format!("💾 {}", card.mount.display()))
+                            .font(FontId::monospace(11.0))
+                            .color(colors.text_muted),
+                    );
                     if !card.volume_label.is_empty() && card.volume_label != card.device_name {
-                        ui.label(RichText::new(format!("({})", card.volume_label))
-                            .font(FontId::monospace(10.0))
-                            .color(colors.text_muted));
+                        ui.label(
+                            RichText::new(format!("({})", card.volume_label))
+                                .font(FontId::monospace(10.0))
+                                .color(colors.text_muted),
+                        );
                     }
                 });
 
@@ -171,9 +190,11 @@ fn render_card(
                 // File count summary (now with selection info).
                 ui.horizontal(|ui| {
                     let summary = selection_summary(card);
-                    ui.label(RichText::new(summary)
-                        .font(FontId::monospace(11.0))
-                        .color(device_color));
+                    ui.label(
+                        RichText::new(summary)
+                            .font(FontId::monospace(11.0))
+                            .color(device_color),
+                    );
                 });
 
                 // ── File selection list ──
@@ -190,7 +211,15 @@ fn render_card(
                         .auto_shrink([false; 2])
                         .show_rows(ui, row_height, total, |ui, range| {
                             for i in range {
-                                render_file_row(ui, state, idx, i, card, &card.files[i], file_durations);
+                                render_file_row(
+                                    ui,
+                                    state,
+                                    idx,
+                                    i,
+                                    card,
+                                    &card.files[i],
+                                    file_durations,
+                                );
                             }
                         });
                 }
@@ -211,14 +240,26 @@ fn render_device_name_edit(
     let truth = card.device_name.clone();
     let mount_for_cmd = mount.clone();
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Device folder: ")
-            .font(FontId::monospace(11.0))
-            .color(colors.text_muted));
+        ui.label(
+            RichText::new("Device folder: ")
+                .font(FontId::monospace(11.0))
+                .color(colors.text_muted),
+        );
         bound::text(
-            ui, state,
-            |s| s.sh.device_names.get_mut(&mount).expect("device shadow seeded in logic()"),
+            ui,
+            state,
+            |s| {
+                s.sh.device_names
+                    .get_mut(&mount)
+                    .expect("device shadow seeded in logic()")
+            },
             &truth,
-            move |v| GuiCommand::Offload(OffloadCommand::SetDeviceNameByMount(mount_for_cmd.clone(), v)),
+            move |v| {
+                GuiCommand::Offload(OffloadCommand::SetDeviceNameByMount(
+                    mount_for_cmd.clone(),
+                    v,
+                ))
+            },
             |edit| edit.font(FontId::monospace(14.0)).desired_width(140.0),
         );
     });
@@ -239,12 +280,19 @@ fn render_bulk_select_buttons(ui: &mut Ui, state: &mut AppState, idx: usize) {
     ui.horizontal(|ui| {
         let btn_size = Vec2::new(40.0, 18.0);
         if ui.add_sized(btn_size, egui::Button::new("All")).clicked() {
-            state.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(idx, true)));
+            state.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(
+                idx, true,
+            )));
         }
         if ui.add_sized(btn_size, egui::Button::new("None")).clicked() {
-            state.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(idx, false)));
+            state.send(GuiCommand::Offload(OffloadCommand::SetAllFilesSelected(
+                idx, false,
+            )));
         }
-        if ui.add_sized(egui::vec2(60.0, 18.0), egui::Button::new("Latest day")).clicked() {
+        if ui
+            .add_sized(egui::vec2(60.0, 18.0), egui::Button::new("Latest day"))
+            .clicked()
+        {
             state.send(GuiCommand::Offload(OffloadCommand::SelectLatestDay(idx)));
         }
     });
@@ -254,17 +302,25 @@ fn render_bulk_select_buttons(ui: &mut Ui, state: &mut AppState, idx: usize) {
 fn render_file_column_headers(ui: &mut Ui, colors: &ThemeColors) {
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
-            RichText::new("File").font(FontId::monospace(10.0)).color(colors.text_muted),
+            RichText::new("File")
+                .font(FontId::monospace(10.0))
+                .color(colors.text_muted),
         ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(egui::Label::new(
-                RichText::new("Size").font(FontId::monospace(10.0)).color(colors.text_muted),
+                RichText::new("Size")
+                    .font(FontId::monospace(10.0))
+                    .color(colors.text_muted),
             ));
             ui.add(egui::Label::new(
-                RichText::new("Length  ").font(FontId::monospace(10.0)).color(colors.text_muted),
+                RichText::new("Length  ")
+                    .font(FontId::monospace(10.0))
+                    .color(colors.text_muted),
             ));
             ui.add(egui::Label::new(
-                RichText::new("Date           ").font(FontId::monospace(10.0)).color(colors.text_muted),
+                RichText::new("Date           ")
+                    .font(FontId::monospace(10.0))
+                    .color(colors.text_muted),
             ));
         });
     });
@@ -291,9 +347,13 @@ fn render_file_row(
         ui.set_min_height(row_height);
         ui.set_height(row_height);
         bound::checkbox(
-            ui, state,
-            |s| s.sh.file_selection.get_mut(&(mount_key.clone(), file_key.clone()))
-                .expect("file-selection shadow seeded in logic()"),
+            ui,
+            state,
+            |s| {
+                s.sh.file_selection
+                    .get_mut(&(mount_key.clone(), file_key.clone()))
+                    .expect("file-selection shadow seeded in logic()")
+            },
             selected,
             "",
             true,
@@ -301,27 +361,36 @@ fn render_file_row(
         );
 
         // Filename
-        ui.label(RichText::new(&file.name)
-            .font(FontId::monospace(11.0))
-            .color(text_main));
+        ui.label(
+            RichText::new(&file.name)
+                .font(FontId::monospace(11.0))
+                .color(text_main),
+        );
 
         // Date, duration, size — right-aligned
-        let date_str = file.modified
+        let date_str = file
+            .modified
             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_default();
         let dur_str = duration_cell_text(file_durations, &file.path);
         let size_str = format_bytes(file.size_bytes);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(size_str)
-                .font(FontId::monospace(10.0))
-                .color(text_muted));
-            ui.label(RichText::new(format!("  {}", dur_str))
-                .font(FontId::monospace(10.0))
-                .color(text_muted));
-            ui.label(RichText::new(format!("  {}", date_str))
-                .font(FontId::monospace(10.0))
-                .color(text_muted));
+            ui.label(
+                RichText::new(size_str)
+                    .font(FontId::monospace(10.0))
+                    .color(text_muted),
+            );
+            ui.label(
+                RichText::new(format!("  {}", dur_str))
+                    .font(FontId::monospace(10.0))
+                    .color(text_muted),
+            );
+            ui.label(
+                RichText::new(format!("  {}", date_str))
+                    .font(FontId::monospace(10.0))
+                    .color(text_muted),
+            );
         });
     });
 }
@@ -329,10 +398,7 @@ fn render_file_row(
 /// Pure duration cell: formatted length for a probed file, `—` when probing
 /// failed/pending (key present with `None`), `…` while the probe is in
 /// flight (key absent).
-fn duration_cell_text(
-    file_durations: &HashMap<PathBuf, Option<f64>>,
-    path: &Path,
-) -> String {
+fn duration_cell_text(file_durations: &HashMap<PathBuf, Option<f64>>, path: &Path) -> String {
     file_durations
         .get(path)
         .and_then(|opt| *opt)
@@ -357,11 +423,25 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
 
     ui.horizontal(|ui| {
         if is_running {
-            if ui.button(RichText::new("■ Cancel").font(FontId::proportional(13.0)).color(colors.error_red)).clicked() {
+            if ui
+                .button(
+                    RichText::new("■ Cancel")
+                        .font(FontId::proportional(13.0))
+                        .color(colors.error_red),
+                )
+                .clicked()
+            {
                 state.send(GuiCommand::Offload(OffloadCommand::CancelOffload));
             }
         } else if can_start {
-            if ui.button(RichText::new("Start Offload").font(FontId::proportional(13.0)).color(ACCENT)).clicked() {
+            if ui
+                .button(
+                    RichText::new("Start Offload")
+                        .font(FontId::proportional(13.0))
+                        .color(ACCENT),
+                )
+                .clicked()
+            {
                 state.mark_offload_start_pending();
                 state.send(GuiCommand::Offload(OffloadCommand::StartOffload));
             }
@@ -383,7 +463,15 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
 
     // Overall progress bar.
     if copy_running || copy_fraction > 0.0 {
-        render_overall_progress(ui, &colors, copy_fraction, copy_speed, copy_running, &units, &off.device_totals);
+        render_overall_progress(
+            ui,
+            &colors,
+            copy_fraction,
+            copy_speed,
+            copy_running,
+            &units,
+            &off.device_totals,
+        );
         ui.add_space(4.0);
 
         // Per-device progress — merge units with device_totals.
@@ -397,9 +485,11 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
 
     // Error message.
     if let Some(ref err) = off.error {
-        ui.label(RichText::new(format!("Error: {}", err))
-            .font(FontId::monospace(11.0))
-            .color(colors.error_red));
+        ui.label(
+            RichText::new(format!("Error: {}", err))
+                .font(FontId::monospace(11.0))
+                .color(colors.error_red),
+        );
     }
 }
 
@@ -413,9 +503,11 @@ fn render_overall_progress(
     units: &[gui_engine::job::UnitSnapshot],
     device_totals: &[gui_engine::offload::OffloadDeviceTotals],
 ) {
-    ui.add(egui::ProgressBar::new(copy_fraction)
-        .show_percentage()
-        .desired_width(ui.available_width()));
+    ui.add(
+        egui::ProgressBar::new(copy_fraction)
+            .show_percentage()
+            .desired_width(ui.available_width()),
+    );
 
     let speed_text = if copy_speed > 0.0 {
         format!("{} / s", format_bytes(copy_speed as u64))
@@ -424,17 +516,25 @@ fn render_overall_progress(
     };
     ui.horizontal(|ui| {
         if !speed_text.is_empty() {
-            ui.label(RichText::new(&speed_text)
-                .font(FontId::monospace(10.0))
-                .color(ACCENT));
+            ui.label(
+                RichText::new(&speed_text)
+                    .font(FontId::monospace(10.0))
+                    .color(ACCENT),
+            );
         }
         if copy_running {
             let (done_bytes, total_bytes) = copy_byte_totals(units, device_totals);
             if total_bytes > 0 {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(format!("{} / {}", format_bytes(done_bytes), format_bytes(total_bytes)))
+                    ui.label(
+                        RichText::new(format!(
+                            "{} / {}",
+                            format_bytes(done_bytes),
+                            format_bytes(total_bytes)
+                        ))
                         .font(FontId::monospace(10.0))
-                        .color(colors.text_muted));
+                        .color(colors.text_muted),
+                    );
                 });
             }
         }
@@ -448,7 +548,9 @@ fn copy_byte_totals(
     device_totals: &[gui_engine::offload::OffloadDeviceTotals],
 ) -> (u64, u64) {
     let total_bytes: u64 = device_totals.iter().map(|d| d.bytes_total).sum();
-    let done_bytes: u64 = units.iter().zip(device_totals.iter())
+    let done_bytes: u64 = units
+        .iter()
+        .zip(device_totals.iter())
         .map(|(u, t)| (u.fraction * t.bytes_total as f32) as u64)
         .sum();
     (done_bytes, total_bytes)
@@ -476,11 +578,19 @@ fn device_progress_text(
     let files_total = totals.map(|t| t.files_total).unwrap_or(0);
 
     let bytes_str = if bytes_total > 0 {
-        format!("{} / {}  ", format_bytes(bytes_done), format_bytes(bytes_total))
+        format!(
+            "{} / {}  ",
+            format_bytes(bytes_done),
+            format_bytes(bytes_total)
+        )
     } else {
         String::new()
     };
-    let files_done = if files_total > 0 { (unit.fraction * files_total as f32).round() as usize } else { 0 };
+    let files_done = if files_total > 0 {
+        (unit.fraction * files_total as f32).round() as usize
+    } else {
+        0
+    };
     format!("{}{}/{} files", bytes_str, files_done, files_total)
 }
 
@@ -500,14 +610,18 @@ fn render_device_progress_row(
 
     let (status_icon, status_color) = unit_state_icon(unit.state, colors);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("{} {}", status_icon, dev_name))
-            .font(FontId::monospace(11.0))
-            .color(status_color));
+        ui.label(
+            RichText::new(format!("{} {}", status_icon, dev_name))
+                .font(FontId::monospace(11.0))
+                .color(status_color),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let bytes_str = device_progress_text(unit, totals);
-            ui.label(RichText::new(bytes_str)
-                .font(FontId::monospace(10.0))
-                .color(text_muted));
+            ui.label(
+                RichText::new(bytes_str)
+                    .font(FontId::monospace(10.0))
+                    .color(text_muted),
+            );
         });
     });
     if files_total > 0 || bytes_total > 0 {
@@ -516,9 +630,11 @@ fn render_device_progress_row(
 
     if let UnitState::Running = unit.state {
         if !unit.message.is_empty() {
-            ui.label(RichText::new(format!("  {}", unit.message))
-                .font(FontId::monospace(9.0))
-                .color(colors.text_muted));
+            ui.label(
+                RichText::new(format!("  {}", unit.message))
+                    .font(FontId::monospace(9.0))
+                    .color(colors.text_muted),
+            );
         }
     }
 }
@@ -533,11 +649,17 @@ fn render_completed_devices(
         return;
     }
     ui.add_space(4.0);
-    ui.label(RichText::new("Completed:").font(FontId::proportional(12.0)).color(colors.success_green));
+    ui.label(
+        RichText::new("Completed:")
+            .font(FontId::proportional(12.0))
+            .color(colors.success_green),
+    );
     for name in &off.completed_devices {
-        ui.label(RichText::new(format!("  ✅ {}", name))
-            .font(FontId::monospace(11.0))
-            .color(colors.success_green));
+        ui.label(
+            RichText::new(format!("  ✅ {}", name))
+                .font(FontId::monospace(11.0))
+                .color(colors.success_green),
+        );
     }
 }
 
@@ -565,9 +687,9 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use gui_engine::job::UnitSnapshot;
     use gui_engine::offload::{OffloadDeviceTotals, OffloadFileInfo, SdCardInfo};
+    use std::path::PathBuf;
 
     fn card(selected_count: usize, media_count: usize, selected_bytes: u64) -> SdCardInfo {
         SdCardInfo {
@@ -594,7 +716,11 @@ mod tests {
     }
 
     fn totals(bytes: u64, files: usize) -> OffloadDeviceTotals {
-        OffloadDeviceTotals { name: "DEV".to_string(), files_total: files, bytes_total: bytes }
+        OffloadDeviceTotals {
+            name: "DEV".to_string(),
+            files_total: files,
+            bytes_total: bytes,
+        }
     }
 
     #[test]
@@ -609,7 +735,10 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(PathBuf::from("a.wav"), Some(12.5));
         // test-lint: allow(text-pin): formatter output is the contract
-        assert_eq!(duration_cell_text(&map, &PathBuf::from("a.wav")), format_duration_secs(12.5));
+        assert_eq!(
+            duration_cell_text(&map, &PathBuf::from("a.wav")),
+            format_duration_secs(12.5)
+        );
     }
 
     #[test]
@@ -634,7 +763,10 @@ mod tests {
     fn copy_byte_totals_handles_missing_units_or_totals() {
         assert_eq!(copy_byte_totals(&[], &[]), (0, 0));
         // More totals than units: the extra device still counts toward total.
-        let (done, total) = copy_byte_totals(&[unit(1.0, UnitState::Done)], &[totals(10, 1), totals(20, 1)]);
+        let (done, total) = copy_byte_totals(
+            &[unit(1.0, UnitState::Done)],
+            &[totals(10, 1), totals(20, 1)],
+        );
         assert_eq!(total, 30);
         assert_eq!(done, 10);
     }
@@ -664,7 +796,10 @@ mod tests {
         // test-lint: allow(text-pin): formatter output is the contract
         let u = unit(0.5, UnitState::Running);
         assert_eq!(device_progress_text(&u, None), "0/0 files");
-        assert_eq!(device_progress_text(&u, Some(&totals(1000, 10))), "500 B / 1.0 KB  5/10 files");
+        assert_eq!(
+            device_progress_text(&u, Some(&totals(1000, 10))),
+            "500 B / 1.0 KB  5/10 files"
+        );
     }
 
     #[test]

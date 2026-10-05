@@ -6,9 +6,8 @@ use std::sync::Mutex;
 use log::{info, warn};
 
 use crate::converter::args::{
-    build_audio_to_audio_args, build_audio_to_synthetic_video_args,
-    build_concat_audio_args, build_split_track_args, build_video_track_extract_args,
-    build_video_to_video_args,
+    build_audio_to_audio_args, build_audio_to_synthetic_video_args, build_concat_audio_args,
+    build_split_track_args, build_video_to_video_args, build_video_track_extract_args,
 };
 use crate::converter::capabilities::{HwDeviceContext, ResolvedHwDevice};
 use crate::converter::formats::{
@@ -17,9 +16,7 @@ use crate::converter::formats::{
 use crate::converter::planning::{
     plan_concat_outputs, plan_video_outputs_for_file, selected_channel_pairs, VideoOutputStep,
 };
-use crate::converter::process::{
-    run_ffmpeg_process, StepFailure,
-};
+use crate::converter::process::{run_ffmpeg_process, StepFailure};
 use crate::converter::settings::{ConversionPipeline, ConverterSettings, RecordingType};
 use crate::ffprobe::VideoAudioProbe;
 use crate::job::{JobContext, JobError, JobFinal, UnitProgress};
@@ -89,7 +86,8 @@ impl<'a> JobConversionReport<'a> {
     }
 
     fn set_overall(&self, f: f32) {
-        self.overall_progress.store((f.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+        self.overall_progress
+            .store((f.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
     }
 }
 
@@ -103,7 +101,8 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
     }
 
     fn set_step_weight(&self, w: f32) {
-        self.step_weight.store((w.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+        self.step_weight
+            .store((w.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
     }
 
     fn report_step_fraction(&self, step_fraction: f32, _line: &str) {
@@ -112,14 +111,19 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
         let combined = overall + step_fraction * sw;
         let clamped = combined.min(1.0);
         self.ctx.progress.unit(0).set_fraction(clamped);
-        self.ctx.progress.set_message(format!("Conversion: {:.0}%", clamped * 100.0));
+        self.ctx
+            .progress
+            .set_message(format!("Conversion: {:.0}%", clamped * 100.0));
     }
 
     fn advance_step(&self) {
         let overall = self.overall();
         let sw = self.step_weight();
         self.set_overall(overall + sw);
-        self.ctx.progress.unit(0).set_fraction(self.overall().min(1.0));
+        self.ctx
+            .progress
+            .unit(0)
+            .set_fraction(self.overall().min(1.0));
     }
 
     fn set_log(&self, text: &str) {
@@ -140,7 +144,11 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
         self.failed.store(true, Ordering::Relaxed);
         self.ctx.progress.unit(0).set_fraction(0.0);
         let log_text = self.overall_log.lock().unwrap().clone();
-        let full = if log.is_empty() { log_text } else { format!("{}\n{}", log_text, log) };
+        let full = if log.is_empty() {
+            log_text
+        } else {
+            format!("{}\n{}", log_text, log)
+        };
         // Also record the failure in the tracker's rolling log so the
         // failure context rides along in JobStatus.log and JobOutcome.log.
         if !log.is_empty() {
@@ -156,7 +164,10 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
 
     fn mark_completed(&self, summary: &str) {
         let log = self.overall_log.lock().unwrap().clone();
-        let msg = format!("{}\n\n--- CONVERSION COMPLETED SUCCESSFULLY ---{}", log, summary);
+        let msg = format!(
+            "{}\n\n--- CONVERSION COMPLETED SUCCESSFULLY ---{}",
+            log, summary
+        );
         self.ctx.progress.unit(0).set_fraction(1.0);
         self.ctx.progress.set_message(msg);
     }
@@ -386,9 +397,10 @@ pub enum StepOutcome {
 
 fn resolve_device_for_candidate(encoder: &str, ctx: &HwDeviceContext) -> Option<ResolvedHwDevice> {
     match video_codecs::hw_frames_for(encoder) {
-        Some(video_codecs::HwFramePath::Vaapi) => {
-            ctx.vaapi_device.clone().map(|path| ResolvedHwDevice::Vaapi { device_path: path })
-        }
+        Some(video_codecs::HwFramePath::Vaapi) => ctx
+            .vaapi_device
+            .clone()
+            .map(|path| ResolvedHwDevice::Vaapi { device_path: path }),
         Some(video_codecs::HwFramePath::Vulkan) if ctx.vulkan_available => {
             Some(ResolvedHwDevice::Vulkan)
         }
@@ -425,7 +437,8 @@ fn run_video_step_with_fallback(
         let hw_ctx = &fallback.hw_ctx;
         settings.resolved_hw_device = resolve_device_for_candidate(&encoder, hw_ctx);
 
-        if video_codecs::hw_frames_for(&encoder).is_some() && settings.resolved_hw_device.is_none() {
+        if video_codecs::hw_frames_for(&encoder).is_some() && settings.resolved_hw_device.is_none()
+        {
             let msg = format!(
                 "--- no hardware device available for '{}'; skipping ---",
                 encoder
@@ -438,13 +451,7 @@ fn run_video_step_with_fallback(
         }
 
         let args = build_args(settings);
-        match run_ffmpeg_process(
-            &args,
-            output,
-            report,
-            total_steps,
-            current_step,
-        ) {
+        match run_ffmpeg_process(&args, output, report, total_steps, current_step) {
             Ok(()) => {
                 fallback.note_success(&encoder);
                 return StepOutcome::Succeeded;
@@ -471,7 +478,12 @@ fn run_video_step_with_fallback(
     let msg = format!(
         "all encoder candidates for codec '{}' failed to initialize ({})",
         video_codecs::normalize_video_codec(&settings.video_encoder),
-        fallback.failed.iter().cloned().collect::<Vec<_>>().join(", ")
+        fallback
+            .failed
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     warn!("{}", msg);
     report.append_log(&format!("\n\n--- {} ---", msg));
@@ -517,7 +529,10 @@ fn prepare_copy_mode(settings: &mut ConverterSettings) {
         settings.trim_offsets_secs[i] = snapped;
         if let Some(Some(meta)) = settings.timecode_meta_per_file.get_mut(i) {
             meta.start = crate::converter::timecode::shift_timecode_back(
-                &meta.start, delta, meta.fps, meta.drop_frame,
+                &meta.start,
+                delta,
+                meta.fps,
+                meta.drop_frame,
             );
         }
     }
@@ -553,8 +568,8 @@ pub fn run_conversion<R: ConversionReport>(
         })
         .unwrap_or_default();
 
-    let copy_mode = settings.copy_video
-        && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough);
+    let copy_mode =
+        settings.copy_video && matches!(settings.pipeline, ConversionPipeline::VideoPassthrough);
     let metadata_only = matches!(settings.pipeline, ConversionPipeline::MetadataOnly);
     if copy_mode {
         prepare_copy_mode(&mut settings);
@@ -577,7 +592,9 @@ pub fn run_conversion<R: ConversionReport>(
     }
 
     let (output_format, output_extension) = match settings.pipeline {
-        ConversionPipeline::AudioOnly { generate_synthetic_video: false } => {
+        ConversionPipeline::AudioOnly {
+            generate_synthetic_video: false,
+        } => {
             let (fmt, ext) = audio_encoder_to_output_format(&settings.audio_encoder);
             (fmt.to_string(), ext.to_string())
         }
@@ -587,7 +604,10 @@ pub fn run_conversion<R: ConversionReport>(
         }
         _ => {
             let ext = extension_for_container(&settings.container);
-            (container_to_ffmpeg_format(&settings.container).to_string(), ext.to_string())
+            (
+                container_to_ffmpeg_format(&settings.container).to_string(),
+                ext.to_string(),
+            )
         }
     };
     let extension = &output_extension;
@@ -595,13 +615,23 @@ pub fn run_conversion<R: ConversionReport>(
         ConversionPipeline::VideoPassthrough => settings.input_files.len(),
         ConversionPipeline::MetadataOnly => {
             let per_file_steps = if settings.recording_type == RecordingType::VideoClipSequence {
-                2 + if settings.split_tracks { settings.channel_map.num_channels().max(1) } else { 1 }
+                2 + if settings.split_tracks {
+                    settings.channel_map.num_channels().max(1)
+                } else {
+                    1
+                }
             } else {
                 2
             };
             settings.input_files.len() * per_file_steps
         }
-        _ => if settings.split_tracks { settings.channel_map.num_channels() } else { 1 },
+        _ => {
+            if settings.split_tracks {
+                settings.channel_map.num_channels()
+            } else {
+                1
+            }
+        }
     };
     let input_count = settings.input_files.len();
 
@@ -615,17 +645,30 @@ pub fn run_conversion<R: ConversionReport>(
         settings.audio_encoder,
     );
 
-    report.set_message(&format!("Pipeline: {:?}, {} steps", settings.pipeline, total_steps));
+    report.set_message(&format!(
+        "Pipeline: {:?}, {} steps",
+        settings.pipeline, total_steps
+    ));
 
-match settings.pipeline {
-        ConversionPipeline::AudioOnly { generate_synthetic_video: false } => {
+    match settings.pipeline {
+        ConversionPipeline::AudioOnly {
+            generate_synthetic_video: false,
+        } => {
             run_audio_to_audio(&settings, &output_format, extension, report);
         }
-        ConversionPipeline::AudioOnly { generate_synthetic_video: true } => {
+        ConversionPipeline::AudioOnly {
+            generate_synthetic_video: true,
+        } => {
             run_audio_to_synthetic_video(&mut settings, extension, &mut fallback, report);
         }
         ConversionPipeline::VideoPassthrough => {
-            run_video_to_video(&mut settings, extension, &mut fallback, report, &mut total_steps);
+            run_video_to_video(
+                &mut settings,
+                extension,
+                &mut fallback,
+                report,
+                &mut total_steps,
+            );
         }
         ConversionPipeline::MetadataOnly => {
             run_metadata_only(&settings, report, total_steps);
@@ -669,7 +712,11 @@ pub fn spawn_conversion_job(
 
     if report.is_failed() {
         let log_msg = ctx.progress.snapshot().message.clone();
-        let err_msg = if log_msg.is_empty() { "Unknown conversion failure".to_string() } else { log_msg };
+        let err_msg = if log_msg.is_empty() {
+            "Unknown conversion failure".to_string()
+        } else {
+            log_msg
+        };
         Err(JobError::Failed(err_msg))
     } else if report.is_cancelled() {
         info!("Conversion job cancelled");
@@ -700,7 +747,9 @@ fn run_audio_to_audio(
         let physical: Vec<(usize, usize)> = (0..map_n).map(|i| (i, 0)).collect();
         let mut emitted = 0usize;
         for sel in selected_channel_pairs(settings, &physical) {
-            if report.is_cancelled() { break; }
+            if report.is_cancelled() {
+                break;
+            }
 
             let output_path = settings.output_path_for_index("audio", sel.output_k + 1, extension);
             let tc = settings
@@ -755,8 +804,7 @@ fn run_audio_to_synthetic_video(
     report: &impl ConversionReport,
 ) {
     let output_path = settings.output_path_for_index("video", 1, extension);
-    let mut build_args =
-        |s: &ConverterSettings| build_audio_to_synthetic_video_args(s);
+    let mut build_args = |s: &ConverterSettings| build_audio_to_synthetic_video_args(s);
     report.set_step_weight(1.0);
     run_video_step_with_fallback(
         settings,
@@ -799,14 +847,20 @@ fn probe_all_video_audio(
     let mut probes: Vec<Option<VideoAudioProbe>> = Vec::new();
 
     for file_idx in 0..settings.input_files.len() {
-        if report.is_cancelled() { break; }
+        if report.is_cancelled() {
+            break;
+        }
         let input = &settings.input_files[file_idx];
         match crate::ffprobe::probe_video_audio(input) {
             Ok(probe) => {
                 probes.push(Some(probe));
             }
             Err(e) => {
-                warn!("Probe failed for '{}': {} — treating as no-audio", input.display(), e);
+                warn!(
+                    "Probe failed for '{}': {} — treating as no-audio",
+                    input.display(),
+                    e
+                );
                 probes.push(None);
             }
         }
@@ -833,10 +887,16 @@ fn plan_video_steps(
     if use_concat {
         let ext = extension_for_container(&settings.container);
         for file_idx in 0..settings.input_files.len() {
-            if report.is_cancelled() { break; }
+            if report.is_cancelled() {
+                break;
+            }
             let video_out = settings.output_path_for_file("video", file_idx, file_idx + 1, ext);
             steps.push(StepEntry {
-                step: VideoOutputStep::VideoOnly { file_idx, output: video_out, naming_index: file_idx + 1 },
+                step: VideoOutputStep::VideoOnly {
+                    file_idx,
+                    output: video_out,
+                    naming_index: file_idx + 1,
+                },
                 is_audio_only: false,
             });
         }
@@ -847,19 +907,23 @@ fn plan_video_steps(
             report.append_log(&format!("\n--- {}\n", warning.trim()));
         }
         for cs in concat_steps {
-            steps.push(StepEntry { step: cs, is_audio_only: true });
+            steps.push(StepEntry {
+                step: cs,
+                is_audio_only: true,
+            });
         }
     } else {
         for (file_idx, probe_opt) in probes.iter().enumerate() {
-            let probe = probe_opt
-                .clone()
-                .unwrap_or(VideoAudioProbe {
-                    streams: Vec::new(),
-                    total_audio_channels: 0,
-                    is_video_file: true,
-                });
+            let probe = probe_opt.clone().unwrap_or(VideoAudioProbe {
+                streams: Vec::new(),
+                total_audio_channels: 0,
+                is_video_file: true,
+            });
             for s in plan_video_outputs_for_file(settings, file_idx, &probe) {
-                steps.push(StepEntry { step: s, is_audio_only: false });
+                steps.push(StepEntry {
+                    step: s,
+                    is_audio_only: false,
+                });
             }
         }
     }
@@ -877,15 +941,26 @@ fn execute_video_steps(
     report: &impl ConversionReport,
 ) {
     for (step_idx, entry) in steps.iter().enumerate() {
-        if report.is_cancelled() { break; }
+        if report.is_cancelled() {
+            break;
+        }
 
         report.set_step_weight(1.0 / steps.len().max(1) as f32);
 
         if entry.is_audio_only {
-            if let VideoOutputStep::AudioChannelConcat { segments, output, format, sample_rate } = &entry.step {
+            if let VideoOutputStep::AudioChannelConcat {
+                segments,
+                output,
+                format,
+                sample_rate,
+            } = &entry.step
+            {
                 if let Err(e) = run_ffmpeg_process(
                     &build_concat_audio_args(settings, segments, format, *sample_rate),
-                    output, report, steps.len(), step_idx + 1,
+                    output,
+                    report,
+                    steps.len(),
+                    step_idx + 1,
                 ) {
                     report.mark_failed(&e.to_string());
                     break;
@@ -893,11 +968,15 @@ fn execute_video_steps(
             }
         } else {
             let output = entry.step.output().to_path_buf();
-            let probe = probes.first().cloned().flatten().unwrap_or(VideoAudioProbe {
-                streams: Vec::new(),
-                total_audio_channels: 0,
-                is_video_file: true,
-            });
+            let probe = probes
+                .first()
+                .cloned()
+                .flatten()
+                .unwrap_or(VideoAudioProbe {
+                    streams: Vec::new(),
+                    total_audio_channels: 0,
+                    is_video_file: true,
+                });
             let mut build_args =
                 |s: &ConverterSettings| build_video_to_video_args(s, &entry.step, &probe);
 
@@ -933,7 +1012,11 @@ fn execute_video_steps(
     }
 }
 
-fn rename_target_in_source_dir(settings: &ConverterSettings, file_idx: usize, ext: &str) -> PathBuf {
+fn rename_target_in_source_dir(
+    settings: &ConverterSettings,
+    file_idx: usize,
+    ext: &str,
+) -> PathBuf {
     let naming_ctx = naming::NamingContext {
         filename: settings
             .input_files
@@ -942,7 +1025,10 @@ fn rename_target_in_source_dir(settings: &ConverterSettings, file_idx: usize, ex
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string(),
-        device: settings.device_name.clone().unwrap_or_else(|| "unknown".into()),
+        device: settings
+            .device_name
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
         clip: file_idx + 1,
         track: (file_idx + 1).max(1),
     };
@@ -1091,7 +1177,8 @@ fn run_metadata_only_with(
     let Some(probes) = probe_all_metadata_files_with(settings, report, &mut ledger, prober) else {
         return;
     };
-    let Some(()) = extract_metadata_audio(settings, &probes, report, total_steps, &mut ledger) else {
+    let Some(()) = extract_metadata_audio(settings, &probes, report, total_steps, &mut ledger)
+    else {
         return;
     };
     let Some(()) = tag_and_rename_files(settings, &probes, report, &mut ledger) else {
@@ -1204,7 +1291,10 @@ fn extract_concat_audio(
                         report,
                         FailureKind::Extraction(e.clone()),
                         Some(output),
-                        &format!("audio concatenation step {} failed", step_label(cursor, total_actual)),
+                        &format!(
+                            "audio concatenation step {} failed",
+                            step_label(cursor, total_actual)
+                        ),
                     );
                 } else {
                     ledger.note_success();
@@ -1224,7 +1314,12 @@ fn extract_concat_audio(
                     .unwrap_or(48000);
                 if let Err(e) = run_ffmpeg_process(
                     &build_video_track_extract_args(
-                        settings, *file_idx, *stream_idx, *channel_idx, format, sr,
+                        settings,
+                        *file_idx,
+                        *stream_idx,
+                        *channel_idx,
+                        format,
+                        sr,
                     ),
                     output,
                     report,
@@ -1253,10 +1348,7 @@ fn extract_concat_audio(
 
 /// Sample rate of `stream_idx` in the probe, defaulting to 48 kHz when the
 /// stream is absent from the probe.
-fn sample_rate_for_stream(
-    probe: &crate::ffprobe::VideoAudioProbe,
-    stream_idx: usize,
-) -> u32 {
+fn sample_rate_for_stream(probe: &crate::ffprobe::VideoAudioProbe, stream_idx: usize) -> u32 {
     probe
         .streams
         .iter()
@@ -1291,8 +1383,7 @@ fn extract_per_file_audio(
                 .iter()
                 .flat_map(|s| (0..s.channels).map(move |ch| (s.stream_index, ch)))
                 .collect();
-            let use_split =
-                settings.split_tracks && settings.channel_map.num_channels() > 0;
+            let use_split = settings.split_tracks && settings.channel_map.num_channels() > 0;
 
             let fx = FileExtraction {
                 settings,
@@ -1363,8 +1454,14 @@ fn extract_split_channels_for_file<R: ConversionReport>(
         emitted += 1;
         let output_path = settings.output_path_for_file("audio", file_idx, emitted, aext);
         let sample_rate = sample_rate_for_stream(probe, stream_idx);
-        let args =
-            build_video_track_extract_args(settings, file_idx, stream_idx, ch_idx, fmt, sample_rate);
+        let args = build_video_track_extract_args(
+            settings,
+            file_idx,
+            stream_idx,
+            ch_idx,
+            fmt,
+            sample_rate,
+        );
         if let Err(e) = run_ffmpeg_process(&args, &output_path, report, total_actual, *cursor) {
             note_step_failure(
                 ledger,
@@ -1452,18 +1549,13 @@ fn tag_and_rename_files(
                             format!("✓ {} — tagged via ffmpeg\n", input_path.display())
                         }
                         crate::tagger::TagOutcome::Skipped { reason } => {
-                            format!(
-                                "⚠ {} — skipped tagging: {}\n",
-                                input_path.display(),
-                                reason
-                            )
+                            format!("⚠ {} — skipped tagging: {}\n", input_path.display(), reason)
                         }
                     };
                     report.append_log(&msg);
                 }
                 Err(e) => {
-                    let detail =
-                        format!("{} — tagging failed: {}", input_path.display(), e);
+                    let detail = format!("{} — tagging failed: {}", input_path.display(), e);
                     log::error!("{}", detail);
                     report.append_log(&format!("✗ {}\n", detail));
                     note_plaintext_failure(ledger, FailureKind::Tag, Some(input_path), detail);
@@ -1496,19 +1588,12 @@ fn tag_and_rename_files(
                 } else {
                     match std::fs::rename(input_path, &new_path) {
                         Ok(()) => {
-                            let msg = format!(
-                                "✓ {} → {}\n",
-                                input_path.display(),
-                                new_path.display()
-                            );
+                            let msg =
+                                format!("✓ {} → {}\n", input_path.display(), new_path.display());
                             report.append_log(&msg);
                         }
                         Err(e) => {
-                            let detail = format!(
-                                "{} — rename failed: {}",
-                                input_path.display(),
-                                e
-                            );
+                            let detail = format!("{} — rename failed: {}", input_path.display(), e);
                             log::error!("{}", detail);
                             report.append_log(&format!("✗ {}\n", detail));
                             note_plaintext_failure(
@@ -1539,7 +1624,8 @@ fn summarize_metadata_failures(report: &impl ConversionReport, ledger: &FailureL
     let summary = format!(
         "\n--- {} STEP(S) FAILED ---\n{}",
         ledger.details.len(),
-        ledger.details
+        ledger
+            .details
             .iter()
             .map(|r| r.detail.as_str())
             .collect::<Vec<_>>()
@@ -1555,9 +1641,9 @@ fn summarize_metadata_failures(report: &impl ConversionReport, ledger: &FailureL
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::converter::test_fixtures::*;
     use crate::ChannelMap;
-    use super::*;
 
     #[test]
     fn test_run_audio_to_audio_split_all_dropped_fails() {
@@ -1569,9 +1655,7 @@ mod tests {
 
         let report = TestReport::new();
 
-        run_audio_to_audio(
-            &settings, "wav", "wav", &report,
-        );
+        run_audio_to_audio(&settings, "wav", "wav", &report);
 
         assert!(
             *report.failed.lock().unwrap(),
@@ -1594,9 +1678,7 @@ mod tests {
 
         let report = TestReport::new();
 
-        run_audio_to_audio(
-            &settings, "wav", "wav", &report,
-        );
+        run_audio_to_audio(&settings, "wav", "wav", &report);
 
         assert!(
             !*report.failed.lock().unwrap(),
@@ -1605,7 +1687,12 @@ mod tests {
         );
     }
 
-    fn create_test_wav(dir: &std::path::Path, name: &str, sample_rate: u32, duration_secs: f64) -> std::path::PathBuf {
+    fn create_test_wav(
+        dir: &std::path::Path,
+        name: &str,
+        sample_rate: u32,
+        duration_secs: f64,
+    ) -> std::path::PathBuf {
         let path = dir.join(name);
         let num_samples = (sample_rate as f64 * duration_secs) as u32;
         let spec = hound::WavSpec {
@@ -1624,11 +1711,12 @@ mod tests {
 
     #[test]
     fn test_encoder_fallback_remaining_skips_failed() {
-        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
-        let mut fb = EncoderFallback::new_with_hw(
-            vec!["enc_a".into(), "enc_b".into(), "enc_c".into()],
-            hw,
-        );
+        let hw = HwDeviceContext {
+            vaapi_device: None,
+            vulkan_available: false,
+        };
+        let mut fb =
+            EncoderFallback::new_with_hw(vec!["enc_a".into(), "enc_b".into(), "enc_c".into()], hw);
         fb.note_failure("enc_a");
         let remaining = fb.remaining();
         assert_eq!(remaining, vec!["enc_b".to_string(), "enc_c".to_string()]);
@@ -1636,11 +1724,11 @@ mod tests {
 
     #[test]
     fn test_encoder_fallback_pins_resolved_encoder() {
-        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
-        let mut fb = EncoderFallback::new_with_hw(
-            vec!["enc_a".into(), "enc_b".into()],
-            hw,
-        );
+        let hw = HwDeviceContext {
+            vaapi_device: None,
+            vulkan_available: false,
+        };
+        let mut fb = EncoderFallback::new_with_hw(vec!["enc_a".into(), "enc_b".into()], hw);
         fb.note_success("enc_a");
         assert_eq!(fb.resolved(), Some("enc_a"));
         assert_eq!(fb.remaining(), vec!["enc_a".to_string()]);
@@ -1648,18 +1736,21 @@ mod tests {
 
     #[test]
     fn test_encoder_fallback_exhausted_chain() {
-        let hw = HwDeviceContext { vaapi_device: None, vulkan_available: false };
-        let mut fb = EncoderFallback::new_with_hw(
-            vec!["enc_a".into()],
-            hw,
-        );
+        let hw = HwDeviceContext {
+            vaapi_device: None,
+            vulkan_available: false,
+        };
+        let mut fb = EncoderFallback::new_with_hw(vec!["enc_a".into()], hw);
         fb.note_failure("enc_a");
         assert!(fb.remaining().is_empty());
     }
 
     #[test]
     fn test_resolve_device_for_candidate_software_encoder() {
-        let ctx = HwDeviceContext { vaapi_device: None, vulkan_available: false };
+        let ctx = HwDeviceContext {
+            vaapi_device: None,
+            vulkan_available: false,
+        };
         assert!(resolve_device_for_candidate("libx264", &ctx).is_none());
         assert!(resolve_device_for_candidate("pcm_s24le", &ctx).is_none());
     }
@@ -1692,7 +1783,12 @@ mod tests {
 
     fn tc_meta() -> Option<crate::converter::timecode::TimecodeMetadata> {
         Some(crate::converter::timecode::TimecodeMetadata {
-            start: audio_core::Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            start: audio_core::Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
             fps: 25.0,
             drop_frame: false,
         })
@@ -1700,7 +1796,9 @@ mod tests {
 
     #[test]
     fn test_run_metadata_only_wav_happy_path() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let wav1 = create_test_wav(dir.path(), "take1.wav", 48000, 0.25);
         let wav2 = create_test_wav(dir.path(), "take2.wav", 48000, 0.25);
@@ -1714,17 +1812,25 @@ mod tests {
         let report = TestReport::new();
         run_conversion(&report, settings, None);
 
-        assert!(!*report.failed.lock().unwrap(), "metadata-only wav run should not fail; log: {}",
-            report.log.lock().unwrap());
+        assert!(
+            !*report.failed.lock().unwrap(),
+            "metadata-only wav run should not fail; log: {}",
+            report.log.lock().unwrap()
+        );
         assert!(*report.completed.lock().unwrap(), "should complete");
         // Originals were tagged in place and renamed (prefix "output" is
         // non-empty), so the original names must be gone.
-        assert!(!wav1.exists() && !wav2.exists(), "originals should have been renamed");
+        assert!(
+            !wav1.exists() && !wav2.exists(),
+            "originals should have been renamed"
+        );
     }
 
     #[test]
     fn test_run_metadata_only_video_extraction() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let clip = dir.path().join("clip1.mp4");
         crate::converter::test_fixtures::create_test_video_with_tone(&clip, 1.0);
@@ -1738,15 +1844,23 @@ mod tests {
         let report = TestReport::new();
         run_conversion(&report, settings, None);
 
-        assert!(!*report.failed.lock().unwrap(), "metadata-only video run should not fail; log: {}",
-            report.log.lock().unwrap());
+        assert!(
+            !*report.failed.lock().unwrap(),
+            "metadata-only video run should not fail; log: {}",
+            report.log.lock().unwrap()
+        );
         // Extracted merged audio must exist in the output folder.
-        let wavs: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        let wavs: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
             .collect();
-        assert!(!wavs.is_empty(), "expected an extracted wav in {}", dir.path().display());
+        assert!(
+            !wavs.is_empty(),
+            "expected an extracted wav in {}",
+            dir.path().display()
+        );
     }
 
     /// Pins current best-effort semantics: a probe failure logs "✗ … probe
@@ -1754,7 +1868,9 @@ mod tests {
     /// the all-steps-failed accounting deliberately.
     #[test]
     fn test_run_metadata_only_probe_failure_is_best_effort() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let clip = dir.path().join("clip1.mp4");
         crate::converter::test_fixtures::create_test_video_with_tone(&clip, 1.0);
@@ -1769,28 +1885,41 @@ mod tests {
         let total = settings.input_files.len() * 3;
         run_metadata_only(&settings, &report, total);
 
-        assert!(!*report.failed.lock().unwrap(),
-            "probe failure is best-effort; run should not be marked failed");
+        assert!(
+            !*report.failed.lock().unwrap(),
+            "probe failure is best-effort; run should not be marked failed"
+        );
         // clip1 was still processed: its extracted audio exists on disk.
-        let wavs: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        let wavs: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
             .collect();
-        assert!(!wavs.is_empty(), "clip1 should still be extracted: expected a wav in {}",
-            dir.path().display());
+        assert!(
+            !wavs.is_empty(),
+            "clip1 should still be extracted: expected a wav in {}",
+            dir.path().display()
+        );
         // The probe failure for clip2 is recorded structurally in the
         // ledger, together with its best-effort tag/rename failures.
         let failures = report.failures();
-        assert_eq!(failures.len(), 3, "probe + tag + rename failures for clip2: {:?}",
-            failures);
+        assert_eq!(
+            failures.len(),
+            3,
+            "probe + tag + rename failures for clip2: {:?}",
+            failures
+        );
         let missing = Path::new("/nonexistent/clip2.mp4");
-        assert!(failures.iter().any(|r| matches!(r.kind, FailureKind::Probe)
-            && r.file.as_deref() == Some(missing)));
-        assert!(failures.iter().any(|r| matches!(r.kind, FailureKind::Tag)
-            && r.file.as_deref() == Some(missing)));
-        assert!(failures.iter().any(|r| matches!(r.kind, FailureKind::Rename)
-            && r.file.as_deref() == Some(missing)));
+        assert!(failures
+            .iter()
+            .any(|r| matches!(r.kind, FailureKind::Probe) && r.file.as_deref() == Some(missing)));
+        assert!(failures
+            .iter()
+            .any(|r| matches!(r.kind, FailureKind::Tag) && r.file.as_deref() == Some(missing)));
+        assert!(failures
+            .iter()
+            .any(|r| matches!(r.kind, FailureKind::Rename) && r.file.as_deref() == Some(missing)));
     }
 
     #[test]
@@ -1802,19 +1931,31 @@ mod tests {
         settings.output_folder = dir.path().to_path_buf();
 
         let report = TestReport::new();
-        report.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        report
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         run_metadata_only(&settings, &report, 2);
 
-        assert!(*report.failed.lock().unwrap(), "cancelled run must be failed");
-        assert!(report.cancel_notified(),
-            "cancellation must be signalled through the typed report seam");
+        assert!(
+            *report.failed.lock().unwrap(),
+            "cancelled run must be failed"
+        );
+        assert!(
+            report.cancel_notified(),
+            "cancellation must be signalled through the typed report seam"
+        );
         assert!(report.failures().is_empty(), "no steps were attempted");
-        assert!(std::fs::read_dir(dir.path()).unwrap().count() == 0, "no output files");
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().count() == 0,
+            "no output files"
+        );
     }
 
     #[test]
     fn test_run_video_to_video_copy_mode_missing_input_fails() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let mut settings = make_copy_settings();
         settings.input_files = vec![PathBuf::from("/nonexistent/clip.mp4")];
@@ -1823,19 +1964,26 @@ mod tests {
         let report = TestReport::new();
         let mut fallback = EncoderFallback::new_with_hw(
             vec!["libx264".into()],
-            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+            HwDeviceContext {
+                vaapi_device: None,
+                vulkan_available: false,
+            },
         );
         let mut total = 1;
         run_video_to_video(&mut settings, "mp4", &mut fallback, &report, &mut total);
 
-        assert!(*report.failed.lock().unwrap(),
+        assert!(
+            *report.failed.lock().unwrap(),
             "copy-mode run on a missing input must fail; log: {}",
-            report.log.lock().unwrap());
+            report.log.lock().unwrap()
+        );
     }
 
     #[test]
     fn test_run_video_to_video_happy_path() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let clip = dir.path().join("clip1.mp4");
         crate::converter::test_fixtures::create_test_video_with_tone(&clip, 1.0);
@@ -1852,19 +2000,30 @@ mod tests {
         // Encoder-fallback ordering is covered by video_codecs unit tests.
         let mut fallback = EncoderFallback::new_with_hw(
             vec!["libx264".into()],
-            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+            HwDeviceContext {
+                vaapi_device: None,
+                vulkan_available: false,
+            },
         );
         let mut total = 1;
         run_video_to_video(&mut settings, "mkv", &mut fallback, &report, &mut total);
 
-        assert!(!*report.failed.lock().unwrap(), "video passthrough should succeed; log: {}",
-            report.log.lock().unwrap());
-        let outs: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        assert!(
+            !*report.failed.lock().unwrap(),
+            "video passthrough should succeed; log: {}",
+            report.log.lock().unwrap()
+        );
+        let outs: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().map(|e| e == "mkv").unwrap_or(false))
             .collect();
-        assert!(!outs.is_empty(), "expected an .mkv output in {}", dir.path().display());
+        assert!(
+            !outs.is_empty(),
+            "expected an .mkv output in {}",
+            dir.path().display()
+        );
     }
 
     // ── PR-3: phase helpers + failure accounting ─────────────────────────
@@ -1876,11 +2035,15 @@ mod tests {
         assert!(!*report.failed.lock().unwrap());
         assert!(report.log.lock().unwrap().is_empty());
 
-        report.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        report
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(check_cancelled(&report));
         assert!(*report.failed.lock().unwrap());
-        assert!(report.cancel_notified(),
-            "check_cancelled must signal cancellation through the typed seam");
+        assert!(
+            report.cancel_notified(),
+            "check_cancelled must signal cancellation through the typed seam"
+        );
     }
 
     #[test]
@@ -1914,7 +2077,9 @@ mod tests {
 
     // ── PR-7: logic-level tests via the prober seam ──────────────────────
 
-    use crate::converter::test_fixtures::{make_stereo_probe, make_video_settings as fixture_video};
+    use crate::converter::test_fixtures::{
+        make_stereo_probe, make_video_settings as fixture_video,
+    };
 
     #[test]
     fn test_metadata_only_with_probe_failure_branch() {
@@ -1932,17 +2097,30 @@ mod tests {
         let mut prober = |_p: &Path| Err("no such file".to_string());
         run_metadata_only_with(&settings, &report, 6, &mut prober);
 
-        assert!(*report.failed.lock().unwrap(), "all probes failed → run failed");
+        assert!(
+            *report.failed.lock().unwrap(),
+            "all probes failed → run failed"
+        );
         let failures = report.failures();
         // Probe, tag, and rename all fail per clip (best-effort phases keep
         // running after the probe failure); no ffmpeg step ever runs.
-        assert_eq!(failures.len(), 6, "probe + tag + rename per clip: {:?}", failures);
         assert_eq!(
-            failures.iter().filter(|r| matches!(r.kind, FailureKind::Probe)).count(),
+            failures.len(),
+            6,
+            "probe + tag + rename per clip: {:?}",
+            failures
+        );
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|r| matches!(r.kind, FailureKind::Probe))
+                .count(),
             2,
             "one probe failure per clip"
         );
-        assert!(failures.iter().all(|r| !matches!(r.kind, FailureKind::Ffmpeg(_))));
+        assert!(failures
+            .iter()
+            .all(|r| !matches!(r.kind, FailureKind::Ffmpeg(_))));
     }
 
     #[test]
@@ -1964,15 +2142,26 @@ mod tests {
         };
         run_metadata_only_with(&settings, &report, 3, &mut prober);
 
-        assert!(*report.failed.lock().unwrap(), "cancel between phases fails the run");
-        assert!(report.cancel_notified(),
-            "cancel between phases must signal through the typed seam");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "no outputs produced");
+        assert!(
+            *report.failed.lock().unwrap(),
+            "cancel between phases fails the run"
+        );
+        assert!(
+            report.cancel_notified(),
+            "cancel between phases must signal through the typed seam"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no outputs produced"
+        );
     }
 
     #[test]
     fn test_metadata_only_concat_planning_path() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let clip1 = dir.path().join("clip1.mp4");
         let clip2 = dir.path().join("clip2.mp4");
@@ -1994,20 +2183,30 @@ mod tests {
 
         // The concat plan was built and executed: one concatenated audio
         // output per surviving track (identity map over 2 channels).
-        assert!(!*report.failed.lock().unwrap(), "concat run should not fail; log: {}",
-            report.log.lock().unwrap());
-        let wavs: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+        assert!(
+            !*report.failed.lock().unwrap(),
+            "concat run should not fail; log: {}",
+            report.log.lock().unwrap()
+        );
+        let wavs: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
             .collect();
-        assert_eq!(wavs.len(), 2, "one concat audio output per surviving track: {:?}",
-            wavs);
+        assert_eq!(
+            wavs.len(),
+            2,
+            "one concat audio output per surviving track: {:?}",
+            wavs
+        );
     }
 
     #[test]
     fn test_metadata_only_extraction_failure_accounting() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         // Probe succeeds (fake), but extraction fails on the nonexistent
         // input → typed ffmpeg failure recorded; nothing succeeds → run
         // marked failed.
@@ -2026,9 +2225,17 @@ mod tests {
         let failures = report.failures();
         // The extraction ffmpeg step fails (typed Extraction record), and
         // the best-effort tag/rename phases fail on the nonexistent input.
-        assert_eq!(failures.len(), 3, "extraction + tag + rename: {:?}", failures);
         assert_eq!(
-            failures.iter().filter(|r| matches!(r.kind, FailureKind::Extraction(_))).count(),
+            failures.len(),
+            3,
+            "extraction + tag + rename: {:?}",
+            failures
+        );
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|r| matches!(r.kind, FailureKind::Extraction(_)))
+                .count(),
             1,
             "the failed extraction is recorded"
         );
@@ -2036,7 +2243,9 @@ mod tests {
 
     #[test]
     fn test_video_to_video_bogus_codec_falls_through_and_fails() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let clip = dir.path().join("clip1.mp4");
         crate::converter::test_fixtures::create_test_video_with_tone(&clip, 0.5);
@@ -2049,12 +2258,18 @@ mod tests {
         let report = TestReport::new();
         let mut fallback = EncoderFallback::new_with_hw(
             video_codecs::static_encoder_chain("no-such-codec"),
-            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+            HwDeviceContext {
+                vaapi_device: None,
+                vulkan_available: false,
+            },
         );
         let mut total = 0;
         run_video_to_video(&mut settings, "mkv", &mut fallback, &report, &mut total);
 
-        assert!(*report.failed.lock().unwrap(), "bogus codec must fail the run");
+        assert!(
+            *report.failed.lock().unwrap(),
+            "bogus codec must fail the run"
+        );
         assert!(
             fallback.failed().contains("no-such-codec"),
             "failed-encoder set records the bogus codec: {:?}",
@@ -2067,7 +2282,9 @@ mod tests {
     /// the fallback's failed set.
     #[test]
     fn test_run_video_step_with_fallback_exhausted_reports_outcome() {
-        if skip_if_no_ffmpeg() { return; }
+        if skip_if_no_ffmpeg() {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let mut settings = fixture_video();
         settings.output_folder = dir.path().to_path_buf();
@@ -2077,15 +2294,24 @@ mod tests {
         let report = TestReport::new();
         let mut fallback = EncoderFallback::new_with_hw(
             vec!["no-such-encoder".into()],
-            HwDeviceContext { vaapi_device: None, vulkan_available: false },
+            HwDeviceContext {
+                vaapi_device: None,
+                vulkan_available: false,
+            },
         );
-        let mut build_args = |s: &ConverterSettings| vec![
-            "-f".to_string(), "lavfi".to_string(),
-            "-i".to_string(), "testsrc=size=64x64:rate=10".to_string(),
-            "-t".to_string(), "0.1".to_string(),
-            "-c:v".to_string(), s.resolved_video_encoder.clone(),
-            output_str.clone(),
-        ];
+        let mut build_args = |s: &ConverterSettings| {
+            vec![
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                "testsrc=size=64x64:rate=10".to_string(),
+                "-t".to_string(),
+                "0.1".to_string(),
+                "-c:v".to_string(),
+                s.resolved_video_encoder.clone(),
+                output_str.clone(),
+            ]
+        };
 
         let outcome = run_video_step_with_fallback(
             &mut settings,
@@ -2099,7 +2325,9 @@ mod tests {
 
         assert_eq!(outcome, StepOutcome::Exhausted);
         assert!(fallback.failed().contains("no-such-encoder"));
-        assert!(*report.failed.lock().unwrap(), "exhausted chain marks the run failed");
+        assert!(
+            *report.failed.lock().unwrap(),
+            "exhausted chain marks the run failed"
+        );
     }
-
 }

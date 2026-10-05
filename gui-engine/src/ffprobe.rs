@@ -83,7 +83,11 @@ impl std::fmt::Display for ProbeError {
                 write!(f, "No audio streams found in '{}'", path.display())
             }
             ProbeError::Parse(msg) => {
-                write!(f, "ffprobe probe failed: Failed to parse ffprobe JSON: {}", msg)
+                write!(
+                    f,
+                    "ffprobe probe failed: Failed to parse ffprobe JSON: {}",
+                    msg
+                )
             }
         }
     }
@@ -201,7 +205,9 @@ pub fn probe_video_audio_with(
     let streams_val = parsed
         .get("streams")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| ProbeError::NoStreams { path: path.to_path_buf() })?;
+        .ok_or_else(|| ProbeError::NoStreams {
+            path: path.to_path_buf(),
+        })?;
 
     let mut streams = Vec::new();
     for s in streams_val {
@@ -452,7 +458,11 @@ pub fn probe_stream_duration_secs_with(
     }
 
     // Fallback to format-level duration
-    if let Some(d) = parsed.get("format").and_then(|f| f.get("duration")).and_then(|v| v.as_str()) {
+    if let Some(d) = parsed
+        .get("format")
+        .and_then(|f| f.get("duration"))
+        .and_then(|v| v.as_str())
+    {
         if let Ok(secs) = d.parse::<f64>() {
             if secs > 0.0 {
                 return Some(secs);
@@ -531,31 +541,32 @@ pub fn extract_audio_channel_with_progress_with(
     on_frac: &impl Fn(f32),
     seam: &mut ExtractSeam<'_>,
 ) -> Result<(), ExtractError> {
-    let ExtractSeam { cancel, stall, spawner } = seam;
+    let ExtractSeam {
+        cancel,
+        stall,
+        spawner,
+    } = seam;
     let mut args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
     args.push("-progress".to_string());
     args.push("pipe:2".to_string());
 
-    let run = run_ffmpeg_collect_stderr(
-        *spawner,
-        &args,
-        *stall,
-        *cancel,
-        &mut |line| {
-            if let Some(secs) = parse_out_time_us(line) {
-                if let Some(duration) = total_duration_secs {
-                    if duration > 0.0 {
-                        let frac = (secs / duration).min(1.0) as f32;
-                        on_frac(frac);
-                    }
+    let run = run_ffmpeg_collect_stderr(*spawner, &args, *stall, *cancel, &mut |line| {
+        if let Some(secs) = parse_out_time_us(line) {
+            if let Some(duration) = total_duration_secs {
+                if duration > 0.0 {
+                    let frac = (secs / duration).min(1.0) as f32;
+                    on_frac(frac);
                 }
             }
-        },
-    );
+        }
+    });
 
     match run {
         Ok(_) => {
-            info!("Audio extraction (with progress) successful: {}", output_wav.display());
+            info!(
+                "Audio extraction (with progress) successful: {}",
+                output_wav.display()
+            );
             Ok(())
         }
         Err(e) => {
@@ -583,9 +594,7 @@ pub fn extract_audio_channel_with_progress_with(
                 crate::subprocess::FfmpegRunError::Stalled => ExtractError::Stalled {
                     stall_secs: stall.as_secs(),
                 },
-                crate::subprocess::FfmpegRunError::Wait(err) => {
-                    ExtractError::Wait(err)
-                }
+                crate::subprocess::FfmpegRunError::Wait(err) => ExtractError::Wait(err),
             })
         }
     }
@@ -652,10 +661,8 @@ pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
         path.to_string_lossy().into(),
     ];
 
-    let parsed: serde_json::Value = match run_ffprobe_json_with(
-        &args,
-        PROBE_TIMEOUT,
-        &mut |a: &[String]| {
+    let parsed: serde_json::Value =
+        match run_ffprobe_json_with(&args, PROBE_TIMEOUT, &mut |a: &[String]| {
             run_output_with_timeout(
                 no_window_command("ffprobe")
                     .args(a)
@@ -663,31 +670,36 @@ pub fn snap_trim_to_keyframe(path: &Path, offset_secs: f64) -> f64 {
                     .stderr(Stdio::piped()),
                 PROBE_TIMEOUT,
             )
-        },
-    ) {
-        Ok(v) => v,
-        Err(SubprocessFailure::Io(e)) => {
-            warn!("Failed to run ffprobe for keyframe lookup: {}", e);
-            return offset_secs;
-        }
-        Err(SubprocessFailure::NonZeroExit { stderr_tail }) => {
-            warn!("Failed to run ffprobe for keyframe lookup: ffprobe failed: {}", stderr_tail);
-            return offset_secs;
-        }
-        Err(SubprocessFailure::Parse(e)) => {
-            warn!("Failed to run ffprobe for keyframe lookup: Failed to parse ffprobe JSON: {}", e);
-            return offset_secs;
-        }
-        Err(SubprocessFailure::TimedOut) => {
-            warn!(
-                "Keyframe probe timed out after {:.0}s for '{}' (offset {:.3}s)",
-                PROBE_TIMEOUT.as_secs_f64(),
-                path.display(),
-                offset_secs,
-            );
-            return offset_secs;
-        }
-    };
+        }) {
+            Ok(v) => v,
+            Err(SubprocessFailure::Io(e)) => {
+                warn!("Failed to run ffprobe for keyframe lookup: {}", e);
+                return offset_secs;
+            }
+            Err(SubprocessFailure::NonZeroExit { stderr_tail }) => {
+                warn!(
+                    "Failed to run ffprobe for keyframe lookup: ffprobe failed: {}",
+                    stderr_tail
+                );
+                return offset_secs;
+            }
+            Err(SubprocessFailure::Parse(e)) => {
+                warn!(
+                    "Failed to run ffprobe for keyframe lookup: Failed to parse ffprobe JSON: {}",
+                    e
+                );
+                return offset_secs;
+            }
+            Err(SubprocessFailure::TimedOut) => {
+                warn!(
+                    "Keyframe probe timed out after {:.0}s for '{}' (offset {:.3}s)",
+                    PROBE_TIMEOUT.as_secs_f64(),
+                    path.display(),
+                    offset_secs,
+                );
+                return offset_secs;
+            }
+        };
 
     let stdout = serde_json::to_string(&parsed).unwrap_or_default();
     match parse_last_keyframe(&stdout, offset_secs) {
@@ -903,7 +915,8 @@ mod tests {
     // ── probe_video_audio_with timeout ──────────────────────────────────────
 
     fn probe_success_runner(_args: &[String]) -> Result<Output, SubprocessFailure> {
-        let json = br#"{"streams":[{"index":1,"codec_name":"aac","channels":2,"sample_rate":"48000"}]}"#;
+        let json =
+            br#"{"streams":[{"index":1,"codec_name":"aac","channels":2,"sample_rate":"48000"}]}"#;
         Ok(Output {
             status: std::process::ExitStatus::default(),
             stdout: json.to_vec(),
@@ -948,7 +961,10 @@ mod tests {
         let path = Path::new("unreadable.mp4");
         let result = probe_video_audio_with(path, &mut probe_io_error_runner);
         assert!(
-            matches!(result, Err(ProbeError::Subprocess(SubprocessFailure::Io(_)))),
+            matches!(
+                result,
+                Err(ProbeError::Subprocess(SubprocessFailure::Io(_)))
+            ),
             "spawn IO failure must map to ProbeError::Subprocess(Io), got {:?}",
             result
         );
@@ -1025,7 +1041,10 @@ mod tests {
         let err = run_ffprobe_json_with(&[], PROBE_TIMEOUT, &mut runner).unwrap_err();
         match err {
             SubprocessFailure::NonZeroExit { stderr_tail } => {
-                assert_eq!(stderr_tail, "some error", "stderr tail must carry the child's stderr");
+                assert_eq!(
+                    stderr_tail, "some error",
+                    "stderr tail must carry the child's stderr"
+                );
             }
             other => panic!("expected NonZeroExit, got {:?}", other),
         }
@@ -1082,7 +1101,11 @@ mod tests {
     fn test_probe_stream_duration_secs_with_timed_out_returns_none() {
         let path = Path::new("corrupt.mp4");
         let result = probe_stream_duration_secs_with(path, 0, &mut probe_timeout_runner);
-        assert!(result.is_none(), "timeout should return None, got {:?}", result);
+        assert!(
+            result.is_none(),
+            "timeout should return None, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -1154,7 +1177,10 @@ mod tests {
         let out = Path::new("/tmp/_test_extract_io.wav");
         let result = extract_audio_channel_with(path, 1, 0, out, &mut runner);
         assert!(
-            matches!(result, Err(ExtractError::Subprocess(SubprocessFailure::Io(_)))),
+            matches!(
+                result,
+                Err(ExtractError::Subprocess(SubprocessFailure::Io(_)))
+            ),
             "spawn IO failure must map to ExtractError::Subprocess(Io), got {:?}",
             result
         );
@@ -1206,8 +1232,11 @@ mod tests {
             "cancel must map to ExtractError::Cancelled, got {:?}",
             result
         );
-        assert!(elapsed < Duration::from_secs(5),
-            "cancel took {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel took {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -1234,8 +1263,11 @@ mod tests {
             "stall timeout must map to ExtractError::Stalled, got {:?}",
             result
         );
-        assert!(elapsed < Duration::from_secs(5),
-            "stall detection took {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "stall detection took {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -1245,11 +1277,17 @@ mod tests {
         let mut spawner = |_args: &[String]| {
             let mut cmd = if cfg!(windows) {
                 let mut c = std::process::Command::new("cmd");
-                c.args(["/C", "echo out_time_us=5000000>&2 & echo out_time_us=10000000>&2"]);
+                c.args([
+                    "/C",
+                    "echo out_time_us=5000000>&2 & echo out_time_us=10000000>&2",
+                ]);
                 c
             } else {
                 let mut c = std::process::Command::new("sh");
-                c.args(["-c", "echo out_time_us=5000000 >&2; echo out_time_us=10000000 >&2"]);
+                c.args([
+                    "-c",
+                    "echo out_time_us=5000000 >&2; echo out_time_us=10000000 >&2",
+                ]);
                 c
             };
             cmd.stdout(std::process::Stdio::null());
@@ -1280,6 +1318,10 @@ mod tests {
         assert!(result.is_ok(), "expected ok, got {:?}", result);
         let p = fracs.lock().unwrap();
         // Should have called on_frac with at least one value
-        assert!(!p.is_empty(), "at least one progress callback should fire, got {:?}", p);
+        assert!(
+            !p.is_empty(),
+            "at least one progress callback should fire, got {:?}",
+            p
+        );
     }
 }

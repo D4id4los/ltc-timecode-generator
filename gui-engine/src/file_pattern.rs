@@ -313,8 +313,10 @@ pub fn match_files_all_patterns(folder: &Path) -> Vec<MatchedGroup> {
 fn match_files_all_patterns_in(folder: &Path, files: &[PathBuf]) -> Vec<MatchedGroup> {
     // TASCAM pattern (audio) — limited to .wav only
     let audio_patterns = &BUILTIN_PATTERNS[..1];
-    let all_patterns: Vec<&FileNamingPattern> =
-        audio_patterns.iter().chain(CAMERA_PATTERNS.iter()).collect();
+    let all_patterns: Vec<&FileNamingPattern> = audio_patterns
+        .iter()
+        .chain(CAMERA_PATTERNS.iter())
+        .collect();
 
     let mut used_paths: HashSet<PathBuf> = HashSet::new();
     let mut results: Vec<MatchedGroup> = Vec::new();
@@ -372,7 +374,10 @@ fn group_files_for_pattern(
                 .unwrap_or_default();
             let rel = relative_dir(folder, path);
             used_paths.insert(path.clone());
-            group_map.entry((rel, prefix)).or_default().push(path.clone());
+            group_map
+                .entry((rel, prefix))
+                .or_default()
+                .push(path.clone());
         }
     }
 
@@ -478,10 +483,7 @@ mod tests {
 
     #[test]
     fn test_default_output_filename_empty_group() {
-        assert_eq!(
-            default_output_filename("", "mkv"),
-            "-multi-audio-vid.mkv"
-        );
+        assert_eq!(default_output_filename("", "mkv"), "-multi-audio-vid.mkv");
     }
 
     #[test]
@@ -548,10 +550,7 @@ mod tests {
 
     #[test]
     fn test_group_display_key_nested() {
-        assert_eq!(
-            group_display_key("take1_", "subdir"),
-            "take1_ (subdir)"
-        );
+        assert_eq!(group_display_key("take1_", "subdir"), "take1_ (subdir)");
         assert_eq!(
             group_display_key("C0001", "day1/card2"),
             "C0001 (day1/card2)"
@@ -567,10 +566,7 @@ mod tests {
     #[test]
     fn test_group_key_prefix_nested() {
         assert_eq!(group_key_prefix("take1_ (subdir)"), "take1_");
-        assert_eq!(
-            group_key_prefix("C0001 (day1/card2)"),
-            "C0001"
-        );
+        assert_eq!(group_key_prefix("C0001 (day1/card2)"), "C0001");
     }
 
     #[test]
@@ -669,10 +665,8 @@ mod tests {
 
     #[test]
     fn test_match_files_nonexistent_directory() {
-        let result = match_files_to_groups(
-            Path::new("/nonexistent_dir_abc123"),
-            &BUILTIN_PATTERNS[0],
-        );
+        let result =
+            match_files_to_groups(Path::new("/nonexistent_dir_abc123"), &BUILTIN_PATTERNS[0]);
         assert!(result.is_empty());
     }
 
@@ -694,7 +688,12 @@ mod tests {
         let result = match_files_to_groups(base, &BUILTIN_PATTERNS[0]);
 
         // Two groups: root-level "take1_" and nested "take1_ (card2)"
-        assert_eq!(result.len(), 2, "expected 2 separate groups, got {:?}", result.keys());
+        assert_eq!(
+            result.len(),
+            2,
+            "expected 2 separate groups, got {:?}",
+            result.keys()
+        );
         let root_group = result.get("take1_").expect("missing root group");
         assert_eq!(root_group.len(), 2);
         assert!(root_group[0].to_string_lossy().ends_with("take1_S01.wav"));
@@ -733,7 +732,10 @@ mod tests {
         let result = match_files_to_groups(base, &BUILTIN_PATTERNS[0]);
         assert_eq!(result.len(), 2);
         assert!(result.contains_key("take1_"), "expected plain key 'take1_'");
-        assert!(result.contains_key("scene1_"), "expected plain key 'scene1_'");
+        assert!(
+            result.contains_key("scene1_"),
+            "expected plain key 'scene1_'"
+        );
     }
 
     #[test]
@@ -819,10 +821,13 @@ mod tests {
         // C00001.MP4 DO match it (with surrounding .* slack); negatives are
         // re-derived from the real regex: wrong prefix letter, too few
         // digits, wrong extension.
-        assert!(re.is_match("C00001.MP4"), "5 digits with .* slack must match");
-        assert!(!re.is_match("C001.MP4"));   // 3 digits — no C + 4 digits
-        assert!(!re.is_match("D0001.MP4"));  // wrong prefix letter
-        assert!(!re.is_match("C0001.AVI"));  // wrong extension
+        assert!(
+            re.is_match("C00001.MP4"),
+            "5 digits with .* slack must match"
+        );
+        assert!(!re.is_match("C001.MP4")); // 3 digits — no C + 4 digits
+        assert!(!re.is_match("D0001.MP4")); // wrong prefix letter
+        assert!(!re.is_match("C0001.AVI")); // wrong extension
     }
 
     #[test]
@@ -831,8 +836,8 @@ mod tests {
         assert!(re.is_match("00001.MTS"));
         assert!(re.is_match("12345.mts"));
         assert!(re.is_match("99999.MTS"));
-        assert!(!re.is_match("00001.mp4"));  // mp4 not in the extension set
-        assert!(!re.is_match("0001.MTS"));   // too few digits
+        assert!(!re.is_match("00001.mp4")); // mp4 not in the extension set
+        assert!(!re.is_match("0001.MTS")); // too few digits
     }
 
     #[test]
@@ -842,9 +847,12 @@ mod tests {
         assert!(re.is_match("MVI_9999.MP4"));
         let caps = re.captures("MVI_0123.mp4").unwrap();
         assert_eq!(caps.name("prefix").unwrap().as_str(), "MVI_0123");
-        assert!(re.is_match("MVI_00001.mp4"), "5 digits with .* slack must match");
-        assert!(!re.is_match("MVI_000.MP4"));    // 3 digits — no MVI_ + 4
-        assert!(!re.is_match("MVX_0001.mp4"));   // wrong prefix
+        assert!(
+            re.is_match("MVI_00001.mp4"),
+            "5 digits with .* slack must match"
+        );
+        assert!(!re.is_match("MVI_000.MP4")); // 3 digits — no MVI_ + 4
+        assert!(!re.is_match("MVX_0001.mp4")); // wrong prefix
     }
 
     #[test]
@@ -854,8 +862,8 @@ mod tests {
         assert!(re.is_match("GH12345.MP4"));
         let caps = re.captures("GH00001.mp4").unwrap();
         assert_eq!(caps.name("prefix").unwrap().as_str(), "GH00001");
-        assert!(!re.is_match("GH0001.mp4"));   // too few digits
-        assert!(!re.is_match("GH00001.mov"));  // wrong extension
+        assert!(!re.is_match("GH0001.mp4")); // too few digits
+        assert!(!re.is_match("GH00001.mov")); // wrong extension
     }
 
     #[test]
@@ -869,8 +877,11 @@ mod tests {
         assert_eq!(caps.name("prefix").unwrap().as_str(), "GOPR0042");
         let caps = re.captures("GP000042.mp4").unwrap();
         assert_eq!(caps.name("prefix").unwrap().as_str(), "GP000042");
-        assert!(re.is_match("GOPR00001.mp4"), "5 digits with .* slack must match");
-        assert!(!re.is_match("GP00001.mp4"));    // 5 digits — GP needs 6
+        assert!(
+            re.is_match("GOPR00001.mp4"),
+            "5 digits with .* slack must match"
+        );
+        assert!(!re.is_match("GP00001.mp4")); // 5 digits — GP needs 6
     }
 
     // ── match_files_all_patterns tests ──────────────────────────────────────

@@ -17,7 +17,10 @@ pub fn supported_containers() -> Vec<(&'static str, &'static str)> {
         ("mov", "QuickTime MOV — ProRes native, Resolve-friendly"),
         ("mkv", "Matroska MKV — versatile, all codecs"),
         ("mp4", "MPEG-4 MP4 — universal compatibility"),
-        ("mxf", "MXF (Material eXchange Format) — professional broadcast"),
+        (
+            "mxf",
+            "MXF (Material eXchange Format) — professional broadcast",
+        ),
     ]
 }
 
@@ -66,7 +69,8 @@ pub fn select_best_combination(caps: &FfmpegCapabilities) -> (String, String, St
         ("mp4", "h264", "aac"),
     ];
 
-    let codec_available = |codec: &str| !video_codecs::resolve_encoder_chain(codec, caps).is_empty();
+    let codec_available =
+        |codec: &str| !video_codecs::resolve_encoder_chain(codec, caps).is_empty();
 
     for &(container, codec, audio) in preferences {
         let ffmpeg_name = container_to_ffmpeg_format(container);
@@ -94,11 +98,7 @@ pub fn select_best_combination(caps: &FfmpegCapabilities) -> (String, String, St
                 if caps.available_encoders.contains(audio)
                     && container_supports_audio_encoder(container, audio)
                 {
-                    return (
-                        container.to_string(),
-                        codec.to_string(),
-                        audio.to_string(),
-                    );
+                    return (container.to_string(), codec.to_string(), audio.to_string());
                 }
             }
         }
@@ -174,8 +174,10 @@ pub fn apply_available_defaults(
     }
     let available = video_codecs::available_video_codecs(container, caps);
     let codecs: Vec<&str> = available.iter().map(|(k, _, _)| k.as_str()).collect();
-    let auds: Vec<&str> =
-        available_audio_encoders_for_container(container, caps).iter().map(|(k, _)| *k).collect();
+    let auds: Vec<&str> = available_audio_encoders_for_container(container, caps)
+        .iter()
+        .map(|(k, _)| *k)
+        .collect();
     if !codecs.contains(&video_encoder.as_str()) || !auds.contains(&audio_encoder.as_str()) {
         let (c, v, a) = select_best_combination(caps);
         *container = c;
@@ -186,9 +188,9 @@ pub fn apply_available_defaults(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use super::*;
     use crate::converter::test_fixtures::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn test_container_supports_audio_encoder_valid() {
@@ -215,23 +217,55 @@ mod tests {
 
     #[test]
     fn test_copy_mode_container_for_input() {
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.mp4")), "mp4");
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.m4v")), "mp4");
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/CLIP.MOV")), "mov");
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.mkv")), "mkv");
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.MXF")), "mxf");
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.mts")), "mp4");
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.M2TS")), "mp4");
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.ts")), "mp4");
-        assert_eq!(copy_mode_container_for_input(Path::new("/x/clip.avi")), "mkv");
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/clip.mp4")),
+            "mp4"
+        );
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/clip.m4v")),
+            "mp4"
+        );
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/CLIP.MOV")),
+            "mov"
+        );
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/clip.mkv")),
+            "mkv"
+        );
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/clip.MXF")),
+            "mxf"
+        );
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/clip.mts")),
+            "mp4"
+        );
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/clip.M2TS")),
+            "mp4"
+        );
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/clip.ts")),
+            "mp4"
+        );
+        assert_eq!(
+            copy_mode_container_for_input(Path::new("/x/clip.avi")),
+            "mkv"
+        );
     }
 
     #[test]
     fn test_select_best_combination_prefers_prores() {
         let mut caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
         caps.available_encoders = ["pcm_s24le", "libsvtav1", "libx264", "prores_ks"]
-            .into_iter().map(String::from).collect();
-        caps.available_formats = ["mov", "matroska", "mp4"].into_iter().map(String::from).collect();
+            .into_iter()
+            .map(String::from)
+            .collect();
+        caps.available_formats = ["mov", "matroska", "mp4"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let (container, codec, audio) = select_best_combination(&caps);
         assert_eq!(container, "mov");
         assert_eq!(codec, "prores");
@@ -241,9 +275,14 @@ mod tests {
     #[test]
     fn test_select_best_combination_prefers_h265() {
         let mut caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
-        caps.available_encoders =
-            ["pcm_s24le", "prores_ks", "libx264", "libx265"].into_iter().map(String::from).collect();
-        caps.available_formats = ["mov", "matroska", "mp4"].into_iter().map(String::from).collect();
+        caps.available_encoders = ["pcm_s24le", "prores_ks", "libx264", "libx265"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        caps.available_formats = ["mov", "matroska", "mp4"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let (container, codec, audio) = select_best_combination(&caps);
         assert_eq!(container, "mov");
         assert_eq!(codec, "h265");
@@ -281,8 +320,13 @@ mod tests {
     fn test_select_best_combination_falls_back_to_dnxhd() {
         let mut caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
         caps.available_encoders = ["pcm_s24le", "dnxhd", "libx264"]
-            .into_iter().map(String::from).collect();
-        caps.available_formats = ["mxf", "mov", "matroska"].into_iter().map(String::from).collect();
+            .into_iter()
+            .map(String::from)
+            .collect();
+        caps.available_formats = ["mxf", "mov", "matroska"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let (container, codec, audio) = select_best_combination(&caps);
         assert_eq!(container, "mxf");
         assert_eq!(codec, "dnxhd");
@@ -291,7 +335,11 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_replaces_invalid_container() {
-        let caps = make_caps(true, BTreeSet::from(["prores_ks", "libx264", "pcm_s24le"]), BTreeSet::from(["mov", "matroska"]));
+        let caps = make_caps(
+            true,
+            BTreeSet::from(["prores_ks", "libx264", "pcm_s24le"]),
+            BTreeSet::from(["mov", "matroska"]),
+        );
         let mut c = "mxf".to_string();
         let mut v = "h264".to_string();
         let mut a = "pcm_s24le".to_string();
@@ -303,7 +351,11 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_replaces_missing_encoder() {
-        let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
+        let caps = make_caps(
+            true,
+            BTreeSet::from(["libx264", "pcm_s24le"]),
+            BTreeSet::from(["matroska"]),
+        );
         let mut c = "mkv".to_string();
         let mut v = "av1".to_string();
         let mut a = "pcm_s24le".to_string();
@@ -315,7 +367,11 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_normalizes_legacy_encoder_names() {
-        let caps = make_caps(true, BTreeSet::from(["libx264", "pcm_s24le"]), BTreeSet::from(["matroska"]));
+        let caps = make_caps(
+            true,
+            BTreeSet::from(["libx264", "pcm_s24le"]),
+            BTreeSet::from(["matroska"]),
+        );
         let mut c = "mkv".to_string();
         let mut v = "libx264".to_string();
         let mut a = "pcm_s24le".to_string();
@@ -327,7 +383,11 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_keeps_valid_selection() {
-        let caps = make_caps(true, BTreeSet::from(["prores_ks", "pcm_s24le"]), BTreeSet::from(["mov"]));
+        let caps = make_caps(
+            true,
+            BTreeSet::from(["prores_ks", "pcm_s24le"]),
+            BTreeSet::from(["mov"]),
+        );
         let mut c = "mov".to_string();
         let mut v = "prores".to_string();
         let mut a = "pcm_s24le".to_string();

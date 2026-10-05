@@ -143,7 +143,11 @@ pub fn checkbox(
 
     let mut v = *shadow(state).value();
     let cb = egui::Checkbox::new(&mut v, label);
-    let response = if enabled { ui.add(cb) } else { ui.add_enabled(false, cb) };
+    let response = if enabled {
+        ui.add(cb)
+    } else {
+        ui.add_enabled(false, cb)
+    };
     let changed = response.changed();
     let focused = response.has_focus();
     shadow(state).set_focused(focused);
@@ -193,7 +197,13 @@ pub fn sync_channel_map(state: &mut AppState, expected_channels: usize) {
     let t = now();
     let seq = state.applied_seq;
     if state.sh.conv.channel_map.value().num_channels() != expected_channels {
-        state.sh.conv.channel_map.force_adopt(&gui_engine::converter::ChannelMap::identity(expected_channels));
+        state
+            .sh
+            .conv
+            .channel_map
+            .force_adopt(&gui_engine::converter::ChannelMap::identity(
+                expected_channels,
+            ));
     } else {
         state.sh.conv.channel_map.sync(&truth, seq, t);
     }

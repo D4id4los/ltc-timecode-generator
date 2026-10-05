@@ -126,9 +126,7 @@ pub fn query_ffmpeg_capabilities_timed() -> (FfmpegCapabilities, ProbeTimings) {
     timings.encoders_ms = elapsed_ms(start);
 
     let start = Instant::now();
-    let formats = run_ffmpeg_list(&["-formats", "-hide_banner"], |flags| {
-        flags.contains('E')
-    });
+    let formats = run_ffmpeg_list(&["-formats", "-hide_banner"], |flags| flags.contains('E'));
     timings.formats_ms = elapsed_ms(start);
 
     // Node count is a cheap directory read done for the measurement record;
@@ -172,27 +170,50 @@ pub fn query_ffmpeg_capabilities_timed() -> (FfmpegCapabilities, ProbeTimings) {
 
 /// Build the `key=value` report rows for `--probe-caps`. Pure — the builder
 /// is the unit-test surface; the CLI merely prints the rows.
-pub fn probe_caps_report(caps: &FfmpegCapabilities, timings: &ProbeTimings) -> Vec<(String, String)> {
+pub fn probe_caps_report(
+    caps: &FfmpegCapabilities,
+    timings: &ProbeTimings,
+) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = vec![
         ("has_ffmpeg".to_string(), caps.has_ffmpeg.to_string()),
-        ("encoder_count".to_string(), caps.available_encoders.len().to_string()),
-        ("format_count".to_string(), caps.available_formats.len().to_string()),
+        (
+            "encoder_count".to_string(),
+            caps.available_encoders.len().to_string(),
+        ),
+        (
+            "format_count".to_string(),
+            caps.available_formats.len().to_string(),
+        ),
         (
             "hw_vaapi_device".to_string(),
-            caps.hw.vaapi_device.clone().unwrap_or_else(|| "none".to_string()),
+            caps.hw
+                .vaapi_device
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
         ),
-        ("hw_vulkan".to_string(), caps.hw.vulkan_available.to_string()),
+        (
+            "hw_vulkan".to_string(),
+            caps.hw.vulkan_available.to_string(),
+        ),
         (
             "error".to_string(),
-            caps.error_message.clone().unwrap_or_else(|| "none".to_string()),
+            caps.error_message
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
         ),
         ("version_ms".to_string(), timings.version_ms.to_string()),
         ("encoders_ms".to_string(), timings.encoders_ms.to_string()),
         ("formats_ms".to_string(), timings.formats_ms.to_string()),
         ("discover_ms".to_string(), timings.discover_ms.to_string()),
-        ("discover_vaapi_nodes".to_string(), timings.discover_vaapi_nodes.to_string()),
+        (
+            "discover_vaapi_nodes".to_string(),
+            timings.discover_vaapi_nodes.to_string(),
+        ),
         ("validate_ms".to_string(), timings.validate_ms.to_string()),
-        ("validate_candidates".to_string(), timings.validate_candidates.len().to_string()),
+        (
+            "validate_candidates".to_string(),
+            timings.validate_candidates.len().to_string(),
+        ),
     ];
     for (name, ms) in &timings.validate_candidates {
         rows.push((format!("validate_{}", name), ms.to_string()));
@@ -201,7 +222,12 @@ pub fn probe_caps_report(caps: &FfmpegCapabilities, timings: &ProbeTimings) -> V
 }
 
 fn run_ffmpeg_list(args: &[&str], filter_fn: fn(&str) -> bool) -> BTreeSet<String> {
-    run_ffmpeg_list_with(|| no_window_command("ffmpeg"), PROBE_TIMEOUT, args, filter_fn)
+    run_ffmpeg_list_with(
+        || no_window_command("ffmpeg"),
+        PROBE_TIMEOUT,
+        args,
+        filter_fn,
+    )
 }
 
 /// Testable seam for the encoder/format list probe: builds the command via
@@ -215,9 +241,7 @@ pub(crate) fn run_ffmpeg_list_with(
     filter_fn: fn(&str) -> bool,
 ) -> BTreeSet<String> {
     let mut cmd = make_cmd();
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     match run_output_with_timeout(&mut cmd, timeout) {
         Ok(out) if out.status.success() => {
             parse_ffmpeg_list_output(&String::from_utf8_lossy(&out.stdout), filter_fn)
@@ -230,7 +254,11 @@ pub(crate) fn run_ffmpeg_list_with(
             BTreeSet::new()
         }
         Err(e) => {
-            log::warn!("ffmpeg list probe ({:?}) failed: {} — treating as no entries", args, e);
+            log::warn!(
+                "ffmpeg list probe ({:?}) failed: {} — treating as no entries",
+                args,
+                e
+            );
             BTreeSet::new()
         }
     }
@@ -257,7 +285,12 @@ pub(crate) fn parse_ffmpeg_list_output(
             }
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() >= 2 && filter_fn(parts[0]) {
-                Some(parts[1].split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+                Some(
+                    parts[1]
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect::<Vec<_>>(),
+                )
             } else {
                 None
             }
@@ -284,7 +317,9 @@ fn probe_version_with(cmd: &mut Command, timeout: Duration) -> FfmpegVersionProb
     match run_output_with_timeout(cmd, timeout) {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let first_line = stdout.lines().find(|l| !l.trim().is_empty())
+            let first_line = stdout
+                .lines()
+                .find(|l| !l.trim().is_empty())
                 .map(|l| l.trim().to_string())
                 .unwrap_or_default();
             FfmpegVersionProbe::Available(first_line)
@@ -377,7 +412,11 @@ mod tests {
             c
         };
         let probe = probe_version_with(&mut cmd, Duration::from_secs(5));
-        assert!(matches!(probe, FfmpegVersionProbe::NonZeroExit), "got {:?}", probe);
+        assert!(
+            matches!(probe, FfmpegVersionProbe::NonZeroExit),
+            "got {:?}",
+            probe
+        );
     }
 
     #[test]
@@ -395,7 +434,11 @@ mod tests {
     fn test_probe_version_success() {
         let mut cmd = Command::new(success_prog());
         let probe = probe_version_with(&mut cmd, Duration::from_secs(5));
-        assert!(matches!(probe, FfmpegVersionProbe::Available(_)), "got {:?}", probe);
+        assert!(
+            matches!(probe, FfmpegVersionProbe::Available(_)),
+            "got {:?}",
+            probe
+        );
     }
 
     // ── caps_for_version_failure ────────────────────────────────────────────
@@ -427,7 +470,10 @@ mod tests {
     // ── timed probe + probe_caps_report ─────────────────────────────────────
 
     fn ffmpeg_available() -> bool {
-        Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success())
+        Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     #[test]
@@ -438,7 +484,10 @@ mod tests {
         }
         let (timed_caps, _timings) = query_ffmpeg_capabilities_timed();
         let plain_caps = query_ffmpeg_capabilities();
-        assert_eq!(timed_caps, plain_caps, "the timed path must return identical capabilities");
+        assert_eq!(
+            timed_caps, plain_caps,
+            "the timed path must return identical capabilities"
+        );
     }
 
     #[test]
@@ -448,7 +497,10 @@ mod tests {
             available_encoders: BTreeSet::from(["libx264".to_string(), "h264_vaapi".to_string()]),
             available_formats: BTreeSet::from(["matroska".to_string()]),
             error_message: None,
-            hw: HwDeviceCapabilities { vaapi_device: Some("/dev/dri/renderD128".to_string()), vulkan_available: false },
+            hw: HwDeviceCapabilities {
+                vaapi_device: Some("/dev/dri/renderD128".to_string()),
+                vulkan_available: false,
+            },
             ffmpeg_version: None,
         };
         let timings = ProbeTimings {
@@ -462,15 +514,27 @@ mod tests {
         };
 
         let rows = probe_caps_report(&caps, &timings);
-        let get = |key: &str| {
-            rows.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-        };
+        let get = |key: &str| rows.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
 
-        assert_eq!(get("has_ffmpeg").as_deref(), Some("true"), "report must carry has_ffmpeg matching the caps");
+        assert_eq!(
+            get("has_ffmpeg").as_deref(),
+            Some("true"),
+            "report must carry has_ffmpeg matching the caps"
+        );
         assert_eq!(get("encoder_count").as_deref(), Some("2"));
         // one timing entry per stage field
-        for stage in ["version_ms", "encoders_ms", "formats_ms", "discover_ms", "validate_ms"] {
-            assert!(get(stage).is_some(), "report must carry a {} timing entry", stage);
+        for stage in [
+            "version_ms",
+            "encoders_ms",
+            "formats_ms",
+            "discover_ms",
+            "validate_ms",
+        ] {
+            assert!(
+                get(stage).is_some(),
+                "report must carry a {} timing entry",
+                stage
+            );
         }
         assert_eq!(get("discover_vaapi_nodes").as_deref(), Some("1"));
         // one per-candidate entry per candidate

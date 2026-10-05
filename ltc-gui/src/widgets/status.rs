@@ -51,16 +51,31 @@ fn render_wide_status(ui: &mut Ui, s: &AppStateSnapshot, colors: &ThemeColors) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = egui::Vec2::new(16.0, 0.0);
         let os = std::env::consts::OS.to_uppercase();
-        dot_label(ui, &format!("OS: {}", os), Color32::from_rgb(0x22, 0xC5, 0x5E), colors);
+        dot_label(
+            ui,
+            &format!("OS: {}", os),
+            Color32::from_rgb(0x22, 0xC5, 0x5E),
+            colors,
+        );
         let dev_text = audio_out_text(s.devices.len());
         dot_label(ui, &dev_text, Color32::from_rgb(0x22, 0xC5, 0x5E), colors);
         let (core_text, core_color) = core_status(s.is_playing, true);
         dot_label(ui, core_text, core_color, colors);
         if !s.sample_format_name.is_empty() {
-            dot_label(ui, &format!("SAMPLE: {}", s.sample_format_name.to_uppercase()), Color32::from_rgb(0x22, 0xC5, 0x5E), colors);
+            dot_label(
+                ui,
+                &format!("SAMPLE: {}", s.sample_format_name.to_uppercase()),
+                Color32::from_rgb(0x22, 0xC5, 0x5E),
+                colors,
+            );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("POWER: AC").font(FontId::monospace(10.0)).color(colors.text_muted).strong());
+            ui.label(
+                RichText::new("POWER: AC")
+                    .font(FontId::monospace(10.0))
+                    .color(colors.text_muted)
+                    .strong(),
+            );
         });
     });
 }
@@ -75,11 +90,21 @@ fn render_narrow_status(ui: &mut Ui, s: &AppStateSnapshot, colors: &ThemeColors)
             let (core_text, core_color) = core_status(s.is_playing, false);
             dot_label(ui, core_text, core_color, colors);
             if !s.sample_format_name.is_empty() {
-                dot_label(ui, &s.sample_format_name.to_uppercase(), Color32::from_rgb(0x22, 0xC5, 0x5E), colors);
+                dot_label(
+                    ui,
+                    &s.sample_format_name.to_uppercase(),
+                    Color32::from_rgb(0x22, 0xC5, 0x5E),
+                    colors,
+                );
             }
         });
         ui.add_space(4.0);
-        ui.label(RichText::new("POWER: AC").font(FontId::monospace(9.5)).color(colors.text_muted).strong());
+        ui.label(
+            RichText::new("POWER: AC")
+                .font(FontId::monospace(9.5))
+                .color(colors.text_muted)
+                .strong(),
+        );
     });
 }
 
@@ -88,7 +113,12 @@ fn dot_label(ui: &mut Ui, text: &str, dot_color: Color32, colors: &crate::theme:
         ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 0.0);
         let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(6.0, 6.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 2.5, dot_color);
-        ui.label(RichText::new(text).font(FontId::monospace(10.0)).color(colors.text_title).strong());
+        ui.label(
+            RichText::new(text)
+                .font(FontId::monospace(10.0))
+                .color(colors.text_title)
+                .strong(),
+        );
     });
 }
 
@@ -132,7 +162,10 @@ mod tests {
         // test-lint: allow(text-pin): formatter output is the contract
         let (wide_run, _) = core_status(true, true);
         let (narrow_run, _) = core_status(true, false);
-        assert!(wide_run.contains(narrow_run), "wide label must extend the narrow one");
+        assert!(
+            wide_run.contains(narrow_run),
+            "wide label must extend the narrow one"
+        );
         let (wide_idle, _) = core_status(false, true);
         let (narrow_idle, _) = core_status(false, false);
         assert!(wide_idle.contains(narrow_idle));
@@ -149,6 +182,9 @@ mod tests {
     fn status_layouts_agree_on_playing_state_from_snapshot() {
         // The wide/narrow split must not change the core-status decision.
         let s = snapshot(true, 2);
-        assert_eq!(core_status(s.is_playing, true).1, core_status(s.is_playing, false).1);
+        assert_eq!(
+            core_status(s.is_playing, true).1,
+            core_status(s.is_playing, false).1
+        );
     }
 }

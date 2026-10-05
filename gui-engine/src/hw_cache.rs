@@ -52,9 +52,10 @@ pub fn cache_key_for(caps: &FfmpegCapabilities) -> Option<CacheKey> {
 
 fn is_hw_encoder(name: &str) -> bool {
     VIDEO_CODECS.iter().any(|codec| {
-        codec.candidates.iter().any(|c| {
-            c.class == EncoderClass::Hardware && c.name == name
-        })
+        codec
+            .candidates
+            .iter()
+            .any(|c| c.class == EncoderClass::Hardware && c.name == name)
     })
 }
 
@@ -105,14 +106,15 @@ pub fn validate_hw_encoders_cached_with(
     let mut passed: BTreeSet<String> = BTreeSet::new();
     let mut probed: BTreeSet<String> = BTreeSet::new();
     {
-        let mut recording_probe = |name: &str, hw_frames: Option<HwFramePath>, vaapi_device: Option<&str>| {
-            probed.insert(name.to_string());
-            let ok = probe(name, hw_frames, vaapi_device);
-            if ok {
-                passed.insert(name.to_string());
-            }
-            ok
-        };
+        let mut recording_probe =
+            |name: &str, hw_frames: Option<HwFramePath>, vaapi_device: Option<&str>| {
+                probed.insert(name.to_string());
+                let ok = probe(name, hw_frames, vaapi_device);
+                if ok {
+                    passed.insert(name.to_string());
+                }
+                ok
+            };
         crate::hw_device::validate_hw_encoders_with(
             &mut caps.available_encoders,
             &caps.hw,
@@ -121,7 +123,10 @@ pub fn validate_hw_encoders_cached_with(
     }
 
     if let Some(key) = key {
-        let mut new_cache = HwValidationCache { key: key.clone(), passed: passed.clone() };
+        let mut new_cache = HwValidationCache {
+            key: key.clone(),
+            passed: passed.clone(),
+        };
         if let Some(prev) = load() {
             if prev.key == key {
                 // Union of previously-passed (still key-valid) and
@@ -156,7 +161,11 @@ pub fn load_hw_cache(cache_dir: &Path) -> Option<HwValidationCache> {
     match serde_json::from_str(&content) {
         Ok(cache) => Some(cache),
         Err(e) => {
-            log::debug!("hw encoder cache at {} is corrupt, treating as empty: {}", path.display(), e);
+            log::debug!(
+                "hw encoder cache at {} is corrupt, treating as empty: {}",
+                path.display(),
+                e
+            );
             None
         }
     }
@@ -212,7 +221,11 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    fn caps_with(encoders: &[&str], version: Option<&str>, vaapi: Option<&str>) -> FfmpegCapabilities {
+    fn caps_with(
+        encoders: &[&str],
+        version: Option<&str>,
+        vaapi: Option<&str>,
+    ) -> FfmpegCapabilities {
         FfmpegCapabilities {
             has_ffmpeg: true,
             available_encoders: encoders.iter().map(|s| s.to_string()).collect(),
@@ -241,22 +254,39 @@ mod tests {
         // Matching-key cache vouches hevc_vaapi: it must survive stage-1
         // publication while other HW encoders are withheld — without any
         // probe call (pure function, no probe parameter).
-        let full = caps_with(&["libx264", "hevc_vaapi", "h264_vaapi"], Some("v1"), Some("/dev/dri/renderD128"));
+        let full = caps_with(
+            &["libx264", "hevc_vaapi", "h264_vaapi"],
+            Some("v1"),
+            Some("/dev/dri/renderD128"),
+        );
         let key = cache_key_for(&full).unwrap();
         let cache = HwValidationCache {
             key,
             passed: BTreeSet::from(["hevc_vaapi".to_string()]),
         };
         let published = publish_stage1_caps(&full, Some(&cache));
-        assert!(published.available_encoders.contains("hevc_vaapi"), "cache-vouched encoder must be published at stage 1");
-        assert!(!published.available_encoders.contains("h264_vaapi"), "non-vouched HW encoder must be withheld");
-        assert!(published.available_encoders.contains("libx264"), "non-HW encoders pass through");
+        assert!(
+            published.available_encoders.contains("hevc_vaapi"),
+            "cache-vouched encoder must be published at stage 1"
+        );
+        assert!(
+            !published.available_encoders.contains("h264_vaapi"),
+            "non-vouched HW encoder must be withheld"
+        );
+        assert!(
+            published.available_encoders.contains("libx264"),
+            "non-HW encoders pass through"
+        );
     }
 
     #[test]
     fn test_key_change_bypasses_cache() {
         // A different ffmpeg version must vouch nothing.
-        let full = caps_with(&["libx264", "hevc_vaapi"], Some("v2"), Some("/dev/dri/renderD128"));
+        let full = caps_with(
+            &["libx264", "hevc_vaapi"],
+            Some("v2"),
+            Some("/dev/dri/renderD128"),
+        );
         let key = CacheKey {
             ffmpeg_version: "v1".to_string(),
             encoders: full.available_encoders.clone(),
@@ -267,7 +297,10 @@ mod tests {
             passed: BTreeSet::from(["hevc_vaapi".to_string()]),
         };
         let published = publish_stage1_caps(&full, Some(&cache));
-        assert!(!published.available_encoders.contains("hevc_vaapi"), "key mismatch must bypass the cache");
+        assert!(
+            !published.available_encoders.contains("hevc_vaapi"),
+            "key mismatch must bypass the cache"
+        );
     }
 
     #[test]
@@ -283,7 +316,11 @@ mod tests {
     fn test_reconcile_prunes_stale_pass() {
         // Cache vouches hevc_vaapi, but the probe says it fails: it must be
         // removed from the reconciled caps AND from the saved cache.
-        let caps = caps_with(&["libx264", "hevc_vaapi", "h264_vaapi"], Some("v1"), Some("/dev/dri/renderD128"));
+        let caps = caps_with(
+            &["libx264", "hevc_vaapi", "h264_vaapi"],
+            Some("v1"),
+            Some("/dev/dri/renderD128"),
+        );
         let key = cache_key_for(&caps).unwrap();
         let stale = HwValidationCache {
             key: key.clone(),
@@ -296,10 +333,19 @@ mod tests {
             &mut || Some(stale.clone()),
             &mut |c| saved = Some(c.clone()),
         );
-        assert!(!reconciled.available_encoders.contains("hevc_vaapi"), "failing vouched encoder must be pruned from caps");
-        assert!(reconciled.available_encoders.contains("h264_vaapi"), "passing encoder must stay");
+        assert!(
+            !reconciled.available_encoders.contains("hevc_vaapi"),
+            "failing vouched encoder must be pruned from caps"
+        );
+        assert!(
+            reconciled.available_encoders.contains("h264_vaapi"),
+            "passing encoder must stay"
+        );
         let saved = saved.expect("validation must write back the cache");
-        assert!(!saved.passed.contains("hevc_vaapi"), "failing vouched encoder must be pruned from the saved cache");
+        assert!(
+            !saved.passed.contains("hevc_vaapi"),
+            "failing vouched encoder must be pruned from the saved cache"
+        );
         assert!(saved.passed.contains("h264_vaapi"));
         assert_eq!(saved.key, key);
     }
@@ -308,7 +354,11 @@ mod tests {
     fn test_failure_not_cached() {
         // No prior cache; a failing candidate must end up in neither the
         // caps nor the saved cache.
-        let caps = caps_with(&["libx264", "h264_vaapi"], Some("v1"), Some("/dev/dri/renderD128"));
+        let caps = caps_with(
+            &["libx264", "h264_vaapi"],
+            Some("v1"),
+            Some("/dev/dri/renderD128"),
+        );
         let mut saved: Option<HwValidationCache> = None;
         let reconciled = validate_hw_encoders_cached_with(
             caps,
@@ -318,8 +368,14 @@ mod tests {
         );
         assert!(!reconciled.available_encoders.contains("h264_vaapi"));
         let saved = saved.expect("validation must write back the cache");
-        assert!(!saved.passed.contains("h264_vaapi"), "failures must never be cached");
-        assert!(!saved.passed.contains("libx264"), "non-HW encoders are not cache entries");
+        assert!(
+            !saved.passed.contains("h264_vaapi"),
+            "failures must never be cached"
+        );
+        assert!(
+            !saved.passed.contains("libx264"),
+            "non-HW encoders are not cache entries"
+        );
         assert!(saved.passed.is_empty());
     }
 
@@ -327,26 +383,46 @@ mod tests {
     fn test_corrupt_cache_file_treated_as_empty() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(cache_path(dir.path()), "{ not json !!!").unwrap();
-        assert!(load_hw_cache(dir.path()).is_none(), "corrupt cache file must load as empty");
+        assert!(
+            load_hw_cache(dir.path()).is_none(),
+            "corrupt cache file must load as empty"
+        );
         // And reconciliation with a corrupt cache simply runs full validation.
-        let caps = caps_with(&["libx264", "h264_vaapi"], Some("v1"), Some("/dev/dri/renderD128"));
+        let caps = caps_with(
+            &["libx264", "h264_vaapi"],
+            Some("v1"),
+            Some("/dev/dri/renderD128"),
+        );
         let mut probe_calls = 0usize;
         let reconciled = validate_hw_encoders_cached_with(
             caps,
-            &mut |_n, _hw, _d| { probe_calls += 1; true },
+            &mut |_n, _hw, _d| {
+                probe_calls += 1;
+                true
+            },
             &mut || load_hw_cache(dir.path()),
             &mut |c| save_hw_cache(dir.path(), c),
         );
-        assert_eq!(probe_calls, 1, "full validation must run on a corrupt cache");
+        assert_eq!(
+            probe_calls, 1,
+            "full validation must run on a corrupt cache"
+        );
         assert!(reconciled.available_encoders.contains("h264_vaapi"));
-        assert!(load_hw_cache(dir.path()).is_some(), "write-back must have replaced the corrupt file");
+        assert!(
+            load_hw_cache(dir.path()).is_some(),
+            "write-back must have replaced the corrupt file"
+        );
     }
 
     #[test]
     fn test_writeback_merges_previous_passes() {
         // Previously passed X (same key); this run X passes again and Y is
         // newly observed: the write-back must be the union {X, Y}.
-        let caps = caps_with(&["libx264", "h264_vaapi", "hevc_vaapi"], Some("v1"), Some("/dev/dri/renderD128"));
+        let caps = caps_with(
+            &["libx264", "h264_vaapi", "hevc_vaapi"],
+            Some("v1"),
+            Some("/dev/dri/renderD128"),
+        );
         let key = cache_key_for(&caps).unwrap();
         let prev = HwValidationCache {
             key: key.clone(),
@@ -356,12 +432,21 @@ mod tests {
         let _ = validate_hw_encoders_cached_with(
             caps,
             &mut probe_always_ok, // both HW candidates pass this run
-            &mut { let p = prev.clone(); move || Some(p.clone()) },
+            &mut {
+                let p = prev.clone();
+                move || Some(p.clone())
+            },
             &mut |c| saved = Some(c.clone()),
         );
         let saved = saved.expect("validation must write back the cache");
-        assert!(saved.passed.contains("h264_vaapi"), "previous pass must survive the union");
-        assert!(saved.passed.contains("hevc_vaapi"), "new pass must be merged");
+        assert!(
+            saved.passed.contains("h264_vaapi"),
+            "previous pass must survive the union"
+        );
+        assert!(
+            saved.passed.contains("hevc_vaapi"),
+            "new pass must be merged"
+        );
         assert_eq!(saved.key, key);
     }
 
@@ -369,18 +454,23 @@ mod tests {
     fn test_missing_version_never_vouches_or_writes_back() {
         // Test fakes carry no ffmpeg version: no cache vouch at stage 1 and
         // no write-back after validation.
-        let full = caps_with(&["libx264", "hevc_vaapi"], None, Some("/dev/dri/renderD128"));
+        let full = caps_with(
+            &["libx264", "hevc_vaapi"],
+            None,
+            Some("/dev/dri/renderD128"),
+        );
         assert!(cache_key_for(&full).is_none());
         let published = publish_stage1_caps(&full, None);
         assert!(!published.available_encoders.contains("hevc_vaapi"));
 
         let mut save_calls = 0usize;
-        let _ = validate_hw_encoders_cached_with(
-            full,
-            &mut probe_always_ok,
-            &mut || None,
-            &mut |_c| save_calls += 1,
+        let _ =
+            validate_hw_encoders_cached_with(full, &mut probe_always_ok, &mut || None, &mut |_c| {
+                save_calls += 1
+            });
+        assert_eq!(
+            save_calls, 0,
+            "a versionless caps must not write back a cache"
         );
-        assert_eq!(save_calls, 0, "a versionless caps must not write back a cache");
     }
 }

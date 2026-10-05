@@ -234,7 +234,12 @@ pub fn build_test_encode_args(
 
 /// Test-encode a single hardware encoder: run a 1-frame null encode and
 /// return `true` if it succeeds within the timeout.
-pub fn test_encode(ffmpeg: &str, encoder: &str, hw_frames: Option<HwFramePath>, vaapi_device: Option<&str>) -> bool {
+pub fn test_encode(
+    ffmpeg: &str,
+    encoder: &str,
+    hw_frames: Option<HwFramePath>,
+    vaapi_device: Option<&str>,
+) -> bool {
     let args = build_test_encode_args(ffmpeg, encoder, hw_frames, vaapi_device);
     let mut child = match no_window_command(ffmpeg)
         .args(&args)
@@ -390,13 +395,21 @@ mod tests {
             assert!(args.iter().any(|a| a.starts_with("vaapi=")));
             true
         };
-        assert!(probe_vaapi_with("ffmpeg", Path::new("/dev/dri/renderD128"), &mut runner));
+        assert!(probe_vaapi_with(
+            "ffmpeg",
+            Path::new("/dev/dri/renderD128"),
+            &mut runner
+        ));
     }
 
     #[test]
     fn test_probe_vaapi_with_failure() {
         let mut runner = |_: &[String]| false;
-        assert!(!probe_vaapi_with("ffmpeg", Path::new("/dev/dri/renderD128"), &mut runner));
+        assert!(!probe_vaapi_with(
+            "ffmpeg",
+            Path::new("/dev/dri/renderD128"),
+            &mut runner
+        ));
     }
 
     #[test]

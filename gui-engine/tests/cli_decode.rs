@@ -103,7 +103,8 @@ fn process_cli_result_output_to_file_writes_wav() {
         c.output_to_file = Some(path.to_string_lossy().to_string());
         c.duration = Some(1.0);
         c.fps = 25.0;
-    })).expect("generate dispatch should succeed");
+    }))
+    .expect("generate dispatch should succeed");
 
     assert!(matches!(outcome, CliOutcome::Done));
     let file = std::fs::File::open(&path).expect("WAV file exists");
@@ -132,7 +133,8 @@ fn process_cli_result_decode_wav_returns_detection_result() {
     let outcome = process_cli_result(cli_with(|c| {
         c.decode = Some(path.to_string_lossy().to_string());
         c.single_pass = true;
-    })).expect("WAV decode dispatch should succeed");
+    }))
+    .expect("WAV decode dispatch should succeed");
 
     assert!(matches!(outcome, CliOutcome::Done));
     // The result itself was printed; decode correctness is covered by the
@@ -160,10 +162,23 @@ fn process_cli_result_decode_nonexistent_fails_without_exit() {
 fn generate_test_video(path: &Path) {
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=25",
-            "-f", "lavfi", "-i", "sine=frequency=1000:duration=1",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
-            "-shortest", path.to_str().unwrap(),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=320x240:rate=25",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            path.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -185,7 +200,8 @@ fn process_cli_result_decode_video_returns_detection_result() {
 
     let outcome = process_cli_result(cli_with(|c| {
         c.decode = Some(video.to_string_lossy().to_string());
-    })).expect("video decode dispatch should succeed");
+    }))
+    .expect("video decode dispatch should succeed");
 
     assert!(matches!(outcome, CliOutcome::Done));
 }

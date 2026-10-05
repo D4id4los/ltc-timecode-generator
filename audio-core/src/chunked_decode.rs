@@ -6,18 +6,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::LtcDecodeError;
 use crate::decoder::LtcDecoder;
 use crate::ltc_decoder::{
-    apply_coherent_first_timecode, compute_ltc_quality,
-    CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD, ChunkSummary, FrameTimecode,
-    LtcDecodeStatus, LtcDetectionResult,
+    apply_coherent_first_timecode, compute_ltc_quality, ChunkSummary, FrameTimecode,
+    LtcDecodeStatus, LtcDetectionResult, CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD,
 };
 use crate::types::{DecodeConfig, DecodeProgress};
 use crate::wav_chunk_reader::WavChunkReader;
+use crate::LtcDecodeError;
 
 /// Single home of the chunk-size math: returns `(chunk_mono_samples, overlap_samples)`.
-fn chunk_geometry(config: &DecodeConfig, bytes_per_mono_sample: u64, sample_rate: u32) -> (usize, usize) {
+fn chunk_geometry(
+    config: &DecodeConfig,
+    bytes_per_mono_sample: u64,
+    sample_rate: u32,
+) -> (usize, usize) {
     let overlap_samples = (config.overlap_seconds * sample_rate as f64) as usize;
     let chunk_mono = ((config.chunk_size_bytes / bytes_per_mono_sample.max(1)) as usize)
         .max(overlap_samples * 2);
@@ -28,7 +31,11 @@ fn chunk_geometry(config: &DecodeConfig, bytes_per_mono_sample: u64, sample_rate
 /// `[start, end)` mono-sample ranges. `count_chunks` is
 /// `plan_chunk_boundaries(..).len()` — the prediction can no longer drift
 /// from what the decode loop actually produces.
-fn plan_chunk_boundaries(total_mono: usize, chunk_mono: usize, overlap: usize) -> Vec<(usize, usize)> {
+fn plan_chunk_boundaries(
+    total_mono: usize,
+    chunk_mono: usize,
+    overlap: usize,
+) -> Vec<(usize, usize)> {
     let mut chunks: Vec<(usize, usize)> = Vec::new();
     let mut pos = 0usize;
     while pos < total_mono {
@@ -122,11 +129,14 @@ pub fn decode_ltc_chunked(
     config: DecodeConfig,
     progress: &DecodeProgress,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
-    let (mut chunk_reader, overall_start) = WavChunkReader::open(path).map_err(LtcDecodeError::Failed)?;
+    let (mut chunk_reader, overall_start) =
+        WavChunkReader::open(path).map_err(LtcDecodeError::Failed)?;
     let mut plan = plan_chunks(&chunk_reader, &config);
 
-    debug!("decode_ltc_chunked: {} samples @ {} Hz, config chunk={} bytes, overlap={}s",
-        plan.total_mono, plan.sample_rate, config.chunk_size_bytes, config.overlap_seconds);
+    debug!(
+        "decode_ltc_chunked: {} samples @ {} Hz, config chunk={} bytes, overlap={}s",
+        plan.total_mono, plan.sample_rate, config.chunk_size_bytes, config.overlap_seconds
+    );
 
     if plan.total_mono == 0 {
         warn!("decode_ltc_chunked: WAV file contains no samples");
@@ -136,15 +146,22 @@ pub fn decode_ltc_chunked(
     // Pick the decode channel once per file, before chunk planning, so every
     // chunk decodes the same channel: if channel 0 is (near-)silent, the
     // channel carrying signal is decoded instead.
-    let peaks = chunk_reader.scan_channel_peaks().map_err(LtcDecodeError::Failed)?;
+    let peaks = chunk_reader
+        .scan_channel_peaks()
+        .map_err(LtcDecodeError::Failed)?;
     plan.active_channel = crate::ltc_decoder::pick_active_channel(&peaks);
     if plan.active_channel != 0 {
-        info!("decode_ltc_chunked: channel 0 is silent, decoding channel {}", plan.active_channel);
+        info!(
+            "decode_ltc_chunked: channel 0 is silent, decoding channel {}",
+            plan.active_channel
+        );
     }
 
     let num_chunks = plan.boundaries.len();
-    info!("decode_ltc_chunked: split into {} chunks, overlap={}s",
-        num_chunks, plan.overlap_seconds);
+    info!(
+        "decode_ltc_chunked: split into {} chunks, overlap={}s",
+        num_chunks, plan.overlap_seconds
+    );
 
     if num_chunks == 0 {
         return Ok(LtcDetectionResult::error("No audio data to decode"));
@@ -180,7 +197,11 @@ pub fn decode_ltc_chunked(
 
     // Stringification of the typed merge carrier happens exactly once, here,
     // with byte-identical output to the former inline `format!` calls.
-    let mut details: Vec<String> = merged.chunk_details.iter().map(render_chunk_detail).collect();
+    let mut details: Vec<String> = merged
+        .chunk_details
+        .iter()
+        .map(render_chunk_detail)
+        .collect();
     details.push(merged.merge_summary);
     let chunk_summaries: Vec<ChunkSummary> =
         merged.chunk_details.iter().map(chunk_summary_of).collect();
@@ -211,8 +232,13 @@ pub fn decode_ltc_chunked(
     let processing_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
     result.processing_time_ms = processing_time_ms;
 
-    info!("decode_ltc_chunked complete: {} valid / {} possible ({:.1}%) in {:.1}ms",
-        result.valid_frames, result.total_possible_frames, result.avg_confidence * 100.0, processing_time_ms);
+    info!(
+        "decode_ltc_chunked complete: {} valid / {} possible ({:.1}%) in {:.1}ms",
+        result.valid_frames,
+        result.total_possible_frames,
+        result.avg_confidence * 100.0,
+        processing_time_ms
+    );
 
     Ok(result)
 }
@@ -224,11 +250,18 @@ struct ChunkResult {
 }
 
 /// Decode chunks strictly in order, honoring cancellation between chunks.
-fn run_sequential(job: &ChunkJob<'_>, plan: &ChunkPlan, progress: &DecodeProgress) -> Vec<ChunkResult> {
+fn run_sequential(
+    job: &ChunkJob<'_>,
+    plan: &ChunkPlan,
+    progress: &DecodeProgress,
+) -> Vec<ChunkResult> {
     let mut results = Vec::with_capacity(plan.boundaries.len());
     for (chunk_idx, &(start_sample, end_sample)) in plan.boundaries.iter().enumerate() {
         if job.cancel_flag.load(Ordering::Relaxed) {
-            info!("decode_ltc_chunked: cancel requested, stopping at chunk {}", chunk_idx);
+            info!(
+                "decode_ltc_chunked: cancel requested, stopping at chunk {}",
+                chunk_idx
+            );
             break;
         }
         let r = decode_one_chunk(job, chunk_idx, start_sample, end_sample);
@@ -264,11 +297,17 @@ fn run_parallel(
             let progress_completed = progress_completed.clone();
             s.spawn(move || loop {
                 let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
-                if idx >= num_chunks { break; }
-                if cancel_flag.load(Ordering::Relaxed) { break; }
+                if idx >= num_chunks {
+                    break;
+                }
+                if cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 let (start_sample, end_sample) = chunks[idx];
                 let result = decode_one_chunk(job, idx, start_sample, end_sample);
-                if cancel_flag.load(Ordering::Relaxed) { break; }
+                if cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 progress_completed.fetch_add(1, Ordering::Relaxed);
                 *results[idx].lock().unwrap() = Some(result);
             });
@@ -308,9 +347,19 @@ enum ChunkDetail {
 /// Single home of the `Chunk N: ...` details-line rendering.
 fn render_chunk_detail(detail: &ChunkDetail) -> String {
     match detail {
-        ChunkDetail::Ok { chunk_idx, valid_frames, total_possible_frames, avg_confidence } => {
-            format!("Chunk {}: {} valid / {} possible (conf {:.1}%)",
-                chunk_idx, valid_frames, total_possible_frames, avg_confidence * 100.0)
+        ChunkDetail::Ok {
+            chunk_idx,
+            valid_frames,
+            total_possible_frames,
+            avg_confidence,
+        } => {
+            format!(
+                "Chunk {}: {} valid / {} possible (conf {:.1}%)",
+                chunk_idx,
+                valid_frames,
+                total_possible_frames,
+                avg_confidence * 100.0
+            )
         }
         ChunkDetail::Err { chunk_idx, source } => {
             format!("Chunk {}: error - {}", chunk_idx, source)
@@ -321,15 +370,18 @@ fn render_chunk_detail(detail: &ChunkDetail) -> String {
 /// Project a typed chunk detail onto the public [`ChunkSummary`] shape.
 fn chunk_summary_of(detail: &ChunkDetail) -> ChunkSummary {
     match detail {
-        ChunkDetail::Ok { chunk_idx, valid_frames, total_possible_frames, avg_confidence } => {
-            ChunkSummary {
-                chunk_idx: *chunk_idx,
-                valid_frames: *valid_frames,
-                total_possible_frames: *total_possible_frames,
-                avg_confidence: *avg_confidence,
-                error: None,
-            }
-        }
+        ChunkDetail::Ok {
+            chunk_idx,
+            valid_frames,
+            total_possible_frames,
+            avg_confidence,
+        } => ChunkSummary {
+            chunk_idx: *chunk_idx,
+            valid_frames: *valid_frames,
+            total_possible_frames: *total_possible_frames,
+            avg_confidence: *avg_confidence,
+            error: None,
+        },
         ChunkDetail::Err { chunk_idx, source } => ChunkSummary {
             chunk_idx: *chunk_idx,
             valid_frames: 0,
@@ -372,7 +424,11 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
                     total_possible_frames: r.total_possible_frames,
                     avg_confidence: r.avg_confidence,
                 });
-                let chunk_start_sample = plan.boundaries.get(cr.chunk_idx).map(|&(s, _)| s).unwrap_or(0);
+                let chunk_start_sample = plan
+                    .boundaries
+                    .get(cr.chunk_idx)
+                    .map(|&(s, _)| s)
+                    .unwrap_or(0);
                 let chunk_start_secs = chunk_start_sample as f64 / sample_rate as f64;
                 let chunk_first_secs = if r.first_ltc_timecode_secs > 0.0 {
                     r.first_ltc_timecode_secs + chunk_start_secs
@@ -389,7 +445,10 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
                 }
             }
             Err(e) => {
-                chunk_details.push(ChunkDetail::Err { chunk_idx: cr.chunk_idx, source: e.clone() });
+                chunk_details.push(ChunkDetail::Err {
+                    chunk_idx: cr.chunk_idx,
+                    source: e.clone(),
+                });
             }
         }
     }
@@ -441,14 +500,20 @@ fn merge_results(chunk_results: &[ChunkResult], plan: &ChunkPlan, fps: f64) -> M
 
     let merge_summary = format!(
         "Chunked decode: {} chunks, {} valid / {} possible after merge",
-        plan.boundaries.len(), valid_frames, true_total_possible,
+        plan.boundaries.len(),
+        valid_frames,
+        true_total_possible,
     );
 
     MergedDecode {
         timecodes: deduped,
         chunk_details,
         merge_summary,
-        first_ltc_timecode_secs: if first_tc_secs < f64::MAX { first_tc_secs } else { 0.0 },
+        first_ltc_timecode_secs: if first_tc_secs < f64::MAX {
+            first_tc_secs
+        } else {
+            0.0
+        },
         avg_confidence,
         total_possible: true_total_possible,
         valid_frames,
@@ -469,19 +534,32 @@ struct ChunkJob<'a> {
 }
 
 /// Decode a single chunk of a WAV file in a worker thread.
-fn decode_one_chunk(job: &ChunkJob<'_>, chunk_idx: usize, start_sample: usize, end_sample: usize) -> ChunkResult {
+fn decode_one_chunk(
+    job: &ChunkJob<'_>,
+    chunk_idx: usize,
+    start_sample: usize,
+    end_sample: usize,
+) -> ChunkResult {
     let num_samples = end_sample - start_sample;
 
     if job.cancel_flag.load(Ordering::Relaxed) {
-        return ChunkResult { chunk_idx, result: Err(LtcDecodeError::Cancelled) };
+        return ChunkResult {
+            chunk_idx,
+            result: Err(LtcDecodeError::Cancelled),
+        };
     }
 
     let mut local_reader = match WavChunkReader::open_with_channel(job.path, job.active_channel) {
         Ok((r, _)) => r,
-        Err(e) => return ChunkResult {
-            chunk_idx,
-            result: Err(LtcDecodeError::Failed(format!("Failed to open file for chunk {}: {}", chunk_idx, e))),
-        },
+        Err(e) => {
+            return ChunkResult {
+                chunk_idx,
+                result: Err(LtcDecodeError::Failed(format!(
+                    "Failed to open file for chunk {}: {}",
+                    chunk_idx, e
+                ))),
+            }
+        }
     };
 
     let chunk_start = Instant::now();
@@ -498,7 +576,12 @@ fn decode_one_chunk(job: &ChunkJob<'_>, chunk_idx: usize, start_sample: usize, e
         cancel: job.cancel_flag,
     });
     let elapsed = chunk_start.elapsed();
-    debug!("Chunk {} decoded ({}): {:.1}ms", chunk_idx + 1, job.decoder.name(), elapsed.as_secs_f64() * 1000.0);
+    debug!(
+        "Chunk {} decoded ({}): {:.1}ms",
+        chunk_idx + 1,
+        job.decoder.name(),
+        elapsed.as_secs_f64() * 1000.0
+    );
     ChunkResult { chunk_idx, result }
 }
 
@@ -544,13 +627,16 @@ mod tests {
         // chunk_mono=50_000, overlap=14_400. Includes the former
         // count_chunks shortcut window (50_000, 64_400] where the old
         // prediction (1) disagreed with the decode loop (2).
-        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 200_000,
+            overlap_seconds: 0.3,
+        };
         let (chunk_mono, overlap) = chunk_geometry(&config, 4, 48000);
         assert_eq!(chunk_mono, 50_000);
         assert_eq!(overlap, 14_400);
         for &total in &[
-            0usize, 1, 49_999, 50_000, 50_001, 60_000, 64_399, 64_400, 64_401,
-            100_000, 150_000, 200_000, 203_600, 250_000, 300_000,
+            0usize, 1, 49_999, 50_000, 50_001, 60_000, 64_399, 64_400, 64_401, 100_000, 150_000,
+            200_000, 203_600, 250_000, 300_000,
         ] {
             let planned = plan_chunk_boundaries(total, chunk_mono, overlap).len();
             let counted = count_chunks(total, 48000, 2, 16, &config);
@@ -562,7 +648,10 @@ mod tests {
     fn test_count_chunks_window_predicts_two_chunks() {
         // Regression pin for the removed shortcut: chunk_mono < total <=
         // chunk_mono + overlap must predict 2 chunks (what decode does).
-        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 200_000,
+            overlap_seconds: 0.3,
+        };
         assert_eq!(count_chunks(60_000, 48000, 2, 16, &config), 2);
     }
 
@@ -582,7 +671,12 @@ mod tests {
     fn ftc(index: u32, secs: f64) -> FrameTimecode {
         FrameTimecode {
             frame_index: index,
-            timecode: Timecode { hours: 0, minutes: 0, seconds: 0, frames: index },
+            timecode: Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: index,
+            },
             timecode_secs: secs,
         }
     }
@@ -613,11 +707,17 @@ mod tests {
         // Chunk starting at 5.0 s (240 000 mono samples @48 kHz); a frame
         // decoded at chunk-local 1.0 s must land at 6.0 s.
         let plan = test_plan(vec![(240_000, 480_000)], 10.0, 2.0);
-        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(1.0, 2)) }];
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(chunk_ok(1.0, 2)),
+        }];
         let merged = merge_results(&results, &plan, 25.0);
         assert_eq!(merged.timecodes.len(), 2);
-        assert!((merged.timecodes[0].timecode_secs - 6.0).abs() < 1e-9,
-            "expected 6.0, got {}", merged.timecodes[0].timecode_secs);
+        assert!(
+            (merged.timecodes[0].timecode_secs - 6.0).abs() < 1e-9,
+            "expected 6.0, got {}",
+            merged.timecodes[0].timecode_secs
+        );
         assert!((merged.timecodes[1].timecode_secs - 6.04).abs() < 1e-9);
     }
 
@@ -633,8 +733,14 @@ mod tests {
         let mut chunk1 = chunk_ok(0.0, 1);
         chunk1.timecodes = vec![ftc(0, 0.046), ftc(1, 0.531)];
         let results = vec![
-            ChunkResult { chunk_idx: 0, result: Ok(chunk0) },
-            ChunkResult { chunk_idx: 1, result: Ok(chunk1) },
+            ChunkResult {
+                chunk_idx: 0,
+                result: Ok(chunk0),
+            },
+            ChunkResult {
+                chunk_idx: 1,
+                result: Ok(chunk1),
+            },
         ];
         let merged = merge_results(&results, &plan, 25.0);
         let secs: Vec<f64> = merged.timecodes.iter().map(|t| t.timecode_secs).collect();
@@ -645,7 +751,10 @@ mod tests {
             assert!((got - want).abs() < 1e-9, "got {} want {}", got, want);
         }
         for (i, t) in merged.timecodes.iter().enumerate() {
-            assert_eq!(t.frame_index, i as u32, "frame_index must be renumbered 0..n");
+            assert_eq!(
+                t.frame_index, i as u32,
+                "frame_index must be renumbered 0..n"
+            );
         }
     }
 
@@ -655,20 +764,30 @@ mod tests {
         // min(0.02, 1.0) = 0.02 s. The keep condition is a strict `>` on
         // the gap from the last kept frame.
         let plan = test_plan(vec![(0, 24_000)], 0.5, 2.0);
-        let results = vec![
-            ChunkResult { chunk_idx: 0, result: Ok(two_frames_at(0.50, 0.5201)) },
-        ];
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(two_frames_at(0.50, 0.5201)),
+        }];
         let merged = merge_results(&results, &plan, 25.0);
-        assert_eq!(merged.timecodes.len(), 2, "frame just beyond threshold must be kept");
+        assert_eq!(
+            merged.timecodes.len(),
+            2,
+            "frame just beyond threshold must be kept"
+        );
         assert!((merged.timecodes[1].timecode_secs - 0.5201).abs() < 1e-9);
 
         // Gap below the threshold → dropped (strict >; an "exactly equal"
         // case is not stable under float rounding, so pin just-below).
-        let results = vec![
-            ChunkResult { chunk_idx: 0, result: Ok(two_frames_at(0.50, 0.519)) },
-        ];
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(two_frames_at(0.50, 0.519)),
+        }];
         let merged = merge_results(&results, &plan, 25.0);
-        assert_eq!(merged.timecodes.len(), 1, "frame below the threshold must be dropped");
+        assert_eq!(
+            merged.timecodes.len(),
+            1,
+            "frame below the threshold must be dropped"
+        );
     }
 
     fn two_frames_at(secs0: f64, secs1: f64) -> LtcDetectionResult {
@@ -681,8 +800,14 @@ mod tests {
     fn test_merge_first_tc_is_min_over_chunks() {
         let plan = test_plan(vec![(0, 240_000), (240_000, 480_000)], 20.0, 2.0);
         let results = vec![
-            ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(1.0, 1)) },   // 1.0 + 0.0
-            ChunkResult { chunk_idx: 1, result: Ok(chunk_ok(0.5, 1)) },   // 0.5 + 5.0 = 5.5
+            ChunkResult {
+                chunk_idx: 0,
+                result: Ok(chunk_ok(1.0, 1)),
+            }, // 1.0 + 0.0
+            ChunkResult {
+                chunk_idx: 1,
+                result: Ok(chunk_ok(0.5, 1)),
+            }, // 0.5 + 5.0 = 5.5
         ];
         let merged = merge_results(&results, &plan, 25.0);
         assert!((merged.first_ltc_timecode_secs - 1.0).abs() < 1e-9);
@@ -692,8 +817,14 @@ mod tests {
     fn test_merge_all_error_chunks_zeroed() {
         let plan = test_plan(vec![(0, 24_000), (24_000, 48_000)], 2.0, 2.0);
         let results = vec![
-            ChunkResult { chunk_idx: 0, result: Err(LtcDecodeError::Failed("boom 0".into())) },
-            ChunkResult { chunk_idx: 1, result: Err(LtcDecodeError::Failed("boom 1".into())) },
+            ChunkResult {
+                chunk_idx: 0,
+                result: Err(LtcDecodeError::Failed("boom 0".into())),
+            },
+            ChunkResult {
+                chunk_idx: 1,
+                result: Err(LtcDecodeError::Failed("boom 1".into())),
+            },
         ];
         let merged = merge_results(&results, &plan, 25.0);
         assert_eq!(merged.valid_frames, 0);
@@ -711,8 +842,14 @@ mod tests {
     fn test_merge_error_chunks_do_not_abort_merge() {
         let plan = test_plan(vec![(0, 24_000), (24_000, 48_000)], 2.0, 2.0);
         let results = vec![
-            ChunkResult { chunk_idx: 0, result: Err(LtcDecodeError::Failed("read failure".into())) },
-            ChunkResult { chunk_idx: 1, result: Ok(chunk_ok(0.0, 1)) },
+            ChunkResult {
+                chunk_idx: 0,
+                result: Err(LtcDecodeError::Failed("read failure".into())),
+            },
+            ChunkResult {
+                chunk_idx: 1,
+                result: Ok(chunk_ok(0.0, 1)),
+            },
         ];
         let merged = merge_results(&results, &plan, 25.0);
         assert_eq!(merged.valid_frames, 1);
@@ -729,20 +866,37 @@ mod tests {
         // 175/250 = 0.70 → Success (>= CONFIDENCE_SUCCESS_THRESHOLD).
         // First frame at 0.001 s: 0.0 would sit exactly on the initial
         // -threshold gate of the dedup loop and be dropped.
-        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(0.001, 175)) }];
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(chunk_ok(0.001, 175)),
+        }];
         let merged = merge_results(&results, &plan_for(), 25.0);
         assert_eq!(merged.total_possible, 250);
-        assert!((merged.avg_confidence - 0.70).abs() < 1e-6, "got {}", merged.avg_confidence);
+        assert!(
+            (merged.avg_confidence - 0.70).abs() < 1e-6,
+            "got {}",
+            merged.avg_confidence
+        );
         assert!(matches!(merged.status, LtcDecodeStatus::Success));
 
         // 75/250 = 0.30 → LowConfidence (>= CONFIDENCE_LOW_THRESHOLD, < success)
-        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(0.001, 75)) }];
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(chunk_ok(0.001, 75)),
+        }];
         let merged = merge_results(&results, &plan_for(), 25.0);
-        assert!((merged.avg_confidence - 0.30).abs() < 1e-6, "got {}", merged.avg_confidence);
+        assert!(
+            (merged.avg_confidence - 0.30).abs() < 1e-6,
+            "got {}",
+            merged.avg_confidence
+        );
         assert!(matches!(merged.status, LtcDecodeStatus::LowConfidence));
 
         // 74/250 = 0.296 → NoSyncWord
-        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk_ok(0.001, 74)) }];
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(chunk_ok(0.001, 74)),
+        }];
         let merged = merge_results(&results, &plan_for(), 25.0);
         assert!(matches!(merged.status, LtcDecodeStatus::NoSyncWord));
     }
@@ -760,24 +914,49 @@ mod tests {
 
     impl MockDecoder {
         fn new(results: Vec<Result<LtcDetectionResult, LtcDecodeError>>) -> Self {
-            Self { results, cancel_flag: None, cancel_after_calls: None, calls: AtomicUsize::new(0) }
+            Self {
+                results,
+                cancel_flag: None,
+                cancel_after_calls: None,
+                calls: AtomicUsize::new(0),
+            }
         }
 
-        fn bailing(results: Vec<Result<LtcDetectionResult, LtcDecodeError>>,
-                   cancel_flag: Arc<AtomicBool>, after: usize) -> Self {
-            Self { results, cancel_flag: Some(cancel_flag), cancel_after_calls: Some(after), calls: AtomicUsize::new(0) }
+        fn bailing(
+            results: Vec<Result<LtcDetectionResult, LtcDecodeError>>,
+            cancel_flag: Arc<AtomicBool>,
+            after: usize,
+        ) -> Self {
+            Self {
+                results,
+                cancel_flag: Some(cancel_flag),
+                cancel_after_calls: Some(after),
+                calls: AtomicUsize::new(0),
+            }
         }
     }
 
     impl LtcDecoder for MockDecoder {
-        fn name(&self) -> &'static str { "mock" }
-
-        fn decode_wav(&self, _path: &Path, _fps: f64, _drop: bool,
-                      _cancel: Option<&AtomicBool>) -> Result<LtcDetectionResult, LtcDecodeError> {
-            Err(LtcDecodeError::Failed("mock: decode_wav not supported".to_string()))
+        fn name(&self) -> &'static str {
+            "mock"
         }
 
-        fn decode_chunk(&self, req: crate::decoder::ChunkDecodeReq<'_>) -> Result<LtcDetectionResult, LtcDecodeError> {
+        fn decode_wav(
+            &self,
+            _path: &Path,
+            _fps: f64,
+            _drop: bool,
+            _cancel: Option<&AtomicBool>,
+        ) -> Result<LtcDetectionResult, LtcDecodeError> {
+            Err(LtcDecodeError::Failed(
+                "mock: decode_wav not supported".to_string(),
+            ))
+        }
+
+        fn decode_chunk(
+            &self,
+            req: crate::decoder::ChunkDecodeReq<'_>,
+        ) -> Result<LtcDetectionResult, LtcDecodeError> {
             let chunk_idx = req.chunk_idx;
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if let (Some(flag), Some(after)) = (&self.cancel_flag, self.cancel_after_calls) {
@@ -791,15 +970,20 @@ mod tests {
 
     fn five_chunk_plan() -> ChunkPlan {
         test_plan(
-            vec![(0, 48_000), (43_200, 91_200), (86_400, 134_400), (129_600, 177_600), (172_800, 220_800)],
-            4.6, 1.0,
+            vec![
+                (0, 48_000),
+                (43_200, 91_200),
+                (86_400, 134_400),
+                (129_600, 177_600),
+                (172_800, 220_800),
+            ],
+            4.6,
+            1.0,
         )
     }
 
     fn five_ok_results() -> Vec<Result<LtcDetectionResult, LtcDecodeError>> {
-        (0..5)
-            .map(|i| Ok(chunk_ok(i as f64 * 0.9, 2)))
-            .collect()
+        (0..5).map(|i| Ok(chunk_ok(i as f64 * 0.9, 2))).collect()
     }
 
     /// `decode_one_chunk` opens a real WavChunkReader before reaching the
@@ -867,8 +1051,16 @@ mod tests {
 
         let merged_seq = merge_results(&seq, &plan, 25.0);
         let merged_par = merge_results(&par, &plan, 25.0);
-        let seq_secs: Vec<f64> = merged_seq.timecodes.iter().map(|t| t.timecode_secs).collect();
-        let par_secs: Vec<f64> = merged_par.timecodes.iter().map(|t| t.timecode_secs).collect();
+        let seq_secs: Vec<f64> = merged_seq
+            .timecodes
+            .iter()
+            .map(|t| t.timecode_secs)
+            .collect();
+        let par_secs: Vec<f64> = merged_par
+            .timecodes
+            .iter()
+            .map(|t| t.timecode_secs)
+            .collect();
         assert_eq!(seq_secs, par_secs);
         assert_eq!(merged_seq.valid_frames, merged_par.valid_frames);
     }
@@ -926,7 +1118,11 @@ mod tests {
         assert_eq!(results.len(), 5);
         let completed = results.iter().filter(|cr| cr.result.is_ok()).count();
         let canceled = results.iter().filter(|cr| cr.result.is_err()).count();
-        assert!(completed <= 1, "at most the first call completes, got {}", completed);
+        assert!(
+            completed <= 1,
+            "at most the first call completes, got {}",
+            completed
+        );
         assert_eq!(completed + canceled, 5, "every slot is filled");
         assert_eq!(
             progress.chunks_completed.load(Ordering::Relaxed),
@@ -968,7 +1164,10 @@ mod tests {
 
     #[test]
     fn test_count_chunks_multiple_chunks_for_large_file() {
-        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 200_000,
+            overlap_seconds: 0.3,
+        };
         let total_mono = 500_000; // mono samples
         let n = count_chunks(total_mono, 48000, 2, 16, &config);
         assert!(n >= 2, "large file should produce >= 2 chunks, got {}", n);
@@ -976,7 +1175,10 @@ mod tests {
 
     #[test]
     fn test_count_chunks_zero_samples() {
-        let config = DecodeConfig { chunk_size_bytes: 1_000, overlap_seconds: 0.1 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 1_000,
+            overlap_seconds: 0.1,
+        };
         let n = count_chunks(0, 48000, 1, 16, &config);
         assert_eq!(n, 0, "zero samples -> zero chunks");
     }
@@ -987,31 +1189,54 @@ mod tests {
         let path = dir.path().join("count_matches.wav");
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 200,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            200,
         );
 
-        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 200_000,
+            overlap_seconds: 0.3,
+        };
         let (reader, _) = WavChunkReader::open(&path).unwrap();
         let total_mono = reader.total_mono_samples();
-        let predicted = count_chunks(total_mono, reader.sample_rate(), reader.channels() as u16,
-            reader.spec().bits_per_sample, &config);
+        let predicted = count_chunks(
+            total_mono,
+            reader.sample_rate(),
+            reader.channels() as u16,
+            reader.spec().bits_per_sample,
+            &config,
+        );
 
         let progress = DecodeProgress::new(1);
         let result = decode_ltc_chunked(&path, false, 25.0, false, config, &progress).unwrap();
-        let actual_chunks: usize = result.chunk_summaries.iter()
+        let actual_chunks: usize = result
+            .chunk_summaries
+            .iter()
             .filter(|c| c.error.is_none())
             .count();
-        assert_eq!(predicted, actual_chunks,
-            "count_chunks predicted {} actual decode produced {}", predicted, actual_chunks);
+        assert_eq!(
+            predicted, actual_chunks,
+            "count_chunks predicted {} actual decode produced {}",
+            predicted, actual_chunks
+        );
     }
 
     #[test]
     fn test_count_chunks_zero_chunk_size_uses_fallback() {
-        let config = DecodeConfig { chunk_size_bytes: 0, overlap_seconds: 0.1 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 0,
+            overlap_seconds: 0.1,
+        };
         let n = count_chunks(100, 48000, 1, 16, &config);
-        assert_eq!(n, 1,
-            "should handle zero chunk_size_bytes gracefully");
+        assert_eq!(n, 1, "should handle zero chunk_size_bytes gracefully");
     }
 
     // ── count_chunks_in_wav wrapper ────────────────────────────────
@@ -1046,10 +1271,21 @@ mod tests {
         let path = dir.path().join("wrapper_matches.wav");
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 200,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            200,
         );
-        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 200_000,
+            overlap_seconds: 0.3,
+        };
         let predicted = count_chunks_in_wav(&path, &config).unwrap();
         let (reader, _) = WavChunkReader::open(&path).unwrap();
         let expected = count_chunks(
@@ -1059,9 +1295,11 @@ mod tests {
             reader.spec().bits_per_sample,
             &config,
         );
-        assert_eq!(predicted, expected,
+        assert_eq!(
+            predicted, expected,
             "count_chunks_in_wav({}) should equal count_chunks({})",
-            predicted, expected);
+            predicted, expected
+        );
     }
 
     // ── chunked merge tests ──────────────────────────────────────────
@@ -1086,8 +1324,16 @@ mod tests {
         let sample_rate = 48000;
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            fps, false, sample_rate, num_frames,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            sample_rate,
+            num_frames,
         );
 
         let config = DecodeConfig {
@@ -1098,15 +1344,21 @@ mod tests {
         let (reader, _) = WavChunkReader::open(&path).unwrap();
         let total_mono = reader.total_mono_samples();
         let nchunks = chunk_count_for_config(total_mono, sample_rate, 2, 16, &config);
-        assert!(nchunks >= 3, "test needs at least 3 chunks, got {}", nchunks);
+        assert!(
+            nchunks >= 3,
+            "test needs at least 3 chunks, got {}",
+            nchunks
+        );
 
         let progress = DecodeProgress::new(nchunks);
         let chunked = decode_ltc_chunked(&path, false, fps, false, config, &progress).unwrap();
         let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, fps, false, None).unwrap();
 
-        assert_eq!(chunked.valid_frames, direct.valid_frames,
+        assert_eq!(
+            chunked.valid_frames, direct.valid_frames,
             "chunked merge lost frames: chunked={} vs direct={}",
-            chunked.valid_frames, direct.valid_frames);
+            chunked.valid_frames, direct.valid_frames
+        );
         assert_eq!(chunked.status, direct.status);
     }
 
@@ -1120,8 +1372,16 @@ mod tests {
         let sample_rate = 48000;
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            fps, false, sample_rate, num_frames,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            sample_rate,
+            num_frames,
         );
 
         let config = DecodeConfig {
@@ -1134,17 +1394,26 @@ mod tests {
         let total_duration = total_mono as f64 / sample_rate as f64;
         let expected_possible = (total_duration * fps).round() as u32;
         let nchunks = chunk_count_for_config(total_mono, sample_rate, 2, 16, &config);
-        assert!(nchunks >= 3, "test needs at least 3 chunks, got {}", nchunks);
+        assert!(
+            nchunks >= 3,
+            "test needs at least 3 chunks, got {}",
+            nchunks
+        );
 
         let progress = DecodeProgress::new(nchunks);
         let chunked = decode_ltc_chunked(&path, false, fps, false, config, &progress).unwrap();
 
-        assert_eq!(chunked.total_possible_frames, expected_possible,
+        assert_eq!(
+            chunked.total_possible_frames, expected_possible,
             "total_possible_frames should be {} (stream total), got {}",
-            expected_possible, chunked.total_possible_frames);
-        assert!(chunked.total_possible_frames <= num_frames + 5,
+            expected_possible, chunked.total_possible_frames
+        );
+        assert!(
+            chunked.total_possible_frames <= num_frames + 5,
             "total_possible should not be significantly larger than num_frames={}, got {}",
-            num_frames, chunked.total_possible_frames);
+            num_frames,
+            chunked.total_possible_frames
+        );
     }
 
     #[test]
@@ -1156,8 +1425,16 @@ mod tests {
         let fps = 25.0;
         generate_ltc_wav(
             &path,
-            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            fps, false, 48000, num_frames,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            48000,
+            num_frames,
         );
 
         let config = DecodeConfig {
@@ -1169,17 +1446,26 @@ mod tests {
         let chunked = decode_ltc_chunked(&path, false, fps, false, config, &progress).unwrap();
         let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, fps, false, None).unwrap();
 
-        assert_eq!(chunked.valid_frames, direct.valid_frames,
+        assert_eq!(
+            chunked.valid_frames, direct.valid_frames,
             "single-chunk merge is identity: chunked={} != direct={}",
-            chunked.valid_frames, direct.valid_frames);
-        assert_eq!(chunked.total_possible_frames, direct.total_possible_frames,
-            "total_possible must match direct decode");
-        assert_eq!(chunked.timecodes.first().map(|t| t.timecode),
+            chunked.valid_frames, direct.valid_frames
+        );
+        assert_eq!(
+            chunked.total_possible_frames, direct.total_possible_frames,
+            "total_possible must match direct decode"
+        );
+        assert_eq!(
+            chunked.timecodes.first().map(|t| t.timecode),
             direct.timecodes.first().map(|t| t.timecode),
-            "first decoded TC must match direct decode");
-        assert!(chunked.total_possible_frames >= chunked.valid_frames,
+            "first decoded TC must match direct decode"
+        );
+        assert!(
+            chunked.total_possible_frames >= chunked.valid_frames,
             "total_possible ({}) < valid_frames ({})",
-            chunked.total_possible_frames, chunked.valid_frames);
+            chunked.total_possible_frames,
+            chunked.valid_frames
+        );
     }
 
     #[test]
@@ -1192,8 +1478,16 @@ mod tests {
         let sample_rate = 48000;
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            fps, false, sample_rate, num_frames,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            sample_rate,
+            num_frames,
         );
 
         let config = DecodeConfig {
@@ -1206,23 +1500,30 @@ mod tests {
         let (reader, _) = WavChunkReader::open(&path).unwrap();
         let total_mono = reader.total_mono_samples();
         let nchunks = chunk_count_for_config(total_mono, sample_rate, 2, 16, &config);
-        assert!(nchunks >= 3, "test needs at least 3 chunks, got {}", nchunks);
+        assert!(
+            nchunks >= 3,
+            "test needs at least 3 chunks, got {}",
+            nchunks
+        );
 
         let progress = DecodeProgress::new(nchunks);
         let chunked = decode_ltc_chunked(&path, false, fps, false, config, &progress).unwrap();
 
-        let total_from_chunks: u32 = chunked.chunk_summaries.iter()
-            .map(|c| c.valid_frames)
-            .sum();
+        let total_from_chunks: u32 = chunked.chunk_summaries.iter().map(|c| c.valid_frames).sum();
 
         let loss = total_from_chunks.saturating_sub(chunked.valid_frames);
         let frame_duration = 1.0 / fps;
-        let max_expected_loss = ((nchunks.saturating_sub(1)) as f64
-            * (overlap_secs / frame_duration).ceil()) as u32;
-        assert!(loss <= max_expected_loss,
+        let max_expected_loss =
+            ((nchunks.saturating_sub(1)) as f64 * (overlap_secs / frame_duration).ceil()) as u32;
+        assert!(
+            loss <= max_expected_loss,
             "unnecessary dedup: lost {} frames (max expected loss from overlap: {}). \
              total_from_chunks={}, valid_after_merge={}",
-            loss, max_expected_loss, total_from_chunks, chunked.valid_frames);
+            loss,
+            max_expected_loss,
+            total_from_chunks,
+            chunked.valid_frames
+        );
     }
 
     #[test]
@@ -1234,8 +1535,16 @@ mod tests {
         let fps = 25.0;
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            fps, false, 48000, num_frames,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            48000,
+            num_frames,
         );
 
         let config = DecodeConfig {
@@ -1246,21 +1555,32 @@ mod tests {
         let (reader, _) = WavChunkReader::open(&path).unwrap();
         let total_mono = reader.total_mono_samples();
         let nchunks = chunk_count_for_config(total_mono, 48000, 2, 16, &config);
-        assert!(nchunks >= 3, "test needs at least 3 chunks, got {}", nchunks);
+        assert!(
+            nchunks >= 3,
+            "test needs at least 3 chunks, got {}",
+            nchunks
+        );
 
         let progress = DecodeProgress::new(nchunks);
         let chunked = decode_ltc_chunked(&path, true, fps, false, config, &progress).unwrap();
-        let direct = crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(&path, fps, false, None).unwrap();
+        let direct =
+            crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(&path, fps, false, None).unwrap();
 
-        assert_eq!(chunked.valid_frames, direct.valid_frames,
+        assert_eq!(
+            chunked.valid_frames, direct.valid_frames,
             "chunked libltc must equal direct libltc exactly: chunked={} vs direct={}",
-            chunked.valid_frames, direct.valid_frames);
-        assert_eq!(chunked.timecodes.first().map(|t| t.timecode),
+            chunked.valid_frames, direct.valid_frames
+        );
+        assert_eq!(
+            chunked.timecodes.first().map(|t| t.timecode),
             direct.timecodes.first().map(|t| t.timecode),
-            "first decoded TC must match direct libltc");
-        assert_eq!(chunked.timecodes.last().map(|t| t.timecode),
+            "first decoded TC must match direct libltc"
+        );
+        assert_eq!(
+            chunked.timecodes.last().map(|t| t.timecode),
             direct.timecodes.last().map(|t| t.timecode),
-            "last decoded TC must match direct libltc");
+            "last decoded TC must match direct libltc"
+        );
         assert!(chunked.total_possible_frames >= chunked.valid_frames);
     }
 
@@ -1273,12 +1593,21 @@ mod tests {
         let plan = test_plan(vec![(0, 480_000)], 10.0, 0.3);
         let mut chunk0 = chunk_ok(0.0, 3);
         chunk0.timecodes = vec![ftc(0, -0.0005), ftc(1, 0.0400), ftc(2, 0.0800)];
-        let results = vec![ChunkResult { chunk_idx: 0, result: Ok(chunk0) }];
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(chunk0),
+        }];
         let merged = merge_results(&results, &plan, 25.0);
-        assert_eq!(merged.timecodes.len(), 3, "all three frames must survive the merge");
-        assert!((merged.timecodes[0].timecode_secs - (-0.0005)).abs() < 1e-9,
+        assert_eq!(
+            merged.timecodes.len(),
+            3,
+            "all three frames must survive the merge"
+        );
+        assert!(
+            (merged.timecodes[0].timecode_secs - (-0.0005)).abs() < 1e-9,
             "first frame must be the negative-offset frame 0, got {}",
-            merged.timecodes[0].timecode_secs);
+            merged.timecodes[0].timecode_secs
+        );
     }
 
     // ── decode_ltc_chunked (existing tests) ───────────────────────────
@@ -1291,7 +1620,15 @@ mod tests {
         sample_rate: u32,
         num_frames: u32,
     ) {
-        generate_ltc_wav_sel(path, start_tc, fps, drop_frame, sample_rate, num_frames, ChannelSel::Both);
+        generate_ltc_wav_sel(
+            path,
+            start_tc,
+            fps,
+            drop_frame,
+            sample_rate,
+            num_frames,
+            ChannelSel::Both,
+        );
     }
 
     fn generate_ltc_wav_sel(
@@ -1320,10 +1657,18 @@ mod tests {
 
         for _ in 0..num_frames {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume: 0.5, channel },
-        &mut last_level,
-        &mut frame_buf[..samples_per_frame * 2]
-    );
+            crate::generate_ltc_frame_stereo(
+                crate::ltc_encoder::LtcFrameParams {
+                    tc: &tc,
+                    drop_frame,
+                    total_samples: samples_per_frame,
+                    samples_per_bit,
+                    volume: 0.5,
+                    channel,
+                },
+                &mut last_level,
+                &mut frame_buf[..samples_per_frame * 2],
+            );
 
             for &sample in &frame_buf[..samples_per_frame * 2] {
                 let clamped = sample.clamp(-1.0, 1.0);
@@ -1363,10 +1708,18 @@ mod tests {
 
         for _ in 0..num_frames {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame, total_samples: samples_per_frame, samples_per_bit, volume: 0.5, channel: ChannelSel::Both },
-        &mut last_level,
-        &mut frame_buf[..samples_per_frame * 2]
-    );
+            crate::generate_ltc_frame_stereo(
+                crate::ltc_encoder::LtcFrameParams {
+                    tc: &tc,
+                    drop_frame,
+                    total_samples: samples_per_frame,
+                    samples_per_bit,
+                    volume: 0.5,
+                    channel: ChannelSel::Both,
+                },
+                &mut last_level,
+                &mut frame_buf[..samples_per_frame * 2],
+            );
 
             for &sample in &frame_buf[..samples_per_frame * 2] {
                 let clamped = sample.clamp(-1.0, 1.0);
@@ -1391,18 +1744,35 @@ mod tests {
         let path = dir.path().join("right_only.wav");
         generate_ltc_wav_sel(
             &path,
-            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 50,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            50,
             ChannelSel::Right,
         );
 
-        let config = DecodeConfig { chunk_size_bytes: 10_000_000, overlap_seconds: 2.0 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 10_000_000,
+            overlap_seconds: 2.0,
+        };
         let progress = DecodeProgress::new(1);
         let result = decode_ltc_chunked(&path, false, 25.0, false, config, &progress).unwrap();
-        assert!(matches!(result.status, LtcDecodeStatus::Success),
-            "expected Success for right-only WAV, got {:?}", result.status);
-        assert!(result.valid_frames >= 40,
-            "should decode at least 40 frames, got {}", result.valid_frames);
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success for right-only WAV, got {:?}",
+            result.status
+        );
+        assert!(
+            result.valid_frames >= 40,
+            "should decode at least 40 frames, got {}",
+            result.valid_frames
+        );
     }
 
     #[test]
@@ -1412,8 +1782,16 @@ mod tests {
 
         generate_ltc_wav(
             &path,
-            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 50,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            50,
         );
 
         let mut reader = hound::WavReader::open(&path).unwrap();
@@ -1429,20 +1807,31 @@ mod tests {
         let (mut cr, _) = WavChunkReader::open(&path).unwrap();
         let cr_samples = cr.read_mono_samples_f32(0, hound_samples.len()).unwrap();
 
-        assert_eq!(hound_samples.len(), cr_samples.len(),
+        assert_eq!(
+            hound_samples.len(),
+            cr_samples.len(),
             "sample count mismatch: hound={}, WavChunkReader={}",
-            hound_samples.len(), cr_samples.len());
+            hound_samples.len(),
+            cr_samples.len()
+        );
 
-        let max_diff: f32 = hound_samples.iter().zip(cr_samples.iter())
+        let max_diff: f32 = hound_samples
+            .iter()
+            .zip(cr_samples.iter())
             .map(|(a, b)| (*a - *b).abs())
             .fold(0.0f32, f32::max);
-        let num_diff = hound_samples.iter().zip(cr_samples.iter())
+        let num_diff = hound_samples
+            .iter()
+            .zip(cr_samples.iter())
             .filter(|(a, b)| (*a - *b).abs() > 1e-6)
             .count();
 
-        assert!(max_diff < 1e-4,
+        assert!(
+            max_diff < 1e-4,
             "max sample diff is {:.10} ({} samples differ > 1e-6)",
-            max_diff, num_diff);
+            max_diff,
+            num_diff
+        );
     }
 
     #[test]
@@ -1452,8 +1841,16 @@ mod tests {
 
         generate_ltc_wav(
             &path,
-            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 50,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            50,
         );
 
         let direct = crate::ltc_decoder::decode_ltc_from_wav(&path, 25.0, false, None).unwrap();
@@ -1465,12 +1862,17 @@ mod tests {
         let progress = DecodeProgress::new(1);
         let chunked = decode_ltc_chunked(&path, false, 25.0, false, config, &progress).unwrap();
 
-        assert_eq!(direct.valid_frames, chunked.valid_frames,
+        assert_eq!(
+            direct.valid_frames, chunked.valid_frames,
             "direct decode got {} valid, chunked got {} valid (both should match)",
-            direct.valid_frames, chunked.valid_frames);
+            direct.valid_frames, chunked.valid_frames
+        );
         assert_eq!(direct.status, chunked.status);
-        assert!(chunked.processing_time_ms > 0.0,
-            "chunked decode processing_time should be positive, got {}", chunked.processing_time_ms);
+        assert!(
+            chunked.processing_time_ms > 0.0,
+            "chunked decode processing_time should be positive, got {}",
+            chunked.processing_time_ms
+        );
     }
 
     #[test]
@@ -1480,8 +1882,16 @@ mod tests {
 
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 50,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            50,
         );
 
         let config = DecodeConfig {
@@ -1490,12 +1900,22 @@ mod tests {
         };
         let progress = DecodeProgress::new(1);
         let result = decode_ltc_chunked(&path, false, 25.0, false, config, &progress).unwrap();
-        assert!(matches!(result.status, LtcDecodeStatus::Success),
-            "expected Success, got {:?} (valid={})", result.status, result.valid_frames);
-        assert!(result.valid_frames >= 40,
-            "should decode at least 40 frames, got {}", result.valid_frames);
-        assert!(result.processing_time_ms > 0.0,
-            "processing_time should be positive, got {}", result.processing_time_ms);
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "expected Success, got {:?} (valid={})",
+            result.status,
+            result.valid_frames
+        );
+        assert!(
+            result.valid_frames >= 40,
+            "should decode at least 40 frames, got {}",
+            result.valid_frames
+        );
+        assert!(
+            result.processing_time_ms > 0.0,
+            "processing_time should be positive, got {}",
+            result.processing_time_ms
+        );
     }
 
     #[test]
@@ -1524,8 +1944,16 @@ mod tests {
 
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 75,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            75,
         );
 
         let config = DecodeConfig {
@@ -1547,8 +1975,16 @@ mod tests {
 
         generate_ltc_wav(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 25,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            25,
         );
 
         let config = DecodeConfig {
@@ -1557,10 +1993,16 @@ mod tests {
         };
         let progress = DecodeProgress::new(1);
         let result = decode_ltc_chunked(&path, true, 25.0, false, config, &progress).unwrap();
-        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
-            "expected no Error for libltc chunked, got {:?}", result.status);
-        assert!(result.valid_frames >= 20,
-            "should decode at least 20 frames with libltc, got {}", result.valid_frames);
+        assert!(
+            !matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "expected no Error for libltc chunked, got {:?}",
+            result.status
+        );
+        assert!(
+            result.valid_frames >= 20,
+            "should decode at least 20 frames with libltc, got {}",
+            result.valid_frames
+        );
     }
 
     #[test]
@@ -1570,8 +2012,17 @@ mod tests {
 
         generate_ltc_wav_with_depth(
             &path,
-            Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 },
-            25.0, false, 48000, 25, 24,
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+            48000,
+            25,
+            24,
         );
 
         let config = DecodeConfig {
@@ -1580,10 +2031,16 @@ mod tests {
         };
         let progress = DecodeProgress::new(1);
         let result = decode_ltc_chunked(&path, true, 25.0, false, config, &progress).unwrap();
-        assert!(!matches!(result.status, LtcDecodeStatus::Error { .. }),
-            "expected no Error for libltc chunked 24-bit, got {:?}", result.status);
-        assert!(result.valid_frames >= 20,
-            "should decode at least 20 frames with libltc 24-bit, got {}", result.valid_frames);
+        assert!(
+            !matches!(result.status, LtcDecodeStatus::Error { .. }),
+            "expected no Error for libltc chunked 24-bit, got {:?}",
+            result.status
+        );
+        assert!(
+            result.valid_frames >= 20,
+            "should decode at least 20 frames with libltc 24-bit, got {}",
+            result.valid_frames
+        );
     }
 
     /// WP-RW A1 regression pin: per-chunk decode results are a pure function
@@ -1605,8 +2062,16 @@ mod tests {
         let total_frames = 200usize; // 8 s
         let _samples_per_frame = (sample_rate as f64 / fps).round() as usize;
         let mut mono = synth_ltc_mono_for_chunked(
-            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
-            fps, sample_rate, total_frames, 0.5,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            sample_rate,
+            total_frames,
+            0.5,
         );
         let mut lcg = 0xdead_beef_cafe_f00du64;
         for (i, s) in mono.iter_mut().enumerate() {
@@ -1627,11 +2092,16 @@ mod tests {
         };
         let mut writer = hound::WavWriter::create(&path, spec).unwrap();
         for &s in &mono {
-            writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).unwrap();
+            writer
+                .write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                .unwrap();
         }
         writer.finalize().unwrap();
 
-        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let config = DecodeConfig {
+            chunk_size_bytes: 200_000,
+            overlap_seconds: 0.3,
+        };
         let (reader, _) = WavChunkReader::open(&path).unwrap();
         let total_mono = reader.total_mono_samples();
         let nchunks = count_chunks(total_mono, sample_rate, 1, 16, &config);
@@ -1639,7 +2109,18 @@ mod tests {
         drop(reader);
 
         let progress = DecodeProgress::new(nchunks);
-        let chunked = decode_ltc_chunked(&path, false, fps, false, DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 }, &progress).unwrap();
+        let chunked = decode_ltc_chunked(
+            &path,
+            false,
+            fps,
+            false,
+            DecodeConfig {
+                chunk_size_bytes: 200_000,
+                overlap_seconds: 0.3,
+            },
+            &progress,
+        )
+        .unwrap();
         assert_eq!(chunked.chunk_summaries.len(), nchunks);
 
         // Same decoder, same byte ranges, standalone: results must match the
@@ -1658,7 +2139,9 @@ mod tests {
                 cancel_flag: &cancel,
             };
             let standalone = decode_one_chunk(&job, idx, start, end);
-            let s = standalone.result.expect("standalone chunk decode must succeed");
+            let s = standalone
+                .result
+                .expect("standalone chunk decode must succeed");
             let summary = &chunked.chunk_summaries[idx];
             assert_eq!(summary.error, None, "chunk {} failed in the full run", idx);
             assert_eq!(
@@ -1676,7 +2159,11 @@ mod tests {
         // Merged stream stays frame-monotonic across chunk borders.
         let secs: Vec<f64> = chunked.timecodes.iter().map(|t| t.timecode_secs).collect();
         for w in secs.windows(2) {
-            assert!(w[1] > w[0], "merged timecodes must strictly increase: {:?}", w);
+            assert!(
+                w[1] > w[0],
+                "merged timecodes must strictly increase: {:?}",
+                w
+            );
         }
 
         // Deterministic: a second identical run must produce byte-identical totals.
@@ -1701,10 +2188,18 @@ mod tests {
         let mut out = Vec::with_capacity(total_frames * samples_per_frame);
         for _ in 0..total_frames {
             frame_buf.fill(0.0);
-            crate::generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &tc, drop_frame: false, total_samples: samples_per_frame, samples_per_bit, volume, channel: ChannelSel::Left },
-        &mut last_level,
-        &mut frame_buf
-    );
+            crate::generate_ltc_frame_stereo(
+                crate::ltc_encoder::LtcFrameParams {
+                    tc: &tc,
+                    drop_frame: false,
+                    total_samples: samples_per_frame,
+                    samples_per_bit,
+                    volume,
+                    channel: ChannelSel::Left,
+                },
+                &mut last_level,
+                &mut frame_buf,
+            );
             out.extend(frame_buf.iter().step_by(2).copied());
             tc = crate::increment_timecode(&tc, fps, false);
         }
@@ -1733,16 +2228,23 @@ mod tests {
         };
         let progress = DecodeProgress::new(100);
         let result = decode_ltc_chunked(&path, true, 25.0, false, config, &progress).unwrap();
-        assert_eq!(result.valid_frames, 0,
-            "float WAV should decode 0 valid frames, got {}", result.valid_frames);
-        let total = progress.chunks_completed.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            result.valid_frames, 0,
+            "float WAV should decode 0 valid frames, got {}",
+            result.valid_frames
+        );
+        let total = progress
+            .chunks_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert!(total > 0, "progress should have completed at least 1 chunk");
-        let has_chunk_error = result.chunk_summaries.iter().any(|c| {
-            matches!(c.error, Some(LtcDecodeError::Failed(_)))
-        });
-        assert!(has_chunk_error,
+        let has_chunk_error = result
+            .chunk_summaries
+            .iter()
+            .any(|c| matches!(c.error, Some(LtcDecodeError::Failed(_))));
+        assert!(
+            has_chunk_error,
             "expected at least one chunk summary carrying a Failed error, got: {:?}",
-            result.chunk_summaries);
+            result.chunk_summaries
+        );
     }
 }
-

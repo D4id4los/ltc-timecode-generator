@@ -70,7 +70,11 @@ pub const LIGHT: ThemeColors = ThemeColors {
 };
 
 pub fn palette(is_dark: bool) -> &'static ThemeColors {
-    if is_dark { &DARK } else { &LIGHT }
+    if is_dark {
+        &DARK
+    } else {
+        &LIGHT
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +109,4 @@ mod tests {
     fn test_accent_same_in_both() {
         assert_eq!(DARK.accent, LIGHT.accent);
     }
-
 }

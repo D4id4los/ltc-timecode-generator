@@ -73,31 +73,56 @@ mod tests {
 
     #[test]
     fn test_timecode_to_string_non_drop() {
-        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 2,
+            seconds: 3,
+            frames: 4,
+        };
         assert_eq!(timecode_to_string(tc, false), "01:02:03:04");
     }
 
     #[test]
     fn test_timecode_to_string_drop_frame() {
-        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 2,
+            seconds: 3,
+            frames: 4,
+        };
         assert_eq!(timecode_to_string(tc, true), "01:02:03;04");
     }
 
     #[test]
     fn test_timecode_to_string_zero() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         assert_eq!(timecode_to_string(tc, false), "00:00:00:00");
     }
 
     #[test]
     fn test_timecode_to_string_max() {
-        let tc = Timecode { hours: 23, minutes: 59, seconds: 59, frames: 29 };
+        let tc = Timecode {
+            hours: 23,
+            minutes: 59,
+            seconds: 59,
+            frames: 29,
+        };
         assert_eq!(timecode_to_string(tc, false), "23:59:59:29");
     }
 
     #[test]
     fn test_timecode_to_string_single_digit_padding() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 0 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
         let s = timecode_to_string(tc, false);
         assert_eq!(s.len(), 11);
     }
@@ -106,49 +131,84 @@ mod tests {
 
     #[test]
     fn test_timecode_to_ms_string_25fps() {
-        let tc = Timecode { hours: 1, minutes: 2, seconds: 3, frames: 0 };
+        let tc = Timecode {
+            hours: 1,
+            minutes: 2,
+            seconds: 3,
+            frames: 0,
+        };
         let s = timecode_to_ms_string(tc, 25.0);
         assert_eq!(s, "01:02:03.000");
     }
 
     #[test]
     fn test_timecode_to_ms_string_mid_frame() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 12 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 12,
+        };
         let s = timecode_to_ms_string(tc, 25.0);
         assert_eq!(s, "00:00:00.480");
     }
 
     #[test]
     fn test_timecode_to_ms_string_last_frame() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 24 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 24,
+        };
         let s = timecode_to_ms_string(tc, 25.0);
         assert_eq!(s, "00:00:00.960");
     }
 
     #[test]
     fn test_timecode_to_ms_string_30fps() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 15 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 15,
+        };
         let s = timecode_to_ms_string(tc, 30.0);
         assert_eq!(s, "00:00:00.500");
     }
 
     #[test]
     fn test_timecode_to_ms_string_24fps() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 6 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 6,
+        };
         let s = timecode_to_ms_string(tc, 24.0);
         assert_eq!(s, "00:00:00.250");
     }
 
     #[test]
     fn test_timecode_to_ms_string_full() {
-        let tc = Timecode { hours: 23, minutes: 59, seconds: 59, frames: 29 };
+        let tc = Timecode {
+            hours: 23,
+            minutes: 59,
+            seconds: 59,
+            frames: 29,
+        };
         let s = timecode_to_ms_string(tc, 30.0);
         assert_eq!(s, "23:59:59.967");
     }
 
     #[test]
     fn test_timecode_to_ms_string_2997() {
-        let tc = Timecode { hours: 0, minutes: 0, seconds: 0, frames: 15 };
+        let tc = Timecode {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: 15,
+        };
         let s = timecode_to_ms_string(tc, 29.97);
         assert!(s.starts_with("00:00:00."));
     }
@@ -159,7 +219,11 @@ mod tests {
     fn test_fps_options_all_valid() {
         for (i, opt) in FPS_OPTIONS.iter().enumerate() {
             assert!(!opt.name.is_empty(), "FPS_OPTIONS[{}] name is empty", i);
-            assert!(!opt.description.is_empty(), "FPS_OPTIONS[{}] description is empty", i);
+            assert!(
+                !opt.description.is_empty(),
+                "FPS_OPTIONS[{}] description is empty",
+                i
+            );
             assert!(opt.fps > 0.0, "FPS_OPTIONS[{}] fps = {} <= 0", i, opt.fps);
         }
     }
@@ -171,7 +235,8 @@ mod tests {
                 assert!(
                     (opt.fps - 29.97).abs() < 0.01,
                     "FPS_OPTIONS[{}]: drop_frame=true but fps={}, not 29.97",
-                    i, opt.fps,
+                    i,
+                    opt.fps,
                 );
                 assert_eq!(
                     opt.name, "29.97 DF",
@@ -193,7 +258,11 @@ mod tests {
         let mut names: Vec<&str> = FPS_OPTIONS.iter().map(|o| o.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), FPS_OPTIONS.len(), "option names must be distinct");
+        assert_eq!(
+            names.len(),
+            FPS_OPTIONS.len(),
+            "option names must be distinct"
+        );
     }
 
     #[test]
@@ -215,13 +284,27 @@ mod tests {
     fn test_chrono_now_string_format() {
         let s = chrono_now_string();
         assert_eq!(s.len(), 8, "expected HH:MM:SS format, got '{}'", s);
-        assert_eq!(s.as_bytes()[2], b':', "expected colon at position 2, got '{}'", s);
-        assert_eq!(s.as_bytes()[5], b':', "expected colon at position 5, got '{}'", s);
+        assert_eq!(
+            s.as_bytes()[2],
+            b':',
+            "expected colon at position 2, got '{}'",
+            s
+        );
+        assert_eq!(
+            s.as_bytes()[5],
+            b':',
+            "expected colon at position 5, got '{}'",
+            s
+        );
         for ch in s.chars().filter(|&c| c != ':') {
-            assert!(ch.is_ascii_digit(), "expected digit, got '{}' in '{}'", ch, s);
+            assert!(
+                ch.is_ascii_digit(),
+                "expected digit, got '{}' in '{}'",
+                ch,
+                s
+            );
         }
     }
 
     // ── Timecode struct ───────────────────────────────────────────────────
-
 }

@@ -1,0 +1,2 @@
+# Presence pins the repo to rustfmt; style = rustfmt defaults.
+# Enforced by the CI fmt step (see .github/workflows/ci.yml).

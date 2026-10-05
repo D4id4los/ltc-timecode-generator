@@ -99,7 +99,10 @@ pub fn run_ffmpeg_collect_stderr(
     match result {
         Ok(status) if status.success() => Ok(collected),
         Ok(status) => {
-            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+            let code = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".into());
             Err(FfmpegRunError::Exit {
                 code,
                 stderr_tail: stderr_tail(&collected, 400),
@@ -110,7 +113,6 @@ pub fn run_ffmpeg_collect_stderr(
         Err(WatchdogStop::Wait(e)) => Err(FfmpegRunError::Wait(e)),
     }
 }
-
 
 impl std::fmt::Display for SubprocessFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -154,8 +156,13 @@ pub fn no_window_command(program: &str) -> Command {
 /// before calling this function (otherwise the returned `Output` will contain
 /// empty buffers).  Returns `SubprocessFailure::TimedOut` when the child does
 /// not exit before the deadline.
-pub fn run_output_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, SubprocessFailure> {
-    let mut child = cmd.spawn().map_err(|e| SubprocessFailure::Io(format!("{}", e)))?;
+pub fn run_output_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<Output, SubprocessFailure> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| SubprocessFailure::Io(format!("{}", e)))?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -172,7 +179,11 @@ pub fn run_output_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<O
             Ok(Some(status)) => {
                 cancel.store(true, Ordering::Relaxed);
                 let out = join_output(stdout_buf, stderr_buf);
-                return Ok(Output { status, stdout: out.0, stderr: out.1 });
+                return Ok(Output {
+                    status,
+                    stdout: out.0,
+                    stderr: out.1,
+                });
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -314,7 +325,10 @@ fn kill_on_stall(child: &mut Child) -> Option<WatchdogStop> {
 /// Reader thread finished. Normally the child has also exited (pipe close =
 /// child exit).  Safeguard: if the child closed stderr while still alive
 /// (rare edge case), bound the wait by the stall timeout.
-fn await_exit_bounded(child: &mut Child, stall: Duration) -> Result<std::process::ExitStatus, WatchdogStop> {
+fn await_exit_bounded(
+    child: &mut Child,
+    stall: Duration,
+) -> Result<std::process::ExitStatus, WatchdogStop> {
     let disconnect_start = Instant::now();
     loop {
         if disconnect_start.elapsed() >= stall {
@@ -379,8 +393,6 @@ fn join_output(
     (out, err)
 }
 
-
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -409,7 +421,10 @@ pub(crate) mod tests {
         let output = cmd.output().expect("should spawn");
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("hello"), "stdout should contain hello, got: {stdout:?}");
+        assert!(
+            stdout.contains("hello"),
+            "stdout should contain hello, got: {stdout:?}"
+        );
     }
 
     // ── run_output_with_timeout tests ────────────────────────────────────────
@@ -434,7 +449,10 @@ pub(crate) mod tests {
         let output = result.expect("echo command should complete");
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("hello"), "stdout should contain hello, got: {stdout:?}");
+        assert!(
+            stdout.contains("hello"),
+            "stdout should contain hello, got: {stdout:?}"
+        );
     }
 
     #[test]
@@ -448,7 +466,11 @@ pub(crate) mod tests {
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(SubprocessFailure::TimedOut)));
         // Should return well before 30 s, and with margin for scheduling
-        assert!(elapsed < Duration::from_secs(5), "took {:?} — process not killed promptly?", elapsed);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "took {:?} — process not killed promptly?",
+            elapsed
+        );
     }
 
     #[test]
@@ -480,14 +502,11 @@ pub(crate) mod tests {
         let stderr = child.stderr.take().unwrap();
 
         let mut lines = Vec::new();
-        let status = watch_stderr_lines(
-            &mut child,
-            stderr,
-            Duration::from_secs(5),
-            None,
-            &mut |l| lines.push(l.to_string()),
-        )
-        .expect("should complete successfully");
+        let status =
+            watch_stderr_lines(&mut child, stderr, Duration::from_secs(5), None, &mut |l| {
+                lines.push(l.to_string())
+            })
+            .expect("should complete successfully");
         assert!(status.success());
         assert_eq!(lines.len(), 2, "should have 2 lines: {:?}", lines);
     }
@@ -533,13 +552,7 @@ pub(crate) mod tests {
         let stall = Duration::from_millis(200);
 
         let start = Instant::now();
-        let result = watch_stderr_lines(
-            &mut child,
-            stderr_reader,
-            stall,
-            None,
-            &mut |_| {},
-        );
+        let result = watch_stderr_lines(&mut child, stderr_reader, stall, None, &mut |_| {});
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(WatchdogStop::Stalled)));
         assert!(
@@ -580,28 +593,48 @@ pub(crate) mod tests {
     // ── platform helpers ─────────────────────────────────────────────────────
 
     #[cfg(windows)]
-    pub(crate) fn success_prog() -> &'static str { "cmd" }
+    pub(crate) fn success_prog() -> &'static str {
+        "cmd"
+    }
     #[cfg(not(windows))]
-    pub(crate) fn success_prog() -> &'static str { "true" }
+    pub(crate) fn success_prog() -> &'static str {
+        "true"
+    }
 
     #[cfg(windows)]
-    pub(crate) fn echo_prog() -> &'static str { "cmd" }
+    pub(crate) fn echo_prog() -> &'static str {
+        "cmd"
+    }
     #[cfg(not(windows))]
-    pub(crate) fn echo_prog() -> &'static str { "printf" }
+    pub(crate) fn echo_prog() -> &'static str {
+        "printf"
+    }
 
     #[cfg(windows)]
-    pub(crate) fn echo_args() -> Vec<&'static str> { vec!["/C", "echo hello world"] }
+    pub(crate) fn echo_args() -> Vec<&'static str> {
+        vec!["/C", "echo hello world"]
+    }
     #[cfg(not(windows))]
-    pub(crate) fn echo_args() -> Vec<&'static str> { vec!["hello world"] }
+    pub(crate) fn echo_args() -> Vec<&'static str> {
+        vec!["hello world"]
+    }
 
     #[cfg(windows)]
-    pub(crate) fn sleep_prog() -> &'static str { "ping" }
+    pub(crate) fn sleep_prog() -> &'static str {
+        "ping"
+    }
     #[cfg(windows)]
-    pub(crate) fn sleep_args(secs: u32) -> Vec<String> { vec!["-n".into(), (secs + 1).to_string(), "127.0.0.1".into()] }
+    pub(crate) fn sleep_args(secs: u32) -> Vec<String> {
+        vec!["-n".into(), (secs + 1).to_string(), "127.0.0.1".into()]
+    }
     #[cfg(not(windows))]
-    pub(crate) fn sleep_prog() -> &'static str { "sleep" }
+    pub(crate) fn sleep_prog() -> &'static str {
+        "sleep"
+    }
     #[cfg(not(windows))]
-    pub(crate) fn sleep_args(secs: u32) -> Vec<String> { vec![secs.to_string()] }
+    pub(crate) fn sleep_args(secs: u32) -> Vec<String> {
+        vec![secs.to_string()]
+    }
 
     // ── run_ffmpeg_collect_stderr tests ─────────────────────────────────
 
@@ -635,28 +668,25 @@ pub(crate) mod tests {
 
     // Two stderr lines, exit 0.
     #[cfg(windows)]
-    const STDERR_TWO_LINES: (&str, &[&str]) =
-        ("cmd", &["/C", "echo line1 >&2& echo line2 >&2"]);
+    const STDERR_TWO_LINES: (&str, &[&str]) = ("cmd", &["/C", "echo line1 >&2& echo line2 >&2"]);
     #[cfg(not(windows))]
-    const STDERR_TWO_LINES: (&str, &[&str]) =
-        ("sh", &["-c", "echo line1 >&2; echo line2 >&2"]);
+    const STDERR_TWO_LINES: (&str, &[&str]) = ("sh", &["-c", "echo line1 >&2; echo line2 >&2"]);
 
     // One stderr line, exit code 1.
     #[cfg(windows)]
-    const STDERR_EXIT1: (&str, &[&str]) =
-        ("cmd", &["/C", "echo boom >&2& exit /b 1"]);
+    const STDERR_EXIT1: (&str, &[&str]) = ("cmd", &["/C", "echo boom >&2& exit /b 1"]);
     #[cfg(not(windows))]
-    const STDERR_EXIT1: (&str, &[&str]) =
-        ("sh", &["-c", "echo boom >&2; exit 1"]);
+    const STDERR_EXIT1: (&str, &[&str]) = ("sh", &["-c", "echo boom >&2; exit 1"]);
 
     #[test]
     fn test_collect_stderr_success_collects_lines() {
         let (prog, args) = STDERR_TWO_LINES;
         let mut spawner = spawn_fixed(prog, args);
         let mut seen = Vec::new();
-        let result = run_ffmpeg_collect_stderr(
-            &mut spawner, &[], Duration::from_secs(5), None, &mut |l| seen.push(l.to_string()),
-        );
+        let result =
+            run_ffmpeg_collect_stderr(&mut spawner, &[], Duration::from_secs(5), None, &mut |l| {
+                seen.push(l.to_string())
+            });
         let stderr = result.expect("should succeed");
         assert!(stderr.contains("line1") && stderr.contains("line2"));
         assert_eq!(seen.len(), 2);
@@ -666,9 +696,8 @@ pub(crate) mod tests {
     fn test_collect_stderr_exit_code_with_tail() {
         let (prog, args) = STDERR_EXIT1;
         let mut spawner = spawn_fixed(prog, args);
-        let result = run_ffmpeg_collect_stderr(
-            &mut spawner, &[], Duration::from_secs(5), None, &mut |_| {},
-        );
+        let result =
+            run_ffmpeg_collect_stderr(&mut spawner, &[], Duration::from_secs(5), None, &mut |_| {});
         match result {
             Err(FfmpegRunError::Exit { code, stderr_tail }) => {
                 assert_eq!(code, "1");
@@ -683,9 +712,17 @@ pub(crate) mod tests {
         let mut spawner = spawn_sleeper(5);
         let start = std::time::Instant::now();
         let result = run_ffmpeg_collect_stderr(
-            &mut spawner, &[], Duration::from_millis(200), None, &mut |_| {},
+            &mut spawner,
+            &[],
+            Duration::from_millis(200),
+            None,
+            &mut |_| {},
         );
-        assert!(matches!(result, Err(FfmpegRunError::Stalled)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(FfmpegRunError::Stalled)),
+            "got {:?}",
+            result
+        );
         assert!(start.elapsed() < Duration::from_secs(3));
     }
 
@@ -694,20 +731,30 @@ pub(crate) mod tests {
         let cancel = AtomicBool::new(true);
         let mut spawner = spawn_sleeper(5);
         let result = run_ffmpeg_collect_stderr(
-            &mut spawner, &[], Duration::from_secs(5), Some(&cancel), &mut |_| {},
+            &mut spawner,
+            &[],
+            Duration::from_secs(5),
+            Some(&cancel),
+            &mut |_| {},
         );
-        assert!(matches!(result, Err(FfmpegRunError::Cancelled)), "got {:?}", result);
+        assert!(
+            matches!(result, Err(FfmpegRunError::Cancelled)),
+            "got {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_collect_stderr_spawn_failure() {
-        let mut spawner = |_args: &[String]| {
-            std::process::Command::new("no-such-binary-99999").spawn()
-        };
-        let result = run_ffmpeg_collect_stderr(
-            &mut spawner, &[], Duration::from_secs(5), None, &mut |_| {},
+        let mut spawner =
+            |_args: &[String]| std::process::Command::new("no-such-binary-99999").spawn();
+        let result =
+            run_ffmpeg_collect_stderr(&mut spawner, &[], Duration::from_secs(5), None, &mut |_| {});
+        assert!(
+            matches!(result, Err(FfmpegRunError::Spawn(_))),
+            "got {:?}",
+            result
         );
-        assert!(matches!(result, Err(FfmpegRunError::Spawn(_))), "got {:?}", result);
     }
 
     #[test]

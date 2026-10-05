@@ -1,5 +1,5 @@
-use crate::{AudioDeviceInfo, AudioEvent, ChannelSel, Timecode};
 use crate::ltc_encoder::{self, generate_ltc_frame_stereo, increment_timecode};
+use crate::{AudioDeviceInfo, AudioEvent, ChannelSel, Timecode};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use keepawake::{Builder as WakeBuilder, KeepAwake};
 use log::{error, info, warn};
@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 // ── Ring buffer capacities ─────────────────────────────────────────────────
 
-const LTC_RING_CAPACITY: usize = 262_144;   // 128K stereo samples (~2.7s at 48kHz, ~8s at 16kHz)
-const BEEP_RING_CAPACITY: usize = 32_768;    // 32K stereo samples (~0.34s at 48kHz, ~1s at 16kHz)
+const LTC_RING_CAPACITY: usize = 262_144; // 128K stereo samples (~2.7s at 48kHz, ~8s at 16kHz)
+const BEEP_RING_CAPACITY: usize = 32_768; // 32K stereo samples (~0.34s at 48kHz, ~1s at 16kHz)
 
 // ── Internal state structs ─────────────────────────────────────────────────
 
@@ -103,12 +103,8 @@ impl AudioCore {
 
         let buf_size = choose_buffer_size(buffer_size);
 
-        let (stream_config, sample_format) = select_best_config(
-            &configs,
-            2,
-            sample_rate,
-            buf_size,
-        )?;
+        let (stream_config, sample_format) =
+            select_best_config(&configs, 2, sample_rate, buf_size)?;
 
         let fmt_name = sample_format_name(sample_format);
 
@@ -266,10 +262,18 @@ impl AudioCore {
                 .map_err(|e| format!("Producer lock error: {}", e))?;
             for _ in 0..prefill_count {
                 frame_buf.fill(0.0);
-                generate_ltc_frame_stereo(crate::ltc_encoder::LtcFrameParams { tc: &prefill_tc, drop_frame, total_samples: prefill_total, samples_per_bit: prefill_spb, volume: ltc_volume, channel: ltc_channel },
-        &mut prefill_level,
-        &mut frame_buf[..prefill_total * 2]
-    );
+                generate_ltc_frame_stereo(
+                    crate::ltc_encoder::LtcFrameParams {
+                        tc: &prefill_tc,
+                        drop_frame,
+                        total_samples: prefill_total,
+                        samples_per_bit: prefill_spb,
+                        volume: ltc_volume,
+                        channel: ltc_channel,
+                    },
+                    &mut prefill_level,
+                    &mut frame_buf[..prefill_total * 2],
+                );
                 let pushed = producer.push_slice(&frame_buf[..prefill_total * 2]);
                 if pushed < prefill_total * 2 {
                     warn!(
@@ -303,17 +307,22 @@ impl AudioCore {
 
         let handle = std::thread::Builder::new()
             .name("ltc-scheduler".into())
-            .spawn(move || ltc_scheduler_thread(
-                ltc_producer,
-                ltc_clone,
-                stop_signal,
-                underrun_count,
-                callback_counter,
-                events_for_scheduler,
-            ))
+            .spawn(move || {
+                ltc_scheduler_thread(
+                    ltc_producer,
+                    ltc_clone,
+                    stop_signal,
+                    underrun_count,
+                    callback_counter,
+                    events_for_scheduler,
+                )
+            })
             .map_err(|e| format!("Failed to spawn LTC scheduler thread: {}", e))?;
 
-        info!("LTC scheduler thread spawned (tc={:?}, fps={}, drop_frame={})", tc, fps, drop_frame);
+        info!(
+            "LTC scheduler thread spawned (tc={:?}, fps={}, drop_frame={})",
+            tc, fps, drop_frame
+        );
         ltc.scheduler_thread = Some(handle);
 
         // Acquire system wake lock to prevent sleep while LTC is streaming
@@ -381,8 +390,10 @@ impl AudioCore {
             ltc.tc = tc;
             ltc.last_level = (1.0, 1.0);
             ltc.next_frame_time = Instant::now();
-            info!("LTC reset to {:02}:{:02}:{:02}:{:02} (drop_frame={})",
-                tc.hours, tc.minutes, tc.seconds, tc.frames, ltc.drop_frame);
+            info!(
+                "LTC reset to {:02}:{:02}:{:02}:{:02} (drop_frame={})",
+                tc.hours, tc.minutes, tc.seconds, tc.frames, ltc.drop_frame
+            );
         } else {
             warn!("reset_ltc: audio not initialized");
         }
@@ -427,14 +438,23 @@ impl AudioCore {
             .lock()
             .map_err(|e| format!("State lock error: {}", e))?;
         if let Some(ref output) = *audio {
-            let samples = ltc_encoder::generate_beep_samples(sample_rate, frequency, duration, volume, channel);
+            let samples = ltc_encoder::generate_beep_samples(
+                sample_rate,
+                frequency,
+                duration,
+                volume,
+                channel,
+            );
             let mut producer = output
                 .beep_producer
                 .lock()
                 .map_err(|e| format!("Beep producer lock error: {}", e))?;
             let pushed = producer.push_slice(&samples);
             if pushed < samples.len() {
-                warn!("play_beep: ring buffer full, dropped {} beep samples", samples.len() - pushed);
+                warn!(
+                    "play_beep: ring buffer full, dropped {} beep samples",
+                    samples.len() - pushed
+                );
             }
             // Ensure playback is active so the beep is audible even without active LTC
             if !output.playing.load(Ordering::Relaxed) {
@@ -466,7 +486,10 @@ impl AudioCore {
             };
             let pushed = producer.push_slice(&samples);
             if pushed < samples.len() {
-                warn!("push_samples: ring buffer full, dropped {} samples", samples.len() - pushed);
+                warn!(
+                    "push_samples: ring buffer full, dropped {} samples",
+                    samples.len() - pushed
+                );
             }
         }
     }
@@ -479,7 +502,10 @@ impl AudioCore {
         if let Some(output) = audio.take() {
             output.streaming.store(false, Ordering::Relaxed);
             output.playing.store(false, Ordering::Relaxed);
-            let mut ltc = output.ltc.lock().map_err(|e| format!("LTC state lock error: {}", e))?;
+            let mut ltc = output
+                .ltc
+                .lock()
+                .map_err(|e| format!("LTC state lock error: {}", e))?;
             ltc.running = false;
             ltc.stop_signal.store(true, Ordering::Relaxed);
             if let Some(handle) = ltc.scheduler_thread.take() {
@@ -635,7 +661,13 @@ fn select_best_config(
         }
     };
 
-    let mut best_config = try_find_config(configs, desired_channels, desired_sample_rate, desired_buffer_size, &format_priority);
+    let mut best_config = try_find_config(
+        configs,
+        desired_channels,
+        desired_sample_rate,
+        desired_buffer_size,
+        &format_priority,
+    );
 
     if best_config.is_none() && desired_sample_rate >= 44100 {
         let fallback_rates = [48000u32, 44100];
@@ -643,7 +675,13 @@ fn select_best_config(
             if rate == desired_sample_rate {
                 continue;
             }
-            best_config = try_find_config(configs, desired_channels, rate, desired_buffer_size, &format_priority);
+            best_config = try_find_config(
+                configs,
+                desired_channels,
+                rate,
+                desired_buffer_size,
+                &format_priority,
+            );
             if best_config.is_some() {
                 break;
             }
@@ -651,7 +689,13 @@ fn select_best_config(
     }
 
     if best_config.is_none() {
-        best_config = try_fallback_config(configs, desired_channels, desired_sample_rate, desired_buffer_size, &format_priority);
+        best_config = try_fallback_config(
+            configs,
+            desired_channels,
+            desired_sample_rate,
+            desired_buffer_size,
+            &format_priority,
+        );
     }
 
     best_config
@@ -678,10 +722,18 @@ fn build_stream_for_format(
     ctx: StreamContext,
 ) -> Result<cpal::Stream, String> {
     match sample_format {
-        cpal::SampleFormat::F32 => build_stream_generic::<f32>(device, config, ltc_consumer, beep_consumer, ctx),
-        cpal::SampleFormat::I16 => build_stream_generic::<i16>(device, config, ltc_consumer, beep_consumer, ctx),
-        cpal::SampleFormat::I32 => build_stream_generic::<i32>(device, config, ltc_consumer, beep_consumer, ctx),
-        cpal::SampleFormat::U16 => build_stream_generic::<u16>(device, config, ltc_consumer, beep_consumer, ctx),
+        cpal::SampleFormat::F32 => {
+            build_stream_generic::<f32>(device, config, ltc_consumer, beep_consumer, ctx)
+        }
+        cpal::SampleFormat::I16 => {
+            build_stream_generic::<i16>(device, config, ltc_consumer, beep_consumer, ctx)
+        }
+        cpal::SampleFormat::I32 => {
+            build_stream_generic::<i32>(device, config, ltc_consumer, beep_consumer, ctx)
+        }
+        cpal::SampleFormat::U16 => {
+            build_stream_generic::<u16>(device, config, ltc_consumer, beep_consumer, ctx)
+        }
         other => Err(format!("Unsupported sample format: {:?}", other)),
     }
 }
@@ -795,12 +847,36 @@ impl AudioDeviceInfo {
             name,
             is_default,
             formats: s.formats,
-            channels_min: if s.channels_min != u16::MAX { s.channels_min } else { 0 },
-            channels_max: if s.channels_max != u16::MIN { s.channels_max } else { 0 },
-            sample_rate_min: if s.rate_min != u32::MAX { s.rate_min } else { 0 },
-            sample_rate_max: if s.rate_max != u32::MIN { s.rate_max } else { 0 },
-            buffer_min: if s.buffer_min != u32::MAX { s.buffer_min } else { 0 },
-            buffer_max: if s.buffer_max != u32::MIN { s.buffer_max } else { 0 },
+            channels_min: if s.channels_min != u16::MAX {
+                s.channels_min
+            } else {
+                0
+            },
+            channels_max: if s.channels_max != u16::MIN {
+                s.channels_max
+            } else {
+                0
+            },
+            sample_rate_min: if s.rate_min != u32::MAX {
+                s.rate_min
+            } else {
+                0
+            },
+            sample_rate_max: if s.rate_max != u32::MIN {
+                s.rate_max
+            } else {
+                0
+            },
+            buffer_min: if s.buffer_min != u32::MAX {
+                s.buffer_min
+            } else {
+                0
+            },
+            buffer_max: if s.buffer_max != u32::MIN {
+                s.buffer_max
+            } else {
+                0
+            },
         }
     }
 }
@@ -898,7 +974,12 @@ fn probe_device(
     }
     let summary = collect_device_configs(device);
     log_device_supported_configs(&label, &summary);
-    Some(AudioDeviceInfo::from_summary(id, display_name, is_default, summary))
+    Some(AudioDeviceInfo::from_summary(
+        id,
+        display_name,
+        is_default,
+        summary,
+    ))
 }
 
 pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
@@ -972,7 +1053,11 @@ mod watchdog {
     /// `AudioEvent::RecoveryNeeded { reason }` by the scheduler thread.
     /// The event text is a contract (engine log line), so it lives here next
     /// to the payload ingredients it is derived from.
-    pub(crate) fn watchdog_reason(stall_timeout: Duration, attempt: u8, max_attempts: u8) -> String {
+    pub(crate) fn watchdog_reason(
+        stall_timeout: Duration,
+        attempt: u8,
+        max_attempts: u8,
+    ) -> String {
         format!(
             "callback stalled for {}ms (attempt {}/{})",
             stall_timeout.as_millis(),
@@ -1065,7 +1150,10 @@ mod watchdog {
                 // Reset the stall timer so we don't immediately re-trigger.
                 self.last_callback_value = current_callback;
                 self.last_check = now;
-                WatchdogAction::Recover { attempt, backoff: self.backoff }
+                WatchdogAction::Recover {
+                    attempt,
+                    backoff: self.backoff,
+                }
             } else {
                 WatchdogAction::Dead
             }
@@ -1100,7 +1188,9 @@ fn push_frame(
         }
         if stats.drop_count - stats.last_drop_event >= 100 {
             stats.last_drop_event = stats.drop_count;
-            return Some(AudioEvent::FramesDropped { total: stats.drop_count });
+            return Some(AudioEvent::FramesDropped {
+                total: stats.drop_count,
+            });
         }
     }
     None
@@ -1172,7 +1262,10 @@ fn detect_underruns(
     let current_underrun = underrun_count.load(Ordering::Relaxed);
     if current_underrun > *last_underrun_value {
         let new_underruns = current_underrun - *last_underrun_value;
-        warn!("LTC scheduler: detected {} callback underruns (total: {})", new_underruns, current_underrun);
+        warn!(
+            "LTC scheduler: detected {} callback underruns (total: {})",
+            new_underruns, current_underrun
+        );
         if let Ok(mut ev) = events.lock() {
             ev.push(AudioEvent::Underrun);
         }
@@ -1194,7 +1287,10 @@ fn generate_and_push_frame(
     frame_buf.resize(needed, 0.0);
 
     generate_ltc_frame_stereo(
-        crate::ltc_encoder::LtcFrameParams { total_samples: needed / 2, ..params },
+        crate::ltc_encoder::LtcFrameParams {
+            total_samples: needed / 2,
+            ..params
+        },
         last_level,
         &mut frame_buf[..needed],
     );
@@ -1239,7 +1335,11 @@ fn ltc_scheduler_thread(
     let mut frame_buf: Vec<f32> = Vec::new();
     let mut last_underrun_value: u64 = 0;
     let mut wd = CallbackWatchdog::new();
-    let mut push_stats = FramePushStats { frame_count: 0, drop_count: 0, last_drop_event: 0 };
+    let mut push_stats = FramePushStats {
+        frame_count: 0,
+        drop_count: 0,
+        last_drop_event: 0,
+    };
 
     loop {
         if stop_signal.load(Ordering::Relaxed) {
@@ -1247,7 +1347,18 @@ fn ltc_scheduler_thread(
             return;
         }
 
-        let (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, total_samples, samples_per_bit, mut last_level, new_accumulator) = {
+        let (
+            tc,
+            fps,
+            drop_frame,
+            ltc_channel,
+            ltc_volume,
+            frame_dur,
+            total_samples,
+            samples_per_bit,
+            mut last_level,
+            new_accumulator,
+        ) = {
             let state = match ltc.lock() {
                 Ok(s) => s,
                 Err(e) => {
@@ -1284,7 +1395,18 @@ fn ltc_scheduler_thread(
                 state.samples_accumulator,
             );
 
-            (tc, fps, drop_frame, ltc_channel, ltc_volume, frame_dur, frame_samples, spb, last_level, acc)
+            (
+                tc,
+                fps,
+                drop_frame,
+                ltc_channel,
+                ltc_volume,
+                frame_dur,
+                frame_samples,
+                spb,
+                last_level,
+                acc,
+            )
         };
 
         // ── Watchdog: check if audio callback is still alive ──
@@ -1304,7 +1426,9 @@ fn ltc_scheduler_thread(
         // ── Generate LTC frame + push into the ring buffer ──
         let needed = total_samples * 2;
         if !generate_and_push_frame(
-            &ltc_producer, &mut frame_buf, needed,
+            &ltc_producer,
+            &mut frame_buf,
+            needed,
             crate::ltc_encoder::LtcFrameParams {
                 tc: &tc,
                 drop_frame,
@@ -1313,16 +1437,26 @@ fn ltc_scheduler_thread(
                 volume: ltc_volume,
                 channel: ltc_channel,
             },
-            &mut last_level, &mut push_stats, &events,
+            &mut last_level,
+            &mut push_stats,
+            &events,
         ) {
             return;
         }
 
         push_stats.frame_count += 1;
         if push_stats.frame_count % 1000 == 0 {
-            info!("LTC scheduler: frame={}, drops={}, channel={}, fps={}, tc={:02}:{:02}:{:02}:{:02}",
-                push_stats.frame_count, push_stats.drop_count, ltc_channel.as_str(),
-                fps, tc.hours, tc.minutes, tc.seconds, tc.frames);
+            info!(
+                "LTC scheduler: frame={}, drops={}, channel={}, fps={}, tc={:02}:{:02}:{:02}:{:02}",
+                push_stats.frame_count,
+                push_stats.drop_count,
+                ltc_channel.as_str(),
+                fps,
+                tc.hours,
+                tc.minutes,
+                tc.seconds,
+                tc.frames
+            );
         }
 
         {
@@ -1351,7 +1485,12 @@ mod tests {
     fn wd_fast() -> CallbackWatchdog {
         // Accelerated constants for the recovery-ladder walk; behavior is
         // identical to the production constants under the virtual clock.
-        CallbackWatchdog::with_constants(Duration::from_millis(500), 3, Duration::from_secs(10), Duration::from_millis(100))
+        CallbackWatchdog::with_constants(
+            Duration::from_millis(500),
+            3,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+        )
     }
 
     #[test]
@@ -1360,10 +1499,16 @@ mod tests {
         let t0 = Instant::now();
         assert!(matches!(wd.tick(t0, 0), WatchdogAction::Continue));
         // Counter advances → healthy; internal state resets.
-        assert!(matches!(wd.tick(t0 + Duration::from_millis(1), 10), WatchdogAction::Continue));
+        assert!(matches!(
+            wd.tick(t0 + Duration::from_millis(1), 10),
+            WatchdogAction::Continue
+        ));
         // Now a long stall: because the counter advanced at t0+1ms, the
         // stall clock restarted there.
-        assert!(matches!(wd.tick(t0 + Duration::from_millis(400), 10), WatchdogAction::Continue));
+        assert!(matches!(
+            wd.tick(t0 + Duration::from_millis(400), 10),
+            WatchdogAction::Continue
+        ));
         match wd.tick(t0 + Duration::from_millis(901), 10) {
             WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1),
             other => panic!("expected Recover, got {:?}", other),
@@ -1375,7 +1520,10 @@ mod tests {
         let mut wd = wd_fast();
         let t0 = Instant::now();
         assert!(matches!(wd.tick(t0, 0), WatchdogAction::Continue));
-        assert!(matches!(wd.tick(t0 + Duration::from_millis(499), 0), WatchdogAction::Continue));
+        assert!(matches!(
+            wd.tick(t0 + Duration::from_millis(499), 0),
+            WatchdogAction::Continue
+        ));
     }
 
     #[test]
@@ -1385,8 +1533,14 @@ mod tests {
         let t0 = Instant::now();
         // Advance the counter once so the stall clock baseline is t0+1ms.
         assert!(matches!(wd.tick(t0, 0), WatchdogAction::Continue));
-        assert!(matches!(wd.tick(t0 + Duration::from_millis(1), 1), WatchdogAction::Continue));
-        assert!(matches!(wd.tick(t0 + Duration::from_millis(501), 1), WatchdogAction::Continue));
+        assert!(matches!(
+            wd.tick(t0 + Duration::from_millis(1), 1),
+            WatchdogAction::Continue
+        ));
+        assert!(matches!(
+            wd.tick(t0 + Duration::from_millis(501), 1),
+            WatchdogAction::Continue
+        ));
         // One microsecond past the timeout → confirmed.
         match wd.tick(t0 + Duration::from_millis(501_001), 1) {
             WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1),
@@ -1401,7 +1555,9 @@ mod tests {
         wd.tick(t0, 0);
         let t1 = t0 + Duration::from_millis(600);
         match wd.tick(t1, 0) {
-            WatchdogAction::Recover { attempt, backoff, .. } => {
+            WatchdogAction::Recover {
+                attempt, backoff, ..
+            } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff, Duration::from_millis(100));
             }
@@ -1417,7 +1573,10 @@ mod tests {
             WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 3),
             other => panic!("expected Recover, got {:?}", other),
         }
-        assert!(matches!(wd.tick(t1 + Duration::from_millis(1503), 0), WatchdogAction::Dead));
+        assert!(matches!(
+            wd.tick(t1 + Duration::from_millis(1503), 0),
+            WatchdogAction::Dead
+        ));
     }
 
     #[test]
@@ -1430,7 +1589,10 @@ mod tests {
             other => panic!("expected Recover, got {:?}", other),
         }
         // Callback resumes → attempts and first_failure reset.
-        assert!(matches!(wd.tick(t0 + Duration::from_millis(700), 5), WatchdogAction::Continue));
+        assert!(matches!(
+            wd.tick(t0 + Duration::from_millis(700), 5),
+            WatchdogAction::Continue
+        ));
         // Counter stalls again → ladder restarts at attempt 1.
         match wd.tick(t0 + Duration::from_millis(1300), 5) {
             WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1),
@@ -1450,7 +1612,9 @@ mod tests {
         // No progress; next stall check happens just past the 10 s window
         // from the first failure → the attempt counter was reset to 0.
         match wd.tick(t0 + Duration::from_millis(10_601), 0) {
-            WatchdogAction::Recover { attempt, .. } => assert_eq!(attempt, 1, "window reset must restart the ladder"),
+            WatchdogAction::Recover { attempt, .. } => {
+                assert_eq!(attempt, 1, "window reset must restart the ladder")
+            }
             other => panic!("expected Recover, got {:?}", other),
         }
     }
@@ -1458,12 +1622,17 @@ mod tests {
     #[test]
     fn test_watchdog_recover_payload() {
         let mut wd = CallbackWatchdog::with_constants(
-            Duration::from_millis(500), 3, Duration::from_secs(10), Duration::from_millis(100),
+            Duration::from_millis(500),
+            3,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
         );
         let t0 = Instant::now();
         wd.tick(t0, 0);
         match wd.tick(t0 + Duration::from_millis(600), 0) {
-            WatchdogAction::Recover { attempt, backoff, .. } => {
+            WatchdogAction::Recover {
+                attempt, backoff, ..
+            } => {
                 assert_eq!(attempt, 1);
                 assert_eq!(backoff, Duration::from_millis(100));
             }
@@ -1488,7 +1657,11 @@ mod tests {
     // ── push_frame ────────────────────────────────────────────────────────
 
     fn stats() -> FramePushStats {
-        FramePushStats { frame_count: 0, drop_count: 0, last_drop_event: 0 }
+        FramePushStats {
+            frame_count: 0,
+            drop_count: 0,
+            last_drop_event: 0,
+        }
     }
 
     #[test]
@@ -1511,7 +1684,10 @@ mod tests {
         let (mut prod, _cons) = rb.split();
         let mut st = stats();
         let frame = vec![0.0f32; 64]; // bigger than the ring
-        assert!(push_frame(&mut prod, &frame, &mut st).is_none(), "first drop emits no event");
+        assert!(
+            push_frame(&mut prod, &frame, &mut st).is_none(),
+            "first drop emits no event"
+        );
         assert_eq!(st.drop_count, 1);
     }
 
@@ -1530,14 +1706,28 @@ mod tests {
         assert_eq!(st.drop_count, 200);
         let totals: Vec<u64> = events
             .iter()
-            .map(|e| match e { AudioEvent::FramesDropped { total } => *total, other => panic!("unexpected event {:?}", other) })
+            .map(|e| match e {
+                AudioEvent::FramesDropped { total } => *total,
+                other => panic!("unexpected event {:?}", other),
+            })
             .collect();
-        assert_eq!(totals, vec![100, 200], "FramesDropped every 100 cumulative drops");
+        assert_eq!(
+            totals,
+            vec![100, 200],
+            "FramesDropped every 100 cumulative drops"
+        );
     }
 
     // ── AudioDeviceInfo::from_summary ─────────────────────────────────────
 
-    fn summary(ch_min: u16, ch_max: u16, r_min: u32, r_max: u32, b_min: u32, b_max: u32) -> DeviceConfigSummary {
+    fn summary(
+        ch_min: u16,
+        ch_max: u16,
+        r_min: u32,
+        r_max: u32,
+        b_min: u32,
+        b_max: u32,
+    ) -> DeviceConfigSummary {
         DeviceConfigSummary {
             formats: vec!["f32".to_string()],
             channels_min: ch_min,
@@ -1552,7 +1742,9 @@ mod tests {
     #[test]
     fn test_from_summary_all_sentinels_become_zero() {
         let info = AudioDeviceInfo::from_summary(
-            "id".into(), "name".into(), false,
+            "id".into(),
+            "name".into(),
+            false,
             summary(u16::MAX, u16::MIN, u32::MAX, u32::MIN, u32::MAX, u32::MIN),
         );
         assert_eq!(info.channels_min, 0);
@@ -1567,7 +1759,9 @@ mod tests {
     #[test]
     fn test_from_summary_real_values_pass_through() {
         let info = AudioDeviceInfo::from_summary(
-            "id".into(), "name".into(), true,
+            "id".into(),
+            "name".into(),
+            true,
             summary(1, 2, 44100, 48000, 64, 4096),
         );
         assert_eq!(info.channels_min, 1);
@@ -1583,7 +1777,9 @@ mod tests {
     fn test_from_summary_mixed_sentinels() {
         // Min sentinels, max real: only the sentinel sides normalize to 0.
         let info = AudioDeviceInfo::from_summary(
-            "id".into(), "name".into(), false,
+            "id".into(),
+            "name".into(),
+            false,
             summary(u16::MAX, 8, u32::MAX, 96000, 64, u32::MIN),
         );
         assert_eq!(info.channels_min, 0);
@@ -1640,9 +1836,18 @@ mod tests {
 
     #[test]
     fn test_choose_buffer_size_positive_returns_fixed() {
-        assert!(matches!(choose_buffer_size(256), cpal::BufferSize::Fixed(256)));
-        assert!(matches!(choose_buffer_size(1024), cpal::BufferSize::Fixed(1024)));
-        assert!(matches!(choose_buffer_size(480), cpal::BufferSize::Fixed(480)));
+        assert!(matches!(
+            choose_buffer_size(256),
+            cpal::BufferSize::Fixed(256)
+        ));
+        assert!(matches!(
+            choose_buffer_size(1024),
+            cpal::BufferSize::Fixed(1024)
+        ));
+        assert!(matches!(
+            choose_buffer_size(480),
+            cpal::BufferSize::Fixed(480)
+        ));
     }
 
     // ── is_permanent_device_error ─────────────────────────────────────────
@@ -1666,7 +1871,9 @@ mod tests {
     #[test]
     fn test_is_permanent_device_error_partial_context() {
         assert!(is_permanent_device_error("ALSA: Permission denied"));
-        assert!(is_permanent_device_error("Access denied: /dev/snd/pcmC0D0p"));
+        assert!(is_permanent_device_error(
+            "Access denied: /dev/snd/pcmC0D0p"
+        ));
     }
 
     #[test]
@@ -1693,9 +1900,18 @@ mod tests {
     fn test_is_valid_device_plugin_keyword_filtered() {
         let host = cpal::default_host();
         let host_id = host.id();
-        assert!(!is_valid_device("Discard all samples", &host_id), "Discard all samples should be filtered");
-        assert!(!is_valid_device("Rate Converter Plugin", &host_id), "Rate Converter Plugin should be filtered");
-        assert!(!is_valid_device("Samplerate Library", &host_id), "Samplerate Library should be filtered");
+        assert!(
+            !is_valid_device("Discard all samples", &host_id),
+            "Discard all samples should be filtered"
+        );
+        assert!(
+            !is_valid_device("Rate Converter Plugin", &host_id),
+            "Rate Converter Plugin should be filtered"
+        );
+        assert!(
+            !is_valid_device("Samplerate Library", &host_id),
+            "Samplerate Library should be filtered"
+        );
     }
 
     #[test]
@@ -1761,6 +1977,10 @@ mod tests {
         let mut rates = SAMPLE_RATE_OPTIONS.to_vec();
         rates.sort_unstable();
         rates.dedup();
-        assert_eq!(rates.len(), SAMPLE_RATE_OPTIONS.len(), "rates must be distinct");
+        assert_eq!(
+            rates.len(),
+            SAMPLE_RATE_OPTIONS.len(),
+            "rates must be distinct"
+        );
     }
 }

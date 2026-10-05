@@ -25,11 +25,11 @@ use arc_swap::ArcSwap;
 use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::engine::engine_main_with_probe;
 use gui_engine::state::AppStateSnapshot;
+use gui_engine::state::ClipDecodeState;
 use gui_engine::{
     decode_ltc_from_wav, extract_audio_channel, path_is_video, probe_video_audio,
     FfmpegCapabilities, HwDeviceCapabilities, JobKind, JobPhase, LtcDecodeStatus,
 };
-use gui_engine::state::ClipDecodeState;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -39,7 +39,7 @@ fn fake_probe() -> FfmpegCapabilities {
         available_encoders: BTreeSet::new(),
         available_formats: BTreeSet::new(),
         error_message: None,
-            ffmpeg_version: None,
+        ffmpeg_version: None,
         hw: HwDeviceCapabilities::default(),
     }
 }
@@ -83,8 +83,11 @@ fn wait_for_folder_scan(state: &Arc<ArcSwap<AppStateSnapshot>>) {
             return;
         }
         if Instant::now() > deadline {
-            panic!("folder scan did not complete within 30s (groups_folder={:?}, job={:?})",
-                snapshot.converter.groups_folder, snapshot.job(JobKind::FolderScan));
+            panic!(
+                "folder scan did not complete within 30s (groups_folder={:?}, job={:?})",
+                snapshot.converter.groups_folder,
+                snapshot.job(JobKind::FolderScan)
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -131,11 +134,21 @@ fn generate_ltc_wav(dir: &Path, name: &str, fps: f64, duration: f64, channels: &
 ///
 /// Uses the core `mpeg4` encoder so the fixture does not depend on external
 /// encoder libraries (libx264 etc.).
-fn mux_video_fixture(dir: &Path, name: &str, ltc_wav: &Path, leading_silent_stream: bool) -> PathBuf {
+fn mux_video_fixture(
+    dir: &Path,
+    name: &str,
+    ltc_wav: &Path,
+    leading_silent_stream: bool,
+) -> PathBuf {
     let out = dir.join(name);
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-v", "error"]);
-    cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=2:size=128x72:rate=25",
+    ]);
     if leading_silent_stream {
         cmd.args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"]);
     }
@@ -254,7 +267,12 @@ fn test_single_clip_decode_via_group_command() {
     let mp4 = dir.path().join("C0001.MP4");
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-v", "error"]);
-    cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=2:size=128x72:rate=25",
+    ]);
     cmd.arg("-i").arg(&ltc_wav);
     cmd.args(["-map", "0:v", "-map", "1:a"]);
     cmd.args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"]);
@@ -281,24 +299,47 @@ fn test_single_clip_decode_via_group_command() {
         paths: vec![mp4.to_string_lossy().to_string()],
         stream_index: 1,
         channel_index: 0,
-    }).unwrap();
+    })
+    .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let snapshot = state.load().as_ref().clone();
-        if matches!(snapshot.job(JobKind::LtcGroupDecode).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
-            eprintln!("Group done! results={:?} errors={:?} pct={}",
+        if matches!(
+            snapshot.job(JobKind::LtcGroupDecode).phase(),
+            JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled
+        ) {
+            eprintln!(
+                "Group done! results={:?} errors={:?} pct={}",
                 snapshot.decode.group_results.len(),
-                snapshot.decode.group_results.iter().filter(|r| matches!(r, ClipDecodeState::Done(Err(_)))).count(),
-                snapshot.job(JobKind::LtcDecode).fraction());
+                snapshot
+                    .decode
+                    .group_results
+                    .iter()
+                    .filter(|r| matches!(r, ClipDecodeState::Done(Err(_))))
+                    .count(),
+                snapshot.job(JobKind::LtcDecode).fraction()
+            );
             break;
         }
         if Instant::now() > deadline {
-            eprintln!("TIMEOUT! group_ltc_job={:?} results={} failures={} pct={}",
+            eprintln!(
+                "TIMEOUT! group_ltc_job={:?} results={} failures={} pct={}",
                 snapshot.job(JobKind::LtcGroupDecode).phase(),
-                snapshot.decode.group_results.iter().filter(|r| r.ok().is_some()).count(),
-                snapshot.decode.group_results.iter().filter(|r| !r.is_done()).count(),
-                snapshot.job(JobKind::LtcDecode).fraction());
+                snapshot
+                    .decode
+                    .group_results
+                    .iter()
+                    .filter(|r| r.ok().is_some())
+                    .count(),
+                snapshot
+                    .decode
+                    .group_results
+                    .iter()
+                    .filter(|r| !r.is_done())
+                    .count(),
+                snapshot.job(JobKind::LtcDecode).fraction()
+            );
             panic!("test timed out waiting for group decode");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -308,7 +349,10 @@ fn test_single_clip_decode_via_group_command() {
     drop(tx);
     handle.join().expect("engine thread panicked");
 
-    assert!(snapshot.decode.group_results.iter().any(|r| r.is_done()), "should have processed at least 1 clip");
+    assert!(
+        snapshot.decode.group_results.iter().any(|r| r.is_done()),
+        "should have processed at least 1 clip"
+    );
     assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running);
 }
 
@@ -327,7 +371,12 @@ fn test_extract_audio_channel_with_progress_reports_fraction() {
     let mp4 = dir.path().join("video.mp4");
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-v", "error"]);
-    cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=2:size=128x72:rate=25",
+    ]);
     cmd.arg("-i").arg(&ltc_wav);
     cmd.args(["-map", "0:v", "-map", "1:a"]);
     cmd.args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"]);
@@ -339,14 +388,24 @@ fn test_extract_audio_channel_with_progress_reports_fraction() {
     // Probe duration for progress fraction computation
     let duration = gui_engine::probe_stream_duration_secs(&mp4, 1)
         .expect("stream duration should be available");
-    assert!(duration > 0.0, "duration should be positive, got {}", duration);
+    assert!(
+        duration > 0.0,
+        "duration should be positive, got {}",
+        duration
+    );
 
     let out = dir.path().join("extract.wav");
     let cancel = AtomicBool::new(false);
     let progress = std::sync::Mutex::new(Vec::new());
 
     let result = gui_engine::extract_audio_channel_with_progress(
-        &mp4, 1, 0, &out, Some(duration), Some(&cancel), &|frac| {
+        &mp4,
+        1,
+        0,
+        &out,
+        Some(duration),
+        Some(&cancel),
+        &|frac| {
             let mut p = progress.lock().unwrap();
             p.push(frac);
         },
@@ -359,7 +418,11 @@ fn test_extract_audio_channel_with_progress_reports_fraction() {
     assert!(!p.is_empty(), "should have progress updates");
     let last = *p.last().unwrap();
     // Last progress fraction should be near 1.0 (allow for minor timing inaccuracies)
-    assert!(last > 0.8, "final progress should be near 1.0, got {}", last);
+    assert!(
+        last > 0.8,
+        "final progress should be near 1.0, got {}",
+        last
+    );
 }
 
 /// Helper: spawn engine, send commands, monitor state.
@@ -418,14 +481,23 @@ fn test_group_decode_completes_both_clips() {
     for (i, clip) in [&clip1, &clip2].iter().enumerate() {
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-y", "-v", "error"]);
-        cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+        cmd.args([
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=128x72:rate=25",
+        ]);
         cmd.arg("-i").arg(&ltc_wav);
         cmd.args(["-map", "0:v", "-map", "1:a"]);
         cmd.args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"]);
         cmd.args(["-c:a", "aac", "-b:a", "192k", "-t", "2"]);
         cmd.arg(clip.to_string_lossy().to_string());
         let status = cmd.status().expect("failed to spawn ffmpeg for clip");
-        assert!(status.success(), "ffmpeg clip creation failed for C000{}.MP4", i + 1);
+        assert!(
+            status.success(),
+            "ffmpeg clip creation failed for C000{}.MP4",
+            i + 1
+        );
     }
 
     let paths: Vec<String> = vec![
@@ -440,7 +512,12 @@ fn test_group_decode_completes_both_clips() {
             channel_index: 0,
         }],
         |s, deadline| {
-            if !s.decode.group_results.is_empty() && matches!(s.job(JobKind::LtcGroupDecode).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled) {
+            if !s.decode.group_results.is_empty()
+                && matches!(
+                    s.job(JobKind::LtcGroupDecode).phase(),
+                    JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled
+                )
+            {
                 return true;
             }
             Instant::now() > *deadline
@@ -448,10 +525,25 @@ fn test_group_decode_completes_both_clips() {
         30,
     );
 
-    assert!(snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running, "group decode should not be detecting after completion");
-    assert_eq!(snapshot.decode.group_results.len(), 2, "two clip results expected");
-    assert_eq!(snapshot.decode.group_results.iter().filter(|r| r.ok().is_some()).count(), 2,
-        "both clips should have decode results");
+    assert!(
+        snapshot.job(JobKind::LtcGroupDecode).phase() != JobPhase::Running,
+        "group decode should not be detecting after completion"
+    );
+    assert_eq!(
+        snapshot.decode.group_results.len(),
+        2,
+        "two clip results expected"
+    );
+    assert_eq!(
+        snapshot
+            .decode
+            .group_results
+            .iter()
+            .filter(|r| r.ok().is_some())
+            .count(),
+        2,
+        "both clips should have decode results"
+    );
 }
 
 #[test]
@@ -467,7 +559,12 @@ fn test_single_video_decode_completes() {
     let mp4 = dir.path().join("video.mp4");
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-v", "error"]);
-    cmd.args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"]);
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=2:size=128x72:rate=25",
+    ]);
     cmd.arg("-i").arg(&ltc_wav);
     cmd.args(["-map", "0:v", "-map", "1:a"]);
     cmd.args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"]);
@@ -494,19 +591,23 @@ fn test_single_video_decode_completes() {
         120,
     );
 
-    assert!(snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running, "should not still be detecting");
+    assert!(
+        snapshot.job(JobKind::LtcDecode).phase() != JobPhase::Running,
+        "should not still be detecting"
+    );
     // The test sends no cancel and feeds a valid video, so a terminal
     // phase without a result is a failure, not a cancel-shaped pass-through.
     assert!(
         snapshot.decode.result.is_some(),
         "a valid video decode must produce a result, got error={:?}, result={:?}",
-        snapshot.decode.error, snapshot.decode.result
+        snapshot.decode.error,
+        snapshot.decode.result
     );
 }
 
 fn assert_decodes_ltc(wav: &Path, min_valid_frames: u32) {
-    let result = decode_ltc_from_wav(wav, 25.0, false, None)
-        .expect("LTC decode of extracted wav failed");
+    let result =
+        decode_ltc_from_wav(wav, 25.0, false, None).expect("LTC decode of extracted wav failed");
     assert!(
         matches!(result.status, LtcDecodeStatus::Success),
         "expected Success, got {:?} (valid={})",
@@ -558,8 +659,7 @@ fn test_extract_first_audio_stream_by_absolute_index() {
     let mp4 = mux_video_fixture(dir.path(), "video_1audio.mp4", &ltc_wav, false);
 
     let out = dir.path().join("extract_c0.wav");
-    extract_audio_channel(&mp4, 1, 0, &out)
-        .expect("extraction of absolute stream 1 must succeed");
+    extract_audio_channel(&mp4, 1, 0, &out).expect("extraction of absolute stream 1 must succeed");
     assert!(out.exists(), "extracted wav must exist");
 
     let reader = hound::WavReader::open(&out).expect("extracted wav must be readable");
@@ -639,8 +739,7 @@ fn test_extract_stereo_channel_1() {
     let mp4 = mux_video_fixture(dir.path(), "video_1audio.mp4", &ltc_wav, false);
 
     let out = dir.path().join("extract_c1.wav");
-    extract_audio_channel(&mp4, 1, 1, &out)
-        .expect("extraction of channel 1 must succeed");
+    extract_audio_channel(&mp4, 1, 1, &out).expect("extraction of channel 1 must succeed");
     assert_decodes_ltc(&out, 40);
 }
 
@@ -665,7 +764,10 @@ fn test_extract_invalid_stream_error_includes_ffmpeg_stderr() {
         "ffmpeg's stderr excerpt must be carried in the typed Exit payload, got: {:?}",
         err
     );
-    assert!(!out.exists(), "failed extraction must clean up its output file");
+    assert!(
+        !out.exists(),
+        "failed extraction must clean up its output file"
+    );
 }
 
 // ── Engine command path (what the GUIs drive) ────────────────────────────
@@ -686,7 +788,10 @@ fn test_engine_mpsc_parse_ltc_video() {
         GuiCommand::ParseLtcVideo(mp4_str.clone(), 1, 0),
     ]);
 
-    assert!(snapshot.decode.probe.is_some(), "probe result must be stored");
+    assert!(
+        snapshot.decode.probe.is_some(),
+        "probe result must be stored"
+    );
     assert!(
         snapshot.decode.error.is_none(),
         "unexpected decode error: {:?}",
@@ -752,17 +857,24 @@ fn test_select_recording_probe_failure_publishes_error() {
         })
         .expect("failed to spawn engine thread");
 
-    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(
+        dir.path().to_path_buf(),
+    )))
+    .unwrap();
     wait_for_folder_scan(&state);
     let initial_probe_gen = state.load().as_ref().converter.probes_generation;
-    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0)))
+        .unwrap();
 
     // Wait until the converter clip probe completes (terminal phase).
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let snapshot = state.load().as_ref().clone();
         if snapshot.converter.probes_generation > initial_probe_gen
-            && matches!(snapshot.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded | JobPhase::Failed)
+            && matches!(
+                snapshot.job(JobKind::ClipProbe).phase(),
+                JobPhase::Succeeded | JobPhase::Failed
+            )
         {
             break;
         }
@@ -816,16 +928,23 @@ fn test_select_recording_probe_falls_back_to_successful_clip() {
         })
         .expect("failed to spawn engine thread");
 
-    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(
+        dir.path().to_path_buf(),
+    )))
+    .unwrap();
     wait_for_folder_scan(&state);
     let initial_probe_gen = state.load().as_ref().converter.probes_generation;
-    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0)))
+        .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = state.load().as_ref().clone();
-if snapshot.converter.probes_generation > initial_probe_gen
-            && matches!(snapshot.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded | JobPhase::Failed)
+        if snapshot.converter.probes_generation > initial_probe_gen
+            && matches!(
+                snapshot.job(JobKind::ClipProbe).phase(),
+                JobPhase::Succeeded | JobPhase::Failed
+            )
         {
             break;
         }
@@ -840,7 +959,11 @@ if snapshot.converter.probes_generation > initial_probe_gen
         snapshot.decode.probe.is_some(),
         "ltc_probe must be populated from a later successful clip when the first fails",
     );
-    assert!(snapshot.decode.error.is_none(), "ltc_decode_error must be None when at least one clip succeeds: {:?}", snapshot.decode.error);
+    assert!(
+        snapshot.decode.error.is_none(),
+        "ltc_decode_error must be None when at least one clip succeeds: {:?}",
+        snapshot.decode.error
+    );
     assert!(snapshot.job(JobKind::ClipProbe).phase() != JobPhase::Running);
 
     drop(tx);
@@ -876,18 +999,25 @@ fn test_select_recording_preserves_ltc_probe() {
 
     // Reproduce the GUI's command order: SelectFolder → ProbeVideo → SelectRecording.
     // SelectRecording wipes ltc_probe, but the conv-probe drain must restore it.
-    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(dir.path().to_path_buf()))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectFolder(
+        dir.path().to_path_buf(),
+    )))
+    .unwrap();
     wait_for_folder_scan(&state);
     tx.send(GuiCommand::ProbeVideo(mp4_str)).unwrap();
     let initial_probe_gen = state.load().as_ref().converter.probes_generation;
-    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0)))
+        .unwrap();
 
     // Wait until the converter clip probe completes.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let snapshot = state.load().as_ref().clone();
         if snapshot.converter.probes_generation > initial_probe_gen
-            && matches!(snapshot.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded | JobPhase::Failed)
+            && matches!(
+                snapshot.job(JobKind::ClipProbe).phase(),
+                JobPhase::Succeeded | JobPhase::Failed
+            )
         {
             break;
         }
@@ -929,7 +1059,8 @@ fn test_select_recording_without_folder_does_not_probe() {
 
     // Send SelectRecording without SelectFolder — engine groups are empty.
     let initial_probe_gen = state.load().as_ref().converter.probes_generation;
-    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0))).unwrap();
+    tx.send(GuiCommand::Converter(ConverterCommand::SelectRecording(0)))
+        .unwrap();
 
     // Wait for one tick to process the command
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -939,14 +1070,20 @@ fn test_select_recording_without_folder_does_not_probe() {
         // to false so this is the signal the command was processed.
         if snapshot.converter.probes_generation > initial_probe_gen
             && (snapshot.job(JobKind::ClipProbe).phase() == JobPhase::Idle
-                || matches!(snapshot.job(JobKind::ClipProbe).phase(), JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled))
+                || matches!(
+                    snapshot.job(JobKind::ClipProbe).phase(),
+                    JobPhase::Succeeded | JobPhase::Failed | JobPhase::Cancelled
+                ))
         {
             break;
         }
         if Instant::now() > deadline {
             let s = state.load();
-            panic!("engine did not process SelectRecording within 10s (phase={:?}, gen={})",
-                s.job(JobKind::ClipProbe).phase(), s.converter.probes_generation);
+            panic!(
+                "engine did not process SelectRecording within 10s (phase={:?}, gen={})",
+                s.job(JobKind::ClipProbe).phase(),
+                s.converter.probes_generation
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }

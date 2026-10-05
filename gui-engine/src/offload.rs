@@ -10,8 +10,8 @@ use chrono::{DateTime, Local, NaiveDate};
 use log::{debug, info, warn};
 
 use crate::device_name;
-use crate::subprocess::no_window_command;
 pub use crate::device_name::DeviceNameSource;
+use crate::subprocess::no_window_command;
 
 /// Extract drive letters from a `GetLogicalDrives` bitmask (bit 0 = 'A').
 /// Platform-independent so the parsing logic is unit-testable off-Windows.
@@ -23,7 +23,6 @@ pub(crate) fn drive_letters_from_mask(mask: u32) -> Vec<char> {
         .collect()
 }
 
-
 // ── Windows drive enumeration helper ─────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -31,9 +30,8 @@ mod win_driver {
     use std::path::PathBuf;
     use windows_sys::Win32::Storage::FileSystem;
     use windows_sys::Win32::System::WindowsProgramming::{
-        DRIVE_CDROM, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK,
-        DRIVE_REMOTE, DRIVE_UNKNOWN,
-        DRIVE_REMOVABLE as WIN32_DRIVE_REMOVABLE,
+        DRIVE_CDROM, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_RAMDISK, DRIVE_REMOTE,
+        DRIVE_REMOVABLE as WIN32_DRIVE_REMOVABLE, DRIVE_UNKNOWN,
     };
 
     pub struct DriveCandidate {
@@ -52,7 +50,11 @@ mod win_driver {
             let root = format!("{}:\\", letter);
             let root_wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
             let kind = unsafe { FileSystem::GetDriveTypeW(root_wide.as_ptr()) };
-            candidates.push(DriveCandidate { letter, kind, root: PathBuf::from(root) });
+            candidates.push(DriveCandidate {
+                letter,
+                kind,
+                root: PathBuf::from(root),
+            });
         }
         candidates
     }
@@ -189,9 +191,9 @@ impl OffloadSnapshot {
             device_totals: Vec::new(),
             completed_devices: Vec::new(),
             last_offload_parent: None,
-        last_offload_version: 0,
-        error: None,
-        plan_error: None,
+            last_offload_version: 0,
+            error: None,
+            plan_error: None,
             file_durations: HashMap::new(),
             durations_version: 0,
         }
@@ -315,7 +317,8 @@ pub fn detect_cards_with_progress(progress: Option<&ScanProgress>) -> Vec<SdCard
                 );
                 let updated_mounts =
                     fs::read_to_string("/proc/mounts").unwrap_or_else(|_| mounts.clone());
-                let new_cards = detect_cards_from_mounts(&updated_mounts, sys_root, deadline, progress);
+                let new_cards =
+                    detect_cards_from_mounts(&updated_mounts, sys_root, deadline, progress);
                 let existing: std::collections::HashSet<PathBuf> =
                     cards.iter().map(|c| c.mount.clone()).collect();
                 for c in new_cards {
@@ -363,10 +366,7 @@ fn collect_mounted_devices(mounts_content: &str) -> std::collections::HashSet<St
 /// Walk `/sys/class/block` for card-like device partitions that are not
 /// listed in the given mounts content. Returns a list of partition device
 /// names (e.g. `sdb1`, `mmcblk0p1`).
-fn find_unmounted_card_partitions(
-    mounts_content: &str,
-    sys_root: &Path,
-) -> Vec<String> {
+fn find_unmounted_card_partitions(mounts_content: &str, sys_root: &Path) -> Vec<String> {
     let mounted = collect_mounted_devices(mounts_content);
     let mut result = Vec::new();
 
@@ -448,7 +448,10 @@ fn udisks_mount(dev_path: &str) -> std::io::Result<Option<PathBuf>> {
 /// the shared exit-status/mountpoint parsing.
 fn udisks_mount_with(
     dev_path: &str,
-    runner: &mut dyn FnMut(&[String]) -> Result<std::process::Output, crate::subprocess::SubprocessFailure>,
+    runner: &mut dyn FnMut(
+        &[String],
+    )
+        -> Result<std::process::Output, crate::subprocess::SubprocessFailure>,
 ) -> std::io::Result<Option<PathBuf>> {
     let args = ["mount".to_string(), "-b".to_string(), dev_path.to_string()];
     let output = runner(&args).map_err(|e| Error::other(e.to_string()))?;
@@ -495,7 +498,11 @@ pub fn detect_cards_with_progress(progress: Option<&ScanProgress>) -> Vec<SdCard
 /// Windows arm of [`detect_cards_with_progress`]: probe each removable drive
 /// found via `GetLogicalDrives` and append accepted cards to `cards`.
 #[cfg(all(not(target_os = "linux"), target_os = "windows"))]
-fn scan_windows_drives(cards: &mut Vec<SdCardInfo>, deadline: Instant, progress: Option<&ScanProgress>) {
+fn scan_windows_drives(
+    cards: &mut Vec<SdCardInfo>,
+    deadline: Instant,
+    progress: Option<&ScanProgress>,
+) {
     let candidates = win_driver::enumerate();
     info!(
         "Windows card scan: {} drive(s) detected via GetLogicalDrives",
@@ -508,7 +515,10 @@ fn scan_windows_drives(cards: &mut Vec<SdCardInfo>, deadline: Instant, progress:
             continue;
         }
         if Instant::now() >= deadline {
-            warn!("Windows card scan: budget exceeded — skipping drive {}", cand.letter);
+            warn!(
+                "Windows card scan: budget exceeded — skipping drive {}",
+                cand.letter
+            );
             break;
         }
         if let Some(p) = progress {
@@ -530,7 +540,11 @@ fn scan_windows_drives(cards: &mut Vec<SdCardInfo>, deadline: Instant, progress:
 /// macOS arm of [`detect_cards_with_progress`]: probe each volume under
 /// `/Volumes` and append accepted cards to `cards`.
 #[cfg(all(not(target_os = "linux"), target_os = "macos"))]
-fn scan_macos_volumes(cards: &mut Vec<SdCardInfo>, deadline: Instant, progress: Option<&ScanProgress>) {
+fn scan_macos_volumes(
+    cards: &mut Vec<SdCardInfo>,
+    deadline: Instant,
+    progress: Option<&ScanProgress>,
+) {
     match fs::read_dir("/Volumes") {
         Ok(entries) => {
             for entry in entries.flatten() {
@@ -561,10 +575,7 @@ fn scan_macos_volumes(cards: &mut Vec<SdCardInfo>, deadline: Instant, progress: 
                     debug!("macOS volume {:?}: no media files found", mp);
                 }
             }
-            info!(
-                "macOS /Volumes scan: {} volume(s) processed",
-                cards.len()
-            );
+            info!("macOS /Volumes scan: {} volume(s) processed", cards.len());
         }
         Err(e) => {
             log::warn!("Cannot read /Volumes: {} — only real volumes skipped", e);
@@ -644,11 +655,9 @@ fn mount_candidates(mounts_content: &str, sys_root: &Path, user: &str) -> (Vec<P
         }
 
         // Must be under a recognised media mount root.
-        let in_media = mp.starts_with("/media")
-            || mp.starts_with("/run/media")
-            || mp.starts_with("/mnt");
-        let in_user_media = mp.starts_with(format!("/media/{}", user))
-            || in_user_run_media;
+        let in_media =
+            mp.starts_with("/media") || mp.starts_with("/run/media") || mp.starts_with("/mnt");
+        let in_user_media = mp.starts_with(format!("/media/{}", user)) || in_user_run_media;
         if !in_media && !in_user_media {
             skipped += 1;
             continue;
@@ -684,7 +693,10 @@ fn probe_candidates(
             continue;
         }
         if Instant::now() >= deadline {
-            warn!("detect_cards_from_mounts: budget exceeded — skipping {:?}", mp);
+            warn!(
+                "detect_cards_from_mounts: budget exceeded — skipping {:?}",
+                mp
+            );
             budget_exhausted += 1;
             continue;
         }
@@ -721,11 +733,18 @@ fn classify_mount(mount: &Path, _label_source: &Path, deadline: Instant) -> Opti
     let volume_label = volume_label_for(mount);
 
     if media_files.is_empty() {
-        debug!("Mount {:?} rejected: no media files found (label='{}')", mount, volume_label);
+        debug!(
+            "Mount {:?} rejected: no media files found (label='{}')",
+            mount, volume_label
+        );
         return None;
     }
 
-    debug!("Resolving device name from {} file(s) with budget until {:?}", media_files.len(), deadline);
+    debug!(
+        "Resolving device name from {} file(s) with budget until {:?}",
+        media_files.len(),
+        deadline
+    );
     let budget = deadline.saturating_duration_since(Instant::now());
     let (device_name, name_source, pattern_name) =
         device_name::resolve_device_name_with_budget(&media_files, &volume_label, None, budget);
@@ -772,7 +791,10 @@ fn collect_media_files_shallow(root: &Path) -> Vec<OffloadFileInfo> {
             Err(_) => continue,
         };
         // Limit depth by counting path components beyond root.
-        let depth = dir.components().count().saturating_sub(root.components().count());
+        let depth = dir
+            .components()
+            .count()
+            .saturating_sub(root.components().count());
         for entry in read_dir.flatten() {
             if files.len() >= MAX_CARD_FILES {
                 break;
@@ -795,7 +817,9 @@ fn collect_media_files_shallow(root: &Path) -> Vec<OffloadFileInfo> {
                 stack.push(entry.path());
             } else if ft.is_file() && is_media_file(&entry.path()) {
                 let p = entry.path();
-                let modified = fs::metadata(&p).ok().and_then(|m| m.modified().ok().map(|sys| sys.into()));
+                let modified = fs::metadata(&p)
+                    .ok()
+                    .and_then(|m| m.modified().ok().map(|sys| sys.into()));
                 let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                 files.push(OffloadFileInfo {
                     path: p,
@@ -810,7 +834,11 @@ fn collect_media_files_shallow(root: &Path) -> Vec<OffloadFileInfo> {
     let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
     debug!(
         "Scanned {:?}: {} dirs visited, {} symlinks skipped, {} media files ({} bytes)",
-        root, visited_dirs, skipped_symlinks, files.len(), total_bytes
+        root,
+        visited_dirs,
+        skipped_symlinks,
+        files.len(),
+        total_bytes
     );
     files
 }
@@ -950,16 +978,14 @@ pub fn build_copy_plan(
     let device_plans: Vec<Vec<CopyPlanItem>> = cards
         .iter()
         .map(|card| {
-            let selected_with_sizes: Vec<(PathBuf, u64)> = card.files.iter()
+            let selected_with_sizes: Vec<(PathBuf, u64)> = card
+                .files
+                .iter()
                 .zip(card.selected.iter())
                 .filter(|(_, &sel)| sel)
                 .map(|(f, _)| (f.path.clone(), f.size_bytes))
                 .collect();
-            plan_copies_for_files_with_sizes(
-                &selected_with_sizes,
-                &card.device_name,
-                &dest_parent,
-            )
+            plan_copies_for_files_with_sizes(&selected_with_sizes, &card.device_name, &dest_parent)
         })
         .collect();
 
@@ -967,7 +993,8 @@ pub fn build_copy_plan(
         return Err(OffloadPlanError::NoFilesSelected);
     }
 
-    let device_totals: Vec<OffloadDeviceTotals> = device_names.iter()
+    let device_totals: Vec<OffloadDeviceTotals> = device_names
+        .iter()
         .zip(device_plans.iter())
         .map(|(name, plans)| OffloadDeviceTotals {
             name: name.clone(),
@@ -975,7 +1002,10 @@ pub fn build_copy_plan(
             bytes_total: plans.iter().map(|p| p.size).sum(),
         })
         .collect();
-    let total_bytes = device_plans.iter().flat_map(|p| p.iter().map(|i| i.size)).sum();
+    let total_bytes = device_plans
+        .iter()
+        .flat_map(|p| p.iter().map(|i| i.size))
+        .sum();
 
     Ok(OffloadCopyPlan {
         device_names,
@@ -991,7 +1021,8 @@ pub fn build_copy_plan(
 /// Find the latest date (in local time) for which any file has a recording.
 /// Returns `None` if no files have a valid modification time.
 pub fn latest_recording_date(files: &[OffloadFileInfo]) -> Option<NaiveDate> {
-    files.iter()
+    files
+        .iter()
         .filter_map(|f| f.modified)
         .map(|dt| dt.date_naive())
         .max()
@@ -1004,18 +1035,29 @@ pub fn default_selection(files: &[OffloadFileInfo]) -> Vec<bool> {
         Some(d) => d,
         None => return vec![false; files.len()],
     };
-    files.iter()
-        .map(|f| f.modified.map(|dt| dt.date_naive() == latest).unwrap_or(false))
+    files
+        .iter()
+        .map(|f| {
+            f.modified
+                .map(|dt| dt.date_naive() == latest)
+                .unwrap_or(false)
+        })
         .collect()
 }
 
 /// Apply a selection vector to a card: update `selected`, `selected_count`,
 /// and `selected_bytes`. Panics if the selection length doesn't match.
 pub fn apply_selection(card: &mut SdCardInfo, selection: Vec<bool>) {
-    assert_eq!(selection.len(), card.files.len(), "selection length mismatch");
+    assert_eq!(
+        selection.len(),
+        card.files.len(),
+        "selection length mismatch"
+    );
     card.selected = selection;
     card.selected_count = card.selected.iter().filter(|&&s| s).count();
-    card.selected_bytes = card.files.iter()
+    card.selected_bytes = card
+        .files
+        .iter()
         .zip(card.selected.iter())
         .filter(|(_, &sel)| sel)
         .map(|(f, _)| f.size_bytes)
@@ -1044,8 +1086,6 @@ fn resolve_collision(name: &str, used: &mut HashMap<String, u32>) -> String {
 
 // ── Copy execution ──────────────────────────────────────────────────────
 
-
-
 /// Copy a single file with 1 MiB chunked IO.
 ///
 /// Reads the source in `COPY_BUF_SIZE` chunks, writes each chunk to a
@@ -1058,12 +1098,13 @@ fn copy_file(
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(u64),
 ) -> Result<(), CopyError> {
-    let src_file = fs::File::open(src).map_err(|e| CopyError::Io(format!("Cannot open {:?}: {}", src, e)))?;
+    let src_file =
+        fs::File::open(src).map_err(|e| CopyError::Io(format!("Cannot open {:?}: {}", src, e)))?;
     let mut src_file = std::io::BufReader::with_capacity(COPY_BUF_SIZE, src_file);
 
     let tmp = dst.with_extension("offload_tmp");
-    let mut dst_file =
-        fs::File::create(&tmp).map_err(|e| CopyError::Io(format!("Cannot create {:?}: {}", tmp, e)))?;
+    let mut dst_file = fs::File::create(&tmp)
+        .map_err(|e| CopyError::Io(format!("Cannot create {:?}: {}", tmp, e)))?;
 
     let mut buf = vec![0u8; COPY_BUF_SIZE];
     let mut total: u64 = 0;
@@ -1092,7 +1133,8 @@ fn copy_file(
         .sync_all()
         .map_err(|e| CopyError::Io(format!("Sync error on {:?}: {}", tmp, e)))?;
     drop(dst_file);
-    fs::rename(&tmp, dst).map_err(|e| CopyError::Io(format!("Rename {:?} → {:?}: {}", tmp, dst, e)))?;
+    fs::rename(&tmp, dst)
+        .map_err(|e| CopyError::Io(format!("Rename {:?} → {:?}: {}", tmp, dst, e)))?;
     Ok(())
 }
 
@@ -1120,8 +1162,6 @@ pub fn verify_copy(src: &Path, dst: &Path, mode: &VerifyMode) -> Result<(), Stri
     }
 }
 
-
-
 /// Resolve the base (whole-disk) device name from a partition or device name.
 /// Uses the sysfs `partition` attribute to detect partitions:
 /// returns the input unchanged if it's already a whole-disk device.
@@ -1143,9 +1183,7 @@ fn base_device_name<'a>(dev_part: &'a str, sys_root: &'a Path) -> &'a str {
     // Strip trailing digits, then a trailing 'p' if the remainder ends in a digit.
     let trimmed = dev_part.trim_end_matches(|c: char| c.is_ascii_digit());
     if let Some(stripped) = trimmed.strip_suffix('p') {
-        if !stripped.is_empty()
-            && stripped.ends_with(|c: char| c.is_ascii_digit())
-        {
+        if !stripped.is_empty() && stripped.ends_with(|c: char| c.is_ascii_digit()) {
             return stripped;
         }
     }
@@ -1243,7 +1281,8 @@ pub fn run_offload_scan_job_with(
         }
     };
 
-    ctx.progress.set_message(format!("Found {} card(s)", cards.len()));
+    ctx.progress
+        .set_message(format!("Found {} card(s)", cards.len()));
     ctx.progress.set_indeterminate(false);
     ctx.progress.grow_to(1);
     ctx.progress.unit(0).finish();
@@ -1263,9 +1302,15 @@ pub fn run_offload_copy_job(
 ) -> Result<JobFinal, JobError> {
     ctx.cancel.check()?;
 
-    let grand_total: u64 = device_plans.iter().flat_map(|p| p.iter()).map(|i| i.size).sum();
+    let grand_total: u64 = device_plans
+        .iter()
+        .flat_map(|p| p.iter())
+        .map(|i| i.size)
+        .sum();
     if grand_total == 0 || device_names.is_empty() {
-        return Ok(JobFinal::OffloadCopy { completed_devices: Vec::new() });
+        return Ok(JobFinal::OffloadCopy {
+            completed_devices: Vec::new(),
+        });
     }
 
     let dev_count = device_names.len();
@@ -1285,7 +1330,8 @@ pub fn run_offload_copy_job(
         dev_unit.set_state(UnitState::Running);
         dev_unit.set_message(format!("Starting device '{}'…", name));
 
-        let dest_parent_dev = plans.first()
+        let dest_parent_dev = plans
+            .first()
             .and_then(|p| p.dst.parent())
             .unwrap_or(&dest_parent)
             .to_path_buf();
@@ -1307,7 +1353,12 @@ pub fn run_offload_copy_job(
                 break;
             }
 
-            dev_unit.set_message(format!("[{}/{}] {}", item_idx + 1, dev_total, item.dst.display()));
+            dev_unit.set_message(format!(
+                "[{}/{}] {}",
+                item_idx + 1,
+                dev_total,
+                item.dst.display()
+            ));
 
             let mut bytes_copied: u64 = 0;
             match copy_file(&item.src, &item.dst, &cancel_flag, &mut |total| {
@@ -1315,7 +1366,8 @@ pub fn run_offload_copy_job(
             }) {
                 Ok(()) => {
                     cumulative_bytes += bytes_copied;
-                    let speed = speed_meter.update(cumulative_bytes as usize, std::time::Instant::now());
+                    let speed =
+                        speed_meter.update(cumulative_bytes as usize, std::time::Instant::now());
                     ctx.progress.set_speed(speed);
                     if verify_copy(&item.src, &item.dst, &verify_mode).is_ok() {
                         dev_unit.set_fraction((item_idx + 1) as f32 / dev_total as f32);
@@ -1348,7 +1400,9 @@ pub fn run_offload_copy_job(
         }
     }
 
-    Ok(JobFinal::OffloadCopy { completed_devices: completed })
+    Ok(JobFinal::OffloadCopy {
+        completed_devices: completed,
+    })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1365,14 +1419,22 @@ mod tests {
             name_source: DeviceNameSource::VolumeLabel,
             media_file_count: files.len(),
             total_bytes: files.iter().map(|f| f.1).sum(),
-            files: files.iter().map(|(n, sz)| OffloadFileInfo {
-                path: PathBuf::from(n),
-                name: (*n).to_string(),
-                size_bytes: *sz,
-                modified: None,
-            }).collect(),
+            files: files
+                .iter()
+                .map(|(n, sz)| OffloadFileInfo {
+                    path: PathBuf::from(n),
+                    name: (*n).to_string(),
+                    size_bytes: *sz,
+                    modified: None,
+                })
+                .collect(),
             selected_count: select.iter().filter(|&&s| s).count(),
-            selected_bytes: files.iter().zip(select.iter()).filter(|(_, &s)| s).map(|(f, _)| f.1).sum(),
+            selected_bytes: files
+                .iter()
+                .zip(select.iter())
+                .filter(|(_, &s)| s)
+                .map(|(f, _)| f.1)
+                .sum(),
             selected: select,
         }
     }
@@ -1393,13 +1455,21 @@ mod tests {
     #[test]
     fn build_copy_plan_aggregates_selected_files_per_device() {
         let cards = vec![
-            card("CAM_A", vec![("/a/c1.mp4", 100), ("/a/c2.mp4", 200)], vec![true, false]),
+            card(
+                "CAM_A",
+                vec![("/a/c1.mp4", 100), ("/a/c2.mp4", 200)],
+                vec![true, false],
+            ),
             card("CAM_B", vec![("/b/c1.mp4", 50)], vec![true]),
         ];
         let plan = build_copy_plan(&cards, Path::new("/parent"), "2026-01-01").unwrap();
         assert_eq!(plan.device_names, vec!["CAM_A", "CAM_B"]);
         assert_eq!(plan.device_plans.len(), 2);
-        assert_eq!(plan.device_plans[0].len(), 1, "only the selected file is planned");
+        assert_eq!(
+            plan.device_plans[0].len(),
+            1,
+            "only the selected file is planned"
+        );
         assert_eq!(plan.device_plans[0][0].src, PathBuf::from("/a/c1.mp4"));
         assert_eq!(plan.device_plans[1].len(), 1);
         assert_eq!(plan.total_files(), 2);
@@ -1410,11 +1480,16 @@ mod tests {
         assert_eq!(plan.device_totals[0].files_total, 1);
         assert_eq!(plan.device_totals[0].bytes_total, 100);
         // Destination layout: dest_parent/<device>/<filename>
-        assert_eq!(plan.device_plans[0][0].dst, PathBuf::from("/parent/2026-01-01/CAM_A/c1.mp4"));
+        assert_eq!(
+            plan.device_plans[0][0].dst,
+            PathBuf::from("/parent/2026-01-01/CAM_A/c1.mp4")
+        );
     }
 
     use super::*;
-    use crate::job::{CancelToken, JobEvent, JobKind, JobOutcome, JobSpec, ProgressTracker, UnitSpec, spawn_job};
+    use crate::job::{
+        spawn_job, CancelToken, JobEvent, JobKind, JobOutcome, JobSpec, ProgressTracker, UnitSpec,
+    };
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1487,14 +1562,8 @@ mod tests {
         assert_eq!(plans.len(), 2);
         assert!(plans[0].dst.starts_with(dest.path().join("A6700")));
         assert!(plans[1].dst.starts_with(dest.path().join("A6700")));
-        assert_eq!(
-            plans[0].dst.file_name().unwrap(),
-            "C0001.MP4"
-        );
-        assert_eq!(
-            plans[1].dst.file_name().unwrap(),
-            "C0002.MP4"
-        );
+        assert_eq!(plans[0].dst.file_name().unwrap(), "C0001.MP4");
+        assert_eq!(plans[1].dst.file_name().unwrap(), "C0002.MP4");
     }
 
     #[test]
@@ -1543,14 +1612,8 @@ mod tests {
         // Since we sort alphabetically by src path, DCIM/100M... comes first,
         // DCIM/101M... second, root third.
         assert!(plans[0].dst.to_string_lossy().ends_with("C0001.MP4"));
-        assert!(plans[1]
-            .dst
-            .to_string_lossy()
-            .ends_with("C0001 (2).MP4"));
-        assert!(plans[2]
-            .dst
-            .to_string_lossy()
-            .ends_with("C0001 (3).MP4"));
+        assert!(plans[1].dst.to_string_lossy().ends_with("C0001 (2).MP4"));
+        assert!(plans[2].dst.to_string_lossy().ends_with("C0001 (3).MP4"));
     }
 
     // ── plan_copies_for_files_with_sizes ─────────────────────────────
@@ -1579,9 +1642,12 @@ mod tests {
 
         // Run the size-based version with known sizes.
         let sizes: Vec<(std::path::PathBuf, u64)> = vec![
-            (card.path().join("C0001.MP4"), 6),       // "data_a" = 6 bytes
-            (card.path().join("C0002.MP4"), 7),       // "data_bb" = 7 bytes
-            (card.path().join("DCIM").join("100MSDCF").join("C0001.MP4"), 8), // "data_ccc" = 8 bytes
+            (card.path().join("C0001.MP4"), 6), // "data_a" = 6 bytes
+            (card.path().join("C0002.MP4"), 7), // "data_bb" = 7 bytes
+            (
+                card.path().join("DCIM").join("100MSDCF").join("C0001.MP4"),
+                8,
+            ), // "data_ccc" = 8 bytes
         ];
         let plans_size = plan_copies_for_files_with_sizes(&sizes, "A6100", dest.path());
 
@@ -1643,8 +1709,6 @@ mod tests {
         assert!(verify_copy(&src, &dst, &VerifyMode::SizeOnly).is_err());
     }
 
-    
-
     #[test]
     fn test_copy_file_copies_content_correctly() {
         let dir = TempDir::new().unwrap();
@@ -1661,7 +1725,10 @@ mod tests {
 
         // Content matches.
         let dst_content = fs::read(&dst).unwrap();
-        assert_eq!(dst_content, content, "copied file content must match source");
+        assert_eq!(
+            dst_content, content,
+            "copied file content must match source"
+        );
 
         // Progress callback called with increasing values ending at file size.
         assert!(
@@ -1685,8 +1752,11 @@ mod tests {
         // contract: at least one callback per full buffer. Floor, not exact
         // count (read() may deliver short reads).
         let expected_min = content.len().div_ceil(COPY_BUF_SIZE);
-        assert!(progress_events.len() >= expected_min,
-            "expected >= {expected_min} progress callbacks, got {}", progress_events.len());
+        assert!(
+            progress_events.len() >= expected_min,
+            "expected >= {expected_min} progress callbacks, got {}",
+            progress_events.len()
+        );
     }
 
     #[test]
@@ -1712,7 +1782,10 @@ mod tests {
         );
 
         // Destination should NOT exist (tmp was deleted on cancel).
-        assert!(!dst.exists(), "destination should not exist after cancelled copy");
+        assert!(
+            !dst.exists(),
+            "destination should not exist after cancelled copy"
+        );
 
         // Temp file should be gone.
         let tmp = dst.with_extension("offload_tmp");
@@ -1747,8 +1820,6 @@ mod tests {
         // Destination should not exist.
         assert!(!dst.exists());
     }
-
-    
 
     // ── detect_cards_from_mounts ──────────────────────────────────────
 
@@ -1821,9 +1892,18 @@ proc /proc proc rw 0 0
             .filter_map(|n| n.to_str())
             .collect();
 
-        assert!(names.contains(&"root_clip.mp4"), "real file should be found");
-        assert!(!names.contains(&"cycle_back"), "symlink dir should be skipped");
-        assert!(!names.contains(&"linked.mp4"), "symlink file should be skipped");
+        assert!(
+            names.contains(&"root_clip.mp4"),
+            "real file should be found"
+        );
+        assert!(
+            !names.contains(&"cycle_back"),
+            "symlink dir should be skipped"
+        );
+        assert!(
+            !names.contains(&"linked.mp4"),
+            "symlink file should be skipped"
+        );
     }
 
     // ── Depth limit in collect_media_files_shallow ───────────────────────
@@ -1847,8 +1927,14 @@ proc /proc proc rw 0 0
             .collect();
 
         // The shallow file should be found, the deep one (depth > 6) should not.
-        assert!(names.contains(&"shallow.mp4"), "shallow file should be found");
-        assert!(!names.contains(&"deep.mp4"), "deep file beyond depth limit should not be found");
+        assert!(
+            names.contains(&"shallow.mp4"),
+            "shallow file should be found"
+        );
+        assert!(
+            !names.contains(&"deep.mp4"),
+            "deep file beyond depth limit should not be found"
+        );
     }
 
     // ── Windows drive bitmask parsing (pure logic, no API calls) ────────
@@ -1861,7 +1947,10 @@ proc /proc proc rw 0 0
         let mask: u32 = (1u32 << 0) | (1u32 << 2) | (1u32 << 25);
         assert_eq!(drive_letters_from_mask(mask), vec!['A', 'C', 'Z']);
 
-        assert!(drive_letters_from_mask(0).is_empty(), "empty mask -> no drives");
+        assert!(
+            drive_letters_from_mask(0).is_empty(),
+            "empty mask -> no drives"
+        );
         assert_eq!(drive_letters_from_mask(1u32 << 2), vec!['C']);
 
         // High bits beyond 'Z' (>= 26) must be ignored.
@@ -1944,9 +2033,18 @@ proc /proc proc rw 0 0
         }
 
         for dev in usb_devs {
-            let symlink_target = root.join("devices").join("pci0000:00").join("0000:00:14.0")
-                .join("usb1").join("1-1").join("1-1:1.0").join("host0")
-                .join("target0:0:0").join("0:0:0:0").join("block").join(dev);
+            let symlink_target = root
+                .join("devices")
+                .join("pci0000:00")
+                .join("0000:00:14.0")
+                .join("usb1")
+                .join("1-1")
+                .join("1-1:1.0")
+                .join("host0")
+                .join("target0:0:0")
+                .join("0:0:0:0")
+                .join("block")
+                .join(dev);
             fs::create_dir_all(&symlink_target).unwrap();
             fs::write(symlink_target.join("removable"), "0").unwrap();
             let link_path = root.join("class").join("block").join(dev);
@@ -1956,8 +2054,15 @@ proc /proc proc rw 0 0
         }
 
         for dev in mmc_devs {
-            let symlink_target = root.join("devices").join("pci0000:00").join("0000:00:1a.0")
-                .join("mmc_host").join("mmc0").join("mmc0:0001").join("block").join(dev);
+            let symlink_target = root
+                .join("devices")
+                .join("pci0000:00")
+                .join("0000:00:1a.0")
+                .join("mmc_host")
+                .join("mmc0")
+                .join("mmc0:0001")
+                .join("block")
+                .join(dev);
             fs::create_dir_all(&symlink_target).unwrap();
             fs::write(symlink_target.join("removable"), "0").unwrap();
             let link_path = root.join("class").join("block").join(dev);
@@ -1967,8 +2072,15 @@ proc /proc proc rw 0 0
         }
 
         // Nvme — should NOT be card-like (removable=0, pci bus, not usb/mmc).
-        let nvme_tgt = root.join("devices").join("pci0000:00").join("0000:00:1c.0")
-            .join("nvme").join("nvme0").join("nvme0n1").join("block").join("nvme0n1");
+        let nvme_tgt = root
+            .join("devices")
+            .join("pci0000:00")
+            .join("0000:00:1c.0")
+            .join("nvme")
+            .join("nvme0")
+            .join("nvme0n1")
+            .join("block")
+            .join("nvme0n1");
         fs::create_dir_all(&nvme_tgt).unwrap();
         fs::write(nvme_tgt.join("removable"), "0").unwrap();
         let nvme_link = root.join("class").join("block").join("nvme0n1");
@@ -2090,7 +2202,10 @@ systemd-1 /run/snapd/ns/snapd-disk-annotate.mnt autofs rw 0 0
 ";
         let sys = make_mock_sys(&[], &[], &[], &[]);
         let cards = detect_cards_from_mounts(mounts, sys.path(), far_deadline(), None);
-        assert!(cards.is_empty(), "nvme under /run/media should be excluded by bus heuristic");
+        assert!(
+            cards.is_empty(),
+            "nvme under /run/media should be excluded by bus heuristic"
+        );
     }
 
     #[test]
@@ -2203,19 +2318,11 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         // the filter in detect_cards_from_mounts. Use /mnt/../tmp/... which
         // starts with /mnt as a prefix path component but resolves to the TempDir.
         let fake_mount = format!("/mnt/..{}", mp.display());
-        let mounts = format!(
-            "/dev/sdb1 {} vfat rw 0 0",
-            fake_mount
-        );
+        let mounts = format!("/dev/sdb1 {} vfat rw 0 0", fake_mount);
         let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
 
         let progress = ScanProgress::new();
-        let cards = detect_cards_from_mounts(
-            &mounts,
-            sys.path(),
-            far_deadline(),
-            Some(&progress),
-        );
+        let cards = detect_cards_from_mounts(&mounts, sys.path(), far_deadline(), Some(&progress));
 
         // The progress cell should have been set with a message about the mount path.
         let last_msg = progress.read();
@@ -2241,10 +2348,7 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         fs::write(mp.join("C0001.MP4"), b"data").unwrap();
 
         let fake_mount = format!("/mnt/..{}", mp.display());
-        let mounts = format!(
-            "/dev/sdb1 {} vfat rw 0 0",
-            fake_mount
-        );
+        let mounts = format!("/dev/sdb1 {} vfat rw 0 0", fake_mount);
         let sys = make_mock_sys(&["sdb"], &[], &[], &["sdb1"]);
 
         let cards = detect_cards_from_mounts(&mounts, sys.path(), far_deadline(), None);
@@ -2297,7 +2401,10 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
 
     /// Helper: create a minimal JobContext for testing.
     fn test_job_context() -> (JobContext, ProgressTracker) {
-        let tracker = ProgressTracker::new(vec![UnitSpec { weight: 1.0, label: "test".into() }]);
+        let tracker = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "test".into(),
+        }]);
         let tracker_clone = tracker.clone();
         let cancel = CancelToken::new();
         let emit: Box<dyn Fn(crate::job::JobItem) + Send + Sync> = Box::new(|_| {});
@@ -2361,10 +2468,14 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         let (ctx, tracker) = test_job_context();
         let plans = vec![vec![
             CopyPlanItem {
-                src: src1, dst: dst1, size: 1 << 20,
+                src: src1,
+                dst: dst1,
+                size: 1 << 20,
             },
             CopyPlanItem {
-                src: src2, dst: dst2, size: 1 << 20,
+                src: src2,
+                dst: dst2,
+                size: 1 << 20,
             },
         ]];
         let names = vec!["DEVICE".to_string()];
@@ -2412,18 +2523,17 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         });
 
         // Run detect_cards_from_mounts with the forwarding ScanProgress.
-        let cards = detect_cards_from_mounts(
-            &mounts,
-            sys.path(),
-            far_deadline(),
-            Some(&scan_progress),
-        );
+        let cards =
+            detect_cards_from_mounts(&mounts, sys.path(), far_deadline(), Some(&scan_progress));
 
         assert_eq!(cards.len(), 1);
 
         // The progress tracker's message should have been set.
         let tracker_msg = tracker.snapshot().message;
-        assert!(!tracker_msg.is_empty(), "tracker should have a non-empty message after scan");
+        assert!(
+            !tracker_msg.is_empty(),
+            "tracker should have a non-empty message after scan"
+        );
 
         // The forwarded messages should include the mount path.
         let msgs = forward_msgs.lock().unwrap();
@@ -2443,13 +2553,18 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
     /// supervisor and return the drained `JobEvent::Finished` event. This is
     /// the only place the OffloadScan job kind is exercised end-to-end.
     fn run_scan_job_to_finished(
-        detect: impl Fn(&CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String> + Send + 'static,
+        detect: impl Fn(&CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String>
+            + Send
+            + 'static,
     ) -> JobEvent {
         let mut supervisor = crate::job::JobSupervisor::new();
         let spec = JobSpec {
             kind: JobKind::OffloadScan,
             name: "offload-scan-test",
-            units: vec![UnitSpec { weight: 1.0, label: "scan".into() }],
+            units: vec![UnitSpec {
+                weight: 1.0,
+                label: "scan".into(),
+            }],
         };
         spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
             run_offload_scan_job_with(ctx, detect)
@@ -2460,7 +2575,9 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         loop {
             supervisor.poll(); // moves channel events into the events buffer
             let events = supervisor.drain();
-            let finished = events.into_iter().find(|e| matches!(e, JobEvent::Finished { .. }));
+            let finished = events
+                .into_iter()
+                .find(|e| matches!(e, JobEvent::Finished { .. }));
             if let Some(f) = finished {
                 supervisor.shutdown(std::time::Duration::from_secs(1));
                 return f;
@@ -2479,15 +2596,17 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
             Ok(vec![card("TESTCAM", vec![("/mnt/a.wav", 10)], vec![true])])
         });
         match event {
-            JobEvent::Finished { outcome: JobOutcome::Succeeded { .. }, payload, .. } => {
-                match payload {
-                    JobFinal::OffloadScan { cards } => {
-                        assert_eq!(cards.len(), 1);
-                        assert_eq!(cards[0].device_name, "TESTCAM");
-                    }
-                    other => panic!("expected OffloadScan payload, got {other:?}"),
+            JobEvent::Finished {
+                outcome: JobOutcome::Succeeded { .. },
+                payload,
+                ..
+            } => match payload {
+                JobFinal::OffloadScan { cards } => {
+                    assert_eq!(cards.len(), 1);
+                    assert_eq!(cards[0].device_name, "TESTCAM");
                 }
-            }
+                other => panic!("expected OffloadScan payload, got {other:?}"),
+            },
             other => panic!("expected Succeeded Finished event, got {other:?}"),
         }
     }
@@ -2496,7 +2615,10 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
     fn test_run_offload_scan_job_with_err_fails_job() {
         let event = run_scan_job_to_finished(|_cancel, _progress| Err("detector boom".to_string()));
         match event {
-            JobEvent::Finished { outcome: JobOutcome::Failed { error, .. }, .. } => {
+            JobEvent::Finished {
+                outcome: JobOutcome::Failed { error, .. },
+                ..
+            } => {
                 // The injected detector error must reach the outcome payload
                 // verbatim (it is this test's own fixture string).
                 assert_eq!(error, "detector boom");
@@ -2511,12 +2633,17 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         // before the detector is even called, mapping to JobError::Cancelled.
         let pre_cancelled = CancelToken::new();
         pre_cancelled.cancel();
-        let tracker = ProgressTracker::new(vec![UnitSpec { weight: 1.0, label: "scan".into() }]);
+        let tracker = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "scan".into(),
+        }]);
         let (emit_tx, _emit_rx) = std::sync::mpsc::channel();
         let ctx = JobContext {
             progress: tracker,
             cancel: pre_cancelled,
-            emit: Box::new(move |item| { let _ = emit_tx.send(item); }),
+            emit: Box::new(move |item| {
+                let _ = emit_tx.send(item);
+            }),
         };
         let result = run_offload_scan_job_with(&ctx, |_cancel, _progress| Ok(Vec::new()));
         assert!(matches!(result, Err(JobError::Cancelled)));
@@ -2528,18 +2655,26 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         // when cancelled — mirrors the PR-2 integration cancel seam.
         let cancel_flag = CancelToken::new();
         let cancel_for_detector = cancel_flag.clone();
-        let tracker = ProgressTracker::new(vec![UnitSpec { weight: 1.0, label: "scan".into() }]);
+        let tracker = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "scan".into(),
+        }]);
         let (emit_tx, _emit_rx) = std::sync::mpsc::channel();
         let ctx = JobContext {
             progress: tracker,
             cancel: cancel_flag,
-            emit: Box::new(move |item| { let _ = emit_tx.send(item); }),
+            emit: Box::new(move |item| {
+                let _ = emit_tx.send(item);
+            }),
         };
         let handle = std::thread::spawn(move || {
             run_offload_scan_job_with(&ctx, move |cancel, _progress| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !cancel.is_cancelled() {
-                    assert!(std::time::Instant::now() < deadline, "detector never cancelled");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "detector never cancelled"
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err("cancelled by test".to_string())
@@ -2575,7 +2710,11 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         let mp = mount_dir("success");
         let mp_str = mp.to_string_lossy().to_string();
         let mut runner = |_: &[String]| {
-            Ok(fake_output(0, &format!("Mounted /dev/sdb1 at {}\n", mp_str), ""))
+            Ok(fake_output(
+                0,
+                &format!("Mounted /dev/sdb1 at {}\n", mp_str),
+                "",
+            ))
         };
         let result = udisks_mount_with("/dev/sdb1", &mut runner).unwrap();
         assert_eq!(result, Some(mp));
@@ -2585,7 +2724,11 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
     #[cfg(target_os = "linux")]
     fn test_udisks_mount_with_failure_surfaces_stderr() {
         let mut runner = |_: &[String]| {
-            Ok(fake_output(1, "", "Error mounting(/dev/sdb1): not authorized\n"))
+            Ok(fake_output(
+                1,
+                "",
+                "Error mounting(/dev/sdb1): not authorized\n",
+            ))
         };
         let err = udisks_mount_with("/dev/sdb1", &mut runner).unwrap_err();
         assert!(
@@ -2598,10 +2741,12 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
     #[test]
     #[cfg(target_os = "linux")]
     fn test_udisks_mount_with_timeout() {
-        let mut runner =
-            |_: &[String]| Err(crate::subprocess::SubprocessFailure::TimedOut);
+        let mut runner = |_: &[String]| Err(crate::subprocess::SubprocessFailure::TimedOut);
         let result = udisks_mount_with("/dev/sdb1", &mut runner);
-        assert!(result.is_err(), "a timed-out mount must not be reported as success");
+        assert!(
+            result.is_err(),
+            "a timed-out mount must not be reported as success"
+        );
     }
 
     #[test]
@@ -2610,7 +2755,11 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
         // udisksctl reported success but the printed path is not a directory —
         // treat as "already mounted / nothing to return" rather than an error.
         let mut runner = |_: &[String]| {
-            Ok(fake_output(0, "Mounted /dev/sdb1 at /nonexistent/nope\n", ""))
+            Ok(fake_output(
+                0,
+                "Mounted /dev/sdb1 at /nonexistent/nope\n",
+                "",
+            ))
         };
         let result = udisks_mount_with("/dev/sdb1", &mut runner).unwrap();
         assert_eq!(result, None);

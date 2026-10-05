@@ -480,12 +480,20 @@ pub fn probe_status_label(probe_active: bool, probe_is_none: bool) -> ProbeStatu
 
 #[derive(Debug, Clone)]
 pub enum JobOutcome {
-    Succeeded { log: String },
-    Cancelled { log: String },
+    Succeeded {
+        log: String,
+    },
+    Cancelled {
+        log: String,
+    },
     /// `panicked` distinguishes a worker panic (catch_unwind conversion)
     /// from a worker that returned `Err(JobError::Failed)` — a typed fact
     /// that must not be recovered from the error text.
-    Failed { error: String, log: String, panicked: bool },
+    Failed {
+        error: String,
+        log: String,
+        panicked: bool,
+    },
 }
 
 // ── Payload enums ───────────────────────────────────────────────────────
@@ -747,33 +755,37 @@ where
     let handle = std::thread::Builder::new()
         .name(job_name.clone())
         .spawn(move || {
-            let (outcome, payload) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                f(&ctx)
-            })) {
-                Ok(Ok(result)) => {
-                    let payload: JobFinal = result.into();
-                    (JobOutcome::Succeeded {
-                        log: String::new(),
-                    }, payload)
-                }
-                Ok(Err(JobError::Cancelled)) => (JobOutcome::Cancelled {
-                    log: String::new(),
-                }, JobFinal::NoPayload),
-                Ok(Err(JobError::Failed(msg))) => (JobOutcome::Failed {
-                    error: msg,
-                    log: String::new(),
-                    panicked: false,
-                }, JobFinal::NoPayload),
-                Err(panic) => {
-                    let msg = panic_message(&panic);
-                    error!("Job '{}' (id={:?}) panicked: {}", job_name, id, msg);
-                    (JobOutcome::Failed {
-                        error: format!("internal error (panic in {})", job_name),
-                        log: msg,
-                        panicked: true,
-                    }, JobFinal::NoPayload)
-                }
-            };
+            let (outcome, payload) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&ctx))) {
+                    Ok(Ok(result)) => {
+                        let payload: JobFinal = result.into();
+                        (JobOutcome::Succeeded { log: String::new() }, payload)
+                    }
+                    Ok(Err(JobError::Cancelled)) => (
+                        JobOutcome::Cancelled { log: String::new() },
+                        JobFinal::NoPayload,
+                    ),
+                    Ok(Err(JobError::Failed(msg))) => (
+                        JobOutcome::Failed {
+                            error: msg,
+                            log: String::new(),
+                            panicked: false,
+                        },
+                        JobFinal::NoPayload,
+                    ),
+                    Err(panic) => {
+                        let msg = panic_message(&panic);
+                        error!("Job '{}' (id={:?}) panicked: {}", job_name, id, msg);
+                        (
+                            JobOutcome::Failed {
+                                error: format!("internal error (panic in {})", job_name),
+                                log: msg,
+                                panicked: true,
+                            },
+                            JobFinal::NoPayload,
+                        )
+                    }
+                };
 
             let _ = event_tx.send(JobEvent::Finished {
                 job: id,
@@ -880,8 +892,8 @@ impl Default for SpeedMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -1067,16 +1079,18 @@ mod tests {
     #[test]
     fn test_spawn_job_panic_converts_to_failed() {
         let mut sup = JobSupervisor::new();
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
-            panic!("deliberate panic");
-        });
-
-        let events = wait_for_finished(
+        spawn_job::<JobFinal, _>(
             &mut sup,
-            JobKind::FfmpegCapProbe,
-            Duration::from_secs(10),
+            empty_spec(),
+            |_ctx| -> Result<JobFinal, JobError> {
+                panic!("deliberate panic");
+            },
         );
-        let finished = events.iter().find(|e| matches!(e, JobEvent::Finished { .. }));
+
+        let events = wait_for_finished(&mut sup, JobKind::FfmpegCapProbe, Duration::from_secs(10));
+        let finished = events
+            .iter()
+            .find(|e| matches!(e, JobEvent::Finished { .. }));
         assert!(finished.is_some(), "expected a Finished event");
         if let Some(JobEvent::Finished { outcome, .. }) = finished {
             match outcome {
@@ -1096,21 +1110,23 @@ mod tests {
         let cancel_outer = CancelToken::new();
         let cancel_clone = cancel_outer.clone();
 
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), move |ctx| -> Result<JobFinal, JobError> {
-            // Signal cancellation from outside
-            cancel_clone.cancel();
-            ctx.cancel.check()?;
-            Ok(JobFinal::NoPayload)
-        });
+        spawn_job::<JobFinal, _>(
+            &mut sup,
+            empty_spec(),
+            move |ctx| -> Result<JobFinal, JobError> {
+                // Signal cancellation from outside
+                cancel_clone.cancel();
+                ctx.cancel.check()?;
+                Ok(JobFinal::NoPayload)
+            },
+        );
 
         sup.cancel_all();
 
-        let events = wait_for_finished(
-            &mut sup,
-            JobKind::FfmpegCapProbe,
-            Duration::from_secs(10),
-        );
-        let finished = events.iter().find(|e| matches!(e, JobEvent::Finished { .. }));
+        let events = wait_for_finished(&mut sup, JobKind::FfmpegCapProbe, Duration::from_secs(10));
+        let finished = events
+            .iter()
+            .find(|e| matches!(e, JobEvent::Finished { .. }));
         assert!(finished.is_some(), "expected a Finished event");
         if let Some(JobEvent::Finished { outcome, .. }) = finished {
             match outcome {
@@ -1127,24 +1143,33 @@ mod tests {
         let mut sup = JobSupervisor::new();
         let path = PathBuf::from("/test/file.wav");
 
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), move |ctx| -> Result<JobFinal, JobError> {
-            ctx.emit(JobItem::DurationResult {
-                path: path.clone(),
-                secs: Some(10.0),
-            });
-            Ok(JobFinal::DurationsDone)
-        });
-
-        let events: Vec<_> = wait_for_finished(
+        spawn_job::<JobFinal, _>(
             &mut sup,
-            JobKind::FfmpegCapProbe,
-            Duration::from_secs(10),
+            empty_spec(),
+            move |ctx| -> Result<JobFinal, JobError> {
+                ctx.emit(JobItem::DurationResult {
+                    path: path.clone(),
+                    secs: Some(10.0),
+                });
+                Ok(JobFinal::DurationsDone)
+            },
         );
+
+        let events: Vec<_> =
+            wait_for_finished(&mut sup, JobKind::FfmpegCapProbe, Duration::from_secs(10));
         // Emitted item and Finished should both appear
-        let item_pos = events
+        let item_pos = events.iter().position(|e| {
+            matches!(
+                e,
+                JobEvent::Item {
+                    item: JobItem::DurationResult { .. },
+                    ..
+                }
+            )
+        });
+        let fin_pos = events
             .iter()
-            .position(|e| matches!(e, JobEvent::Item { item: JobItem::DurationResult { .. }, .. }));
-        let fin_pos = events.iter().position(|e| matches!(e, JobEvent::Finished { .. }));
+            .position(|e| matches!(e, JobEvent::Finished { .. }));
         assert!(item_pos.is_some(), "should have received an Item event");
         assert!(fin_pos.is_some(), "should have received a Finished event");
         // Same worker thread, same channel ⇒ Item strictly precedes Finished
@@ -1161,10 +1186,14 @@ mod tests {
         let mut sup = JobSupervisor::new();
         assert!(!sup.is_running(JobKind::FfmpegCapProbe));
 
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
-            std::thread::sleep(Duration::from_millis(100));
-            Ok(JobFinal::NoPayload)
-        });
+        spawn_job::<JobFinal, _>(
+            &mut sup,
+            empty_spec(),
+            |_ctx| -> Result<JobFinal, JobError> {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(JobFinal::NoPayload)
+            },
+        );
 
         assert!(sup.is_running(JobKind::FfmpegCapProbe));
     }
@@ -1174,17 +1203,17 @@ mod tests {
     #[test]
     fn test_drain_returns_accumulated_events() {
         let mut sup = JobSupervisor::new();
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
-            std::thread::sleep(Duration::from_millis(10));
-            Ok(JobFinal::NoPayload)
-        });
+        spawn_job::<JobFinal, _>(
+            &mut sup,
+            empty_spec(),
+            |_ctx| -> Result<JobFinal, JobError> {
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(JobFinal::NoPayload)
+            },
+        );
 
         // Wait for job to finish
-        let events = wait_for_finished(
-            &mut sup,
-            JobKind::FfmpegCapProbe,
-            Duration::from_secs(10),
-        );
+        let events = wait_for_finished(&mut sup, JobKind::FfmpegCapProbe, Duration::from_secs(10));
         assert!(!events.is_empty(), "should have events after drain");
 
         // Second drain should be empty
@@ -1332,12 +1361,16 @@ mod tests {
         assert!(sup.is_running(JobKind::FfmpegCapProbe));
         assert!(sup.cancel(JobKind::FfmpegCapProbe));
 
-        let events = wait_for_finished(
-            &mut sup,
-            JobKind::FfmpegCapProbe,
-            Duration::from_secs(10),
-        );
-        let cancelled = events.iter().any(|e| matches!(e, JobEvent::Finished { outcome: JobOutcome::Cancelled { .. }, .. }));
+        let events = wait_for_finished(&mut sup, JobKind::FfmpegCapProbe, Duration::from_secs(10));
+        let cancelled = events.iter().any(|e| {
+            matches!(
+                e,
+                JobEvent::Finished {
+                    outcome: JobOutcome::Cancelled { .. },
+                    ..
+                }
+            )
+        });
         assert!(cancelled, "expected Cancelled outcome");
     }
 
@@ -1359,20 +1392,32 @@ mod tests {
         });
 
         sup.shutdown(Duration::from_secs(5));
-        assert!(flag.load(Ordering::Relaxed), "job should have been cancelled");
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "job should have been cancelled"
+        );
     }
 
     // ── JobStatus::is_active ──────────────────────────────────────────────
 
     #[test]
     fn test_probe_label_shows_probing_during_indeterminate() {
-        assert_eq!(probe_status_label(true, true), ProbeStatusLabel::Probing,
-            "Indeterminate/Running → show Probing");
+        assert_eq!(
+            probe_status_label(true, true),
+            ProbeStatusLabel::Probing,
+            "Indeterminate/Running → show Probing"
+        );
         assert_eq!(probe_status_label(true, false), ProbeStatusLabel::Probing);
-        assert_eq!(probe_status_label(false, true), ProbeStatusLabel::ProbeFailed,
-            "Idle/Succeeded/Failed + no probe → show failed");
-        assert_eq!(probe_status_label(false, false), ProbeStatusLabel::NoChannels,
-            "Probe exists → show no channels (unreachable in this branch)");
+        assert_eq!(
+            probe_status_label(false, true),
+            ProbeStatusLabel::ProbeFailed,
+            "Idle/Succeeded/Failed + no probe → show failed"
+        );
+        assert_eq!(
+            probe_status_label(false, false),
+            ProbeStatusLabel::NoChannels,
+            "Probe exists → show no channels (unreachable in this branch)"
+        );
     }
 
     // ── set_label ────────────────────────────────────────────────────────
@@ -1396,7 +1441,10 @@ mod tests {
         let spec = JobSpec {
             kind: JobKind::LtcDecode,
             name: "progress-test",
-            units: vec![UnitSpec { weight: 1.0, label: "phase1".into() }],
+            units: vec![UnitSpec {
+                weight: 1.0,
+                label: "phase1".into(),
+            }],
         };
 
         spawn_job::<JobFinal, _>(&mut sup, spec, |ctx| -> Result<JobFinal, JobError> {
@@ -1422,7 +1470,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
 
-        assert!(observed, "expected to observe fraction=0.5 in poll snapshot");
+        assert!(
+            observed,
+            "expected to observe fraction=0.5 in poll snapshot"
+        );
     }
 
     // ── latest_job tracking ─────────────────────────────────────────────
@@ -1432,23 +1483,34 @@ mod tests {
         let mut sup = JobSupervisor::new();
         assert_eq!(sup.latest_job.get(&JobKind::FfmpegCapProbe), None);
 
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
-            std::thread::sleep(Duration::from_millis(10));
-            Ok(JobFinal::NoPayload)
-        });
+        spawn_job::<JobFinal, _>(
+            &mut sup,
+            empty_spec(),
+            |_ctx| -> Result<JobFinal, JobError> {
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(JobFinal::NoPayload)
+            },
+        );
 
         let id = sup.latest_job.get(&JobKind::FfmpegCapProbe);
         assert!(id.is_some(), "latest_job should be set after spawn");
 
         // Spawning again of the same kind updates the ID
         let first_id = *id.unwrap();
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
-            std::thread::sleep(Duration::from_millis(10));
-            Ok(JobFinal::NoPayload)
-        });
+        spawn_job::<JobFinal, _>(
+            &mut sup,
+            empty_spec(),
+            |_ctx| -> Result<JobFinal, JobError> {
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(JobFinal::NoPayload)
+            },
+        );
 
         let second_id = sup.latest_job.get(&JobKind::FfmpegCapProbe).unwrap();
-        assert!(second_id.0 > first_id.0, "second spawn should have larger JobId");
+        assert!(
+            second_id.0 > first_id.0,
+            "second spawn should have larger JobId"
+        );
     }
 
     // NOTE: stale-event *gating* lives in the engine's event-drain loop
@@ -1461,40 +1523,43 @@ mod tests {
         let mut sup = JobSupervisor::new();
 
         // Spawn a quick job that finishes immediately
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
-            Ok(JobFinal::NoPayload)
-        });
+        spawn_job::<JobFinal, _>(
+            &mut sup,
+            empty_spec(),
+            |_ctx| -> Result<JobFinal, JobError> { Ok(JobFinal::NoPayload) },
+        );
 
         // The Finished event is in the buffer — drain it so we start clean
-        let first_events = wait_for_finished(
-            &mut sup,
-            JobKind::FfmpegCapProbe,
-            Duration::from_secs(10),
-        );
+        let first_events =
+            wait_for_finished(&mut sup, JobKind::FfmpegCapProbe, Duration::from_secs(10));
         assert!(
-            first_events.iter().any(|e| matches!(e, JobEvent::Finished { .. })),
+            first_events
+                .iter()
+                .any(|e| matches!(e, JobEvent::Finished { .. })),
             "first job should have finished"
         );
 
         // Spawn a second job of same kind — updates latest_job to new ID
-        spawn_job::<JobFinal, _>(&mut sup, empty_spec(), |_ctx| -> Result<JobFinal, JobError> {
-            Ok(JobFinal::NoPayload)
-        });
-
-        let second_events = wait_for_finished(
+        spawn_job::<JobFinal, _>(
             &mut sup,
-            JobKind::FfmpegCapProbe,
-            Duration::from_secs(10),
+            empty_spec(),
+            |_ctx| -> Result<JobFinal, JobError> { Ok(JobFinal::NoPayload) },
         );
+
+        let second_events =
+            wait_for_finished(&mut sup, JobKind::FfmpegCapProbe, Duration::from_secs(10));
 
         // Only events from the second (latest) job should appear;
         // the first job's Finished event was already drained above so it's
         // irrelevant — what matters is that the second job's Finished event
         // carries the correct ID.
-        let second_finished: Vec<&JobEvent> = second_events.iter()
+        let second_finished: Vec<&JobEvent> = second_events
+            .iter()
             .filter(|e| matches!(e, JobEvent::Finished { .. }))
             .collect();
-        assert_eq!(second_finished.len(), 1,
+        assert_eq!(
+            second_finished.len(),
+            1,
             "expected exactly one Finished event from second job, got {}",
             second_finished.len(),
         );

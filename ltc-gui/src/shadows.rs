@@ -123,5 +123,4 @@ impl Shadows {
             file_selection: HashMap::new(),
         }
     }
-
 }

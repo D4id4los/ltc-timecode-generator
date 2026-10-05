@@ -90,8 +90,7 @@ pub(crate) fn validate_bcd(
         let next = tcs.get(pos + 1);
         let repaired = match (kept.last(), next) {
             (Some(prev), Some(next))
-                if bcd_value_valid(&prev.timecode, fps)
-                    && bcd_value_valid(&next.timecode, fps) =>
+                if bcd_value_valid(&prev.timecode, fps) && bcd_value_valid(&next.timecode, fps) =>
             {
                 let expected = increment_timecode(&prev.timecode, fps, drop_frame);
                 (next.timecode == two_after(&prev.timecode, fps, drop_frame)).then_some(expected)
@@ -205,7 +204,10 @@ pub(crate) fn apply_value_integrity(result: &mut LtcDetectionResult) {
     // usable values left — the decode must not claim Success on an empty
     // value set (periodic non-LTC content can sync-match without decoding).
     if result.timecodes.is_empty()
-        && !matches!(result.status, crate::ltc_decoder::LtcDecodeStatus::Error { .. })
+        && !matches!(
+            result.status,
+            crate::ltc_decoder::LtcDecodeStatus::Error { .. }
+        )
     {
         result.status = crate::ltc_decoder::LtcDecodeStatus::NoSyncWord;
     }
@@ -218,11 +220,20 @@ mod tests {
     const FPS: f64 = 25.0;
 
     fn ftc(frame_index: u32, tc: Timecode, secs: f64) -> FrameTimecode {
-        FrameTimecode { frame_index, timecode: tc, timecode_secs: secs }
+        FrameTimecode {
+            frame_index,
+            timecode: tc,
+            timecode_secs: secs,
+        }
     }
 
     fn tc(h: u32, m: u32, s: u32, f: u32) -> Timecode {
-        Timecode { hours: h, minutes: m, seconds: s, frames: f }
+        Timecode {
+            hours: h,
+            minutes: m,
+            seconds: s,
+            frames: f,
+        }
     }
 
     /// A clean ascending run starting at 01:00:00:00, one frame per

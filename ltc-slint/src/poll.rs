@@ -4,19 +4,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gui_engine::converter::{format_blockers, RecordingType};
-use gui_engine::{JobKind, JobPhase, UnitState};
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::edit_state::EditState;
 use gui_engine::log_buffer::LogBuffer;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::timecode;
 use gui_engine::{ArcSwap, AudioEvent, ChannelSel, SAMPLE_RATE_OPTIONS};
+use gui_engine::{JobKind, JobPhase, UnitState};
 use log::info;
 use slint::{ModelRc, SharedString, VecModel};
 
 use crate::shadows::Shadows;
-use crate::toast::{push_toast, ToastItem};
 use crate::timecode_helpers::set_tc_segments;
+use crate::toast::{push_toast, ToastItem};
 use crate::{AppColors, AppWindow, FileGroupInfo, LogEntry};
 use slint::ComponentHandle;
 use slint::Global;
@@ -39,7 +39,11 @@ fn channel_index(ch: ChannelSel) -> i32 {
 /// Advance the clapper pulse phase by one poll interval.
 fn advance_pulse(phase: f64) -> f64 {
     let advanced = phase + 4.0 * 2.0 * PI * (POLL_INTERVAL_MS as f64 / 1000.0);
-    if advanced > PI * 100.0 { 0.0 } else { advanced }
+    if advanced > PI * 100.0 {
+        0.0
+    } else {
+        advanced
+    }
 }
 
 /// True when the engine's monotonic `clap_seq` has moved past the last
@@ -88,25 +92,40 @@ fn format_decode_status(s: &AppStateSnapshot) -> (String, String, String) {
                 let sep = if r.drop_frame { ";" } else { ":" };
                 format!(
                     "{:02}{sep}{:02}{sep}{:02}{sep}{:02} → {:02}{sep}{:02}{sep}{:02}{sep}{:02}",
-                    f.hours, f.minutes, f.seconds, f.frames,
-                    l.hours, l.minutes, l.seconds, l.frames,
+                    f.hours,
+                    f.minutes,
+                    f.seconds,
+                    f.frames,
+                    l.hours,
+                    l.minutes,
+                    l.seconds,
+                    l.frames,
                 )
             }
             _ => "—".to_string(),
         };
-        let quality_str = r.quality.as_ref().map(|q| {
-            let issues = if q.edit_count > 0 {
-                format!("{} edit(s)", q.edit_count)
-            } else if q.glitch_count > 0 || q.gap_count > 0 {
-                format!("{}/{} gap/glitch", q.gap_count, q.glitch_count)
-            } else if q.missing_frames > 0 {
-                format!("{} missing", q.missing_frames)
-            } else {
-                "perfect".to_string()
-            };
-            format!(" | Quality: {:.0}% ({}) {:.1}% usable, {}",
-                q.score * 100.0, q.grade, q.usable_coverage * 100.0, issues)
-        }).unwrap_or_default();
+        let quality_str = r
+            .quality
+            .as_ref()
+            .map(|q| {
+                let issues = if q.edit_count > 0 {
+                    format!("{} edit(s)", q.edit_count)
+                } else if q.glitch_count > 0 || q.gap_count > 0 {
+                    format!("{}/{} gap/glitch", q.gap_count, q.glitch_count)
+                } else if q.missing_frames > 0 {
+                    format!("{} missing", q.missing_frames)
+                } else {
+                    "perfect".to_string()
+                };
+                format!(
+                    " | Quality: {:.0}% ({}) {:.1}% usable, {}",
+                    q.score * 100.0,
+                    q.grade,
+                    q.usable_coverage * 100.0,
+                    issues
+                )
+            })
+            .unwrap_or_default();
         let result_text = format!(
             "{} | Conf: {:.1}% | Frames: {}/{} | {} | {:.1}ms{}",
             fps_str,
@@ -152,28 +171,39 @@ fn build_channel_labels(
 
 /// Converter file-group list model from the snapshot.
 fn build_group_model(s: &AppStateSnapshot) -> Vec<FileGroupInfo> {
-    s.converter.groups.iter().map(|g| {
-        let durs: Vec<Option<f64>> = g.files.iter()
-            .map(|f| {
-                let full_path = s.converter.groups_folder.as_ref().map(|p| p.join(f));
-                full_path.and_then(|p| s.file_durations.get(&p).copied().flatten())
-            })
-            .collect();
-        let dur_text = group_duration_secs(
-            &g.recording_type, &durs,
-        ).map(format_duration_secs).unwrap_or_default();
-        FileGroupInfo {
-            prefix: SharedString::from(g.prefix.clone()),
-            files: ModelRc::new(VecModel::<SharedString>::from(
-                g.files.iter().map(|f| {
-                    SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
-                }).collect::<Vec<_>>()
-            )),
-            channel_count: g.files.len() as i32,
-            is_audio_recording: matches!(g.recording_type, RecordingType::MultiTrackAudio),
-            duration_text: SharedString::from(dur_text),
-        }
-    }).collect()
+    s.converter
+        .groups
+        .iter()
+        .map(|g| {
+            let durs: Vec<Option<f64>> = g
+                .files
+                .iter()
+                .map(|f| {
+                    let full_path = s.converter.groups_folder.as_ref().map(|p| p.join(f));
+                    full_path.and_then(|p| s.file_durations.get(&p).copied().flatten())
+                })
+                .collect();
+            let dur_text = group_duration_secs(&g.recording_type, &durs)
+                .map(format_duration_secs)
+                .unwrap_or_default();
+            FileGroupInfo {
+                prefix: SharedString::from(g.prefix.clone()),
+                files: ModelRc::new(VecModel::<SharedString>::from(
+                    g.files
+                        .iter()
+                        .map(|f| {
+                            SharedString::from(
+                                f.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                channel_count: g.files.len() as i32,
+                is_audio_recording: matches!(g.recording_type, RecordingType::MultiTrackAudio),
+                duration_text: SharedString::from(dur_text),
+            }
+        })
+        .collect()
 }
 
 /// Conversion status line for the converter panel ("idle", "running N%", …).
@@ -194,13 +224,17 @@ fn build_offload_file_infos(
     card: &gui_engine::offload::SdCardInfo,
     off: &gui_engine::offload::OffloadSnapshot,
 ) -> Vec<crate::OffloadFileInfo> {
-    card.files.iter()
+    card.files
+        .iter()
         .zip(card.selected.iter())
         .map(|(f, &sel)| {
-            let date_text = f.modified
+            let date_text = f
+                .modified
                 .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
-            let dur_text = off.file_durations.get(&f.path)
+            let dur_text = off
+                .file_durations
+                .get(&f.path)
                 .and_then(|opt| *opt)
                 .map(format_duration_secs)
                 .unwrap_or_else(|| {
@@ -217,25 +251,31 @@ fn build_offload_file_infos(
                 size_text: SharedString::from(format_bytes(f.size_bytes)),
                 selected: sel,
             }
-        }).collect()
+        })
+        .collect()
 }
 
 /// Card list model for the offload panel.
-fn build_offload_card_infos(off: &gui_engine::offload::OffloadSnapshot) -> Vec<crate::OffloadCardInfo> {
-    off.cards.iter().map(|card| {
-        let files = build_offload_file_infos(card, off);
-        crate::OffloadCardInfo {
-            mount: SharedString::from(card.mount.to_string_lossy().as_ref()),
-            volume_label: SharedString::from(card.volume_label.clone()),
-            device_name: SharedString::from(card.device_name.clone()),
-            name_source: SharedString::from(format!("{:?}", card.name_source)),
-            media_file_count: card.media_file_count as i32,
-            total_bytes: SharedString::from(format_bytes(card.total_bytes)),
-            files: ModelRc::new(VecModel::<crate::OffloadFileInfo>::from(files)),
-            selected_count: card.selected_count as i32,
-            selected_bytes: SharedString::from(format_bytes(card.selected_bytes)),
-        }
-    }).collect()
+fn build_offload_card_infos(
+    off: &gui_engine::offload::OffloadSnapshot,
+) -> Vec<crate::OffloadCardInfo> {
+    off.cards
+        .iter()
+        .map(|card| {
+            let files = build_offload_file_infos(card, off);
+            crate::OffloadCardInfo {
+                mount: SharedString::from(card.mount.to_string_lossy().as_ref()),
+                volume_label: SharedString::from(card.volume_label.clone()),
+                device_name: SharedString::from(card.device_name.clone()),
+                name_source: SharedString::from(format!("{:?}", card.name_source)),
+                media_file_count: card.media_file_count as i32,
+                total_bytes: SharedString::from(format_bytes(card.total_bytes)),
+                files: ModelRc::new(VecModel::<crate::OffloadFileInfo>::from(files)),
+                selected_count: card.selected_count as i32,
+                selected_bytes: SharedString::from(format_bytes(card.selected_bytes)),
+            }
+        })
+        .collect()
 }
 
 /// Per-device copy-progress rows for the offload panel.
@@ -243,40 +283,48 @@ fn build_offload_device_status(
     off: &gui_engine::offload::OffloadSnapshot,
     copy_job: &gui_engine::JobStatus,
 ) -> Vec<crate::OffloadDeviceStatus> {
-    off.device_totals.iter().enumerate().map(|(i, dt)| {
-        let unit = copy_job.units().get(i);
-        let state_text = match unit.map(|u| u.state) {
-            Some(UnitState::Pending) => "Pending",
-            Some(UnitState::Running) => "Copying",
-            Some(UnitState::Done) => "Done",
-            Some(UnitState::Failed) => "Failed",
-            Some(UnitState::Skipped) => "Skipped",
-            None => "Pending",
-        };
-        let fraction = unit.map(|u| u.fraction).unwrap_or(0.0);
-        let bytes_done = (dt.bytes_total as f64 * fraction as f64) as u64;
-        let bytes_text = if dt.bytes_total > 0 {
-            format!("{} / {}", format_bytes(bytes_done), format_bytes(dt.bytes_total))
-        } else {
-            String::new()
-        };
-        let files_done = (dt.files_total as f32 * fraction) as i32;
-        let current_file = unit.map(|u| u.message.clone()).unwrap_or_default();
-        let error_str = match unit.map(|u| u.state) {
-            Some(UnitState::Failed) => current_file.clone(),
-            _ => String::new(),
-        };
-        crate::OffloadDeviceStatus {
-            device_name: SharedString::from(dt.name.clone()),
-            state_text: SharedString::from(state_text),
-            files_total: dt.files_total as i32,
-            files_done,
-            progress: fraction,
-            bytes_text: SharedString::from(bytes_text),
-            current_file: SharedString::from(current_file),
-            error: SharedString::from(error_str),
-        }
-    }).collect()
+    off.device_totals
+        .iter()
+        .enumerate()
+        .map(|(i, dt)| {
+            let unit = copy_job.units().get(i);
+            let state_text = match unit.map(|u| u.state) {
+                Some(UnitState::Pending) => "Pending",
+                Some(UnitState::Running) => "Copying",
+                Some(UnitState::Done) => "Done",
+                Some(UnitState::Failed) => "Failed",
+                Some(UnitState::Skipped) => "Skipped",
+                None => "Pending",
+            };
+            let fraction = unit.map(|u| u.fraction).unwrap_or(0.0);
+            let bytes_done = (dt.bytes_total as f64 * fraction as f64) as u64;
+            let bytes_text = if dt.bytes_total > 0 {
+                format!(
+                    "{} / {}",
+                    format_bytes(bytes_done),
+                    format_bytes(dt.bytes_total)
+                )
+            } else {
+                String::new()
+            };
+            let files_done = (dt.files_total as f32 * fraction) as i32;
+            let current_file = unit.map(|u| u.message.clone()).unwrap_or_default();
+            let error_str = match unit.map(|u| u.state) {
+                Some(UnitState::Failed) => current_file.clone(),
+                _ => String::new(),
+            };
+            crate::OffloadDeviceStatus {
+                device_name: SharedString::from(dt.name.clone()),
+                state_text: SharedString::from(state_text),
+                files_total: dt.files_total as i32,
+                files_done,
+                progress: fraction,
+                bytes_text: SharedString::from(bytes_text),
+                current_file: SharedString::from(current_file),
+                error: SharedString::from(error_str),
+            }
+        })
+        .collect()
 }
 
 /// Map an audio event to its toast (message, severity) pair.
@@ -284,17 +332,16 @@ fn audio_event_to_notification(event: &AudioEvent) -> (String, &'static str) {
     match event {
         AudioEvent::StreamError(m) => (m.clone(), "error"),
         AudioEvent::StreamDied => ("Audio stream died".to_string(), "error"),
-        AudioEvent::StreamRecovering { attempt } => {
-            (format!("Stream recovering (attempt {})", attempt), "warning")
-        }
+        AudioEvent::StreamRecovering { attempt } => (
+            format!("Stream recovering (attempt {})", attempt),
+            "warning",
+        ),
         AudioEvent::StreamDead => ("Audio device unreachable".to_string(), "error"),
         AudioEvent::RecoveryNeeded { reason } => {
             (format!("Audio recovery needed: {}", reason), "warning")
         }
         AudioEvent::Underrun => ("Audio underrun".to_string(), "warning"),
-        AudioEvent::FramesDropped { total } => {
-            (format!("{} frames dropped", total), "warning")
-        }
+        AudioEvent::FramesDropped { total } => (format!("{} frames dropped", total), "warning"),
     }
 }
 
@@ -324,29 +371,41 @@ pub(crate) struct PollContext {
 
 fn sync_clock_and_theme(ui: &AppWindow, s: &AppStateSnapshot) {
     // 1. System time
-    ui.set_system_time(SharedString::from(format!("{} UTC", timecode::chrono_now_string())));
+    ui.set_system_time(SharedString::from(format!(
+        "{} UTC",
+        timecode::chrono_now_string()
+    )));
 
     // 2. Theme sync
     AppColors::get(ui).set_theme_dark(s.is_dark_theme);
 }
 
-fn sync_clapper_metadata(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64, now: Instant, sh: &mut Shadows) {
+fn sync_clapper_metadata(
+    ui: &AppWindow,
+    s: &AppStateSnapshot,
+    applied_seq: u64,
+    now: Instant,
+    sh: &mut Shadows,
+) {
     // 3. Clapper metadata (fix one-way sync gaps). Shadow-backed:
     //    the roll push is skipped while an edit awaits its ack (the
     //    ROLL TextInput is two-way bound to the `roll` property);
     //    auto-increment likewise until its toggle is acked.
-    if let Some(roll) = sh.roll.sync_and_push(
-        &s.clapper.roll,
-        ui.get_roll_editing(),
-        applied_seq,
-        now,
-    ) {
+    if let Some(roll) =
+        sh.roll
+            .sync_and_push(&s.clapper.roll, ui.get_roll_editing(), applied_seq, now)
+    {
         ui.set_roll(SharedString::from(roll));
     }
     ui.set_scene(s.clapper.scene as i32);
     ui.set_take(s.clapper.take as i32);
-    push_shadow(&mut sh.auto_increment, &s.clapper.auto_increment_take, applied_seq, now,
-        |v| ui.set_auto_increment(v));
+    push_shadow(
+        &mut sh.auto_increment,
+        &s.clapper.auto_increment_take,
+        applied_seq,
+        now,
+        |v| ui.set_auto_increment(v),
+    );
 }
 
 fn sync_decode_state(ui: &AppWindow, s: &AppStateSnapshot) {
@@ -359,20 +418,33 @@ fn sync_decode_state(ui: &AppWindow, s: &AppStateSnapshot) {
     }
 }
 
-fn sync_decode_fps_shadow(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64, now: Instant, sh: &mut Shadows) {
+fn sync_decode_fps_shadow(
+    ui: &AppWindow,
+    s: &AppStateSnapshot,
+    applied_seq: u64,
+    now: Instant,
+    sh: &mut Shadows,
+) {
     // 5. LTC decode FPS index sync (shadow-backed, gated on ack)
-    push_shadow(&mut sh.decode_fps_index, &s.decode.fps_index, applied_seq, now,
-        |v| ui.set_decode_fps_index(v as i32));
+    push_shadow(
+        &mut sh.decode_fps_index,
+        &s.decode.fps_index,
+        applied_seq,
+        now,
+        |v| ui.set_decode_fps_index(v as i32),
+    );
 }
 
 fn sync_channel_labels(ui: &AppWindow, s: &AppStateSnapshot) {
     // 6. Video audio probe info
     if let Some(ref probe) = s.decode.probe {
-        let (labels, ltc_row_idx) = build_channel_labels(
-            probe, s.decode.selected_stream, s.decode.selected_channel,
-        );
+        let (labels, ltc_row_idx) =
+            build_channel_labels(probe, s.decode.selected_stream, s.decode.selected_channel);
         ui.set_ltc_channel_names(ModelRc::new(VecModel::from(
-            labels.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+            labels
+                .into_iter()
+                .map(SharedString::from)
+                .collect::<Vec<_>>(),
         )));
         ui.set_conv_ltc_row_index(ltc_row_idx);
     } else {
@@ -385,7 +457,9 @@ fn sync_probe_flags(ui: &AppWindow, s: &AppStateSnapshot) {
     // 7. Probe-status flags for video recordings
     if ui.get_conv_is_video_recording() {
         ui.set_conv_ltc_probe_loading(s.job(JobKind::ClipProbe).is_active());
-        ui.set_conv_ltc_probe_failed(s.decode.probe.is_none() && !s.job(JobKind::ClipProbe).is_active());
+        ui.set_conv_ltc_probe_failed(
+            s.decode.probe.is_none() && !s.job(JobKind::ClipProbe).is_active(),
+        );
     } else {
         ui.set_conv_ltc_probe_loading(false);
         ui.set_conv_ltc_probe_failed(false);
@@ -438,7 +512,6 @@ fn sync_transport_display(ui: &AppWindow, s: &AppStateSnapshot) {
     let buffer_smp = (s.sample_rate as f64 / s.fps()).round() as i32;
     ui.set_buffer_size(buffer_smp);
     ui.set_sample_format(SharedString::from(s.sample_format_name.to_uppercase()));
-
 }
 
 fn sync_clap_strike(ui: &AppWindow, s: &AppStateSnapshot, last_clap_seq: &Mutex<u64>) {
@@ -451,9 +524,17 @@ fn sync_clap_strike(ui: &AppWindow, s: &AppStateSnapshot, last_clap_seq: &Mutex<
     }
 }
 
-fn sync_device_selection(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64, now: Instant, sh: &mut Shadows) {
+fn sync_device_selection(
+    ui: &AppWindow,
+    s: &AppStateSnapshot,
+    applied_seq: u64,
+    now: Instant,
+    sh: &mut Shadows,
+) {
     // 17. Device selection sync
-    let dev_idx = s.selected_device.as_ref()
+    let dev_idx = s
+        .selected_device
+        .as_ref()
         .and_then(|id| s.devices.iter().position(|d| &d.id == id))
         .map(|i| i as i32)
         .unwrap_or(-1);
@@ -461,14 +542,26 @@ fn sync_device_selection(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64,
 
     // 18. Volume / pitch / duration (shadow-backed, gated on ack —
     //     avoids fighting the user mid-drag)
-    push_shadow(&mut sh.ltc_volume, &s.ltc_volume, applied_seq, now,
-        |v| ui.set_ltc_volume(v));
-    push_shadow(&mut sh.beep_volume, &s.beep_volume, applied_seq, now,
-        |v| ui.set_beep_volume(v));
-    push_shadow(&mut sh.beep_frequency, &s.beep_frequency, applied_seq, now,
-        |v| ui.set_beep_frequency(v));
-    push_shadow(&mut sh.beep_duration, &s.beep_duration, applied_seq, now,
-        |v| ui.set_beep_duration(v));
+    push_shadow(&mut sh.ltc_volume, &s.ltc_volume, applied_seq, now, |v| {
+        ui.set_ltc_volume(v)
+    });
+    push_shadow(&mut sh.beep_volume, &s.beep_volume, applied_seq, now, |v| {
+        ui.set_beep_volume(v)
+    });
+    push_shadow(
+        &mut sh.beep_frequency,
+        &s.beep_frequency,
+        applied_seq,
+        now,
+        |v| ui.set_beep_frequency(v),
+    );
+    push_shadow(
+        &mut sh.beep_duration,
+        &s.beep_duration,
+        applied_seq,
+        now,
+        |v| ui.set_beep_duration(v),
+    );
 
     // 19. Start timecode steppers
     ui.set_hour(s.start_timecode.hours as i32);
@@ -479,60 +572,137 @@ fn sync_device_selection(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64,
     ui.set_frame(s.start_timecode.frames as i32);
 
     // 20. FPS and sample rate index (shadow-backed, gated on ack)
-    push_shadow(&mut sh.fps_index, &s.fps_index, applied_seq, now,
-        |v| ui.set_fps_index(v as i32));
-    let sr_truth = SAMPLE_RATE_OPTIONS.iter()
+    push_shadow(&mut sh.fps_index, &s.fps_index, applied_seq, now, |v| {
+        ui.set_fps_index(v as i32)
+    });
+    let sr_truth = SAMPLE_RATE_OPTIONS
+        .iter()
         .position(|&r| r == s.sample_rate)
         .unwrap_or(0);
-    push_shadow(&mut sh.sample_rate, &sr_truth, applied_seq, now,
-        |v| ui.set_sample_rate_index(v as i32));
+    push_shadow(&mut sh.sample_rate, &sr_truth, applied_seq, now, |v| {
+        ui.set_sample_rate_index(v as i32)
+    });
 }
 
-fn sync_converter_settings(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64, now: Instant, sh: &mut Shadows) {
+fn sync_converter_settings(
+    ui: &AppWindow,
+    s: &AppStateSnapshot,
+    applied_seq: u64,
+    now: Instant,
+    sh: &mut Shadows,
+) {
     // 21. Converter user settings sync — shadow-backed, gated on ack
     {
-        push_shadow(&mut sh.conv.container, &s.converter.settings.container, applied_seq, now,
-            |v| ui.set_conv_container(SharedString::from(v)));
-        push_shadow(&mut sh.conv.video_encoder, &s.converter.settings.video_encoder, applied_seq, now,
-            |v| ui.set_conv_video_encoder(SharedString::from(v)));
-        push_shadow(&mut sh.conv.audio_encoder, &s.converter.settings.audio_encoder, applied_seq, now,
-            |v| ui.set_conv_audio_encoder(SharedString::from(v)));
-        push_shadow(&mut sh.conv.split_tracks, &s.converter.settings.split_tracks, applied_seq, now,
-            |v| ui.set_conv_split_tracks(v));
-        push_shadow(&mut sh.conv.drop_ltc_track, &s.converter.settings.drop_ltc_track, applied_seq, now,
-            |v| ui.set_conv_drop_ltc_track(v));
-        push_shadow(&mut sh.conv.concat_audio, &s.converter.settings.concat_audio, applied_seq, now,
-            |v| ui.set_conv_concat_audio(v));
-        push_shadow(&mut sh.conv.generate_synthetic_video, &s.converter.settings.generate_synthetic_video, applied_seq, now,
-            |v| ui.set_conv_generate_synthetic_video(v));
-        push_shadow(&mut sh.conv.copy_video, &s.converter.settings.copy_video, applied_seq, now,
-            |v| ui.set_conv_copy_video(v));
-        push_shadow(&mut sh.conv.metadata_only, &s.converter.settings.metadata_only, applied_seq, now,
-            |v| ui.set_conv_metadata_only(v));
-        push_shadow(&mut sh.conv.embed_camera_metadata, &s.converter.settings.embed_camera_metadata, applied_seq, now,
-            |v| ui.set_conv_embed_camera_meta(v));
-        push_shadow(&mut sh.conv.set_start_from_ltc, &s.converter.settings.set_start_from_ltc, applied_seq, now,
-            |v| ui.set_set_start_from_ltc(v));
+        push_shadow(
+            &mut sh.conv.container,
+            &s.converter.settings.container,
+            applied_seq,
+            now,
+            |v| ui.set_conv_container(SharedString::from(v)),
+        );
+        push_shadow(
+            &mut sh.conv.video_encoder,
+            &s.converter.settings.video_encoder,
+            applied_seq,
+            now,
+            |v| ui.set_conv_video_encoder(SharedString::from(v)),
+        );
+        push_shadow(
+            &mut sh.conv.audio_encoder,
+            &s.converter.settings.audio_encoder,
+            applied_seq,
+            now,
+            |v| ui.set_conv_audio_encoder(SharedString::from(v)),
+        );
+        push_shadow(
+            &mut sh.conv.split_tracks,
+            &s.converter.settings.split_tracks,
+            applied_seq,
+            now,
+            |v| ui.set_conv_split_tracks(v),
+        );
+        push_shadow(
+            &mut sh.conv.drop_ltc_track,
+            &s.converter.settings.drop_ltc_track,
+            applied_seq,
+            now,
+            |v| ui.set_conv_drop_ltc_track(v),
+        );
+        push_shadow(
+            &mut sh.conv.concat_audio,
+            &s.converter.settings.concat_audio,
+            applied_seq,
+            now,
+            |v| ui.set_conv_concat_audio(v),
+        );
+        push_shadow(
+            &mut sh.conv.generate_synthetic_video,
+            &s.converter.settings.generate_synthetic_video,
+            applied_seq,
+            now,
+            |v| ui.set_conv_generate_synthetic_video(v),
+        );
+        push_shadow(
+            &mut sh.conv.copy_video,
+            &s.converter.settings.copy_video,
+            applied_seq,
+            now,
+            |v| ui.set_conv_copy_video(v),
+        );
+        push_shadow(
+            &mut sh.conv.metadata_only,
+            &s.converter.settings.metadata_only,
+            applied_seq,
+            now,
+            |v| ui.set_conv_metadata_only(v),
+        );
+        push_shadow(
+            &mut sh.conv.embed_camera_metadata,
+            &s.converter.settings.embed_camera_metadata,
+            applied_seq,
+            now,
+            |v| ui.set_conv_embed_camera_meta(v),
+        );
+        push_shadow(
+            &mut sh.conv.set_start_from_ltc,
+            &s.converter.settings.set_start_from_ltc,
+            applied_seq,
+            now,
+            |v| ui.set_set_start_from_ltc(v),
+        );
         // Text fields: skip the push while an edit awaits its ack,
         // and never re-push the text the user already typed.
         let editing = ui.get_conv_text_editing();
         if let Some(v) = sh.conv.filename_prefix.sync_and_push(
-            &s.converter.settings.filename_prefix, editing, applied_seq, now,
+            &s.converter.settings.filename_prefix,
+            editing,
+            applied_seq,
+            now,
         ) {
             ui.set_conv_filename_prefix(SharedString::from(v));
         }
         if let Some(v) = sh.conv.audio_suffix_template.sync_and_push(
-            &s.converter.settings.audio_suffix_template, editing, applied_seq, now,
+            &s.converter.settings.audio_suffix_template,
+            editing,
+            applied_seq,
+            now,
         ) {
             ui.set_conv_audio_suffix_template(SharedString::from(v));
         }
         if let Some(v) = sh.conv.video_suffix_template.sync_and_push(
-            &s.converter.settings.video_suffix_template, editing, applied_seq, now,
+            &s.converter.settings.video_suffix_template,
+            editing,
+            applied_seq,
+            now,
         ) {
             ui.set_conv_video_suffix_template(SharedString::from(v));
         }
         ui.set_conv_output_folder(SharedString::from(
-            s.converter.settings.output_folder.to_string_lossy().as_ref(),
+            s.converter
+                .settings
+                .output_folder
+                .to_string_lossy()
+                .as_ref(),
         ));
 
         // Channel map
@@ -563,19 +733,33 @@ fn sync_ffmpeg_caps(ui: &AppWindow, s: &AppStateSnapshot) {
 /// static data, so they are set once instead of on every tick.
 fn set_static_converter_models(ui: &AppWindow) {
     let container_options: Vec<SharedString> = gui_engine::converter::supported_containers()
-        .iter().map(|(k, _)| SharedString::from(*k)).collect();
-    ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(container_options)));
+        .iter()
+        .map(|(k, _)| SharedString::from(*k))
+        .collect();
+    ui.set_conv_container_options(ModelRc::new(VecModel::<SharedString>::from(
+        container_options,
+    )));
 
     let video_options: Vec<SharedString> = gui_engine::video_codecs::supported_video_codecs()
-        .iter().map(|(k, desc)| SharedString::from(format!("{} — {}", k, desc))).collect();
+        .iter()
+        .map(|(k, desc)| SharedString::from(format!("{} — {}", k, desc)))
+        .collect();
     ui.set_conv_video_encoder_options(ModelRc::new(VecModel::<SharedString>::from(video_options)));
 
     let audio_options: Vec<SharedString> = gui_engine::converter::supported_audio_encoders()
-        .iter().map(|(k, _)| SharedString::from(*k)).collect();
+        .iter()
+        .map(|(k, _)| SharedString::from(*k))
+        .collect();
     ui.set_conv_audio_encoder_options(ModelRc::new(VecModel::<SharedString>::from(audio_options)));
 }
 
-fn sync_converter_groups(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64, now: Instant, sh: &mut Shadows) {
+fn sync_converter_groups(
+    ui: &AppWindow,
+    s: &AppStateSnapshot,
+    applied_seq: u64,
+    now: Instant,
+    sh: &mut Shadows,
+) {
     // 24. Converter group + file info sync
     {
         let groups = &s.converter.groups;
@@ -588,14 +772,22 @@ fn sync_converter_groups(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64,
         if let Some(idx) = selected_idx {
             if idx < groups.len() {
                 let files = &groups[idx].files;
-                let ltc_file_names: Vec<SharedString> = files.iter().map(|f| {
-                    SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
-                }).collect();
+                let ltc_file_names: Vec<SharedString> = files
+                    .iter()
+                    .map(|f| {
+                        SharedString::from(f.file_name().and_then(|s| s.to_str()).unwrap_or("?"))
+                    })
+                    .collect();
                 let is_audio = matches!(groups[idx].recording_type, RecordingType::MultiTrackAudio);
                 ui.set_conv_is_video_recording(!is_audio);
                 ui.set_conv_num_channels(if is_audio { files.len() as i32 } else { 0 });
-                push_shadow(&mut sh.conv.ltc_file_idx, &s.converter.settings.ltc_file_idx, applied_seq, now,
-                    |v| ui.set_ltc_file_idx(v as i32));
+                push_shadow(
+                    &mut sh.conv.ltc_file_idx,
+                    &s.converter.settings.ltc_file_idx,
+                    applied_seq,
+                    now,
+                    |v| ui.set_ltc_file_idx(v as i32),
+                );
                 ui.set_ltc_file_names(ModelRc::new(VecModel::<SharedString>::from(ltc_file_names)));
             }
         }
@@ -627,7 +819,10 @@ fn sync_conversion_status(ui: &AppWindow, s: &AppStateSnapshot) {
             s.converter.collision_warning.as_deref().unwrap_or(""),
         ));
         ui.set_conv_duplicate_output_warning(SharedString::from(
-            s.converter.duplicate_output_warning.as_deref().unwrap_or(""),
+            s.converter
+                .duplicate_output_warning
+                .as_deref()
+                .unwrap_or(""),
         ));
     }
 }
@@ -638,7 +833,9 @@ fn sync_clapper_logs(ui: &AppWindow, s: &AppStateSnapshot, last_log_count: &Mute
         let current_log_count = s.clapper.logs.len();
         let mut last = last_log_count.lock().unwrap();
         if current_log_count != *last {
-            let log_entries: Vec<LogEntry> = s.clapper.logs
+            let log_entries: Vec<LogEntry> = s
+                .clapper
+                .logs
                 .iter()
                 .map(|l| LogEntry {
                     timestamp: SharedString::from(&l.timestamp),
@@ -653,16 +850,25 @@ fn sync_clapper_logs(ui: &AppWindow, s: &AppStateSnapshot, last_log_count: &Mute
     }
 }
 
-fn sync_device_names(ui: &AppWindow, s: &AppStateSnapshot, last_device_key: &Mutex<(usize, String)>) {
+fn sync_device_names(
+    ui: &AppWindow,
+    s: &AppStateSnapshot,
+    last_device_key: &Mutex<(usize, String)>,
+) {
     // 28. Device names (only rebuild if device list changed)
     {
         let device_key = (
             s.devices.len(),
-            s.devices.iter().map(|d| d.id.clone()).collect::<Vec<_>>().join("\n"),
+            s.devices
+                .iter()
+                .map(|d| d.id.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
         );
         let mut last = last_device_key.lock().unwrap();
         if device_key != *last {
-            let device_names: Vec<SharedString> = s.devices
+            let device_names: Vec<SharedString> = s
+                .devices
                 .iter()
                 .map(|d| SharedString::from(device_display_name(&d.name, d.is_default)))
                 .collect();
@@ -698,7 +904,9 @@ fn sync_debug_log(
         let current_count = entries.entries.len();
         let mut last_count = last_debug_log_count.lock().unwrap();
         if current_count != *last_count {
-            let model: Vec<SharedString> = entries.entries.iter()
+            let model: Vec<SharedString> = entries
+                .entries
+                .iter()
                 .map(|s| SharedString::from(s.as_str()))
                 .collect();
             drop(entries);
@@ -708,14 +916,26 @@ fn sync_debug_log(
     }
 }
 
-fn sync_offload(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64, now: Instant, sh: &mut Shadows) {
+fn sync_offload(
+    ui: &AppWindow,
+    s: &AppStateSnapshot,
+    applied_seq: u64,
+    now: Instant,
+    sh: &mut Shadows,
+) {
     // 31. Offload state sync
     {
         let off = &s.offload;
         ui.set_off_parent_folder(SharedString::from(
-            off.parent_folder.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+            off.parent_folder
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
         ));
-        if let Some(v) = sh.parent_name.sync_and_push(&off.parent_name, false, applied_seq, now) {
+        if let Some(v) = sh
+            .parent_name
+            .sync_and_push(&off.parent_name, false, applied_seq, now)
+        {
             ui.set_off_parent_name(SharedString::from(v));
         }
         let scan_job = s.job(JobKind::OffloadScan);
@@ -725,33 +945,34 @@ fn sync_offload(ui: &AppWindow, s: &AppStateSnapshot, applied_seq: u64, now: Ins
         ui.set_off_running(copy_job.is_active());
         ui.set_off_overall_progress(copy_job.fraction());
         let speed_bps = copy_job.speed().unwrap_or(0.0);
-        ui.set_off_speed_text(SharedString::from(
-            if speed_bps > 0.0 {
-                format!("{} / s", format_bytes(speed_bps as u64))
-            } else {
-                String::new()
-            },
-        ));
+        ui.set_off_speed_text(SharedString::from(if speed_bps > 0.0 {
+            format!("{} / s", format_bytes(speed_bps as u64))
+        } else {
+            String::new()
+        }));
         ui.set_off_error(SharedString::from(off.error.clone().unwrap_or_default()));
 
         let card_infos: Vec<crate::OffloadCardInfo> = build_offload_card_infos(off);
-        ui.set_off_cards(ModelRc::new(VecModel::<crate::OffloadCardInfo>::from(card_infos)));
+        ui.set_off_cards(ModelRc::new(VecModel::<crate::OffloadCardInfo>::from(
+            card_infos,
+        )));
 
         let device_status: Vec<crate::OffloadDeviceStatus> =
             build_offload_device_status(off, copy_job);
-        ui.set_off_device_progress(ModelRc::new(VecModel::<crate::OffloadDeviceStatus>::from(device_status)));
+        ui.set_off_device_progress(ModelRc::new(VecModel::<crate::OffloadDeviceStatus>::from(
+            device_status,
+        )));
 
-        let completed: Vec<SharedString> = off.completed_devices.iter()
+        let completed: Vec<SharedString> = off
+            .completed_devices
+            .iter()
             .map(|d| SharedString::from(d.clone()))
             .collect();
         ui.set_off_completed_devices(ModelRc::new(VecModel::<SharedString>::from(completed)));
     }
 }
 
-pub fn setup_poll_timer(
-    ui: &AppWindow,
-    ctx: PollContext,
-) {
+pub fn setup_poll_timer(ui: &AppWindow, ctx: PollContext) {
     set_static_converter_models(ui);
 
     let PollContext {
@@ -813,7 +1034,11 @@ pub fn setup_poll_timer(
             // 32. Perf diagnostics
             let poll_elapsed = poll_start.elapsed();
             if tick % 250 == 0 {
-                info!("[PERF] Poll tick #{}: {}ms", tick, poll_elapsed.as_micros() as f64 / 1000.0);
+                info!(
+                    "[PERF] Poll tick #{}: {}ms",
+                    tick,
+                    poll_elapsed.as_micros() as f64 / 1000.0
+                );
             }
         },
     );
@@ -852,13 +1077,13 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slint::Model;
     use gui_engine::ffprobe::{AudioStreamInfo, VideoAudioProbe};
     use gui_engine::job::{JobStatus, ProgressSnapshot, UnitSnapshot};
     use gui_engine::{
         DeviceNameSource, FrameTimecode, LtcDecodeStatus, LtcDetectionResult, OffloadDeviceTotals,
         OffloadFileInfo, SdCardInfo, Timecode,
     };
+    use slint::Model;
 
     fn result_with(status: LtcDecodeStatus) -> LtcDetectionResult {
         let mut r = LtcDetectionResult::error("unused");
@@ -871,12 +1096,22 @@ mod tests {
         r.processing_time_ms = 12.0;
         r.timecodes.push(FrameTimecode {
             frame_index: 0,
-            timecode: Timecode { hours: 1, minutes: 2, seconds: 3, frames: 4 },
+            timecode: Timecode {
+                hours: 1,
+                minutes: 2,
+                seconds: 3,
+                frames: 4,
+            },
             timecode_secs: 0.0,
         });
         r.timecodes.push(FrameTimecode {
             frame_index: 89,
-            timecode: Timecode { hours: 1, minutes: 2, seconds: 6, frames: 19 },
+            timecode: Timecode {
+                hours: 1,
+                minutes: 2,
+                seconds: 6,
+                frames: 19,
+            },
             timecode_secs: 3.5,
         });
         r
@@ -900,8 +1135,14 @@ mod tests {
     fn clap_started_fires_only_on_seq_change() {
         assert!(!clap_started(0, 0), "same seq must not retrigger");
         assert!(clap_started(1, 0), "bumped seq triggers once");
-        assert!(!clap_started(1, 1), "already-animated seq must not retrigger");
-        assert!(clap_started(3, 2), "missed claps still trigger (animates once)");
+        assert!(
+            !clap_started(1, 1),
+            "already-animated seq must not retrigger"
+        );
+        assert!(
+            clap_started(3, 2),
+            "missed claps still trigger (animates once)"
+        );
     }
 
     #[test]
@@ -919,10 +1160,8 @@ mod tests {
     #[test]
     fn decode_status_detecting_wins_while_jobs_run() {
         let mut s = AppStateSnapshot::initial();
-        s.jobs.insert(
-            JobKind::LtcDecode,
-            JobStatus::running("decoding"),
-        );
+        s.jobs
+            .insert(JobKind::LtcDecode, JobStatus::running("decoding"));
         s.decode.error = Some("stale".to_string());
         let (status, result_text, error) = format_decode_status(&s);
         assert_eq!(status, "detecting");
@@ -973,12 +1212,15 @@ mod tests {
 
     fn probe(streams: &[(usize, usize)]) -> VideoAudioProbe {
         VideoAudioProbe {
-            streams: streams.iter().map(|&(i, ch)| AudioStreamInfo {
-                stream_index: i,
-                channels: ch,
-                codec_name: "pcm".into(),
-                sample_rate: 48_000,
-            }).collect(),
+            streams: streams
+                .iter()
+                .map(|&(i, ch)| AudioStreamInfo {
+                    stream_index: i,
+                    channels: ch,
+                    codec_name: "pcm".into(),
+                    sample_rate: 48_000,
+                })
+                .collect(),
             total_audio_channels: streams.iter().map(|&(_, c)| c).sum(),
             is_video_file: true,
         }
@@ -1031,18 +1273,22 @@ mod tests {
     #[test]
     fn group_model_lists_files_and_marks_audio_recordings() {
         let mut s = AppStateSnapshot::initial();
-        s.converter.groups.push(gui_engine::file_pattern::MatchedGroup {
-            prefix: "take1".into(),
-            rel_dir: String::new(),
-            files: vec![std::path::PathBuf::from("take1S1.wav")],
-            recording_type: RecordingType::MultiTrackAudio,
-        });
-        s.converter.groups.push(gui_engine::file_pattern::MatchedGroup {
-            prefix: "MVI_0001".into(),
-            rel_dir: String::new(),
-            files: vec![std::path::PathBuf::from("MVI_0001.MP4")],
-            recording_type: RecordingType::VideoClipSequence,
-        });
+        s.converter
+            .groups
+            .push(gui_engine::file_pattern::MatchedGroup {
+                prefix: "take1".into(),
+                rel_dir: String::new(),
+                files: vec![std::path::PathBuf::from("take1S1.wav")],
+                recording_type: RecordingType::MultiTrackAudio,
+            });
+        s.converter
+            .groups
+            .push(gui_engine::file_pattern::MatchedGroup {
+                prefix: "MVI_0001".into(),
+                rel_dir: String::new(),
+                files: vec![std::path::PathBuf::from("MVI_0001.MP4")],
+                recording_type: RecordingType::VideoClipSequence,
+            });
         let model = build_group_model(&s);
         assert_eq!(model.len(), 2);
         assert!(model[0].is_audio_recording);
@@ -1091,11 +1337,17 @@ mod tests {
         off.file_durations.insert(c.files[0].path.clone(), None); // probed, failed
         let infos = build_offload_card_infos(&off);
         // failed probe renders the em dash; unprobed (absent key) renders ellipsis
-        assert_eq!(infos[0].files.row_data(0).unwrap().duration_text.as_str(), "—");
+        assert_eq!(
+            infos[0].files.row_data(0).unwrap().duration_text.as_str(),
+            "—"
+        );
         let mut off2 = gui_engine::offload::OffloadSnapshot::initial();
         off2.cards.push(card());
         let infos2 = build_offload_card_infos(&off2);
-        assert_eq!(infos2[0].files.row_data(0).unwrap().duration_text.as_str(), "…");
+        assert_eq!(
+            infos2[0].files.row_data(0).unwrap().duration_text.as_str(),
+            "…"
+        );
     }
 
     #[test]
@@ -1110,7 +1362,12 @@ mod tests {
         let (name, state, bytes, progress) = {
             let rows = build_offload_device_status(&off, &js);
             let r = &rows[0];
-            (r.device_name.clone(), r.state_text.clone(), r.bytes_text.clone(), r.progress)
+            (
+                r.device_name.clone(),
+                r.state_text.clone(),
+                r.bytes_text.clone(),
+                r.progress,
+            )
         };
         assert_eq!(name.as_str(), "cam-a");
         assert_eq!(state, "Pending");
