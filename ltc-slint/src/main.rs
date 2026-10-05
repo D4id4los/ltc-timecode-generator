@@ -1206,16 +1206,25 @@ fn _run_gui(
     register_offload(&ui, &rt);
 
     // ── Poll timer — state sync ────────────────────────────────────────────
-    setup_poll_timer(&ui, PollContext::new(
-        engine_state,
-        event_rx,
-        toasts,
-        next_toast_id,
-        log_buffer,
-        last_debug_log_count,
-        pulse_phase,
-        rt.shadows.clone(),
-    ));
+    let initial_clap_seq = engine_state.load().clapper.clap_seq;
+    setup_poll_timer(
+        &ui,
+        PollContext {
+            engine_state,
+            event_rx,
+            toasts,
+            next_toast_id,
+            log_buffer,
+            last_debug_log_count,
+            pulse_phase,
+            shadows: rt.shadows.clone(),
+            last_log_count: Arc::new(Mutex::new(0)),
+            last_device_key: Arc::new(Mutex::new((0, String::new()))),
+            // Seeded from the snapshot so a mid-session GUI start does not
+            // fire for an old clap.
+            last_clap_seq: Arc::new(Mutex::new(initial_clap_seq)),
+        },
+    );
 
     info!("LTC Slint GUI initialized, showing window");
     ui.run()?;

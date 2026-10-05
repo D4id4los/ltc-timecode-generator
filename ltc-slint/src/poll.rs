@@ -303,47 +303,19 @@ fn audio_event_to_notification(event: &AudioEvent) -> (String, &'static str) {
 // takes exactly two parameters.
 
 pub(crate) struct PollContext {
-    engine_state: Arc<ArcSwap<AppStateSnapshot>>,
-    event_rx: std::sync::mpsc::Receiver<AudioEvent>,
-    toasts: Arc<Mutex<Vec<ToastItem>>>,
-    next_toast_id: Arc<Mutex<i32>>,
-    log_buffer: Arc<Mutex<LogBuffer>>,
-    last_debug_log_count: Arc<Mutex<usize>>,
-    pulse_phase: Arc<Mutex<f64>>,
-    shadows: Arc<Mutex<Shadows>>,
-    last_log_count: Arc<Mutex<usize>>,
-    last_device_key: Arc<Mutex<(usize, String)>>,
+    pub(crate) engine_state: Arc<ArcSwap<AppStateSnapshot>>,
+    pub(crate) event_rx: std::sync::mpsc::Receiver<AudioEvent>,
+    pub(crate) toasts: Arc<Mutex<Vec<ToastItem>>>,
+    pub(crate) next_toast_id: Arc<Mutex<i32>>,
+    pub(crate) log_buffer: Arc<Mutex<LogBuffer>>,
+    pub(crate) last_debug_log_count: Arc<Mutex<usize>>,
+    pub(crate) pulse_phase: Arc<Mutex<f64>>,
+    pub(crate) shadows: Arc<Mutex<Shadows>>,
+    pub(crate) last_log_count: Arc<Mutex<usize>>,
+    pub(crate) last_device_key: Arc<Mutex<(usize, String)>>,
     /// Last `clapper.clap_seq` the GUI animated (seeded from the snapshot so
     /// a mid-session start does not fire for an old clap).
-    last_clap_seq: Arc<Mutex<u64>>,
-}
-
-impl PollContext {
-    pub(crate) fn new(
-        engine_state: Arc<ArcSwap<AppStateSnapshot>>,
-        event_rx: std::sync::mpsc::Receiver<AudioEvent>,
-        toasts: Arc<Mutex<Vec<ToastItem>>>,
-        next_toast_id: Arc<Mutex<i32>>,
-        log_buffer: Arc<Mutex<LogBuffer>>,
-        last_debug_log_count: Arc<Mutex<usize>>,
-        pulse_phase: Arc<Mutex<f64>>,
-        shadows: Arc<Mutex<Shadows>>,
-    ) -> Self {
-        let initial_clap_seq = engine_state.load().clapper.clap_seq;
-        Self {
-            engine_state,
-            event_rx,
-            toasts,
-            next_toast_id,
-            log_buffer,
-            last_debug_log_count,
-            pulse_phase,
-            shadows,
-            last_log_count: Arc::new(Mutex::new(0)),
-            last_device_key: Arc::new(Mutex::new((0, String::new()))),
-            last_clap_seq: Arc::new(Mutex::new(initial_clap_seq)),
-        }
-    }
+    pub(crate) last_clap_seq: Arc<Mutex<u64>>,
 }
 
 // ── Per-tick sync functions ─────────────────────────────────────────────
