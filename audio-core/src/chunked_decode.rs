@@ -1561,6 +1561,124 @@ mod tests {
             "should decode at least 20 frames with libltc 24-bit, got {}", result.valid_frames);
     }
 
+    /// WP-RW A1 regression pin: per-chunk decode results are a pure function
+    /// of the chunk's sample range — the same byte range must produce the
+    /// same valid/possible counts whether decoded inside the full-file chunked
+    /// run or standalone. (The reported "context-dependent per-chunk results"
+    /// anomaly was a measurement artifact — excerpts cut off the true chunk
+    /// boundary — but this pins the invariant the recon suspected broken.)
+    #[test]
+    fn test_chunked_per_chunk_results_match_standalone_decodes_of_same_ranges() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("context_independence.wav");
+
+        // Multi-chunk WAV with distinct per-chunk outcomes: even-index
+        // seconds clean LTC, odd-index seconds LTC + heavy deterministic
+        // noise. Small DecodeConfig → many small chunks spanning both kinds.
+        let fps = 25.0;
+        let sample_rate = 48000u32;
+        let total_frames = 200usize; // 8 s
+        let _samples_per_frame = (sample_rate as f64 / fps).round() as usize;
+        let mut mono = synth_ltc_mono_for_chunked(
+            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            fps, sample_rate, total_frames, 0.5,
+        );
+        let mut lcg = 0xdead_beef_cafe_f00du64;
+        for (i, s) in mono.iter_mut().enumerate() {
+            let second = i / sample_rate as usize;
+            if second % 2 == 1 {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let noise = ((lcg >> 33) as f32 / 0x7fff_ffffu32 as f32 - 1.0) * 0.9;
+                *s = (*s + noise).clamp(-1.0, 1.0);
+            }
+        }
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for &s in &mono {
+            writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let config = DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 };
+        let (reader, _) = WavChunkReader::open(&path).unwrap();
+        let total_mono = reader.total_mono_samples();
+        let nchunks = count_chunks(total_mono, sample_rate, 1, 16, &config);
+        assert!(nchunks >= 3, "test needs multiple chunks, got {}", nchunks);
+        drop(reader);
+
+        let progress = DecodeProgress::new(nchunks);
+        let chunked = decode_ltc_chunked(&path, false, fps, false, DecodeConfig { chunk_size_bytes: 200_000, overlap_seconds: 0.3 }, &progress).unwrap();
+        assert_eq!(chunked.chunk_summaries.len(), nchunks);
+
+        // Same decoder, same byte ranges, standalone: results must match the
+        // full-run per-chunk summaries exactly.
+        let decoder = crate::decoder::decoder_for(false);
+        let plan = plan_chunks(&WavChunkReader::open(&path).unwrap().0, &config);
+        for (idx, &(start, end)) in plan.boundaries.iter().enumerate() {
+            let standalone = decode_one_chunk(
+                &path, decoder, idx, start, end,
+                sample_rate, fps, false, &AtomicBool::new(false), 0,
+            );
+            let s = standalone.result.expect("standalone chunk decode must succeed");
+            let summary = &chunked.chunk_summaries[idx];
+            assert_eq!(summary.error, None, "chunk {} failed in the full run", idx);
+            assert_eq!(
+                s.valid_frames, summary.valid_frames,
+                "chunk {} valid frames differ between contexts (standalone {} vs chunked {})",
+                idx, s.valid_frames, summary.valid_frames
+            );
+            assert_eq!(
+                s.total_possible_frames, summary.total_possible_frames,
+                "chunk {} possible frames differ between contexts",
+                idx
+            );
+        }
+
+        // Merged stream stays frame-monotonic across chunk borders.
+        let secs: Vec<f64> = chunked.timecodes.iter().map(|t| t.timecode_secs).collect();
+        for w in secs.windows(2) {
+            assert!(w[1] > w[0], "merged timecodes must strictly increase: {:?}", w);
+        }
+
+        // Deterministic: a second identical run must produce byte-identical totals.
+        let progress2 = DecodeProgress::new(nchunks);
+        let again = decode_ltc_chunked(&path, false, fps, false, config, &progress2).unwrap();
+        assert_eq!(again.valid_frames, chunked.valid_frames);
+        assert_eq!(again.timecodes.len(), chunked.timecodes.len());
+    }
+
+    fn synth_ltc_mono_for_chunked(
+        start_tc: Timecode,
+        fps: f64,
+        sample_rate: u32,
+        total_frames: usize,
+        volume: f32,
+    ) -> Vec<f32> {
+        let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
+        let samples_per_bit = samples_per_frame as f32 / 80.0;
+        let mut tc = start_tc;
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut frame_buf = vec![0.0f32; samples_per_frame * 2];
+        let mut out = Vec::with_capacity(total_frames * samples_per_frame);
+        for _ in 0..total_frames {
+            frame_buf.fill(0.0);
+            crate::generate_ltc_frame_stereo(
+                &tc, false, samples_per_frame, samples_per_bit, volume,
+                ChannelSel::Left, &mut last_level, &mut frame_buf,
+            );
+            out.extend(frame_buf.iter().step_by(2).copied());
+            tc = crate::increment_timecode(&tc, fps, false);
+        }
+        out
+    }
+
     #[test]
     fn test_decode_ltc_chunked_progress_on_libltc_read_error() {
         let dir = tempfile::TempDir::new().unwrap();

@@ -251,9 +251,14 @@ fn decode_ltc_samples_inner(
     }
 
     // ── Try ZC-interval method (fast, works on synthetic/clean LTC) ─────────
+    // The gate uses the grid-only count: chain re-lock recovers post-desync
+    // frames but says nothing about how clean the dominant grid is, and a
+    // chain-inflated confidence must not skip the detailed decode path (its
+    // sample-locked extraction decodes fade/noise regions the ZC bitstream
+    // mangles).
     let zc_result = try_decode_via_zc_intervals(&zc, sample_rate, fps, drop_frame, samples.len());
     let zc_conf = zc_result.as_ref().map_or(0.0, |r| {
-        if r.total_possible > 0 { r.valid_frames as f32 / r.total_possible as f32 } else { 0.0 }
+        if r.total_possible > 0 { r.grid_valid as f32 / r.total_possible as f32 } else { 0.0 }
     });
 
     match zc_result.as_ref() {
@@ -263,7 +268,7 @@ fn decode_ltc_samples_inner(
     }
 
     if zc_conf >= 0.70 {
-        info!("LTC decode: ZC-interval confidence {:.1}% >= 70% -- using directly", zc_conf * 100.0);
+        info!("LTC decode: ZC-interval grid confidence {:.1}% >= 70% -- using directly", zc_conf * 100.0);
         return build_result(zc_result, &zc, samples, sample_rate, threshold, channels, total_duration, start);
     }
 
@@ -556,7 +561,9 @@ fn score_candidate(
         return ScoredCandidate::TooShort;
     }
 
-    let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
+    let scan = find_frames(&bits, fps, drop_frame);
+    let (valid_frames, total_possible, frame_starts, grid_valid) =
+        (scan.valid_frames, scan.total_possible, scan.frame_starts, scan.grid_valid);
     if valid_frames <= best_valid {
         return ScoredCandidate::NoBeat;
     }
@@ -580,6 +587,7 @@ fn score_candidate(
 
     ScoredCandidate::Beat(ScoredResult::from_frame_starts(
         fps, drop_frame, spb, phase, total_possible, &bits, frame_starts, sample_rate, details_entry, adaptive,
+        grid_valid,
     ))
 }
 
@@ -1842,10 +1850,13 @@ fn try_decode_via_zc_intervals(
         return None;
     }
 
-    let (valid_frames, total_possible, frame_starts) = find_frames(&bits);
-    if valid_frames == 0 {
+    let scan = find_frames(&bits, fps, drop_frame);
+    if scan.valid_frames == 0 {
         return None;
     }
+    let (valid_frames, total_possible, frame_starts) =
+        (scan.valid_frames, scan.total_possible, scan.frame_starts);
+    let grid_valid = scan.grid_valid;
 
     let spb = sample_rate as f64 / (fps * 80.0);
     let fps_name = format!("{:.2} fps", fps);
@@ -1857,6 +1868,7 @@ fn try_decode_via_zc_intervals(
 
     Some(ScoredResult::from_frame_starts(
         fps, drop_frame, spb, zc[0], total_possible, &bits, frame_starts, sample_rate, details_entry, false,
+        grid_valid,
     ))
 }
 
@@ -1988,10 +2000,23 @@ fn bits_hamming_distance_16(a: &[u8]) -> u32 {
     dist
 }
 
-fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
+/// Frame-detection outcome. `valid_frames` counts every accepted frame
+/// (dominant grid + chain re-locks — the decoded reality); `grid_valid`
+/// counts only dominant-grid frames and feeds the fast-path confidence
+/// gates: chain re-lock recovers post-desync frames but says nothing about
+/// how clean the dominant grid is, and a chain-inflated count must not skip
+/// the detailed decode path.
+struct FrameScan {
+    valid_frames: u32,
+    grid_valid: u32,
+    total_possible: u32,
+    frame_starts: Vec<usize>,
+}
+
+fn find_frames(bits: &[u8], fps: f64, drop_frame: bool) -> FrameScan {
     let mut sync_positions = Vec::new();
     if bits.len() < 16 {
-        return (0, 0, Vec::new());
+        return FrameScan { valid_frames: 0, grid_valid: 0, total_possible: 0, frame_starts: Vec::new() };
     }
     let max_start = bits.len() - 16;
     let mut i = 0;
@@ -2006,9 +2031,16 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
     }
 
     if sync_positions.is_empty() {
-        return (0, 0, Vec::new());
+        return FrameScan { valid_frames: 0, grid_valid: 0, total_possible: 0, frame_starts: Vec::new() };
     }
 
+    // Alignment histogram: keeps the legacy total-possible denominator (the
+    // dominant-alignment grid estimate). Frame *detection* below no longer
+    // decodes along that grid: a single real-world disturbance shifts the
+    // extracted bitstream, and grid decoding lost everything after the shift
+    // (the WP-RW A2/A3 long-file collapse — chunk 0 of a 49-min recording
+    // decoded 62% while its 120 s slices decoded 94–100%). Instead each
+    // detected sync word re-locks its own frame at `sp - SYNC_OFFSET`.
     let mut alignment_scores = vec![0u32; 80];
     for &sp in &sync_positions {
         if sp >= SYNC_OFFSET {
@@ -2024,7 +2056,7 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         .unwrap_or((0, &0));
 
     if alignment_scores[0] == 0 && alignment_scores.iter().all(|&c| c == 0) {
-        return (0, 0, Vec::new());
+        return FrameScan { valid_frames: 0, grid_valid: 0, total_possible: 0, frame_starts: Vec::new() };
     }
 
     let total_possible = if bits.len() > best_alignment {
@@ -2033,9 +2065,12 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         0
     };
 
-    let mut frame_starts = Vec::new();
+    // Legacy dominant-grid walk (acceptance unchanged). Chains below extend
+    // this; grid frames remain the noise-regime baseline.
+    let mut grid_starts: Vec<usize> = Vec::new();
     let align = best_alignment;
-    for idx in 0.. {
+    let mut idx = 0usize;
+    loop {
         let frame_start = align + idx * 80;
         if frame_start + 80 > bits.len() {
             break;
@@ -2044,11 +2079,106 @@ fn find_frames(bits: &[u8]) -> (u32, u32, Vec<usize>) {
         if sync_start + 16 <= bits.len()
             && bits_hamming_distance_16(&bits[sync_start..sync_start + 16]) <= SYNC_MATCH_TOLERANCE
         {
-            frame_starts.push(frame_start);
+            grid_starts.push(frame_start);
+        }
+        idx += 1;
+    }
+    // Chain re-lock (WP-RW A2/A3): a real-world disturbance shifts the
+    // extracted bitstream, so every frame after it sits off the dominant
+    // grid and the legacy walk loses the rest of the stream. A shifted (or
+    // dominant-but-outvoted) segment is a run of consecutive sync words
+    // spaced exactly 80 bits. Accept a run when it carries a consecutive-TC
+    // pair: a true chain decodes to incrementing timecodes, while
+    // noise-induced false syncs chained 80 bits apart decode to garbage.
+    // Grid frames are unaffected (the walk above stays the noise-regime
+    // baseline); dedup removes the overlap where both accept a frame.
+    let flush_run = |run: &Vec<usize>, chain_starts: &mut Vec<usize>| {
+        // ≥5 members: any real desync strands at least a fraction of a
+        // second of frames (25/s), while noise-induced chance chains never
+        // stack four exact 80-bit hops *and* a consecutive-TC pair.
+        if run.len() < 5 {
+            return;
+        }
+        let tcs: Vec<Option<Timecode>> = run
+            .iter()
+            .map(|&sp| {
+                sp.checked_sub(SYNC_OFFSET)
+                    .filter(|&fs| fs + 80 <= bits.len())
+                    .map(|fs| decode_timecode_from_bits(bits, fs))
+            })
+            .collect();
+        let sequential = tcs.windows(2).any(|w| {
+            matches!(
+                (&w[0], &w[1]),
+                (Some(a), Some(b)) if crate::increment_timecode(a, fps, drop_frame) == *b
+            )
+        });
+        if sequential {
+            for &sp in run {
+                if let Some(fs) = sp.checked_sub(SYNC_OFFSET) {
+                    chain_starts.push(fs);
+                }
+            }
+        }
+    };
+    let mut chain_starts: Vec<usize> = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    for i in 0..=sync_positions.len() {
+        if i < sync_positions.len() {
+            if let Some(&last) = run.last() {
+                if sync_positions[i] != last + 80 {
+                    flush_run(&run, &mut chain_starts);
+                    run.clear();
+                }
+            }
+            run.push(sync_positions[i]);
+        } else {
+            flush_run(&run, &mut chain_starts);
         }
     }
+    // Near-duplicate chains: a noise-shifted sync match can spawn a second
+    // chain 1–2 bits off a first one; both decode to the same frame values.
+    // Cluster chain starts closer than half a frame (40 bits), keeping the
+    // first of each cluster. (Distinct true frames sit exactly 80 bits
+    // apart, so the cluster radius cannot merge neighbours.)
+    chain_starts.sort_unstable();
+    let mut clustered: Vec<usize> = Vec::with_capacity(chain_starts.len());
+    for &c in &chain_starts {
+        let near_prev = clustered
+            .last()
+            .is_some_and(|&k| c - k < 40);
+        if !near_prev {
+            clustered.push(c);
+        }
+    }
+    let chain_starts = clustered;
+    // Duplicate resolution, grid-preferred: in fading or impulse noise a
+    // noise-shifted sync match can spawn a chain copy of a frame the grid
+    // already accepted — its payload crosses bit boundaries differently and
+    // decodes wrong where the grid copy decoded right, and keeping both
+    // yields duplicated timecode values. A chain start within half a frame
+    // (40 bits) of a grid start is the same frame; the grid copy wins.
+    // Chains matter exactly where the grid is dark — the shifted segment
+    // after a desync — and those have no grid neighbour.
+    let mut merged: Vec<usize> = grid_starts.clone();
+    for c in chain_starts {
+        let superseded = merged.iter().any(|&g| {
+            let d = c.abs_diff(g);
+            d < 40
+        });
+        if !superseded {
+            merged.push(c);
+        }
+    }
+    merged.sort_unstable();
+    merged.dedup();
 
-    (frame_starts.len() as u32, total_possible, frame_starts)
+    FrameScan {
+        valid_frames: merged.len() as u32,
+        grid_valid: grid_starts.len() as u32,
+        total_possible,
+        frame_starts: merged,
+    }
 }
 
 // ── Timecode decoding ────────────────────────────────────────────────────────
@@ -2104,11 +2234,15 @@ struct ScoredResult {
     /// before the array origin carry negative indices (still sample-valid via
     /// `phase + idx·spb`).
     frame_starts: Vec<i64>,
+    /// Dominant-grid-only valid count (see `FrameScan`): feeds the
+    /// ZC-interval fast-path gate, never the reported result.
+    grid_valid: u32,
 }
 
 impl ScoredResult {
     /// Single home of the `(phase + start·spb)/sample_rate` timing and the
     /// frame_index renumbering — previously 4 near-copies.
+    #[allow(clippy::too_many_arguments)]
     fn from_frame_starts(
         fps: f64,
         drop_frame: bool,
@@ -2120,6 +2254,7 @@ impl ScoredResult {
         sample_rate: u32,
         details_entry: String,
         adaptive: bool,
+        grid_valid: u32,
     ) -> ScoredResult {
         let valid_frames = frame_starts.len() as u32;
         let timecodes: Vec<FrameTimecode> = frame_starts
@@ -2142,6 +2277,7 @@ impl ScoredResult {
             phase,
             adaptive,
             frame_starts: frame_starts.into_iter().map(|s| s as i64).collect(),
+            grid_valid,
         }
     }
 
@@ -2151,6 +2287,7 @@ impl ScoredResult {
             fps: params.fps,
             drop_frame: params.drop_frame,
             valid_frames: 0,
+            grid_valid: 0,
             total_possible: 0,
             timecodes: Vec::new(),
             details_entry: "Canceled".to_string(),
@@ -2186,13 +2323,17 @@ fn decode_full_file(
     if cancelled(cancel) {
         return ScoredResult::canceled(params, absolute_phase);
     }
-    let (valid_nominal, total_possible, frame_starts_nominal) = find_frames(&bits_nominal);
+    let scan_nominal = find_frames(&bits_nominal, params.fps, params.drop_frame);
+    let (valid_nominal, total_possible, frame_starts_nominal) =
+        (scan_nominal.valid_frames, scan_nominal.total_possible, scan_nominal.frame_starts);
 
     if cancelled(cancel) {
         return ScoredResult::canceled(params, absolute_phase);
     }
     let bits_adaptive = extract_bits_adaptive(samples, params.spb, absolute_phase, threshold, zero_crossings, cancel);
-    let (valid_adaptive, total_possible_adaptive, frame_starts_adaptive) = find_frames(&bits_adaptive);
+    let scan_adaptive = find_frames(&bits_adaptive, params.fps, params.drop_frame);
+    let (valid_adaptive, total_possible_adaptive, frame_starts_adaptive) =
+        (scan_adaptive.valid_frames, scan_adaptive.total_possible, scan_adaptive.frame_starts);
 
     let (use_adaptive, valid_frames, total_possible, frame_starts, bits) = if valid_adaptive > valid_nominal {
         (true, valid_adaptive, total_possible_adaptive, frame_starts_adaptive, bits_adaptive)
@@ -2205,9 +2346,11 @@ fn decode_full_file(
         "{:.2} fps: {} valid / {} possible frames (single-pass {method}, spb={:.2}, phase={})",
         params.fps, valid_frames, total_possible, params.spb, absolute_phase
     );
+    let grid_valid = if use_adaptive { scan_adaptive.grid_valid } else { scan_nominal.grid_valid };
     ScoredResult::from_frame_starts(
         params.fps, params.drop_frame, params.spb, absolute_phase, total_possible,
         &bits, frame_starts, sample_rate, details_entry, use_adaptive,
+        grid_valid,
     )
 }
 
@@ -2482,7 +2625,8 @@ mod tests {
     #[test]
     fn test_find_frames_single_frame() {
         let bits = build_frame_bits(Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 });
-        let (valid, total, starts) = find_frames(&bits);
+        let scan = find_frames(&bits, 25.0, false);
+        let (valid, total, starts) = (scan.valid_frames, scan.total_possible, scan.frame_starts);
         assert_eq!(valid, 1);
         assert_eq!(total, 1);
         assert_eq!(starts, vec![0]);
@@ -2492,7 +2636,8 @@ mod tests {
     fn test_find_frames_two_frames() {
         let mut bits = build_frame_bits(Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 });
         bits.extend(build_frame_bits(Timecode { hours: 1, minutes: 0, seconds: 0, frames: 1 }));
-        let (valid, _total, starts) = find_frames(&bits);
+        let scan = find_frames(&bits, 25.0, false);
+        let (valid, starts) = (scan.valid_frames, scan.frame_starts);
         assert_eq!(valid, 2);
         assert_eq!(starts, vec![0, 80]);
     }
@@ -2500,7 +2645,8 @@ mod tests {
     #[test]
     fn test_find_frames_no_sync_word() {
         let bits = vec![0u8; 160];
-        let (valid, _total, starts) = find_frames(&bits);
+        let scan = find_frames(&bits, 25.0, false);
+        let (valid, starts) = (scan.valid_frames, scan.frame_starts);
         assert_eq!(valid, 0);
         assert!(starts.is_empty());
     }
@@ -2517,7 +2663,7 @@ mod tests {
             seed.hash(&mut h);
             *b = (h.finish() & 1) as u8;
         }
-        let (valid, _, _) = find_frames(&bits);
+        let valid = find_frames(&bits, 25.0, false).valid_frames;
         // False-positive *ceiling* on garbage input: legitimate per the Test
         // Quality Rules (noise must not decode). `valid <= 2` bounds the sync
         // word false-match rate over 320 random bits; a decoder that got
@@ -2529,7 +2675,8 @@ mod tests {
     #[test]
     fn test_find_frames_short_buffer() {
         let bits = vec![0u8; 10];
-        let (valid, total, starts) = find_frames(&bits);
+        let scan = find_frames(&bits, 25.0, false);
+        let (valid, total, starts) = (scan.valid_frames, scan.total_possible, scan.frame_starts);
         assert_eq!(valid, 0);
         assert_eq!(total, 0);
         assert!(starts.is_empty());
@@ -2539,8 +2686,105 @@ mod tests {
     fn test_find_frames_alignment_matters() {
         let mut bits = vec![0u8; 160];
         bits[0..16].copy_from_slice(&SYNC_WORD);
-        let (valid, _, _) = find_frames(&bits);
+        let valid = find_frames(&bits, 25.0, false).valid_frames;
         assert_eq!(valid, 0, "sync word at wrong offset should not produce valid frames");
+    }
+
+    #[test]
+    fn test_find_frames_resyncs_after_bit_glitch() {
+        // A real-world disturbance (drop-out, noise burst) inserts or removes
+        // bits from the extracted bitstream, shifting every subsequent frame
+        // off the 80-bit grid. Frame detection must re-lock at each detected
+        // sync word — losing only the glitched frame — not decode from one
+        // global alignment grid (which discards everything after the first
+        // shift; the A2/A3 long-file collapse).
+        let mut bits = Vec::new();
+        for f in 0..6u32 {
+            bits.extend(build_frame_bits(Timecode { hours: 1, minutes: 0, seconds: 0, frames: f }));
+        }
+        bits.extend_from_slice(&[0, 1, 0]); // glitch: permanent 3-bit shift
+        for f in 6..12u32 {
+            bits.extend(build_frame_bits(Timecode { hours: 1, minutes: 0, seconds: 0, frames: f }));
+        }
+        let scan = find_frames(&bits, 25.0, false);
+        let (valid, starts) = (scan.valid_frames, scan.frame_starts);
+        assert_eq!(valid, 12, "all frames must be found across the bit shift, starts={:?}", starts);
+        assert_eq!(
+            starts,
+            vec![0, 80, 160, 240, 320, 400, 483, 563, 643, 723, 803, 883],
+            "post-shift frames start 3 bits past the grid"
+        );
+    }
+
+    /// Deterministic mono LTC synthesis for in-memory decode tests.
+    fn synth_ltc_mono(
+        start_tc: Timecode,
+        fps: f64,
+        sample_rate: u32,
+        total_frames: usize,
+        volume: f32,
+    ) -> Vec<f32> {
+        let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
+        let samples_per_bit = samples_per_frame as f32 / 80.0;
+        let mut tc = start_tc;
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut frame_buf = vec![0.0f32; samples_per_frame * 2];
+        let mut out = Vec::with_capacity(total_frames * samples_per_frame);
+        for _ in 0..total_frames {
+            frame_buf.fill(0.0);
+            crate::generate_ltc_frame_stereo(
+                &tc, false, samples_per_frame, samples_per_bit, volume,
+                ChannelSel::Left, &mut last_level, &mut frame_buf,
+            );
+            out.extend(frame_buf.iter().step_by(2).copied());
+            tc = crate::increment_timecode(&tc, fps, false);
+        }
+        out
+    }
+
+    #[test]
+    fn test_decode_recovers_after_mid_stream_glitch_burst() {
+        // Real-world failure shape (WP-RW A2/A3): a short disturbance inside
+        // a long clean LTC recording must cost only the glitched frames. The
+        // extracted bitstream shifts across the burst; frame detection that
+        // decodes from one global alignment grid loses *everything after the
+        // burst* (measured: chunk 0 of TASCAM_0094S2.wav 62.4% where 120 s
+        // slices decode 94–100%).
+        let fps = 25.0;
+        let sample_rate = 48000u32;
+        let total_frames = 1500usize; // 60 s: 30 s clean · 1 s burst · 29 s clean
+        let mut buf = synth_ltc_mono(
+            Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            fps, sample_rate, total_frames, 0.5,
+        );
+        let burst_start = 30 * sample_rate as usize;
+        let burst_end = 31 * sample_rate as usize;
+        let mut lcg = 0x1234_5678_9abc_def0u64;
+        for s in &mut buf[burst_start..burst_end] {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let noise = ((lcg >> 33) as f32 / 0x7fff_ffffu32 as f32 - 1.0) * 0.8;
+            *s = (*s + noise).clamp(-1.0, 1.0);
+        }
+
+        let result = decode_ltc_samples(
+            &buf, sample_rate, 1, fps, false, std::time::Instant::now(), None,
+        )
+        .unwrap();
+        assert!(
+            matches!(result.status, LtcDecodeStatus::Success),
+            "a 1 s burst in 60 s of clean LTC must still decode Success, got {:?}",
+            result.status
+        );
+        // Floor well above the broken behaviour (~50% = everything after the
+        // burst lost) and below perfection (the burst's own frames are gone).
+        let floor = (total_frames as f64 * 0.90) as u32;
+        assert!(
+            result.valid_frames >= floor,
+            "expected ≥ {} valid frames after glitch recovery, got {}",
+            floor, result.valid_frames
+        );
     }
 
     #[test]
@@ -3826,6 +4070,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 50,
+            grid_valid: 50,
             total_possible: 60,
             timecodes: vec![
                 FrameTimecode {
@@ -3864,6 +4109,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 10,
+            grid_valid: 10,
             total_possible: 100,
             timecodes: vec![],
             details_entry: "".to_string(),
@@ -3880,6 +4126,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 40,
+            grid_valid: 40,
             total_possible: 100,
             timecodes: vec![],
             details_entry: "".to_string(),
@@ -3895,6 +4142,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 90,
+            grid_valid: 90,
             total_possible: 100,
             timecodes: vec![],
             details_entry: "".to_string(),
@@ -3913,6 +4161,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 0,
+            grid_valid: 0,
             total_possible: 0,
             timecodes: vec![],
             details_entry: "".to_string(),
@@ -3949,6 +4198,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 3,
+            grid_valid: 3,
             total_possible: 3,
             timecodes: vec![],
             details_entry: "test".to_string(),
@@ -3975,6 +4225,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 0,
+            grid_valid: 0,
             total_possible: 0,
             timecodes: vec![],
             details_entry: "test".to_string(),
@@ -4012,6 +4263,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 3,
+            grid_valid: 3,
             total_possible: 3,
             timecodes: vec![],
             details_entry: "test".to_string(),
@@ -4051,6 +4303,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames: 0,
+            grid_valid: 0,
             total_possible: 3,
             timecodes: vec![],
             details_entry: "test".to_string(),
@@ -5271,6 +5524,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             valid_frames,
+            grid_valid: valid_frames,
             total_possible: 10,
             timecodes: Vec::new(),
             details_entry: String::new(),
@@ -5290,7 +5544,7 @@ mod tests {
 
         let r = ScoredResult::from_frame_starts(
             25.0, false, 24.0, 480, 5, &bits, vec![0, 80], 48000,
-            "details".to_string(), false,
+            "details".to_string(), false, 2,
         );
 
         assert_eq!(r.valid_frames, 2, "valid_frames == frame_starts.len()");
