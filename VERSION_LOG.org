@@ -1,6 +1,34 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased
+
+Main feature is a step change in the builtin LTC decoder's robustness
+(WP-DR): it used to keep reporting a confident decode well after noise
+had corrupted the decoded timecode *values*, and it lost the signal
+entirely to DC offsets and mains hum at amplitudes equal to the signal
+itself. Both gaps are closed.
+
+List of Changes:
+- Decoder: wrong-value robustness up 2x+ - a new value-integrity pass
+  validates every decoded frame against LTC's BCD digit ranges and
+  frame-rate bounds, repairs single-frame outliers from their coherent
+  neighbours, and drops unverifiable garbage instead of reporting it
+  with confidence. Gaussian noise up to std 0.31 (was 0.18) and click
+  density up to 5.6% (was 0.4%) now decode with correct values.
+- Decoder: DC-offset and mains-hum immunity - decode input is
+  conditioned (median click filter, DC removal, 50/60 Hz mains notches)
+  before detection, so offsets up to 16x the signal amplitude and hum
+  up to the measurement cap decode correctly (previously the cliff was
+  offset/hum at about 1x signal). Quieter signals decode too: the
+  minimum volume dropped from 0.0104 to 0.0041.
+- Decoder: a decode left with no usable timecode values (periodic
+  non-LTC content that merely sync-matches) no longer claims Success,
+  and the quality report no longer scores a degenerate single-frame
+  decode as usable. Decode runtime stays well within 2x of the
+  previous release on both decoders.
+
+
 * v0.5.2
 
 Main feature is a tag-driven release pipeline: pushing a strict
