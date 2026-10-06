@@ -1,5 +1,0 @@
-# cargo-mutants config. Phase 1 scope: audio-core only (pure logic, fast
-# suite, no subprocesses). gui-engine integration tests spawn real ffmpeg
-# and are far too slow to re-run per mutant — phase 2 decision is deferred
-# (see reports/2026-10-06-quality-tooling-assessment-report.md).
-test_tool = "nextest"
