@@ -42,7 +42,7 @@ pub fn read_wav_sample_rate_from_file(file: &mut std::fs::File) -> Option<u32> {
             ]));
         }
         offset += 8 + chunk_size;
-        if chunk_size % 2 != 0 {
+        if !chunk_size.is_multiple_of(2) {
             offset += 1;
         }
     }
@@ -69,7 +69,7 @@ fn decrement_timecode_frame(tc: &Timecode, fps: f64, drop_frame: bool) -> Timeco
     let mut s = tc.seconds;
     let mut f = tc.frames;
 
-    if drop_frame && s == 0 && m % 10 != 0 && f <= 1 {
+    if drop_frame && s == 0 && !m.is_multiple_of(10) && f <= 1 {
         if m > 0 {
             m -= 1;
         } else {

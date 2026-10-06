@@ -1033,7 +1033,7 @@ pub fn setup_poll_timer(ui: &AppWindow, ctx: PollContext) {
 
             // 32. Perf diagnostics
             let poll_elapsed = poll_start.elapsed();
-            if tick % 250 == 0 {
+            if tick.is_multiple_of(250) {
                 info!(
                     "[PERF] Poll tick #{}: {}ms",
                     tick,

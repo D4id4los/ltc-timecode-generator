@@ -624,7 +624,7 @@ pub fn parse_last_keyframe(json: &str, offset_secs: f64) -> Option<f64> {
             .and_then(|v| v.parse::<f64>().ok())
             .or_else(|| p.get("pts_time").and_then(|v| v.as_f64()));
         if let Some(pts) = pts {
-            if pts <= offset_secs + 0.001 && best.map_or(true, |b| pts > b) {
+            if pts <= offset_secs + 0.001 && best.is_none_or(|b| pts > b) {
                 best = Some(pts);
             }
         }

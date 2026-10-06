@@ -2043,11 +2043,11 @@ fn decode_bits_from_zero_crossings(
 
     if short_ratio > 0.10 {
         let mut bits = decode_bits_real_zc(zc, spb);
-        bits.extend(std::iter::repeat(0u8).take(trailing_zeros));
+        bits.extend(std::iter::repeat_n(0u8, trailing_zeros));
         bits
     } else {
         let mut bits = decode_bits_synthetic_zc(zc, spb);
-        bits.extend(std::iter::repeat(0u8).take(trailing_zeros));
+        bits.extend(std::iter::repeat_n(0u8, trailing_zeros));
         bits
     }
 }
@@ -2938,9 +2938,9 @@ mod tests {
         // half-bit-like) → -0.70 → +0.18×9 → -0.70: every reversal is a
         // real transition.
         let mut samples = vec![-0.69f32];
-        samples.extend(std::iter::repeat(0.18).take(9));
+        samples.extend(std::iter::repeat_n(0.18, 9));
         samples.push(-0.70);
-        samples.extend(std::iter::repeat(0.18).take(9));
+        samples.extend(std::iter::repeat_n(0.18, 9));
         samples.push(-0.70);
         let crossings = find_zero_crossings(&samples, 0.196);
         assert_eq!(crossings, vec![1, 10, 11, 20]);
@@ -2952,8 +2952,8 @@ mod tests {
     #[test]
     fn test_find_zero_crossings_short_subthreshold_dip_ignored() {
         let mut samples = vec![-0.69f32];
-        samples.extend(std::iter::repeat(0.18).take(5));
-        samples.extend(std::iter::repeat(-0.70).take(2));
+        samples.extend(std::iter::repeat_n(0.18, 5));
+        samples.extend(std::iter::repeat_n(-0.70, 2));
         let crossings = find_zero_crossings(&samples, 0.196);
         assert!(crossings.is_empty());
     }
@@ -8006,7 +8006,7 @@ mod tests {
         /// Frames 0 and 1 do not exist in DF minutes whose number is not a
         /// multiple of 10 (seconds == 0). Rejection rate ≈ 0.1 %.
         fn df_frame_valid(m: u32, s: u32, f: u32) -> bool {
-            !(s == 0 && m % 10 != 0 && f < 2)
+            !(s == 0 && !m.is_multiple_of(10) && f < 2)
         }
 
         fn arb_start_tc(drop_frame: bool, biased_minutes: bool) -> impl Strategy<Value = Timecode> {

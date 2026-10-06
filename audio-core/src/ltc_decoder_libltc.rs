@@ -625,7 +625,7 @@ mod tests {
         }];
         // Need enough samples for libltc to detect (just 1 frame may not be enough)
         // Repeat the same timecode a few times
-        let tcs_rep: Vec<Timecode> = std::iter::repeat(tcs[0]).take(10).collect();
+        let tcs_rep: Vec<Timecode> = std::iter::repeat_n(tcs[0], 10).collect();
         let samples = synthesize_ltc_samples_i16(&tcs_rep, 25.0, false, 48000, 0.5);
         let result =
             decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None)

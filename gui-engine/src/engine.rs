@@ -356,7 +356,7 @@ fn publish_if_changed(els: &mut EngineLoopState, state: &Arc<ArcSwap<AppStateSna
     let changed = els
         .last_published
         .as_ref()
-        .map_or(true, |p| p.as_ref() != &els.current);
+        .is_none_or(|p| p.as_ref() != &els.current);
     if changed {
         let next = Arc::new(els.current.clone());
         state.store(next.clone());
