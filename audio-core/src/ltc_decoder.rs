@@ -8450,7 +8450,7 @@ mod tests {
         // (slope = 0.04 s/s).
         let a = [0.5, 1.5, 2.5];
         let drift = [0.02, 0.06, 0.10]; // = 0.04 * a
-        let segments = [0..3];
+        let segments = [0..3].as_slice();
         let stats = analyze_drift(&a, &drift, &segments, 25.0);
         let b = &stats.blocks[0];
         assert!((b.duration - 2.0).abs() < 1e-9, "duration {}", b.duration);
