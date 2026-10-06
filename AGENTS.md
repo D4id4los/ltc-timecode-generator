@@ -504,14 +504,23 @@ deferred, see `reports/2026-10-06-quality-tooling-assessment-report.md`).
 # (1663 mutants, ~4-8 h) OOM-crashed a 32 GB desktop at -j 12 and sits on
 # the 6 h hosted-runner job cap. Mutant order is deterministic, so shards
 # partition identically on every invocation and merge by concatenation.
-# -j 3 ceiling locally (per-mutant rustc peak 1.5-2.5 GB each);
-# -j 2 on the 16 GB CI runner. The cgroup cap MUST sit far below the
-# machine's RAM: a 26G cap on a 32G machine still starved the system and
-# the global OOM killer shot the scope (2026-10-06, second incident).
-# MemoryMax=14G trips the scope long before the desktop can starve;
-# the cost of tripping is one shard's in-flight work, nothing more.
-systemd-run --user --scope -p MemoryHigh=10G -p MemoryMax=14G \
-  cargo mutants -p audio-core -j 3 --baseline skip \
+# Three hardening rules, each paid for by a real incident (2026-10-06):
+#   1. cgroup caps far below machine RAM — a 26G cap on a 32G machine let
+#      the scope starve the system and the global OOM killer shot it;
+#      14G/10G trips the scope first (cost: one shard's in-flight work).
+#      MemorySwapMax stops the scope pushing 15G into system swap.
+#   2. work trees OFF tmpfs — cargo-mutants copies the tree to $TMPDIR;
+#      on /tmp-as-tmpfs each ~5G copy is unswappable RAM, and trees of
+#      killed runs are leaked outside any cgroup cap (3 orphans held
+#      8.6G). Point TMPDIR at disk; `rm -rf /tmp/cargo-mutants-*` after
+#      crashed runs.
+#   3. -t 120 caps per-command runtime — auto-derived timeouts (up to
+#      681s) let an unbounded-loop mutant (e.g. `+=`→`-=` in
+#      decode_bits_real_zc) allocation-bomb for 11 minutes until the
+#      scope died; at 120s a bomb is a plain caught-timeout instead.
+systemd-run --user --scope -p MemoryHigh=10G -p MemoryMax=14G -p MemorySwapMax=4G \
+  env TMPDIR="$HOME/mutants-tmp" \
+  cargo mutants -p audio-core -j 3 -t 120 --baseline skip \
     -o reports/mutants/<date>-<label>-shard<i> --shard <i>/6
 ```
 
