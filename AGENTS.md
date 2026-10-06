@@ -505,8 +505,12 @@ deferred, see `reports/2026-10-06-quality-tooling-assessment-report.md`).
 # the 6 h hosted-runner job cap. Mutant order is deterministic, so shards
 # partition identically on every invocation and merge by concatenation.
 # -j 3 ceiling locally (per-mutant rustc peak 1.5-2.5 GB each);
-# -j 2 on the 16 GB CI runner.
-systemd-run --user --scope -p MemoryHigh=20G -p MemoryMax=26G \
+# -j 2 on the 16 GB CI runner. The cgroup cap MUST sit far below the
+# machine's RAM: a 26G cap on a 32G machine still starved the system and
+# the global OOM killer shot the scope (2026-10-06, second incident).
+# MemoryMax=14G trips the scope long before the desktop can starve;
+# the cost of tripping is one shard's in-flight work, nothing more.
+systemd-run --user --scope -p MemoryHigh=10G -p MemoryMax=14G \
   cargo mutants -p audio-core -j 3 --baseline skip \
     -o reports/mutants/<date>-<label>-shard<i> --shard <i>/6
 ```
