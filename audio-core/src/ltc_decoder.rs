@@ -8450,8 +8450,11 @@ mod tests {
         // (slope = 0.04 s/s).
         let a = [0.5, 1.5, 2.5];
         let drift = [0.02, 0.06, 0.10]; // = 0.04 * a
-        let segments = [0..3].as_slice();
-        let stats = analyze_drift(&a, &drift, &segments, 25.0);
+                                        // Single-element Range array trips clippy::single_range_in_vec_init;
+                                        // the slice type is the API shape.
+        #[allow(clippy::single_range_in_vec_init)]
+        let segments = [0..3];
+        let stats = analyze_drift(&a, &drift, segments.as_slice(), 25.0);
         let b = &stats.blocks[0];
         assert!((b.duration - 2.0).abs() < 1e-9, "duration {}", b.duration);
         assert!((b.slope - 0.04).abs() < 1e-9, "slope {}", b.slope);
