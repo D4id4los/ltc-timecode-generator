@@ -8441,6 +8441,172 @@ mod tests {
         );
     }
 
+    // ── mutant-killers: analyze_drift ────────────────────────────────────
+
+    #[test]
+    fn test_analyze_drift_block_geometry_and_fit() {
+        // n=3 points in one segment, non-zero start so the duration
+        // subtraction cannot pass as `+`. drift is exactly linear
+        // (slope = 0.04 s/s).
+        let a = [0.5, 1.5, 2.5];
+        let drift = [0.02, 0.06, 0.10]; // = 0.04 * a
+        let segments = [0..3];
+        let stats = analyze_drift(&a, &drift, &segments, 25.0);
+        let b = &stats.blocks[0];
+        assert!((b.duration - 2.0).abs() < 1e-9, "duration {}", b.duration);
+        assert!((b.slope - 0.04).abs() < 1e-9, "slope {}", b.slope);
+        // accum_frames = |slope * duration| * fps = 0.08 * 25 = 2.0
+        assert!(
+            (b.accum_frames - 2.0).abs() < 1e-9,
+            "accum {}",
+            b.accum_frames
+        );
+        assert_eq!(b.frames, 3);
+        // accum 2.0 > 1.0 → not usable despite enough frames/duration
+        assert!((stats.usable_coverage - 0.0).abs() < 1e-9);
+        assert!((stats.worst_slope - 0.04).abs() < 1e-9);
+        assert!((stats.worst_block_drift_frames - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_analyze_drift_short_span_uses_scaled_min_duration() {
+        // total_span == 2.2 exactly takes the else branch (min 2.0, strict
+        // `<` 2.2); a block of duration 1.99 is then *not* usable. Under the
+        // `==` mutant min becomes 1.98 and the block would count as usable.
+        let a = [0.0, 1.99, 2.0, 2.2];
+        let drift = [0.0; 4];
+        let segments = [0..2, 2..4];
+        let stats = analyze_drift(&a, &drift, &segments, 25.0);
+        assert!((stats.usable_coverage - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_analyze_drift_total_span_uses_first_minus_last() {
+        // total_span = audio_secs[n-1] - audio_secs[0] gates the scaled
+        // minimum-block-duration. a[0] > 0 so `+` (3.1) and `/` (5.2)
+        // mutants both push the span over 2.2 and the minimum to 2.0,
+        // flipping block 1 (duration 1.95) from usable to unusable.
+        // Real: span 2.1 < 2.2 → min 1.89 → block 1 usable (coverage 0.5).
+        let a = [0.5, 2.45, 2.5, 2.6];
+        let drift = [0.0; 4];
+        let segments = [0..2, 2..4];
+        let stats = analyze_drift(&a, &drift, &segments, 25.0);
+        assert!((stats.usable_coverage - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_analyze_drift_degraded_usable_block_penalized_exact() {
+        // One usable degraded block: accum = 0.75 → severity (0.75-0.5)/0.5
+        // = 0.5; penalty = 0.10 * 0.5 * (2 frames of n=4) = 0.025.
+        // Second block accumulates 1.05 > 1.0 → unusable, keeps n=4.
+        let a = [0.0, 2.0, 2.1, 4.1];
+        // Blocks are 2.0 s long (== min duration at span >= 2.2). slope
+        // 0.015 over block 1 → accum 0.015*2.0*25 = 0.75 (usable, degraded);
+        // slope 0.021 over block 2 → accum 1.05 > 1.0 (unusable).
+        let drift = [0.000, 0.030, 0.0441, 0.0861];
+        let segments = [0..2, 2..4];
+        let stats = analyze_drift(&a, &drift, &segments, 25.0);
+        assert!((stats.usable_coverage - 0.5).abs() < 1e-9);
+        assert!(
+            (stats.drift_penalty - 0.025).abs() < 1e-9,
+            "penalty {}",
+            stats.drift_penalty
+        );
+    }
+
+    #[test]
+    fn test_analyze_drift_worst_slope_exact_tie_keeps_first() {
+        // Powers of two make both block slopes exactly ±0.25: the strict
+        // `>` keeps the first (positive) block's slope; a `>=` mutant
+        // overwrites it with the second (negative) one.
+        let a = [0.0, 1.0, 1.0, 2.0];
+        let drift = [0.0, 0.25, 0.25, 0.0];
+        let segments = [0..2, 2..4];
+        let stats = analyze_drift(&a, &drift, &segments, 25.0);
+        assert_eq!(stats.worst_slope, 0.25);
+    }
+
+    // ── mutant-killers: analyze_gaps ─────────────────────────────────────
+
+    #[test]
+    fn test_analyze_gaps_counts_and_edges() {
+        // Two segments → exactly one gap edge (4, 5); continuous audio and
+        // LTC → no edits, no backward jumps.
+        let n = 10;
+        let a: Vec<f64> = (0..n).map(|i| i as f64 * 0.04).collect();
+        let ltc = a.clone();
+        let segments = [0..5, 5..n];
+        let g = analyze_gaps(&a, &ltc, &segments, 25.0);
+        assert_eq!(g.gap_count, 1);
+        assert_eq!(g.gap_edges, vec![(4, 5)]);
+        assert_eq!(g.edit_count, 0);
+        assert_eq!(g.backward_jump_count, 0);
+        assert_eq!(g.backward_affected_frames, 0);
+    }
+
+    #[test]
+    fn test_analyze_gaps_edit_requires_ltc_jump_over_10_frames_exactly() {
+        // LTC jumps by exactly 10 frames (10/fps s) while audio runs
+        // continuously: the strict `>` on the LTC jump must NOT count an
+        // edit at the exact threshold (audio-vs-LTC diff 0.36 > 0.1 holds).
+        let a: Vec<f64> = (0..10).map(|i| i as f64 * 0.04).collect();
+        let mut ltc = a.clone();
+        ltc[5] = ltc[4] + 10.0 / 25.0;
+        let segments = [0..5, 5..10];
+        let g = analyze_gaps(&a, &ltc, &segments, 25.0);
+        assert_eq!(g.edit_count, 0, "exact 10-frame jump is not an edit");
+
+        // 11 frames: both thresholds exceeded → one edit.
+        let mut ltc2 = a.clone();
+        ltc2[5] = ltc2[4] + 11.0 / 25.0;
+        let g2 = analyze_gaps(&a, &ltc2, &segments, 25.0);
+        assert_eq!(g2.edit_count, 1);
+    }
+
+    #[test]
+    fn test_analyze_gaps_edit_diff_uses_audio_minus_ltc() {
+        // The audio-vs-LTC difference must gate the edit: audio rewinds
+        // (-0.22 s) while LTC jumps 0.5 s → real diff 0.72 > 0.1 → edit.
+        // Under the `-`→`/` mutant on audio_elapsed, |0.18/0.4 - 0.5| = 0.05
+        // → no edit, flipping the verdict.
+        let a = [0.0, 0.4, 0.18, 0.58];
+        let ltc = [0.0, 0.4, 0.9, 0.9];
+        let segments = [0..2, 2..4];
+        let g = analyze_gaps(&a, &ltc, &segments, 25.0);
+        assert_eq!(g.edit_count, 1);
+    }
+
+    #[test]
+    fn test_analyze_gaps_backward_jump_boundary_and_affected_frames() {
+        // Backward jump of one full frame (-0.04 s): counted (< -0.5 frames);
+        // everything from the *next* segment on is affected.
+        let a: Vec<f64> = (0..10).map(|i| i as f64 * 0.04).collect();
+        let mut ltc = a.clone();
+        ltc[5] = ltc[4] - 0.04;
+        let segments = [0..5, 5..10];
+        let g = analyze_gaps(&a, &ltc, &segments, 25.0);
+        assert_eq!(g.backward_jump_count, 1);
+        assert_eq!(g.backward_affected_frames, 5);
+
+        // Exactly -0.5 frames is NOT a backward jump (strict `<`); with the
+        // `<=` mutant it would be counted. fps=32 makes 1/fps and 0.5/fps
+        // binary exact so the boundary lands precisely.
+        let a32: Vec<f64> = (0..10).map(|i| i as f64 / 64.0).collect();
+        let mut ltc32 = a32.clone();
+        ltc32[5] = ltc32[4] - 0.5 / 32.0; // exactly -0.5 frames
+        let g_half = analyze_gaps(&a32, &ltc32, &[0..5, 5..10], 32.0);
+        assert_eq!(g_half.backward_jump_count, 0);
+        assert_eq!(g_half.backward_affected_frames, 0);
+
+        // A tiny forward step (+0.01 s, 0.25 frames) is also not a backward
+        // jump; with the sign deleted (`-0.5*fd` → `0.5*fd`) it would be.
+        let mut ltc_fwd = a.clone();
+        ltc_fwd[5] = ltc_fwd[4] + 0.01;
+        let g_fwd = analyze_gaps(&a, &ltc_fwd, &segments, 25.0);
+        assert_eq!(g_fwd.backward_jump_count, 0);
+        assert_eq!(g_fwd.backward_affected_frames, 0);
+    }
+
     // ── mutant-killers: QualityGrade labels & thresholds ─────────────────
     //
     // as_str strings are the contract (serialized grade labels); from_score
