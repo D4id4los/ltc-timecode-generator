@@ -27,11 +27,14 @@ jobs:
         with:
           key: mutants-audio-core
 
-      - name: Install cargo-mutants
+      - name: Install cargo-mutants and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants
+          tool: cargo-mutants,cargo-nextest
 
+      # Scope & exclusions come from .cargo/mutants.toml (the config path
+      # cargo-mutants reads): audio-core only, nextest, audio_output.rs
+      # excluded (device-lifecycle, unobservable from unit tests).
       - name: Run cargo-mutants (audio-core)
         run: cargo mutants -p audio-core -o mutants.out
 

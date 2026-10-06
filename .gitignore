@@ -12,7 +12,9 @@ perf-test/results/
 
 # Local Docker compilation cache folders
 .docker-cache/
-/.cargo/
+/.cargo/*
+# ... but the cargo-mutants config IS tracked (the tool reads it by default)
+!/.cargo/mutants.toml
 /target/
 /deploy-to-onedrive.sh
 
