@@ -8,7 +8,14 @@ on:
 jobs:
   mutants-audio-core:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 6-way shard matrix: a monolithic run sits on the 6 h hosted-runner
+    # job cap; each shard lands at ~1-2.5 h at -j 2 (16 GB runner RAM —
+    # per-mutant rustc peak is 1.5-2.5 GB, do not raise -j).
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/6", "2/6", "3/6", "4/6", "5/6", "6/6"]
     env:
       PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
     steps:
@@ -34,14 +41,16 @@ jobs:
 
       # Scope & exclusions come from .cargo/mutants.toml (the config path
       # cargo-mutants reads): audio-core only, nextest, audio_output.rs
-      # excluded (device-lifecycle, unobservable from unit tests).
-      - name: Run cargo-mutants (audio-core)
-        run: cargo mutants -p audio-core -o mutants.out
+      # excluded (device-lifecycle, unobservable from unit tests). Mutant
+      # order is deterministic, so shard partitions are stable and the
+      # per-shard outcome lists merge by concatenation.
+      - name: Run cargo-mutants (audio-core, shard ${{ matrix.shard }})
+        run: cargo mutants -p audio-core -j 2 --baseline skip --shard ${{ matrix.shard }} -o mutants.out
 
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mutants-audio-core
+          name: mutants-audio-core-shard-${{ strategy.job-index }}
           path: mutants.out
           retention-days: 30

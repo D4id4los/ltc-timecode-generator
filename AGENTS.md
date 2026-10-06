@@ -500,8 +500,23 @@ spawn real ffmpeg and are far too slow to re-run per mutant (phase-2 decision
 deferred, see `reports/2026-10-06-quality-tooling-assessment-report.md`).
 
 ```bash
-cargo mutants -p audio-core -o reports/mutants/<date>-<label>   # local run; artifacts under gitignored reports/
+# Full run — desktop machines only, and ONLY sharded: a monolithic run
+# (1663 mutants, ~4-8 h) OOM-crashed a 32 GB desktop at -j 12 and sits on
+# the 6 h hosted-runner job cap. Mutant order is deterministic, so shards
+# partition identically on every invocation and merge by concatenation.
+# -j 3 ceiling locally (per-mutant rustc peak 1.5-2.5 GB each);
+# -j 2 on the 16 GB CI runner.
+systemd-run --user --scope -p MemoryHigh=20G -p MemoryMax=26G \
+  cargo mutants -p audio-core -j 3 --baseline skip \
+    -o reports/mutants/<date>-<label>-shard<i> --shard <i>/6
 ```
+
+Shards run one per sitting (each ≈ 2.5-3.5 h at `-j 3`) into separate
+`reports/mutants/…-shard<i>/` dirs; merge the `mutants.out/{caught,missed,
+timeout,unviable}.txt` lists by concatenation + `sort -u` (see
+`plans/2026-10-06-cargo-mutants-oom-safe-sharded-execution-plan.md` for the
+memory math and the merge recipe). CI runs the same partition as a 6-way
+matrix job.
 
 Triage policy: **every survivor is classified, no exceptions** — (1) missing/
 weak assertion → write a killing test at the lowest layer (Test Quality Rules
