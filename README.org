@@ -1,180 +1,346 @@
-A SMPTE LTC timecode generator + digital clapper for multi-camera video sync,
-with native desktop GUIs (ltc-gui / ltc-slint), LTC decoding, recording
-conversion, and camera-card offloading. Primarily vibecoded to be good enough
-for practical application.
+#+TITLE: LTC Timecode Generator
+
+[[https://github.com/D4id4los/ltc-timecode-generator/actions/workflows/ci.yml][https://github.com/D4id4los/ltc-timecode-generator/actions/workflows/ci.yml/badge.svg]]
+[[https://github.com/D4id4los/ltc-timecode-generator/releases][https://img.shields.io/github/v/release/D4id4los/ltc-timecode-generator]]
+[[https://github.com/D4id4los/ltc-timecode-generator/blob/main/LICENSE-MIT][https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue]]
+
+A high-precision SMPTE linear timecode (LTC) generator and digital clapper
+board for multi-camera video sync — plus the tooling that belongs with it:
+decode LTC from your recordings, convert and timecode-tag footage, and offload
+camera cards. Native desktop app for Linux and Windows.
 
 The ltc-gui interface:
+
 [[file:./assets/ltc-timecode-generator-ui.png]]
 
-* System Dependencies
+** Contents
 
-You need to have rust installed.
+- [[*What is LTC?][What is LTC?]]
+- [[*Features][Features]]
+- [[*Download & Installation][Download & Installation]]
+- [[*Getting Started][Getting Started]]
+- [[*Troubleshooting & FAQ][Troubleshooting & FAQ]]
+- [[*Supported Formats & Codecs][Supported Formats & Codecs]]
+- [[*Project Status & Support][Project Status & Support]]
+- [[*Changelog][Changelog]]
+- [[*Development][Development]]
+- [[*License][License]]
 
-For the audio backend, you will need the pipewire & pulseaudio dev libraries:
-- Debian/Ubuntu :: =sudo apt install libpipewire-0.3-dev libpulse-dev=
-- Fedora/RHEL :: =sudo dnf install pipewire-devel pulseaudio-libs-devel=
-- Arch Linux :: =sudo pacman -S pipewire libpulse=
+* What is LTC?
 
-* Compiling the Rust GUI
+[[https://en.wikipedia.org/wiki/Linear_timecode][Linear timecode]] (LTC) is an audio signal that encodes SMPTE timecode —
+hours, minutes, seconds, frames — using bi-phase mark modulation, so it can be
+recorded onto an ordinary audio track. Feed it into a camera or audio recorder
+and every device carries the same absolute clock, which makes aligning
+multi-camera and multi-recorder footage in the edit trivial instead of a
+guessing game. This app generates that signal, doubles as a digital clapper
+board for visual + acoustic sync marks, and reads the signal back out of your
+recordings (including quality analysis) so you can verify and post-process
+what you captured.
 
-Setup:
+* Features
+
+** Timecode Generation & Clapper Board
+
+- Generate LTC at 24, 25, 29.97 (drop and non-drop) and 30 fps with a
+  configurable start timecode.
+- Route the LTC signal and a sync beep independently to the left channel,
+  right channel, or both — beep frequency and duration are adjustable, so the
+  second stereo channel stays free for a scratch mic.
+- Digital clapper board: scene / take / roll metadata with optional
+  auto-increment, and a clap action that fires the beep, flashes the slate
+  animation, and logs the exact timecode of the mark.
+- Keyboard-driven operation: =Space= play/pause, =C= clap, =R= reset
+  timecode, =L= lock the controls.
+- Runs on weak hardware: the GUI targets low-power tablets (it was built for
+  one), with software OpenGL as a fallback.
+
+** LTC Decoding
+
+- Decode LTC from WAV files (8/16/24/32-bit integer and float samples) and
+  directly from video files — the audio track is extracted automatically via
+  ffmpeg, with stream and channel selection for multi-stream material.
+- Two decoder backends: a pure-Rust builtin decoder (chunked and parallel,
+  with progress and cancellation) and a binding to the classic
+  [[https://github.com/x42/libltc][libltc]] C library.
+- Quality reports: confidence, drift, gaps and glitch positions with
+  surrounding-frame context.
+- The builtin decoder is hardened against real-world signal degradation:
+  background noise, mains hum (50/60 Hz), DC offset, dropouts, lossy audio
+  codecs, and quiet recordings.
+
+** Converter / Export
+
+- Parse LTC tracks and embed the detected start timecode for each recording as
+  metadata (native =tmcd= track for MP4/MOV, =bext= block for WAV, ffmpeg
+  =-timecode= otherwise).
+- Split multi-track WAV recordings into per-track files, or drop the LTC
+  track entirely; map input channels to output files in any order.
+- Re-encode with a codec/container matrix from web-friendly H.264/HEVC/AV1 up
+  to editorial ProRes and DNxHD/MXF — or leave video untouched and remux
+  (stream copy) with tagging only.
+- Hardware encoders (VAAPI, Vulkan, NVENC, QSV, AMF, Media Foundation) are
+  auto-detected and validated with a test encode before being offered;
+  software fallbacks always exist.
+- Flexible output naming via templates (={device}=, ={clip}=, ={track}=, …)
+  and optional camera make/model metadata embedding.
+- Tag-in-place mode: embed timecode metadata into the original files without
+  re-encoding, rename them, and extract per-channel audio.
+
+** Camera-Card Offloading
+
+- Detects removable cards (USB/SD), scans them for recordings, and copies
+  your selection into an organised =<parent>/<ISO-date>/<device>/= layout.
+- Per-file and per-card selection, "latest day" quick-select, and automatic
+  device naming from camera metadata or file naming conventions
+  (Sony, Canon, Panasonic, GoPro, TASCAM, …).
+- Verified copies with resumability: existing files of matching size are
+  skipped, everything else is copied to a temp name and atomically renamed.
+- Hands the fresh offload folder straight to the converter.
+
+** Command Line
+
+Everything above is also scriptable:
+
+- =--headless= playback and =--output-to-file= for rendering LTC to WAV
+  without a GUI.
+- =--decode= with verbose quality reports, full timecode listing, and
+  decoder selection.
+- =--list-devices= for audio device discovery; =--probe-caps= for an ffmpeg
+  capability timing report.
+
+# Additional tab screenshots (Convert / Offload) — capture from a real
+# session, drop into assets/, then uncomment:
+# [[file:./assets/ltc-gui-convert-tab.png]]
+# [[file:./assets/ltc-gui-offload-tab.png]]
+
+* Download & Installation
+
+Grab the latest binaries from the
+[[https://github.com/D4id4los/ltc-timecode-generator/releases][GitHub releases page]].
+
+| Platform           | Status                 | How                                                        |
+|--------------------+------------------------+------------------------------------------------------------|
+| Linux x86-64       | Prebuilt binary        | =ltc-gui_<ver>_linux-x86_64.tar.xz= (see below)            |
+| Windows x86-64     | Prebuilt binary        | =ltc-gui.exe=                                              |
+| macOS              | Builds from source     | See [[*Development][Development]]                           |
+| Linux 32-bit (i686) | Manual Docker build   | See [[*Development][Development]]                           |
+
+All shipped binaries link libltc statically — no extra runtime libraries are
+needed for generation and playback.
+
+** Linux
+
+The Linux build targets glibc >= 2.31 (Debian 11, Ubuntu 20.04, or anything
+newer):
 
 #+begin_src bash
-  cargo install cargo-zigbuild
+  tar -xJf ltc-gui_*_linux-x86_64.tar.xz
+  ./ltc-gui
 #+end_src
 
-Compilation:
+** Windows
+
+Download =ltc-gui.exe= and run it — no installer, no registry entries. The
+binary is not code-signed, so Windows SmartScreen will show a warning on
+first launch — choose /"More info"/ → /"Run anyway"/.
+
+** Optional runtime dependencies
+
+- =ffmpeg= and =ffprobe= ([[https://ffmpeg.org][ffmpeg.org]]) — required for
+  decoding LTC from video files, the entire converter, and duration display
+  of non-WAV media. Install them anywhere on your =PATH=; everything else
+  works without them.
+- =exiftool= ([[https://exiftool.org][exiftool.org]]) — optional; improves
+  camera/device auto-detection during card offload and conversion.
+- Audio output goes through the system audio server (PulseAudio/PipeWire on
+  Linux, WASAPI on Windows) — nothing to configure.
+
+* Getting Started
+
+** GUI
+
+1. Start the app. On the /Settings/ tab, pick the audio output device that
+   feeds your camera/recorder inputs, route LTC (and optionally the beep) to
+   the left/right/both channels, set the frame rate and start timecode.
+2. On the /Clapper/ tab, set scene/take/roll. Press =Space= to start LTC
+   output; press =C= (or the clap button) at the slate moment — the beep and
+   flash mark the exact timecode, which is logged with the take number.
+3. In the /Convert/ tab, decode a recording's LTC to adopt its start timecode
+   automatically, then convert: embed timecode metadata, split or drop the LTC
+   track, and encode to your delivery format.
+4. In the /Offload/ tab, copy cards into an organised folder tree and hand
+   the result straight to the converter.
+
+** CLI examples
 
 #+begin_src bash
-  cargo zigbuild --release --bin ltc-gui
-  cargo zigbuild --release --bin ltc-slint
+  # List audio output devices
+  ltc-gui --list-devices
+
+  # Headless LTC playback into a specific device
+  ltc-gui --headless --device "alsa_output.pci-0000_00_1f.3.analog-stereo" \
+          --fps 25 --start-timecode 10:00:00:00 --channel left
+
+  # Render two minutes of LTC to a WAV file (no audio device needed)
+  ltc-gui --output-to-file jam-sync.wav --fps 25 --duration 120
+
+  # Decode a recording with a detailed quality report
+  ltc-gui --decode take01.wav -v
+
+  # Decode channel 1 of the first audio stream of a video file
+  ltc-gui --decode clip.mp4 --audio-stream 0 --audio-channel 1 -v
+
+  # Use the libltc backend and print every decoded timecode
+  ltc-gui --decode sync.wav --decoder libltc --list-timecodes
 #+end_src
 
-** Compiling the 32bit version
+Run =ltc-gui --help= for the full list of options.
+
+* Troubleshooting & FAQ
+
+- *No sound on Linux* :: The app plays through PulseAudio/PipeWire. Open the
+  Settings tab, refresh the device list, and pick your output device. The
+  engine retries transient device errors automatically and recovers the
+  stream if it dies mid-session.
+- *Garbled rendering or a very slow GPU (old tablets)* :: Force software
+  OpenGL: =LIBGL_ALWAYS_SOFTWARE=1 ./ltc-gui=. The app was developed on
+  exactly such hardware and runs fine with llvmpipe.
+- *Windows shows a blue "Windows protected your PC" dialog* :: The exe is
+  unsigned; choose /More info/ → /Run anyway/.
+- *Video decode or the Convert tab reports missing ffmpeg* :: Install ffmpeg
+  (including ffprobe) and make sure both are on your =PATH=.
+- *Decode returns garbage or low confidence* :: Check that the decode frame
+  rate matches the recording (=--decode-fps=, =--decode-drop-frame= — e.g.
+  29.97 DF material needs =--decode-fps 29.97 --decode-drop-frame=), and
+  prefer the builtin decoder for degraded material.
+- *libltc decoder fails on 24-bit WAV files* :: The libltc binding only
+  supports 16-bit samples; use the default builtin decoder, which handles
+  8–32-bit and float samples.
+
+* Supported Formats & Codecs
+
+** Timecode generation
+
+| Frame rate       | Drop-frame |
+|------------------+------------|
+| 24 fps           | —          |
+| 25 fps (PAL)     | —          |
+| 29.97 fps (NTSC) | yes / no   |
+| 30 fps           | —          |
+
+** Decoding
+
+| Input            | Formats                                                             |
+|------------------+---------------------------------------------------------------------|
+| Audio files      | WAV, 8/16/24/32-bit integer and 32-bit float                        |
+| Video files      | mp4, m4v, mov, mkv, mts, m2ts, m2t, ts, mxf, avi, webm (via ffmpeg) |
+| Decoder backends | builtin (pure Rust), libltc (16-bit WAV input only)                 |
+
+** Conversion
+
+| Video codec | Containers         | Hardware encoders                                |
+|-------------+--------------------+--------------------------------------------------|
+| H.264       | mp4, mov, mkv, mxf | NVENC, QSV, AMF, Media Foundation, VAAPI, Vulkan |
+| H.265/HEVC  | mp4, mov, mkv, mxf | NVENC, QSV, AMF, Media Foundation, VAAPI, Vulkan |
+| AV1         | mp4, mov, mkv      | NVENC, QSV, AMF, VAAPI, Vulkan                   |
+| ProRes      | mov, mkv           | — (software)                                     |
+| DNxHD       | mxf, mov, mkv      | — (software)                                     |
+
+Stream-copy mode remuxes any of the supported video inputs without
+re-encoding (mts/m2ts/ts are normalised to mp4).
+
+** Offloading
+
+Any removable volume (USB card readers, SD cards); recognised media are video
+files and =.wav= recordings.
+
+* Project Status & Support
+
+This project started as a personal tool for my own multi-camera shoots, and
+it is primarily *vibecoded* — developed iteratively with LLM assistance,
+backed by an extensive test suite, property-based decoder testing, and CI
+quality gates. I am publishing it in the hope that it proves as useful to
+others as it has been for me.
+
+That said, it is a spare-time project: bug reports and feature requests via
+[[https://github.com/D4id4los/ltc-timecode-generator/issues][GitHub issues]] are welcome, but I make no guarantees about how quickly bugs get
+fixed or whether feature requests will be implemented.
+
+* Changelog
+
+Version history with prose feature summaries lives in [[file:VERSION_LOG.org][VERSION_LOG.org]];
+per-release notes are attached to each [[https://github.com/D4id4los/ltc-timecode-generator/releases][GitHub release]].
+
+* Development
+
+** Building from Source
+
+You need a Rust toolchain ([[https://rustup.rs][rustup]]) plus the system
+libraries for the audio backend and libltc:
+
+- Debian/Ubuntu :: =sudo apt install libltc-dev libpipewire-0.3-dev
+  libpulse-dev libasound2-dev libfontconfig1-dev libclang-dev= (the latter is
+  needed by bindgen when building the libltc binding), then
+  =export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig=
+- Fedora/RHEL :: =sudo dnf install libltc-devel pipewire-devel
+  pulseaudio-libs-devel alsa-lib-devel fontconfig-devel clang-devel=
+- Arch :: =sudo pacman -S --needed pipewire libpulse alsa-lib fontconfig
+  clang= (=libltc= is available in the AUR)
+
+Build and run the GUIs from the repository root:
 
 #+begin_src bash
-  docker build --platform linux/386 -t ltc-debian11-builder -f Dockerfile.gui-build .
-  docker run --rm \
-         -v "$(pwd)":/app \
-         -v "$(pwd)/.cargo_cache:/usr/local/cargo/registry" \
-         -w /app/ltc-gui \
-         ltc-debian11-builder \
-         cargo zigbuild --target i686-unknown-linux-gnu.2.31 --release
+  cargo run --bin ltc-gui --release        # primary GUI (egui/eframe)
+  cargo run --bin ltc-slint --release      # alternative GUI (Slint)
+
+  # Debug logging
+  RUST_LOG=info cargo run --bin ltc-gui --release
+  RUST_LOG=audio_core=info,ltc_gui=info cargo run --bin ltc-gui --release
+
+  # Force software OpenGL (GPU-less machines)
+  LIBGL_ALWAYS_SOFTWARE=1 cargo run --bin ltc-gui
 #+end_src
 
-** Cross compiling from linux to windows
-
-Install the windows target:
-#+begin_src bash
-  rustup target add x86_64-pc-windows-gnu
-#+end_src
-
-Install the cross-compilation linker:
-#+begin_src bash
-  sudo apt update
-  sudo apt install mingw-w64
-#+end_src
-
-Place the following toolchain config in =.cargo/config.toml= in the project
-root (this is a developer-local setting, so not committed to git):
-#+begin_src toml
-  [target.x86_64-pc-windows-gnu]
-  linker = "x86_64-w64-mingw32-gcc"
-#+end_src
-
-Now compile with:
-#+begin_src bash
-  # dev
-  cargo build --target x86_64-pc-windows-gnu
-  # release
-  cargo build --target x86_64-pc-windows-gnu --release --bin ltc-gui
-  cargo build --target x86_64-pc-windows-gnu --release --bin ltc-slint
-#+end_src
-
-* Running the Rust GUI
+** Tests & Lints
 
 #+begin_src bash
-  cd ltc-gui
-  cargo run                    # Debug
-  cargo run --release          # Release (12MB stripped)
-  LIBGL_ALWAYS_SOFTWARE=1 cargo run  # Force software rendering for GPU-less testing
-#+end_src
-or in the project root:
-#+begin_src bash
-  cargo run --bin ltc-gui
-  cargo run --bin ltc-slint
+  cargo test                            # unit + integration tests
+  cargo clippy --all-targets            # workspace lints
+  cargo nextest run --profile ci        # CI retry profile (flaky detection)
+  bash scripts/test-lint.sh             # test-quality guardrails
 #+end_src
 
+** Building Release Artifacts Locally
 
-To run the rust GUI with debug output, use:
-#+begin_src bash
-  RUST_LOG=info cargo run --release
-  # with granular settings:
-  RUST_LOG=audio_core=info,ltc_gui=info cargo run --release
-#+end_src
-
-* Releases
-
-Official releases are tag-driven: pushing a =vX.Y.Z= tag (strict
-=v<major>.<minor>.<patch>=, cut via =scripts/bump-version.sh=) runs
-=.github/workflows/release.yml=, which builds the ship matrix and publishes
-a GitHub Release whose body is the matching =VERSION_LOG.org= entry.
-
-Official assets (per release):
-- =ltc-gui_<ver>_linux-x86_64.tar.xz= :: linux x64 binary, linked against
-  a static libltc (no =libltc.so= runtime dependency), built with a
-  glibc 2.31 floor (Debian 11 / oldest supported runtime)
-- =ltc-gui_<ver>_windows-x86_64.zip= :: windows x64 binary (static libltc)
-- =SHA256SUMS= :: checksums of both
-
-Policy:
-- Forward-only (D4): releases are cut from the first tagged version after
-  this pipeline exists; no retro-releases for old tags.
-- i686 is *not* part of the official release pipeline (D3). The Medion
-  tablet build remains a manual local speciality (see below); i686 is
-  re-introduced to CI/releases only on user demand.
-- The release workflow also has a =workflow_dispatch= dry-run mode
-  (default on) to rehearse the full pipeline on a branch without
-  publishing anything.
-- Hardening (D5): the workflow guard enforces the strict tag regex, and a
-  one-time repo setting (Settings → Tags → protection rule =v*=,
-  Maintainers/Owners only) blocks who may push release tags.
-
-If a release smoke test fails: delete the GitHub release, delete the tag,
-fix forward, re-tag.
-
-** Building the release matrix locally
-
-=build-all-rust-targets.sh= reproduces the CI release artifacts locally
-(static libltc via =scripts/build-libltc-static.sh= into the gitignored
-=./libltc-prefix/=, glibc 2.31 floor via zigbuild):
+=build-all-rust-targets.sh= reproduces the official ship matrix — linux x64
+(glibc 2.31 floor) and windows x64, both statically linked against libltc:
 
 #+begin_src bash
   ./build-all-rust-targets.sh
 #+end_src
 
 Prerequisites: =cargo install cargo-zigbuild= (plus zig 0.13.0),
-=rustup target add x86_64-pc-windows-gnu=, and =sudo apt install
-mingw-w64=. To link the windows build through a fixed prefix instead, see
-=.cargo/config.toml= under "Cross compiling from linux to windows".
+=rustup target add x86_64-pc-windows-gnu=, and =sudo apt install mingw-w64=.
+The script provisions a static-only libltc prefix via
+=scripts/build-libltc-static.sh= into the gitignored =./libltc-prefix/=.
 
-=deploy-to-onedrive.sh= remains the personal-distribution copy step; the
-x86 tablet line applies to manual docker builds only.
+** Cross-Compiling from Linux to Windows (Manual Recipe)
 
-** Building the 32bit version (manual speciality)
+For day-to-day builds prefer =build-all-rust-targets.sh=, which handles the
+static libltc prefix and environment for you. The manual equivalent:
 
-The docker image (Dockerfile.gui-build) now carries a pinned static
-libltc again, so the tablet build works:
-
-#+begin_src bash
-  docker build --platform linux/386 -t ltc-debian11-builder -f Dockerfile.gui-build .
-  docker run --rm \
-         -v "$(pwd)":/app \
-         -v "$(pwd)/.cargo_cache:/usr/local/cargo/registry" \
-         -w /app/ltc-gui \
-         ltc-debian11-builder \
-         cargo zigbuild --target i686-unknown-linux-gnu.2.31 --release
-#+end_src
-
-** Cross compiling from linux to windows
-
-For the release-quality recipe, use =build-all-rust-targets.sh= (it
-provisions the static libltc prefix and sets the env vars for you). The
-manual recipe, if you need it:
-
-Install the windows target:
 #+begin_src bash
   rustup target add x86_64-pc-windows-gnu
-#+end_src
-
-Build a static libltc prefix (pinned =v1.3.2=, static-only — no =.so= —
-so the binary carries no runtime libltc dependency):
-#+begin_src bash
+  sudo apt install mingw-w64
+  # Static-only libltc prefix (pinned v1.3.2 — no .so, so the binary carries
+  # no runtime libltc dependency)
   scripts/build-libltc-static.sh /path/to/libltc-win64 x86_64-w64-mingw32
 #+end_src
 
 Place the following toolchain config in =.cargo/config.toml= in the project
-root (this is a developer-local setting, so not committed to git):
+root (developer-local, not committed):
+
 #+begin_src toml
   [target.x86_64-pc-windows-gnu]
   linker = "x86_64-w64-mingw32-gcc"
@@ -184,11 +350,7 @@ root (this is a developer-local setting, so not committed to git):
   BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu = "-I/path/to/libltc-win64/include"
 #+end_src
 
-Now compile with:
 #+begin_src bash
-  # dev
-  cargo build --target x86_64-pc-windows-gnu
-  # release
   cargo build --target x86_64-pc-windows-gnu --release --bin ltc-gui
   cargo build --target x86_64-pc-windows-gnu --release --bin ltc-slint
 #+end_src
@@ -197,64 +359,80 @@ Note: for a *static* link the prefix must contain only =libltc.a= (which
 =build-libltc-static.sh= guarantees); if a distro =libltc-dev= package is
 also installed, =-lltc= may resolve to the shared library instead.
 
-* Continuous Integration & Code Quality (SonarQube Cloud)
+** The 32-bit Tablet Build (Manual Speciality)
 
-GitHub Actions (=.github/workflows/ci.yml=) runs the test-lint guardrail,
-clippy, the Rust test suite with LCOV coverage (=cargo llvm-cov=) on every
-push to =main= and every pull request, then publishes everything to
-[[https://sonarcloud.io/project/overview?id=D4id4los_ltc-timecode-generator][SonarQube Cloud]] (project key
-=D4id4los_ltc-timecode-generator=, organization =d4id4los=).
+The i686 target is not part of the official release pipeline; it lives on as
+a manual Docker build for the original weak-GPU tablet (the builder image
+=Dockerfile.gui-build= carries a pinned static libltc). Docker installation
+instructions: [[https://docs.docker.com/engine/install/]].
 
-The Sonar scan step is skipped automatically when the =SONAR_TOKEN= repository
-secret is not set, so forks run the plain CI pipeline without any setup.
-Analysis configuration (sources, exclusions, report paths) lives in
-=sonar-project.properties=.
+#+begin_src bash
+  docker build --platform linux/386 -t ltc-debian11-builder -f Dockerfile.gui-build .
+  docker run --rm \
+         -v "$(pwd)":/app \
+         -v "$(pwd)/.cargo_cache:/usr/local/cargo/registry" \
+         -w /app/ltc-gui \
+         ltc-debian11-builder \
+         cargo zigbuild --target i686-unknown-linux-gnu.2.31 --release
+#+end_src
 
-Local Sonar helpers (need =jq= on the dev machine; CI runs the scanner action
-directly):
+** CI & Code Quality
+
+GitHub Actions runs the test-lint guardrail, clippy, and the Rust test suite
+with coverage on every push and pull request, followed by a
+[[https://sonarcloud.io/project/overview?id=D4id4los_ltc-timecode-generator][SonarQube
+Cloud]] scan (skipped automatically in forks without a =SONAR_TOKEN=). A
+windows-cross-check job compile-guards the Windows target, and windows-tests
+runs the full suite on Windows.
+
+Local Sonar helpers (need =jq=):
+
 #+begin_src bash
   SONAR_TOKEN=<token> scripts/sonar-gate.sh    # idempotent quality-gate setup
   SONAR_TOKEN=<token> scripts/sonar-report.sh  # deterministic report into reports/sonar/
 #+end_src
 
-* Version Bumping
+** Version Bumping & Releasing
 
-The single source of truth is the =version= field under =[workspace.package]=
-in the root =Cargo.toml=; all four workspace members inherit it via
-=version.workspace = true=.
-
-#+begin_src bash
-  scripts/bump-version.sh patch         # 0.4.7 → 0.4.8, updates Cargo.lock, creates git commit + tag v0.4.8
-  scripts/bump-version.sh minor         # 0.4.7 → 0.5.0
-  scripts/bump-version.sh major         # 0.4.7 → 1.0.0
-  scripts/bump-version.sh 0.6.0         # explicit version
-  scripts/bump-version.sh patch --dry-run  # print the plan, apply nothing
-#+end_src
-The script refuses to run on a dirty working tree and verifies all four
-workspace members show the new version in =Cargo.lock= before committing.
-
-The tagged tree must contain a =VERSION_LOG.org= entry for the new version
-(headings =* vX.Y.Z=, newest first) — the release workflow extracts it as
-the release body and fails loudly if it is missing. Keep entries
-markdown-compatible (plain prose + hyphen bullets, no org-only markup like
-===verbatim===), so they publish as-is.
-
-
-* Installing Docker
-
-** Ubuntu
+The version source of truth is =[workspace.package]= in the root =Cargo.toml=;
+=scripts/bump-version.sh= rewrites it, updates =Cargo.lock=, and creates the
+release commit + tag:
 
 #+begin_src bash
-  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  sudo chmod a+r /etc/apt/keyrings/docker.asc
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-  sudo apt update
-  sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin  
+  scripts/bump-version.sh patch         # 0.5.3 → 0.5.4
+  scripts/bump-version.sh minor         # 0.5.3 → 0.6.0
+  scripts/bump-version.sh patch --dry-run
 #+end_src
 
-Allow non root (i.e. you) users to run docker:
-#+begin_src bash
-  sudo usermod -aG docker $USER
-  newgrp docker
+Releases are tag-driven: pushing a strict =vX.Y.Z= tag runs the release
+workflow, which builds the ship matrix and publishes a GitHub Release whose
+body is the matching =VERSION_LOG.org= entry (keep entries markdown-compatible
+— plain prose + hyphen bullets). The workflow also has a dry-run mode to
+rehearse the pipeline on a branch without publishing. Policy: forward-only —
+if a release smoke test fails, delete the release and tag, fix forward, and
+re-tag.
+
+** Architecture Map
+
+#+begin_src
+  audio-core   raw audio engine: LTC/beep generation, cpal output, decoders
+  gui-engine   shared engine: state, CLI, decode, conversion, offload
+  ltc-gui      primary GUI (egui/eframe), tuned for weak-GPU tablets
+  ltc-slint    alternative GUI (Slint)
 #+end_src
 
+Both GUIs are thin rendering shells over =gui-engine=, which owns the audio
+core and all application state and publishes it to the GUIs via a lock-free
+snapshot. The exhaustive developer guide — architecture, data flow, testing
+methodology, engineering policies — is [[file:AGENTS.md][AGENTS.md]].
+
+* License
+
+This project is dual-licensed under your choice of
+[[file:LICENSE-MIT][MIT]] or [[file:LICENSE-APACHE][Apache-2.0]]
+(SPDX: =MIT OR Apache-2.0=).
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the Apache-2.0
+license, shall be dual-licensed as above, without any additional terms or
+conditions.

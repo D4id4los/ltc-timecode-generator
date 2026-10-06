@@ -1,6 +1,7 @@
 [package]
 name = "ltc-slint"
 version.workspace = true
+license.workspace = true
 description = "Slint-based GUI spike for the LTC Timecode Generator"
 authors = ["Daidalos"]
 edition = "2021"
