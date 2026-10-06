@@ -20,6 +20,15 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const OFFLOAD_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Tab bar geometry (deck tab affordance redesign, plans/2026-10-07-ltc-gui-tab-bar-affordance-plan.md)
+const TAB_GAP: f32 = 6.0;
+const TAB_MIN_W: f32 = 90.0;
+const TAB_MIN_H: f32 = 34.0;
+const TAB_ACTIVE_UNDERLINE_H: f32 = 3.0;
+const TAB_HOVER_UNDERLINE_H: f32 = 2.0;
+/// Faint accent underline shown on hovered inactive tabs (ACCENT @ ~40 % alpha).
+const TAB_HOVER_UNDERLINE: Color32 = Color32::from_rgba_unmultiplied_const(0xFF, 0x5F, 0x1F, 102);
+
 // ── GUI-only types ──────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -566,6 +575,15 @@ pub fn centered_horizontal_row<R>(
 // ── Clock-section helpers ───────────────────────────────────────────────
 
 /// Routing pill text: `LTC: LEFT | CLAP: RIGHT` (uppercase channel names).
+/// Paint a tab-selection underline bar along the bottom inside edge of a tab chip.
+fn paint_tab_indicator(ui: &Ui, rect: &egui::Rect, color: Color32, height: f32) {
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.bottom() - height),
+        egui::vec2(rect.width(), height),
+    );
+    ui.painter().rect_filled(bar, 1.5, color);
+}
+
 fn route_label(ltc: gui_engine::ChannelSel, beep: gui_engine::ChannelSel) -> String {
     format!("LTC: {} | CLAP: {}", ltc.as_str().to_uppercase(), beep.as_str().to_uppercase())
 }
@@ -823,25 +841,33 @@ impl AppState {
 
     fn render_tabbed_deck(&mut self, ui: &mut Ui) {
         let colors = self.theme.colors();
+        let row_w = ui.available_width();
+        let is_wide = row_w > 500.0;
+        let tab_w = ((row_w - TAB_GAP * 3.0) / 4.0).max(TAB_MIN_W);
+
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = egui::Vec2::new(0.0, 0.0);
+            ui.spacing_mut().item_spacing = egui::Vec2::new(TAB_GAP, 0.0);
             for tab in &[Tab::Clapper, Tab::Settings, Tab::Converter, Tab::Offload] {
                 let is_active = *tab == self.active_tab;
-                let label = tab.nav_label(ui.available_width() > 500.0).to_string();
-                let btn = egui::Button::new(
-                    RichText::new(label)
-                        .font(FontId::proportional(12.0))
-                        .color(if is_active { ACCENT } else { colors.text_muted })
-                        .strong(),
-                )
-                .fill(if is_active { colors.card_bg } else { colors.app_bg })
-                .corner_radius(8)
-                .stroke(if is_active {
-                    egui::Stroke::new(2.0, ACCENT)
-                } else {
-                    egui::Stroke::new(0.0, Color32::TRANSPARENT)
-                });
-                if ui.add(btn).clicked() {
+                let text = RichText::new(tab.nav_label(is_wide))
+                    .font(FontId::proportional(12.0))
+                    .strong();
+                let text = if is_active { text.color(ACCENT) } else { text };
+                let mut btn = egui::Button::new(text)
+                    .stroke(egui::Stroke::new(1.0, colors.border_main))
+                    .corner_radius(8)
+                    .min_size(egui::vec2(tab_w, TAB_MIN_H))
+                    .selected(is_active);
+                if is_active {
+                    btn = btn.fill(colors.card_bg);
+                }
+                let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+                if is_active {
+                    paint_tab_indicator(ui, &resp.rect, ACCENT, TAB_ACTIVE_UNDERLINE_H);
+                } else if resp.hovered() {
+                    paint_tab_indicator(ui, &resp.rect, TAB_HOVER_UNDERLINE, TAB_HOVER_UNDERLINE_H);
+                }
+                if resp.clicked() {
                     self.active_tab = *tab;
                 }
             }
