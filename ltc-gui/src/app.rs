@@ -31,12 +31,18 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub fn label(self) -> &'static str {
-        match self {
-            Tab::Clapper => "Clapper Slate & Logs",
-            Tab::Settings => "Signal & Audio Settings",
-            Tab::Converter => "File Converter & Export",
-            Tab::Offload => "Offload & Ingest",
+    /// Navigation label: full descriptive form on wide layouts (row > 500 px),
+    /// short form on narrow ones.
+    pub fn nav_label(self, wide: bool) -> &'static str {
+        match (self, wide) {
+            (Tab::Clapper, true) => "Clapper Slate & Logs",
+            (Tab::Settings, true) => "Signal & Audio Settings",
+            (Tab::Converter, true) => "File Converter & Export",
+            (Tab::Offload, true) => "Offload & Ingest",
+            (Tab::Clapper, false) => "Clapper",
+            (Tab::Settings, false) => "Settings",
+            (Tab::Converter, false) => "Convert",
+            (Tab::Offload, false) => "Offload",
         }
     }
 }
@@ -821,17 +827,7 @@ impl AppState {
             ui.spacing_mut().item_spacing = egui::Vec2::new(0.0, 0.0);
             for tab in &[Tab::Clapper, Tab::Settings, Tab::Converter, Tab::Offload] {
                 let is_active = *tab == self.active_tab;
-                let is_wide = ui.available_width() > 500.0;
-                let label = if is_wide {
-                    tab.label().to_string()
-                } else {
-                    match tab {
-                        Tab::Clapper => "Clapper".to_string(),
-                        Tab::Settings => "Settings".to_string(),
-                        Tab::Converter => "Convert".to_string(),
-                        Tab::Offload => "Offload".to_string(),
-                    }
-                };
+                let label = tab.nav_label(ui.available_width() > 500.0).to_string();
                 let btn = egui::Button::new(
                     RichText::new(label)
                         .font(FontId::proportional(12.0))
@@ -1442,6 +1438,24 @@ mod tests {
             matches!(&cmds[1], GuiCommand::Converter(gui_engine::command::ConverterCommand::SelectRecording(0))),
             "second command must be SelectRecording(0), got: {:?}", cmds[1]
         );
+    }
+
+    // test-lint: allow(text-pin): label mapping is the contract
+    #[test]
+    fn nav_label_wide_uses_full_names() {
+        assert_eq!(Tab::Clapper.nav_label(true), "Clapper Slate & Logs");
+        assert_eq!(Tab::Settings.nav_label(true), "Signal & Audio Settings");
+        assert_eq!(Tab::Converter.nav_label(true), "File Converter & Export");
+        assert_eq!(Tab::Offload.nav_label(true), "Offload & Ingest");
+    }
+
+    // test-lint: allow(text-pin): label mapping is the contract
+    #[test]
+    fn nav_label_narrow_uses_short_names() {
+        assert_eq!(Tab::Clapper.nav_label(false), "Clapper");
+        assert_eq!(Tab::Settings.nav_label(false), "Settings");
+        assert_eq!(Tab::Converter.nav_label(false), "Convert");
+        assert_eq!(Tab::Offload.nav_label(false), "Offload");
     }
 
 }
