@@ -521,7 +521,7 @@ deferred, see `reports/2026-10-06-quality-tooling-assessment-report.md`).
 systemd-run --user --scope -p MemoryHigh=10G -p MemoryMax=14G -p MemorySwapMax=4G \
   env TMPDIR="$HOME/mutants-tmp" \
   cargo mutants -p audio-core -j 3 -t 120 --baseline skip \
-    -o reports/mutants/<date>-<label>-shard<i> --shard <i>/6
+    -o reports/mutants/<date>-<label>-shard<i> --shard <i>/6   # 0-based: i in 0..5
 ```
 
 Shards run one per sitting (each ≈ 2.5-3.5 h at `-j 3`) into separate

@@ -8,7 +8,7 @@ root=reports/mutants
 out="$root/2026-10-06-audio-core-baseline-merged"
 mkdir -p "$out"
 : > "$out/caught.txt"; : > "$out/missed.txt"; : > "$out/timeout.txt"; : > "$out/unviable.txt"
-for i in 1 2 3 4 5 6; do
+for i in 0 1 2 3 4 5; do
   d="$root/2026-10-06-baseline-shard$i/mutants.out"
   [ -d "$d" ] || { echo "shard $i missing — skipping"; continue; }
   cat "$d/caught.txt"  >> "$out/caught.txt"
