@@ -877,7 +877,7 @@ fn tag_wav_bext(
 
         offset += 8 + chunk_size;
         // Chunk padding to even byte boundary
-        if chunk_size % 2 != 0 {
+        if !chunk_size.is_multiple_of(2) {
             offset += 1;
         }
     }
@@ -1329,7 +1329,7 @@ mod tests {
 
         // Append reserved bytes to reach 602 payload
         let remaining = 602 - (bext_chunk.len() - 8);
-        bext_chunk.extend(std::iter::repeat(0u8).take(remaining));
+        bext_chunk.extend(std::iter::repeat_n(0u8, remaining));
 
         // Build modified file: everything before data chunk + bext + rest
         let mut modified = Vec::new();

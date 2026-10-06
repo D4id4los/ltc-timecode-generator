@@ -1183,7 +1183,7 @@ fn push_frame(
     let pushed = producer.push_slice(frame);
     if pushed < needed {
         stats.drop_count += 1;
-        if stats.drop_count <= 1 || stats.drop_count % 100 == 0 {
+        if stats.drop_count <= 1 || stats.drop_count.is_multiple_of(100) {
             warn!("LTC scheduler: ring buffer full, dropped frame #{} (pushed {}/{}, total drops: {})",
                 stats.frame_count, pushed, needed, stats.drop_count);
         }
@@ -1446,7 +1446,7 @@ fn ltc_scheduler_thread(
         }
 
         push_stats.frame_count += 1;
-        if push_stats.frame_count % 1000 == 0 {
+        if push_stats.frame_count.is_multiple_of(1000) {
             info!(
                 "LTC scheduler: frame={}, drops={}, channel={}, fps={}, tc={:02}:{:02}:{:02}:{:02}",
                 push_stats.frame_count,

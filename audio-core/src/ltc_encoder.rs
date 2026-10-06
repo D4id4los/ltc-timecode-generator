@@ -110,7 +110,7 @@ pub fn increment_timecode(tc: &Timecode, fps: f64, drop_frame: bool) -> Timecode
                     h = 0;
                 }
             }
-            if drop_frame && m % 10 != 0 {
+            if drop_frame && !m.is_multiple_of(10) {
                 f = 2;
             }
         }
