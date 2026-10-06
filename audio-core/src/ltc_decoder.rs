@@ -8313,4 +8313,161 @@ mod tests {
             }
         }
     }
+
+    // ── mutant-killers: decrement_timecode roundtrip ─────────────────────
+    //
+    // decrement_timecode is the exact inverse of increment_timecode; sweep a
+    // boundary-heavy finite domain and require decrement→increment == identity
+    // for every fps/DF pair. Kills arithmetic/operator mutants in the borrow
+    // chain (frames > 0 / seconds > 0 / minutes > 0 / hours > 0 / wrap).
+
+    #[test]
+    fn test_decrement_increment_roundtrip_exhaustive() {
+        let fps_values = [24.0_f64, 25.0, 30.0];
+        for fps in fps_values {
+            for drop_frame in [false, true] {
+                let max_frames = fps.round() as u32;
+                // Boundaries: frame 0, second 0, minute 0, hour 0 (borrow
+                // chain), plus a mid-second control and the drop-frame
+                // skipped-minute neighborhood (m % 10 != 0).
+                let mut cases = Vec::new();
+                for &h in &[0u32, 1, 23] {
+                    for &m in &[0u32, 1, 9, 10, 59] {
+                        for &s in &[0u32, 1, 30, 59] {
+                            for &f in &[0, max_frames - 1, max_frames / 2] {
+                                cases.push(Timecode {
+                                    hours: h,
+                                    minutes: m,
+                                    seconds: s,
+                                    frames: f,
+                                });
+                            }
+                        }
+                    }
+                }
+                cases.push(Timecode {
+                    hours: 0,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                });
+                for tc in cases {
+                    // Drop-frame timecodes never contain the two skipped
+                    // frames at the head of minutes not divisible by 10;
+                    // decrement is only defined on the valid DF domain.
+                    if drop_frame && tc.seconds == 0 && tc.minutes % 10 != 0 && tc.frames < 2 {
+                        continue;
+                    }
+                    let dec = decrement_timecode(&tc, fps, drop_frame)
+                        .unwrap_or_else(|| panic!("decrement returned None for {tc:?}"));
+                    assert_eq!(
+                        increment_timecode(&dec, fps, drop_frame),
+                        tc,
+                        "roundtrip failed for {tc:?} at fps {fps} df {drop_frame}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_decrement_timecode_borrow_branch_exact_values() {
+        // Each borrow branch (frames > 0 / seconds > 0 / minutes > 0 /
+        // hours > 0) must land on the *last frame* of the preceding unit —
+        // max_frames - 1 — not merely any value the increment can absorb.
+        let tc = |h, m, s, f| Timecode {
+            hours: h,
+            minutes: m,
+            seconds: s,
+            frames: f,
+        };
+        for &fps in &[24.0_f64, 25.0, 30.0] {
+            let last = fps.round() as u32 - 1;
+            // frames > 0 branch: pure frame step-down
+            assert_eq!(
+                decrement_timecode(&tc(1, 2, 3, 7), fps, false),
+                Some(tc(1, 2, 3, 6))
+            );
+            // seconds > 0 branch: borrow into previous second
+            assert_eq!(
+                decrement_timecode(&tc(1, 2, 3, 0), fps, false),
+                Some(tc(1, 2, 2, last))
+            );
+            // minutes > 0 branch: borrow into previous minute
+            assert_eq!(
+                decrement_timecode(&tc(1, 2, 0, 0), fps, false),
+                Some(tc(1, 1, 59, last))
+            );
+            // hours > 0 branch: borrow into previous hour
+            assert_eq!(
+                decrement_timecode(&tc(1, 0, 0, 0), fps, false),
+                Some(tc(0, 59, 59, last))
+            );
+        }
+    }
+
+    #[test]
+    fn test_decrement_timecode_wrap_at_zero() {
+        // The absolute-zero borrow must land on the last frame of the day,
+        // not on a zeroed-out struct.
+        let dec = decrement_timecode(
+            &Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            false,
+        )
+        .expect("decrement at zero must wrap");
+        assert_eq!(
+            dec,
+            Timecode {
+                hours: 23,
+                minutes: 59,
+                seconds: 59,
+                frames: 24
+            }
+        );
+        assert_eq!(
+            increment_timecode(&dec, 25.0, false),
+            Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0
+            }
+        );
+    }
+
+    // ── mutant-killers: QualityGrade labels & thresholds ─────────────────
+    //
+    // as_str strings are the contract (serialized grade labels); from_score
+    // thresholds are the score→grade mapping. Assert both exactly.
+
+    #[test]
+    fn test_quality_grade_labels_are_contract() {
+        assert_eq!(QualityGrade::Excellent.as_str(), "Excellent");
+        assert_eq!(QualityGrade::Good.as_str(), "Good");
+        assert_eq!(QualityGrade::Fair.as_str(), "Fair");
+        assert_eq!(QualityGrade::Poor.as_str(), "Poor");
+        assert_eq!(QualityGrade::Bad.as_str(), "Bad");
+        assert_eq!(QualityGrade::Good.to_string(), "Good");
+    }
+
+    #[test]
+    fn test_quality_grade_thresholds_exact() {
+        let grade = QualityGrade::from_score;
+        assert_eq!(grade(1.0), QualityGrade::Excellent);
+        assert_eq!(grade(0.95), QualityGrade::Excellent);
+        assert_eq!(grade(0.9499999), QualityGrade::Good);
+        assert_eq!(grade(0.80), QualityGrade::Good);
+        assert_eq!(grade(0.7999999), QualityGrade::Fair);
+        assert_eq!(grade(0.60), QualityGrade::Fair);
+        assert_eq!(grade(0.5999999), QualityGrade::Poor);
+        assert_eq!(grade(0.30), QualityGrade::Poor);
+        assert_eq!(grade(0.2999999), QualityGrade::Bad);
+        assert_eq!(grade(0.0), QualityGrade::Bad);
+    }
 }

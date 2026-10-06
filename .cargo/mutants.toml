@@ -12,4 +12,12 @@ test_tool = "nextest"
 # Excluded from scope; audio_output correctness is covered by the
 # CallbackWatchdog virtual-clock unit tests and the engine recovery-ladder
 # integration tests instead.
-exclude_re = ["audio-core/src/audio_output\\.rs"]
+exclude_re = [
+    "audio-core/src/audio_output\\.rs",
+    # Equivalent: generate_and_push_frame re-derives total_samples = needed/2
+    # from its own `needed` argument, which every caller also passes as
+    # params.total_samples (needed = total_samples * 2, needed is even). The
+    # explicit field is redundant with ..params, so deleting it changes
+    # nothing.
+    "delete field total_samples from struct crate::ltc_encoder::LtcFrameParams",
+]
