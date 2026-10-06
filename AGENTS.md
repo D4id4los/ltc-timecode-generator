@@ -494,7 +494,7 @@ can be timing-sensitive. Follow these rules to keep them deterministic:
 
 `cargo-mutants` audits the test suite itself: it mutates production code one
 change at a time and checks whether some test fails. Config lives in
-`mutants.toml` (workspace root; `test_tool = "nextest"`). Scope: **audio-core
+`.cargo/mutants.toml` (the path cargo-mutants reads; `test_tool = "nextest"`). Scope: **audio-core
 only** — pure logic, fast suite, no subprocesses; gui-engine integration tests
 spawn real ffmpeg and are far too slow to re-run per mutant (phase-2 decision
 deferred, see `reports/2026-10-06-quality-tooling-assessment-report.md`).
@@ -506,7 +506,7 @@ cargo mutants -p audio-core -o reports/mutants/<date>-<label>   # local run; art
 Triage policy: **every survivor is classified, no exceptions** — (1) missing/
 weak assertion → write a killing test at the lowest layer (Test Quality Rules
 apply); (2) equivalent/unobservable mutant → suppress with `#[mutants::skip]`
-or `mutants.toml` `exclude_re`, always with an inline reason; (3) timeouts
+or `.cargo/mutants.toml` `exclude_re`, always with an inline reason; (3) timeouts
 count as caught, but inspect a sample (a mutant that unbounds a loop can flag
 a missing cancellation contract). CI runs audio-core mutants weekly via
 `.github/workflows/mutants.yml` (also `workflow_dispatch`; never per-PR —
