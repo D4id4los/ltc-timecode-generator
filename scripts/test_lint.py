@@ -39,6 +39,10 @@ CRATE_DIRS = ["audio-core", "gui-engine", "ltc-gui", "ltc-slint"]
 SLEEP_RE = re.compile(r"\b(?:std::)?thread::sleep\b")
 DEADLINE_RE = re.compile(r"Instant::now\(\)|\.elapsed\(\)|\bdeadline\b", re.IGNORECASE)
 JOIN_RE = re.compile(r"\.join\(\)")
+# A cancel-parked worker spin (`while !x.is_cancelled() { sleep }`) is the
+# worker-closure pattern in seam form: the closure parks a background worker
+# (spawn_job thread, injected ScanCards seam) until the test cancels it.
+CANCEL_PARK_RE = re.compile(r"\bis_cancelled\(\)")
 SPAWN_RE = re.compile(r"\bspawn_job\b|\.spawn\(")
 FN_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+\w")
 CONTAINS_RE = re.compile(r'\b(err|error|msg|message|status|label|details)\w*\s*\.contains\("')
@@ -158,6 +162,12 @@ def rule_sleep_violations(rel_path, lines, start, end, verbose):
         if in_spawn_closure(masked, idx):
             continue
         fn_start, fn_end = enclosing_fn(lines, idx)
+        # Cancel-parked spin exemption: a sleep whose loop condition (or a
+        # near neighbor) observes a cancel token is a parked worker, not a
+        # wait-for-state mechanism.
+        park_lo, park_hi = max(fn_start, idx - 3), min(fn_end, idx + 4)
+        if any(CANCEL_PARK_RE.search(lines[i]) for i in range(park_lo, park_hi)):
+            continue
         win_lo = max(fn_start, idx - DEADLINE_WINDOW)
         win_hi = min(fn_end, idx + DEADLINE_WINDOW + 1)
         if any(DEADLINE_RE.search(lines[i]) for i in range(win_lo, win_hi)):
@@ -247,6 +257,18 @@ fn t() {
             Ok(JobFinal::NoPayload)
         },
     );
+}
+"""),
+    ("sleep_cancel_parked_seam_closure", None, """
+#[test]
+fn t() {
+    let parked = cancel.clone();
+    els.scan_cards = Arc::new(move |_c, _p| {
+        while !parked.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(Vec::new())
+    });
 }
 """),
     ("sleep_then_join", None, """

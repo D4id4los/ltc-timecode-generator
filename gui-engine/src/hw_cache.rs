@@ -473,4 +473,50 @@ mod tests {
             "a versionless caps must not write back a cache"
         );
     }
+
+    // ── is_hw_encoder classification table (WP-B) ─────────────────────────
+
+    #[test]
+    fn is_hw_encoder_classification_table() {
+        // Hardware registry candidates classify as HW.
+        for name in [
+            "h264_nvenc",
+            "h264_qsv",
+            "h264_amf",
+            "h264_mf",
+            "h264_vaapi",
+            "h264_vulkan",
+            "h264_v4l2m2m",
+            "hevc_nvenc",
+            "av1_nvenc",
+        ] {
+            assert!(is_hw_encoder(name), "{} is a HW candidate", name);
+        }
+        // Software candidates and non-encoder names do not.
+        for name in [
+            "libx264",
+            "libx265",
+            "libsvtav1",
+            "prores_ks",
+            "dnxhd",
+            "pcm_s24le",
+            "",
+            "h264_madeup",
+        ] {
+            assert!(!is_hw_encoder(name), "{} must not classify as HW", name);
+        }
+    }
+
+    #[test]
+    fn cache_key_for_none_branch_and_key_shape() {
+        // Unknown ffmpeg version → no key (never cache-vouched or written).
+        let mut caps = caps_with(&["libx264"], None, None);
+        assert_eq!(cache_key_for(&caps), None);
+
+        caps.ffmpeg_version = Some("n7.1".to_string());
+        let key = cache_key_for(&caps).unwrap();
+        assert_eq!(key.ffmpeg_version, "n7.1");
+        assert_eq!(key.encoders, caps.available_encoders);
+        assert_eq!(key.hw, caps.hw);
+    }
 }

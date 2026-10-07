@@ -330,6 +330,7 @@ pub fn validate_hw_encoders_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video_codecs;
 
     #[test]
     fn test_list_render_nodes_sorts_by_suffix() {
@@ -440,5 +441,161 @@ mod tests {
             let nodes = list_vaapi_render_nodes(tmp.path());
             assert!(nodes.is_empty());
         }
+    }
+
+    // ── build_test_encode_args (pure arg table) ──────────────────────────
+
+    fn find_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+    }
+
+    #[test]
+    fn test_build_test_encode_args_software_frames() {
+        let args = build_test_encode_args("ffmpeg", "h264_nvenc", None, None);
+        assert_eq!(&args[..3], ["-v", "error", "-nostdin"]);
+        assert!(
+            !args.windows(2).any(|w| w[0] == "-init_hw_device"),
+            "no hw frames → no device prelude"
+        );
+        assert_eq!(find_flag_value(&args, "-vf"), Some("format=yuv420p"));
+        assert_eq!(find_flag_value(&args, "-c:v"), Some("h264_nvenc"));
+        // Terminal sink: the output must be `-f null -`.
+        let n = args.len();
+        assert_eq!(&args[n - 3..], ["-f", "null", "-"]);
+        // The lavfi source must come before the -vf filter.
+        let input_idx = args
+            .iter()
+            .position(|a| a == "testsrc=size=160x120:rate=25:duration=0.08");
+        let vf_idx = args.iter().position(|a| a == "-vf");
+        assert!(input_idx.is_some() && vf_idx.is_some() && input_idx.unwrap() < vf_idx.unwrap());
+    }
+
+    #[test]
+    fn test_build_test_encode_args_vaapi_arms() {
+        // No device given → the default render node.
+        let args = build_test_encode_args("ffmpeg", "h264_vaapi", Some(HwFramePath::Vaapi), None);
+        assert_eq!(
+            find_flag_value(&args, "-init_hw_device"),
+            Some("vaapi=vaapi0:/dev/dri/renderD128")
+        );
+        assert_eq!(find_flag_value(&args, "-filter_hw_device"), Some("vaapi0"));
+        assert_eq!(find_flag_value(&args, "-vf"), Some("format=nv12,hwupload"));
+
+        // Explicit device is threaded through verbatim.
+        let args = build_test_encode_args(
+            "ffmpeg",
+            "h264_vaapi",
+            Some(HwFramePath::Vaapi),
+            Some("/dev/dri/renderD129"),
+        );
+        assert_eq!(
+            find_flag_value(&args, "-init_hw_device"),
+            Some("vaapi=vaapi0:/dev/dri/renderD129")
+        );
+    }
+
+    #[test]
+    fn test_build_test_encode_args_vulkan_arm() {
+        let args = build_test_encode_args("ffmpeg", "h264_vulkan", Some(HwFramePath::Vulkan), None);
+        assert_eq!(
+            find_flag_value(&args, "-init_hw_device"),
+            Some("vulkan=vulkan0")
+        );
+        assert_eq!(find_flag_value(&args, "-filter_hw_device"), Some("vulkan0"));
+        assert_eq!(find_flag_value(&args, "-vf"), Some("format=nv12,hwupload"));
+    }
+
+    // ── test_encode_with (injectable runner) ─────────────────────────────
+
+    #[test]
+    fn test_encode_with_passes_built_args_to_runner() {
+        let mut runner = |args: &[String]| {
+            assert_eq!(&args[..3], ["-v", "error", "-nostdin"]);
+            assert!(args.contains(&"h264_nvenc".to_string()));
+            true
+        };
+        assert!(test_encode_with(&mut runner, "h264_nvenc", None, None,));
+
+        let mut failing = |_: &[String]| false;
+        assert!(!test_encode_with(&mut failing, "h264_nvenc", None, None,));
+    }
+
+    // ── validate_hw_encoders_with (injectable probe) ─────────────────────
+
+    #[test]
+    fn validate_removes_failing_hw_encoders_and_keeps_passing() {
+        let mut encoders = BTreeSet::from([
+            "h264_nvenc".to_string(),
+            "hevc_nvenc".to_string(),
+            "libx264".to_string(), // software — never probed
+        ]);
+        let hw = HwDeviceCapabilities::default();
+        let mut probed: Vec<String> = Vec::new();
+
+        validate_hw_encoders_with(&mut encoders, &hw, &mut |name, hw_frames, dev| {
+            probed.push(name.to_string());
+            assert!(hw_frames.is_none(), "nvenc candidates take plain frames");
+            assert!(dev.is_none());
+            name != "hevc_nvenc" // fail exactly one
+        });
+
+        assert!(encoders.contains("h264_nvenc"));
+        assert!(
+            !encoders.contains("hevc_nvenc"),
+            "a failed test encode must remove the encoder"
+        );
+        assert!(
+            encoders.contains("libx264"),
+            "software encoders are never validated"
+        );
+        assert_eq!(probed.len(), 2, "only the two nvenc candidates were probed");
+    }
+
+    #[test]
+    fn validate_skips_vaapi_candidate_without_device() {
+        let mut encoders = BTreeSet::from(["h264_vaapi".to_string()]);
+        let hw = HwDeviceCapabilities::default(); // no vaapi_device
+
+        let mut probe_calls = 0;
+        validate_hw_encoders_with(&mut encoders, &hw, &mut |_, _, _| {
+            probe_calls += 1;
+            true
+        });
+
+        assert_eq!(
+            probe_calls, 0,
+            "vaapi candidate without a device must be skipped, not probed"
+        );
+        // Skipped ≠ removed: it stays listed (gating elsewhere filters it).
+        assert!(encoders.contains("h264_vaapi"));
+    }
+
+    #[test]
+    fn validate_probes_vaapi_with_device_and_vulkan_when_available() {
+        let mut encoders = BTreeSet::from(["h264_vaapi".to_string(), "h264_vulkan".to_string()]);
+        let hw = HwDeviceCapabilities {
+            vaapi_device: Some("/dev/dri/renderD127".to_string()),
+            vulkan_available: true,
+        };
+
+        let mut calls: Vec<(String, Option<String>)> = Vec::new();
+        validate_hw_encoders_with(&mut encoders, &hw, &mut |name, hw_frames, dev| {
+            calls.push((name.to_string(), dev.map(str::to_string)));
+            assert_eq!(hw_frames, video_codecs::hw_frames_for(name));
+            true
+        });
+
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .any(|(n, d)| n == "h264_vaapi" && d.as_deref() == Some("/dev/dri/renderD127")),
+            "the vaapi probe must receive the discovered device, got {:?}",
+            calls
+        );
+        assert!(calls.iter().any(|(n, _)| n == "h264_vulkan"));
+        assert!(encoders.contains("h264_vaapi") && encoders.contains("h264_vulkan"));
     }
 }

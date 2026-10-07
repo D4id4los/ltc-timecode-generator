@@ -5230,4 +5230,784 @@ mod tests {
             );
         }
     }
+
+    // ── job-arrival handlers + pure helpers (WP-B coverage) ──────────────
+
+    fn probe_caps() -> crate::converter::FfmpegCapabilities {
+        let mut encs = std::collections::BTreeSet::new();
+        encs.insert("pcm_s24le");
+        encs.insert("libx264");
+        let mut fmts = std::collections::BTreeSet::new();
+        fmts.insert("mov");
+        fmts.insert("matroska");
+        crate::converter::FfmpegCapabilities {
+            has_ffmpeg: true,
+            available_encoders: encs.into_iter().map(String::from).collect(),
+            available_formats: fmts.into_iter().map(String::from).collect(),
+            error_message: None,
+            ffmpeg_version: None,
+            hw: HwDeviceCapabilities::default(),
+        }
+    }
+
+    fn sd_card(
+        name: &str,
+        files: Vec<crate::offload::OffloadFileInfo>,
+    ) -> crate::offload::SdCardInfo {
+        let count = files.len();
+        let total = files.iter().map(|f| f.size_bytes).sum();
+        crate::offload::SdCardInfo {
+            mount: PathBuf::from("/media/card"),
+            volume_label: name.to_string(),
+            device_name: name.to_string(),
+            name_source: crate::device_name::DeviceNameSource::VolumeLabel,
+            media_file_count: count,
+            total_bytes: total,
+            files,
+            selected: vec![false; count],
+            selected_count: 0,
+            selected_bytes: 0,
+        }
+    }
+
+    fn offload_file(name: &str, size: u64) -> crate::offload::OffloadFileInfo {
+        crate::offload::OffloadFileInfo {
+            path: PathBuf::from("/media/card").join(name),
+            name: name.to_string(),
+            size_bytes: size,
+            modified: None,
+        }
+    }
+
+    fn succeeded() -> JobOutcome {
+        JobOutcome::Succeeded { log: String::new() }
+    }
+
+    #[test]
+    fn on_ffmpeg_caps_finished_publishes_caps_and_succeeds() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::FfmpegCapProbe, JobStatus::running("probe"));
+
+        on_ffmpeg_caps_finished(
+            &mut els,
+            &mut JobSupervisor::new(),
+            succeeded(),
+            JobFinal::FfmpegCaps {
+                caps: Some(probe_caps()),
+            },
+        );
+
+        assert!(
+            els.current.ffmpeg_caps.is_some(),
+            "stage-1 caps must land in the snapshot"
+        );
+        assert_eq!(
+            els.current.job(JobKind::FfmpegCapProbe).phase(),
+            JobPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn on_ffmpeg_caps_finished_none_and_wrong_payload_still_terminate() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::FfmpegCapProbe, JobStatus::running("probe"));
+
+        on_ffmpeg_caps_finished(
+            &mut els,
+            &mut JobSupervisor::new(),
+            succeeded(),
+            JobFinal::FfmpegCaps { caps: None },
+        );
+        assert!(els.current.ffmpeg_caps.is_none());
+        assert_eq!(
+            els.current.job(JobKind::FfmpegCapProbe).phase(),
+            JobPhase::Succeeded
+        );
+
+        // A mismatched payload must not clobber or panic — phase still applied.
+        on_ffmpeg_caps_finished(
+            &mut els,
+            &mut JobSupervisor::new(),
+            succeeded(),
+            JobFinal::DurationsDone,
+        );
+        assert_eq!(
+            els.current.job(JobKind::FfmpegCapProbe).phase(),
+            JobPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn on_hw_validate_finished_untouched_latch_upgrades_defaults() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::HwValidate, JobStatus::running("hw-validate"));
+        // Settings the caps repair leaves untouched (mkv/h264 available), so
+        // the only possible container change is the untouched-latch upgrade.
+        els.current.converter.settings.container = "mkv".to_string();
+        els.current.converter.settings.video_encoder = "h264".to_string();
+
+        on_hw_validate_finished(
+            &mut els,
+            succeeded(),
+            JobFinal::FfmpegCaps {
+                caps: Some(probe_caps()),
+            },
+        );
+
+        // select_best_combination prefers mov/h264 over mkv/h264.
+        assert_eq!(
+            els.current.converter.settings.container, "mov",
+            "untouched latch must allow the stage-2 default upgrade"
+        );
+        assert_eq!(els.current.converter.settings.video_encoder, "h264");
+        assert_eq!(
+            els.current.job(JobKind::HwValidate).phase(),
+            JobPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn on_hw_validate_finished_touched_latch_never_flips() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::HwValidate, JobStatus::running("hw-validate"));
+        els.encoder_touched = true;
+        // Same setup as the untouched test; the latch must keep mkv.
+        els.current.converter.settings.container = "mkv".to_string();
+        els.current.converter.settings.video_encoder = "h264".to_string();
+
+        on_hw_validate_finished(
+            &mut els,
+            succeeded(),
+            JobFinal::FfmpegCaps {
+                caps: Some(probe_caps()),
+            },
+        );
+
+        assert_eq!(
+            els.current.converter.settings.container, "mkv",
+            "touched latch must keep the user's container"
+        );
+    }
+
+    #[test]
+    fn on_video_probe_finished_ok_seeds_decode_state() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::VideoProbe, JobStatus::running("probe"));
+        let probe = two_channel_probe();
+
+        on_video_probe_finished(
+            &mut els,
+            succeeded(),
+            JobFinal::VideoProbe { result: Ok(probe) },
+        );
+
+        assert!(els.current.decode.probe.is_some());
+        assert_eq!(els.current.decode.selected_stream, 0);
+        assert_eq!(els.current.decode.selected_channel, 0);
+        assert!(els.current.decode.error.is_none());
+        assert_eq!(
+            els.current.job(JobKind::VideoProbe).phase(),
+            JobPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn on_video_probe_finished_err_surfaces_decode_error() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::VideoProbe, JobStatus::running("probe"));
+
+        on_video_probe_finished(
+            &mut els,
+            succeeded(),
+            JobFinal::VideoProbe {
+                result: Err("no such stream".to_string()),
+            },
+        );
+
+        assert!(els.current.decode.probe.is_none());
+        assert!(els.current.decode.error.is_some());
+        assert_eq!(
+            els.current.job(JobKind::VideoProbe).phase(),
+            JobPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn on_offload_scan_finished_applies_default_selection_and_spawns_duration_probe() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::OffloadScan, JobStatus::running("scan"));
+        els.current
+            .offload
+            .file_durations
+            .insert(PathBuf::from("x"), Some(1.0));
+        let pre_version = els.current.offload.durations_version;
+        let mut sup = JobSupervisor::new();
+
+        let card = sd_card("CAM-A", vec![offload_file("clip.MP4", 100)]);
+        on_offload_scan_finished(
+            &mut els,
+            &mut sup,
+            succeeded(),
+            JobFinal::OffloadScan { cards: vec![card] },
+        );
+
+        assert_eq!(els.current.offload.cards.len(), 1);
+        assert!(
+            els.current.offload.file_durations.is_empty(),
+            "scan must clear stale per-file durations"
+        );
+        assert_ne!(els.current.offload.durations_version, pre_version);
+        assert!(
+            sup.latest_job.contains_key(&JobKind::DurationProbe),
+            "a non-empty scan must spawn the async duration probe"
+        );
+        sup.shutdown(std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn on_offload_scan_finished_empty_cards_spawns_nothing() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::OffloadScan, JobStatus::running("scan"));
+        let mut sup = JobSupervisor::new();
+
+        on_offload_scan_finished(
+            &mut els,
+            &mut sup,
+            succeeded(),
+            JobFinal::OffloadScan { cards: vec![] },
+        );
+
+        assert!(els.current.offload.cards.is_empty());
+        assert!(
+            !sup.latest_job.contains_key(&JobKind::DurationProbe),
+            "an empty scan must not spawn a duration probe"
+        );
+    }
+
+    #[test]
+    fn on_duration_result_updates_both_maps_and_bumps_version() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let pre_version = els.current.offload.durations_version;
+        let path = PathBuf::from("/media/card/clip.MP4");
+
+        on_duration_result(&mut els, path.clone(), Some(12.5));
+
+        assert_eq!(els.current.file_durations.get(&path), Some(&Some(12.5)));
+        assert_eq!(
+            els.current.offload.file_durations.get(&path),
+            Some(&Some(12.5))
+        );
+        assert_ne!(els.current.offload.durations_version, pre_version);
+    }
+
+    #[test]
+    fn on_duration_probe_finished_applies_outcome() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::DurationProbe, JobStatus::running("durations"));
+
+        on_duration_probe_finished(&mut els, succeeded(), JobFinal::DurationsDone);
+
+        assert_eq!(
+            els.current.job(JobKind::DurationProbe).phase(),
+            JobPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn on_offload_copy_finished_success_records_handoff_once() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::OffloadCopy, JobStatus::running("copy"));
+        els.current.offload.parent_folder = Some(PathBuf::from("/parent"));
+        els.current.offload.parent_name = "2026-10-07".to_string();
+        let pre_version = els.current.offload.last_offload_version;
+
+        on_offload_copy_finished(
+            &mut els,
+            succeeded(),
+            JobFinal::OffloadCopy {
+                completed_devices: vec!["CAM-A".to_string()],
+            },
+        );
+        // Duplicate arrival of the same device name must not double-push.
+        on_offload_copy_finished(
+            &mut els,
+            succeeded(),
+            JobFinal::OffloadCopy {
+                completed_devices: vec!["CAM-A".to_string()],
+            },
+        );
+
+        assert_eq!(els.current.offload.completed_devices, vec!["CAM-A"]);
+        assert_eq!(
+            els.current.offload.last_offload_parent,
+            Some(PathBuf::from("/parent/2026-10-07"))
+        );
+        assert!(els.current.offload.last_offload_version > pre_version);
+        assert_eq!(
+            els.current.job(JobKind::OffloadCopy).phase(),
+            JobPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn on_offload_copy_finished_empty_completion_never_yanks_converter() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::OffloadCopy, JobStatus::running("copy"));
+        els.current.offload.parent_folder = Some(PathBuf::from("/parent"));
+
+        on_offload_copy_finished(
+            &mut els,
+            succeeded(),
+            JobFinal::OffloadCopy {
+                completed_devices: vec![],
+            },
+        );
+
+        assert!(
+            els.current.offload.last_offload_parent.is_none(),
+            "a fully-failed/empty offload must not fire the converter handoff"
+        );
+    }
+
+    #[test]
+    fn on_offload_copy_finished_cancelled_sets_error_not_handoff() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::OffloadCopy, JobStatus::running("copy"));
+        els.current.offload.parent_folder = Some(PathBuf::from("/parent"));
+
+        on_offload_copy_finished(
+            &mut els,
+            JobOutcome::Cancelled { log: String::new() },
+            JobFinal::OffloadCopy {
+                completed_devices: vec!["CAM-A".to_string()],
+            },
+        );
+
+        assert!(els.current.offload.error.is_some());
+        assert!(
+            els.current.offload.last_offload_parent.is_none(),
+            "a cancelled copy must not fire the converter handoff"
+        );
+        assert_eq!(
+            els.current.job(JobKind::OffloadCopy).phase(),
+            JobPhase::Cancelled
+        );
+    }
+
+    #[test]
+    fn on_group_clip_result_replaces_pending_and_ignores_out_of_range() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.decode.group_paths = vec![PathBuf::from("a"), PathBuf::from("b")];
+        els.current.decode.group_results = vec![ClipDecodeState::Pending, ClipDecodeState::Pending];
+
+        on_group_clip_result(&mut els, 1, Ok(Box::new(make_ltc_result())));
+        assert!(matches!(
+            els.current.decode.group_results[1],
+            ClipDecodeState::Done(Ok(_))
+        ));
+        assert!(matches!(
+            els.current.decode.group_results[0],
+            ClipDecodeState::Pending
+        ));
+
+        // Out-of-range index: logged and dropped, never a panic.
+        on_group_clip_result(&mut els, 5, Err("late result".to_string()));
+    }
+
+    #[test]
+    fn on_group_decode_finished_applies_once_per_generation() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current
+            .jobs
+            .insert(JobKind::LtcGroupDecode, JobStatus::running("group"));
+        els.current.decode.group_results = vec![
+            ClipDecodeState::Done(Ok(Box::new(make_ltc_result()))),
+            ClipDecodeState::Done(Err("clip2 failed".to_string())),
+        ];
+        els.current.decode.group_generation = 3;
+        assert_eq!(els.last_auto_applied_group_ltc_gen, 0);
+
+        on_group_decode_finished(&mut els, succeeded(), JobFinal::NoPayload);
+
+        assert!(
+            els.current.converter.settings.split_tracks
+                && els.current.converter.settings.drop_ltc_track
+                && els.current.converter.settings.set_start_from_ltc,
+            "first finish must auto-apply the LTC-derived settings"
+        );
+        assert_eq!(els.last_auto_applied_group_ltc_gen, 3);
+        assert_eq!(
+            els.current.job(JobKind::LtcGroupDecode).phase(),
+            JobPhase::Succeeded
+        );
+
+        // Same generation again → latch holds, settings survive a user un-tick.
+        els.current.converter.settings.split_tracks = false;
+        on_group_decode_finished(&mut els, succeeded(), JobFinal::NoPayload);
+        assert!(!els.current.converter.settings.split_tracks);
+    }
+
+    #[test]
+    fn seed_decode_state_from_probes_first_ok_wins() {
+        let mut state = AppStateSnapshot::initial();
+        let mut four_channel = two_channel_probe();
+        four_channel.total_audio_channels = 4;
+
+        seed_decode_state_from_probes(
+            &mut state,
+            &[Err("first failed".to_string()), Ok(four_channel)],
+        );
+
+        assert_eq!(
+            state.decode.probe.map(|p| p.total_audio_channels),
+            Some(4),
+            "the first *successful* probe seeds the decode panel"
+        );
+        assert!(state.decode.error.is_none());
+    }
+
+    #[test]
+    fn seed_decode_state_from_probes_all_errors_surface_first_error() {
+        let mut state = AppStateSnapshot::initial();
+        seed_decode_state_from_probes(
+            &mut state,
+            &[Err("boom".to_string()), Err("second".to_string())],
+        );
+        assert!(state.decode.probe.is_none());
+        assert!(state.decode.error.is_some());
+    }
+
+    #[test]
+    fn reconcile_channel_map_to_probe_resizes_to_first_probe() {
+        let mut state = AppStateSnapshot::initial();
+        state.converter.settings.channel_map = ChannelMap::identity(8);
+        state.converter.probes = vec![Some(two_channel_probe())];
+
+        reconcile_channel_map_to_probe(&mut state);
+        assert_eq!(state.converter.settings.channel_map.num_channels(), 2);
+
+        // Zero-channel probe must not collapse the map.
+        let mut zero = two_channel_probe();
+        zero.total_audio_channels = 0;
+        state.converter.probes = vec![Some(zero)];
+        reconcile_channel_map_to_probe(&mut state);
+        assert_eq!(state.converter.settings.channel_map.num_channels(), 2);
+
+        // Equal width is a no-op.
+        state.converter.probes = vec![Some(two_channel_probe())];
+        reconcile_channel_map_to_probe(&mut state);
+        assert_eq!(state.converter.settings.channel_map.num_channels(), 2);
+    }
+
+    #[test]
+    fn sync_job_statuses_empty_supervisor_leaves_jobs_untouched() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut status = JobStatus::running("conversion");
+        status.progress.phase = JobPhase::Failed;
+        els.current.jobs.insert(JobKind::Conversion, status);
+
+        sync_job_statuses(&mut els, &mut JobSupervisor::new());
+
+        assert_eq!(
+            els.current.job(JobKind::Conversion).phase(),
+            JobPhase::Failed,
+            "an idle supervisor must not clobber terminal phases"
+        );
+    }
+
+    #[test]
+    fn sync_job_statuses_publishes_running_snapshot_for_live_job() {
+        let mut sup = JobSupervisor::new();
+        let cancel = CancelToken::new();
+        let parked = cancel.clone();
+        spawn_job::<JobFinal, _>(
+            &mut sup,
+            job::JobSpec {
+                kind: JobKind::DurationProbe,
+                name: "parked durations",
+                units: vec![],
+            },
+            move |_ctx| {
+                while !parked.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(JobFinal::NoPayload)
+            },
+        );
+
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            sync_job_statuses(&mut els, &mut sup);
+            if els.current.jobs.contains_key(&JobKind::DurationProbe) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live job must appear in the job-status map"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            els.current.job(JobKind::DurationProbe).phase(),
+            JobPhase::Running
+        );
+
+        cancel.cancel();
+        sup.shutdown(std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn publish_if_changed_stores_only_on_change() {
+        let shared: Arc<ArcSwap<AppStateSnapshot>> =
+            Arc::new(ArcSwap::from_pointee(AppStateSnapshot::initial()));
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+
+        publish_if_changed(&mut els, &shared);
+        let first = els.last_published.clone().unwrap();
+        assert!(Arc::ptr_eq(&shared.load_full(), &first));
+
+        // Identical snapshot → no republish (same Arc stored).
+        publish_if_changed(&mut els, &shared);
+        assert!(
+            Arc::ptr_eq(els.last_published.as_ref().unwrap(), &first),
+            "idle publish must be skipped, not deep-cloned"
+        );
+
+        // Mutation → new Arc stored.
+        els.current.is_playing = true;
+        publish_if_changed(&mut els, &shared);
+        assert!(shared.load().is_playing);
+        assert!(!Arc::ptr_eq(els.last_published.as_ref().unwrap(), &first));
+    }
+
+    // ── handle_offload_command guard branches ─────────────────────────────
+
+    #[test]
+    fn offload_device_name_commands_update_card_by_index_and_mount() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.offload.cards = vec![
+            sd_card("CAM-A", vec![offload_file("a.MP4", 10)]),
+            sd_card("CAM-B", vec![offload_file("b.MP4", 20)]),
+        ];
+        let mut sup = JobSupervisor::new();
+
+        handle_offload_command(
+            crate::command::OffloadCommand::SetDeviceName(1, "renamed".to_string()),
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(els.current.offload.cards[1].device_name, "renamed");
+        assert_eq!(
+            els.current.offload.cards[1].name_source,
+            crate::device_name::DeviceNameSource::Manual
+        );
+        // Out-of-range index is ignored, never a panic.
+        handle_offload_command(
+            crate::command::OffloadCommand::SetDeviceName(9, "ghost".to_string()),
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(els.current.offload.cards.len(), 2);
+
+        handle_offload_command(
+            crate::command::OffloadCommand::SetDeviceNameByMount(
+                PathBuf::from("/media/card"),
+                "by-mount".to_string(),
+            ),
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(els.current.offload.cards[0].device_name, "by-mount");
+    }
+
+    #[test]
+    fn offload_selection_commands_update_counts_and_bytes() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.offload.cards = vec![sd_card(
+            "CAM-A",
+            vec![offload_file("a.MP4", 10), offload_file("b.MP4", 30)],
+        )];
+        let mut sup = JobSupervisor::new();
+
+        handle_offload_command(
+            crate::command::OffloadCommand::SetFileSelected(0, 1, true),
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(els.current.offload.cards[0].selected_count, 1);
+        assert_eq!(els.current.offload.cards[0].selected_bytes, 30);
+
+        handle_offload_command(
+            crate::command::OffloadCommand::SetAllFilesSelected(0, true),
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(els.current.offload.cards[0].selected_count, 2);
+        assert_eq!(els.current.offload.cards[0].selected_bytes, 40);
+
+        handle_offload_command(
+            crate::command::OffloadCommand::SelectLatestDay(0),
+            &mut els,
+            &mut sup,
+        );
+        // No modified timestamps → default selection is empty.
+        assert_eq!(els.current.offload.cards[0].selected_count, 0);
+
+        // Out-of-range card/file indices are ignored, never a panic.
+        handle_offload_command(
+            crate::command::OffloadCommand::SetFileSelected(3, 0, true),
+            &mut els,
+            &mut sup,
+        );
+        handle_offload_command(
+            crate::command::OffloadCommand::SetFileSelected(0, 9, true),
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(els.current.offload.cards[0].selected_count, 0);
+    }
+
+    #[test]
+    fn offload_start_guard_rejects_no_cards_then_no_parent() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut sup = JobSupervisor::new();
+
+        handle_offload_command(
+            crate::command::OffloadCommand::StartOffload,
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(
+            els.current.offload.plan_error,
+            Some(crate::offload::OffloadPlanError::NoCards)
+        );
+
+        els.current.offload.cards = vec![sd_card("CAM-A", vec![offload_file("a.MP4", 10)])];
+        handle_offload_command(
+            crate::command::OffloadCommand::StartOffload,
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(
+            els.current.offload.plan_error,
+            Some(crate::offload::OffloadPlanError::NoParentFolder)
+        );
+        assert!(!sup.latest_job.contains_key(&JobKind::OffloadCopy));
+    }
+
+    #[test]
+    fn offload_start_guard_rejects_no_files_selected() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        els.current.offload.cards = vec![sd_card("CAM-A", vec![offload_file("a.MP4", 10)])];
+        els.current.offload.parent_folder = Some(PathBuf::from("/parent"));
+        let mut sup = JobSupervisor::new();
+
+        handle_offload_command(
+            crate::command::OffloadCommand::StartOffload,
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(
+            els.current.offload.plan_error,
+            Some(crate::offload::OffloadPlanError::NoFilesSelected)
+        );
+        assert!(!sup.latest_job.contains_key(&JobKind::OffloadCopy));
+    }
+
+    #[test]
+    fn offload_scan_cards_ignores_duplicate_while_running() {
+        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let cancel = CancelToken::new();
+        let parked = cancel.clone();
+        els.scan_cards = Arc::new(move |_cancel, _progress| {
+            while !parked.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(Vec::new())
+        });
+        let mut sup = JobSupervisor::new();
+
+        handle_offload_command(
+            crate::command::OffloadCommand::ScanCards,
+            &mut els,
+            &mut sup,
+        );
+        let first = *sup.latest_job.get(&JobKind::OffloadScan).unwrap();
+
+        // While the first scan is still running, a duplicate must be ignored.
+        handle_offload_command(
+            crate::command::OffloadCommand::ScanCards,
+            &mut els,
+            &mut sup,
+        );
+        assert_eq!(
+            *sup.latest_job.get(&JobKind::OffloadScan).unwrap(),
+            first,
+            "duplicate ScanCards while running must not spawn a second job"
+        );
+
+        cancel.cancel();
+        sup.shutdown(std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn recompute_converter_derived_publishes_blockers_and_ready_state() {
+        // No group → blocked.
+        let mut state = AppStateSnapshot::initial();
+        recompute_converter_derived(&mut state);
+        assert!(state
+            .converter
+            .readiness
+            .contains(&crate::converter::ConvertBlocker::NoRecording));
+        assert!(
+            state
+                .converter
+                .readiness
+                .contains(&crate::converter::ConvertBlocker::NoOutputFolder),
+            "empty output folder must block"
+        );
+
+        // Group + prefix + folder + ffmpeg caps → ready, no warnings.
+        let mut state = AppStateSnapshot::initial();
+        state.converter.groups.push(MatchedGroup {
+            prefix: "T".into(),
+            rel_dir: String::new(),
+            recording_type: crate::converter::RecordingType::MultiTrackAudio,
+            files: vec![PathBuf::from("/tmp/T_S01.wav")],
+        });
+        state.converter.selected_group_idx = Some(0);
+        state.converter.settings.output_folder = PathBuf::from("/tmp/out");
+        state.ffmpeg_caps = Some(probe_caps());
+        recompute_converter_derived(&mut state);
+        assert!(
+            state.converter.readiness.is_empty(),
+            "all blockers satisfied → readiness empty, got {:?}",
+            state.converter.readiness
+        );
+    }
 }

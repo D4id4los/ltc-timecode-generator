@@ -1206,4 +1206,129 @@ mod tests {
             "no description when camera has no lens/model info beyond originator"
         );
     }
+
+    // ── push_timecode_args / push_audio_timecode_args (WP-B) ─────────────
+
+    fn tc_meta(fps: f64) -> crate::converter::TimecodeMetadata {
+        crate::converter::TimecodeMetadata {
+            start: Timecode {
+                hours: 9,
+                minutes: 30,
+                seconds: 1,
+                frames: 12,
+            },
+            fps,
+            drop_frame: false,
+        }
+    }
+
+    /// ffmpeg arg vectors are legitimate string contracts (AGENTS.md).
+    #[test]
+    fn push_timecode_args_force_frame_rate_appends_r() {
+        let mut forced = vec![];
+        push_timecode_args(&mut forced, &tc_meta(25.0), true);
+        assert!(forced.windows(2).any(|w| w[0] == "-timecode"));
+        assert!(forced
+            .windows(2)
+            .any(|w| w[0] == "-write_tmcd" && w[1] == "1"));
+        assert_eq!(
+            forced
+                .windows(2)
+                .find(|w| w[0] == "-r")
+                .map(|w| w[1].as_str()),
+            Some("25.000"),
+            "force_frame_rate must pin -r to the metadata fps"
+        );
+
+        let mut plain = vec![];
+        push_timecode_args(&mut plain, &tc_meta(25.0), false);
+        assert!(
+            !plain.iter().any(|a| a == "-r"),
+            "without force, -r must not be emitted"
+        );
+    }
+
+    #[test]
+    fn push_audio_timecode_args_wav_gets_bext_and_time_reference() {
+        // 1 h 30 m 1 s 12 f at 25 fps → 30*3600 + 1*60 + 1 = 108061 s.
+        let mut args = vec![];
+        push_audio_timecode_args(&mut args, &tc_meta(25.0), "wav", 48000);
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-write_bext" && w[1] == "1"));
+        assert_eq!(
+            args.windows(2)
+                .find(|w| w[0] == "-metadata")
+                .map(|w| w[1].as_str()),
+            Some("time_reference=1641671040"),
+            "time_reference must be start seconds × sample rate (34201.48 × 48000)"
+        );
+        assert!(args.windows(2).any(|w| w[0] == "-timecode"));
+
+        // Non-WAV formats carry -timecode but no WAV bext block.
+        let mut args = vec![];
+        push_audio_timecode_args(&mut args, &tc_meta(25.0), "adts", 48000);
+        assert!(!args.iter().any(|a| a == "-write_bext"));
+        assert!(!args.iter().any(|a| a.starts_with("time_reference=")));
+        assert!(args.windows(2).any(|w| w[0] == "-timecode"));
+    }
+
+    // ── build_video_to_video_args dispatch arms ──────────────────────────
+
+    #[test]
+    fn build_video_to_video_args_dispatches_audio_channel_with_probe_sample_rate() {
+        let s = make_video_settings();
+        // Probe reports stream 1 at 44100 — the dispatch must pick it up.
+        let probe = VideoAudioProbe {
+            streams: vec![crate::ffprobe::AudioStreamInfo {
+                stream_index: 1,
+                channels: 2,
+                codec_name: "pcm_s16le".into(),
+                sample_rate: 44100,
+            }],
+            total_audio_channels: 2,
+            is_video_file: true,
+        };
+        let step = VideoOutputStep::AudioChannel {
+            file_idx: 0,
+            stream_idx: 1,
+            channel_idx: 0,
+            output: std::path::PathBuf::from("/tmp/out.wav"),
+            format: "wav".to_string(),
+            naming_index: 0,
+        };
+        let args = build_video_to_video_args(&s, &step, &probe);
+        let joined = args.join(" ");
+        assert!(joined.contains("pan=mono|FC=c0"));
+        assert!(joined.contains("-c:a pcm_s24le"), "wav format forces PCM");
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_video_to_video_args_panics_on_concat_step() {
+        let s = make_video_settings();
+        let probe = make_stereo_probe();
+        let step = VideoOutputStep::AudioChannelConcat {
+            segments: vec![(0, 1, 0)],
+            output: std::path::PathBuf::from("/tmp/out.wav"),
+            format: "wav".to_string(),
+            sample_rate: 48000,
+        };
+        let _ = build_video_to_video_args(&s, &step, &probe);
+    }
+
+    // ── layout_for_count (smallest layout table) ─────────────────────────
+
+    #[test]
+    fn layout_for_count_table() {
+        assert_eq!(layout_for_count(1), "mono");
+        assert_eq!(layout_for_count(2), "stereo");
+        assert_eq!(layout_for_count(3), "5.1");
+        assert_eq!(layout_for_count(6), "5.1");
+        assert_eq!(layout_for_count(8), "5.1");
+        // Reflected through pan_filter for a 3-survivor routing.
+        let f = pan_filter(&[0, 2, 4]);
+        assert!(f.starts_with("pan=5.1|"), "got {}", f);
+        assert!(f.contains("c0=0") && f.contains("c1=2") && f.contains("c2=4"));
+    }
 }
