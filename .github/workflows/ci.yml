@@ -152,9 +152,10 @@ jobs:
       - name: cargo-deny (RustSec advisories)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          # The action's `arguments` sit at the `cargo deny` level (the
-          # check subcommand is no longer implicit), so name it explicitly.
-          arguments: check advisories
+          # The action's CLI plumbing changed: `arguments` no longer lands
+          # after the implicit `check` subcommand. `command-arguments` is
+          # the per-command input and produces `cargo deny check advisories`.
+          command-arguments: advisories
 
   # Compile-check the Windows-only cfg blocks (offload win_driver, subprocess
   # console suppression) that the Linux job never builds. Check-only: no
