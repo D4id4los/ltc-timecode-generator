@@ -2466,4 +2466,119 @@ mod tests {
         assert_eq!(merged.total_possible, 0);
         assert_eq!(merged.avg_confidence, 0.0, "0/0 must be guarded to 0.0");
     }
+
+    // ── plan_chunk_boundaries edge geometry (WP-B) ────────────────────────
+
+    #[test]
+    fn plan_chunk_boundaries_overlap_larger_than_advance_stops() {
+        // Overlap so large the next start would not advance: the planner must
+        // terminate after one chunk instead of spinning.
+        let plan = plan_chunk_boundaries(1000, 400, 400);
+        assert_eq!(plan, vec![(0, 400)]);
+        // Just above the degenerate threshold, stepping works normally.
+        let plan = plan_chunk_boundaries(1000, 400, 200);
+        assert_eq!(plan, vec![(0, 400), (200, 600), (400, 800), (600, 1000)]);
+    }
+
+    #[test]
+    fn plan_chunk_boundaries_exact_multiple_no_tail_chunk() {
+        // Total exactly divisible by the chunk size: no zero-length tail.
+        let plan = plan_chunk_boundaries(800, 400, 100);
+        assert_eq!(plan, vec![(0, 400), (300, 700), (600, 800)]);
+    }
+
+    #[test]
+    fn plan_chunk_boundaries_chunks_are_ascending_and_cover_the_file() {
+        let plan = plan_chunk_boundaries(10_000, 1_500, 250);
+        assert_eq!(plan.first().unwrap().0, 0);
+        assert_eq!(plan.last().unwrap().1, 10_000);
+        for w in plan.windows(2) {
+            assert!(w[1].0 > w[0].0, "starts must strictly advance: {:?}", plan);
+            assert!(
+                w[1].0 > w[0].1 - 250 - 1,
+                "advance never below total-overlap"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_geometry_scales_with_channel_count_and_enforces_min_overlap() {
+        // 2 ch × 2 bytes = 4 bytes/mono-sample; 480 000 bytes → 120 000 mono.
+        let cfg = DecodeConfig {
+            chunk_size_bytes: 480_000,
+            overlap_seconds: 1.0,
+        };
+        let (chunk_mono, overlap) = chunk_geometry(&cfg, 4, 48_000);
+        assert_eq!(chunk_mono, 120_000);
+        assert_eq!(overlap, 48_000);
+
+        // Overlap floor: overlap_seconds*rate*2 must not exceed the chunk.
+        let tiny = DecodeConfig {
+            chunk_size_bytes: 96,
+            overlap_seconds: 10.0,
+        };
+        let (chunk_mono, overlap) = chunk_geometry(&tiny, 4, 48_000);
+        assert_eq!(overlap, 480_000);
+        assert!(
+            chunk_mono >= overlap * 2,
+            "chunk must always be at least 2× overlap, got chunk={} overlap={}",
+            chunk_mono,
+            overlap
+        );
+
+        // Degenerate bytes_per_mono_sample (0) must not divide by zero.
+        let (_, overlap) = chunk_geometry(&cfg, 0, 48_000);
+        assert_eq!(overlap, 48_000);
+    }
+
+    // ── render_chunk_detail / chunk_summary_of (projections) ──────────────
+
+    fn ok_detail() -> ChunkDetail {
+        ChunkDetail::Ok {
+            chunk_idx: 3,
+            valid_frames: 40,
+            total_possible_frames: 50,
+            avg_confidence: 0.912,
+        }
+    }
+
+    #[test]
+    fn render_chunk_detail_ok_and_err_lines() {
+        assert_eq!(
+            render_chunk_detail(&ok_detail()),
+            "Chunk 3: 40 valid / 50 possible (conf 91.2%)"
+        );
+        let err = ChunkDetail::Err {
+            chunk_idx: 7,
+            source: LtcDecodeError::Cancelled,
+        };
+        assert_eq!(
+            render_chunk_detail(&err),
+            "Chunk 7: error - Decode canceled by user"
+        );
+    }
+
+    #[test]
+    fn chunk_summary_of_projects_both_arms() {
+        let summary = chunk_summary_of(&ok_detail());
+        assert_eq!(summary.chunk_idx, 3);
+        assert_eq!(summary.valid_frames, 40);
+        assert_eq!(summary.total_possible_frames, 50);
+        assert!((summary.avg_confidence - 0.912).abs() < 1e-6);
+        assert!(summary.error.is_none());
+
+        let err = ChunkDetail::Err {
+            chunk_idx: 7,
+            source: LtcDecodeError::Failed("io".to_string()),
+        };
+        let summary = chunk_summary_of(&err);
+        assert_eq!(summary.chunk_idx, 7);
+        assert_eq!(summary.valid_frames, 0);
+        assert_eq!(summary.total_possible_frames, 0);
+        assert_eq!(summary.avg_confidence, 0.0);
+        assert_eq!(
+            summary.error,
+            Some(LtcDecodeError::Failed("io".to_string()))
+        );
+    }
 }

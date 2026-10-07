@@ -615,4 +615,33 @@ File formats:
         );
         assert!(got.contains("world"), "got {:?}", got);
     }
+
+    // ── ResolvedHwDevice::prelude_args (WP-B) ─────────────────────────────
+
+    /// ffmpeg arg vectors are legitimate string contracts (AGENTS.md).
+    #[test]
+    fn resolved_hw_device_prelude_args_arms() {
+        let vaapi = ResolvedHwDevice::Vaapi {
+            device_path: "/dev/dri/renderD129".to_string(),
+        };
+        assert_eq!(
+            vaapi.prelude_args(),
+            vec![
+                "-init_hw_device".to_string(),
+                "vaapi=vaapi0:/dev/dri/renderD129".to_string(),
+                "-filter_hw_device".to_string(),
+                "vaapi0".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            ResolvedHwDevice::Vulkan.prelude_args(),
+            vec![
+                "-init_hw_device".to_string(),
+                "vulkan=vulkan0".to_string(),
+                "-filter_hw_device".to_string(),
+                "vulkan0".to_string(),
+            ]
+        );
+    }
 }
