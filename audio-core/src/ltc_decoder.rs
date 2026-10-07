@@ -8683,6 +8683,26 @@ mod tests {
     }
 
     #[test]
+    fn test_notch_stage_keeps_q25_notch_width() {
+        // A tone 0.7 Hz off the notch centre sits inside a Q≈25 notch
+        // (half-width ≈1 Hz) and must pass largely intact; the
+        // `2.0 * 25.0` → `2.0 + 25.0` alpha mutant halves the effective Q
+        // and attenuates it roughly 3× more (calibrated: orig RMS 0.208 vs
+        // mutant 0.072 for a 0.5-amplitude tone).
+        let rate = 48_000.0f32;
+        let mut sig: Vec<f32> = (0..48_000)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 50.7 * i as f32 / rate).sin())
+            .collect();
+        notch_stage(&mut sig, 50.0, 48_000);
+        let tail = &sig[24_000..];
+        let rms = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt();
+        assert!(
+            rms > 0.15,
+            "off-centre tone must survive the notch, rms {rms}"
+        );
+    }
+
+    #[test]
     fn test_robust_peak_ignores_sparse_full_scale_clicks() {
         // 1000 samples: 993 at 0.05, 4 at 0.1, 3 clicks at 1.0 (0.3% —
         // below the 0.5% tail). The cumulative count reaches the 995 target
