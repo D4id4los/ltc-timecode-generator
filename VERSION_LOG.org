@@ -1,6 +1,33 @@
 #+TITLE: Version History for LTC Timecode Generator
 
 
+* Unreleased
+
+Main features are LTC encoder robustness (WP-EN): drift-free file renders at
+fractional frame rates, calibrated output levels with dBFS presets, and a
+standards-permitted clock-preamble lead-in that protects the first LTC frame
+from a recorder's input settling window.
+
+List of Changes:
+- Encoder/CLI: WAV renders (--output-to-file) now use the same fractional-
+  sample accumulator as the live scheduler, so renders at fractional fps no
+  longer drift against wall clock (29.97 fps @ 48 kHz previously gained
+  +120 samples per 10 s = +1.79 s per 2 h; 24 fps @ 44.1 kHz +0.5 samples
+  per frame). Integer-rate renders are bit-identical.
+- Levels: --volume is now optional with per-mode defaults — file renders
+  default to 0.5 UI (−12 dBFS peak, a safe-hot reference level that buys
+  decoder SNR headroom), live playback stays at 0.25 UI (−24.1 dBFS). Both
+  GUIs gain −18/−12/−6 dBFS preset buttons and a live dBFS readout beside
+  the LTC volume slider.
+- Lead-in: playback and renders now begin with one frame's worth of
+  alternating bi-phase clock bits (no sync word, no timecode) so a
+  recorder's AGC/HPF settling window cannot swallow the first real LTC
+  frame. Under a measured 250 ms settle ramp with chain noise the builtin
+  decoder previously lost the first two frames; with the preamble all
+  frames decode starting at the start TC (libltc head loss likewise fixed;
+  its documented tail loss is unaffected). The preamble carries no codeword
+  and cannot pollute trim-to-first-LTC flows.
+
 * v0.5.3
 
 Main features are a permanent real-world decode-test asset (WP-RW) — a corpus

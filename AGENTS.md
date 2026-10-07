@@ -96,7 +96,7 @@ Both Rust GUIs delegate all audio lifecycle, state management, CLI handling, dec
 │       ├── chunked_decode.rs     # plan_chunk_boundaries, count_chunks* , decode_ltc_chunked (plan → run → merge)
 │       ├── decoder.rs            # trait LtcDecoder + BuiltinDecoder/LibltcDecoder + decoder_for() backend seam
 │       ├── audio_output.rs       # AudioCore, device/stream lifecycle, config selection, error classification, scheduler + watchdog
-│       ├── ltc_encoder.rs        # get_ltc_bits, increment_timecode, generate_ltc_frame_stereo
+│       ├── ltc_encoder.rs        # get_ltc_bits, increment_timecode, generate_ltc_frame_stereo, lead-in + dBFS level helpers
 │       ├── ltc_decoder.rs        # Builtin decoder (strategy ladder) + quality sub-analyzers
 │       └── ltc_decoder_libltc.rs # libltc-binding decoder
 ├── scripts/                      # bump-version.sh, sonar-gate.sh, sonar-report.sh, test-lint.sh (+ test_lint.py)
@@ -368,7 +368,7 @@ The `audio-core` crate provides the raw audio engine, split by concern:
 - **`chunked_decode.rs`** — chunked parallel decode: `chunk_geometry()` + `plan_chunk_boundaries()` (the single home of the chunk-boundary math — `count_chunks` is `plan(..).len()` by construction), `count_chunks_in_wav`, `decode_ltc_chunked` decomposed into `plan_chunks` → `run_sequential`/`run_parallel` (over `&dyn LtcDecoder`) → `merge_results` (offset/dedup/reindex/confidence aggregation, unit-tested with a `MockDecoder`).
 - **`decoder.rs`** — backend-selection seam: `trait LtcDecoder` (`name`/`decode_wav`/`decode_chunk`), `BuiltinDecoder`/`LibltcDecoder` unit structs, and `decoder_for(use_libltc)` — the only `if use_libltc` in the crate.
 - **`audio_output.rs`** — `AudioCore` (cpal output stream, ring buffers 128K LTC + 32K beep, scheduler thread, wake lock, event queue); `list_audio_devices()` / `AudioDeviceInfo` (built via `DeviceConfigSummary` + `from_summary`); config selection, stream building, device enumeration; error classification (`is_permanent_device_error`); `suggest_sample_rate()`; `SAMPLE_RATE_OPTIONS = &[44100, 48000]`. The scheduler's callback-stall recovery is a pure `CallbackWatchdog` state machine (virtual-clock tested) plus a device-free `push_frame` helper.
-- **`ltc_encoder.rs`** — `get_ltc_bits()` (80-bit bi-phase mark frame), `increment_timecode()`, `compute_frame_sample_count()`, `generate_ltc_frame_stereo()`.
+- **`ltc_encoder.rs`** — `get_ltc_bits()` (80-bit bi-phase mark frame), `increment_timecode()`, `compute_frame_sample_count()`, `generate_ltc_frame_stereo()`, `generate_ltc_lead_in_stereo()` (80-alternating-bit clock preamble, `LEAD_IN_BITS`, no sync word — emitted at playback start and render start so a recorder's settle window can't swallow the first frame), and the level helpers `dbfs_to_ui_volume()` / `ui_volume_to_dbfs()` (inverse of the quadratic `map_volume`).
 - **`ltc_decoder.rs`** — builtin pure-Rust decoder: `decode_ltc_samples()` (crate-private; the strategy ladder — ZC-interval attempt, `scan_windows`, `score_candidate`, `prefer_zc_or_detailed` epilogue, `decode_full_file` — with all `ScoredResult` construction funneled through `from_frame_starts`), `decode_ltc_from_wav()`, first-coherent-frame alignment (`find_first_coherent_index`, `apply_coherent_first_timecode` — crate-private), and `compute_ltc_quality()` as an orchestrator over pure sub-analyzers (`split_segments`, `analyze_drift`, `analyze_gaps`, `analyze_glitches`, `missing_in_span`, `quality_score`); types `LtcDetectionResult`, `FrameTimecode`, `LtcQualityReport`, `LtcDecodeStatus`.
 - **`ltc_decoder_libltc.rs`** — `decode_ltc_from_wav_libltc()` via the `libltc-rs` binding (requires system `libltc`); the sample-level entry is crate-private.
 - Common `AudioEvent` variants: StreamError/StreamDied/StreamRecovering/StreamDead/RecoveryNeeded/Underrun/FramesDropped.
@@ -378,7 +378,7 @@ The `audio-core` crate provides the raw audio engine, split by concern:
 `gui_engine::cli` (shared by both Rust GUIs; binary `ltc-gui`). Modes: `--list-devices/-l`, `--output-to-file <PATH>` (WAV render), `--headless/-H` (live playback, ctrlc handler), `--decode <PATH>` (decode + summary), otherwise GUI.
 
 Flag groups (see `cli.rs::Cli` for the full list with defaults):
-- **Playback**: `--device <NAME>` / `--device-index <N>`, `--start-timecode` (default `01:00:00:00`), `--fps` (24/25/29.97/30), `--drop-frame`, `--channel left|right|both`, `--volume`, `--sample-rate`, `--duration`, `--autostart`
+- **Playback**: `--device <NAME>` / `--device-index <N>`, `--start-timecode` (default `01:00:00:00`), `--fps` (24/25/29.97/30), `--drop-frame`, `--channel left|right|both`, `--volume` (optional; per-mode defaults: render 0.5 = −12 dBFS, live 0.25 = −24.1 dBFS), `--sample-rate`, `--duration`, `--autostart`
 - **Decode**: `--decoder builtin|libltc`, `--decode-fps`, `--decode-drop-frame`, `--audio-stream <N>` / `--audio-channel <N>` (video files), `--single-pass`, `--context-frames <N>`, `--list-timecodes/-t`
 - **Misc**: `--verbose/-v` (timecode progression / detailed quality report), `--debug/-d`
 

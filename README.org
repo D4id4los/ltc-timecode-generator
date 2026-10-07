@@ -197,6 +197,16 @@ first launch — choose /"More info"/ → /"Run anyway"/.
 
 Run =ltc-gui --help= for the full list of options.
 
+** Volume defaults
+
+The LTC =--volume= flag is optional and defaults per mode: file renders
+(=--output-to-file=) use 0.5 (a −12 dBFS peak — a safe-hot reference level
+that maximises decoder SNR headroom), live playback uses 0.25 (−24.1 dBFS,
+mic-level-safe for camera feeds). Both GUIs offer −18/−12/−6 dBFS presets
+and a live dBFS readout beside the LTC volume slider. Renders also begin
+with a short clock-preamble lead-in (no timecode content) so a recorder's
+input settling window cannot swallow the first LTC frame.
+
 * Troubleshooting & FAQ
 
 - *No sound on Linux* :: The app plays through PulseAudio/PipeWire. Open the
