@@ -73,4 +73,44 @@ exclude_re = [
     "audio-core/src/ltc_decoder.rs:642:22: replace > with >= in scan_channel_peaks_hound",
     "audio-core/src/ltc_decoder.rs:651:22: replace > with >= in scan_channel_peaks_hound",
     "audio-core/src/wav_chunk_reader.rs:166:26: replace > with >= in WavChunkReader::scan_channel_peaks",
+    # ── 2026-10-07 batch-2 triage (strategy ladder + quality) ─────────────
+    # Mean-centering equivalence: sxy = Σdx·(y ∓ my) and Σdx == 0 by
+    # construction of my, so flipping the intercept-side subtraction cannot
+    # change the covariance (FP noise only).
+    "audio-core/src/ltc_decoder.rs:1271:24: replace - with \\+ in fit_segment_drift",
+    # Re-suppressed at current positions (were removed with the stale
+    # short-form entries in 29babba): worst_block_drift_frames tracks
+    # max(accum_frames) with accum absolute — a tie overwrite writes the
+    # same number; the degraded-block severity ((accum−0.5)/0.5).min(1.0)
+    # is exactly 0.0 at accum == 0.5.
+    "audio-core/src/ltc_decoder.rs:1413:27: replace > with >= in analyze_drift",
+    "audio-core/src/ltc_decoder.rs:1423:31: replace > with >= in analyze_drift",
+    # Segment-length emptiness: seg_len only gates a loop that is empty for
+    # every segment shorter than 3 frames, so end+start vs end−start cannot
+    # change the glitch set.
+    "audio-core/src/ltc_decoder.rs:1526:31: replace - with \\+ in analyze_glitches",
+    # Ramp-boundary parity: at glitch_ratio == 0.001 the ramp term
+    # ((ratio−0.001)/0.009) is exactly 0.0, so widening `>` to `>=` adds a
+    # zero penalty.
+    "audio-core/src/ltc_decoder.rs:1583:21: replace > with >= in quality_score",
+    # Running-max equivalence (max tracking): a tie overwrite writes the
+    # same value.
+    "audio-core/src/ltc_decoder.rs:1874:14: replace > with >= in robust_peak_amplitude",
+    # Histogram scale off-by-one/bin quantisation: the interpolated
+    # percentile moves by at most one bin width (max/4095 ≈ 0.02 % of peak)
+    # — unobservable outside absurdly tight windows.
+    "audio-core/src/ltc_decoder.rs:1882:23: replace - with \\+ in robust_peak_amplitude",
+    "audio-core/src/ltc_decoder.rs:1882:23: replace - with / in robust_peak_amplitude",
+    # Clamp non-binding: (|s|·scale) never exceeds BINS−1, so widening the
+    # clamp bound cannot change a bin index.
+    "audio-core/src/ltc_decoder.rs:1884:57: replace - with \\+ in robust_peak_amplitude",
+    "audio-core/src/ltc_decoder.rs:1884:57: replace - with / in robust_peak_amplitude",
+    # Unreachable branch: the winning bin always has count ≥ 1 (seen ≥
+    # target implies the current bin contributed), so `count > 0` vs
+    # `count == 0` selects the same arm.
+    "audio-core/src/ltc_decoder.rs:1895:33: replace > with >= in robust_peak_amplitude",
+    # Fraction arithmetic mutants shift the in-bin interpolation by at most
+    # one bin width (max/4095 ≈ 0.02 % of peak) — same quantisation margin.
+    "audio-core/src/ltc_decoder.rs:1896:21: replace - with / in robust_peak_amplitude",
+    "audio-core/src/ltc_decoder.rs:1896:29: replace - with / in robust_peak_amplitude",
 ]

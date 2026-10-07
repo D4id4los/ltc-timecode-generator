@@ -3928,6 +3928,29 @@ mod tests {
     }
 
     #[test]
+    fn test_backfill_reads_exactly_eighty_bits_at_buffer_end() {
+        // The signal ends exactly 80 bits (one frame) after the backfill
+        // target: the extraction yields precisely 80 bits, and the length
+        // gate (a strict `< 80`) must accept the minimum qualifying frame;
+        // `<=`/`==` would reject it. The locked-frame bookkeeping is
+        // hand-built — backfill never re-reads the locked frame's samples.
+        let fps = 25.0;
+        let rate = 48_000u32;
+        let lead = 96usize;
+        let tcs = simple_tcs(2);
+        let mut signal = vec![0.0f32; lead];
+        signal.extend(synthesize_ltc_signal(&tcs[..1], fps, false, rate, 0.5));
+        let mut r = scored_locked_frames(&tcs[1..], 1, fps, false, rate, lead);
+        backfill_leading_frames(&signal, &mut r, 0.01, rate);
+        assert_eq!(
+            r.timecodes.len(),
+            2,
+            "the exactly-80-bit frame must backfill"
+        );
+        assert_eq!(r.timecodes[0].timecode, tcs[0]);
+    }
+
+    #[test]
     fn test_wav_roundtrip_different_start_tc() {
         let result = verify_roundtrip(
             Timecode {
@@ -8648,6 +8671,15 @@ mod tests {
         let mut four = [1.0f32, 2.0, 3.0, 4.0];
         median_filter(&mut four);
         assert_eq!(four, [1.0, 2.0, 3.0, 4.0], "len < 5 is untouched");
+        // len == 5 is the first filtered length: the spike at the window
+        // centre must be removed (a `<=` guard would skip the whole buffer).
+        let mut five = [0.5f32, 0.5, 99.0, 0.5, 0.5];
+        median_filter(&mut five);
+        assert_eq!(
+            five[2], 0.5,
+            "5-sample buffer must be filtered, got {:?}",
+            five
+        );
     }
 
     #[test]
@@ -9020,6 +9052,221 @@ mod tests {
         (0..n).fold(start, |acc, _| {
             crate::increment_timecode(&acc, fps, drop_frame)
         })
+    }
+
+    // ── strategy-ladder fixtures (2026-10-07 survivor triage) ────────────
+    // Adversarial signals that pin the ladder's routing decisions: the ZC
+    // re-scan gate, the sliding-window scan, and the full-file decode.
+
+    /// Adds a fast square-wave interferer: `half_period`-sample polarity
+    /// runs at `amplitude`. With amplitude above the carrier and 2-sample
+    /// runs (which the median pre-filter preserves), every run boundary is
+    /// a decisive zero-crossing — the ZC stream floods far past the
+    /// 240-per-frame noise budget and only the stricter re-scan recovers it.
+    fn add_square_interference(signal: &mut [f32], half_period: usize, amplitude: f32) {
+        let mut phase = 0usize;
+        for s in signal.iter_mut() {
+            *s += if phase < half_period {
+                amplitude
+            } else {
+                -amplitude
+            };
+            phase = (phase + 1) % (half_period * 2);
+        }
+    }
+
+    #[test]
+    fn test_decode_ltc_samples_reports_total_audio_duration() {
+        // 50 frames @ 48 kHz = exactly 2.0 s of samples: the duration is
+        // samples/sample_rate — a `%` reads 0.0, a `*` reads 1.9 M.
+        let tcs: Vec<Timecode> = (0..50)
+            .map(|i| {
+                increment_timecode_n(
+                    Timecode {
+                        hours: 0,
+                        minutes: 0,
+                        seconds: 0,
+                        frames: 0,
+                    },
+                    i,
+                    25.0,
+                    false,
+                )
+            })
+            .collect();
+        let sig = synthesize_ltc_signal(&tcs, 25.0, false, 48_000, 0.5);
+        let r = decode_ltc_samples(
+            &sig,
+            48_000,
+            1,
+            25.0,
+            false,
+            std::time::Instant::now(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            (r.total_audio_duration_secs - 2.0).abs() < 1e-9,
+            "got {}",
+            r.total_audio_duration_secs
+        );
+    }
+
+    #[test]
+    fn test_decode_exactly_eight_zero_crossings_proceeds_not_errors() {
+        // 9 constant runs → exactly 8 transitions: the `zc.len() < 8` gate
+        // is strict, so the ladder must run (and end in NoSyncWord on a
+        // buffer far too short for a frame); `<=`/`==` would take the
+        // "Only N zero-crossings" error path.
+        let mut sig: Vec<f32> = Vec::new();
+        for run in 0..9 {
+            let level = if run % 2 == 0 { 0.5f32 } else { -0.5 };
+            sig.extend(std::iter::repeat_n(level, 200));
+        }
+        let r = decode_ltc_samples(
+            &sig,
+            48_000,
+            1,
+            25.0,
+            false,
+            std::time::Instant::now(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(r.status, LtcDecodeStatus::NoSyncWord),
+            "exactly 8 crossings must run the ladder, got {:?}",
+            r.status
+        );
+    }
+
+    #[test]
+    fn test_zc_rescan_rescues_interfered_signal() {
+        // 30 s of clean LTC under a fast square-wave interferer (2-sample
+        // runs, amplitude above the carrier): the raw ZC stream floods to
+        // ~680k crossings, far past the 3×240-per-frame budget, and the
+        // adaptive re-scan at 4× the threshold must recover every frame.
+        // Disabling the re-scan (e*len, ==-gated, zc<1000) or mistuning the
+        // stricter threshold (÷4 keeps the floods, +4 silences everything)
+        // all fail to decode.
+        let tcs: Vec<Timecode> = (0..750)
+            .map(|i| {
+                increment_timecode_n(
+                    Timecode {
+                        hours: 0,
+                        minutes: 0,
+                        seconds: 0,
+                        frames: 0,
+                    },
+                    i,
+                    25.0,
+                    false,
+                )
+            })
+            .collect();
+        let mut sig = synthesize_ltc_signal(&tcs, 25.0, false, 48_000, 0.5);
+        add_square_interference(&mut sig, 2, 0.7);
+        let r = decode_ltc_samples(
+            &sig,
+            48_000,
+            1,
+            25.0,
+            false,
+            std::time::Instant::now(),
+            None,
+        )
+        .unwrap();
+        assert_ltc_ok(&r, 700);
+    }
+
+    #[test]
+    fn test_window_scan_recovers_late_clean_region() {
+        // 45 s: interference in [0, 30) s, clean LTC in [30, 45) s. Window
+        // 0 is all interference (0 valid), window 2 is fully clean →
+        // HighConf with clean parameters and a full-file decode from its
+        // phase. The fallback cannot rescue anything: its phases derive
+        // from the global ZC[0], an interference flip. Mutants that stop
+        // after the first window, corrupt window-local ZC offsets, or
+        // never advance `best` all converge to ~0 frames; losing the
+        // window's phase offset loses the decode.
+        let tcs: Vec<Timecode> = (0..1125)
+            .map(|i| {
+                increment_timecode_n(
+                    Timecode {
+                        hours: 0,
+                        minutes: 0,
+                        seconds: 0,
+                        frames: 0,
+                    },
+                    i,
+                    25.0,
+                    false,
+                )
+            })
+            .collect();
+        let mut sig = vec![0.0f32; 30 * 48_000];
+        sig.extend(synthesize_ltc_signal(&tcs[750..], 25.0, false, 48_000, 0.5));
+        add_square_interference(&mut sig[..30 * 48_000], 2, 0.7);
+        let r = decode_ltc_samples(
+            &sig,
+            48_000,
+            1,
+            25.0,
+            false,
+            std::time::Instant::now(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            r.valid_frames >= 300,
+            "expected ≥300 of 375 clean-region frames, got {} ({:?})",
+            r.valid_frames,
+            r.status
+        );
+    }
+
+    #[test]
+    fn test_window_scan_high_conf_at_first_window_not_skipped() {
+        // 40 s: clean LTC in [0, 25) s (62.5% of the file — below the 70%
+        // ZC-interval fast-path gate), interference in [25, 40) s. Window 0
+        // spans all the clean material and must reach HighConf immediately;
+        // a window_start `idx + stride` mutant first evaluates [15, 45) s
+        // (only ~250 decodable frames) and converges to roughly a third of
+        // the frames.
+        let tcs: Vec<Timecode> = (0..625)
+            .map(|i| {
+                increment_timecode_n(
+                    Timecode {
+                        hours: 0,
+                        minutes: 0,
+                        seconds: 0,
+                        frames: 0,
+                    },
+                    i,
+                    25.0,
+                    false,
+                )
+            })
+            .collect();
+        let mut sig = synthesize_ltc_signal(&tcs, 25.0, false, 48_000, 0.5);
+        sig.extend(vec![0.0f32; 15 * 48_000]);
+        add_square_interference(&mut sig[25 * 48_000..], 2, 0.7);
+        let r = decode_ltc_samples(
+            &sig,
+            48_000,
+            1,
+            25.0,
+            false,
+            std::time::Instant::now(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            r.valid_frames >= 450,
+            "expected ≥450 of 625 clean frames, got {} ({:?})",
+            r.valid_frames,
+            r.status
+        );
     }
 
     // ── Property tests (proptest): generative decode degradation ───────
