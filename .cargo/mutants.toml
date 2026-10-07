@@ -62,4 +62,15 @@ exclude_re = [
     # timecode invalid), so weakening the outer guard is unobservable.
     "audio-core/src/ltc_decoder\\.rs:1041:29: replace \\|\\| with && in find_first_coherent_index",
     "audio-core/src/ltc_decoder\\.rs:1094:36: replace \\|\\| with && in apply_coherent_first_timecode",
+
+    # ── 2026-10-07 peak/mono wrapper triage (triage report, item 4) ───────
+    # Log-only: the condition gates an info! line about the auto-selected
+    # channel; the decoded samples are identical either way.
+    "audio-core/src/ltc_decoder.rs:565:23: replace != with == in decode_ltc_from_wav",
+    # Running-max equivalence: `>` vs `>=` when updating the per-channel
+    # peak overwrites with an identical value at a tie — the resulting peak
+    # vector is the same.
+    "audio-core/src/ltc_decoder.rs:642:22: replace > with >= in scan_channel_peaks_hound",
+    "audio-core/src/ltc_decoder.rs:651:22: replace > with >= in scan_channel_peaks_hound",
+    "audio-core/src/wav_chunk_reader.rs:166:26: replace > with >= in WavChunkReader::scan_channel_peaks",
 ]

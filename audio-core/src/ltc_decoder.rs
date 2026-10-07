@@ -1225,6 +1225,12 @@ fn backfill_leading_frames(
     if accepted_tcs.is_empty() {
         return;
     }
+    // The walk visits predecessors newest-first; restore chronological
+    // (ascending) order before prepending them to the locked frames —
+    // every downstream consumer (integrity, coherent-start trim, quality)
+    // assumes time-ascending timecodes.
+    accepted_tcs.reverse();
+    accepted_starts.reverse();
     r.total_possible += accepted_tcs.len() as u32;
     accepted_tcs.append(&mut r.timecodes);
     for (i, ftc) in accepted_tcs.iter_mut().enumerate() {
@@ -3736,6 +3742,191 @@ mod tests {
         );
     }
 
+    // ── backfill_leading_frames (direct, ScoredResult-level) ─────────────
+    // These drive the backfill at the lowest layer with hand-built
+    // ScoredResults so the walk arithmetic is observable frame by frame.
+
+    /// A `ScoredResult` locked onto `tcs` (the frames from absolute frame
+    /// index `first_locked` onwards) of a signal with `lead` samples of
+    /// lead-in before frame 0.
+    fn scored_locked_frames(
+        tcs: &[Timecode],
+        first_locked: usize,
+        fps: f64,
+        drop_frame: bool,
+        sample_rate: u32,
+        lead: usize,
+    ) -> ScoredResult {
+        let spb = sample_rate as f64 / (fps * 80.0);
+        let timecodes: Vec<FrameTimecode> = tcs
+            .iter()
+            .enumerate()
+            .map(|(i, tc)| FrameTimecode {
+                frame_index: i as u32,
+                timecode: *tc,
+                timecode_secs: (lead as f64 + (first_locked * 80 + i * 80) as f64 * spb)
+                    / sample_rate as f64,
+            })
+            .collect();
+        ScoredResult {
+            fps,
+            drop_frame,
+            valid_frames: tcs.len() as u32,
+            total_possible: tcs.len() as u32,
+            timecodes,
+            details_entry: String::new(),
+            spb,
+            phase: lead,
+            adaptive: false,
+            frame_starts: (0..tcs.len())
+                .map(|i| (first_locked * 80 + i * 80) as i64)
+                .collect(),
+            grid_valid: tcs.len() as u32,
+        }
+    }
+
+    fn simple_tcs(n: usize) -> Vec<Timecode> {
+        (0..n)
+            .map(|i| Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_backfill_prepends_predecessor_frames() {
+        // Decoder locked onto frames 1..3 of a 4-frame signal with a 96-
+        // sample lead-in: the walk must recover frame 0 (one 80-bit step
+        // back, offset 96 + 0·24), prepend it, renumber, and grow the
+        // totals by exactly one frame.
+        let fps = 25.0;
+        let rate = 48_000u32;
+        let lead = 96usize;
+        let tcs = simple_tcs(4);
+        let mut signal = vec![0.0f32; lead];
+        signal.extend(synthesize_ltc_signal(&tcs, fps, false, rate, 0.5));
+        let mut r = scored_locked_frames(&tcs[1..], 1, fps, false, rate, lead);
+        backfill_leading_frames(&signal, &mut r, 0.01, rate);
+        assert_eq!(r.timecodes.len(), 4, "predecessor frame must be backfilled");
+        assert_eq!(r.timecodes[0].timecode, tcs[0]);
+        assert_eq!(r.frame_starts[0], 0, "frame 0 sits at bit 0");
+        assert_eq!(r.total_possible, 4);
+        assert_eq!(r.valid_frames, 4);
+        for (i, ftc) in r.timecodes.iter().enumerate() {
+            assert_eq!(ftc.frame_index, i as u32, "renumbered");
+        }
+        assert!(
+            (r.timecodes[0].timecode_secs - lead as f64 / rate as f64).abs() < 1e-9,
+            "backfilled frame's seconds must be offset/sample_rate, got {}",
+            r.timecodes[0].timecode_secs
+        );
+    }
+
+    #[test]
+    fn test_backfill_accepts_frame_at_exact_sample_zero() {
+        // No lead-in: the backfilled predecessor sits at offset_f == 0.0
+        // exactly and must still be accepted (the bound is a strict `< 0.0`
+        // break; `<=`/`==` would reject the frame at the very start).
+        let fps = 25.0;
+        let rate = 48_000u32;
+        let tcs = simple_tcs(3);
+        let signal = synthesize_ltc_signal(&tcs, fps, false, rate, 0.5);
+        let mut r = scored_locked_frames(&tcs[1..], 1, fps, false, rate, 0);
+        backfill_leading_frames(&signal, &mut r, 0.01, rate);
+        assert_eq!(r.timecodes.len(), 3, "frame at sample 0 must backfill");
+        assert_eq!(r.timecodes[0].timecode, tcs[0]);
+    }
+
+    #[test]
+    fn test_backfill_accepts_sync_at_tolerance_boundary() {
+        // Corrupt exactly two sync bits of frame 0 (bits 66 and 67 are '1'
+        // in the sync word; duplicating each bit's first half over its
+        // second half decodes them as '0'): the Hamming distance lands
+        // exactly on SYNC_MATCH_TOLERANCE and the frame must still be
+        // accepted. A `>` widened to `==`/`>=` would reject at dist 2.
+        let fps = 25.0;
+        let rate = 48_000u32;
+        let lead = 96usize;
+        let tcs = simple_tcs(4);
+        let mut signal = vec![0.0f32; lead];
+        signal.extend(synthesize_ltc_signal(&tcs, fps, false, rate, 0.5));
+        for &bit in &[66usize, 67] {
+            let half2 = lead + bit * 24 + 12;
+            let first_half: Vec<f32> = signal[half2 - 12..half2].to_vec();
+            signal[half2..half2 + 12].copy_from_slice(&first_half);
+        }
+        let mut r = scored_locked_frames(&tcs[1..], 1, fps, false, rate, lead);
+        backfill_leading_frames(&signal, &mut r, 0.01, rate);
+        assert_eq!(
+            r.timecodes.len(),
+            4,
+            "sync at exactly the tolerance must backfill"
+        );
+        assert_eq!(r.timecodes[0].timecode, tcs[0]);
+    }
+
+    #[test]
+    fn test_backfill_rejects_frame_with_wrong_timecode_value() {
+        // Zero frame 0's payload bits: the sync word stays intact but the
+        // decoded timecode is 00:00:00:00 — not the predecessor of frame 1.
+        // The value guard must reject it and never invent the frame; a
+        // hardened-true guard would prepend the junk.
+        let fps = 25.0;
+        let rate = 48_000u32;
+        let lead = 96usize;
+        let tcs = simple_tcs(4);
+        let mut signal = vec![0.0f32; lead];
+        signal.extend(synthesize_ltc_signal(&tcs, fps, false, rate, 0.5));
+        for s in signal[lead..lead + 64 * 24].iter_mut() {
+            *s = 0.0;
+        }
+        let mut r = scored_locked_frames(&tcs[1..], 1, fps, false, rate, lead);
+        backfill_leading_frames(&signal, &mut r, 0.01, rate);
+        assert_eq!(
+            r.timecodes.len(),
+            3,
+            "a frame decoding to the wrong timecode must not be invented"
+        );
+        assert_eq!(r.timecodes[0].timecode, tcs[1], "decode starts at frame 1");
+    }
+
+    #[test]
+    fn test_backfill_walks_to_signal_start_and_keeps_exact_seconds() {
+        // 8 kHz, 2 s, 50 frames, decoder locked from frame 40: the walk
+        // recovers all 40 predecessors down to the signal start. Frame 39's
+        // offset (12 576 samples) exceeds the sample rate, so a `%` instead
+        // of `/` in the seconds arithmetic would land at 0.572 s instead of
+        // 1.572 s.
+        let fps = 25.0;
+        let rate = 8_000u32;
+        let lead = 96usize;
+        let tcs: Vec<Timecode> = (0..50)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: (i / 25) as u32,
+                frames: (i % 25) as u32,
+            })
+            .collect();
+        let mut signal = vec![0.0f32; lead];
+        signal.extend(synthesize_ltc_signal(&tcs, fps, false, rate, 0.5));
+        let mut r = scored_locked_frames(&tcs[40..], 40, fps, false, rate, lead);
+        backfill_leading_frames(&signal, &mut r, 0.01, rate);
+        assert_eq!(r.timecodes.len(), 50, "all 50 frames (40 backfilled)");
+        assert_eq!(r.timecodes[0].timecode, tcs[0]);
+        let want = (lead + 39 * 320) as f64 / rate as f64;
+        assert!(
+            (r.timecodes[39].timecode_secs - want).abs() < 1e-9,
+            "frame 39 secs must be {want}, got {}",
+            r.timecodes[39].timecode_secs
+        );
+        assert_eq!(r.total_possible, 50);
+        assert_eq!(r.valid_frames, 50);
+    }
+
     #[test]
     fn test_wav_roundtrip_different_start_tc() {
         let result = verify_roundtrip(
@@ -3980,6 +4171,11 @@ mod tests {
             pick_active_channel(&[SILENT_CHANNEL_PEAK, 0.0]),
             0,
             "all-silent still falls back to channel 0"
+        );
+        assert_eq!(
+            pick_active_channel(&[0.0, SILENT_CHANNEL_PEAK]),
+            0,
+            "a channel peaking exactly at the threshold is still silent"
         );
     }
 
@@ -8436,6 +8632,394 @@ mod tests {
     fn phase_window_rounds_quarter_spb_before_clamping() {
         // 30/4 = 7.5 → rounds to 8 (banker's-unaware round-half-away).
         assert_eq!(phase_window(30.0), 8);
+    }
+
+    // ── mutant-killing boundary table (2026-10-07 survivor triage) ──────
+    // Direct low-layer tests for the conditioning / ZC / bit-extraction /
+    // frame-scan / quality survivors; see the triage follow-up report.
+
+    #[test]
+    fn test_median_filter_accepts_short_buffers() {
+        // The < 5 guard must catch every short buffer: running the loop on a
+        // 1-sample buffer would underflow `samples.len() - 2`.
+        let mut one = [0.5f32];
+        median_filter(&mut one);
+        assert_eq!(one[0], 0.5);
+        let mut four = [1.0f32, 2.0, 3.0, 4.0];
+        median_filter(&mut four);
+        assert_eq!(four, [1.0, 2.0, 3.0, 4.0], "len < 5 is untouched");
+    }
+
+    #[test]
+    fn test_robust_peak_ignores_sparse_full_scale_clicks() {
+        // 1000 samples: 993 at 0.05, 4 at 0.1, 3 clicks at 1.0 (0.3% —
+        // below the 0.5% tail). The cumulative count reaches the 995 target
+        // in the 0.1 bin with seen−target = count/2, so the interpolation
+        // midpoint lands exactly on 0.1; the clicks must not inflate it and
+        // the interpolation arithmetic must not overshoot the bin.
+        let mut samples = vec![0.05f32; 993];
+        samples.extend(std::iter::repeat_n(0.1f32, 4));
+        samples.extend(std::iter::repeat_n(1.0f32, 3));
+        let peak = robust_peak_amplitude(&samples);
+        assert!(
+            (peak - 0.1).abs() < 1e-4,
+            "99.5th percentile must be ≈0.1, got {peak}"
+        );
+    }
+
+    #[test]
+    fn test_estimate_noise_floor_scans_all_four_windows() {
+        // 40 000 samples, window size 10 000: only the third quarter is
+        // quiet. Windows must start at total·w/4 — start-arithmetic mutants
+        // collapse the windows onto loud prefixes and read 1.0.
+        let mut samples = vec![1.0f32; 40_000];
+        for s in samples[20_000..30_000].iter_mut() {
+            *s = 0.01;
+        }
+        let floor = estimate_noise_floor(&samples);
+        assert!(floor < 0.05, "must find the quiet window, got {floor}");
+    }
+
+    #[test]
+    fn test_find_zero_crossings_leading_zero_does_not_arm_polarity() {
+        // A leading zero must not arm a sign: the first crossing comes from
+        // the first decisive sample transition, not from index 1.
+        let s = 0.5f32;
+        let samples = [0.0, -s, s, -s, s, -s, s, -s];
+        let zc = find_zero_crossings(&samples, 0.1);
+        assert_eq!(zc, vec![2, 3, 4, 5, 6, 7], "got {zc:?}");
+    }
+
+    #[test]
+    fn test_find_zero_crossings_sustained_zero_run_is_not_a_crossing() {
+        // Ten zero samples between polarities: zeros inherit the consumed
+        // sign (no crossing); a `s <= 0.0` sign mutant would treat the run
+        // as a sustained negative excursion and emit a phantom crossing at
+        // its start.
+        let mut samples = vec![0.5f32];
+        samples.extend(std::iter::repeat_n(0.0f32, 10));
+        samples.extend(vec![-0.5, 0.5, -0.5]);
+        let zc = find_zero_crossings(&samples, 0.1);
+        assert_eq!(zc, vec![11, 12, 13], "got {zc:?}");
+    }
+
+    #[test]
+    fn test_decode_bits_from_zc_two_crossings_yields_bits() {
+        // Exactly 2 crossings: the strict `< 2` guard lets the single
+        // interval decode (synthetic path → two 1 bits + trailing zeros);
+        // `<=`/`==` would return an empty bitstream.
+        let bits = decode_bits_from_zero_crossings(&[0, 24], 48_000, 25.0, 100);
+        assert!(!bits.is_empty(), "one interval must decode, got {bits:?}");
+        assert_eq!(&bits[..2], &[1, 1]);
+    }
+
+    #[test]
+    fn test_decode_bits_from_zc_all_short_intervals_use_real_path() {
+        // Every interval short (half-spb gaps): short_ratio == 1.0 → the
+        // real-SMPTE path must run. Differential oracle: the output must
+        // equal decode_bits_real_zc on the same array — a `ratio % total`
+        // mutant would read 0 and take the synthetic path.
+        let zc: Vec<usize> = (0..21).map(|i| i * 12).collect();
+        let got = decode_bits_from_zero_crossings(&zc, 48_000, 25.0, 300);
+        let want = decode_bits_real_zc(&zc, 24.0);
+        assert_eq!(
+            got.len(),
+            want.len() + ((300 - zc.last().unwrap()) as f64 / 24.0).ceil() as usize
+        );
+        assert_eq!(&got[..want.len()], &want[..], "must use the real-ZC path");
+    }
+
+    #[test]
+    fn test_decode_bits_from_zc_rare_short_intervals_use_synthetic_path() {
+        // One short interval among 20 (ratio 0.05 < 0.10): the synthetic
+        // path must run; `short*total` would read 20 and flip to the real
+        // path. Differential oracle against decode_bits_synthetic_zc.
+        let mut zc: Vec<usize> = vec![0, 12];
+        let mut pos = 24usize;
+        for _ in 0..19 {
+            zc.push(pos);
+            pos += 24;
+        }
+        let got = decode_bits_from_zero_crossings(&zc, 48_000, 25.0, 600);
+        let want = decode_bits_synthetic_zc(&zc, 24.0);
+        assert_eq!(&got[..want.len()], &want[..], "must use the synthetic path");
+    }
+
+    #[test]
+    fn test_decode_bits_from_zc_ratio_exactly_at_threshold_is_synthetic() {
+        // One short interval of ten → ratio 0.10: the classification gate is
+        // a strict `>`, so the synthetic path runs; `>=` would flip to real.
+        let mut zc: Vec<usize> = vec![0, 12];
+        let mut pos = 36usize;
+        for _ in 0..9 {
+            zc.push(pos);
+            pos += 24;
+        }
+        let got = decode_bits_from_zero_crossings(&zc, 48_000, 25.0, 400);
+        let want = decode_bits_synthetic_zc(&zc, 24.0);
+        assert_eq!(&got[..want.len()], &want[..], "ratio 0.10 is synthetic");
+    }
+
+    #[test]
+    fn test_decode_bits_from_zc_interval_exactly_short_threshold() {
+        // One interval of exactly 0.75·spb (18 samples @ spb 24): the short
+        // test is a strict `<`, so the interval is long → synthetic path;
+        // `<=` would count it short (ratio 1/9 > 0.10) and go real.
+        let mut zc: Vec<usize> = vec![0, 18];
+        let mut pos = 42usize;
+        for _ in 0..8 {
+            zc.push(pos);
+            pos += 24;
+        }
+        let got = decode_bits_from_zero_crossings(&zc, 48_000, 25.0, 400);
+        let want = decode_bits_synthetic_zc(&zc, 24.0);
+        assert_eq!(&got[..want.len()], &want[..], "18-sample interval is long");
+    }
+
+    #[test]
+    fn test_extract_bits_stops_before_tail_overrun() {
+        // spb 4, len 4k+3: the last extractable bit needs pos + 0.75·spb
+        // strictly inside the buffer. A `<=` would extract at pos 8 and read
+        // p75 = 11 past the end (median_sample underflow).
+        let samples = vec![
+            0.5f32, 0.5, -0.5, -0.5, //
+            0.5, 0.5, -0.5, -0.5, //
+            0.5,
+        ];
+        let bits = extract_bits(&samples, 4.0, 0, 0.1, None);
+        assert_eq!(bits, vec![1, 1], "tail bit must not be extracted");
+    }
+
+    #[test]
+    fn test_extract_bits_honors_cancel_from_start() {
+        let samples = vec![0.5f32; 1000];
+        let cancel = AtomicBool::new(true);
+        let bits = extract_bits(&samples, 4.0, 0, 0.1, Some(&cancel));
+        assert!(
+            bits.is_empty(),
+            "pre-cancelled extraction must return empty"
+        );
+    }
+
+    #[test]
+    fn test_extract_bits_adaptive_stops_before_tail_overrun() {
+        let samples = vec![
+            0.5f32, 0.5, -0.5, -0.5, //
+            0.5, 0.5, -0.5, -0.5, //
+            0.5,
+        ];
+        let bits = extract_bits_adaptive(&samples, 4.0, 0, 0.1, &[], None);
+        assert_eq!(bits, vec![1, 1], "tail bit must not be extracted");
+    }
+
+    #[test]
+    fn test_extract_bits_adaptive_honors_cancel_from_start() {
+        let samples = vec![0.5f32; 1000];
+        let cancel = AtomicBool::new(true);
+        let bits = extract_bits_adaptive(&samples, 4.0, 0, 0.1, &[], Some(&cancel));
+        assert!(
+            bits.is_empty(),
+            "pre-cancelled extraction must return empty"
+        );
+    }
+
+    fn frame_bits(tc: &Timecode, drop_frame: bool) -> Vec<u8> {
+        crate::get_ltc_bits(tc, drop_frame).to_vec()
+    }
+
+    #[test]
+    fn test_find_frames_total_possible_excludes_leading_garbage() {
+        // 40 junk bits + two frames: sync words sit at 104/184, alignment 40
+        // → total_possible = (200-40)/80 = 2; an alignment `+` mutant reads
+        // 3. The junk must not contain an accidental sync (all-ones is ≥ 3
+        // mismatches away everywhere it touches the payload boundary).
+        let mut bits = vec![1u8; 40];
+        bits.extend(frame_bits(
+            &Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            false,
+        ));
+        bits.extend(frame_bits(
+            &Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: 1,
+            },
+            false,
+        ));
+        let scan = find_frames(&bits, 25.0, false);
+        assert_eq!(scan.total_possible, 2);
+        assert_eq!(scan.valid_frames, 2, "both frames must be accepted");
+        assert_eq!(scan.frame_starts, vec![40, 120]);
+    }
+
+    #[test]
+    fn test_flush_chain_run_accepts_exactly_five_member_run() {
+        // Five consecutive sync words at 80-bit spacing with a consecutive
+        // TC pair: the ≥5-member gate is a strict `<`, so the run must be
+        // accepted; `<=` would reject the minimum qualifying run.
+        let tcs: Vec<Timecode> = (0..5)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect();
+        let mut bits = Vec::new();
+        for tc in &tcs {
+            bits.extend(frame_bits(tc, false));
+        }
+        let run: Vec<usize> = (0..5).map(|i| 64 + i * 80).collect();
+        let starts = flush_chain_run(&run, &bits, 25.0, false);
+        assert_eq!(starts, vec![0, 80, 160, 240, 320]);
+    }
+
+    #[test]
+    fn test_dedupe_near_duplicates_keeps_exactly_40_bit_gap() {
+        // The cluster radius is a strict `< 40`: starts exactly 40 bits
+        // apart are distinct frames and must all survive; `<=` would drop
+        // the middle one.
+        assert_eq!(dedupe_near_duplicates(vec![0, 40, 80]), vec![0, 40, 80]);
+    }
+
+    #[test]
+    fn test_score_candidate_accepts_exactly_80_bits() {
+        // spb 4 over a 320-sample buffer yields exactly 80 bits: the
+        // TooShort gate is a strict `< 80`, so the candidate must be scored
+        // (all-zero bits → no frames → NoBeat); `<=` would call it TooShort.
+        let ctx = DecodeCtx {
+            samples: &vec![0.5f32; 320],
+            zc: &[],
+            sample_rate: 48_000,
+            threshold: 0.1,
+            fps: 25.0,
+            drop_frame: false,
+            cancel: None,
+        };
+        let outcome = score_candidate(&ctx, 4.0, 0, false, 0);
+        assert!(
+            matches!(outcome, ScoredCandidate::NoBeat),
+            "exactly 80 bits must be scored, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_analyze_glitches_short_segment_interior_checked() {
+        // A 3-frame segment has exactly one interior frame: the len gate is
+        // a strict `< 3`, so the glitch in it must count; `<=`/`==` would
+        // skip the whole segment.
+        let ltc = vec![0.0, 0.14, 0.08];
+        let stats = analyze_glitches(&ltc, &[0..3], 25.0);
+        assert_eq!(stats.glitch_count, 1, "interior glitch must count");
+        assert_eq!(stats.glitch_indices, vec![1]);
+    }
+
+    #[test]
+    fn test_analyze_glitches_clean_segment_has_no_glitches() {
+        // expected = (prev + next)/2 on aligned frames: a `+`→`-` mutant
+        // reads ≈0 and flags every interior frame.
+        let ltc: Vec<f64> = (0..6).map(|i| i as f64 * 0.04).collect();
+        let stats = analyze_glitches(&ltc, &[0..6], 25.0);
+        assert_eq!(
+            stats.glitch_count, 0,
+            "clean segment, got {:?}",
+            stats.glitch_indices
+        );
+    }
+
+    #[test]
+    fn test_analyze_glitches_deviation_exactly_at_threshold_is_clean() {
+        // fps 32 makes everything dyadic: deviation exactly 1.5 frames
+        // (0.046875 s) sits ON the threshold — the strict `>` must not flag
+        // it; `>=` would.
+        let ltc = vec![0.0, 0.09375, 0.09375];
+        let stats = analyze_glitches(&ltc, &[0..3], 32.0);
+        assert_eq!(stats.glitch_count, 0, "deviation == threshold is clean");
+    }
+
+    #[test]
+    fn test_quality_score_glitch_ramp_interior_is_linear() {
+        // Inside the ramp (0.001, 0.01], the penalty is 0.15·(ratio−0.001)/0.009:
+        // at 0.0055 exactly 0.075. `ratio+0.001` reads 0.1083.
+        let clean = quality_score(1.0, 0, 0.0, 0.0055, 0.0, 0.0);
+        assert!((clean - 0.925).abs() < 1e-9, "got {clean}");
+        // Missing-frame ramp: 0.15·ratio/0.5 → at 0.1 exactly 0.03.
+        let missing = quality_score(1.0, 0, 0.0, 0.0, 0.0, 0.1);
+        assert!((missing - 0.97).abs() < 1e-9, "got {missing}");
+    }
+
+    #[test]
+    fn test_compute_ltc_quality_backward_jump_and_drift_oracle() {
+        // 120 frames, two 60-frame segments: audio advances 0.0402 s/frame
+        // (0.0002 s/frame of clock drift) while the TC value jumps backwards
+        // at the segment boundary. Oracle: usable coverage 1.0 (both blocks
+        // ≤ 0.5 frames of accumulated drift), one forward-classified edit
+        // plus one backward jump → score = 1 − 0.02 − 0.30·0.5 = 0.83, and
+        // max_drift_secs = 0.295/25. `ratio % n` and `frames % fps` mutants
+        // produce wildly different numbers; a flipped drift sign makes the
+        // first block unusable (score 0.33).
+        let n = 120usize;
+        let mut tcs: Vec<FrameTimecode> = Vec::with_capacity(n);
+        for i in 0..n {
+            let tc = if i < 60 {
+                increment_timecode_n(
+                    Timecode {
+                        hours: 1,
+                        minutes: 0,
+                        seconds: 0,
+                        frames: 0,
+                    },
+                    i,
+                    25.0,
+                    false,
+                )
+            } else {
+                increment_timecode_n(
+                    Timecode {
+                        hours: 0,
+                        minutes: 0,
+                        seconds: 0,
+                        frames: 0,
+                    },
+                    i - 60,
+                    25.0,
+                    false,
+                )
+            };
+            tcs.push(FrameTimecode {
+                frame_index: i as u32,
+                timecode: tc,
+                timecode_secs: i as f64 * 0.0402,
+            });
+        }
+        let result = decode_result_with_timecodes(tcs, 25.0);
+        let report = compute_ltc_quality(&result).expect("quality report");
+        assert!((report.score - 0.83).abs() < 1e-6, "score {}", report.score);
+        assert_eq!(report.backward_jump_count, 1);
+        assert_eq!(report.edit_count, 1);
+        assert!(
+            (report.usable_coverage - 1.0).abs() < 1e-9,
+            "coverage {}",
+            report.usable_coverage
+        );
+        assert!(
+            (report.max_drift_secs - 0.295 / 25.0).abs() < 1e-6,
+            "max_drift_secs {}",
+            report.max_drift_secs
+        );
+        assert_eq!(report.largest_block, 60);
+    }
+
+    fn increment_timecode_n(start: Timecode, n: usize, fps: f64, drop_frame: bool) -> Timecode {
+        (0..n).fold(start, |acc, _| {
+            crate::increment_timecode(&acc, fps, drop_frame)
+        })
     }
 
     // ── Property tests (proptest): generative decode degradation ───────

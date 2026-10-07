@@ -460,6 +460,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_read_mono_samples_f32_float_stereo_extracts_exact_frames() {
+        // Float-format stereo, channel 1, with values whose four IEEE bytes
+        // are pairwise distinct (0.82 = 0x3F51EB85, −0.19 = 0xBEC28F5C):
+        // byte-offset arithmetic mutants that re-read an earlier byte cannot
+        // reproduce the values.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mono_float_stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        let mut ch1_values = Vec::new();
+        for i in 0..10 {
+            let v = if i % 2 == 0 { 0.82f32 } else { -0.19f32 };
+            ch1_values.push(v);
+            writer.write_sample(0.25f32).unwrap();
+            writer.write_sample(v).unwrap();
+        }
+        writer.finalize().unwrap();
+        let (mut reader, _start) = WavChunkReader::open_with_channel(&path, 1).unwrap();
+        let read = reader.read_mono_samples_f32(0, 10).unwrap();
+        assert_eq!(read.len(), 10);
+        for (i, v) in ch1_values.iter().enumerate() {
+            assert!(
+                (read[i] - *v).abs() < 1e-6,
+                "frame {i}: expected {v}, got {}",
+                read[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_mono_samples_i16_stereo_extracts_requested_channel() {
+        // i16 stereo, channel 1: the stride filter must pick ch1 frames.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut samples: Vec<i32> = Vec::new();
+        let mut ch1_values = Vec::new();
+        for i in 0..10 {
+            let v = -5000 + i as i32;
+            ch1_values.push(v);
+            samples.push(1000 * (i as i32) + 7);
+            samples.push(v);
+        }
+        let path = write_test_wav_int(&dir, "i16_stereo_ch1.wav", 2, 48_000, 16, &samples);
+        let (mut reader, _start) = WavChunkReader::open_with_channel(&path, 1).unwrap();
+        let read = reader.read_mono_samples_i16(0, 10).unwrap();
+        assert_eq!(read.len(), 10);
+        for (i, v) in ch1_values.iter().enumerate() {
+            assert_eq!(read[i], *v as i16, "frame {i}");
+        }
+    }
+
     // ── WavChunkReader 24-bit sign extension ──────────────────────────────
 
     #[test]
