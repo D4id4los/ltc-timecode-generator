@@ -31,3 +31,6 @@ plans/
 
 # Maintainer-local deploy commands (never commit)
 /command_list.org
+
+# Local copies of copyrighted SMPTE/IEC standards (never commit; see reports/ digest)
+standards/

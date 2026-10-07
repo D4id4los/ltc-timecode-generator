@@ -560,8 +560,14 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let sample_rate = cli.sample_rate.unwrap_or(48000);
     let total_frames = (duration_secs * fps).ceil() as u64;
-    let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
-    let samples_per_bit = samples_per_frame as f32 / 80.0;
+    // Drift-free frame timing (mirrors the live scheduler in audio-core):
+    // the per-frame sample count is tracked through a fractional-sample
+    // accumulator so renders at fractional fps land on the exact wall-clock
+    // sample count instead of drifting (29.97 fps @ 48 kHz: +120 samples/10 s
+    // with naive rounding).
+    let exact_samples_per_frame = sample_rate as f64 / fps;
+    let base_samples = exact_samples_per_frame.floor() as usize;
+    let mut samples_accumulator = 0.0_f64;
 
     let num_channels = 2;
 
@@ -588,7 +594,7 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tc = start_tc;
     let mut last_level = (1.0f32, 1.0f32);
-    let mut frame_buf = vec![0.0f32; samples_per_frame * 2];
+    let mut frame_buf = vec![0.0f32; (base_samples + 1) * 2];
 
     let report_interval = if total_frames > 100 {
         total_frames / 100
@@ -597,6 +603,12 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     for frame_num in 0..total_frames {
+        let (samples_per_frame, samples_per_bit, new_acc) = audio_core::compute_frame_sample_count(
+            exact_samples_per_frame,
+            base_samples,
+            samples_accumulator,
+        );
+        samples_accumulator = new_acc;
         frame_buf.fill(0.0);
         generate_ltc_frame_stereo(
             audio_core::ltc_encoder::LtcFrameParams {

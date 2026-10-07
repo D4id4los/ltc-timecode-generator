@@ -91,6 +91,130 @@ fn generate_test_wav(path: &Path) {
     process_cli_result(cli).expect("WAV generation dispatch failed");
 }
 
+/// Mono samples the render's transmission lead-in contributes at the given
+/// base frame size. Zero until the lead-in lands (WP-EN Step 3); the drift
+/// assertions route through this so the one-const change keeps them green.
+fn expected_lead_in_samples(_base_samples: usize) -> usize {
+    0
+}
+
+/// Render + hound readback: total mono sample count.
+fn render_mono_sample_count(cli: Cli) -> usize {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("drift.wav");
+    let cli = {
+        let mut c = cli;
+        c.output_to_file = Some(path.to_string_lossy().to_string());
+        c
+    };
+    process_cli_result(cli).expect("render dispatch should succeed");
+    let mut reader = hound::WavReader::open(&path).expect("valid WAV");
+    let ch = reader.spec().channels as usize;
+    reader.samples::<i16>().count() / ch
+}
+
+fn render_decode_all_timecodes(
+    path: &Path,
+    fps: f64,
+    drop_frame: bool,
+) -> Vec<gui_engine::Timecode> {
+    let result = gui_engine::decode_ltc_from_wav(path, fps, drop_frame, None)
+        .expect("decode of generated render must succeed");
+    result.timecodes.iter().map(|f| f.timecode).collect()
+}
+
+fn tc_frame_number(tc: &gui_engine::Timecode, fps: f64) -> u64 {
+    let mpf = fps.ceil() as u64;
+    (tc.hours as u64 * 3600 + tc.minutes as u64 * 60 + tc.seconds as u64) * mpf + tc.frames as u64
+}
+
+// ── render drift (WP-EN item 1) ──────────────────────────────────────────
+
+#[test]
+fn render_total_samples_drift_free_2997_48k() {
+    init_test_config();
+    let fps = 29.97f64;
+    let rate = 48000u32;
+    let frames = (10.0 * fps).ceil() as usize; // 300
+    let exact_spf = rate as f64 / fps;
+    let base = exact_spf.floor() as usize;
+
+    let cli = cli_with(|c| {
+        c.fps = fps;
+        c.sample_rate = Some(rate);
+        c.duration = Some(10.0);
+    });
+    let actual = render_mono_sample_count(cli);
+
+    let expected =
+        (frames as f64 * exact_spf).round() as i64 + expected_lead_in_samples(base) as i64;
+    let drift = actual as i64 - expected;
+    assert!(
+        drift.abs() <= 2,
+        "29.97 fps @ 48 kHz render must be drift-free: expected ≈{expected} samples, got {actual} (drift {drift})"
+    );
+}
+
+#[test]
+fn render_total_samples_drift_free_24fps_441k() {
+    init_test_config();
+    let fps = 24.0f64;
+    let rate = 44100u32;
+    let frames = (10.0 * fps).ceil() as usize; // 240
+    let exact_spf = rate as f64 / fps; // 1837.5
+    let base = exact_spf.floor() as usize;
+
+    let cli = cli_with(|c| {
+        c.fps = fps;
+        c.sample_rate = Some(rate);
+        c.duration = Some(10.0);
+    });
+    let actual = render_mono_sample_count(cli);
+
+    let expected =
+        (frames as f64 * exact_spf).round() as i64 + expected_lead_in_samples(base) as i64;
+    let drift = actual as i64 - expected;
+    assert!(
+        drift.abs() <= 2,
+        "24 fps @ 44.1 kHz render must be drift-free: expected ≈{expected} samples, got {actual} (drift {drift})"
+    );
+}
+
+#[test]
+fn render_2997_decodes_continuous() {
+    init_test_config();
+    let fps = 29.97f64;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("cont2997.wav");
+
+    let cli = cli_with(|c| {
+        c.output_to_file = Some(path.to_string_lossy().to_string());
+        c.fps = fps;
+        c.sample_rate = Some(48000);
+        c.duration = Some(10.0);
+        c.start_timecode = "01:00:00:00".to_string();
+    });
+    process_cli_result(cli).expect("render dispatch should succeed");
+
+    let decoded = render_decode_all_timecodes(&path, fps, false);
+    assert_eq!(decoded.len(), 300, "every rendered frame must decode");
+    assert_eq!(
+        decoded[0],
+        gui_engine::Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 0
+        },
+        "first decoded frame must be the start TC"
+    );
+    for i in 1..decoded.len() {
+        let prev = tc_frame_number(&decoded[i - 1], fps);
+        let cur = tc_frame_number(&decoded[i], fps);
+        assert_eq!(cur, prev + 1, "frame {i} must be the strict +1 successor");
+    }
+}
+
 // ── output-to-file dispatch ──────────────────────────────────────────────
 
 #[test]

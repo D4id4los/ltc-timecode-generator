@@ -31,7 +31,9 @@ pub use wav_chunk_reader::WavChunkReader;
 
 // ── LTC encoder ───────────────────────────────────────────────────────────
 
-pub use ltc_encoder::{generate_ltc_frame_stereo, get_ltc_bits, increment_timecode};
+pub use ltc_encoder::{
+    compute_frame_sample_count, generate_ltc_frame_stereo, get_ltc_bits, increment_timecode,
+};
 
 // ── Audio output ──────────────────────────────────────────────────────────
 
