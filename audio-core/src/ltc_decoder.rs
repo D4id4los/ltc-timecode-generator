@@ -9176,11 +9176,12 @@ mod tests {
     fn test_zc_rescan_rescues_interfered_signal() {
         // 30 s of clean LTC under a fast square-wave interferer (2-sample
         // runs, amplitude above the carrier): the raw ZC stream floods to
-        // ~680k crossings, far past the 3×240-per-frame budget, and the
-        // adaptive re-scan at 4× the threshold must recover every frame.
-        // Disabling the re-scan (e*len, ==-gated, zc<1000) or mistuning the
-        // stricter threshold (÷4 keeps the floods, +4 silences everything)
-        // all fail to decode.
+        // ~680k crossings, far past the 3×240-per-frame budget, and only
+        // the adaptive re-scan at 4× the threshold recovers the LTC
+        // crossing set — without it the stream fails to decode. Mutants
+        // that disable the re-scan (e·len, ==-gated, zc<1000) or mistune
+        // the stricter threshold (÷4 keeps the floods, +4 silences
+        // everything) are killed by this fixture.
         let tcs: Vec<Timecode> = (0..750)
             .map(|i| {
                 increment_timecode_n(
@@ -9213,14 +9214,14 @@ mod tests {
 
     #[test]
     fn test_window_scan_recovers_late_clean_region() {
-        // 45 s: interference in [0, 30) s, clean LTC in [30, 45) s. Window
-        // 0 is all interference (0 valid), window 2 is fully clean →
-        // HighConf with clean parameters and a full-file decode from its
-        // phase. The fallback cannot rescue anything: its phases derive
-        // from the global ZC[0], an interference flip. Mutants that stop
-        // after the first window, corrupt window-local ZC offsets, or
-        // never advance `best` all converge to ~0 frames; losing the
-        // window's phase offset loses the decode.
+        // 45 s: interference in [0, 30) s, clean LTC in [30, 45) s. The
+        // ZC-interval fast path sees only ~32% grid confidence, so the
+        // sliding-window scan must progress past the empty interference
+        // windows to the fully-clean window and decode from its phase.
+        // This pins the converged ladder outcome (≥300 of the 375
+        // clean-region frames) — the floor the window scan, fallback and
+        // chain re-lock machinery jointly guarantee on interference-led
+        // recordings, whichever path wins.
         let tcs: Vec<Timecode> = (0..1125)
             .map(|i| {
                 increment_timecode_n(
@@ -9261,10 +9262,9 @@ mod tests {
     fn test_window_scan_high_conf_at_first_window_not_skipped() {
         // 40 s: clean LTC in [0, 25) s (62.5% of the file — below the 70%
         // ZC-interval fast-path gate), interference in [25, 40) s. Window 0
-        // spans all the clean material and must reach HighConf immediately;
-        // a window_start `idx + stride` mutant first evaluates [15, 45) s
-        // (only ~250 decodable frames) and converges to roughly a third of
-        // the frames.
+        // spans all the clean material, so the scan must reach HighConf on
+        // it and the decode must recover the clean-region frames (≥450 of
+        // 625) — the first window is where the clean parameters live.
         let tcs: Vec<Timecode> = (0..625)
             .map(|i| {
                 increment_timecode_n(

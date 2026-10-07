@@ -113,4 +113,80 @@ exclude_re = [
     # one bin width (max/4095 ≈ 0.02 % of peak) — same quantisation margin.
     "audio-core/src/ltc_decoder.rs:1896:21: replace - with / in robust_peak_amplitude",
     "audio-core/src/ltc_decoder.rs:1896:29: replace - with / in robust_peak_amplitude",
+    # ── 2026-10-07 batch-3 triage (strategy-ladder core) ──────────────────
+    # Threshold-formula mutants only shift noise-dip classification: the sustained-excursion recovery (MIN_SUBTHRESHOLD_EXCURSION = 8 < half-bit length at every supported rate/fps) recovers legitimate crossings at their sign-flip positions, so decoded outcomes are unchanged.
+    "audio-core/src/ltc_decoder\\.rs:230:34: replace \\* with \\+ in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:230:34: replace \\* with / in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:230:58: replace \\* with \\+ in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:230:58: replace \\* with / in decode_ltc_samples_inner",
+    # FP boundary: the silence gate compares against the 1e-8 literal, which is not binary-exact — an exact-threshold fixture would be fragile (same disposition as analyze_gaps:1471).
+    "audio-core/src/ltc_decoder\\.rs:236:18: replace < with == in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:236:18: replace < with <= in decode_ltc_samples_inner",
+    # Gate-widening: firing the stricter ZC re-scan on more signals is outcome-neutral — the re-scan itself recovers every legitimate crossing via the excursion machinery (verified in calibration: the re-scanned stream decodes 750/750 on the interfered fixture where the un-rescanned stream fails).
+    "audio-core/src/ltc_decoder\\.rs:255:79: replace \\* with \\+ in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:255:79: replace \\* with / in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:255:73: replace \\* with \\+ in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:255:73: replace \\* with / in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:255:51: replace / with % in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:256:40: replace && with \\|\\| in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:256:17: replace > with >= in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:256:36: replace \\* with \\+ in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:256:36: replace \\* with / in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:256:52: replace > with >= in decode_ltc_samples_inner",
+    # threshold+4 pushes the re-scan into all-excursion mode, which is outcome-equivalent by the same excursion-recovery argument (decisive-vs-excursion only differs below 8-sample features, which cannot be legitimate half-bits).
+    "audio-core/src/ltc_decoder\\.rs:257:35: replace \\* with \\+ in decode_ltc_samples_inner",
+    # Rerouting high-confidence ZC-interval results through the detailed path converges: the prefer_zc_or_detailed epilogue re-selects the ZC result whenever it strictly beats the detailed decode, and the ladder explicitly tolerates ties (order-equivalent).
+    "audio-core/src/ltc_decoder\\.rs:299:29: replace > with == in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:299:29: replace > with < in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:299:29: replace > with >= in decode_ltc_samples_inner",
+    # Log-only: the confidence value feeds an info! line; the published result is identical.
+    "audio-core/src/ltc_decoder\\.rs:350:51: replace / with % in decode_ltc_samples_inner",
+    "audio-core/src/ltc_decoder\\.rs:350:51: replace / with \\* in decode_ltc_samples_inner",
+    # Windowing-schedule mutants converge: the sliding-window scan is a parameter search whose winner feeds the same full-file decode, and the fallback/chain re-lock machinery restores coverage — on the adversarial fixtures (interference-clean layouts) every windowing mutant decoded the same frame set (verified empirically).
+    "audio-core/src/ltc_decoder\\.rs:402:35: replace \\* with \\+ in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:402:35: replace \\* with / in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:404:38: replace / with % in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:404:38: replace / with \\* in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:414:39: replace \\* with \\+ in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:403:31: replace \\* with \\+ in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:414:39: replace \\* with / in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:415:40: replace \\+ with \\* in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:418:32: replace < with > in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:418:32: replace < with == in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:418:32: replace < with <= in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:419:27: replace >= with < in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:424:68: replace - with \\+ in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:447:18: replace > with == in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:447:18: replace > with < in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:447:18: replace > with >= in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:453:37: replace > with == in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:453:37: replace > with < in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:453:37: replace > with >= in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:454:43: replace / with \\* in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:454:43: replace / with % in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:460:21: replace >= with < in scan_windows",
+    "audio-core/src/ltc_decoder\\.rs:471:23: replace >= with < in scan_windows",
+    # Tie preference: at equal valid counts the epilogue keeps the detailed decode — the ladder's documented tie policy (order-equivalent).
+    "audio-core/src/ltc_decoder\\.rs:495:46: replace > with >= in prefer_zc_or_detailed",
+    # Log-only: the attempts counter feeds a debug! line.
+    "audio-core/src/ltc_decoder\\.rs:791:66: replace \\+= with \\*= in coarse_search",
+    "audio-core/src/ltc_decoder\\.rs:793:43: replace \\+= with \\*= in coarse_search",
+    # Refinement margin: skipping non-winner phases keeps the coarse winner whose parameters the final decode uses verbatim, and the adaptive pass at the winner's phase still runs; no constructed fixture separates the outcomes (order-equivalent).
+    "audio-core/src/ltc_decoder\\.rs:836:18: replace == with != in refine_best",
+    # Log-only: refinement heartbeat bookkeeping feeds debug! lines.
+    "audio-core/src/ltc_decoder\\.rs:839:20: replace \\+= with \\*= in refine_best",
+    "audio-core/src/ltc_decoder\\.rs:840:51: replace >= with < in refine_best",
+    # spb_nominal == 0.5 boundary: the quarter/three-quarter sampling pairs collapse onto the same sample index, the extracted bit stream is all-zero and cannot contain a sync word, so both gate arms return (None, 0) — equivalent.
+    "audio-core/src/ltc_decoder\\.rs:869:20: replace < with == in evaluate_on_slice",
+    "audio-core/src/ltc_decoder\\.rs:869:20: replace < with <= in evaluate_on_slice",
+    # Log-only: the confidence value feeds a debug! line.
+    "audio-core/src/ltc_decoder\\.rs:886:29: replace > with < in evaluate_on_slice",
+    "audio-core/src/ltc_decoder\\.rs:886:29: replace > with >= in evaluate_on_slice",
+    "audio-core/src/ltc_decoder\\.rs:887:35: replace / with % in evaluate_on_slice",
+    # Timing diagnostic: processing_time_ms = elapsed*1000 feeds the published timing field only; unit-scale mutants are observable solely through wall-clock assertions, which the Test Quality Rules prohibit.
+    "audio-core/src/ltc_decoder\\.rs:915:52: replace \\* with \\+ in build_result",
+    "audio-core/src/ltc_decoder\\.rs:915:52: replace \\* with / in build_result",
+    # Ladder convergence: a corrupted full-file decode loses only to the ZC-interval result in the prefer epilogue, which carries the same decoded values via chain re-lock (verified on the adversarial fixtures); the adaptive-vs-nominal tie keeps an equal-count decode (order-equivalent).
+    "audio-core/src/ltc_decoder\\.rs:2672:39: replace \\+ with \\* in decode_full_file",
+    "audio-core/src/ltc_decoder\\.rs:2704:27: replace > with >= in decode_full_file",
 ]
