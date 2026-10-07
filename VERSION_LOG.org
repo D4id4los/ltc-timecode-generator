@@ -1,7 +1,6 @@
 #+TITLE: Version History for LTC Timecode Generator
 
-
-* Unreleased
+* v0.5.4
 
 Main features are LTC encoder robustness (WP-EN): drift-free file renders at
 fractional frame rates, calibrated output levels with dBFS presets, and a
@@ -27,6 +26,10 @@ List of Changes:
   frames decode starting at the start TC (libltc head loss likewise fixed;
   its documented tail loss is unaffected). The preamble carries no codeword
   and cannot pollute trim-to-first-LTC flows.
+- CI/Testing: mutant-run hardening (sharded OOM-safe cargo-mutants runs,
+  weekly CI audit), clippy 1.96 lint fixes under the -D warnings gate,
+  MSRV/advisory checks, and a unit-test backfill recovering the Sonar
+  new-code coverage gate.
 
 * v0.5.3
 
