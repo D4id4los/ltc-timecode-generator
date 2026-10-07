@@ -55,4 +55,11 @@ exclude_re = [
     # guard above), and 0.0 fails both confidence branches — the widened
     # `>=` takes the same NoSyncWord path.
     "audio-core/src/chunked_decode.rs:489:34: replace > with >= in merge_results",
+    # ── 2026-10-07 coherent-start triage (triage report, item 2) ──────────
+    # Guard parity: both disjuncts are re-guarded inside
+    # find_first_coherent_index itself (empty → None via the len < min_run
+    # gate with min_run ≥ 1; fps ≤ 0 → None via max_frames = 0 making every
+    # timecode invalid), so weakening the outer guard is unobservable.
+    "audio-core/src/ltc_decoder.rs:1041:29: replace || with && in find_first_coherent_index",
+    "audio-core/src/ltc_decoder.rs:1094:36: replace || with && in apply_coherent_first_timecode",
 ]

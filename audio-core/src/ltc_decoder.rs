@@ -3970,6 +3970,151 @@ mod tests {
         assert_eq!(pick_active_channel(&[1e-9]), 0);
     }
 
+    #[test]
+    fn test_pick_active_channel_peak_exactly_at_silence_threshold_is_silent() {
+        // A channel peaking at exactly SILENT_CHANNEL_PEAK (1 LSB of dither
+        // at 16-bit) still counts as silent — sub-LSB dither must not hijack
+        // channel selection away from a channel carrying signal.
+        assert_eq!(pick_active_channel(&[SILENT_CHANNEL_PEAK, 0.5]), 1);
+        assert_eq!(
+            pick_active_channel(&[SILENT_CHANNEL_PEAK, 0.0]),
+            0,
+            "all-silent still falls back to channel 0"
+        );
+    }
+
+    // ── scan_channel_peaks_hound / read_mono_samples (peak & mono wrappers) ──
+    // WAV fixtures written in-test with hound, asserting exact per-channel
+    // peaks and extracted mono values.
+
+    fn write_hound_int_wav(path: &Path, channels: u16, samples: &[i32]) -> hound::WavSpec {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+        spec
+    }
+
+    fn write_hound_float_wav(path: &Path, channels: u16, samples: &[f32]) -> hound::WavSpec {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+        spec
+    }
+
+    #[test]
+    fn test_scan_channel_peaks_hound_int_full_scale_negative_spike() {
+        // ch0: quiet 100-LSB noise plus one full-scale negative sample —
+        // its |−32768/32768| must register as the channel peak (1.0); ch1:
+        // constant 12345. Pins the exact int-branch peak arithmetic.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("peaks_int_spike.wav");
+        let mut samples: Vec<i32> = Vec::new();
+        for i in 0..64 {
+            let ch0 = if i == 32 {
+                -32768
+            } else {
+                ((i * 37) % 100) - 50
+            };
+            let ch1 = 12345;
+            samples.push(ch0);
+            samples.push(ch1);
+        }
+        let spec = write_hound_int_wav(&path, 2, &samples);
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let peaks = scan_channel_peaks_hound(&mut reader, &spec);
+        assert!(
+            (peaks[0] - 1.0).abs() < 1e-6,
+            "full-scale negative spike must peak at 1.0, got {}",
+            peaks[0]
+        );
+        assert!(
+            (peaks[1] - 12345.0 / 32768.0).abs() < 1e-6,
+            "ch1 peak must be 12345/32768, got {}",
+            peaks[1]
+        );
+    }
+
+    #[test]
+    fn test_scan_channel_peaks_hound_float_stereo_exact_peaks() {
+        // ch0: silence except one 0.25 sample; ch1: constant −0.5. The
+        // float branch must map samples to channels by interleaved index
+        // and track the per-channel max.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("peaks_float.wav");
+        let mut samples: Vec<f32> = Vec::new();
+        for i in 0..64 {
+            let ch0 = if i == 32 { 0.25 } else { 0.0 };
+            samples.push(ch0);
+            samples.push(-0.5);
+        }
+        let spec = write_hound_float_wav(&path, 2, &samples);
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let peaks = scan_channel_peaks_hound(&mut reader, &spec);
+        assert!(
+            (peaks[0] - 0.25).abs() < 1e-6,
+            "ch0 peak must be 0.25, got {}",
+            peaks[0]
+        );
+        assert!(
+            (peaks[1] - 0.5).abs() < 1e-6,
+            "ch1 peak must be 0.5, got {}",
+            peaks[1]
+        );
+    }
+
+    #[test]
+    fn test_read_mono_samples_int_stereo_extracts_requested_channel() {
+        // ch0 = [100, −200, 300], ch1 = [−1000, 2000, −3000]: reading
+        // channel 1 must yield ch1/32768 — the int values normalised by
+        // 2^(bits−1), not scaled by anything else.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mono_int.wav");
+        let spec = write_hound_int_wav(&path, 2, &[100, -1000, -200, 2000, 300, -3000]);
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let spec_snapshot = spec;
+        let samples = read_mono_samples(&mut reader, &spec_snapshot, 1).unwrap();
+        assert_eq!(samples.len(), 3);
+        for (got, want) in samples.iter().zip([-1000.0, 2000.0, -3000.0]) {
+            assert!(
+                (got - want / 32768.0).abs() < 1e-6,
+                "expected {}, got {}",
+                want / 32768.0,
+                got
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_mono_samples_float_stereo_extracts_requested_channel() {
+        // Float stereo: reading channel 1 must extract exactly the ch1
+        // samples, unnormalised.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mono_float.wav");
+        let spec = write_hound_float_wav(&path, 2, &[0.1, 0.5, -0.2, -0.25, 0.3, 0.75]);
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let samples = read_mono_samples(&mut reader, &spec, 1).unwrap();
+        assert_eq!(samples.len(), 3, "ch1 must yield 3 samples");
+        for (got, want) in samples.iter().zip([0.5, -0.25, 0.75]) {
+            assert!((got - want).abs() < 1e-6, "expected {}, got {}", want, got);
+        }
+    }
+
     // ── Edge case: mid-signal start ──────────────────────────────────────
 
     #[test]

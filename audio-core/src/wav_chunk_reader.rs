@@ -349,6 +349,117 @@ mod tests {
         assert!(decode_le_int_sample(&raw, 0, 0).is_err());
     }
 
+    #[test]
+    fn test_decode_le_int_sample_32bit_distinct_bytes() {
+        // 0x12345678 has four distinct little-endian bytes, so a byte-offset
+        // arithmetic mutant that re-reads an earlier byte cannot reproduce
+        // the value (the all-zeros / all-FF fixtures cannot distinguish).
+        assert_eq!(
+            decode_le_int_sample(&[0x78, 0x56, 0x34, 0x12], 0, 4).unwrap(),
+            0x12345678
+        );
+    }
+
+    // ── scan_channel_peaks boundary arithmetic ────────────────────────────
+
+    #[test]
+    fn test_scan_channel_peaks_int_full_scale_negative_spike() {
+        // Stereo 16-bit: ch0 quiet noise plus one full-scale negative sample
+        // (|-32768/32768| must register as the channel peak 1.0); ch1
+        // constant 12345 → 12345/32768.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut samples: Vec<i32> = Vec::new();
+        for i in 0..64 {
+            let ch0 = if i == 32 {
+                -32768
+            } else {
+                ((i * 37) % 100) - 50
+            };
+            samples.push(ch0);
+            samples.push(12345);
+        }
+        let path = write_test_wav_int(&dir, "peaks_int_spike.wav", 2, 48_000, 16, &samples);
+        let (mut reader, _start) = WavChunkReader::open(&path).unwrap();
+        let peaks = reader.scan_channel_peaks().unwrap();
+        assert!(
+            (peaks[0] - 1.0).abs() < 1e-6,
+            "full-scale negative spike must peak ch0 at 1.0, got {}",
+            peaks[0]
+        );
+        assert!(
+            (peaks[1] - 12345.0 / 32768.0).abs() < 1e-6,
+            "ch1 peak must be 12345/32768, got {}",
+            peaks[1]
+        );
+    }
+
+    #[test]
+    fn test_scan_channel_peaks_float_stereo_exact_peaks() {
+        // Sample values chosen so every mantissa byte differs (0.82 =
+        // 0x3F51EB85, −0.19 = 0xBEC28F5C little-endian): byte-index
+        // arithmetic mutants that re-read a wrong byte cannot reproduce the
+        // exact peaks. ch0: silence except one 0.82 sample; ch1: constant
+        // −0.19.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("peaks_float_stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..64 {
+            writer
+                .write_sample(if i == 32 { 0.82f32 } else { 0.0f32 })
+                .unwrap();
+            writer.write_sample(-0.19f32).unwrap();
+        }
+        writer.finalize().unwrap();
+        let (mut reader, _start) = WavChunkReader::open(&path).unwrap();
+        let peaks = reader.scan_channel_peaks().unwrap();
+        assert!(
+            (peaks[0] - 0.82).abs() < 1e-6,
+            "ch0 peak must be 0.82, got {}",
+            peaks[0]
+        );
+        assert!(
+            (peaks[1] - 0.19).abs() < 1e-6,
+            "ch1 peak must be 0.19, got {}",
+            peaks[1]
+        );
+    }
+
+    #[test]
+    fn test_read_mono_samples_f32_stereo_extracts_exact_frames() {
+        // Reading channel 1 of a stereo file must yield the exact ch1 frames
+        // at their 4-byte stride — both the sample accounting and the values
+        // (a nonzero channel also makes stride arithmetic under/mis-flow
+        // observable).
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut samples: Vec<i32> = Vec::new();
+        let mut ch1_values = Vec::new();
+        for i in 0..10 {
+            let v = -5000 + i as i32;
+            ch1_values.push(v);
+            samples.push(1000 * (i as i32) + 7);
+            samples.push(v);
+        }
+        let path = write_test_wav_int(&dir, "mono_stereo_frames.wav", 2, 48_000, 16, &samples);
+        let (mut reader, _start) = WavChunkReader::open_with_channel(&path, 1).unwrap();
+        let read = reader.read_mono_samples_f32(0, 10).unwrap();
+        assert_eq!(read.len(), 10);
+        let max_val = 32768.0f32;
+        for (i, v) in ch1_values.iter().enumerate() {
+            assert!(
+                (read[i] - *v as f32 / max_val).abs() < 1e-6,
+                "frame {i}: expected {}, got {}",
+                *v as f32 / max_val,
+                read[i]
+            );
+        }
+    }
+
     // ── WavChunkReader 24-bit sign extension ──────────────────────────────
 
     #[test]
