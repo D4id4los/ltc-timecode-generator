@@ -20,17 +20,10 @@ exclude_re = [
     # explicit field is redundant with ..params, so deleting it changes
     # nothing.
     "delete field total_samples from struct crate::ltc_encoder::LtcFrameParams",
-    # Equivalent: worst_block_drift_frames tracks max(|accum_frames|);
-    # accum_frames is an absolute value, so `>` vs `>=` at an exact tie
-    # overwrites with an identical number — unobservable.
-    "analyze_drift:1407:27: replace > with >=",
-    # Equivalent: the degraded-block severity is ((accum-0.5)/0.5).min(1.0),
-    # which is exactly 0.0 at accum == 0.5, so widening the branch predicate
-    # from > to >= adds only a zero-penalty iteration — unobservable.
-    "analyze_drift:1417:31: replace > with >=",
     # Equivalent: diff = |audio_elapsed - ltc_elapsed| only gates the edit
     # counter, and the co-required condition ltc_elapsed > 10/fps with
     # audio_secs positive & increasing implies diff > 0.1 under both `-`
     # and `+` — the two operators always yield the same verdict here.
-    "analyze_gaps:1469:35: replace - with +",
+    # (exclude_re is start-anchored — use the full mutant name.)
+    "audio-core/src/ltc_decoder.rs:1469:35: replace - with \\+ in analyze_gaps",
 ]

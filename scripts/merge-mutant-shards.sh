@@ -4,6 +4,7 @@
 # that ran before killing-test commits record stale `missed` entries), prefer
 # `caught`. See plans/2026-10-06-cargo-mutants-oom-safe-sharded-execution-plan.md.
 set -euo pipefail
+export LC_ALL=C
 root=reports/mutants
 out="$root/2026-10-06-audio-core-baseline-merged"
 mkdir -p "$out"
