@@ -78,6 +78,7 @@ export component AppWindow inherits Window {
     in-out property <int> ltc-channel-index: 0;
     in-out property <int> beep-channel-index: 1;
     in-out property <float> ltc-volume: 0.25;
+    in-out property <string> ltc-dbfs-readout;
     in-out property <float> beep-volume: 0.5;
     in-out property <float> beep-frequency: 1000.0;
     in-out property <float> beep-duration: 0.5;
@@ -205,6 +206,7 @@ export component AppWindow inherits Window {
     callback ltc-channel-selected(int);
     callback beep-channel-selected(int);
     callback ltc-volume-changed(float);
+    callback ltc-volume-preset(float);
     callback beep-volume-changed(float);
     callback beep-frequency-changed(float);
     callback beep-duration-changed(float);
@@ -703,6 +705,7 @@ export component AppWindow inherits Window {
                     ltc-channel-index: root.ltc-channel-index;
                     beep-channel-index: root.beep-channel-index;
                     ltc-volume: root.ltc-volume;
+                    ltc-dbfs-readout: root.ltc-dbfs-readout;
                     beep-volume: root.beep-volume;
                     beep-frequency: root.beep-frequency;
                     beep-duration: root.beep-duration;
@@ -721,6 +724,7 @@ export component AppWindow inherits Window {
                     ltc-channel-selected(index) => { root.ltc-channel-selected(index); }
                     beep-channel-selected(index) => { root.beep-channel-selected(index); }
                     ltc-volume-changed(val) => { root.ltc-volume-changed(val); }
+                    ltc-volume-preset(dbfs) => { root.ltc-volume-preset(dbfs); }
                     beep-volume-changed(val) => { root.beep-volume-changed(val); }
                     beep-frequency-changed(val) => { root.beep-frequency-changed(val); }
                     beep-duration-changed(val) => { root.beep-duration-changed(val); }

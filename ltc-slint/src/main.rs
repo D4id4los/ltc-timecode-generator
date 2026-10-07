@@ -654,6 +654,26 @@ fn register_settings_selections(ui: &AppWindow, rt: &GuiRuntime) {
         });
     }
     {
+        // Calibrated level presets (−18/−12/−6 dBFS): convert to the UI
+        // volume through the quadratic map's inverse, then reuse the same
+        // SetLtcVolume path as the slider.
+        let sink = rt.sink.clone();
+        let shadows = rt.shadows.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_ltc_volume_preset(move |dbfs| {
+            let val = gui_engine::dbfs_to_ui_volume(dbfs as f32);
+            let seq = sink.send(GuiCommand::SetLtcVolume(val));
+            shadows
+                .lock()
+                .unwrap()
+                .ltc_volume
+                .send_and_mark(val, seq, Instant::now());
+            if let Some(u) = ui_weak.upgrade() {
+                u.set_ltc_volume(val);
+            }
+        });
+    }
+    {
         let sink = rt.sink.clone();
         let shadows = rt.shadows.clone();
         let ui_weak = ui.as_weak();

@@ -591,6 +591,29 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
                 .font(FontId::monospace(10.0))
                 .color(colors.text_title),
         );
+        // Live dBFS readout: the peak level the shown UI volume produces.
+        let dbfs = gui_engine::ui_volume_to_dbfs(shown);
+        let readout = if dbfs.is_finite() {
+            format!("≈ {dbfs:.1} dBFS")
+        } else {
+            "silence".to_string()
+        };
+        ui.label(
+            RichText::new(readout)
+                .font(FontId::monospace(9.0))
+                .color(colors.text_muted),
+        );
+        // Calibrated level presets (safe-hot reference levels for camera
+        // feeds); each sends the equivalent UI volume through SetLtcVolume.
+        for &(label, dbfs) in &[("-18", -18.0f32), ("-12", -12.0), ("-6", -6.0)] {
+            if ui
+                .small_button(RichText::new(label).font(FontId::monospace(9.0)))
+                .clicked()
+            {
+                let v = gui_engine::dbfs_to_ui_volume(dbfs);
+                bound::set_value(state, |s| &mut s.sh.ltc_volume, v, GuiCommand::SetLtcVolume);
+            }
+        }
     });
 
     let truth = state.latest.beep_volume;

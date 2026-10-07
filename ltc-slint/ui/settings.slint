@@ -18,6 +18,7 @@ export component SettingsSection {
     in-out property <int> ltc-channel-index;
     in-out property <int> beep-channel-index;
     in-out property <float> ltc-volume;
+    in-out property <string> ltc-dbfs-readout;
     in-out property <float> beep-volume;
     in-out property <float> beep-frequency;
     in-out property <float> beep-duration;
@@ -38,6 +39,7 @@ export component SettingsSection {
     callback ltc-channel-selected(int);
     callback beep-channel-selected(int);
     callback ltc-volume-changed(float);
+    callback ltc-volume-preset(float);
     callback beep-volume-changed(float);
     callback beep-frequency-changed(float);
     callback beep-duration-changed(float);
@@ -370,10 +372,34 @@ export component SettingsSection {
                                     changed(new_val) => { root.ltc-volume-changed(new_val); }
                                 }
                                 Text {
-                                    text: root.ltc-volume * 100;
-                                    color: AppColors.text-title;
-                                    font-size: 10px;
-                                    font-weight: 700;
+                                    text: root.ltc-dbfs-readout;
+                                    color: AppColors.text-muted;
+                                    font-size: 9px;
+                                }
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    for p in [
+                                        { label: "−18", dbfs: -18.0 },
+                                        { label: "−12", dbfs: -12.0 },
+                                        { label: "−6", dbfs: -6.0 },
+                                    ]: Rectangle {
+                                        width: 34px;
+                                        border-radius: 6px;
+                                        background: AppColors.card-bg;
+                                        border-width: 1px;
+                                        border-color: AppColors.border-main;
+                                        TouchArea {
+                                            clicked => { root.ltc-volume-preset(p.dbfs); }
+                                        }
+                                        Text {
+                                            text: p.label;
+                                            color: AppColors.text-title;
+                                            font-size: 9px;
+                                            font-weight: 700;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
                                 }
                             }
                             Row {

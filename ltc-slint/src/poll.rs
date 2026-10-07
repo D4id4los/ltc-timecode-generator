@@ -545,6 +545,15 @@ fn sync_device_selection(
     push_shadow(&mut sh.ltc_volume, &s.ltc_volume, applied_seq, now, |v| {
         ui.set_ltc_volume(v)
     });
+    // Live dBFS readout for the LTC level (mirror of the slider's shadow).
+    {
+        let dbfs = gui_engine::ui_volume_to_dbfs(*sh.ltc_volume.value());
+        ui.set_ltc_dbfs_readout(if dbfs.is_finite() {
+            format!("≈ {dbfs:.1} dBFS").into()
+        } else {
+            "silence".into()
+        });
+    }
     push_shadow(&mut sh.beep_volume, &s.beep_volume, applied_seq, now, |v| {
         ui.set_beep_volume(v)
     });

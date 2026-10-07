@@ -32,10 +32,10 @@ pub use arc_swap::ArcSwap;
 pub use camera_meta::{probe_camera_info, CameraInfo, CameraMetaSource};
 
 pub use audio_core::{
-    compute_ltc_quality, decode_ltc_chunked, decode_ltc_from_wav, decode_ltc_from_wav_libltc,
-    decode_ltc_with_decoder, AudioDeviceInfo, AudioEvent, ChannelSel, DecodeConfig, DecodeProgress,
-    FrameTimecode, LtcDecodeStatus, LtcDetectionResult, LtcQualityReport, Timecode, WavChunkReader,
-    SAMPLE_RATE_OPTIONS,
+    compute_ltc_quality, dbfs_to_ui_volume, decode_ltc_chunked, decode_ltc_from_wav,
+    decode_ltc_from_wav_libltc, decode_ltc_with_decoder, ui_volume_to_dbfs, AudioDeviceInfo,
+    AudioEvent, ChannelSel, DecodeConfig, DecodeProgress, FrameTimecode, LtcDecodeStatus,
+    LtcDetectionResult, LtcQualityReport, Timecode, WavChunkReader, SAMPLE_RATE_OPTIONS,
 };
 
 // Re-export converter/file_pattern types for convenience
