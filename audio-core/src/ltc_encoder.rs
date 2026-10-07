@@ -217,18 +217,42 @@ pub fn generate_ltc_frame_stereo(
         channel,
     } = params;
     let bits = get_ltc_bits(tc, drop_frame);
+    modulate_bits_stereo(
+        &bits,
+        total_samples,
+        samples_per_bit,
+        volume,
+        channel,
+        last_level,
+        stereo_out,
+    );
+}
+
+/// Core bi-phase mark modulator shared by timecode frames and the lead-in
+/// preamble. Modulates `bits` (LSB-first per slot, one bit per slot) into
+/// `stereo_out` (`total_samples * 2` interleaved elements), carrying
+/// `last_level` across calls for glitch-free continuity.
+fn modulate_bits_stereo(
+    bits: &[u8],
+    total_samples: usize,
+    samples_per_bit: f32,
+    volume: f32,
+    channel: ChannelSel,
+    last_level: &mut (f32, f32),
+    stereo_out: &mut [f32],
+) {
     let play_left = matches!(channel, ChannelSel::Both | ChannelSel::Left);
     let play_right = matches!(channel, ChannelSel::Both | ChannelSel::Right);
     let alpha = 0.35f32;
     let mut current_level = last_level.0;
     let mut last_y = last_level.1;
 
-    for b in 0..80u32 {
+    for b in 0..bits.len() {
         let bf = b as f32;
         let start_sample = (bf * samples_per_bit).round() as usize;
         let end_sample = ((bf + 1.0) * samples_per_bit).round() as usize;
         let mid_sample = ((bf + 0.5) * samples_per_bit).round() as usize;
-        let bit_val = bits[b as usize];
+        let bit_val = bits[b];
 
         current_level = -current_level;
 
@@ -256,6 +280,59 @@ pub fn generate_ltc_frame_stereo(
 
     last_level.0 = current_level;
     last_level.1 = last_y;
+}
+
+// ── Transmission lead-in (clock preamble) ──────────────────────────────────
+
+/// Length of the transmission lead-in in bi-phase bits: one full 80-bit
+/// frame's worth of alternating 0/1 clock (no sync word, no timecode), so a
+/// recorder's input settling window (AGC/HPF conditioning) is absorbed
+/// before the first real LTC frame. A preamble of raw clock carries no
+/// codeword and cannot pollute trim-to-first-LTC flows.
+pub const LEAD_IN_BITS: usize = 80;
+
+/// Parameters for one lead-in render: length in mono samples, bit timing,
+/// level, and channel routing.
+pub struct LeadInParams {
+    pub total_samples: usize,
+    pub samples_per_bit: f32,
+    pub volume: f32,
+    pub channel: ChannelSel,
+}
+
+/// Generate the transmission lead-in: `LEAD_IN_BITS` alternating 0/1
+/// bi-phase clock bits with **no** sync word — an ordinary bi-phase-mark
+/// signal that decoders cannot lock a timecode frame onto.
+///
+/// Same modulation, filtering, level and routing as a real frame;
+/// `last_level` must be threaded into the first real frame for continuity.
+/// `stereo_out` must be at least `total_samples * 2` elements.
+pub fn generate_ltc_lead_in_stereo(
+    params: LeadInParams,
+    last_level: &mut (f32, f32),
+    stereo_out: &mut [f32],
+) {
+    let LeadInParams {
+        total_samples,
+        samples_per_bit,
+        volume,
+        channel,
+    } = params;
+    let bits = [0u8, 1u8]
+        .iter()
+        .copied()
+        .cycle()
+        .take(LEAD_IN_BITS)
+        .collect::<Vec<u8>>();
+    modulate_bits_stereo(
+        &bits,
+        total_samples,
+        samples_per_bit,
+        volume,
+        channel,
+        last_level,
+        stereo_out,
+    );
 }
 
 // ── Beep tone generation ───────────────────────────────────────────────────
@@ -1465,6 +1542,342 @@ mod tests {
         assert!(
             (level - (-12.0)).abs() <= 0.5,
             "0.5 UI must be ≈ −12 dBFS, got {level}"
+        );
+    }
+
+    // ── Acceptance: transmission lead-in survives a recorder settle ───────
+
+    /// 60 frames @ 25 fps/48 kHz, mono, with a deterministic LCG for the
+    /// chain-noise component. Returns (audio, frame TCs).
+    fn settle_fixture(with_lead_in: bool) -> (Vec<f32>, Vec<Timecode>) {
+        let sample_rate = 48000u32;
+        let fps = 25.0f64;
+        let exact_spf = sample_rate as f64 / fps;
+        let base = exact_spf.floor() as usize;
+        let num_frames = 60;
+        let mut tc = mk_tc(1, 0, 0, 0);
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut accumulator = 0.0_f64;
+        let mut audio: Vec<f32> = Vec::new();
+        let mut frame_buf = vec![0.0f32; (base + 1) * 2];
+        let mut tcs = Vec::new();
+
+        if with_lead_in {
+            generate_ltc_lead_in_stereo(
+                LeadInParams {
+                    total_samples: base,
+                    samples_per_bit: base as f32 / LEAD_IN_BITS as f32,
+                    volume: 0.8,
+                    channel: ChannelSel::Both,
+                },
+                &mut last_level,
+                &mut frame_buf[..base * 2],
+            );
+            audio.extend(frame_buf[..base * 2].iter().step_by(2).copied());
+        }
+
+        for _ in 0..num_frames {
+            let (samples, spb, new_acc) = compute_frame_sample_count(exact_spf, base, accumulator);
+            frame_buf[..samples * 2].fill(0.0);
+            generate_ltc_frame_stereo(
+                LtcFrameParams {
+                    tc: &tc,
+                    drop_frame: false,
+                    total_samples: samples,
+                    samples_per_bit: spb,
+                    volume: 0.8,
+                    channel: ChannelSel::Both,
+                },
+                &mut last_level,
+                &mut frame_buf[..samples * 2],
+            );
+            audio.extend(frame_buf[..samples * 2].iter().step_by(2).copied());
+            tcs.push(tc);
+            accumulator = new_acc;
+            tc = increment_timecode(&tc, fps, false);
+        }
+        (audio, tcs)
+    }
+
+    /// Simulated recorder settle: linear gain ramp 0→1 over the first
+    /// 250 ms plus deterministic chain noise (LCG, ≈ −40 dBFS peak).
+    fn apply_settle(audio: &mut [f32], sample_rate: u32) {
+        let ramp_len = (sample_rate as usize * 250) / 1000;
+        for (i, s) in audio.iter_mut().enumerate().take(ramp_len) {
+            *s *= i as f32 / ramp_len as f32;
+        }
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        for s in audio.iter_mut() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *s += ((seed >> 33) as i32 as f32 / i32::MAX as f32) * 0.01;
+        }
+    }
+
+    /// With the lead-in, the first real frame survives a 250 ms settle ramp:
+    /// the decoder must return every frame starting at the start TC.
+    /// (Measured without the lead-in: builtin loses frames 0–1 — first
+    /// decoded = :02, 58/60 — see the WP-EN report addendum.)
+    #[test]
+    fn test_settle_ramp_with_lead_in_first_frame_survives_builtin() {
+        let sample_rate = 48000u32;
+        let fps = 25.0f64;
+        let (mut audio, tcs) = settle_fixture(true);
+        apply_settle(&mut audio, sample_rate);
+        let result = crate::ltc_decoder::decode_ltc_samples(
+            &audio,
+            sample_rate,
+            1,
+            fps,
+            false,
+            std::time::Instant::now(),
+            None,
+        )
+        .expect("decode of settled lead-in render must succeed");
+        let decoded: Vec<Timecode> = result.timecodes.iter().map(|f| f.timecode).collect();
+        assert_eq!(
+            decoded.first(),
+            Some(&tcs[0]),
+            "first decoded frame must be the start TC under a 250 ms settle"
+        );
+        assert_eq!(
+            decoded.len(),
+            tcs.len(),
+            "every generated frame must survive the settle"
+        );
+        for (i, frame) in decoded.iter().enumerate() {
+            assert_eq!(
+                frame, &tcs[i],
+                "decoded frame {i} must match generation order"
+            );
+        }
+    }
+
+    /// Same acceptance on the libltc backend: the lead-in must fix the
+    /// head loss (measured without lead-in: first decoded = :01 under the
+    /// 250 ms settle). Tail loss is libltc's documented boundary artifact,
+    /// so only the head and a floor on the yield are asserted here.
+    #[test]
+    fn test_settle_ramp_with_lead_in_first_frame_survives_libltc() {
+        let sample_rate = 48000u32;
+        let fps = 25.0f64;
+        let (mut audio, tcs) = settle_fixture(true);
+        apply_settle(&mut audio, sample_rate);
+
+        let tmp =
+            std::env::temp_dir().join(format!("ltc-leadin-acceptance-{}.wav", std::process::id()));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&tmp, spec).expect("temp WAV create");
+        for s in &audio {
+            w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                .expect("temp WAV write");
+        }
+        w.finalize().expect("temp WAV finalize");
+
+        let result =
+            match crate::ltc_decoder_libltc::decode_ltc_from_wav_libltc(&tmp, fps, false, None) {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    eprintln!("--- SKIPPED: libltc backend unavailable");
+                    return;
+                }
+            };
+        let _ = std::fs::remove_file(&tmp);
+
+        let decoded: Vec<Timecode> = result.timecodes.iter().map(|f| f.timecode).collect();
+        assert_eq!(
+            decoded.first(),
+            Some(&tcs[0]),
+            "libltc: first decoded frame must be the start TC under a 250 ms settle"
+        );
+        assert!(
+            decoded.len() >= tcs.len() - 1,
+            "libltc: yield floor (tail loss tolerated): {}/{}",
+            decoded.len(),
+            tcs.len()
+        );
+    }
+
+    // ── generate_ltc_lead_in_stereo ───────────────────────────────────────
+
+    #[test]
+    fn test_lead_in_sample_count_and_written() {
+        let total_samples = 1920;
+        let samples_per_bit = total_samples as f32 / LEAD_IN_BITS as f32;
+        let mut buf = vec![f32::NAN; total_samples * 2];
+        let mut level = (1.0f32, 1.0f32);
+        generate_ltc_lead_in_stereo(
+            LeadInParams {
+                total_samples,
+                samples_per_bit,
+                volume: 0.8,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
+        assert!(buf.iter().all(|s| s.is_finite()), "every sample written");
+    }
+
+    #[test]
+    fn test_lead_in_dc_near_zero() {
+        let total_samples = 1920;
+        let samples_per_bit = total_samples as f32 / LEAD_IN_BITS as f32;
+        let mut buf = vec![0.0f32; total_samples * 2];
+        let mut level = (1.0f32, 1.0f32);
+        generate_ltc_lead_in_stereo(
+            LeadInParams {
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
+        let mean: f32 = buf.iter().sum::<f32>() / buf.len() as f32;
+        assert!(
+            mean.abs() < 0.02,
+            "clock preamble must be DC-free, got {mean}"
+        );
+    }
+
+    #[test]
+    fn test_lead_in_volume_zero_silence() {
+        let total_samples = 1920;
+        let samples_per_bit = total_samples as f32 / LEAD_IN_BITS as f32;
+        let mut buf = vec![0.0f32; total_samples * 2];
+        let mut level = (1.0f32, 1.0f32);
+        generate_ltc_lead_in_stereo(
+            LeadInParams {
+                total_samples,
+                samples_per_bit,
+                volume: 0.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
+        let max_amp = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(max_amp < 1e-10, "zero-volume lead-in must be silent");
+    }
+
+    #[test]
+    fn test_lead_in_channel_routing_left_only() {
+        let total_samples = 1920;
+        let samples_per_bit = total_samples as f32 / LEAD_IN_BITS as f32;
+        let mut buf = vec![0.0f32; total_samples * 2];
+        let mut level = (1.0f32, 1.0f32);
+        generate_ltc_lead_in_stereo(
+            LeadInParams {
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Left,
+            },
+            &mut level,
+            &mut buf,
+        );
+        let left_energy: f32 = buf.iter().step_by(2).map(|s| s * s).sum();
+        let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s * s).sum();
+        assert!(left_energy > 0.0, "left channel should carry the preamble");
+        assert!(right_energy < 1e-10, "right channel must be silent");
+    }
+
+    /// Continuity across the lead-in → first-frame seam: with 80 alternating
+    /// bits ending on bit value 1 (bit 79 = 1), the preamble ends mid-bit with
+    /// the post-midpoint level of a `1` bit; the following frame's first
+    /// half-bit must still start with a level flip (no missing/extra
+    /// transition). Mirrors `test_frame_continuity_carries_across_calls`.
+    #[test]
+    fn test_lead_in_continuity_into_first_frame() {
+        let total_samples = 640;
+        let samples_per_bit = total_samples as f32 / 80.0;
+        let mut lead_buf = vec![0.0f32; total_samples * 2];
+        let mut frame_buf = vec![0.0f32; total_samples * 2];
+        let mut level = (1.0f32, 1.0f32);
+
+        generate_ltc_lead_in_stereo(
+            LeadInParams {
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut lead_buf,
+        );
+        let tc = mk_tc(1, 0, 0, 0);
+        generate_ltc_frame_stereo(
+            LtcFrameParams {
+                tc: &tc,
+                drop_frame: false,
+                total_samples,
+                samples_per_bit,
+                volume: 1.0,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut frame_buf,
+        );
+        let last_lead = lead_buf[lead_buf.len() - 2];
+        let first_frame = frame_buf[0];
+        assert!(
+            (last_lead.signum() - first_frame.signum()).abs() < 0.1,
+            "sign must be continuous across the lead-in seam: last={last_lead} first={first_frame}"
+        );
+        // A bi-phase mark always flips at the bit boundary, so the filter is
+        // driven toward the opposite level right at the seam: the frame's
+        // first sample must move away from the lead-in's last value, not
+        // freeze (which would mean a missing transition).
+        assert!(
+            (first_frame - last_lead).abs() > 1e-4,
+            "first frame sample must show a level change across the seam"
+        );
+    }
+
+    /// Lead-in carries no sync word: the builtin decoder must not decode a
+    /// timecode frame from a preamble-only signal.
+    #[test]
+    fn test_lead_in_alone_decodes_no_timecode() {
+        let sample_rate = 48000u32;
+        let fps = 25.0f64;
+        let total_samples = (sample_rate as f64 / fps) as usize;
+        let samples_per_bit = total_samples as f32 / LEAD_IN_BITS as f32;
+        let mut buf = vec![0.0f32; total_samples * 2];
+        let mut level = (1.0f32, 1.0f32);
+        generate_ltc_lead_in_stereo(
+            LeadInParams {
+                total_samples,
+                samples_per_bit,
+                volume: 0.8,
+                channel: ChannelSel::Both,
+            },
+            &mut level,
+            &mut buf,
+        );
+        let mono: Vec<f32> = buf.iter().step_by(2).copied().collect();
+        let result = crate::ltc_decoder::decode_ltc_samples(
+            &mono,
+            sample_rate,
+            1,
+            fps,
+            false,
+            std::time::Instant::now(),
+            None,
+        )
+        .expect("decode of lead-in must not error");
+        assert!(
+            result.timecodes.is_empty(),
+            "clock preamble carries no timecode, decoded {}",
+            result.timecodes.len()
         );
     }
 

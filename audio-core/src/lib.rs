@@ -32,8 +32,9 @@ pub use wav_chunk_reader::WavChunkReader;
 // ── LTC encoder ───────────────────────────────────────────────────────────
 
 pub use ltc_encoder::{
-    compute_frame_sample_count, dbfs_to_ui_volume, generate_ltc_frame_stereo, get_ltc_bits,
-    increment_timecode, ui_volume_to_dbfs,
+    compute_frame_sample_count, dbfs_to_ui_volume, generate_ltc_frame_stereo,
+    generate_ltc_lead_in_stereo, get_ltc_bits, increment_timecode, ui_volume_to_dbfs, LeadInParams,
+    LEAD_IN_BITS,
 };
 
 // ── Audio output ──────────────────────────────────────────────────────────
