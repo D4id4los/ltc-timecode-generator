@@ -7,7 +7,8 @@ on:
 
 jobs:
   mutants-audio-core:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest flips to Ubuntu 26 on 2026-10-19.
+    runs-on: ubuntu-24.04
     # 6-way shard matrix: a monolithic run sits on the 6 h hosted-runner
     # job cap; each shard lands at ~1-2.5 h at -j 2 (16 GB runner RAM —
     # per-mutant rustc peak is 1.5-2.5 GB, do not raise -j).

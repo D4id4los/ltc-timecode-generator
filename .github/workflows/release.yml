@@ -31,7 +31,7 @@ env:
 
 jobs:
   guard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -86,7 +86,8 @@ jobs:
 
   build-linux-x64:
     needs: guard
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest flips to Ubuntu 26 on 2026-10-19.
+    runs-on: ubuntu-24.04
     env:
       PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
       LIBLTC_PREFIX: ${{ github.workspace }}/libltc-prefix
@@ -128,7 +129,7 @@ jobs:
           tool: cargo-zigbuild
 
       - name: Cache zig (pinned 0.13.0, parity with Dockerfile.gui-build)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: zig
           key: zig-0.13.0-linux-x86_64
@@ -142,7 +143,7 @@ jobs:
           echo "$GITHUB_WORKSPACE/zig" >> "$GITHUB_PATH"
 
       - name: Cache libltc static prefix (keyed on the pinned release)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/libltc-prefix
           key: libltc-${{ env.LIBLTC_TAG }}-linux64-static
@@ -219,32 +220,36 @@ jobs:
           }
 
       - name: Cache libltc static prefix (keyed on the pinned release)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/libltc-prefix
-          key: libltc-${{ env.LIBLTC_TAG }}-mingw64
+          key: libltc-${{ env.LIBLTC_TAG }}-ucrt64
 
-      - name: Provision libltc (MSYS2 mingw64 source build via shared script)
+      - name: Provision libltc (MSYS2 ucrt64 source build via shared script)
         uses: msys2/setup-msys2@v2
         with:
           release: true
-          msystem: MINGW64
+          # UCRT64: MINGW64 (msvcrt) is deprecated by MSYS2; the UCRT64 gcc
+          # uses the same x86_64-w64-mingw32 host triple.
+          msystem: UCRT64
           update: false
-          install: git make autoconf automake libtool mingw-w64-x86_64-toolchain
+          install: git make autoconf automake libtool mingw-w64-ucrt-x86_64-toolchain
 
       - name: Build libltc into the job prefix
         shell: msys2 {0}
         run: bash scripts/build-libltc-static.sh "$(cygpath -u "$LIBLTC_PREFIX")" x86_64-w64-mingw32
 
-      - name: Put the MSYS2 mingw64 linker on PATH
+      - name: Put the MSYS2 ucrt64 linker on PATH
         # rustc's self-contained mingw only covers its own CRT objects; an
         # external C library needs the mingw gcc as the linker.
-        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        run: echo "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Cache cargo build (windows-release)
         uses: Swatinem/rust-cache@v2
         with:
-          key: windows-release
+          # Suffix bumps with the MSYS2 environment so objects linked
+          # against the old CRT never leak into the cache.
+          key: windows-release-ucrt64
           workspaces: |
             .
 
@@ -260,7 +265,7 @@ jobs:
 
   release:
     needs: [guard, build-linux-x64, build-windows-x64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
