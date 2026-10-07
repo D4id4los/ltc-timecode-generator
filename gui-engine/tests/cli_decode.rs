@@ -44,7 +44,7 @@ fn cli_with(mutate: impl FnOnce(&mut Cli)) -> Cli {
         fps: 25.0,
         start_timecode: "01:00:00:00".to_string(),
         channel: "both".to_string(),
-        volume: 0.5,
+        volume: Some(0.5),
         sample_rate: Some(48000),
         list_devices: false,
         headless: false,
@@ -213,6 +213,52 @@ fn render_2997_decodes_continuous() {
         let cur = tc_frame_number(&decoded[i], fps);
         assert_eq!(cur, prev + 1, "frame {i} must be the strict +1 successor");
     }
+}
+
+/// Render + hound readback: peak absolute sample as a fraction of full scale.
+fn render_peak_level(cli: Cli) -> f32 {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("level.wav");
+    let cli = {
+        let mut c = cli;
+        c.output_to_file = Some(path.to_string_lossy().to_string());
+        c
+    };
+    process_cli_result(cli).expect("render dispatch should succeed");
+    let mut reader = hound::WavReader::open(&path).expect("valid WAV");
+    reader
+        .samples::<i16>()
+        .map(|s| (s.expect("sample read") as f32 / i16::MAX as f32).abs())
+        .fold(0.0f32, f32::max)
+}
+
+// ── render level defaults (WP-EN item 2) ─────────────────────────────────
+
+#[test]
+fn render_default_volume_is_minus_12dbfs() {
+    init_test_config();
+    let peak = render_peak_level(cli_with(|c| {
+        c.volume = None;
+        c.duration = Some(0.5);
+    }));
+    // 0.5 UI default → quadratic gain 0.25 → −12 dBFS peak.
+    assert!(
+        (peak - 0.25).abs() <= 0.02,
+        "default render peak must be ≈ −12 dBFS (0.25 linear), got {peak}"
+    );
+}
+
+#[test]
+fn render_explicit_volume_is_honored() {
+    init_test_config();
+    let peak = render_peak_level(cli_with(|c| {
+        c.volume = Some(0.25);
+        c.duration = Some(0.5);
+    }));
+    assert!(
+        (peak - 0.0625).abs() <= 0.005,
+        "explicit 0.25 UI must render at 0.0625 linear peak, got {peak}"
+    );
 }
 
 // ── output-to-file dispatch ──────────────────────────────────────────────

@@ -461,7 +461,7 @@ mod tests {
             fps: 25.0,
             start_timecode: "01:00:00:00".to_string(),
             channel: "left".to_string(),
-            volume: 0.5,
+            volume: Some(0.5),
             sample_rate: Some(48000),
             list_devices: false,
             headless: false,

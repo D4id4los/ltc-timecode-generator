@@ -18,6 +18,23 @@ use crate::state::AppStateSnapshot;
 
 // ── Logger ──────────────────────────────────────────────────────────────
 
+/// Default LTC volume for file renders (`--output-to-file`): 0.5 UI =
+/// 0.25 linear = −12 dBFS peak through the quadratic map — a safe-hot
+/// reference level that maximises decoder SNR headroom without clipping.
+pub const DEFAULT_RENDER_VOLUME: f32 = 0.5;
+
+/// Default LTC volume for live playback (headless/GUI feeds): 0.25 UI =
+/// −24.1 dBFS peak — mic-level-safe for camera input chains.
+pub const DEFAULT_LIVE_VOLUME: f32 = 0.25;
+
+/// Validate an explicitly supplied UI volume.
+fn validate_volume(volume: f32) -> Result<(), Box<dyn std::error::Error>> {
+    if !(0.0..=1.0).contains(&volume) {
+        return Err("Volume must be between 0.0 and 1.0".to_string().into());
+    }
+    Ok(())
+}
+
 fn init_logger() {
     let _ = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(crate::log_buffer::DEFAULT_LOG_FILTER),
@@ -70,9 +87,10 @@ pub struct Cli {
     #[arg(long, default_value = "left")]
     pub channel: String,
 
-    /// LTC volume (0.0 to 1.0)
-    #[arg(long, default_value_t = 0.25)]
-    pub volume: f32,
+    /// LTC volume (0.0 to 1.0). Per-mode default when omitted: file renders
+    /// use 0.5 (−12 dBFS), live playback uses 0.25 (−24.1 dBFS).
+    #[arg(long)]
+    pub volume: Option<f32>,
 
     /// Sample rate: 44100 or 48000 (default: auto-detect)
     #[arg(long)]
@@ -381,7 +399,7 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli.channel
         )
     })?;
-    let volume = cli.volume;
+    let volume = cli.volume.unwrap_or(DEFAULT_LIVE_VOLUME);
     let verbose = cli.verbose;
 
     let valid_fps = [24.0, 25.0, 29.97, 30.0];
@@ -393,8 +411,8 @@ pub fn run_headless(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    if !(0.0..=1.0).contains(&volume) {
-        return Err("Volume must be between 0.0 and 1.0".to_string().into());
+    if let Some(v) = cli.volume {
+        validate_volume(v)?;
     }
 
     info!(
@@ -548,7 +566,13 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli.channel
         )
     })?;
-    let volume = cli.volume;
+    let volume = match cli.volume {
+        Some(v) => {
+            validate_volume(v)?;
+            v
+        }
+        None => DEFAULT_RENDER_VOLUME,
+    };
 
     let duration_secs = cli
         .duration
@@ -1451,7 +1475,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             channel: "left".into(),
-            volume: 0.25,
+            volume: Some(0.25),
             sample_rate: None,
             duration: None,
             output_to_file: None,

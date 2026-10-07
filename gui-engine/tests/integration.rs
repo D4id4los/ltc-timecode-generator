@@ -35,7 +35,7 @@ fn make_wav_cli(
         fps,
         start_timecode: "01:00:00:00".to_string(),
         channel: "both".to_string(),
-        volume: 0.5,
+        volume: Some(0.5),
         sample_rate: Some(sample_rate),
         list_devices: false,
         headless: false,
