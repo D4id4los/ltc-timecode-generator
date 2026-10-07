@@ -11,6 +11,28 @@ fn map_volume(linear: f32) -> f32 {
     v * v
 }
 
+/// Convert a dBFS peak target to the UI volume (0–1) that produces it
+/// through `map_volume` (quadratic). `amp = 10^(dbfs/20)`, `ui = sqrt(amp)`,
+/// i.e. `ui = 10^(dbfs/40)`. Inputs below −60 dBFS clamp to 0 (silence),
+/// above 0 dBFS clamp to 1 (full scale).
+pub fn dbfs_to_ui_volume(dbfs: f32) -> f32 {
+    if dbfs <= -60.0 {
+        return 0.0;
+    }
+    if dbfs >= 0.0 {
+        return 1.0;
+    }
+    10f32.powf(dbfs / 40.0)
+}
+
+/// Convert a UI volume (0–1) back to the dBFS peak it produces through
+/// `map_volume`. Inverse of [`dbfs_to_ui_volume`]; `ui_volume_to_dbfs(0.0)`
+/// is silence and returns `f32::NEG_INFINITY`.
+pub fn ui_volume_to_dbfs(ui: f32) -> f32 {
+    let amp = map_volume(ui);
+    20.0 * amp.log10()
+}
+
 // ── Bit writing helper ─────────────────────────────────────────────────────
 
 fn write_val(bits: &mut [u8; 80], val: u32, start_bit: usize, length: usize) {
@@ -1395,8 +1417,58 @@ mod tests {
         );
     }
 
-    // ── map_volume ────────────────────────────────────────────────────────
+    // ── dBFS ↔ UI-volume level helpers ────────────────────────────────────
 
+    #[test]
+    fn test_dbfs_to_ui_reference_points() {
+        // −12 dBFS ↔ 0.5 UI (the calibration anchor: 0.5² = 0.25 = 10^(−12/10)
+        // within rounding). −6.02 dBFS is ½ amplitude → 0.7079 UI; −18.06 is
+        // ⅛ amplitude → 0.3548 UI.
+        assert!((dbfs_to_ui_volume(-12.04) - 0.5).abs() < 0.005);
+        assert!((dbfs_to_ui_volume(-6.02) - 0.7079).abs() < 0.005);
+        assert!((dbfs_to_ui_volume(-18.06) - 0.3548).abs() < 0.005);
+        assert!((dbfs_to_ui_volume(0.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_ui_volume_to_dbfs_reference_points() {
+        assert!((ui_volume_to_dbfs(0.5) - (-12.04)).abs() < 0.05);
+        assert!((ui_volume_to_dbfs(1.0)).abs() < 1e-6);
+        assert_eq!(ui_volume_to_dbfs(0.0), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_dbfs_ui_round_trip() {
+        // −60 dBFS is the clamp boundary (→ 0 UI → −inf), so round-trip
+        // fidelity is asserted inside the unclamped range only.
+        for dbfs in [-59.0f32, -48.0, -24.0, -18.0, -12.0, -6.0, -1.0] {
+            let ui = dbfs_to_ui_volume(dbfs);
+            let back = ui_volume_to_dbfs(ui);
+            assert!(
+                (back - dbfs).abs() < 0.01,
+                "round trip {dbfs} dBFS -> {ui} UI -> {back} dBFS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dbfs_to_ui_clamps() {
+        assert_eq!(dbfs_to_ui_volume(-80.0), 0.0, "below −60 dBFS → silence");
+        assert_eq!(dbfs_to_ui_volume(3.0), 1.0, "above 0 dBFS → full scale");
+    }
+
+    #[test]
+    fn test_render_default_is_minus_12_dbfs_level() {
+        // 0.5 UI through the quadratic map must produce a −12 dBFS peak
+        // (±0.5 dB) — the calibrated render reference level.
+        let level = ui_volume_to_dbfs(0.5);
+        assert!(
+            (level - (-12.0)).abs() <= 0.5,
+            "0.5 UI must be ≈ −12 dBFS, got {level}"
+        );
+    }
+
+    // ── map_volume ────────────────────────────────────────────────────────
     #[test]
     fn test_map_volume_zero() {
         assert_eq!(map_volume(0.0), 0.0);
