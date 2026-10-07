@@ -534,7 +534,12 @@ matrix job.
 Triage policy: **every survivor is classified, no exceptions** — (1) missing/
 weak assertion → write a killing test at the lowest layer (Test Quality Rules
 apply); (2) equivalent/unobservable mutant → suppress with `#[mutants::skip]`
-or `.cargo/mutants.toml` `exclude_re`, always with an inline reason; (3) timeouts
+or `.cargo/mutants.toml` `exclude_re`, always with an inline reason; (2b) `exclude_re`
+entries are unanchored regexes matched against the full mutant name — escape `*`, `+`, `|`,
+`.` (`||` in a pattern is an empty alternation that matches every mutant; ` * ` never matches);
+struct-field-delete mutants ("delete field X from struct Y expression in F") are not reachable
+by `exclude_re` at all; never reuse line numbers from a stale missed.txt — re-derive them from
+`cargo mutants --list`; (3) timeouts
 count as caught, but inspect a sample (a mutant that unbounds a loop can flag
 a missing cancellation contract). CI runs audio-core mutants weekly via
 `.github/workflows/mutants.yml` (also `workflow_dispatch`; never per-PR —
