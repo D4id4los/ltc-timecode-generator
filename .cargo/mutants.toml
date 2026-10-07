@@ -40,10 +40,10 @@ exclude_re = [
     # published timing field; the + and / unit-scale mutants are observable
     # solely through wall-clock assertions, which the Test Quality Rules
     # prohibit (no elapsed-time assertions).
-    "audio-core/src/chunked_decode.rs:209:68: replace * with \\+ in decode_ltc_chunked",
-    "audio-core/src/chunked_decode.rs:209:68: replace * with / in decode_ltc_chunked",
-    "audio-core/src/chunked_decode.rs:232:68: replace * with \\+ in decode_ltc_chunked",
-    "audio-core/src/chunked_decode.rs:232:68: replace * with / in decode_ltc_chunked",
+    "audio-core/src/chunked_decode.rs:209:68: replace \\* with \\+ in decode_ltc_chunked",
+    "audio-core/src/chunked_decode.rs:209:68: replace \\* with / in decode_ltc_chunked",
+    "audio-core/src/chunked_decode.rs:232:68: replace \\* with \\+ in decode_ltc_chunked",
+    "audio-core/src/chunked_decode.rs:232:68: replace \\* with / in decode_ltc_chunked",
     # Display-only: human-rendered "Chunk N: ..." details line; the typed
     # ChunkSummary fields it mirrors ARE pinned by tests.
     "audio-core/src/chunked_decode.rs:349:5: replace render_chunk_detail -> String with String::new()",
@@ -60,6 +60,6 @@ exclude_re = [
     # find_first_coherent_index itself (empty → None via the len < min_run
     # gate with min_run ≥ 1; fps ≤ 0 → None via max_frames = 0 making every
     # timecode invalid), so weakening the outer guard is unobservable.
-    "audio-core/src/ltc_decoder.rs:1041:29: replace || with && in find_first_coherent_index",
-    "audio-core/src/ltc_decoder.rs:1094:36: replace || with && in apply_coherent_first_timecode",
+    "audio-core/src/ltc_decoder\\.rs:1041:29: replace \\|\\| with && in find_first_coherent_index",
+    "audio-core/src/ltc_decoder\\.rs:1094:36: replace \\|\\| with && in apply_coherent_first_timecode",
 ]
