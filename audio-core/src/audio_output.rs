@@ -261,6 +261,31 @@ impl AudioCore {
                 .ltc_producer
                 .lock()
                 .map_err(|e| format!("Producer lock error: {}", e))?;
+            // Transmission lead-in: one frame's worth of alternating clock
+            // bits (no sync word, no timecode — tc is not incremented) so the
+            // recorder's input settling window doesn't swallow the first real
+            // frame. Sized through the accumulator like a real frame.
+            let (lead_in_samples, lead_in_spb, lead_in_acc) =
+                crate::compute_frame_sample_count(exact_samples_per_frame, base_samples, 0.0_f64);
+            frame_buf.fill(0.0);
+            crate::generate_ltc_lead_in_stereo(
+                crate::ltc_encoder::LeadInParams {
+                    total_samples: lead_in_samples,
+                    samples_per_bit: lead_in_spb,
+                    volume: ltc_volume,
+                    channel: ltc_channel,
+                },
+                &mut prefill_level,
+                &mut frame_buf[..lead_in_samples * 2],
+            );
+            let pushed = producer.push_slice(&frame_buf[..lead_in_samples * 2]);
+            if pushed < lead_in_samples * 2 {
+                warn!(
+                    "LTC start: ring buffer full during lead-in prefill, dropped {} samples",
+                    lead_in_samples * 2 - pushed
+                );
+            }
+            let _ = lead_in_acc;
             for _ in 0..prefill_count {
                 frame_buf.fill(0.0);
                 generate_ltc_frame_stereo(

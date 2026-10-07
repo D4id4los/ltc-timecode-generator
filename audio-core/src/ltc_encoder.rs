@@ -247,12 +247,11 @@ fn modulate_bits_stereo(
     let mut current_level = last_level.0;
     let mut last_y = last_level.1;
 
-    for b in 0..bits.len() {
+    for (b, &bit_val) in bits.iter().enumerate() {
         let bf = b as f32;
         let start_sample = (bf * samples_per_bit).round() as usize;
         let end_sample = ((bf + 1.0) * samples_per_bit).round() as usize;
         let mid_sample = ((bf + 0.5) * samples_per_bit).round() as usize;
-        let bit_val = bits[b];
 
         current_level = -current_level;
 

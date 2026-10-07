@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use std::path::{Path, PathBuf};
 
 use audio_core::{
-    generate_ltc_frame_stereo, increment_timecode, list_audio_devices, AudioCore, ChannelSel,
-    Timecode,
+    generate_ltc_frame_stereo, generate_ltc_lead_in_stereo, increment_timecode, list_audio_devices,
+    AudioCore, ChannelSel, Timecode,
 };
 use clap::Parser;
 use log::{error, info, warn};
@@ -625,6 +625,36 @@ pub fn generate_wav(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         1
     };
+
+    // Transmission lead-in: one frame's worth of alternating clock bits
+    // (no sync word, no timecode) before the first real frame, so a
+    // recorder's input settling window doesn't swallow the first frame.
+    {
+        let (lead_in_samples, lead_in_spb, lead_in_acc) = audio_core::compute_frame_sample_count(
+            exact_samples_per_frame,
+            base_samples,
+            samples_accumulator,
+        );
+        samples_accumulator = lead_in_acc;
+        frame_buf.fill(0.0);
+        generate_ltc_lead_in_stereo(
+            audio_core::ltc_encoder::LeadInParams {
+                total_samples: lead_in_samples,
+                samples_per_bit: lead_in_spb,
+                volume,
+                channel,
+            },
+            &mut last_level,
+            &mut frame_buf[..lead_in_samples * 2],
+        );
+        for &sample in &frame_buf[..lead_in_samples * 2] {
+            let clamped = sample.clamp(-1.0, 1.0);
+            let int_sample = (clamped * i16::MAX as f32) as i16;
+            writer
+                .write_sample(int_sample)
+                .map_err(|e| format!("WAV write error at lead-in: {}", e))?;
+        }
+    }
 
     for frame_num in 0..total_frames {
         let (samples_per_frame, samples_per_bit, new_acc) = audio_core::compute_frame_sample_count(

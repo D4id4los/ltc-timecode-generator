@@ -661,7 +661,7 @@ fn register_settings_selections(ui: &AppWindow, rt: &GuiRuntime) {
         let shadows = rt.shadows.clone();
         let ui_weak = ui.as_weak();
         ui.on_ltc_volume_preset(move |dbfs| {
-            let val = gui_engine::dbfs_to_ui_volume(dbfs as f32);
+            let val = gui_engine::dbfs_to_ui_volume(dbfs);
             let seq = sink.send(GuiCommand::SetLtcVolume(val));
             shadows
                 .lock()

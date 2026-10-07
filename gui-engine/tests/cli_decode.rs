@@ -91,11 +91,10 @@ fn generate_test_wav(path: &Path) {
     process_cli_result(cli).expect("WAV generation dispatch failed");
 }
 
-/// Mono samples the render's transmission lead-in contributes at the given
-/// base frame size. Zero until the lead-in lands (WP-EN Step 3); the drift
-/// assertions route through this so the one-const change keeps them green.
-fn expected_lead_in_samples(_base_samples: usize) -> usize {
-    0
+/// Mono samples the render's transmission lead-in contributes: one full
+/// 80-bit frame worth, i.e. the base frame size (WP-EN item 3).
+fn expected_lead_in_samples(base_samples: usize) -> usize {
+    base_samples
 }
 
 /// Render + hound readback: total mono sample count.
