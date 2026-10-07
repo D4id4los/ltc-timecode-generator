@@ -189,4 +189,33 @@ exclude_re = [
     # Ladder convergence: a corrupted full-file decode loses only to the ZC-interval result in the prefer epilogue, which carries the same decoded values via chain re-lock (verified on the adversarial fixtures); the adaptive-vs-nominal tie keeps an equal-count decode (order-equivalent).
     "audio-core/src/ltc_decoder\\.rs:2672:39: replace \\+ with \\* in decode_full_file",
     "audio-core/src/ltc_decoder\\.rs:2704:27: replace > with >= in decode_full_file",
+
+    # ── 2026-10-07 open-bucket triage (beep / ltc_integrity / libltc / types) ──
+    # Release-boundary equivalent: the mutant only reroutes i == num_samples -
+    # release, where the release envelope is (num - i)/release == 1.0 — exactly
+    # the else-branch value. At i == 0 (the only other reroute when the release
+    # window saturates) the sine itself is 0, so the sample is unchanged.
+    "audio-core/src/ltc_encoder\\.rs:266:21: replace > with >= in generate_beep_samples",
+    # Equivalent: this total_samples feeds only the `== 0` emptiness check;
+    # `len()/channels` and `len()*channels` are zero for exactly the same
+    # inputs (the decode path re-derives its own total_samples).
+    "audio-core/src/ltc_decoder_libltc\\.rs:60:43: replace / with \\* in decode_ltc_from_wav_libltc",
+    # Equivalent: `>` vs `>=` when updating a running maximum — assigning an
+    # equal peak leaves the value unchanged.
+    "audio-core/src/ltc_decoder_libltc\\.rs:161:14: replace > with >= in find_active_channel",
+    # Log-only: the condition gates an info! line about the picked channel.
+    "audio-core/src/ltc_decoder_libltc\\.rs:166:15: replace != with == in find_active_channel",
+    # Unreachable branch: libltc emits a frame only while write_i16 processes
+    # samples (the next frame's sync word finalises the current one), and the
+    # per-chunk read loop empties the queue after every write — so the
+    # post-loop drain never yields a frame (verified with a trailing-context
+    # fixture: the tail frame stays lost). The drain is a defensive flush;
+    # its frame_index arithmetic is dead.
+    "audio-core/src/ltc_decoder_libltc\\.rs:234:21: replace \\+= with -= in decode_all_chunks",
+    "audio-core/src/ltc_decoder_libltc\\.rs:234:21: replace \\+= with \\*= in decode_all_chunks",
+    # Timing diagnostic: processing_time_ms = elapsed*1000 feeds the published
+    # timing field only; unit-scale mutants are observable solely through
+    # wall-clock assertions, which the Test Quality Rules prohibit.
+    "audio-core/src/ltc_decoder_libltc\\.rs:266:60: replace \\* with \\+ in assemble_result",
+    "audio-core/src/ltc_decoder_libltc\\.rs:266:60: replace \\* with / in assemble_result",
 ]

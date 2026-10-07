@@ -672,6 +672,92 @@ mod tests {
     }
 
     #[test]
+    fn find_active_channel_sub_threshold_ch0_is_not_amplified() {
+        // ch0 carries a ±1 LSB dither: peak 1/32768 ≈ 3.05e-5, below
+        // SILENT_CHANNEL_PEAK (2/32768). The normalisation must divide by
+        // 32768 — an amplified peak would wrongly keep the silent ch0.
+        let stereo: Vec<i16> = (0..100)
+            .flat_map(|i| [if i % 2 == 0 { 1i16 } else { -1 }, 10_000i16])
+            .collect();
+        assert_eq!(find_active_channel(&stereo, 2), 1);
+    }
+
+    /// Multi-chunk decode (48000 mono samples = 6 × 8192-sample chunks):
+    /// frame indices must stay contiguous across chunk boundaries and
+    /// `timecode_secs` must track the audio position inside the 1 s buffer.
+    #[test]
+    fn decoded_frames_are_contiguous_and_positioned() {
+        let tcs: Vec<Timecode> = (0..25)
+            .map(|i| Timecode {
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+                frames: i as u32,
+            })
+            .collect();
+        let samples = synthesize_ltc_samples_i16(&tcs, 25.0, false, 48000, 0.5);
+        let result =
+            decode_ltc_samples_libltc(&samples, 1, 48000, 25.0, false, Instant::now(), None)
+                .unwrap();
+        assert!(
+            result.valid_frames >= 24,
+            "expected at least 24 valid frames, got {}",
+            result.valid_frames
+        );
+        for (i, ftc) in result.timecodes.iter().enumerate() {
+            assert_eq!(
+                ftc.frame_index, i as u32,
+                "frame indices must be contiguous across chunk boundaries"
+            );
+            assert!(
+                ftc.timecode_secs < 1.5,
+                "frame {} positioned at {} s, outside the 1 s buffer",
+                ftc.frame_index,
+                ftc.timecode_secs
+            );
+        }
+    }
+
+    #[test]
+    fn assemble_result_mid_confidence_is_low_confidence() {
+        // 12 of 25 ≈ 0.48: between the low (0.30) and success (0.70)
+        // thresholds. A `*` or `%` mutant of the ratio collapses to ≥ 1.0
+        // and would report Success.
+        let tcs: Vec<FrameTimecode> = (0..12u32)
+            .map(|i| FrameTimecode {
+                frame_index: i,
+                timecode: Timecode {
+                    hours: 0,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: i,
+                },
+                timecode_secs: i as f64 / 25.0,
+            })
+            .collect();
+        let stats = AssembleStats {
+            fps: 25.0,
+            drop_frame: false,
+            total_duration: 1.0,
+            sample_rate: 48_000,
+            initial_apv: 1920,
+            queue_length: 0,
+            processing_time: Duration::from_millis(5),
+        };
+        let r = assemble_result(tcs, &stats);
+        assert!(
+            matches!(r.status, LtcDecodeStatus::LowConfidence),
+            "got {:?}",
+            r.status
+        );
+        assert!(
+            r.avg_confidence > 0.3 && r.avg_confidence < 0.7,
+            "avg_confidence must stay on the fraction scale, got {}",
+            r.avg_confidence
+        );
+    }
+
+    #[test]
     fn assemble_result_thresholds_confidence_into_status() {
         // 24 valid of 25 possible = 96% ≥ success threshold.
         let tcs: Vec<FrameTimecode> = (0..24u32)

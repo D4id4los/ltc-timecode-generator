@@ -147,6 +147,27 @@ impl DecodeProgress {
 mod tests {
     use super::*;
 
+    // ── LtcDecodeError Display ────────────────────────────────────────────
+
+    // Display output is the contract here (R3/R4 of the error-handling
+    // policy): the UnsupportedBitDepth prose is byte-identical to the
+    // former Failed(...) payload that consumers matched on.
+    #[test]
+    fn test_ltc_decode_error_display_renders_each_variant() {
+        assert_eq!(
+            LtcDecodeError::Cancelled.to_string(),
+            "Decode canceled by user"
+        );
+        assert_eq!(
+            LtcDecodeError::Failed("disk on fire".to_string()).to_string(),
+            "disk on fire"
+        );
+        assert_eq!(
+            LtcDecodeError::UnsupportedBitDepth { bits: 24 }.to_string(),
+            "libltc decoder requires 16-bit integer PCM WAV (got 24 bit Int)"
+        );
+    }
+
     // ── Timecode ──────────────────────────────────────────────────────────
 
     #[test]

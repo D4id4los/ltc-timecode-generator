@@ -1223,6 +1223,56 @@ mod tests {
         assert!(max_amp < 1e-10, "zero-volume beep should be silent");
     }
 
+    /// Envelope shape at sine peaks. At 48 kHz a 1 kHz sine peaks
+    /// (|sin| = 1) exactly at i = 48k + 12, so the expected sample value is
+    /// envelope × volume² (map_volume squares the clamped gain) — an
+    /// independent restatement of the documented attack/5 ms, release/20 ms
+    /// envelope contract.
+    #[test]
+    fn test_beep_envelope_probe_points() {
+        let vol = 0.8f32;
+        let v2 = vol * vol;
+        let samples = generate_beep_samples(48000, 1000.0, 0.5, vol, ChannelSel::Both);
+        let num = 24000usize; // 48000 * 0.5
+        assert_eq!(samples.len(), num * 2, "stereo sample count");
+        // attack = 240 samples, release = 960 samples, release window opens
+        // at i > num - release = 23040.
+        let probes: &[(usize, f32)] = &[
+            (12, 12.0 / 240.0),     // attack ramp
+            (204, 204.0 / 240.0),   // attack ramp, higher
+            (492, 1.0),             // sustain
+            (12012, 1.0),           // sustain, late (phase-sensitive)
+            (23820, 180.0 / 960.0), // release ramp
+        ];
+        for &(i, env) in probes {
+            let got = samples[i * 2]; // left channel
+            let want = env * v2;
+            assert!(
+                (got - want).abs() < 0.02,
+                "sample {i}: expected ≈ {want}, got {got}"
+            );
+        }
+    }
+
+    /// Overlap fixture: the tone (20 ms = 960 samples) equals the release
+    /// length, so `num - release` saturates to 0 and every i > 0 — including
+    /// the boundary sample i == attack — falls inside the release branch.
+    /// The boundary sample must carry the release envelope, not the 1.0 a
+    /// mis-routed attack branch would produce.
+    #[test]
+    fn test_beep_attack_release_overlap_boundary() {
+        let vol = 0.8f32;
+        let samples = generate_beep_samples(48000, 2050.0, 0.02, vol, ChannelSel::Both);
+        assert_eq!(samples.len(), 960 * 2, "stereo sample count");
+        // i = 240 == attack; t·f = 0.005 · 2050 = 10.25 → sine peak.
+        let got = samples[240 * 2];
+        let want = (720.0 / 960.0) * vol * vol;
+        assert!(
+            (got - want).abs() < 0.02,
+            "attack/release boundary sample: expected ≈ {want}, got {got}"
+        );
+    }
+
     #[test]
     fn test_beep_envelope_attack() {
         let samples = generate_beep_samples(48000, 1000.0, 0.1, 1.0, ChannelSel::Both);

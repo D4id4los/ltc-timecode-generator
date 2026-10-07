@@ -347,6 +347,26 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_bcd_does_not_repair_off_invalid_prev() {
+        // prev is BCD-invalid (frames 25 ≥ fps), the suspect sits on prev's
+        // grid (next == prev + 2), but a corrupt anchor must not legitimise
+        // a reconstruction: the suspect is dropped, not "repaired" into a
+        // value derived from garbage.
+        let mut tcs = vec![
+            ftc(0, tc(1, 0, 0, 25), 0.0),       // invalid prev
+            ftc(1, tc(1, 0, 0, 30), 1.0 / FPS), // suspect
+            ftc(2, tc(1, 0, 1, 1), 2.0 / FPS),  // two_after(prev), valid
+        ];
+        let stats = validate_bcd(&mut tcs, FPS, false);
+        // Both the invalid anchor and the suspect are dropped; only the
+        // valid next frame survives.
+        assert_eq!(stats.bcd_dropped, 2);
+        assert_eq!(stats.bcd_repaired, 0);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].timecode, tc(1, 0, 1, 1));
+    }
+
+    #[test]
     fn test_validate_bcd_keeps_clean_input_untouched() {
         let mut tcs = clean_run(50);
         let before = tcs.clone();
@@ -361,6 +381,38 @@ mod tests {
         assert_eq!(stats.outliers_repaired, outliers, "outliers repaired");
         assert_eq!(stats.bcd_dropped, 0);
         assert_eq!(stats.bcd_repaired, 0);
+    }
+
+    #[test]
+    fn test_three_frame_segment_outlier_repaired() {
+        // Exactly three frames — the minimum the pass accepts — with the
+        // classic single-frame outlier shape in the only interior slot.
+        // Guards both the len < 3 gate (len == 3 must proceed) and the
+        // segment-length gate (a 3-frame segment must not be skipped).
+        let mut tcs = vec![
+            ftc(0, tc(1, 0, 0, 0), 0.0),
+            ftc(1, tc(1, 0, 0, 9), 1.0 / FPS),
+            ftc(2, tc(1, 0, 0, 2), 2.0 / FPS),
+        ];
+        let stats = repair_single_frame_outliers(&mut tcs, FPS, false);
+        assert_stats(stats, 1);
+        assert_eq!(tcs[1].timecode, tc(1, 0, 0, 1));
+        assert_eq!(tcs.len(), 3, "consistent tail/head must survive");
+    }
+
+    #[test]
+    fn test_non_positive_fps_disables_outlier_repair() {
+        // fps ≤ 0 leaves the frame list untouched: with no frame rate the
+        // grid is undefined and every "repair" would be fabrication.
+        let mut tcs = vec![
+            ftc(0, tc(1, 0, 0, 0), 0.0),
+            ftc(1, tc(1, 0, 0, 9), 1.0 / FPS),
+            ftc(2, tc(1, 0, 0, 2), 2.0 / FPS),
+        ];
+        let stats = repair_single_frame_outliers(&mut tcs, 0.0, false);
+        assert_eq!(stats, RepairStats::default());
+        assert_eq!(tcs[1].timecode, tc(1, 0, 0, 9));
+        assert_eq!(tcs.len(), 3);
     }
 
     #[test]
@@ -535,6 +587,18 @@ mod tests {
         assert_eq!(r.timecodes[3].timecode, tc(1, 0, 0, 3));
         assert_eq!(r.timecodes[7].timecode, tc(1, 0, 0, 7));
         assert_eq!(r.details.len(), 1, "one details line for the pass");
+    }
+
+    #[test]
+    fn test_apply_value_integrity_outlier_only_still_logs_once() {
+        // A run whose only mutation is a continuity outlier must still
+        // append exactly one details line — the outlier count is the sole
+        // mutation record for value-valid repairs.
+        let mut r = detection_result(clean_run(10));
+        r.timecodes[7].timecode = tc(1, 0, 0, 15); // value-valid outlier
+        apply_value_integrity(&mut r);
+        assert_eq!(r.timecodes[7].timecode, tc(1, 0, 0, 7));
+        assert_eq!(r.details.len(), 1, "outlier-only run must log once");
     }
 
     #[test]
