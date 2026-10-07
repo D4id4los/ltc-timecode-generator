@@ -8947,7 +8947,11 @@ mod tests {
         // a strict `< 3`, so the glitch in it must count; `<=`/`==` would
         // skip the whole segment.
         let ltc = vec![0.0, 0.14, 0.08];
-        let stats = analyze_glitches(&ltc, &[0..3], 25.0);
+        // Single-element Range array trips clippy::single_range_in_vec_init;
+        // the slice type is the API shape.
+        #[allow(clippy::single_range_in_vec_init)]
+        let segments = [0..3];
+        let stats = analyze_glitches(&ltc, segments.as_slice(), 25.0);
         assert_eq!(stats.glitch_count, 1, "interior glitch must count");
         assert_eq!(stats.glitch_indices, vec![1]);
     }
@@ -8957,7 +8961,11 @@ mod tests {
         // expected = (prev + next)/2 on aligned frames: a `+`→`-` mutant
         // reads ≈0 and flags every interior frame.
         let ltc: Vec<f64> = (0..6).map(|i| i as f64 * 0.04).collect();
-        let stats = analyze_glitches(&ltc, &[0..6], 25.0);
+        // Single-element Range array trips clippy::single_range_in_vec_init;
+        // the slice type is the API shape.
+        #[allow(clippy::single_range_in_vec_init)]
+        let segments = [0..6];
+        let stats = analyze_glitches(&ltc, segments.as_slice(), 25.0);
         assert_eq!(
             stats.glitch_count, 0,
             "clean segment, got {:?}",
@@ -8971,7 +8979,11 @@ mod tests {
         // (0.046875 s) sits ON the threshold — the strict `>` must not flag
         // it; `>=` would.
         let ltc = vec![0.0, 0.09375, 0.09375];
-        let stats = analyze_glitches(&ltc, &[0..3], 32.0);
+        // Single-element Range array trips clippy::single_range_in_vec_init;
+        // the slice type is the API shape.
+        #[allow(clippy::single_range_in_vec_init)]
+        let segments = [0..3];
+        let stats = analyze_glitches(&ltc, segments.as_slice(), 32.0);
         assert_eq!(stats.glitch_count, 0, "deviation == threshold is clean");
     }
 

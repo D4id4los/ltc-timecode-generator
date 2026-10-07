@@ -440,9 +440,9 @@ mod tests {
         let mut samples: Vec<i32> = Vec::new();
         let mut ch1_values = Vec::new();
         for i in 0..10 {
-            let v = -5000 + i as i32;
+            let v = -5000 + i;
             ch1_values.push(v);
-            samples.push(1000 * (i as i32) + 7);
+            samples.push(1000 * i + 7);
             samples.push(v);
         }
         let path = write_test_wav_int(&dir, "mono_stereo_frames.wav", 2, 48_000, 16, &samples);
@@ -502,9 +502,9 @@ mod tests {
         let mut samples: Vec<i32> = Vec::new();
         let mut ch1_values = Vec::new();
         for i in 0..10 {
-            let v = -5000 + i as i32;
+            let v = -5000 + i;
             ch1_values.push(v);
-            samples.push(1000 * (i as i32) + 7);
+            samples.push(1000 * i + 7);
             samples.push(v);
         }
         let path = write_test_wav_int(&dir, "i16_stereo_ch1.wav", 2, 48_000, 16, &samples);
