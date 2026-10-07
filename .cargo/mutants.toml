@@ -26,4 +26,33 @@ exclude_re = [
     # and `+` — the two operators always yield the same verdict here.
     # (exclude_re is start-anchored — use the full mutant name.)
     "audio-core/src/ltc_decoder.rs:1469:35: replace - with \\+ in analyze_gaps",
+    # ── 2026-10-07 chunking-machinery triage (triage report, item 3) ──────
+    # Log-only: the condition gates an info! line about non-zero decode
+    # channels; the published result is identical either way.
+    "audio-core/src/chunked_decode.rs:153:28: replace != with == in decode_ltc_chunked",
+    # Branch parity: run_sequential and run_parallel produce identical
+    # ChunkResults for every deterministic input (pinned by
+    # test_run_parallel_matches_run_sequential); the num_workers==1 choice
+    # is unobservable through decode_ltc_chunked, whose pre-cancelled path
+    # returns Err(Cancelled) before the merge in both arms.
+    "audio-core/src/chunked_decode.rs:185:44: replace <= with > in decode_ltc_chunked",
+    # Timing diagnostic: processing_time_ms = elapsed*1000 only feeds the
+    # published timing field; the + and / unit-scale mutants are observable
+    # solely through wall-clock assertions, which the Test Quality Rules
+    # prohibit (no elapsed-time assertions).
+    "audio-core/src/chunked_decode.rs:209:68: replace * with \\+ in decode_ltc_chunked",
+    "audio-core/src/chunked_decode.rs:209:68: replace * with / in decode_ltc_chunked",
+    "audio-core/src/chunked_decode.rs:232:68: replace * with \\+ in decode_ltc_chunked",
+    "audio-core/src/chunked_decode.rs:232:68: replace * with / in decode_ltc_chunked",
+    # Display-only: human-rendered "Chunk N: ..." details line; the typed
+    # ChunkSummary fields it mirrors ARE pinned by tests.
+    "audio-core/src/chunked_decode.rs:349:5: replace render_chunk_detail -> String with String::new()",
+    "audio-core/src/chunked_decode.rs:349:5: replace render_chunk_detail -> String with \"xyzzy\".into()",
+    # Tie overwrite: when chunk_first_secs equals first_tc_secs, `<=`
+    # overwrites the minimum with the same value — unobservable.
+    "audio-core/src/chunked_decode.rs:438:63: replace < with <= in merge_results",
+    # Gate parity: valid_frames == 0 yields avg_confidence 0.0 (the > 0
+    # guard above), and 0.0 fails both confidence branches — the widened
+    # `>=` takes the same NoSyncWord path.
+    "audio-core/src/chunked_decode.rs:489:34: replace > with >= in merge_results",
 ]

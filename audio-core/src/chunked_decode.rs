@@ -2247,4 +2247,223 @@ mod tests {
             result.chunk_summaries
         );
     }
+
+    // ── chunk_geometry overlap floor ─────────────────────────────────────
+
+    /// Stereo 16-bit WAV with LTC on channel 0 and digital silence on
+    /// channel 1 — the 4 bytes-per-mono-sample geometry the floor tests
+    /// rely on.
+    fn write_stereo_ltc_wav(
+        dir: &tempfile::TempDir,
+        start_tc: Timecode,
+        fps: f64,
+        sample_rate: u32,
+        total_frames: usize,
+        volume: f32,
+    ) -> std::path::PathBuf {
+        let samples_per_frame = (sample_rate as f64 / fps).round() as usize;
+        let samples_per_bit = samples_per_frame as f32 / 80.0;
+        let mut tc = start_tc;
+        let mut last_level = (1.0f32, 1.0f32);
+        let mut frame_buf = vec![0.0f32; samples_per_frame * 2];
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let path = dir.path().join("floor_geometry.wav");
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..total_frames {
+            frame_buf.fill(0.0);
+            crate::generate_ltc_frame_stereo(
+                crate::ltc_encoder::LtcFrameParams {
+                    tc: &tc,
+                    drop_frame: false,
+                    total_samples: samples_per_frame,
+                    samples_per_bit,
+                    volume,
+                    channel: crate::ChannelSel::Left,
+                },
+                &mut last_level,
+                &mut frame_buf,
+            );
+            for &s in frame_buf.iter().step_by(2) {
+                let clamped = s.clamp(-1.0, 1.0);
+                writer
+                    .write_sample((clamped * i16::MAX as f32) as i16)
+                    .unwrap();
+                writer.write_sample(0i16).unwrap();
+            }
+            tc = crate::increment_timecode(&tc, fps, false);
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_chunk_geometry_floor_keeps_chunk_above_twice_overlap() {
+        // 1000 bytes / 4 bytes-per-mono-sample = 250 raw samples — far below
+        // the 2×overlap floor. The floor must win: a chunk at or below the
+        // overlap makes the boundary walk stop after the first chunk
+        // (next <= pos) and silently truncates the file at ~0.15 s.
+        let config = DecodeConfig {
+            chunk_size_bytes: 1000,
+            overlap_seconds: 0.3,
+        };
+        let (chunk_mono, overlap) = chunk_geometry(&config, 4, 48_000);
+        assert_eq!(overlap, 14_400);
+        assert_eq!(chunk_mono, 28_800);
+    }
+
+    #[test]
+    fn test_count_chunks_floor_geometry_predicts_full_coverage() {
+        // 1.25 s @ 48 kHz stereo 16-bit with the floor binding: advancing
+        // 28800-sample chunks with 14400 overlap cover [0, 60000) in exactly
+        // 4 steps. An overlap-sized chunk would predict ~1 (walk stops), a
+        // 2-samples-too-small one ~22 800.
+        let config = DecodeConfig {
+            chunk_size_bytes: 1000,
+            overlap_seconds: 0.3,
+        };
+        assert_eq!(count_chunks(60_000, 48_000, 2, 16, &config), 4);
+    }
+
+    #[test]
+    fn test_chunked_decode_full_coverage_under_floor_geometry() {
+        // End-to-end companion to the floor tests: with the floor binding,
+        // every frame of the file decodes. A plan truncated at the first
+        // chunk would keep only the first ~3 frames of 31.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_stereo_ltc_wav(
+            &dir,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            25.0,
+            48_000,
+            31,
+            0.8,
+        );
+        let config = DecodeConfig {
+            chunk_size_bytes: 1000,
+            overlap_seconds: 0.3,
+        };
+        let progress = DecodeProgress::new(4);
+        let result = decode_ltc_chunked(&path, false, 25.0, false, config, &progress).unwrap();
+        assert!(
+            result.valid_frames >= 25,
+            "expected ≥25 of 31 frames under floor geometry, got {}",
+            result.valid_frames
+        );
+    }
+
+    // ── merge_results first-TC / dedup / confidence boundaries ───────────
+
+    #[test]
+    fn test_merge_first_tc_min_prefers_offset_later_chunk() {
+        // Chunk 1 starts at 5.0 s and carries the earliest absolute first TC:
+        // 1.0 + 5.0 = 6.0 beats chunk 0's 10.0. The chunk start must be
+        // ADDED — a subtraction yields −4.0, the > 0.0 gate discards it, and
+        // the merge would wrongly fall back to 10.0.
+        let plan = test_plan(vec![(0, 240_000), (240_000, 480_000)], 20.0, 2.0);
+        let results = vec![
+            ChunkResult {
+                chunk_idx: 0,
+                result: Ok(chunk_ok(10.0, 1)),
+            },
+            ChunkResult {
+                chunk_idx: 1,
+                result: Ok(chunk_ok(1.0, 1)),
+            },
+        ];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert!(
+            (merged.first_ltc_timecode_secs - 6.0).abs() < 1e-9,
+            "expected 6.0, got {}",
+            merged.first_ltc_timecode_secs
+        );
+    }
+
+    #[test]
+    fn test_merge_zero_first_tc_chunk_does_not_zero_the_minimum() {
+        // A later chunk reporting first_ltc_timecode_secs == 0.0 (no LTC
+        // decoded there) must be excluded by the strict `> 0.0` gate before
+        // the chunk start is added. A `>=` would add chunk 1's 5.0 s offset
+        // to 0.0 and drag the merged first TC to 5.0.
+        let plan = test_plan(vec![(0, 240_000), (240_000, 480_000)], 20.0, 2.0);
+        let results = vec![
+            ChunkResult {
+                chunk_idx: 0,
+                result: Ok(chunk_ok(10.0, 1)),
+            },
+            ChunkResult {
+                chunk_idx: 1,
+                result: Ok(chunk_ok(0.0, 0)),
+            },
+        ];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert!(
+            (merged.first_ltc_timecode_secs - 10.0).abs() < 1e-9,
+            "expected 10.0, got {}",
+            merged.first_ltc_timecode_secs
+        );
+    }
+
+    #[test]
+    fn test_merge_dedup_threshold_uses_overlap_branch_when_below_half_frame() {
+        // fps 25 → half-frame 0.02 s; overlap 0.01 s → the min() must pick
+        // the overlap branch (0.005 s). Frames 10 ms apart survive the dedup;
+        // `overlap + 0.5` or `overlap / 0.5` both push the threshold to
+        // 0.02 s and wrongly drop the second frame.
+        let plan = test_plan(vec![(0, 480_000)], 0.5, 0.01);
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(two_frames_at(0.001, 0.011)),
+        }];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert_eq!(
+            merged.timecodes.len(),
+            2,
+            "gap 0.01 > threshold 0.005 must keep both frames"
+        );
+    }
+
+    #[test]
+    fn test_merge_dedup_drops_frame_exactly_at_threshold() {
+        // fps 50 → frame_duration = fl(0.02); overlap 0.04 → half-overlap =
+        // fl(0.02), so the threshold is the half-frame t = fl(0.02)/2. All
+        // values dyadic: frames at t and 2t give a gap of exactly t, and the
+        // strict `>` must drop the second frame (a `>=` would keep it).
+        let plan = test_plan(vec![(0, 96_000)], 2.0, 0.04);
+        let t = (1.0f64 / 50.0) / 2.0;
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Ok(two_frames_at(t, 2.0 * t)),
+        }];
+        let merged = merge_results(&results, &plan, 50.0);
+        assert_eq!(
+            merged.timecodes.len(),
+            1,
+            "a frame at exactly the dedup threshold is dropped"
+        );
+    }
+
+    #[test]
+    fn test_merge_zero_total_possible_keeps_zero_confidence() {
+        // total_duration 0 → true_total_possible 0: the `> 0` guard must
+        // yield 0.0 confidence; a `>=` would divide 0/0 and poison
+        // avg_confidence with NaN.
+        let plan = test_plan(vec![], 0.0, 0.0);
+        let results = vec![ChunkResult {
+            chunk_idx: 0,
+            result: Err(LtcDecodeError::Failed("boom".into())),
+        }];
+        let merged = merge_results(&results, &plan, 25.0);
+        assert_eq!(merged.total_possible, 0);
+        assert_eq!(merged.avg_confidence, 0.0, "0/0 must be guarded to 0.0");
+    }
 }

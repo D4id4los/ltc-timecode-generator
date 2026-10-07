@@ -4682,6 +4682,319 @@ mod tests {
         assert_eq!(find_first_coherent_index(&tcs, fps, false), Some(0));
     }
 
+    // ── find_first_coherent_index boundary table ────────────────────────
+    // Killing tests for the scan-boundary mutants: min_run arithmetic, the
+    // len gate, the per-field validity comparisons, the pair-timing
+    // tolerance, and the run-length early return.
+
+    /// `n` consecutive frames starting at `start_tc` with `step` seconds
+    /// between neighbouring frames.
+    fn consecutive_run(
+        start_tc: Timecode,
+        fps: f64,
+        drop_frame: bool,
+        n: usize,
+        step: f64,
+    ) -> Vec<FrameTimecode> {
+        let mut tc = start_tc;
+        (0..n)
+            .map(|i| {
+                let ftc = FrameTimecode {
+                    frame_index: i as u32,
+                    timecode: tc,
+                    timecode_secs: i as f64 * step,
+                };
+                tc = crate::increment_timecode(&tc, fps, drop_frame);
+                ftc
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_coherent_index_min_run_is_two_seconds_not_two_plus_fps() {
+        // 40 coherent frames at 25 fps = 1.6 s — below the 2 s (50-frame)
+        // minimum run, so no index qualifies. `(2.0 + fps).ceil()` would
+        // lower the bar to 27 and accept the run.
+        let fps = 25.0;
+        let tcs = consecutive_run(
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            40,
+            1.0 / fps,
+        );
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), None);
+    }
+
+    #[test]
+    fn test_coherent_index_exactly_min_run_qualifies() {
+        // Exactly 50 coherent frames at 25 fps = the 2 s minimum: the length
+        // gate is a strict `<`, so the run must still be reported.
+        let fps = 25.0;
+        let tcs = consecutive_run(
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            50,
+            1.0 / fps,
+        );
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), Some(0));
+    }
+
+    #[test]
+    fn test_coherent_index_boundary_field_values_are_invalid_start() {
+        // Fields at their exact inclusive-looking boundary must be rejected
+        // as a run anchor. A `<=` or `&&`→`||` weakening of a field check
+        // would anchor the run at index 0 instead.
+        let fps = 25.0;
+        // Runs that stay on the boundary value after incrementing (hours 24
+        // or 30, minutes 60, seconds 60): under the real predicate the whole
+        // run is invalid → None; a weakened predicate anchors at 0.
+        let stuck_at_boundary = [
+            Timecode {
+                hours: 24,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            Timecode {
+                hours: 30,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            Timecode {
+                hours: 1,
+                minutes: 60,
+                seconds: 0,
+                frames: 0,
+            },
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 60,
+                frames: 0,
+            },
+        ];
+        for start in stuck_at_boundary {
+            let tcs = consecutive_run(start, fps, false, 51, 1.0 / fps);
+            assert_eq!(
+                find_first_coherent_index(&tcs, fps, false),
+                None,
+                "boundary tc {:?} must invalidate the whole run",
+                start
+            );
+        }
+        // frames == max_frames rolls over on increment: frame 0 is invalid,
+        // frames 1.. form a 50-frame run → Some(1); a weakened frames check
+        // would anchor at 0.
+        let tcs = consecutive_run(
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 25,
+            },
+            fps,
+            false,
+            51,
+            1.0 / fps,
+        );
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), Some(1));
+    }
+
+    #[test]
+    fn test_coherent_index_pair_timing_tolerance_is_half_frame_strict() {
+        // fps 32 makes everything dyadic-exact: frames spaced 1.5 frame
+        // periods deviate from the expected spacing by exactly half a frame,
+        // so the strict `<` must reject every pair (→ None); a `<=` would
+        // accept the whole run.
+        let fps = 32.0;
+        let step = 1.5 / fps;
+        let tcs = consecutive_run(
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            64,
+            step,
+        );
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), None);
+    }
+
+    #[test]
+    fn test_coherent_index_pair_timing_tolerance_bounds_are_finite() {
+        // Timecodes consecutive but audio spaced 2.5 frame periods: the
+        // deviation (1.5 frames) sits above the real tolerance (0.5 frames)
+        // yet below both operator-mutant tolerances (frame+0.5 s ≈ 13.5
+        // frames and frame/0.5 = 2 frames), so a loosened tolerance accepts
+        // the run that the real one rejects.
+        let fps = 25.0;
+        let step = 2.5 / fps;
+        let tcs = consecutive_run(
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            50,
+            step,
+        );
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), None);
+    }
+
+    #[test]
+    fn test_coherent_index_run_length_gate_never_fires_below_min_run() {
+        // 60 valid timecodes, none consecutive: every run dies at length 1,
+        // so the answer is None. An early-return on `run_len < min_run`
+        // would report index 0 immediately.
+        let fps = 25.0;
+        let tc = Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
+        let tcs: Vec<FrameTimecode> = (0..60)
+            .map(|i| FrameTimecode {
+                frame_index: i as u32,
+                timecode: tc,
+                timecode_secs: i as f64 / fps,
+            })
+            .collect();
+        assert_eq!(find_first_coherent_index(&tcs, fps, false), None);
+    }
+
+    // ── apply_coherent_first_timecode ───────────────────────────────────
+
+    fn decode_result_with_timecodes(tcs: Vec<FrameTimecode>, fps: f64) -> LtcDetectionResult {
+        LtcDetectionResult {
+            status: LtcDecodeStatus::Success,
+            detected_fps: fps as f32,
+            drop_frame: false,
+            total_possible_frames: tcs.len() as u32,
+            valid_frames: tcs.len() as u32,
+            timecodes: tcs,
+            avg_confidence: 1.0,
+            details: vec![],
+            total_audio_duration_secs: 0.0,
+            sample_rate: 48_000,
+            processing_time_ms: 0.0,
+            first_ltc_timecode_secs: 0.0,
+            quality: None,
+            chunk_summaries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_apply_coherent_trims_non_coherent_lead() {
+        // 3 noise frames (invalid timecodes) before a 50-frame coherent run:
+        // the lead must be trimmed, indexes renumbered, and the first-TC
+        // seconds moved to the first coherent frame.
+        let fps = 25.0;
+        let mut tcs = vec![
+            FrameTimecode {
+                frame_index: 0,
+                timecode: Timecode {
+                    hours: 45,
+                    minutes: 85,
+                    seconds: 85,
+                    frames: 45,
+                },
+                timecode_secs: 0.0,
+            },
+            FrameTimecode {
+                frame_index: 1,
+                timecode: Timecode {
+                    hours: 9,
+                    minutes: 9,
+                    seconds: 9,
+                    frames: 9,
+                },
+                timecode_secs: 0.11,
+            },
+            FrameTimecode {
+                frame_index: 2,
+                timecode: Timecode {
+                    hours: 3,
+                    minutes: 33,
+                    seconds: 33,
+                    frames: 3,
+                },
+                timecode_secs: 0.27,
+            },
+        ];
+        let run = consecutive_run(
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            50,
+            1.0 / fps,
+        );
+        let first_coherent_secs = run[0].timecode_secs;
+        tcs.extend(run);
+        for (i, ftc) in tcs.iter_mut().enumerate() {
+            ftc.frame_index = i as u32;
+        }
+        let mut result = decode_result_with_timecodes(tcs, fps);
+        apply_coherent_first_timecode(&mut result);
+        assert_eq!(result.timecodes.len(), 50, "lead frames must be trimmed");
+        assert_eq!(result.timecodes[0].frame_index, 0, "indexes renumbered");
+        assert!(
+            (result.first_ltc_timecode_secs - first_coherent_secs).abs() < 1e-9,
+            "first TC secs must move to the first coherent frame"
+        );
+    }
+
+    #[test]
+    fn test_apply_coherent_already_clean_result_is_untouched() {
+        // A fully coherent decode reports Some(0) — nothing to trim: the
+        // timecodes, first-TC seconds and details list must all stay
+        // exactly as they were (no "trimmed 0 frames" details line).
+        let fps = 25.0;
+        let tcs = consecutive_run(
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            false,
+            60,
+            1.0 / fps,
+        );
+        let mut result = decode_result_with_timecodes(tcs, fps);
+        let details_before = result.details.len();
+        let secs_before = result.first_ltc_timecode_secs;
+        apply_coherent_first_timecode(&mut result);
+        assert_eq!(result.timecodes.len(), 60);
+        assert_eq!(result.details.len(), details_before, "no trim note added");
+        assert!((result.first_ltc_timecode_secs - secs_before).abs() < 1e-9);
+    }
+
     // ── bits_hamming_distance_16 ───────────────────────────────────────
 
     #[test]
