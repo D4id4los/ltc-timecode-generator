@@ -30,9 +30,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install system dependencies (alsa, pipewire, pulse, fontconfig, libltc, libclang, ffmpeg)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libltc-dev libclang-dev ffmpeg
+        # resilient-apt: bounded retries + .deb cache against degraded
+        # azure.archive.ubuntu.com nodes (see the action's description).
+        # timeout-minutes is the fail-fast backstop — composite steps
+        # cannot declare it, so it lives here on every caller.
+        timeout-minutes: 30
+        uses: ./.github/actions/resilient-apt
+        with:
+          packages: libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libltc-dev libclang-dev ffmpeg
 
       # WP-T7 guardrail: needs only python3 (preinstalled), so it runs
       # before any toolchain install and reds the PR cheapest-first.
@@ -126,9 +131,10 @@ jobs:
 
       - name: Install system dependencies (alsa, pipewire, pulse, fontconfig, libltc, libclang)
         # bindgen runs at check time, so libclang + libltc headers are needed
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libltc-dev libclang-dev
+        timeout-minutes: 30
+        uses: ./.github/actions/resilient-apt
+        with:
+          packages: libasound2-dev libpipewire-0.3-dev libpulse-dev libfontconfig1-dev libltc-dev libclang-dev
 
       - name: Install Rust toolchain (MSRV 1.92)
         uses: dtolnay/rust-toolchain@1.92
@@ -169,17 +175,17 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install cross toolchain (mingw-w64 x86-64, libltc headers, libclang)
-        # Step-level timeout: a runner stalled on a slow/degraded apt mirror
-        # (azure.archive.ubuntu.com hangs are a recurring hosted-runner
-        # issue) fails in minutes with a clear re-run signal instead of
-        # sitting for hours.
-        timeout-minutes: 10
-        run: |
-          sudo apt-get update
-          # Only the x86-64 toolchain: the full `mingw-w64` meta-package
-          # drags in the entire i686 toolchain (~half the download) that the
-          # x86_64-pc-windows-gnu target never uses.
-          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 libltc-dev libclang-dev
+        # resilient-apt (bounded retries + .deb cache) instead of the bare
+        # 10-min step timeout from 69a36b9: this job downloads 173 MB in a
+        # handful of huge mingw debs — the worst case for the degraded
+        # azure-mirror nodes that stall apt (actions/runner-images#14823).
+        # Only the x86-64 toolchain: the full `mingw-w64` meta-package
+        # drags in the entire i686 toolchain (~half the download) that the
+        # x86_64-pc-windows-gnu target never uses.
+        timeout-minutes: 30
+        uses: ./.github/actions/resilient-apt
+        with:
+          packages: gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 libltc-dev libclang-dev
 
       - name: Install Rust toolchain (stable, windows-gnu target)
         uses: dtolnay/rust-toolchain@stable
