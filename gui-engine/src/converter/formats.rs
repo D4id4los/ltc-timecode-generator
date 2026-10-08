@@ -317,6 +317,20 @@ mod tests {
     }
 
     #[test]
+    fn test_select_best_combination_av1_only_lands_non_mov() {
+        // ffmpeg ≥ 8 movenc rejects AV1: with only AV1 encoders installed,
+        // the auto-selection must never pair av1 with mov.
+        let caps = make_caps(
+            true,
+            BTreeSet::from(["libsvtav1", "pcm_s24le"]),
+            BTreeSet::from(["mov", "matroska", "mp4"]),
+        );
+        let (container, codec, _) = select_best_combination(&caps);
+        assert_eq!(codec, "av1");
+        assert_ne!(container, "mov", "av1 must not be auto-paired with mov");
+    }
+
+    #[test]
     fn test_select_best_combination_falls_back_to_dnxhd() {
         let mut caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
         caps.available_encoders = ["pcm_s24le", "dnxhd", "libx264"]

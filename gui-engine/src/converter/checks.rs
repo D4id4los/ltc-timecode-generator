@@ -242,7 +242,7 @@ pub fn conversion_sanity_check_pure(
             container: container.to_string(),
             hint: match codec_id {
                 "prores" => "ProRes typically requires MOV or MKV containers.",
-                "av1" => "AV1 works in MKV, MP4, and MOV containers.",
+                "av1" => "AV1 works in MKV and MP4 containers.",
                 "dnxhd" => "DNxHD requires MXF, MOV, or MKV containers.",
                 "h264" | "h265" => "H.264/HEVC work in all containers.",
                 _ => "",

@@ -222,7 +222,10 @@ pub static VIDEO_CODECS: &[VideoCodecSpec] = &[
     VideoCodecSpec {
         id: "av1",
         label: "AV1 — good compression, widely supported",
-        containers: &["mkv", "mov", "mp4"],
+        // No `mov`: ffmpeg ≥ 8's movenc refuses AV1 ("av1 only supported in
+        // MP4 and AVIF") and fails at muxer-header time for every encoder —
+        // the av01 sample entry was never a sanctioned MOV mapping anyway.
+        containers: &["mkv", "mp4"],
         codec_args: NO_ARGS,
         candidates: &[
             EncoderCandidate {
@@ -632,8 +635,38 @@ mod tests {
     }
 
     #[test]
+    fn test_av1_container_matrix_excludes_mov() {
+        // ffmpeg ≥ 8's movenc refuses AV1 ("av1 only supported in MP4 and
+        // AVIF"): planning av1 into mov fails at muxer-header time for
+        // every encoder candidate, so the registry must not offer the pair.
+        assert!(!codec_supports_container("av1", "mov"));
+        assert!(codec_supports_container("av1", "mkv"));
+        assert!(codec_supports_container("av1", "mp4"));
+    }
+
+    #[test]
+    fn test_av1_dropdown_not_offered_for_mov() {
+        // Even with AV1 encoders installed, mov must not offer av1; mp4
+        // and mkv still do.
+        let c = caps(["libsvtav1", "pcm_s24le"]);
+        let ids = |container: &str| -> Vec<String> {
+            available_video_codecs(container, &c)
+                .into_iter()
+                .map(|(k, _, _)| k)
+                .collect()
+        };
+        assert!(
+            !ids("mov").iter().any(|k| k == "av1"),
+            "av1 must not be offered for mov"
+        );
+        assert!(ids("mp4").iter().any(|k| k == "av1"));
+        assert!(ids("mkv").iter().any(|k| k == "av1"));
+    }
+
+    #[test]
     fn test_available_video_codecs_for_container() {
-        // mov: prores, dnxhd, h264, h265, av1 — only h264/h265 have candidates
+        // mov: prores, dnxhd, h264, h265 — av1 excluded by the registry
+        // (ffmpeg ≥ 8 movenc rejects it); only h264/h265 have candidates
         let c = caps(["libx264", "libx265", "pcm_s24le"]);
         let available = available_video_codecs("mov", &c);
         let ids: Vec<&str> = available.iter().map(|(k, _, _)| k.as_str()).collect();

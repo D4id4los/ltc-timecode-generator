@@ -8,10 +8,13 @@ use crate::subprocess::{no_window_command, run_ffmpeg_collect_stderr, FFMPEG_STA
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StepFailure {
-    /// ffmpeg exited before producing any output — typically an encoder
+    /// ffmpeg exited before producing any output — an encoder
     /// initialization failure (the encoder is listed by `ffmpeg -encoders`
-    /// but the hardware/driver is missing). Safe to retry with the next
-    /// candidate in the chain.
+    /// but the hardware/driver is missing), or a pre-output rejection by
+    /// another part of the command (e.g. the muxer refusing the
+    /// codec×container pair at header-write time). Retrying with the next
+    /// candidate in the chain is safe; an encoder-independent cause fails
+    /// every candidate and surfaces as "all encoder candidates … failed".
     EncoderInit(String),
     /// Failure after output was produced, a spawn error, or user
     /// cancellation. Not retryable with a different encoder.
@@ -30,6 +33,23 @@ impl std::fmt::Display for StepFailure {
 /// Minimum output file size (in bytes) that suggests ffmpeg actually produced
 /// real encoded/copied content (not just a muxer header).
 pub const MIN_PRODUCED_OUTPUT_BYTES: u64 = 4096;
+
+/// Render an ffmpeg argument vector as a single log-friendly command line.
+/// Arguments containing whitespace or single quotes are single-quoted with
+/// the standard `'\''` escape. Readability aid for logs only — never parsed
+/// back.
+pub fn format_command_line(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.chars().any(|c| c.is_whitespace() || c == '\'') {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Highest step fraction reported while the ffmpeg process is still running.
 /// ffmpeg emits `progress=end` (and `out_time` can reach the container
@@ -57,6 +77,27 @@ pub fn parse_out_time(line: &str) -> Option<f64> {
     let s: f64 = caps[3].parse().unwrap_or(0.0);
     let frac: f64 = caps[4].parse().unwrap_or(0.0) / 1_000_000.0;
     Some(h * 3600.0 + m * 60.0 + s + frac)
+}
+
+/// Maximum captured-ffmpeg-stderr length (in bytes) logged to the
+/// application log on a failed run. ffmpeg's error is at the very bottom of
+/// its stderr, so only a capped tail is forwarded — progress output
+/// (`-progress pipe:2` also writes to stderr) must not flood the log.
+pub const FFMPEG_STDERR_LOG_MAX_CHARS: usize = 4000;
+
+/// Tail of the captured ffmpeg stderr for the application log, capped at
+/// [`FFMPEG_STDERR_LOG_MAX_CHARS`] bytes and snapped forward to the next
+/// line boundary so the first logged line is whole.
+pub fn stderr_log_tail(stderr: &str) -> String {
+    if stderr.len() <= FFMPEG_STDERR_LOG_MAX_CHARS {
+        return stderr.to_string();
+    }
+    let cut = stderr.len() - FFMPEG_STDERR_LOG_MAX_CHARS;
+    let start = stderr[cut..]
+        .find('\n')
+        .map(|i| cut + i + 1)
+        .unwrap_or(stderr.len());
+    format!("...\n{}", &stderr[start..])
 }
 
 /// Classify an ffmpeg step failure as retryable (`EncoderInit`) or
@@ -144,6 +185,14 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
 
     let args_str = format!("{} ffmpeg \\\n  {}", step_label, full_args.join(" \\\n  "));
     report.set_log(&args_str);
+    // Full precise command line in the application log: the per-job report
+    // is only visible in the UI, and a failing ffmpeg invocation cannot be
+    // diagnosed from arg counts alone.
+    info!(
+        "{} command: ffmpeg {}",
+        step_label,
+        format_command_line(full_args)
+    );
 
     if report.is_cancelled() {
         return Err(StepFailure::Fatal("cancelled by user".to_string()));
@@ -214,6 +263,13 @@ pub fn run_ffmpeg_process_with<R: crate::converter::runner::ConversionReport>(
             Err(StepFailure::Fatal(err_msg))
         }
         Err(crate::subprocess::FfmpegRunError::Exit { code, .. }) => {
+            // Surface the captured stderr in the application log: the full
+            // text rides the per-job report (UI only), and a bare exit code
+            // is not diagnosable from the log alone.
+            let tail = stderr_log_tail(&local_log);
+            if !tail.trim().is_empty() {
+                warn!("{} ffmpeg stderr tail:\n{}", step_label, tail);
+            }
             warn!(
                 "{} ffmpeg exited with code {}: {}",
                 step_label,
@@ -556,5 +612,130 @@ mod tests {
             Err(StepFailure::EncoderInit(_)) => {} // expected
             other => panic!("expected EncoderInit, got {:?}", other),
         }
+    }
+
+    // ── stderr_log_tail ──────────────────────────────────────────────────
+
+    #[test]
+    fn stderr_log_tail_short_input_unchanged() {
+        let log = "Input #0, mov, from 'in.mp4'\n[mov] av1 only supported in MP4 and AVIF.\n";
+        assert_eq!(stderr_log_tail(log), log);
+    }
+
+    #[test]
+    fn stderr_log_tail_long_input_keeps_the_end_snapped_to_line() {
+        let mut log: Vec<String> = (0..1000).map(|i| format!("progress line {i}")).collect();
+        let err_line = "[out#0/mov] Could not write header: Invalid argument".to_string();
+        log.push(err_line.clone());
+        let joined = log.join("\n");
+
+        let capped = stderr_log_tail(&joined);
+        assert!(
+            capped.len() <= FFMPEG_STDERR_LOG_MAX_CHARS + 1,
+            "capped tail must stay within the budget: {} chars",
+            capped.len()
+        );
+        assert!(
+            capped.ends_with(&err_line),
+            "the tail must keep the final error line"
+        );
+        assert!(
+            !capped.contains("progress line 0\n"),
+            "the head must be dropped: got {} chars",
+            capped.len()
+        );
+    }
+
+    #[test]
+    fn stderr_log_tail_empty() {
+        assert_eq!(stderr_log_tail(""), "");
+    }
+
+    /// A failing ffmpeg run must forward its captured stderr to the
+    /// application log (warn level), not only into the per-job UI report.
+    /// nextest runs each test in its own process, so installing the global
+    /// capturing logger here is deterministic; under plain `cargo test` the
+    /// `let _ =` makes a lost init race a no-op.
+    #[test]
+    fn run_ffmpeg_failure_logs_captured_stderr_tail() {
+        let buffer = match crate::log_buffer::init_logger("debug") {
+            Ok(buffer) => buffer,
+            Err(_) => return, // another test owns the global logger
+        };
+        let report = TestReport::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("_test_stderr_tail_log.mp4");
+
+        let mut spawner = |_args: &[String]| {
+            let mut cmd = if cfg!(windows) {
+                let mut c = std::process::Command::new("cmd");
+                c.args([
+                    "/C",
+                    "echo [mov] av1 only supported in MP4.>&2 & exit /b 234",
+                ]);
+                c
+            } else {
+                let mut cmd = std::process::Command::new("sh");
+                cmd.args([
+                    "-c",
+                    "echo '[mov] av1 only supported in MP4.' >&2; exit 234",
+                ]);
+                cmd
+            };
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.spawn()
+        };
+
+        let result = run_ffmpeg_process_with(
+            &["-i".to_string(), "nonexistent".to_string()],
+            &out,
+            &report,
+            1,
+            1,
+            &mut spawner,
+            Duration::from_secs(5),
+        );
+        assert!(result.is_err(), "expected the run to fail");
+
+        let entries = buffer.lock().unwrap().entries.clone();
+        assert!(
+            entries.iter().any(
+                |e| e.contains("ffmpeg stderr tail") && e.contains("av1 only supported in MP4")
+            ),
+            "captured stderr must reach the application log; got {} entries",
+            entries.len()
+        );
+    }
+
+    // ── format_command_line ──────────────────────────────────────────────
+
+    #[test]
+    fn format_command_line_plain_args_unchanged() {
+        let args = vec![
+            "-y".to_string(),
+            "-i".to_string(),
+            "/media/in/file.mp4".to_string(),
+        ];
+        assert_eq!(format_command_line(&args), "-y -i /media/in/file.mp4");
+    }
+
+    #[test]
+    fn format_command_line_quotes_spaces_and_embedded_quotes() {
+        let args = vec![
+            "-i".to_string(),
+            "/media/My Clips/a b.mov".to_string(),
+            "-metadata".to_string(),
+            "title=it's".to_string(),
+        ];
+        assert_eq!(
+            format_command_line(&args),
+            "-i '/media/My Clips/a b.mov' -metadata 'title=it'\\''s'"
+        );
+    }
+
+    #[test]
+    fn format_command_line_empty() {
+        assert_eq!(format_command_line(&[]), "");
     }
 }

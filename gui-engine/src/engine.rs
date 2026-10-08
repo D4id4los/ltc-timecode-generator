@@ -1706,26 +1706,23 @@ fn on_conversion_finished(els: &mut EngineLoopState, outcome: JobOutcome, payloa
     if let Some(status) = els.current.jobs.get_mut(&JobKind::Conversion) {
         status.apply_outcome(&outcome);
     }
-    let payload = match payload {
-        JobFinal::Conversion {
-            encoder_used,
-            steps_attempted,
-        } => {
-            info!(
-                "Conversion finished: encoder_used={:?}, steps_attempted={}",
-                encoder_used, steps_attempted,
-            );
+    // A `JobFinal::Conversion` payload only rides success (failure paths
+    // emit `NoPayload` by design), so the payload is decoded per outcome.
+    let payload_encoder_used = match (&outcome, payload) {
+        (JobOutcome::Succeeded { .. }, JobFinal::Conversion { encoder_used, .. }) => {
+            info!("Conversion finished: encoder_used={:?}", encoder_used);
             Some(encoder_used)
         }
-        other => {
+        (JobOutcome::Succeeded { .. }, other) => {
             warn!(
-                "JobKind::Conversion finished with unexpected payload: {:?}",
+                "JobKind::Conversion succeeded with unexpected payload: {:?}",
                 other
             );
             None
         }
+        _ => None,
     };
-    match (payload, outcome) {
+    match (payload_encoder_used, outcome) {
         (Some(encoder_used), JobOutcome::Succeeded { .. }) => {
             recompute_converter_derived(&mut els.current);
             match encoder_used {

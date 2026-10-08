@@ -68,6 +68,10 @@ pub struct JobConversionReport<'a> {
     overall_progress: AtomicU32,
     overall_log: Mutex<String>,
     failed: AtomicBool,
+    /// Concise reason from the last `mark_failed` call. Lives here rather
+    /// than only in the tracker message because the job wrapper resets that
+    /// message before observing the failure.
+    failure: Mutex<Option<String>>,
 }
 
 impl<'a> JobConversionReport<'a> {
@@ -78,7 +82,13 @@ impl<'a> JobConversionReport<'a> {
             overall_progress: AtomicU32::new(0),
             overall_log: Mutex::new(String::new()),
             failed: AtomicBool::new(false),
+            failure: Mutex::new(None),
         }
+    }
+
+    /// The concise failure reason recorded by the last `mark_failed`, if any.
+    pub fn failure_reason(&self) -> Option<String> {
+        self.failure.lock().unwrap().clone()
     }
 
     fn overall(&self) -> f32 {
@@ -142,6 +152,7 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
 
     fn mark_failed(&self, log: &str) {
         self.failed.store(true, Ordering::Relaxed);
+        *self.failure.lock().unwrap() = Some(log.to_string());
         self.ctx.progress.unit(0).set_fraction(0.0);
         let log_text = self.overall_log.lock().unwrap().clone();
         let full = if log.is_empty() {
@@ -711,12 +722,14 @@ pub fn spawn_conversion_job(
     ctx.progress.set_message("");
 
     if report.is_failed() {
-        let log_msg = ctx.progress.snapshot().message.clone();
-        let err_msg = if log_msg.is_empty() {
+        // The reason is captured on the report itself: the tracker message
+        // below has already been reset, and reading it back here produced
+        // the "Unknown conversion failure" placeholder instead of the real
+        // failure context.
+        let err_msg = report.failure_reason().unwrap_or_else(|| {
+            warn!("conversion failed without a recorded failure reason");
             "Unknown conversion failure".to_string()
-        } else {
-            log_msg
-        };
+        });
         Err(JobError::Failed(err_msg))
     } else if report.is_cancelled() {
         info!("Conversion job cancelled");
@@ -2329,5 +2342,59 @@ mod tests {
             *report.failed.lock().unwrap(),
             "exhausted chain marks the run failed"
         );
+    }
+
+    // ── failure-reason surfacing (spawn_conversion_job) ─────────────────
+
+    fn test_job_context() -> crate::job::JobContext {
+        crate::job::JobContext {
+            progress: crate::job::ProgressTracker::new(vec![crate::job::UnitSpec {
+                weight: 1.0,
+                label: "step".to_string(),
+            }]),
+            cancel: crate::job::CancelToken::new(),
+            emit: Box::new(|_| {}),
+        }
+    }
+
+    /// The failure reason must live on the report, not only in the tracker
+    /// message: the job wrapper resets that message before observing the
+    /// failure (the "Unknown conversion failure" incident).
+    #[test]
+    fn job_conversion_report_failure_reason_survives_message_wipe() {
+        let ctx = test_job_context();
+        let report = JobConversionReport::new(&ctx);
+        assert_eq!(report.failure_reason(), None);
+
+        report.mark_failed("all encoder candidates for codec 'av1' failed to initialize");
+        ctx.progress.set_message("");
+        assert_eq!(
+            report.failure_reason().as_deref(),
+            Some("all encoder candidates for codec 'av1' failed to initialize"),
+            "the reason must survive a later tracker-message reset"
+        );
+    }
+
+    /// A failing conversion must surface its real failure reason through
+    /// `JobError::Failed`, never the generic placeholder. Runs the real
+    /// ffmpeg against a nonexistent input; the spawn-failure path (no
+    /// ffmpeg installed) fails the same way.
+    #[test]
+    fn spawn_conversion_job_reports_real_failure_reason() {
+        let ctx = test_job_context();
+        let mut settings = make_settings_audio_only();
+        settings.input_files = vec![PathBuf::from("/nonexistent/ltc-test-input.wav")];
+        settings.video_encoder = "av1".to_string();
+        settings.container = "mp4".to_string();
+
+        match spawn_conversion_job(&ctx, settings, None) {
+            Err(crate::job::JobError::Failed(msg)) => {
+                assert_ne!(
+                    msg, "Unknown conversion failure",
+                    "the real failure reason must reach JobError::Failed, got the placeholder"
+                );
+            }
+            other => panic!("expected JobError::Failed, got {:?}", other),
+        }
     }
 }
