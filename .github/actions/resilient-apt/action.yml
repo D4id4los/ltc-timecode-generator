@@ -1,0 +1,91 @@
+name: Resilient apt install
+description: >-
+  apt-get update + install that survives degraded azure.archive.ubuntu.com
+  nodes on hosted Ubuntu runners (actions/runner-images#14823, #14594).
+  The image's own defenses (Acquire::Retries=1, http::Timeout=15) only trip
+  when no data arrives for 15 s, so an archive download that trickles or
+  stalls on a bad CDN node hangs apt indefinitely — apt has no
+  minimum-throughput setting. Here every apt invocation is hard-bounded by
+  wall-clock `timeout` and retried on a fresh mirror connection (apt
+  resumes partial archives between attempts), and the downloaded .debs are
+  served from the Actions cache so warm runs never touch the mirror at
+  all. apt validates every cached .deb against the signed index SHA256, so
+  stale entries are re-downloaded, never installed.
+
+inputs:
+  packages:
+    description: Space-separated package list passed to apt-get install
+    required: true
+  attempts:
+    description: Number of bounded attempts before the step fails
+    default: "4"
+  attempt-minutes:
+    description: >-
+      Wall-clock cap in minutes per apt invocation (update and install are
+      each bounded separately)
+    default: "3"
+
+runs:
+  using: composite
+  steps:
+    - name: Record runner image + package hash for the cache key
+      shell: bash
+      # Hosted runners export ImageVersion (e.g. 20261002.1.0); it salts the
+      # cache key so a rolled image (new toolchain baseline) re-warms. The
+      # package hash is computed in bash because composite-action step
+      # expressions reject the hashString() function (and step
+      # timeout-minutes — both workflow-file-only syntax).
+      run: |
+        echo "RESILIENT_APT_IMAGE=${ImageVersion:-no-image}" >> "$GITHUB_ENV"
+        echo "RESILIENT_APT_PKGHASH=$(printf '%s' '${{ inputs.packages }}' | sha256sum | cut -c1-16)" >> "$GITHUB_ENV"
+
+    - name: Restore downloaded .debs (apt archive cache)
+      id: apt-cache
+      uses: actions/cache/restore@v6
+      with:
+        # Flat *.deb glob only: the `lock` file and `partial/` dir in
+        # archives/ are root-only and abort the runner-user tar with
+        # "Permission denied" (observed on the first dispatched run).
+        path: /var/cache/apt/archives/*.deb
+        key: resilient-apt-${{ runner.os }}-${{ env.RESILIENT_APT_IMAGE }}-${{ env.RESILIENT_APT_PKGHASH }}
+        # Prefix fallback: the newest entry for the same runner image even
+        # when the package set drifted — apt re-validates every .deb against
+        # the signed index SHA256 and downloads only what is missing.
+        restore-keys: |
+          resilient-apt-${{ runner.os }}-${{ env.RESILIENT_APT_IMAGE }}-
+
+    - name: apt-get update + install
+      shell: bash
+      # Self-bounded: attempts x 2 x attempt-minutes + sleeps. The
+      # fail-fast backstop (step timeout-minutes) lives on the calling
+      # workflow step — composite steps may not declare it.
+      run: |
+        set -euo pipefail
+        for i in $(seq 1 "${{ inputs.attempts }}"); do
+          echo "::group::apt attempt $i of ${{ inputs.attempts }}"
+          if timeout "${{ inputs.attempt-minutes }}m" sudo apt-get update \
+             && timeout "${{ inputs.attempt-minutes }}m" sudo apt-get install \
+                  -y -o Acquire::Retries=3 ${{ inputs.packages }}; then
+            echo "::endgroup::"
+            exit 0
+          fi
+          echo "::endgroup::"
+          echo "apt attempt $i of ${{ inputs.attempts }} stalled or failed — retrying on a fresh mirror connection (partial archives are resumed)"
+          sleep 3
+        done
+        echo "::error::apt-get did not succeed within ${{ inputs.attempts }} bounded attempts"
+        exit 1
+
+    - name: Save downloaded .debs for the next run (default branch only)
+      # Saves are scoped to the creating branch, and empirically only
+      # default-branch entries restore (branch-scoped entries did not
+      # restore even on their own branch — observed on the dispatched
+      # rehearsal runs). PR/branch runs therefore skip the save: their
+      # uploads could never be read by anyone. Runs only when the install
+      # step succeeded (a failed step stops the job) and the exact key did
+      # not hit (saving an existing key errors).
+      if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: /var/cache/apt/archives/*.deb
+        key: resilient-apt-${{ runner.os }}-${{ env.RESILIENT_APT_IMAGE }}-${{ env.RESILIENT_APT_PKGHASH }}
