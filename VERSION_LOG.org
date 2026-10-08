@@ -1,5 +1,16 @@
 #+TITLE: Version History for LTC Timecode Generator
 
+* v0.5.5
+
+Minor patch to disallow the combination of MOV + AV1 in the conversion GUI, as
+ffmpeg does not support it.
+
+List of Changes:
+- Converter: The previously allowed combination of MOV + AV1 is now disallowed,
+  as it is unsupported by ffmpeg.
+- Logging: Ffmpeg arguments and error messages now appear in the app's debug
+  log to make bug reports easier to debug.
+
 * v0.5.4
 
 Main features are LTC encoder robustness (WP-EN): drift-free file renders at
