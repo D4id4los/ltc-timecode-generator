@@ -1290,15 +1290,66 @@ pub fn run_offload_scan_job_with(
     Ok(JobFinal::OffloadScan { cards })
 }
 
+/// Per-device `UnitSpec`s for the copy job: one unit per device, weight
+/// proportional to the device's planned byte share of the grand total so the
+/// overall bar moves byte-linearly across devices of unequal size. All-empty
+/// plans (degenerate, the runner early-returns) fall back to equal weights.
+pub fn offload_copy_unit_specs(
+    device_plans: &[Vec<CopyPlanItem>],
+    device_names: &[String],
+) -> Vec<crate::job::UnitSpec> {
+    let total: u64 = device_plans
+        .iter()
+        .flat_map(|p| p.iter())
+        .map(|i| i.size)
+        .sum();
+    device_plans
+        .iter()
+        .zip(device_names.iter())
+        .map(|(plans, name)| {
+            let bytes: u64 = plans.iter().map(|i| i.size).sum();
+            let weight = if total > 0 {
+                bytes as f32 / total as f32
+            } else {
+                1.0 / device_plans.len() as f32
+            };
+            crate::job::UnitSpec {
+                weight,
+                label: name.clone(),
+            }
+        })
+        .collect()
+}
+
 /// Run the full offload copy job, reporting progress via `ctx.progress`.
 /// Units = devices, per-unit state mirrors the device state machine
-/// (Pending/Running/Done/Failed/Skipped). Byte-weighted progress is
-/// approximated by equal weights.
+/// (Pending/Running/Done/Failed/Skipped). Overall progress is byte-weighted
+/// across devices via [`offload_copy_unit_specs`] and advances with the bytes
+/// actually moved (the copy backend's chunk callback is forwarded to the
+/// device unit after every chunk).
 pub fn run_offload_copy_job(
     ctx: &JobContext,
     device_plans: Vec<Vec<CopyPlanItem>>,
     device_names: Vec<String>,
     dest_parent: std::path::PathBuf,
+) -> Result<JobFinal, JobError> {
+    run_offload_copy_job_with(ctx, device_plans, device_names, dest_parent, &mut copy_file)
+}
+
+/// Injectable copy backend for [`run_offload_copy_job_with`] — the shape of
+/// [`copy_file`] (the project's `_with` seam convention).
+pub type CopyFileFn<'a> =
+    &'a mut dyn FnMut(&Path, &Path, &AtomicBool, &mut dyn FnMut(u64)) -> Result<(), CopyError>;
+
+/// Testable variant of [`run_offload_copy_job`]: the copy backend is
+/// injectable via `copy_file_fn`. Job mechanics — cancel checks, progress
+/// units, `JobFinal::OffloadCopy` construction — stay engine/offload-owned.
+pub fn run_offload_copy_job_with(
+    ctx: &JobContext,
+    device_plans: Vec<Vec<CopyPlanItem>>,
+    device_names: Vec<String>,
+    dest_parent: std::path::PathBuf,
+    copy_file_fn: CopyFileFn<'_>,
 ) -> Result<JobFinal, JobError> {
     ctx.cancel.check()?;
 
@@ -1342,6 +1393,8 @@ pub fn run_offload_copy_job(
             continue;
         }
 
+        let dev_bytes_total: u64 = plans.iter().map(|i| i.size).sum();
+        let mut dev_done_bytes: u64 = 0;
         let mut dev_ok = true;
         let dev_total = plans.len();
         let cancel_flag = ctx.cancel.inner().clone();
@@ -1361,16 +1414,31 @@ pub fn run_offload_copy_job(
             ));
 
             let mut bytes_copied: u64 = 0;
-            match copy_file(&item.src, &item.dst, &cancel_flag, &mut |total| {
+            let done_before_item = cumulative_bytes + dev_done_bytes;
+            let unit_for_chunks = dev_unit.clone();
+            let dev_done_before_item = dev_done_bytes;
+            let result = copy_file_fn(&item.src, &item.dst, &cancel_flag, &mut |total| {
                 bytes_copied = total;
-            }) {
+                // Progress contract: forward the chunk callback while
+                // the file is still copying, so the device fraction and
+                // the speed readout advance with the bytes actually
+                // moved — not once per completed file.
+                unit_for_chunks.set_bytes(dev_done_before_item + total, dev_bytes_total);
+                let speed = speed_meter.update(
+                    (done_before_item + total) as usize,
+                    std::time::Instant::now(),
+                );
+                ctx.progress.set_speed(speed);
+            });
+            match result {
                 Ok(()) => {
                     cumulative_bytes += bytes_copied;
-                    let speed =
-                        speed_meter.update(cumulative_bytes as usize, std::time::Instant::now());
-                    ctx.progress.set_speed(speed);
+                    dev_done_bytes += bytes_copied;
+                    // Pin the byte-exact device fraction after each file
+                    // (covers zero-byte files, whose copy never reports).
+                    dev_unit.set_bytes(dev_done_bytes, dev_bytes_total);
                     if verify_copy(&item.src, &item.dst, &verify_mode).is_ok() {
-                        dev_unit.set_fraction((item_idx + 1) as f32 / dev_total as f32);
+                        // Fraction is already byte-exact; nothing more to do.
                     } else {
                         let msg = format!("Verify failed: {}", item.dst.display());
                         warn!("{}", msg);
@@ -2494,6 +2562,248 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
             );
         }
         let _ = tracker; // progress tracker exercised by other copy tests
+    }
+
+    // ── Byte-granular progress contract of run_offload_copy_job_with ────
+    //
+    // The copy backend's per-chunk byte callback must be forwarded to the
+    // tracker while the file is still copying (not once per completed file),
+    // and the overall fraction must move byte-linearly. The fakes below
+    // sample the tracker *inside* the copy backend after every reported
+    // chunk — deterministic, no threads or sleeps needed to observe
+    // mid-copy state.
+
+    /// What the tracker's overall fraction was after each reported chunk,
+    /// in report order.
+    type FractionSamples = Arc<Mutex<Vec<f32>>>;
+
+    /// Build a fake copy backend that reports `chunks` cumulative
+    /// increments of the actual source-file size (mirroring `copy_file`'s
+    /// real-bytes contract), records the tracker fraction after each report
+    /// into `samples`, then materialises the destination file so size-only
+    /// verification passes.
+    fn recording_fake_copy(
+        chunks: u64,
+        samples: FractionSamples,
+        tracker: ProgressTracker,
+    ) -> impl FnMut(&Path, &Path, &AtomicBool, &mut dyn FnMut(u64)) -> Result<(), CopyError> {
+        move |src: &Path, dst: &Path, _cancel: &AtomicBool, on_progress: &mut dyn FnMut(u64)| {
+            let file_bytes = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+            for step in 1..=chunks {
+                on_progress(file_bytes * step / chunks);
+                samples.lock().unwrap().push(tracker.snapshot().fraction);
+            }
+            fs::write(dst, vec![0u8; file_bytes as usize])
+                .map_err(|e| CopyError::Io(format!("fake copy write: {e}")))?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn copy_job_reports_byte_granular_progress_during_file_copy() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.bin");
+        fs::write(&src, vec![0u8; 400]).unwrap();
+        let dst = dir.path().join("dst.bin");
+
+        let (ctx, tracker) = test_job_context();
+        let plans = vec![vec![CopyPlanItem {
+            src,
+            dst: dst.clone(),
+            size: 400,
+        }]];
+        let samples: FractionSamples = Arc::new(Mutex::new(Vec::new()));
+        let mut copy_fn = recording_fake_copy(4, Arc::clone(&samples), tracker.clone());
+
+        let result = run_offload_copy_job_with(
+            &ctx,
+            plans,
+            vec!["DEV".to_string()],
+            dir.path().to_path_buf(),
+            &mut copy_fn,
+        );
+        assert!(result.is_ok(), "copy job should succeed");
+        assert!(dst.exists());
+
+        let recorded = samples.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 4, "one sample per reported chunk");
+        assert!(
+            recorded[0] > 0.0,
+            "fraction must move during the first file's copy, samples={recorded:?}"
+        );
+        for pair in recorded.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "fraction must strictly increase per reported chunk, samples={recorded:?}"
+            );
+        }
+        assert!(
+            (recorded[3] - 1.0).abs() < 0.001,
+            "last in-file sample must be the full device fraction, samples={recorded:?}"
+        );
+        let final_snap = tracker.snapshot();
+        assert!(
+            (final_snap.fraction - 1.0).abs() < 0.001,
+            "job must end at full"
+        );
+        assert_eq!(final_snap.units[0].state, UnitState::Done);
+    }
+
+    #[test]
+    fn copy_job_progress_is_monotonic_across_files_within_a_device() {
+        let dir = TempDir::new().unwrap();
+        let plans = vec![{
+            let mut ps = Vec::new();
+            for i in 0..2 {
+                let src = dir.path().join(format!("src{i}.bin"));
+                fs::write(&src, vec![0u8; 400]).unwrap();
+                ps.push(CopyPlanItem {
+                    src,
+                    dst: dir.path().join(format!("dst{i}.bin")),
+                    size: 400,
+                });
+            }
+            ps
+        }];
+
+        let (ctx, tracker) = test_job_context();
+        let samples: FractionSamples = Arc::new(Mutex::new(Vec::new()));
+        let mut copy_fn = recording_fake_copy(4, Arc::clone(&samples), tracker.clone());
+
+        let result = run_offload_copy_job_with(
+            &ctx,
+            plans,
+            vec!["DEV".to_string()],
+            dir.path().to_path_buf(),
+            &mut copy_fn,
+        );
+        assert!(result.is_ok(), "copy job should succeed");
+
+        // 4 chunks per file × 2 files; device total 800 bytes. A fix that
+        // forgot the done-bytes carry-over between files would restart the
+        // fraction at 0 for the second file — the windows check catches it.
+        let recorded = samples.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 8);
+        for pair in recorded.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "fraction must be strictly increasing across both files, samples={recorded:?}"
+            );
+        }
+        assert!(
+            (recorded[7] - 1.0).abs() < 0.001,
+            "final in-file sample must be full, samples={recorded:?}"
+        );
+    }
+
+    #[test]
+    fn copy_job_overall_fraction_is_byte_proportional_across_devices() {
+        // Device A: one 400-byte file (weight 0.8), device B: one 100-byte
+        // file (weight 0.2). Four reported chunks per file must move the
+        // overall fraction 0.2 → 1.0 strictly monotonically.
+        let dir = TempDir::new().unwrap();
+        let mut plans_of_plans: Vec<Vec<CopyPlanItem>> = Vec::new();
+        for (dev, size) in [(0u8, 400u64), (1, 100)] {
+            let src = dir.path().join(format!("src{dev}.bin"));
+            fs::write(&src, vec![0u8; size as usize]).unwrap();
+            plans_of_plans.push(vec![CopyPlanItem {
+                src,
+                dst: dir.path().join(format!("dst{dev}.bin")),
+                size,
+            }]);
+        }
+        let names = vec!["CAM_A".to_string(), "CAM_B".to_string()];
+
+        let samples: FractionSamples = Arc::new(Mutex::new(Vec::new()));
+        let samples_for_job = Arc::clone(&samples);
+
+        let mut supervisor = crate::job::JobSupervisor::new();
+        let spec = JobSpec {
+            kind: JobKind::OffloadCopy,
+            name: "offload-copy-progress-test",
+            units: offload_copy_unit_specs(&plans_of_plans, &names),
+        };
+        spawn_job::<JobFinal, _>(&mut supervisor, spec, move |ctx| {
+            let mut copy_fn =
+                recording_fake_copy(4, Arc::clone(&samples_for_job), ctx.progress.clone());
+            run_offload_copy_job_with(
+                ctx,
+                plans_of_plans,
+                names,
+                dir.path().to_path_buf(),
+                &mut copy_fn,
+            )
+        });
+
+        // Predicate wait with deadline: poll until the job is reaped.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            supervisor.poll();
+            if !supervisor.is_running(JobKind::OffloadCopy) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "copy job did not finish in time");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        supervisor.drain();
+
+        let recorded = samples.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 8, "four chunks per device, two devices");
+        assert!(
+            recorded[0] > 0.0,
+            "overall fraction must move during device A's copy, samples={recorded:?}"
+        );
+        for pair in recorded.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "overall fraction must strictly increase across devices, samples={recorded:?}"
+            );
+        }
+        assert!(
+            (recorded[7] - 1.0).abs() < 0.001,
+            "final sample must be full, samples={recorded:?}"
+        );
+    }
+
+    #[test]
+    fn offload_copy_unit_specs_weights_are_byte_proportional() {
+        let plans = vec![
+            vec![
+                CopyPlanItem {
+                    src: PathBuf::from("a1"),
+                    dst: PathBuf::from("x"),
+                    size: 100,
+                },
+                CopyPlanItem {
+                    src: PathBuf::from("a2"),
+                    dst: PathBuf::from("x"),
+                    size: 100,
+                },
+            ],
+            vec![CopyPlanItem {
+                src: PathBuf::from("b1"),
+                dst: PathBuf::from("x"),
+                size: 600,
+            }],
+        ];
+        let names = vec!["A".to_string(), "B".to_string()];
+        let specs = offload_copy_unit_specs(&plans, &names);
+        assert_eq!(specs.len(), 2);
+        assert!((specs[0].weight - 0.25).abs() < 1e-6, "200/800 bytes");
+        assert!((specs[1].weight - 0.75).abs() < 1e-6, "600/800 bytes");
+        assert_eq!(specs[0].label, "A");
+        assert_eq!(specs[1].label, "B");
+    }
+
+    #[test]
+    fn offload_copy_unit_specs_all_empty_falls_back_to_equal_weights() {
+        let plans: Vec<Vec<CopyPlanItem>> = vec![vec![], vec![]];
+        let names = vec!["A".to_string(), "B".to_string()];
+        let specs = offload_copy_unit_specs(&plans, &names);
+        assert!(
+            (specs[0].weight - 0.5).abs() < 1e-6 && (specs[1].weight - 0.5).abs() < 1e-6,
+            "degenerate zero-total plans must fall back to equal weights"
+        );
     }
 
     // ── ProgressTracker message forwarding during scan ──────────────────

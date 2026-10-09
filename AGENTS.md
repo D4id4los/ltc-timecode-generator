@@ -85,6 +85,7 @@ Invariants:
 - `spawn_job()` guarantees a `JobEvent::Finished` emission (even on panic, via `catch_unwind`) and captures the `ProgressTracker` log into `JobOutcome`.
 - **Stale-result gating**: the engine tracks the active `JobId` per kind; `Finished` events from superseded jobs are discarded.
 - Cancellation is the typed `JobError::Cancelled` variant, never an error string (Error-Handling R2).
+- **Progress-granularity contract**: a long-running job must advance its fraction *while the work happens*, never only at unit (file/device/step) boundaries. Forward the work primitive's incremental callback — copy chunks, ffmpeg `out_time`, decode chunks — into `UnitProgress` as the work advances; for byte-counted work use `UnitProgress::set_bytes` (the single home of the bytes→fraction mapping). Unit weights must reflect real work shares (exemplar: `offload_copy_unit_specs` byte-weights the offload devices; equal weights are only acceptable for equal-sized units). This contract lives at the **runner layer** and is guarded there: inject the work via the runner's `_with` seam, sample the tracker fraction *inside* the injected fake after every reported increment, and assert strictly-increasing intermediate values — reference pattern `copy_job_reports_byte_granular_progress_during_file_copy` (`offload.rs` tests). Sampling inside the seam is deterministic; polling the tracker from outside the worker is not and must not be used. GUIs render `jobs[kind]` fractions verbatim — no GUI-local progress substitutes.
 
 ### Sole Source of Truth — State Ownership
 

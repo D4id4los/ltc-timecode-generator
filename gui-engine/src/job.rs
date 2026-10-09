@@ -237,6 +237,18 @@ impl UnitProgress {
         }
     }
 
+    /// Set this unit's fraction from a byte count against a byte total —
+    /// the single home of the bytes→fraction mapping for copy-style jobs,
+    /// so runners cannot hand-roll the fixed-point/clamp math per call site.
+    /// No-op when `total` is zero (nothing planned); `done` above `total`
+    /// clamps to full.
+    pub fn set_bytes(&self, done: u64, total: u64) {
+        if total == 0 {
+            return;
+        }
+        self.set_fraction(done.min(total) as f32 / total as f32);
+    }
+
     pub fn set_label(&self, label: impl Into<String>) {
         let mut units = self.tracker.units.lock().unwrap();
         if let Some(u) = units.get_mut(self.idx) {
@@ -1332,6 +1344,23 @@ mod tests {
         let snap = pt.snapshot();
         assert!((snap.fraction - 1.0).abs() < 0.001);
         assert_eq!(snap.units[0].state, UnitState::Done);
+    }
+
+    // ── UnitProgress set_bytes ─────────────────────────────────────────
+
+    #[test]
+    fn test_unit_progress_set_bytes_maps_to_fraction() {
+        let pt = ProgressTracker::new(vec![UnitSpec {
+            weight: 1.0,
+            label: "X".into(),
+        }]);
+        let unit = pt.unit(0);
+        unit.set_bytes(250, 1000);
+        assert!((pt.snapshot().fraction - 0.25).abs() < 0.001);
+        unit.set_bytes(4000, 1000); // above total clamps to full
+        assert!((pt.snapshot().fraction - 1.0).abs() < 0.001);
+        unit.set_bytes(0, 0); // zero-total is a no-op, not a division by zero
+        assert!((pt.snapshot().fraction - 1.0).abs() < 0.001);
     }
 
     // ── ProgressTracker set_speed ──────────────────────────────────────

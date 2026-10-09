@@ -2456,18 +2456,13 @@ fn handle_offload_command(
 
             let dest_parent_job = plan.dest_parent.clone();
             let names_job = plan.device_names.clone();
+            let units = crate::offload::offload_copy_unit_specs(&plan.device_plans, &names_job);
             let plans_job = plan.device_plans;
 
             let spec = job::JobSpec {
                 kind: JobKind::OffloadCopy,
                 name: "offload-copy",
-                units: names_job
-                    .iter()
-                    .map(|n| job::UnitSpec {
-                        weight: 1.0 / names_job.len() as f32,
-                        label: n.clone(),
-                    })
-                    .collect(),
+                units,
             };
             spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
                 run_offload_copy_job(ctx, plans_job, names_job, dest_parent_job)
