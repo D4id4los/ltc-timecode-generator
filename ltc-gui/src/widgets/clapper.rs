@@ -24,63 +24,61 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 
 fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    super::style::content_frame(&colors).show(ui, |ui| {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("SMART CLAPPER SLATE")
-                        .font(FontId::proportional(11.0))
-                        .color(colors.text_muted)
-                        .strong(),
+    super::style::content_area(ui, &colors, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("SMART CLAPPER SLATE")
+                    .font(FontId::proportional(11.0))
+                    .color(colors.text_muted)
+                    .strong(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let truth = state.latest.clapper.auto_increment_take;
+                bound::checkbox(
+                    ui,
+                    state,
+                    |s| &mut s.sh.auto_increment,
+                    truth,
+                    "Auto-Increment Take",
+                    true,
+                    GuiCommand::SetAutoIncrement,
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let truth = state.latest.clapper.auto_increment_take;
-                    bound::checkbox(
-                        ui,
-                        state,
-                        |s| &mut s.sh.auto_increment,
-                        truth,
-                        "Auto-Increment Take",
-                        true,
-                        GuiCommand::SetAutoIncrement,
-                    );
-                });
             });
-            ui.add_space(8.0);
-            render_clapper_board_drawing(ui, state);
-            ui.add_space(10.0);
-            let cards_w = ui.available_width();
-            if cards_w > 280.0 {
-                ui.columns(3, |cols| {
-                    render_roll_card(&mut cols[0], state);
-                    render_scene_card(&mut cols[1], state);
-                    render_take_card(&mut cols[2], state);
-                });
-            } else {
-                ui.vertical(|ui| {
-                    render_roll_card(ui, state);
-                    ui.add_space(6.0);
-                    render_scene_card(ui, state);
-                    ui.add_space(6.0);
-                    render_take_card(ui, state);
-                });
-            }
-            ui.add_space(12.0);
-            if super::style::action_button(
-                ui,
-                &colors,
-                super::style::ActionStyle::Primary,
-                "CLAP & BEEP",
-                FontId::proportional(13.0),
-                egui::vec2(ui.available_width(), 44.0),
-                true,
-            )
-            .clicked()
-                && !state.latest.is_locked
-            {
-                state.send(GuiCommand::Clap);
-            }
         });
+        ui.add_space(8.0);
+        render_clapper_board_drawing(ui, state);
+        ui.add_space(10.0);
+        let cards_w = ui.available_width();
+        if cards_w > 280.0 {
+            ui.columns(3, |cols| {
+                render_roll_card(&mut cols[0], state);
+                render_scene_card(&mut cols[1], state);
+                render_take_card(&mut cols[2], state);
+            });
+        } else {
+            ui.vertical(|ui| {
+                render_roll_card(ui, state);
+                ui.add_space(6.0);
+                render_scene_card(ui, state);
+                ui.add_space(6.0);
+                render_take_card(ui, state);
+            });
+        }
+        ui.add_space(12.0);
+        if super::style::action_button(
+            ui,
+            &colors,
+            super::style::ActionStyle::Primary,
+            "CLAP & BEEP",
+            FontId::proportional(13.0),
+            egui::vec2(ui.available_width(), 44.0),
+            true,
+        )
+        .clicked()
+            && !state.latest.is_locked
+        {
+            state.send(GuiCommand::Clap);
+        }
     });
 }
 
@@ -303,128 +301,124 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
 fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let s = std::sync::Arc::clone(&state.latest);
-    super::style::content_frame(&colors).show(ui, |ui| {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("SYNCHRONIZATION LOGS")
-                        .font(FontId::proportional(11.0))
-                        .color(colors.text_muted)
-                        .strong(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear").clicked() {
-                        // Clear is GUI-only (just clear the local view)
-                    }
-                    if ui.button("Copy").clicked() {
-                        let text = s
-                            .clapper
-                            .logs
-                            .iter()
-                            .map(|l| {
-                                format!(
-                                    "[{}] LTC: {} | MS: {} | {}",
-                                    l.timestamp, l.timecode, l.milliseconds, l.note
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        ui.ctx().copy_text(text);
-                    }
-                });
+    super::style::content_area(ui, &colors, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("SYNCHRONIZATION LOGS")
+                    .font(FontId::proportional(11.0))
+                    .color(colors.text_muted)
+                    .strong(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Clear").clicked() {
+                    // Clear is GUI-only (just clear the local view)
+                }
+                if ui.button("Copy").clicked() {
+                    let text = s
+                        .clapper
+                        .logs
+                        .iter()
+                        .map(|l| {
+                            format!(
+                                "[{}] LTC: {} | MS: {} | {}",
+                                l.timestamp, l.timecode, l.milliseconds, l.note
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.ctx().copy_text(text);
+                }
             });
-            ui.add_space(8.0);
-            let logs_frame = egui::Frame::new()
-                .fill(colors.deep_bg)
-                .corner_radius(8.0)
-                .stroke(egui::Stroke::new(1.0, colors.border_main))
-                .inner_margin(egui::Margin::same(10));
-            logs_frame.show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt(crate::ids::clap_log_scroll())
-                    .max_height(200.0)
-                    .min_scrolled_height(176.0)
-                    .show(ui, |ui| {
-                        if s.clapper.logs.is_empty() {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(40.0);
-                                ui.label(
-                                    RichText::new("No clapper marks recorded yet.")
-                                        .color(colors.text_muted)
-                                        .strong(),
-                                );
-                                ui.label(
-                                    RichText::new("Tap CLAP & BEEP to capture markings.")
-                                        .font(FontId::proportional(10.0))
-                                        .color(colors.text_muted),
-                                );
-                            });
-                        } else {
-                            for log in s.clapper.logs.iter() {
-                                let item_frame = egui::Frame::new()
-                                    .fill(colors.nested_bg)
-                                    .corner_radius(6.0)
-                                    .stroke(egui::Stroke::new(1.0, colors.border_main))
-                                    .inner_margin(egui::Margin::same(8));
-                                item_frame.show(ui, |ui| {
-                                    ui.vertical(|ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(&log.note).strong().color(ACCENT),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        RichText::new(&log.timestamp)
-                                                            .font(FontId::proportional(10.0))
-                                                            .color(colors.text_muted),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("LTC Timecode:")
-                                                    .color(colors.text_muted)
-                                                    .font(FontId::proportional(10.5)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        RichText::new(&log.timecode)
-                                                            .strong()
-                                                            .color(colors.text_title),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("Milliseconds:")
-                                                    .color(colors.text_muted)
-                                                    .font(FontId::proportional(10.5)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        RichText::new(&log.milliseconds)
-                                                            .strong()
-                                                            .color(ACCENT),
-                                                    );
-                                                },
-                                            );
-                                        });
+        });
+        ui.add_space(8.0);
+        let logs_frame = egui::Frame::new()
+            .fill(colors.deep_bg)
+            .corner_radius(8.0)
+            .stroke(egui::Stroke::new(1.0, colors.border_main))
+            .inner_margin(egui::Margin::same(10));
+        logs_frame.show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(crate::ids::clap_log_scroll())
+                .max_height(200.0)
+                .min_scrolled_height(176.0)
+                .show(ui, |ui| {
+                    if s.clapper.logs.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(40.0);
+                            ui.label(
+                                RichText::new("No clapper marks recorded yet.")
+                                    .color(colors.text_muted)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new("Tap CLAP & BEEP to capture markings.")
+                                    .font(FontId::proportional(10.0))
+                                    .color(colors.text_muted),
+                            );
+                        });
+                    } else {
+                        for log in s.clapper.logs.iter() {
+                            let item_frame = egui::Frame::new()
+                                .fill(colors.nested_bg)
+                                .corner_radius(6.0)
+                                .stroke(egui::Stroke::new(1.0, colors.border_main))
+                                .inner_margin(egui::Margin::same(8));
+                            item_frame.show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&log.note).strong().color(ACCENT));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(&log.timestamp)
+                                                        .font(FontId::proportional(10.0))
+                                                        .color(colors.text_muted),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("LTC Timecode:")
+                                                .color(colors.text_muted)
+                                                .font(FontId::proportional(10.5)),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(&log.timecode)
+                                                        .strong()
+                                                        .color(colors.text_title),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("Milliseconds:")
+                                                .color(colors.text_muted)
+                                                .font(FontId::proportional(10.5)),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(&log.milliseconds)
+                                                        .strong()
+                                                        .color(ACCENT),
+                                                );
+                                            },
+                                        );
                                     });
                                 });
-                                ui.add_space(4.0);
-                            }
+                            });
+                            ui.add_space(4.0);
                         }
-                    });
-            });
+                    }
+                });
         });
     });
 }

@@ -10,71 +10,69 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let playing = state.latest.is_playing;
 
-    style::content_frame(&colors).show(ui, |ui| {
-        ui.vertical(|ui| {
-            // 1. Start Timecode
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("SET STARTING TIMECODE")
-                        .font(FontId::proportional(11.0))
-                        .color(colors.text_muted)
-                        .strong(),
-                );
-                if playing {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        style::static_badge(
-                            ui,
-                            &colors,
-                            style::BadgeTone::Warning,
-                            "STOP STREAM TO EDIT",
-                            egui::FontId::proportional(9.0),
-                        );
-                    });
-                }
-            });
-            ui.add_space(8.0);
-            render_timecode_steppers(ui, state);
-            ui.add_space(16.0);
-
+    style::content_area(ui, &colors, |ui| {
+        // 1. Start Timecode
+        ui.horizontal(|ui| {
             ui.label(
-                RichText::new("SELECT FRAME RATE")
+                RichText::new("SET STARTING TIMECODE")
                     .font(FontId::proportional(11.0))
                     .color(colors.text_muted)
                     .strong(),
             );
-            ui.add_space(8.0);
-            render_frame_rate(ui, state);
-            ui.add_space(16.0);
-
-            ui.label(
-                RichText::new("SAMPLE RATE")
-                    .font(FontId::proportional(11.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
-            ui.add_space(8.0);
-            render_sample_rate(ui, state);
-            ui.add_space(16.0);
-
-            ui.label(
-                RichText::new("OUTPUT AUDIO INTERFACE SELECTION")
-                    .font(FontId::proportional(11.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
-            ui.add_space(8.0);
-            render_audio_device(ui, state);
-            ui.add_space(16.0);
-
-            ui.label(
-                RichText::new("AUDIO ROUTING & SETTINGS")
-                    .font(FontId::proportional(11.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
-            ui.add_space(8.0);
-            render_routing_and_volume(ui, state);
+            if playing {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    style::static_badge(
+                        ui,
+                        &colors,
+                        style::BadgeTone::Warning,
+                        "STOP STREAM TO EDIT",
+                        egui::FontId::proportional(9.0),
+                    );
+                });
+            }
         });
+        ui.add_space(8.0);
+        render_timecode_steppers(ui, state);
+        ui.add_space(16.0);
+
+        ui.label(
+            RichText::new("SELECT FRAME RATE")
+                .font(FontId::proportional(11.0))
+                .color(colors.text_muted)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        render_frame_rate(ui, state);
+        ui.add_space(16.0);
+
+        ui.label(
+            RichText::new("SAMPLE RATE")
+                .font(FontId::proportional(11.0))
+                .color(colors.text_muted)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        render_sample_rate(ui, state);
+        ui.add_space(16.0);
+
+        ui.label(
+            RichText::new("OUTPUT AUDIO INTERFACE SELECTION")
+                .font(FontId::proportional(11.0))
+                .color(colors.text_muted)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        render_audio_device(ui, state);
+        ui.add_space(16.0);
+
+        ui.label(
+            RichText::new("AUDIO ROUTING & SETTINGS")
+                .font(FontId::proportional(11.0))
+                .color(colors.text_muted)
+                .strong(),
+        );
+        ui.add_space(8.0);
+        render_routing_and_volume(ui, state);
     });
 }
 
