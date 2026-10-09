@@ -1,4 +1,4 @@
-use egui::{Color32, FontId, RichText, Sense, Ui, Vec2};
+use egui::{FontId, RichText, Sense, Ui, Vec2};
 use gui_engine::command::GuiCommand;
 use std::time::Instant;
 
@@ -24,12 +24,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 
 fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
-    let frame = egui::Frame::group(ui.style())
-        .fill(colors.card_bg)
-        .corner_radius(12.0)
-        .stroke(egui::Stroke::new(1.5, colors.border_main))
-        .inner_margin(egui::Margin::same(16));
-    frame.show(ui, |ui| {
+    super::style::content_frame(&colors).show(ui, |ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -71,11 +66,18 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
                 });
             }
             ui.add_space(12.0);
-            let btn =
-                egui::Button::new(RichText::new("CLAP & BEEP").strong().color(Color32::BLACK))
-                    .fill(ACCENT)
-                    .min_size(egui::vec2(ui.available_width(), 44.0));
-            if ui.add(btn).clicked() && !state.latest.is_locked {
+            if super::style::action_button(
+                ui,
+                &colors,
+                super::style::ActionStyle::Primary,
+                "CLAP & BEEP",
+                FontId::proportional(13.0),
+                egui::vec2(ui.available_width(), 44.0),
+                true,
+            )
+            .clicked()
+                && !state.latest.is_locked
+            {
                 state.send(GuiCommand::Clap);
             }
         });
@@ -87,14 +89,26 @@ fn render_clapper_board_drawing(ui: &mut Ui, state: &mut AppState) {
     let s = std::sync::Arc::clone(&state.latest);
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 100.0), Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() && !s.is_locked {
         state.send(GuiCommand::Clap);
     }
-    ui.painter().rect_filled(rect, 8.0, colors.deep_bg);
+    ui.painter().rect_filled(
+        rect,
+        8.0,
+        super::style::hover_fill(colors.deep_bg, response.hovered()),
+    );
     ui.painter().rect_stroke(
         rect,
         8.0,
-        egui::Stroke::new(1.0, colors.border_main),
+        egui::Stroke::new(
+            if response.hovered() { 1.5 } else { 1.0 },
+            if response.hovered() {
+                ACCENT.linear_multiply(0.7)
+            } else {
+                colors.border_main
+            },
+        ),
         egui::StrokeKind::Inside,
     );
 
@@ -289,12 +303,7 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
 fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let s = std::sync::Arc::clone(&state.latest);
-    let frame = egui::Frame::group(ui.style())
-        .fill(colors.card_bg)
-        .corner_radius(12.0)
-        .stroke(egui::Stroke::new(1.5, colors.border_main))
-        .inner_margin(egui::Margin::same(16));
-    frame.show(ui, |ui| {
+    super::style::content_frame(&colors).show(ui, |ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label(

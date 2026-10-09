@@ -1,8 +1,8 @@
-use egui::{Color32, FontId, RichText, Sense, Ui, Vec2};
+use egui::{FontId, RichText, Sense, Ui, Vec2};
 use gui_engine::command::GuiCommand;
 use gui_engine::{timecode::FPS_OPTIONS, ChannelSel};
 
-use super::bound;
+use super::{bound, style};
 use crate::app::AppState;
 use crate::theme::ACCENT;
 
@@ -10,12 +10,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let playing = state.latest.is_playing;
 
-    let frame = egui::Frame::group(ui.style())
-        .fill(colors.card_bg)
-        .corner_radius(12.0)
-        .stroke(egui::Stroke::new(1.5, colors.border_main))
-        .inner_margin(egui::Margin::same(16));
-    frame.show(ui, |ui| {
+    style::content_frame(&colors).show(ui, |ui| {
         ui.vertical(|ui| {
             // 1. Start Timecode
             ui.horizontal(|ui| {
@@ -27,22 +22,13 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
                 );
                 if playing {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let warn = egui::Frame::new()
-                            .fill(Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.1))
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.2),
-                            ))
-                            .corner_radius(6.0)
-                            .inner_margin(egui::Margin::symmetric(10, 4));
-                        warn.show(ui, |ui| {
-                            ui.label(
-                                RichText::new("STOP STREAM TO EDIT")
-                                    .color(Color32::from_rgb(0xF5, 0x9E, 0x0B))
-                                    .strong()
-                                    .font(FontId::proportional(9.0)),
-                            );
-                        });
+                        style::static_badge(
+                            ui,
+                            &colors,
+                            style::BadgeTone::Warning,
+                            "STOP STREAM TO EDIT",
+                            egui::FontId::proportional(9.0),
+                        );
                     });
                 }
             });
@@ -234,63 +220,22 @@ fn frame_rate_card(
     opt: &gui_engine::timecode::FpsOption,
     state: &mut AppState,
 ) {
-    let colors = state.theme.colors();
     let is_selected = index == state.latest.fps_index;
     let is_playing = state.latest.is_playing;
-    let card = egui::Frame::new()
-        .fill(if is_selected {
-            ACCENT.linear_multiply(0.08)
-        } else {
-            colors.deep_bg
-        })
-        .stroke(egui::Stroke::new(
-            if is_selected { 1.5 } else { 1.0 },
-            if is_selected {
-                ACCENT
-            } else {
-                colors.border_main
-            },
-        ))
-        .corner_radius(8.0)
-        .inner_margin(egui::Margin::same(10));
-    let response = card
-        .show(ui, |ui| {
-            ui.set_min_height(60.0);
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(opt.name)
-                        .font(FontId::monospace(13.0))
-                        .color(if is_selected {
-                            ACCENT
-                        } else {
-                            colors.text_title
-                        })
-                        .strong(),
-                );
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(opt.description)
-                        .font(FontId::proportional(9.0))
-                        .color(colors.text_muted),
-                );
-            });
-        })
-        .response;
-    let click_sense = if is_playing {
-        Sense::hover()
-    } else {
-        Sense::click()
-    };
-    if ui
-        .interact(response.rect, response.id, click_sense)
-        .clicked()
-    {
+    let response = style::option_card(
+        ui,
+        &state.theme.colors(),
+        opt.name,
+        opt.description,
+        is_selected,
+        !is_playing,
+    );
+    if response.clicked() {
         state.send(GuiCommand::SetFpsIndex(index));
     }
 }
 
 fn render_sample_rate(ui: &mut Ui, state: &mut AppState) {
-    let colors = state.theme.colors();
     let is_playing = state.latest.is_playing;
     let rates = gui_engine::SAMPLE_RATE_OPTIONS;
     let selected_rate = state.latest.sample_rate;
@@ -301,58 +246,41 @@ fn render_sample_rate(ui: &mut Ui, state: &mut AppState) {
         if width > 300.0 {
             ui.horizontal(|ui| {
                 for &rate in rates {
-                    let is_selected = rate == selected_rate;
-                    let btn = if is_selected {
-                        egui::Button::new(
-                            RichText::new(format!("{} Hz", rate))
-                                .strong()
-                                .color(Color32::BLACK),
-                        )
-                        .fill(ACCENT)
-                    } else {
-                        egui::Button::new(RichText::new(format!("{} Hz", rate)))
-                            .stroke(egui::Stroke::new(0.5, colors.border_main))
-                            .fill(colors.card_bg)
-                    };
-                    if ui.add(btn).clicked() {
-                        bound::select_value(
-                            state,
-                            |s| &mut s.sh.sample_rate,
-                            selected_rate,
-                            rate,
-                            GuiCommand::SetSampleRate,
-                        );
-                    }
+                    sample_rate_button(ui, state, selected_rate, rate);
                 }
             });
         } else {
             for &rate in rates {
-                let is_selected = rate == selected_rate;
-                let btn = if is_selected {
-                    egui::Button::new(
-                        RichText::new(format!("{} Hz", rate))
-                            .strong()
-                            .color(Color32::BLACK),
-                    )
-                    .fill(ACCENT)
-                } else {
-                    egui::Button::new(RichText::new(format!("{} Hz", rate)))
-                        .stroke(egui::Stroke::new(0.5, colors.border_main))
-                        .fill(colors.card_bg)
-                };
-                if ui.add(btn).clicked() {
-                    bound::select_value(
-                        state,
-                        |s| &mut s.sh.sample_rate,
-                        selected_rate,
-                        rate,
-                        GuiCommand::SetSampleRate,
-                    );
-                }
+                sample_rate_button(ui, state, selected_rate, rate);
                 ui.add_space(6.0);
             }
         }
     });
+}
+
+/// One sample-rate option chip (shared by the wide and narrow layouts).
+fn sample_rate_button(ui: &mut Ui, state: &mut AppState, selected_rate: u32, rate: u32) {
+    let is_selected = rate == selected_rate;
+    let colors = state.theme.colors();
+    if style::option_chip(
+        ui,
+        &colors,
+        &format!("{} Hz", rate),
+        egui::FontId::proportional(12.0),
+        is_selected,
+        true,
+        Vec2::ZERO,
+    )
+    .clicked()
+    {
+        bound::select_value(
+            state,
+            |s| &mut s.sh.sample_rate,
+            selected_rate,
+            rate,
+            GuiCommand::SetSampleRate,
+        );
+    }
 }
 
 fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
@@ -515,23 +443,16 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         for (val, lbl) in CHANNEL_CHOICES {
-            let active = ltc_ch == val;
-            let btn = if active {
-                egui::Button::new(RichText::new(lbl).strong().color(Color32::BLACK)).fill(ACCENT)
-            } else {
-                egui::Button::new(RichText::new(lbl))
-                    .stroke(egui::Stroke::new(0.5, colors.border_main))
-                    .fill(colors.card_bg)
-            };
-            if ui.add(btn).clicked() {
-                bound::select_value(
-                    state,
-                    |s| &mut s.sh.ltc_channel,
-                    ltc_truth,
-                    val,
-                    GuiCommand::SetLtcChannel,
-                );
-            }
+            channel_button(
+                ui,
+                state,
+                |s| &mut s.sh.ltc_channel,
+                ltc_ch,
+                ltc_truth,
+                val,
+                lbl,
+                GuiCommand::SetLtcChannel,
+            );
         }
     });
 
@@ -545,25 +466,46 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         for (val, lbl) in CHANNEL_CHOICES {
-            let active = beep_ch == val;
-            let btn = if active {
-                egui::Button::new(RichText::new(lbl).strong().color(Color32::BLACK)).fill(ACCENT)
-            } else {
-                egui::Button::new(RichText::new(lbl))
-                    .stroke(egui::Stroke::new(0.5, colors.border_main))
-                    .fill(colors.card_bg)
-            };
-            if ui.add(btn).clicked() {
-                bound::select_value(
-                    state,
-                    |s| &mut s.sh.beep_channel,
-                    beep_truth,
-                    val,
-                    GuiCommand::SetBeepChannel,
-                );
-            }
+            channel_button(
+                ui,
+                state,
+                |s| &mut s.sh.beep_channel,
+                beep_ch,
+                beep_truth,
+                val,
+                lbl,
+                GuiCommand::SetBeepChannel,
+            );
         }
     });
+}
+
+/// One channel option chip (shared by the LTC and clapper routing rows).
+#[allow(clippy::too_many_arguments)]
+fn channel_button(
+    ui: &mut Ui,
+    state: &mut AppState,
+    shadow: fn(&mut AppState) -> &mut gui_engine::edit_state::EditState<ChannelSel>,
+    selected: ChannelSel,
+    truth: ChannelSel,
+    val: ChannelSel,
+    lbl: &str,
+    make_cmd: fn(ChannelSel) -> GuiCommand,
+) {
+    let colors = state.theme.colors();
+    if style::option_chip(
+        ui,
+        &colors,
+        lbl,
+        egui::FontId::proportional(12.0),
+        selected == val,
+        true,
+        Vec2::ZERO,
+    )
+    .clicked()
+    {
+        bound::select_value(state, shadow, truth, val, make_cmd);
+    }
 }
 
 fn render_sliders(ui: &mut Ui, state: &mut AppState) {

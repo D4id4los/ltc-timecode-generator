@@ -638,22 +638,36 @@ fn route_label(ltc: gui_engine::ChannelSel, beep: gui_engine::ChannelSel) -> Str
 
 /// One transport button with the shared size/fill shape; returns whether it
 /// was clicked. Collapses the four near-identical button blocks.
-fn transport_button(ui: &mut Ui, width: f32, label: RichText, fill: Color32) -> bool {
-    let btn = egui::Button::new(label)
-        .fill(fill)
-        .min_size(egui::vec2(width, 32.0));
-    ui.add(btn).clicked()
+fn transport_button(
+    ui: &mut Ui,
+    width: f32,
+    colors: &ThemeColors,
+    style_kind: widgets::style::ActionStyle,
+    label: &str,
+) -> bool {
+    widgets::style::action_button(
+        ui,
+        colors,
+        style_kind,
+        label,
+        egui::FontId::proportional(13.0),
+        egui::vec2(width, 32.0),
+        true,
+    )
+    .clicked()
 }
 
 /// Start/Stop button: green while stopped, red while playing. Gated by the
 /// lock guard like every transport action.
 fn render_start_stop(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, btn_w: f32) {
+    let colors = state.theme.colors();
     if s.is_playing {
         if transport_button(
             ui,
             btn_w,
-            RichText::new("■ STOP").strong().color(Color32::WHITE),
-            Color32::from_rgb(0xDC, 0x26, 0x26),
+            &colors,
+            widgets::style::ActionStyle::Danger,
+            "■ STOP",
         ) && !s.is_locked
         {
             state.send(GuiCommand::StopLtc);
@@ -662,8 +676,9 @@ fn render_start_stop(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, bt
         if transport_button(
             ui,
             btn_w,
-            RichText::new("▶ START").strong().color(Color32::BLACK),
-            Color32::from_rgb(0x22, 0xC5, 0x5E),
+            &colors,
+            widgets::style::ActionStyle::Success,
+            "▶ START",
         ) && !s.is_locked
         {
             state.send(GuiCommand::StartLtc);
@@ -673,11 +688,13 @@ fn render_start_stop(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, bt
 
 /// Clap & beep button (lock-guarded).
 fn render_clap_button(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, btn_w: f32) {
+    let colors = state.theme.colors();
     if transport_button(
         ui,
         btn_w,
-        RichText::new("CLAP & BEEP").strong().color(Color32::BLACK),
-        ACCENT,
+        &colors,
+        widgets::style::ActionStyle::Primary,
+        "CLAP & BEEP",
     ) && !s.is_locked
     {
         state.send(GuiCommand::Clap);
@@ -692,12 +709,7 @@ fn render_reset_button(
     s: &AppStateSnapshot,
     btn_w: f32,
 ) {
-    if transport_button(
-        ui,
-        btn_w,
-        RichText::new("↺").strong().color(colors.text_title),
-        colors.nested_bg,
-    ) && !s.is_locked
+    if transport_button(ui, btn_w, &colors, widgets::style::ActionStyle::Muted, "↺") && !s.is_locked
     {
         state.send(GuiCommand::Reset);
     }
@@ -712,16 +724,12 @@ fn render_lock_button(
     btn_w: f32,
 ) {
     let lock_icon = if s.is_locked { "🔒" } else { "🔓" };
-    let lock_color = if s.is_locked {
-        ACCENT
-    } else {
-        colors.text_muted
-    };
     if transport_button(
         ui,
         btn_w,
-        RichText::new(lock_icon).color(lock_color),
-        colors.nested_bg,
+        &colors,
+        widgets::style::ActionStyle::Muted,
+        lock_icon,
     ) {
         state.send(GuiCommand::ToggleLock);
     }
@@ -749,7 +757,12 @@ impl AppState {
         ui.horizontal(|ui| {
             let (rect, icon_response) =
                 ui.allocate_exact_size(egui::Vec2::new(34.0, 34.0), Sense::click());
-            ui.painter().rect_filled(rect, 4.0, ACCENT);
+            let icon_response = icon_response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            ui.painter().rect_filled(
+                rect,
+                4.0,
+                widgets::style::hover_fill(ACCENT, icon_response.hovered()),
+            );
             let center_y = rect.center().y;
             let line_w = 18.0;
             let line_h = 2.0;
@@ -870,10 +883,17 @@ impl AppState {
                         );
                     });
                 }
-                let help_btn =
-                    egui::Button::new(RichText::new("?").font(FontId::proportional(12.0)).strong())
-                        .fill(colors.nested_bg);
-                if ui.add(help_btn).clicked() {
+                if widgets::style::action_button(
+                    ui,
+                    &colors,
+                    widgets::style::ActionStyle::Muted,
+                    "?",
+                    egui::FontId::proportional(12.0),
+                    egui::vec2(24.0, 24.0),
+                    true,
+                )
+                .clicked()
+                {
                     self.show_faq = !self.show_faq;
                 }
                 let icon = if self.theme == Theme::Dark {
@@ -881,10 +901,17 @@ impl AppState {
                 } else {
                     "\u{1F319}"
                 };
-                let theme_btn =
-                    egui::Button::new(RichText::new(icon).font(FontId::proportional(12.0)))
-                        .fill(colors.nested_bg);
-                if ui.add(theme_btn).clicked() {
+                if widgets::style::action_button(
+                    ui,
+                    &colors,
+                    widgets::style::ActionStyle::Muted,
+                    icon,
+                    egui::FontId::proportional(12.0),
+                    egui::vec2(24.0, 24.0),
+                    true,
+                )
+                .clicked()
+                {
                     self.send(GuiCommand::ToggleTheme);
                 }
             });
@@ -1156,7 +1183,10 @@ impl AppState {
                     .inner_margin(egui::Margin::same(8));
                 frame.show(ui, |ui| {
                     ui.vertical(|ui| {
-                        if ui.selectable_label(false, "Debug Log").clicked() {
+                        if ui
+                            .selectable_label(self.show_debug_log, "Debug Log")
+                            .clicked()
+                        {
                             self.show_debug_log = !self.show_debug_log;
                             self.show_app_menu = false;
                         }

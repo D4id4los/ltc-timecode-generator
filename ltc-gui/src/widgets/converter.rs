@@ -22,6 +22,7 @@ use gui_engine::{JobKind, JobPhase, ProbeStatusLabel};
 use super::bound;
 use crate::app::AppState;
 use crate::theme::{ThemeColors, ACCENT};
+use crate::widgets::style;
 
 pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
@@ -65,12 +66,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             }
         });
 
-    let frame = egui::Frame::group(ui.style())
-        .fill(colors.card_bg)
-        .corner_radius(12.0)
-        .stroke(egui::Stroke::new(1.5, colors.border_main))
-        .inner_margin(egui::Margin::same(16));
-    frame.show(ui, |ui| {
+    style::content_frame(&colors).show(ui, |ui| {
         ui.vertical(|ui| {
             step_header(ui, "1", "SELECT FILES", &colors);
             ui.add_space(8.0);
@@ -108,26 +104,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
 }
 
 fn step_header(ui: &mut Ui, number: &str, label: &str, colors: &crate::theme::ThemeColors) {
-    ui.horizontal(|ui| {
-        let badge = egui::Frame::new()
-            .fill(ACCENT)
-            .corner_radius(4.0)
-            .inner_margin(egui::Margin::symmetric(6, 2));
-        badge.show(ui, |ui| {
-            ui.label(
-                RichText::new(number)
-                    .font(FontId::monospace(11.0))
-                    .color(Color32::BLACK)
-                    .strong(),
-            );
-        });
-        ui.label(
-            RichText::new(label)
-                .font(FontId::proportional(12.0))
-                .color(colors.text_title)
-                .strong(),
-        );
-    });
+    style::step_header(ui, colors, number, label);
 }
 
 /// True when "Leave Video Encoding Untouched" applies. Stream copy is only
@@ -353,7 +330,8 @@ fn render_group_combo(
                         .map(|f| state.latest.file_durations.get(f).copied().flatten())
                         .collect();
                     let label = group_combo_label(group, &durs);
-                    if ui.selectable_label(false, label).clicked() {
+                    let is_sel = state.latest.converter.selected_group_idx == Some(i);
+                    if ui.selectable_label(is_sel, label).clicked() {
                         apply_group_selection(state, groups, i);
                     }
                 }
@@ -738,17 +716,17 @@ fn render_fps_detect_row(
         );
         for (i, opt) in FPS_OPTIONS.iter().enumerate() {
             let is_sel = i == decode_fps_sel;
-            let btn =
-                egui::Button::new(RichText::new(opt.name).font(FontId::monospace(9.0)).color(
-                    if is_sel {
-                        Color32::BLACK
-                    } else {
-                        colors.text_muted
-                    },
-                ))
-                .fill(if is_sel { ACCENT } else { colors.deep_bg })
-                .min_size(egui::vec2(0.0, 22.0));
-            if ui.add(btn).clicked() {
+            if style::option_chip(
+                ui,
+                colors,
+                opt.name,
+                FontId::monospace(9.0),
+                is_sel,
+                true,
+                egui::vec2(0.0, 22.0),
+            )
+            .clicked()
+            {
                 bound::select_value(
                     state,
                     |s| &mut s.sh.decode_fps_index,
@@ -781,36 +759,32 @@ fn render_fps_detect_row(
                     .color(colors.text_muted),
             );
             ui.add_space(4.0);
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("✕ CANCEL")
-                            .font(FontId::proportional(10.0))
-                            .color(Color32::WHITE)
-                            .strong(),
-                    )
-                    .fill(Color32::from_rgb(0xDC, 0x26, 0x26))
-                    .min_size(egui::vec2(80.0, 22.0)),
-                )
-                .clicked()
+            if style::action_button(
+                ui,
+                colors,
+                style::ActionStyle::Danger,
+                "✕ CANCEL",
+                FontId::proportional(10.0),
+                egui::vec2(80.0, 22.0),
+                true,
+            )
+            .clicked()
             {
                 state.send(GuiCommand::CancelDecode);
             }
         } else if is_video {
             let stream_idx = state.latest.decode.selected_stream;
             let channel_idx = state.latest.decode.selected_channel;
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("🔍 Detect LTC All Clips")
-                            .font(FontId::proportional(11.0))
-                            .color(Color32::BLACK)
-                            .strong(),
-                    )
-                    .fill(ACCENT)
-                    .min_size(egui::vec2(140.0, 24.0)),
-                )
-                .clicked()
+            if style::action_button(
+                ui,
+                colors,
+                style::ActionStyle::Primary,
+                "🔍 Detect LTC All Clips",
+                FontId::proportional(11.0),
+                egui::vec2(140.0, 24.0),
+                true,
+            )
+            .clicked()
             {
                 let paths: Vec<String> = group
                     .unwrap()
@@ -828,18 +802,16 @@ fn render_fps_detect_row(
             let file_path = group.unwrap().files[*state.sh.conv.ltc_file_idx.value()]
                 .to_string_lossy()
                 .to_string();
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("🔍 Detect LTC")
-                            .font(FontId::proportional(11.0))
-                            .color(Color32::BLACK)
-                            .strong(),
-                    )
-                    .fill(ACCENT)
-                    .min_size(egui::vec2(100.0, 24.0)),
-                )
-                .clicked()
+            if style::action_button(
+                ui,
+                colors,
+                style::ActionStyle::Primary,
+                "🔍 Detect LTC",
+                FontId::proportional(11.0),
+                egui::vec2(100.0, 24.0),
+                true,
+            )
+            .clicked()
             {
                 state.send(GuiCommand::ParseLtcWavFile(file_path));
             }
@@ -1717,13 +1689,13 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
     );
     let origin = response.rect.left_top();
 
-    draw_matrix_headers(ui, &painter, origin, &layout, &colors);
+    // Interact first: hover/click state must be known before painting so
+    // cells can show their hover affordance this frame.
     let map = state.sh.conv.channel_map.value().clone();
-    draw_matrix_cells(&painter, origin, &layout, &colors, &map);
+    let cell_hover = handle_matrix_clicks(ui, state, origin, &layout, &map);
 
-    // Handle clicks (separate from painter)
-    drop(painter);
-    handle_matrix_clicks(ui, state, origin, &layout, &map);
+    draw_matrix_headers(ui, &painter, origin, &layout, &colors);
+    draw_matrix_cells(&painter, origin, &layout, &colors, &map, &cell_hover);
 }
 
 /// Header text and row labels (LTC row highlighted with accent).
@@ -1761,50 +1733,43 @@ fn draw_matrix_headers(
     }
 }
 
-/// The radio-button circles; selection and LTC-row highlighting.
+/// The radio-button circles; selection, LTC-row highlighting and hover
+/// affordance (hover flags come from the interact pass in
+/// [`handle_matrix_clicks`], which runs before painting).
 fn draw_matrix_cells(
     painter: &egui::Painter,
     origin: egui::Pos2,
     layout: &MatrixLayout,
     colors: &ThemeColors,
     map: &ChannelMap,
+    cell_hover: &[bool],
 ) {
-    for cell in &layout.cells {
+    for (i, cell) in layout.cells.iter().enumerate() {
         let cx = origin.x + cell.cx;
         let cy = origin.y + cell.cy;
         let is_selected = map.get(cell.row) == cell.col;
         let is_ltc_row = layout.row_is_ltc[cell.row];
+        let is_hovered = cell_hover.get(i).copied().unwrap_or(false) && !is_selected;
 
+        let v = style::matrix_cell_visuals(colors, is_selected, is_hovered, is_ltc_row);
         let radius = 10.0;
-        let fill_color = if is_ltc_row && !is_selected {
-            ACCENT.linear_multiply(0.12)
-        } else if is_selected {
-            ACCENT.linear_multiply(0.3)
-        } else {
-            colors.deep_bg
-        };
-        let stroke = if is_selected {
-            egui::Stroke::new(2.5, ACCENT)
-        } else if is_ltc_row {
-            egui::Stroke::new(1.0, ACCENT.linear_multiply(0.5))
-        } else {
-            egui::Stroke::new(1.0, colors.border_main)
-        };
-        painter.circle_stroke(egui::pos2(cx, cy), radius, stroke);
-        painter.circle_filled(egui::pos2(cx, cy), radius - 2.0, fill_color);
+        painter.circle_stroke(egui::pos2(cx, cy), radius, v.ring);
+        painter.circle_filled(egui::pos2(cx, cy), radius - 2.0, v.core);
     }
 }
 
 /// Click-to-swap: clicking an unselected cell swaps its input channel (row)
-/// with the channel currently mapped to that output (column).
+/// with the channel currently mapped to that output (column). Returns the
+/// per-cell hover flags (in `layout.cells` order) for the paint pass.
 fn handle_matrix_clicks(
     ui: &mut Ui,
     state: &mut AppState,
     origin: egui::Pos2,
     layout: &MatrixLayout,
     map: &ChannelMap,
-) {
-    for cell in &layout.cells {
+) -> Vec<bool> {
+    let mut cell_hover = vec![false; layout.cells.len()];
+    for (i, cell) in layout.cells.iter().enumerate() {
         let cx = origin.x + cell.cx;
         let cy = origin.y + cell.cy;
         let is_selected = map.get(cell.row) == cell.col;
@@ -1814,22 +1779,25 @@ fn handle_matrix_clicks(
         );
 
         let click_id = egui::Id::new(("chan_map", cell.row, cell.col));
-        let clicked = ui
-            .interact(hitbox, click_id, egui::Sense::click())
-            .clicked();
-        if clicked && !is_selected {
-            let row = cell.row;
-            let col = cell.col;
-            let mut new_map = map.clone();
-            new_map.swap(row, col);
-            bound::set_value(
-                state,
-                |s| &mut s.sh.conv.channel_map,
-                new_map,
-                move |_| GuiCommand::Converter(ConverterCommand::SwapChannelMapCells(row, col)),
-            );
+        let resp = ui.interact(hitbox, click_id, egui::Sense::click());
+        if !is_selected {
+            cell_hover[i] = resp.hovered();
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.clicked() {
+                let row = cell.row;
+                let col = cell.col;
+                let mut new_map = map.clone();
+                new_map.swap(row, col);
+                bound::set_value(
+                    state,
+                    |s| &mut s.sh.conv.channel_map,
+                    new_map,
+                    move |_| GuiCommand::Converter(ConverterCommand::SwapChannelMapCells(row, col)),
+                );
+            }
         }
     }
+    cell_hover
 }
 
 // ── Split / Drop options ────────────────────────────────────────────────
@@ -2329,12 +2297,10 @@ fn render_audio_format_rows(
 
 /// Tinted amber warning note frame.
 fn render_warning_note(ui: &mut Ui, text: &str, colors: &crate::theme::ThemeColors) {
+    let (fill, stroke, _) = style::badge_colors(colors, style::BadgeTone::Warning);
     let warning_area = egui::Frame::new()
-        .fill(Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.08))
-        .stroke(egui::Stroke::new(
-            1.0,
-            Color32::from_rgb(0xF5, 0x9E, 0x0B).linear_multiply(0.2),
-        ))
+        .fill(fill)
+        .stroke(stroke)
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(10, 6));
     warning_area.show(ui, |ui| {
@@ -2407,12 +2373,10 @@ fn render_caps_error_note(
     if let Some(caps) = caps {
         if !caps.has_ffmpeg {
             ui.add_space(4.0);
+            let (fill, stroke, _) = style::badge_colors(colors, style::BadgeTone::Danger);
             let error_frame = egui::Frame::new()
-                .fill(Color32::from_rgb(0xEF, 0x44, 0x44).linear_multiply(0.08))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    Color32::from_rgb(0xEF, 0x44, 0x44).linear_multiply(0.2),
-                ))
+                .fill(fill)
+                .stroke(stroke)
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(10, 6));
             error_frame.show(ui, |ui| {
@@ -2446,8 +2410,9 @@ fn render_format_row(
             .selected_text(current)
             .show_ui(ui, |ui| {
                 for (key, desc) in options {
+                    let is_sel = key == current;
                     if ui
-                        .selectable_label(false, format!("{} — {}", key, desc))
+                        .selectable_label(is_sel, format!("{} — {}", key, desc))
                         .clicked()
                     {
                         on_change(key);
@@ -2732,18 +2697,16 @@ fn render_convert_button(
     let is_running = state.latest.job(JobKind::Conversion).is_active();
 
     if is_running {
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new("■ CANCEL CONVERSION")
-                        .font(FontId::proportional(13.0))
-                        .color(Color32::WHITE)
-                        .strong(),
-                )
-                .fill(Color32::from_rgb(0xDC, 0x26, 0x26))
-                .min_size(egui::vec2(ui.available_width(), 42.0)),
-            )
-            .clicked()
+        if style::action_button(
+            ui,
+            &colors,
+            style::ActionStyle::Danger,
+            "■ CANCEL CONVERSION",
+            FontId::proportional(13.0),
+            egui::vec2(ui.available_width(), 42.0),
+            true,
+        )
+        .clicked()
         {
             state.send(GuiCommand::Converter(ConverterCommand::CancelConversion));
         }
@@ -2785,18 +2748,16 @@ fn render_convert_button(
     };
 
     ui.add_enabled_ui(can_convert && sanity_ok, |ui| {
-        if ui
-            .add(
-                egui::Button::new(
-                    RichText::new(button_label)
-                        .font(FontId::proportional(13.0))
-                        .color(Color32::BLACK)
-                        .strong(),
-                )
-                .fill(ACCENT)
-                .min_size(egui::vec2(ui.available_width(), 42.0)),
-            )
-            .clicked()
+        if style::action_button(
+            ui,
+            &colors,
+            style::ActionStyle::Primary,
+            button_label,
+            FontId::proportional(13.0),
+            egui::vec2(ui.available_width(), 42.0),
+            can_convert && sanity_ok,
+        )
+        .clicked()
         {
             start_conversion(state);
         }

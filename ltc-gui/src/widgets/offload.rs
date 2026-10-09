@@ -7,7 +7,7 @@ use gui_engine::duration::format_duration_secs;
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::{JobKind, UnitState};
 
-use super::bound;
+use super::{bound, style};
 use crate::app::AppState;
 use crate::theme::{ThemeColors, ACCENT};
 
@@ -15,8 +15,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let _s = &state.latest;
 
-    let frame = egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(16, 12));
-    frame.show(ui, |ui| {
+    style::content_frame(&colors).show(ui, |ui| {
         ui.vertical(|ui| {
             step_header(ui, "1", "SELECT PARENT FOLDER", &colors);
 
@@ -36,13 +35,8 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
     });
 }
 
-fn step_header(ui: &mut Ui, _number: &str, label: &str, colors: &ThemeColors) {
-    ui.horizontal(|ui| {
-        let label_rich = RichText::new(label)
-            .font(FontId::proportional(14.0))
-            .color(colors.text_main);
-        ui.label(label_rich);
-    });
+fn step_header(ui: &mut Ui, number: &str, label: &str, colors: &ThemeColors) {
+    style::step_header(ui, colors, number, label);
     ui.add_space(4.0);
 }
 
@@ -165,65 +159,63 @@ fn render_card(
     let device_color = card_color(&card.name_source, &colors);
 
     ui.push_id(&card.mount, |ui| {
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
+        style::nested_frame(&colors, egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("💾 {}", card.mount.display()))
+                        .font(FontId::monospace(11.0))
+                        .color(colors.text_muted),
+                );
+                if !card.volume_label.is_empty() && card.volume_label != card.device_name {
                     ui.label(
-                        RichText::new(format!("💾 {}", card.mount.display()))
-                            .font(FontId::monospace(11.0))
+                        RichText::new(format!("({})", card.volume_label))
+                            .font(FontId::monospace(10.0))
                             .color(colors.text_muted),
                     );
-                    if !card.volume_label.is_empty() && card.volume_label != card.device_name {
-                        ui.label(
-                            RichText::new(format!("({})", card.volume_label))
-                                .font(FontId::monospace(10.0))
-                                .color(colors.text_muted),
-                        );
-                    }
-                });
-
-                ui.add_space(2.0);
-
-                render_device_name_edit(ui, state, card);
-
-                // File count summary (now with selection info).
-                ui.horizontal(|ui| {
-                    let summary = selection_summary(card);
-                    ui.label(
-                        RichText::new(summary)
-                            .font(FontId::monospace(11.0))
-                            .color(device_color),
-                    );
-                });
-
-                // ── File selection list ──
-                if !card.files.is_empty() {
-                    ui.add_space(4.0);
-                    render_bulk_select_buttons(ui, state, idx);
-                    render_file_column_headers(ui, &colors);
-
-                    let row_height = 20.0;
-                    let total = card.files.len();
-                    egui::ScrollArea::vertical()
-                        .id_salt(crate::ids::offload_card_files_scroll(&card.mount))
-                        .max_height(240.0)
-                        .auto_shrink([false; 2])
-                        .show_rows(ui, row_height, total, |ui, range| {
-                            for i in range {
-                                render_file_row(
-                                    ui,
-                                    state,
-                                    idx,
-                                    i,
-                                    card,
-                                    &card.files[i],
-                                    file_durations,
-                                );
-                            }
-                        });
                 }
             });
+
+            ui.add_space(2.0);
+
+            render_device_name_edit(ui, state, card);
+
+            // File count summary (now with selection info).
+            ui.horizontal(|ui| {
+                let summary = selection_summary(card);
+                ui.label(
+                    RichText::new(summary)
+                        .font(FontId::monospace(11.0))
+                        .color(device_color),
+                );
+            });
+
+            // ── File selection list ──
+            if !card.files.is_empty() {
+                ui.add_space(4.0);
+                render_bulk_select_buttons(ui, state, idx);
+                render_file_column_headers(ui, &colors);
+
+                let row_height = 20.0;
+                let total = card.files.len();
+                egui::ScrollArea::vertical()
+                    .id_salt(crate::ids::offload_card_files_scroll(&card.mount))
+                    .max_height(240.0)
+                    .auto_shrink([false; 2])
+                    .show_rows(ui, row_height, total, |ui, range| {
+                        for i in range {
+                            render_file_row(
+                                ui,
+                                state,
+                                idx,
+                                i,
+                                card,
+                                &card.files[i],
+                                file_durations,
+                            );
+                        }
+                    });
+            }
+        });
     });
 }
 
@@ -423,30 +415,32 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
 
     ui.horizontal(|ui| {
         if is_running {
-            if ui
-                .button(
-                    RichText::new("■ Cancel")
-                        .font(FontId::proportional(13.0))
-                        .color(colors.error_red),
-                )
-                .clicked()
+            if style::action_button(
+                ui,
+                &colors,
+                style::ActionStyle::Danger,
+                "■ Cancel",
+                egui::FontId::proportional(13.0),
+                Vec2::new(120.0, 30.0),
+                true,
+            )
+            .clicked()
             {
                 state.send(GuiCommand::Offload(OffloadCommand::CancelOffload));
             }
-        } else if can_start {
-            if ui
-                .button(
-                    RichText::new("Start Offload")
-                        .font(FontId::proportional(13.0))
-                        .color(ACCENT),
-                )
-                .clicked()
-            {
-                state.mark_offload_start_pending();
-                state.send(GuiCommand::Offload(OffloadCommand::StartOffload));
-            }
-        } else {
-            ui.add_enabled(false, egui::Button::new("Start Offload"));
+        } else if style::action_button(
+            ui,
+            &colors,
+            style::ActionStyle::Primary,
+            "Start Offload",
+            egui::FontId::proportional(13.0),
+            Vec2::new(160.0, 30.0),
+            can_start,
+        )
+        .clicked()
+        {
+            state.mark_offload_start_pending();
+            state.send(GuiCommand::Offload(OffloadCommand::StartOffload));
         }
     });
 }
