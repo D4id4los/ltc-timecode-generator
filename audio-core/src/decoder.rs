@@ -5,10 +5,16 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use crate::ltc_decoder::{decode_ltc_from_wav, decode_ltc_samples, LtcDetectionResult};
-use crate::ltc_decoder_libltc::{decode_ltc_from_wav_libltc, decode_ltc_samples_libltc};
+use crate::ltc_decoder::{
+    decode_ltc_from_wav, decode_ltc_from_wav_with_progress, LtcDetectionResult,
+};
+use crate::ltc_decoder_libltc::{
+    decode_ltc_from_wav_libltc, decode_ltc_from_wav_libltc_with_progress,
+};
 use crate::wav_chunk_reader::WavChunkReader;
 use crate::LtcDecodeError;
+
+pub use crate::types::DecodeProgressCb;
 
 /// Backend-agnostic LTC decode interface.
 pub trait LtcDecoder: Send + Sync {
@@ -23,6 +29,19 @@ pub trait LtcDecoder: Send + Sync {
         drop_frame: bool,
         cancel: Option<&AtomicBool>,
     ) -> Result<LtcDetectionResult, LtcDecodeError>;
+
+    /// [`LtcDecoder::decode_wav`] with a fine-grained progress callback.
+    /// Default: ignore the callback (mock/test backends).
+    fn decode_wav_with_progress(
+        &self,
+        path: &Path,
+        fps: f64,
+        drop_frame: bool,
+        cancel: Option<&AtomicBool>,
+        _progress: Option<DecodeProgressCb<'_>>,
+    ) -> Result<LtcDetectionResult, LtcDecodeError> {
+        self.decode_wav(path, fps, drop_frame, cancel)
+    }
 
     /// Decode the chunk `[start, start+len)` (mono-sample units) via
     /// `req.reader`. Each backend reads its own preferred sample format —
@@ -46,6 +65,10 @@ pub struct ChunkDecodeReq<'a> {
     pub drop_frame: bool,
     pub start_time: Instant,
     pub cancel: &'a AtomicBool,
+    /// Fine-grained progress sink for this chunk: called with the fraction
+    /// of `[start, start+len)` processed; the chunk runner maps it onto the
+    /// whole-stream position. `None` = chunk-boundary granularity only.
+    pub progress: Option<DecodeProgressCb<'a>>,
 }
 
 /// Pure-Rust builtin decoder (f32 samples, chunked parallel decode support).
@@ -69,6 +92,17 @@ impl LtcDecoder for BuiltinDecoder {
         decode_ltc_from_wav(path, fps, drop_frame, cancel)
     }
 
+    fn decode_wav_with_progress(
+        &self,
+        path: &Path,
+        fps: f64,
+        drop_frame: bool,
+        cancel: Option<&AtomicBool>,
+        progress: Option<DecodeProgressCb<'_>>,
+    ) -> Result<LtcDetectionResult, LtcDecodeError> {
+        decode_ltc_from_wav_with_progress(path, fps, drop_frame, cancel, progress)
+    }
+
     fn decode_chunk(&self, req: ChunkDecodeReq<'_>) -> Result<LtcDetectionResult, LtcDecodeError> {
         let ChunkDecodeReq {
             reader,
@@ -80,10 +114,11 @@ impl LtcDecoder for BuiltinDecoder {
             drop_frame,
             start_time,
             cancel,
+            progress,
             ..
         } = req;
         match reader.read_mono_samples_f32(start, len) {
-            Ok(samples) => decode_ltc_samples(
+            Ok(samples) => crate::ltc_decoder::decode_ltc_samples_with_progress(
                 &samples,
                 sample_rate,
                 1,
@@ -91,6 +126,7 @@ impl LtcDecoder for BuiltinDecoder {
                 drop_frame,
                 start_time,
                 Some(cancel),
+                progress,
             ),
             Err(e) => Err(LtcDecodeError::Failed(format!(
                 "Failed to read chunk {}: {}",
@@ -115,6 +151,17 @@ impl LtcDecoder for LibltcDecoder {
         decode_ltc_from_wav_libltc(path, fps, drop_frame, cancel)
     }
 
+    fn decode_wav_with_progress(
+        &self,
+        path: &Path,
+        fps: f64,
+        drop_frame: bool,
+        cancel: Option<&AtomicBool>,
+        progress: Option<DecodeProgressCb<'_>>,
+    ) -> Result<LtcDetectionResult, LtcDecodeError> {
+        decode_ltc_from_wav_libltc_with_progress(path, fps, drop_frame, cancel, progress)
+    }
+
     fn decode_chunk(&self, req: ChunkDecodeReq<'_>) -> Result<LtcDetectionResult, LtcDecodeError> {
         let ChunkDecodeReq {
             reader,
@@ -126,10 +173,11 @@ impl LtcDecoder for LibltcDecoder {
             drop_frame,
             start_time,
             cancel,
+            progress,
             ..
         } = req;
         match reader.read_mono_samples_i16(start, len) {
-            Ok(samples) => decode_ltc_samples_libltc(
+            Ok(samples) => crate::ltc_decoder_libltc::decode_ltc_samples_libltc_with_progress(
                 &samples,
                 1,
                 sample_rate,
@@ -137,6 +185,7 @@ impl LtcDecoder for LibltcDecoder {
                 drop_frame,
                 start_time,
                 Some(cancel),
+                progress,
             ),
             Err(e) => Err(LtcDecodeError::Failed(format!(
                 "Failed to read chunk {}: {}",

@@ -469,7 +469,14 @@ fn sync_probe_flags(ui: &AppWindow, s: &AppStateSnapshot) {
 fn sync_decode_progress(ui: &AppWindow, s: &AppStateSnapshot) {
     // 8. Sync decode progress
     if s.job(JobKind::LtcDecode).is_active() || s.job(JobKind::LtcGroupDecode).is_active() {
-        ui.set_ltc_decode_progress(s.job(JobKind::LtcDecode).fraction());
+        // Read the fraction from the job that is actually running: a group
+        // detect must not render the idle/stale single-decode job's fraction.
+        let active_kind = if s.job(JobKind::LtcDecode).is_active() {
+            JobKind::LtcDecode
+        } else {
+            JobKind::LtcGroupDecode
+        };
+        ui.set_ltc_decode_progress(s.job(active_kind).fraction());
     }
 }
 

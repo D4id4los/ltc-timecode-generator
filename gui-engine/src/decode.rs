@@ -6,7 +6,7 @@
 //! chunk-decode it, and remove the temp file afterwards.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -102,13 +102,28 @@ pub fn decode_video_channel<F: Fn(f32)>(
             let chunk_count = audio_core::count_chunks(total_mono, sr, ch, bps, &config);
 
             if chunk_count <= 1 || total_mono == 0 {
-                let result = audio_core::decode_ltc_with_decoder(
+                let dp = DecodeProgress::new(1);
+                let progress_cb = {
+                    let dp = dp.clone();
+                    move |f: f32| dp.note_fine_fraction(f)
+                };
+                let bridge = decode_unit
+                    .as_ref()
+                    .map(|unit| bridge_decode_progress(dp.clone(), unit.clone(), None));
+
+                let result = audio_core::decode_ltc_with_decoder_progress(
                     &wav_path,
                     use_libltc,
                     decode_fps,
                     decode_drop_frame,
                     Some(cancel),
+                    Some(&progress_cb),
                 );
+                // Let the bridge observe the terminal fraction, then release it.
+                dp.chunks_completed.store(1, Ordering::Relaxed);
+                if let Some(h) = bridge {
+                    let _ = h.join();
+                }
                 chunks_done.store(1, Ordering::Relaxed);
                 result
             } else {
@@ -116,6 +131,7 @@ pub fn decode_video_channel<F: Fn(f32)>(
                     chunks_total: chunk_count,
                     chunks_completed: chunks_done.clone(),
                     cancel_flag: cancel.clone(),
+                    fine_milli: Arc::new(AtomicU32::new(0)),
                 };
 
                 let bridge = decode_unit.as_ref().map(|unit| {
@@ -230,13 +246,29 @@ pub fn decode_wav_core(
 
     match wav_dispatch_decision(params.single_pass, known_chunk_count, counted) {
         WavDispatch::SinglePass => {
-            let result = audio_core::decode_ltc_with_decoder(
-                path,
-                params.use_libltc,
-                params.decode_fps,
-                params.decode_drop_frame,
-                cancel.map(|flag| flag.as_ref()),
-            )?;
+            // The single-pass path previously produced no progress until it
+            // finished; report the decoder's fine-grained stream position so
+            // the bar moves during the decode.
+            let result = match progress {
+                Some(dp) => {
+                    let progress_cb = move |f: f32| dp.note_fine_fraction(f);
+                    audio_core::decode_ltc_with_decoder_progress(
+                        path,
+                        params.use_libltc,
+                        params.decode_fps,
+                        params.decode_drop_frame,
+                        cancel.map(|flag| flag.as_ref()),
+                        Some(&progress_cb),
+                    )
+                }
+                None => audio_core::decode_ltc_with_decoder(
+                    path,
+                    params.use_libltc,
+                    params.decode_fps,
+                    params.decode_drop_frame,
+                    cancel.map(|flag| flag.as_ref()),
+                ),
+            }?;
             Ok(WavDecodeOutcome {
                 result,
                 chunk_count,
@@ -253,6 +285,7 @@ pub fn decode_wav_core(
                         cancel_flag: cancel
                             .cloned()
                             .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                        fine_milli: Arc::new(AtomicU32::new(0)),
                     };
                     &owned_progress
                 }
@@ -379,6 +412,7 @@ pub fn run_wav_decode_job_with(
         chunks_total: chunk_count,
         chunks_completed: chunks_done.clone(),
         cancel_flag: cancel.clone(),
+        fine_milli: Arc::new(AtomicU32::new(0)),
     };
 
     let dp_bridge = bridge_decode_progress(dp.clone(), unit, None);
@@ -405,6 +439,13 @@ pub fn run_wav_decode_job_with(
     }
 }
 
+/// Combined decode fraction (`0.0..=1.0`) for a bridge to publish: the
+/// coarser chunk-completion fraction and the fine-grained stream-position
+/// fraction, whichever is further along. See [`DecodeProgress::percent`].
+pub(crate) fn decode_progress_fraction(dp: &DecodeProgress) -> f32 {
+    dp.percent()
+}
+
 /// Bridge a `DecodeProgress` (from audio-core chunked decode) to a
 /// `UnitProgress` by polling `chunks_completed` on a short-lived helper
 /// thread.  Returns a `JoinHandle` the caller should join before the unit
@@ -420,7 +461,7 @@ pub(crate) fn bridge_decode_progress(
             let done = dp.chunks_completed.load(Ordering::Relaxed);
             let total = dp.chunks_total;
             if total > 0 {
-                unit.set_fraction(done as f32 / total as f32);
+                unit.set_fraction(decode_progress_fraction(&dp));
                 let msg = match &msg_prefix {
                     Some(prefix) => format!("{} — Chunk {}/{}", prefix, done.min(total), total),
                     None => format!("Chunk {}/{}", done.min(total), total),
@@ -618,6 +659,72 @@ mod tests {
             s.contains("_42_3_1_"),
             "path should encode gen/stream/channel: {}",
             s
+        );
+    }
+
+    // ── fine-grained decode progress ─────────────────────────────────────
+
+    /// The progress bridge must publish the fine-grained stream-position
+    /// fraction, not only the chunk-completion fraction: a 2-chunk file
+    /// must not jump 0 → 50 → 100.
+    #[test]
+    fn decode_progress_fraction_combines_chunk_and_fine_values() {
+        let dp = DecodeProgress::new(4);
+        assert_eq!(decode_progress_fraction(&dp), 0.0);
+
+        // Fine value alone (no chunk completed yet) must be visible.
+        dp.note_fine_fraction(0.5);
+        assert!(
+            (decode_progress_fraction(&dp) - 0.5).abs() < 0.001,
+            "fine fraction must surface without completed chunks"
+        );
+
+        // The coarser of the two wins (never rolls backwards).
+        dp.chunks_completed.store(2, Ordering::Relaxed);
+        assert!((decode_progress_fraction(&dp) - 0.5).abs() < 0.001);
+        dp.chunks_completed.store(4, Ordering::Relaxed);
+        assert!((decode_progress_fraction(&dp) - 1.0).abs() < 0.001);
+    }
+
+    /// The single-pass dispatch (< 1 chunk) previously produced no progress
+    /// at all until the decode finished; it must report fine-grained
+    /// fractions into the shared `DecodeProgress`.
+    #[test]
+    fn decode_wav_core_single_pass_reports_fine_progress() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("small.wav");
+        make_ltc_wav(&wav, 2.0);
+
+        let dp = DecodeProgress::new(1);
+        let outcome = decode_wav_core(&wav, test_params(false), Some(1), None, Some(&dp))
+            .expect("small WAV must decode");
+        assert!(outcome.result.valid_frames >= 1);
+
+        assert!(
+            dp.fine_milli.load(Ordering::Relaxed) >= 900,
+            "single-pass decode must report fine-grained progress, got milli {}",
+            dp.fine_milli.load(Ordering::Relaxed)
+        );
+    }
+
+    /// The chunked dispatch must surface intra-chunk progress too: the
+    /// engine's bridge polls `decode_progress_fraction`, which reads the
+    /// fine value that audio-core's chunk runner records.
+    #[test]
+    fn decode_wav_core_chunked_reports_fine_progress() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wav = dir.path().join("small.wav");
+        make_ltc_wav(&wav, 2.0);
+
+        let dp = DecodeProgress::new(3);
+        let outcome = decode_wav_core(&wav, test_params(false), Some(3), None, Some(&dp))
+            .expect("forced-chunked decode must succeed");
+
+        assert_eq!(outcome.chunk_count, 3);
+        assert!(
+            dp.fine_milli.load(Ordering::Relaxed) >= 900,
+            "chunked decode must report fine-grained progress, got milli {}",
+            dp.fine_milli.load(Ordering::Relaxed)
         );
     }
 }

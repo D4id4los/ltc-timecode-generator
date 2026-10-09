@@ -737,36 +737,31 @@ fn run_decode_on_wav(
     let chunk_count = audio_core::count_chunks_in_wav(path, &config).unwrap_or(1);
 
     let progress = audio_core::DecodeProgress::new(chunk_count);
-    let dispatch =
-        crate::decode::wav_dispatch_decision(single_pass, Some(chunk_count), chunk_count);
-
-    let progress_handle = if matches!(dispatch, crate::decode::WavDispatch::Chunked(_)) {
-        let completed_ref = progress.chunks_completed.clone();
+    // Printer runs for both dispatches: the chunked dispatch advances the
+    // chunk counter, and (via the fine-grained stream-position fraction the
+    // decoders report) the single-pass dispatch moves too.
+    let decode_finished = Arc::new(AtomicBool::new(false));
+    let progress_handle = {
+        let progress_ref = progress.clone();
+        let finished = Arc::clone(&decode_finished);
         let total_chunks = chunk_count;
         Some(std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             loop {
-                let done = completed_ref.load(Ordering::Relaxed);
-                let pct = (done.checked_mul(100))
-                    .and_then(|v| v.checked_div(total_chunks))
-                    .unwrap_or(100);
+                let done = progress_ref.chunks_completed.load(Ordering::Relaxed);
+                let pct = (progress_ref.percent() * 100.0) as usize;
                 eprint!(
                     "\rDecoding: {:3}%  (chunk {}/{})",
                     pct.min(100),
                     done.min(total_chunks),
                     total_chunks
                 );
-                if done >= total_chunks
-                    || total_chunks == 0
-                    || std::time::Instant::now() >= deadline
-                {
+                if finished.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }))
-    } else {
-        None
     };
 
     let outcome = crate::decode::decode_wav_core(
@@ -783,6 +778,7 @@ fn run_decode_on_wav(
     )
     .map_err(|e| e.to_string())?;
 
+    decode_finished.store(true, Ordering::Relaxed);
     if let Some(progress_handle) = progress_handle {
         let _ = progress_handle.join();
         eprintln!("\rDecoding: 100%  (chunk {}/{})", chunk_count, chunk_count);

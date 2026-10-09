@@ -2,7 +2,7 @@
 
 use log::{debug, info, warn};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -181,6 +181,8 @@ pub fn decode_ltc_chunked(
         drop_frame,
         active_channel: plan.active_channel,
         cancel_flag: &progress.cancel_flag,
+        fine: Some(&progress.fine_milli),
+        total_mono: plan.total_mono,
     };
     let mut chunk_results = if num_workers <= 1 {
         run_sequential(&job, &plan, progress)
@@ -531,6 +533,29 @@ struct ChunkJob<'a> {
     drop_frame: bool,
     active_channel: usize,
     cancel_flag: &'a AtomicBool,
+    /// Fine-grained progress sink (from `DecodeProgress.fine_milli`): the
+    /// per-chunk decoder fraction is mapped onto the whole-stream position.
+    fine: Option<&'a AtomicU32>,
+    /// Total mono samples of the stream (the fine-fraction denominator).
+    total_mono: usize,
+}
+
+/// Build the chunk's progress callback: maps a within-chunk fraction onto
+/// the whole-stream millifraction, raised monotonically (`fetch_max`) so
+/// out-of-order parallel chunk completions never roll the bar back.
+fn chunk_progress_cb(
+    fine: Option<&AtomicU32>,
+    total_mono: usize,
+    start_sample: usize,
+    num_samples: usize,
+) -> Option<impl Fn(f32) + '_> {
+    fine.map(move |fine| {
+        move |f: f32| {
+            let pos = start_sample as f64 + (f64::from(f.clamp(0.0, 1.0)) * num_samples as f64);
+            let frac = (pos / total_mono.max(1) as f64).clamp(0.0, 1.0);
+            fine.fetch_max((frac * 1000.0) as u32, Ordering::Relaxed);
+        }
+    })
 }
 
 /// Decode a single chunk of a WAV file in a worker thread.
@@ -562,6 +587,10 @@ fn decode_one_chunk(
         }
     };
 
+    let chunk_cb = chunk_progress_cb(job.fine, job.total_mono, start_sample, num_samples);
+    let progress_cb: Option<&(dyn Fn(f32) + Send + Sync)> = chunk_cb
+        .as_ref()
+        .map(|cb| cb as &(dyn Fn(f32) + Send + Sync));
     let chunk_start = Instant::now();
     let result = job.decoder.decode_chunk(crate::decoder::ChunkDecodeReq {
         path: job.path,
@@ -574,6 +603,7 @@ fn decode_one_chunk(
         drop_frame: job.drop_frame,
         start_time: chunk_start,
         cancel: job.cancel_flag,
+        progress: progress_cb,
     });
     let elapsed = chunk_start.elapsed();
     debug!(
@@ -1020,6 +1050,9 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &seq_progress.cancel_flag,
+
+            fine: None,
+            total_mono: 0,
         };
         let par_job = ChunkJob {
             path: &path,
@@ -1029,6 +1062,9 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &par_progress.cancel_flag,
+
+            fine: None,
+            total_mono: 0,
         };
         let seq_results = run_sequential(&seq_job, &plan, &seq_progress);
         let par_results = run_parallel(&par_job, &plan, &par_progress, 3);
@@ -1081,6 +1117,9 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &progress.cancel_flag,
+
+            fine: None,
+            total_mono: 0,
         };
         let results = run_parallel(&job, &plan, &progress, 3);
         assert_eq!(results.len(), 5);
@@ -1112,6 +1151,9 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &progress.cancel_flag,
+
+            fine: None,
+            total_mono: 0,
         };
         let results = run_parallel(&job, &plan, &progress, 3);
 
@@ -1147,10 +1189,78 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &progress.cancel_flag,
+
+            fine: None,
+            total_mono: 0,
         };
         let results = run_sequential(&job, &plan, &progress);
         assert!(results.is_empty());
         assert_eq!(progress.chunks_completed.load(Ordering::Relaxed), 0);
+    }
+
+    /// Decoder that reports mid-chunk progress through the request's
+    /// progress callback (the hook the fine-grained bar rides on).
+    struct HalfwayReportingDecoder;
+
+    impl LtcDecoder for HalfwayReportingDecoder {
+        fn name(&self) -> &'static str {
+            "mock-halfway"
+        }
+
+        fn decode_wav(
+            &self,
+            _path: &Path,
+            _fps: f64,
+            _drop: bool,
+            _cancel: Option<&AtomicBool>,
+        ) -> Result<LtcDetectionResult, LtcDecodeError> {
+            Err(LtcDecodeError::Failed("mock: not supported".to_string()))
+        }
+
+        fn decode_chunk(
+            &self,
+            req: crate::decoder::ChunkDecodeReq<'_>,
+        ) -> Result<LtcDetectionResult, LtcDecodeError> {
+            if let Some(cb) = req.progress {
+                cb(0.5);
+            }
+            Ok(chunk_ok(0.001, 1))
+        }
+    }
+
+    /// The chunk runner must map the decoder's per-buffer progress fraction
+    /// onto the whole-stream millifraction on `DecodeProgress.fine_milli`:
+    /// each chunk's mid-chunk report (f=0.5) lands at its own stream
+    /// position — chunk 1 of the five-chunk plan covers `[43200, 91200)` of
+    /// 220 800 mono samples (mid → milli 304), chunk 4 covers
+    /// `[172800, 220800)` (mid → milli 891); `fetch_max` keeps the final
+    /// value at the highest position reached.
+    #[test]
+    fn run_sequential_maps_chunk_progress_onto_stream_fine_milli() {
+        let plan = five_chunk_plan();
+        let dir = write_mock_wav();
+        let path = dir.path().join("mock.wav");
+        let progress = DecodeProgress::new(5);
+
+        let job = ChunkJob {
+            path: &path,
+            decoder: &HalfwayReportingDecoder,
+            sample_rate: plan.sample_rate,
+            fps: 25.0,
+            drop_frame: false,
+            active_channel: plan.active_channel,
+            cancel_flag: &progress.cancel_flag,
+            fine: Some(&progress.fine_milli),
+            total_mono: 220_800,
+        };
+        run_sequential(&job, &plan, &progress);
+
+        let expected_last = ((172_800.0 + 0.5 * 48_000.0) / 220_800.0 * 1000.0) as u32;
+        assert_eq!(
+            progress.fine_milli.load(Ordering::Relaxed),
+            expected_last,
+            "the final fine value must be the last chunk's stream position"
+        );
     }
 
     // ── count_chunks ──────────────────────────────────────────────────────
@@ -2137,6 +2247,9 @@ mod tests {
                 drop_frame: false,
                 active_channel: 0,
                 cancel_flag: &cancel,
+
+                fine: None,
+                total_mono: 0,
             };
             let standalone = decode_one_chunk(&job, idx, start, end);
             let s = standalone

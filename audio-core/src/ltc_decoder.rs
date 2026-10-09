@@ -181,6 +181,12 @@ const SYNC_OFFSET: usize = 64;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/// Fine-grained decode progress sink: receives the fraction (`0.0..=1.0`)
+/// of the buffer being decoded. Monotonicity across stages is the caller's
+/// contract; the receiver (e.g. `DecodeProgress::note_fine_fraction`)
+/// enforces it anyway.
+pub(crate) type ProgressCb<'a> = &'a (dyn Fn(f32) + Send + Sync);
+
 /// Decode LTC from a pre-loaded buffer of mono f32 samples.
 /// This is the core decoding logic, extracted from `decode_ltc_from_wav`.
 /// Shared substrate of the decode strategy ladder (coarse scan → refinement
@@ -193,8 +199,12 @@ struct DecodeCtx<'a> {
     fps: f64,
     drop_frame: bool,
     cancel: Option<&'a AtomicBool>,
+    progress: Option<ProgressCb<'a>>,
 }
-
+// The 8-argument list is the long-standing decode-parameter bundle plus the
+// single new optional progress sink; a context struct would churn both
+// decoder backends and every call site for no cohesion gain.
+#[allow(clippy::too_many_arguments)]
 fn decode_ltc_samples_inner(
     samples: &[f32],
     sample_rate: u32,
@@ -203,7 +213,13 @@ fn decode_ltc_samples_inner(
     drop_frame: bool,
     start: std::time::Instant,
     cancel: Option<&AtomicBool>,
+    progress: Option<ProgressCb<'_>>,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
+    let report = |f: f32| {
+        if let Some(cb) = progress {
+            cb(f.clamp(0.0, 1.0));
+        }
+    };
     if samples.is_empty() {
         warn!("LTC decode: audio buffer contains no samples");
         return Ok(LtcDetectionResult::error(
@@ -219,6 +235,7 @@ fn decode_ltc_samples_inner(
     let mut conditioned: Vec<f32> = samples.to_vec();
     condition_signal(&mut conditioned, sample_rate);
     let samples: &[f32] = &conditioned;
+    report(0.03);
 
     let total_duration = samples.len() as f64 / sample_rate as f64;
     let noise_floor = estimate_noise_floor(samples);
@@ -247,6 +264,7 @@ fn decode_ltc_samples_inner(
         threshold
     );
     let mut zc = find_zero_crossings(samples, threshold);
+    report(0.10);
     debug!("LTC decode: found {} zero-crossings", zc.len());
 
     // Adaptive ZC: if far more ZCs than expected for clean LTC, noise is causing
@@ -258,6 +276,7 @@ fn decode_ltc_samples_inner(
         info!("LTC decode: ZC count {} is > {}x expected ({}) -- re-running with stricter threshold {:.6}",
             zc.len(), 3, expected_max_zcs, stricter);
         zc = find_zero_crossings(samples, stricter);
+        report(0.15);
         debug!(
             "LTC decode: re-run with stricter threshold found {} zero-crossings",
             zc.len()
@@ -293,8 +312,10 @@ fn decode_ltc_samples_inner(
         fps,
         drop_frame,
         cancel,
+        progress,
     };
     let zc_result = try_decode_via_zc_intervals(&zc, sample_rate, fps, drop_frame, samples.len());
+    report(0.20);
     let zc_conf = zc_result.as_ref().map_or(0.0, |r| {
         if r.total_possible > 0 {
             r.grid_valid as f32 / r.total_possible as f32
@@ -339,6 +360,7 @@ fn decode_ltc_samples_inner(
                 window_start,
                 &zc,
                 cancel,
+                progress,
             );
             let final_r = prefer_zc_or_detailed(zc_result, Some(decoded), "detailed scan");
             return build_result(&ctx, final_r, channels, total_duration, start);
@@ -358,6 +380,7 @@ fn decode_ltc_samples_inner(
                 window_start,
                 &zc,
                 cancel,
+                progress,
             );
             let final_r = prefer_zc_or_detailed(zc_result, Some(decoded), "detailed scan");
             return build_result(&ctx, final_r, channels, total_duration, start);
@@ -441,6 +464,7 @@ fn scan_windows(ctx: &DecodeCtx) -> Result<WindowScan, LtcDecodeError> {
             fps: ctx.fps,
             drop_frame: ctx.drop_frame,
             cancel: ctx.cancel,
+            progress: None,
         };
         let (result, valid) = evaluate_on_slice(&window_ctx);
 
@@ -470,6 +494,12 @@ fn scan_windows(ctx: &DecodeCtx) -> Result<WindowScan, LtcDecodeError> {
 
         if window_end >= samples.len() {
             break;
+        }
+
+        // Window scan covers roughly the 0.20–0.45 band of a buffer decode.
+        if let Some(cb) = ctx.progress {
+            let scan_frac = 0.20 + 0.25 * (window_end as f32 / samples.len() as f32);
+            cb(scan_frac.clamp(0.0, 0.45));
         }
     }
 
@@ -512,6 +542,8 @@ fn prefer_zc_or_detailed(
 }
 
 /// Public entry point for LTC decode. Wraps the inner decoder.
+/// Test-only shim: production callers use [`decode_ltc_samples_with_progress`].
+#[cfg(test)]
 pub(crate) fn decode_ltc_samples(
     samples: &[f32],
     sample_rate: u32,
@@ -521,6 +553,35 @@ pub(crate) fn decode_ltc_samples(
     start: std::time::Instant,
     cancel: Option<&AtomicBool>,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
+    decode_ltc_samples_with_progress(
+        samples,
+        sample_rate,
+        channels,
+        fps,
+        drop_frame,
+        start,
+        cancel,
+        None,
+    )
+}
+/// [`decode_ltc_samples`] with a fine-grained progress callback: `progress`
+/// receives the fraction (0.0..=1.0) of the buffer processed, sampled at
+/// stage boundaries and inside the bit-extraction loops, so a caller can
+/// move a progress bar *during* a chunk decode instead of only at its end.
+// The 8-argument list is the long-standing decode-parameter bundle plus the
+// single new optional progress sink; a context struct would churn both
+// decoder backends and every call site for no cohesion gain.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_ltc_samples_with_progress(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: usize,
+    fps: f64,
+    drop_frame: bool,
+    start: std::time::Instant,
+    cancel: Option<&AtomicBool>,
+    progress: Option<ProgressCb<'_>>,
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     decode_ltc_samples_inner(
         samples,
         sample_rate,
@@ -529,6 +590,7 @@ pub(crate) fn decode_ltc_samples(
         drop_frame,
         start,
         cancel,
+        progress,
     )
 }
 
@@ -540,6 +602,18 @@ pub fn decode_ltc_from_wav(
     fps: f64,
     drop_frame: bool,
     cancel: Option<&AtomicBool>,
+) -> Result<LtcDetectionResult, LtcDecodeError> {
+    decode_ltc_from_wav_with_progress(path, fps, drop_frame, cancel, None)
+}
+
+/// [`decode_ltc_from_wav`] with a fine-grained progress callback (see
+/// [`decode_ltc_samples_with_progress`]).
+pub fn decode_ltc_from_wav_with_progress(
+    path: &Path,
+    fps: f64,
+    drop_frame: bool,
+    cancel: Option<&AtomicBool>,
+    progress: Option<ProgressCb<'_>>,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
     let start = std::time::Instant::now();
 
@@ -590,7 +664,7 @@ pub fn decode_ltc_from_wav(
         }
     }
 
-    decode_ltc_samples(
+    decode_ltc_samples_with_progress(
         &samples,
         sample_rate,
         channels,
@@ -598,6 +672,7 @@ pub fn decode_ltc_from_wav(
         drop_frame,
         start,
         cancel,
+        progress,
     )
 }
 
@@ -911,6 +986,11 @@ fn build_result(
     let samples = ctx.samples;
     let sample_rate = ctx.sample_rate;
     let threshold = ctx.threshold;
+    // Result assembly (backfill + quality analysis) is the decode tail: the
+    // sample work is done, so the progress callback terminates here.
+    if let Some(cb) = ctx.progress {
+        cb(1.0);
+    }
     let elapsed = start.elapsed();
     let processing_time_ms = elapsed.as_secs_f64() * 1000.0;
 
@@ -2191,6 +2271,17 @@ fn extract_bits(
     _threshold: f32,
     cancel: Option<&AtomicBool>,
 ) -> Vec<u8> {
+    extract_bits_with_progress(samples, samples_per_bit, phase, _threshold, cancel, None)
+}
+
+fn extract_bits_with_progress(
+    samples: &[f32],
+    samples_per_bit: f64,
+    phase: usize,
+    _threshold: f32,
+    cancel: Option<&AtomicBool>,
+    progress: Option<&dyn Fn(f32)>,
+) -> Vec<u8> {
     let mut bits = Vec::new();
     let quarter = samples_per_bit * 0.25;
     let three_quarter = samples_per_bit * 0.75;
@@ -2203,6 +2294,9 @@ fn extract_bits(
                 if c.load(Ordering::Relaxed) {
                     return bits;
                 }
+            }
+            if let Some(cb) = progress {
+                cb((pos as f32 / samples.len() as f32).clamp(0.0, 1.0));
             }
         }
         bit_count += 1;
@@ -2229,6 +2323,26 @@ fn extract_bits_adaptive(
     zero_crossings: &[usize],
     cancel: Option<&AtomicBool>,
 ) -> Vec<u8> {
+    extract_bits_adaptive_with_progress(
+        samples,
+        samples_per_bit,
+        phase,
+        _threshold,
+        zero_crossings,
+        cancel,
+        None,
+    )
+}
+
+fn extract_bits_adaptive_with_progress(
+    samples: &[f32],
+    samples_per_bit: f64,
+    phase: usize,
+    _threshold: f32,
+    zero_crossings: &[usize],
+    cancel: Option<&AtomicBool>,
+    progress: Option<&dyn Fn(f32)>,
+) -> Vec<u8> {
     let mut bits = Vec::new();
     let quarter = samples_per_bit * 0.25;
     let three_quarter = samples_per_bit * 0.75;
@@ -2248,6 +2362,9 @@ fn extract_bits_adaptive(
                 if c.load(Ordering::Relaxed) {
                     return bits;
                 }
+            }
+            if let Some(cb) = progress {
+                cb((pos as f32 / samples.len() as f32).clamp(0.0, 1.0));
             }
         }
         bit_count += 1;
@@ -2656,10 +2773,13 @@ impl ScoredResult {
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
-
 /// Run a single-pass `extract_bits` + `find_frames` on the full sample buffer
 /// using the SPB/phase discovered from a window eval. Returns a populated
 /// `ScoredResult` with timecodes computed from the full decode.
+// The 8-argument list is the long-standing decode-parameter bundle plus the
+// single new optional progress sink; a context struct would churn both
+// decoder backends and every call site for no cohesion gain.
+#[allow(clippy::too_many_arguments)]
 fn decode_full_file(
     samples: &[f32],
     params: &ScoredResult,
@@ -2668,10 +2788,25 @@ fn decode_full_file(
     phase_offset: usize,
     zero_crossings: &[usize],
     cancel: Option<&AtomicBool>,
+    progress: Option<ProgressCb<'_>>,
 ) -> ScoredResult {
     let absolute_phase = params.phase + phase_offset;
 
-    let bits_nominal = extract_bits(samples, params.spb, absolute_phase, threshold, cancel);
+    // The two full-buffer bit-extraction passes dominate the decode cost;
+    // the nominal pass maps to the 0.45–0.70 band, the adaptive one to
+    // 0.72–0.95 (result assembly reports the final 1.0).
+    let nominal_cb = progress.map(|cb| move |f: f32| cb(0.45 + 0.25 * f.clamp(0.0, 1.0)));
+    let bits_nominal = extract_bits_with_progress(
+        samples,
+        params.spb,
+        absolute_phase,
+        threshold,
+        cancel,
+        nominal_cb.as_ref().map(|cb| cb as &dyn Fn(f32)),
+    );
+    if let Some(cb) = progress {
+        cb(0.72);
+    }
     if cancelled(cancel) {
         return ScoredResult::canceled(params, absolute_phase);
     }
@@ -2685,14 +2820,19 @@ fn decode_full_file(
     if cancelled(cancel) {
         return ScoredResult::canceled(params, absolute_phase);
     }
-    let bits_adaptive = extract_bits_adaptive(
+    let adaptive_cb = progress.map(|cb| move |f: f32| cb(0.72 + 0.23 * f.clamp(0.0, 1.0)));
+    let bits_adaptive = extract_bits_adaptive_with_progress(
         samples,
         params.spb,
         absolute_phase,
         threshold,
         zero_crossings,
         cancel,
+        adaptive_cb.as_ref().map(|cb| cb as &dyn Fn(f32)),
     );
+    if let Some(cb) = progress {
+        cb(0.97);
+    }
     let scan_adaptive = find_frames(&bits_adaptive, params.fps, params.drop_frame);
     let (valid_adaptive, total_possible_adaptive, frame_starts_adaptive) = (
         scan_adaptive.valid_frames,
@@ -5825,6 +5965,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             cancel: None,
+            progress: None,
         }
     }
 
@@ -6016,7 +6157,7 @@ mod tests {
             frame_starts: vec![],
         };
 
-        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &[], None);
+        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &[], None, None);
         assert_eq!(result.valid_frames, 3);
         assert_eq!(result.total_possible, 3);
         assert_eq!(result.timecodes.len(), 3);
@@ -6043,7 +6184,7 @@ mod tests {
             frame_starts: vec![],
         };
 
-        let result = decode_full_file(&signal, &params, 0.5, 48000, 0, &[], None);
+        let result = decode_full_file(&signal, &params, 0.5, 48000, 0, &[], None, None);
         // With high threshold, signal is below threshold → extract_bits returns zeros
         // No sync word in zeros → valid_frames = 0
         assert_eq!(result.valid_frames, 0);
@@ -6086,7 +6227,7 @@ mod tests {
             frame_starts: vec![],
         };
 
-        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &zc, None);
+        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &zc, None, None);
         assert_eq!(result.valid_frames, 3);
         assert_eq!(result.total_possible, 3);
         assert_eq!(result.timecodes.len(), 3);
@@ -6131,7 +6272,7 @@ mod tests {
             frame_starts: vec![],
         };
 
-        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &zc, None);
+        let result = decode_full_file(&signal, &params, 0.001, 48000, 0, &zc, None, None);
         assert!(
             result.valid_frames >= 2,
             "expected >=2 valid frames with spb mismatch (true={}, used={}), got {}",
@@ -8953,6 +9094,7 @@ mod tests {
             fps: 25.0,
             drop_frame: false,
             cancel: None,
+            progress: None,
         };
         let outcome = score_candidate(&ctx, 4.0, 0, false, 0);
         assert!(
@@ -9959,5 +10101,77 @@ mod tests {
         assert_eq!(grade(0.30), QualityGrade::Poor);
         assert_eq!(grade(0.2999999), QualityGrade::Bad);
         assert_eq!(grade(0.0), QualityGrade::Bad);
+    }
+
+    // ── fine-grained decode progress ─────────────────────────────────────
+    //
+    // The GUI decode bar must move *during* a buffer decode, not only when
+    // the whole 50 MB chunk completes. The decoder reports its stream
+    // position through the optional progress callback; the callback
+    // contract is: monotonic, granular (strictly-between values observed),
+    // terminating near 1.0.
+
+    #[test]
+    fn decode_ltc_samples_with_progress_reports_monotonic_granular_fractions() {
+        let fps = 25.0;
+        let sample_rate = 48000u32;
+        let buf = synth_ltc_mono(
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+            fps,
+            sample_rate,
+            300, // 12 s — enough for multiple windows/stages
+            0.5,
+        );
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<f32>>> = Default::default();
+        let seen_cb = seen.clone();
+        let progress = move |f: f32| {
+            seen_cb.lock().unwrap().push(f.clamp(0.0, 1.0));
+        };
+
+        let result = decode_ltc_samples_with_progress(
+            &buf,
+            sample_rate,
+            1,
+            fps,
+            false,
+            std::time::Instant::now(),
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+        assert!(
+            result.valid_frames >= 250,
+            "synthetic LTC must still decode (got {} valid frames)",
+            result.valid_frames
+        );
+
+        let s = seen.lock().unwrap();
+        assert!(
+            !s.is_empty(),
+            "decoder must report progress callbacks for a 12 s buffer"
+        );
+        for pair in s.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "progress must be monotonic, got {:?}",
+                *s
+            );
+        }
+        assert!(
+            s.iter().any(|&f| f > 0.0 && f < 1.0),
+            "progress must be granular (strictly-between observations), got {:?}",
+            *s
+        );
+        assert!(
+            *s.last().unwrap() > 0.9,
+            "progress must terminate near full, got {:?}",
+            *s
+        );
     }
 }

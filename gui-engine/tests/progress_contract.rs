@@ -299,6 +299,30 @@ fn wav_decode_reports_chunk_granular_monotonic_progress() {
 
     let mut decode_fn = |dp: &DecodeProgress| {
         for done in 1..=dp.chunks_total {
+            // Intra-chunk sub-steps: the fine-grained stream-position
+            // fraction must surface in the tracker while the chunk (and the
+            // whole decode) is still running — a 2-chunk file must not jump
+            // 0 → 50 → 100.
+            for sub in 1..4u32 {
+                dp.note_fine_fraction(
+                    ((done as f32 - 1.0) + sub as f32 / 4.0) / dp.chunks_total as f32,
+                );
+                let expected_fine =
+                    ((done as f32 - 1.0) + sub as f32 / 4.0) / dp.chunks_total as f32;
+                let saw_fine = wait_until(Duration::from_secs(5), || {
+                    (tracker_for_fake.snapshot().fraction - expected_fine).abs() < 0.001
+                });
+                assert!(
+                    saw_fine,
+                    "runner must forward intra-chunk progress {sub}/4 of chunk \
+                     {done}/{} while decode is still running",
+                    dp.chunks_total
+                );
+                samples_for_fake
+                    .lock()
+                    .unwrap()
+                    .push(tracker_for_fake.snapshot().fraction);
+            }
             dp.chunks_completed.store(done, Ordering::Relaxed);
             let expected = done as f32 / dp.chunks_total as f32;
             let saw_increment = wait_until(Duration::from_secs(5), || {
