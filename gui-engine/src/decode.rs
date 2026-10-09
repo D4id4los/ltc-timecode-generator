@@ -349,6 +349,62 @@ fn temp_extract_wav(capture_gen: u64, stream_index: usize, channel_index: usize)
     ))
 }
 
+/// Injectable chunk-decode work for [`run_wav_decode_job_with`] — the shape
+/// of the `decode_wav_core` call the engine's WAV-decode job makes (the
+/// project's `_with` seam convention). The shared `DecodeProgress` carries
+/// the cancel flag the injected work must honor.
+pub type WavDecodeFn<'a> =
+    &'a mut dyn FnMut(&DecodeProgress) -> Result<LtcDetectionResult, LtcDecodeError>;
+
+/// Run the WAV LTC decode job, reporting chunk progress via `ctx.progress`.
+/// Behavior-preserving extraction of the engine's `ParseLtcFile` worker: the
+/// runner owns the job mechanics (unit setup, the live
+/// `DecodeProgress`→`UnitProgress` bridge thread, `JobFinal::Decode`
+/// construction); the injected `decode_fn` only produces the decode result
+/// while advancing the shared `DecodeProgress` atomics.
+pub fn run_wav_decode_job_with(
+    ctx: &job::JobContext,
+    path: PathBuf,
+    chunk_count: usize,
+    decode_fn: WavDecodeFn<'_>,
+) -> Result<job::JobFinal, job::JobError> {
+    let cancel = ctx.cancel.inner().clone();
+    let unit = ctx.progress.unit(0);
+    unit.set_message("decoding LTC…");
+
+    // Share chunks_done and cancel_flag atomics so the bridge thread
+    // can update UnitProgress while decode_ltc_chunked runs.
+    let chunks_done = Arc::new(AtomicUsize::new(0));
+    let dp = DecodeProgress {
+        chunks_total: chunk_count,
+        chunks_completed: chunks_done.clone(),
+        cancel_flag: cancel.clone(),
+    };
+
+    let dp_bridge = bridge_decode_progress(dp.clone(), unit, None);
+
+    let result = decode_fn(&dp);
+    // The single-pass path never touches the shared chunks_done atomic;
+    // release the progress bridge before joining it.
+    if chunk_count <= 1 {
+        chunks_done.store(1, Ordering::Relaxed);
+    }
+
+    let _ = dp_bridge.join();
+
+    match result {
+        Ok(r) => Ok(job::JobFinal::Decode {
+            result: Ok(r),
+            path,
+        }),
+        Err(LtcDecodeError::Cancelled) => Err(job::JobError::Cancelled),
+        Err(e) => Ok(job::JobFinal::Decode {
+            result: Err(e),
+            path,
+        }),
+    }
+}
+
 /// Bridge a `DecodeProgress` (from audio-core chunked decode) to a
 /// `UnitProgress` by polling `chunks_completed` on a short-lived helper
 /// thread.  Returns a `JoinHandle` the caller should join before the unit

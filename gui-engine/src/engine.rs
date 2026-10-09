@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use audio_core::LtcDecodeError;
-use audio_core::{AudioCore, AudioEvent, DecodeConfig, DecodeProgress, LtcDetectionResult};
+use audio_core::{AudioCore, AudioEvent, DecodeConfig, LtcDetectionResult};
 use log::{error, info, warn};
 
 use crate::command::{ConverterCommand, GuiCommand};
@@ -1339,53 +1339,26 @@ fn cmd_parse_ltc_wav_file(
         }],
     };
     spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
-        let cancel = ctx.cancel.inner().clone();
-        let unit = ctx.progress.unit(0);
-        unit.set_message("decoding LTC…");
-
-        // Share chunks_done and cancel_flag atomics so the bridge thread
-        // can update UnitProgress while decode_ltc_chunked runs.
-        let chunks_done = Arc::new(AtomicUsize::new(0));
-        let dp = DecodeProgress {
-            chunks_total: chunk_count,
-            chunks_completed: chunks_done.clone(),
-            cancel_flag: cancel.clone(),
-        };
-
-        let dp_bridge = crate::decode::bridge_decode_progress(dp.clone(), unit, None);
-
-        let result = crate::decode::decode_wav_core(
-            Path::new(&path_job),
-            crate::decode::WavDecodeParams {
-                use_libltc,
-                single_pass: false,
-                decode_fps,
-                decode_drop_frame,
+        crate::decode::run_wav_decode_job_with(
+            ctx,
+            PathBuf::from(&path_job),
+            chunk_count,
+            &mut |dp| {
+                crate::decode::decode_wav_core(
+                    Path::new(&path_job),
+                    crate::decode::WavDecodeParams {
+                        use_libltc,
+                        single_pass: false,
+                        decode_fps,
+                        decode_drop_frame,
+                    },
+                    Some(chunk_count),
+                    Some(&dp.cancel_flag),
+                    Some(dp),
+                )
+                .map(|outcome| outcome.result)
             },
-            Some(chunk_count),
-            Some(&cancel),
-            Some(&dp),
         )
-        .map(|outcome| outcome.result);
-        // The single-pass path never touches the shared chunks_done atomic;
-        // release the progress bridge before joining it.
-        if chunk_count <= 1 {
-            chunks_done.store(1, Ordering::Relaxed);
-        }
-
-        let _ = dp_bridge.join();
-
-        match result {
-            Ok(r) => Ok(JobFinal::Decode {
-                result: Ok(r),
-                path: PathBuf::from(path_job),
-            }),
-            Err(LtcDecodeError::Cancelled) => Err(job::JobError::Cancelled),
-            Err(e) => Ok(JobFinal::Decode {
-                result: Err(e),
-                path: PathBuf::from(path_job),
-            }),
-        }
     });
 }
 
