@@ -182,9 +182,9 @@ const SYNC_OFFSET: usize = 64;
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Fine-grained decode progress sink: receives the fraction (`0.0..=1.0`)
-/// of the buffer being decoded. Monotonicity across stages is the caller's
-/// contract; the receiver (e.g. `DecodeProgress::note_fine_fraction`)
-/// enforces it anyway.
+/// of the buffer being decoded. The receiver (e.g. the chunk runner's
+/// high-water-mark `ChunkMilli`) converts reports into work-unit deltas,
+/// so stage-local non-monotonicity cannot roll the bar back.
 pub(crate) type ProgressCb<'a> = &'a (dyn Fn(f32) + Send + Sync);
 
 /// Decode LTC from a pre-loaded buffer of mono f32 samples.

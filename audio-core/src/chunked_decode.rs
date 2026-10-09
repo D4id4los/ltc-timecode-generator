@@ -173,6 +173,11 @@ pub fn decode_ltc_chunked(
         .unwrap_or(4)
         .min(num_chunks);
 
+    // Size the work-weighted progress: each chunk's sample count is its
+    // weight, so an unequal split (50 MB target + small remainder chunk)
+    // owns the bar proportionally to the work it actually represents.
+    progress.set_work_total(plan.boundaries.iter().map(|&(s, e)| (e - s) as u64).sum());
+
     let job = ChunkJob {
         path,
         decoder,
@@ -181,8 +186,7 @@ pub fn decode_ltc_chunked(
         drop_frame,
         active_channel: plan.active_channel,
         cancel_flag: &progress.cancel_flag,
-        fine: Some(&progress.fine_milli),
-        total_mono: plan.total_mono,
+        progress,
     };
     let mut chunk_results = if num_workers <= 1 {
         run_sequential(&job, &plan, progress)
@@ -533,29 +537,42 @@ struct ChunkJob<'a> {
     drop_frame: bool,
     active_channel: usize,
     cancel_flag: &'a AtomicBool,
-    /// Fine-grained progress sink (from `DecodeProgress.fine_milli`): the
-    /// per-chunk decoder fraction is mapped onto the whole-stream position.
-    fine: Option<&'a AtomicU32>,
-    /// Total mono samples of the stream (the fine-fraction denominator).
-    total_mono: usize,
+    /// Work-weighted progress sink: each chunk converts its per-buffer
+    /// fraction deltas into sample units on the shared `DecodeProgress`.
+    progress: &'a DecodeProgress,
 }
 
-/// Build the chunk's progress callback: maps a within-chunk fraction onto
-/// the whole-stream millifraction, raised monotonically (`fetch_max`) so
-/// out-of-order parallel chunk completions never roll the bar back.
-fn chunk_progress_cb(
-    fine: Option<&AtomicU32>,
-    total_mono: usize,
-    start_sample: usize,
-    num_samples: usize,
-) -> Option<impl Fn(f32) + '_> {
-    fine.map(move |fine| {
-        move |f: f32| {
-            let pos = start_sample as f64 + (f64::from(f.clamp(0.0, 1.0)) * num_samples as f64);
-            let frac = (pos / total_mono.max(1) as f64).clamp(0.0, 1.0);
-            fine.fetch_max((frac * 1000.0) as u32, Ordering::Relaxed);
+/// Fraction-of-chunk milli reported by one worker, tracked so only the
+/// delta is added to the shared work counter (the callback fires with the
+/// absolute position within the chunk, possibly repeatedly per stage).
+struct ChunkMilli(AtomicU32);
+
+impl ChunkMilli {
+    fn new() -> Self {
+        ChunkMilli(AtomicU32::new(0))
+    }
+
+    /// Convert `f` (absolute fraction 0..=1 of this chunk) into work-unit
+    /// deltas on `progress`. Monotonic: a lower report is ignored without
+    /// clobbering the high-water mark (`fetch_max` returns the previous
+    /// peak, so the delta is always measured from it).
+    fn note(&self, progress: &DecodeProgress, chunk_len: u64, f: f32) {
+        let milli = (f.clamp(0.0, 1.0) * 1000.0) as u32;
+        let old = self.0.fetch_max(milli, Ordering::Relaxed);
+        if milli > old {
+            progress.add_work_units((milli - old) as u64 * chunk_len / 1000);
         }
-    })
+    }
+
+    /// Add the remaining units on chunk completion, so the work sum
+    /// terminates at the chunk's full weight even if the decoder backend
+    /// under-reports (e.g. a fast-path exit or a mock in tests).
+    fn flush(&self, progress: &DecodeProgress, chunk_len: u64) {
+        let milli = self.0.swap(1000, Ordering::Relaxed);
+        if milli < 1000 {
+            progress.add_work_units((1000 - milli) as u64 * chunk_len / 1000);
+        }
+    }
 }
 
 /// Decode a single chunk of a WAV file in a worker thread.
@@ -587,10 +604,11 @@ fn decode_one_chunk(
         }
     };
 
-    let chunk_cb = chunk_progress_cb(job.fine, job.total_mono, start_sample, num_samples);
-    let progress_cb: Option<&(dyn Fn(f32) + Send + Sync)> = chunk_cb
-        .as_ref()
-        .map(|cb| cb as &(dyn Fn(f32) + Send + Sync));
+    let chunk_milli = ChunkMilli::new();
+    let progress_cb: Option<&(dyn Fn(f32) + Send + Sync)> = {
+        let chunk_milli = &chunk_milli;
+        Some(&move |f: f32| chunk_milli.note(job.progress, num_samples as u64, f))
+    };
     let chunk_start = Instant::now();
     let result = job.decoder.decode_chunk(crate::decoder::ChunkDecodeReq {
         path: job.path,
@@ -605,6 +623,9 @@ fn decode_one_chunk(
         cancel: job.cancel_flag,
         progress: progress_cb,
     });
+    // A finished chunk's weight is fully accounted for, success or not (a
+    // cancelled job discards the result anyway).
+    chunk_milli.flush(job.progress, num_samples as u64);
     let elapsed = chunk_start.elapsed();
     debug!(
         "Chunk {} decoded ({}): {:.1}ms",
@@ -1050,9 +1071,7 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &seq_progress.cancel_flag,
-
-            fine: None,
-            total_mono: 0,
+            progress: &seq_progress,
         };
         let par_job = ChunkJob {
             path: &path,
@@ -1062,9 +1081,7 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &par_progress.cancel_flag,
-
-            fine: None,
-            total_mono: 0,
+            progress: &par_progress,
         };
         let seq_results = run_sequential(&seq_job, &plan, &seq_progress);
         let par_results = run_parallel(&par_job, &plan, &par_progress, 3);
@@ -1117,9 +1134,7 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &progress.cancel_flag,
-
-            fine: None,
-            total_mono: 0,
+            progress: &progress,
         };
         let results = run_parallel(&job, &plan, &progress, 3);
         assert_eq!(results.len(), 5);
@@ -1151,9 +1166,7 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &progress.cancel_flag,
-
-            fine: None,
-            total_mono: 0,
+            progress: &progress,
         };
         let results = run_parallel(&job, &plan, &progress, 3);
 
@@ -1189,9 +1202,7 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &progress.cancel_flag,
-
-            fine: None,
-            total_mono: 0,
+            progress: &progress,
         };
         let results = run_sequential(&job, &plan, &progress);
         assert!(results.is_empty());
@@ -1228,15 +1239,11 @@ mod tests {
         }
     }
 
-    /// The chunk runner must map the decoder's per-buffer progress fraction
-    /// onto the whole-stream millifraction on `DecodeProgress.fine_milli`:
-    /// each chunk's mid-chunk report (f=0.5) lands at its own stream
-    /// position — chunk 1 of the five-chunk plan covers `[43200, 91200)` of
-    /// 220 800 mono samples (mid → milli 304), chunk 4 covers
-    /// `[172800, 220800)` (mid → milli 891); `fetch_max` keeps the final
-    /// value at the highest position reached.
+    /// The chunk runner must convert the decoder's per-buffer fraction
+    /// into work units on the shared `DecodeProgress` and terminate the
+    /// sum at full when every chunk completes (mid-report + flush).
     #[test]
-    fn run_sequential_maps_chunk_progress_onto_stream_fine_milli() {
+    fn run_sequential_accumulates_chunk_work_units() {
         let plan = five_chunk_plan();
         let dir = write_mock_wav();
         let path = dir.path().join("mock.wav");
@@ -1250,16 +1257,54 @@ mod tests {
             drop_frame: false,
             active_channel: plan.active_channel,
             cancel_flag: &progress.cancel_flag,
-            fine: Some(&progress.fine_milli),
-            total_mono: 220_800,
+            progress: &progress,
         };
         run_sequential(&job, &plan, &progress);
 
-        let expected_last = ((172_800.0 + 0.5 * 48_000.0) / 220_800.0 * 1000.0) as u32;
+        // Every chunk's mid-chunk report (f=0.5) plus its completion flush
+        // adds exactly its full sample weight: 5 chunks × 48 000 units.
         assert_eq!(
-            progress.fine_milli.load(Ordering::Relaxed),
-            expected_last,
-            "the final fine value must be the last chunk's stream position"
+            progress.percent(),
+            1.0,
+            "completion flush must terminate the work sum at full"
+        );
+    }
+
+    /// `ChunkMilli` converts each absolute fraction report into a delta of
+    /// work units (`delta_f × chunk_len`), ignores non-monotonic reports,
+    /// and the completion flush tops the chunk up to its full weight.
+    #[test]
+    fn chunk_milli_converts_fraction_deltas_to_work_units() {
+        let progress = DecodeProgress::new(1);
+        progress.set_work_total(220_800);
+        let chunk_len = 48_000;
+        let cm = ChunkMilli::new();
+
+        cm.note(&progress, chunk_len, 0.5);
+        assert_eq!(progress.work_units_snapshot(), 24_000);
+        cm.note(&progress, chunk_len, 0.25);
+        assert_eq!(
+            progress.work_units_snapshot(),
+            24_000,
+            "a lower fraction must not add units"
+        );
+        cm.note(&progress, chunk_len, 1.0);
+        assert_eq!(progress.work_units_snapshot(), 48_000);
+
+        cm.flush(&progress, chunk_len);
+        assert_eq!(
+            progress.work_units_snapshot(),
+            48_000,
+            "flush after f=1.0 adds nothing"
+        );
+
+        let cm = ChunkMilli::new();
+        cm.note(&progress, chunk_len, 0.25);
+        cm.flush(&progress, chunk_len);
+        assert_eq!(
+            progress.work_units_snapshot(),
+            48_000 + chunk_len,
+            "flush tops an under-reported chunk up to its full weight"
         );
     }
 
@@ -2247,9 +2292,7 @@ mod tests {
                 drop_frame: false,
                 active_channel: 0,
                 cancel_flag: &cancel,
-
-                fine: None,
-                total_mono: 0,
+                progress: &progress,
             };
             let standalone = decode_one_chunk(&job, idx, start, end);
             let s = standalone

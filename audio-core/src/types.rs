@@ -2,7 +2,7 @@
 //! info, and the chunked-decode configuration/progress types.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,13 +125,17 @@ pub struct DecodeProgress {
     pub chunks_total: usize,
     pub chunks_completed: Arc<AtomicUsize>,
     pub cancel_flag: Arc<AtomicBool>,
-    /// Fine-grained intra-chunk progress: the whole-stream position as a
-    /// millifraction (0..=1000), raised monotonically by the decoders while
-    /// a chunk (or a single-pass buffer) is being decoded. Decoders report
-    /// through [`DecodeProgress::note_fine_fraction`]; consumers read the
-    /// combined value via [`DecodeProgress::percent`]. A consumer that never
-    /// reports fine fractions keeps pure chunk granularity (fine stays 0).
-    pub fine_milli: Arc<AtomicU32>,
+    /// Work-weighted progress in completed work units. The chunked runner
+    /// sizes the job with [`DecodeProgress::set_work_total`] (the plan's
+    /// total sample count); each parallel chunk worker converts its
+    /// per-buffer fraction deltas into sample units via
+    /// [`DecodeProgress::add_work_units`]. A work **sum** — not a leading
+    /// stream position — is the only honest model for parallel chunks: the
+    /// chunk that happens to finish first (e.g. a small trailing remainder
+    /// chunk, or a silent region that fast-fails) must not pin the bar at
+    /// 100 % while slower chunks are still working.
+    work_units: Arc<AtomicU64>,
+    work_total: Arc<AtomicU64>,
 }
 
 impl DecodeProgress {
@@ -140,29 +144,59 @@ impl DecodeProgress {
             chunks_total,
             chunks_completed: Arc::new(AtomicUsize::new(0)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            fine_milli: Arc::new(AtomicU32::new(0)),
+            work_units: Arc::new(AtomicU64::new(0)),
+            work_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Record a fine-grained stream-position fraction (`0.0..=1.0`) reached
-    /// by the decoder. Monotonic: a lower value never rolls the bar back
-    /// (parallel chunk workers finish out of order).
-    pub fn note_fine_fraction(&self, fraction: f32) {
-        let milli = (fraction.clamp(0.0, 1.0) * 1000.0) as u32;
-        self.fine_milli.fetch_max(milli, Ordering::Relaxed);
+    /// Like [`DecodeProgress::new`], but sharing externally owned chunk
+    /// bookkeeping atomics (callers that count completions themselves).
+    pub fn with_atomics(
+        chunks_total: usize,
+        chunks_completed: Arc<AtomicUsize>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            chunks_total,
+            chunks_completed,
+            cancel_flag,
+            work_units: Arc::new(AtomicU64::new(0)),
+            work_total: Arc::new(AtomicU64::new(0)),
+        }
     }
 
-    /// Combined decode fraction (`0.0..=1.0`): the coarser chunk-completion
-    /// fraction and the fine-grained stream-position fraction, whichever is
-    /// further along.
+    /// Size the job: `units` is the total amount of work the fraction is
+    /// measured against (the chunk plan's total sample count, or 1000 for
+    /// a single-buffer decode). Must be set before the first fraction is
+    /// consumed; a total of 0 keeps pure chunk-count granularity.
+    pub fn set_work_total(&self, units: u64) {
+        self.work_total.store(units, Ordering::Relaxed);
+    }
+
+    /// Record completed work units. Callers add only positive deltas of
+    /// their own progress, so the sum is monotonic by construction even
+    /// with out-of-order parallel chunk completion.
+    pub fn add_work_units(&self, units: u64) {
+        self.work_units.fetch_add(units, Ordering::Relaxed);
+    }
+
+    /// Completed work units so far (observability accessor).
+    pub fn work_units_snapshot(&self) -> u64 {
+        self.work_units.load(Ordering::Relaxed)
+    }
+
+    /// Decode fraction (`0.0..=1.0`): the work-weighted sum when the job
+    /// was sized, otherwise the chunk-completion fraction.
     pub fn percent(&self) -> f32 {
-        let chunk = if self.chunks_total == 0 {
-            1.0
-        } else {
-            self.chunks_completed.load(Ordering::Relaxed) as f32 / self.chunks_total as f32
-        };
-        let fine = self.fine_milli.load(Ordering::Relaxed) as f32 / 1000.0;
-        chunk.max(fine)
+        let total = self.work_total.load(Ordering::Relaxed);
+        if total > 0 {
+            let units = self.work_units.load(Ordering::Relaxed);
+            return (units as f32 / total as f32).min(1.0);
+        }
+        if self.chunks_total == 0 {
+            return 1.0;
+        }
+        self.chunks_completed.load(Ordering::Relaxed) as f32 / self.chunks_total as f32
     }
 
     pub fn cancel(&self) {
