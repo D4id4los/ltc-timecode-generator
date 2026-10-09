@@ -15,23 +15,21 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     let _s = &state.latest;
 
-    style::content_frame(&colors).show(ui, |ui| {
-        ui.vertical(|ui| {
-            step_header(ui, "1", "SELECT PARENT FOLDER", &colors);
+    style::content_area(ui, &colors, |ui| {
+        step_header(ui, "1", "SELECT PARENT FOLDER", &colors);
 
-            render_parent_selection(ui, state);
+        render_parent_selection(ui, state);
 
-            ui.add_space(12.0);
-            step_header(ui, "2", "DETECTED MEDIA CARDS", &colors);
+        ui.add_space(12.0);
+        step_header(ui, "2", "DETECTED MEDIA CARDS", &colors);
 
-            render_cards(ui, state);
+        render_cards(ui, state);
 
-            ui.add_space(12.0);
-            step_header(ui, "3", "COPY FILES", &colors);
+        ui.add_space(12.0);
+        step_header(ui, "3", "COPY FILES", &colors);
 
-            render_offload_actions(ui, state);
-            render_progress(ui, state);
-        });
+        render_offload_actions(ui, state);
+        render_progress(ui, state);
     });
 }
 

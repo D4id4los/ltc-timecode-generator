@@ -66,40 +66,38 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             }
         });
 
-    style::content_frame(&colors).show(ui, |ui| {
-        ui.vertical(|ui| {
-            step_header(ui, "1", "SELECT FILES", &colors);
+    style::content_area(ui, &colors, |ui| {
+        step_header(ui, "1", "SELECT FILES", &colors);
+        ui.add_space(8.0);
+        render_file_selection(ui, state);
+        ui.add_space(16.0);
+
+        if state.latest.converter.selected_group_idx.is_some() {
             ui.add_space(8.0);
-            render_file_selection(ui, state);
+            render_ltc_verification(ui, state);
             ui.add_space(16.0);
 
-            if state.latest.converter.selected_group_idx.is_some() {
-                ui.add_space(8.0);
-                render_ltc_verification(ui, state);
-                ui.add_space(16.0);
-
-                step_header(ui, "2", "CHANNEL SPLITTING OR MAPPING", &colors);
-                ui.add_space(8.0);
-                render_channel_matrix(ui, state);
-                render_split_options(ui, state);
-                ui.add_space(16.0);
-            }
-
-            step_header(ui, "3", "OUTPUT FORMAT", &colors);
+            step_header(ui, "2", "CHANNEL SPLITTING OR MAPPING", &colors);
             ui.add_space(8.0);
-            render_output_format(ui, state, sanity_result.as_ref());
+            render_channel_matrix(ui, state);
+            render_split_options(ui, state);
             ui.add_space(16.0);
+        }
 
-            step_header(ui, "4", "OUTPUT FILE", &colors);
-            ui.add_space(8.0);
-            render_output_path(ui, state);
-            ui.add_space(16.0);
+        step_header(ui, "3", "OUTPUT FORMAT", &colors);
+        ui.add_space(8.0);
+        render_output_format(ui, state, sanity_result.as_ref());
+        ui.add_space(16.0);
 
-            render_convert_button(ui, state, sanity_result.as_ref());
-            ui.add_space(12.0);
+        step_header(ui, "4", "OUTPUT FILE", &colors);
+        ui.add_space(8.0);
+        render_output_path(ui, state);
+        ui.add_space(16.0);
 
-            render_conversion_progress(ui, state);
-        });
+        render_convert_button(ui, state, sanity_result.as_ref());
+        ui.add_space(12.0);
+
+        render_conversion_progress(ui, state);
     });
 }
 

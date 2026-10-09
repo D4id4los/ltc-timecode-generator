@@ -227,6 +227,29 @@ pub fn content_frame(colors: &ThemeColors) -> egui::Frame {
         .inner_margin(egui::Margin::same(16))
 }
 
+/// The standard tab content area: the shared [`content_frame`] panel pinned
+/// to the full width of the deck row — the same width the header, clock and
+/// status bar span. egui frames shrink-wrap to their widest child, so
+/// without the min-width pin each tab's card ended up only as wide as its
+/// content (the offload card rendered visibly narrower than the header).
+/// Contents are laid out vertically, left-aligned.
+///
+/// The returned [`egui::InnerResponse`] is the *frame's* — `.response` carries
+/// the full panel rect, `.inner` the closure's value.
+pub fn content_area<R>(
+    ui: &mut Ui,
+    colors: &ThemeColors,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
+    // `Frame::show` wraps the closure's own `InnerResponse` (from
+    // `ui.vertical`); unwrap both levels so callers see the frame.
+    let outer = content_frame(colors).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.vertical(add_contents)
+    });
+    egui::InnerResponse::new(outer.inner.inner, outer.response)
+}
+
 /// Nested card/container frame (device box, routing box, card list).
 pub fn nested_frame(colors: &ThemeColors, margin: impl Into<egui::Margin>) -> egui::Frame {
     egui::Frame::new()
@@ -578,6 +601,61 @@ mod tests {
         assert_eq!(f.fill, c.card_bg);
         assert_eq!(f.stroke.width, 1.5);
         assert_eq!(f.corner_radius, egui::CornerRadius::same(12));
+    }
+
+    /// Headless egui pass — `Context::run_ui` needs no display backend.
+    fn run_headless_ui(width: f32, body: impl FnMut(&mut Ui)) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 400.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, body);
+    }
+
+    #[test]
+    fn content_area_spans_the_full_available_width() {
+        let c = colors();
+        let panel_w = 600.0;
+        let mut frame_w = 0.0;
+        run_headless_ui(panel_w, |ui| {
+            frame_w = content_area(ui, &c, |ui| {
+                ui.label("tiny");
+            })
+            .response
+            .rect
+            .width();
+        });
+        // The frame rect (including its margins) must be exactly the deck
+        // row the header/footer span — a tiny label must not shrink it.
+        assert!(
+            (frame_w - panel_w).abs() < 0.5,
+            "content_area must fill the row (frame width {frame_w}, row {panel_w})"
+        );
+    }
+
+    #[test]
+    fn bare_content_frame_shrink_wraps_to_its_content() {
+        let c = colors();
+        let panel_w = 600.0;
+        let mut frame_w = 0.0;
+        run_headless_ui(panel_w, |ui| {
+            frame_w = content_frame(&c)
+                .show(ui, |ui| {
+                    ui.label("tiny");
+                })
+                .response
+                .rect
+                .width();
+        });
+        assert!(
+            frame_w < panel_w - 100.0,
+            "a bare frame shrink-wraps to its widest child (got {frame_w}); \
+             the min-width pin in content_area is what widens the tab cards"
+        );
     }
 
     #[test]
