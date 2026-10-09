@@ -138,10 +138,12 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
 
     fn set_log(&self, text: &str) {
         *self.overall_log.lock().unwrap() = text.to_string();
+        self.ctx.progress.push_log(text);
     }
 
     fn append_log(&self, text: &str) {
         self.overall_log.lock().unwrap().push_str(text);
+        self.ctx.progress.push_log(text);
         let log = self.overall_log.lock().unwrap().clone();
         self.ctx.progress.set_message(log);
     }
@@ -181,6 +183,9 @@ impl<'a> ConversionReport for JobConversionReport<'a> {
         );
         self.ctx.progress.unit(0).set_fraction(1.0);
         self.ctx.progress.set_message(msg);
+        self.ctx.progress.push_log(format!(
+            "\n--- CONVERSION COMPLETED SUCCESSFULLY ---{summary}"
+        ));
     }
 
     fn set_unit_count(&self, n: usize) {
@@ -2372,6 +2377,35 @@ mod tests {
             report.failure_reason().as_deref(),
             Some("all encoder candidates for codec 'av1' failed to initialize"),
             "the reason must survive a later tracker-message reset"
+        );
+    }
+
+    /// The ffmpeg log must reach the tracker's *rolling log* — the surface
+    /// the GUI's log box renders (`JobStatus.log`) and the final polled
+    /// snapshot carries — not only the message field (which the job wrapper
+    /// wipes after completion). Sentinel tokens pin the forwarding plumbing,
+    /// not any particular wording.
+    #[test]
+    fn job_conversion_report_forwards_log_to_tracker_rolling_log() {
+        let ctx = test_job_context();
+        let report = JobConversionReport::new(&ctx);
+
+        report.set_log("SENTIEL-STEP-ARGS");
+        report.append_log("SENTINEL-STEP-STDERR\n");
+        report.mark_completed("SENTINEL-COMPLETION-SUMMARY");
+
+        let log = ctx.progress.snapshot().log;
+        assert!(
+            log.contains("SENTIEL-STEP-ARGS"),
+            "set_log content must reach the tracker rolling log; got: {log:?}"
+        );
+        assert!(
+            log.contains("SENTINEL-STEP-STDERR"),
+            "append_log content must reach the tracker rolling log; got: {log:?}"
+        );
+        assert!(
+            log.contains("SENTINEL-COMPLETION-SUMMARY"),
+            "mark_completed summary must reach the tracker rolling log; got: {log:?}"
         );
     }
 
