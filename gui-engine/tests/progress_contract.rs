@@ -298,47 +298,55 @@ fn wav_decode_reports_chunk_granular_monotonic_progress() {
     let chunk_count = 4;
 
     let mut decode_fn = |dp: &DecodeProgress| {
-        for done in 1..=dp.chunks_total {
-            // Intra-chunk sub-steps: the fine-grained stream-position
-            // fraction must surface in the tracker while the chunk (and the
-            // whole decode) is still running — a 2-chunk file must not jump
-            // 0 → 50 → 100.
-            for sub in 1..4u32 {
-                dp.note_fine_fraction(
-                    ((done as f32 - 1.0) + sub as f32 / 4.0) / dp.chunks_total as f32,
-                );
-                let expected_fine =
-                    ((done as f32 - 1.0) + sub as f32 / 4.0) / dp.chunks_total as f32;
+        // Work-weighted model: the fake sizes the job (as the real chunked
+        // runner does from its plan) and reports intra-chunk work-unit
+        // sub-steps plus a completion flush per chunk (mirroring the
+        // runner's residual flush). The tracker must follow each sub-step
+        // while the decode is still running — a 2-chunk file must not jump
+        // 0 → 50 → 100, and a chunk that finishes early must not pin the
+        // bar at 100 %.
+        dp.set_work_total(1000);
+        let total = dp.chunks_total;
+        let chunk_units = 1000u64 / total as u64;
+        let mut done_units = 0u64;
+        for done in 1..=total {
+            for sub in 1..4u64 {
+                dp.add_work_units(10);
+                done_units += 10;
+                let expected = done_units as f32 / 1000.0;
                 let saw_fine = wait_until(Duration::from_secs(5), || {
-                    (tracker_for_fake.snapshot().fraction - expected_fine).abs() < 0.001
+                    (tracker_for_fake.snapshot().fraction - expected).abs() < 0.001
                 });
                 assert!(
                     saw_fine,
                     "runner must forward intra-chunk progress {sub}/4 of chunk \
-                     {done}/{} while decode is still running",
-                    dp.chunks_total
+                     {done}/{total} while decode is still running"
                 );
                 samples_for_fake
                     .lock()
                     .unwrap()
                     .push(tracker_for_fake.snapshot().fraction);
             }
-            dp.chunks_completed.store(done, Ordering::Relaxed);
-            let expected = done as f32 / dp.chunks_total as f32;
+            // Completion flush: top the chunk up to its full weight.
+            let flushed = done as u64 * chunk_units;
+            dp.add_work_units(flushed - done_units);
+            done_units = flushed;
+            let expected = done_units as f32 / 1000.0;
             let saw_increment = wait_until(Duration::from_secs(5), || {
                 (tracker_for_fake.snapshot().fraction - expected).abs() < 0.001
             });
             assert!(
                 saw_increment,
-                "runner must forward chunk {}/{} progress while decode is \
-                 still running",
-                done, dp.chunks_total
+                "runner must forward chunk {done}/{total} completion while decode is \
+                 still running"
             );
             samples_for_fake
                 .lock()
                 .unwrap()
                 .push(tracker_for_fake.snapshot().fraction);
         }
+        // Let the runner's bridge observe termination (done >= total).
+        dp.chunks_completed.store(total, Ordering::Relaxed);
         Err(LtcDecodeError::Failed(
             "progress contract fake decode result".into(),
         ))
