@@ -2678,14 +2678,12 @@ fn apply_recording_selection(
     state.converter.camera_meta.clear();
     state.converter.device_name = None;
     state.converter.probes_generation += 1;
-    state
-        .jobs
-        .entry(JobKind::Conversion)
-        .or_insert_with(JobStatus::idle);
-    state
-        .jobs
-        .entry(JobKind::ClipProbe)
-        .or_insert_with(JobStatus::idle);
+    // Reset unconditionally: `or_insert_with` preserved a stale terminal
+    // status (e.g. Succeeded), keeping the "Conversion completed" banner and
+    // its ffmpeg log visible for the newly selected recording. A job still
+    // running is re-published by the next supervisor poll.
+    state.jobs.insert(JobKind::Conversion, JobStatus::idle());
+    state.jobs.insert(JobKind::ClipProbe, JobStatus::idle());
     // Reset per-recording settings flags
     let channel_count = state
         .converter
@@ -4861,6 +4859,45 @@ mod tests {
         assert_eq!(
             els.current.decode.group_generation, 100,
             "group decode gen bumped from 99"
+        );
+    }
+
+    #[test]
+    fn test_select_recording_resets_terminal_conversion_job_status() {
+        let mut state = setup_state();
+        let mut conv = crate::job::JobStatus::idle();
+        conv.apply_outcome(&JobOutcome::Succeeded {
+            log: "--- old ffmpeg log ---".into(),
+        });
+        state.jobs.insert(JobKind::Conversion, conv);
+
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(
+            GuiCommand::Converter(ConverterCommand::SelectRecording(0)),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
+
+        assert_eq!(
+            els.current.job(JobKind::Conversion).phase(),
+            JobPhase::Idle,
+            "Conversion job status must reset to Idle on recording selection — \
+             a stale Succeeded keeps the 'Conversion completed successfully!' \
+             banner and ffmpeg log visible for the new recording"
+        );
+        assert!(
+            els.current.job(JobKind::Conversion).log().is_empty(),
+            "stale ffmpeg log must be cleared with the status"
         );
     }
 
