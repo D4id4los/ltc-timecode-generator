@@ -5,3 +5,4 @@ pub mod converter;
 pub mod offload;
 pub mod settings;
 pub mod status;
+pub mod style;
