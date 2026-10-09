@@ -47,11 +47,12 @@ pub use audio_output::{
 // ── LTC decoder re-exports ────────────────────────────────────────────────
 
 pub use ltc_decoder::{
-    compute_ltc_quality, decode_ltc_from_wav, find_first_coherent_index, ChunkSummary,
-    FrameTimecode, LtcDecodeStatus, LtcDetectionResult, LtcQualityReport, CONFIDENCE_LOW_THRESHOLD,
-    CONFIDENCE_SUCCESS_THRESHOLD,
+    compute_ltc_quality, decode_ltc_from_wav, decode_ltc_from_wav_with_progress,
+    find_first_coherent_index, ChunkSummary, FrameTimecode, LtcDecodeStatus, LtcDetectionResult,
+    LtcQualityReport, CONFIDENCE_LOW_THRESHOLD, CONFIDENCE_SUCCESS_THRESHOLD,
 };
 pub use ltc_decoder_libltc::decode_ltc_from_wav_libltc;
+pub use types::DecodeProgressCb;
 
 /// Decode LTC from a WAV file, selecting the decoder implementation.
 pub fn decode_ltc_with_decoder(
@@ -62,4 +63,19 @@ pub fn decode_ltc_with_decoder(
     cancel: Option<&AtomicBool>,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
     decoder::decoder_for(use_libltc).decode_wav(path, fps, drop_frame, cancel)
+}
+
+/// [`decode_ltc_with_decoder`] with a fine-grained progress callback: the
+/// decoder reports the fraction of the file processed while it decodes, so
+/// a caller can move a progress bar during (not only after) the decode.
+pub fn decode_ltc_with_decoder_progress(
+    path: &std::path::Path,
+    use_libltc: bool,
+    fps: f64,
+    drop_frame: bool,
+    cancel: Option<&AtomicBool>,
+    progress: Option<decoder::DecodeProgressCb<'_>>,
+) -> Result<LtcDetectionResult, LtcDecodeError> {
+    decoder::decoder_for(use_libltc)
+        .decode_wav_with_progress(path, fps, drop_frame, cancel, progress)
 }

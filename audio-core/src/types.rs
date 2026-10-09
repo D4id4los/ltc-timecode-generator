@@ -2,7 +2,7 @@
 //! info, and the chunked-decode configuration/progress types.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -114,12 +114,24 @@ impl Default for DecodeConfig {
     }
 }
 
+/// Fine-grained decode progress sink: receives the fraction (0.0..=1.0) of
+/// the buffer/chunk being decoded. Shared across worker threads, hence the
+/// `Send + Sync` bound.
+pub type DecodeProgressCb<'a> = &'a (dyn Fn(f32) + Send + Sync);
+
 /// Shared progress state for a chunked decode operation.
 #[derive(Clone)]
 pub struct DecodeProgress {
     pub chunks_total: usize,
     pub chunks_completed: Arc<AtomicUsize>,
     pub cancel_flag: Arc<AtomicBool>,
+    /// Fine-grained intra-chunk progress: the whole-stream position as a
+    /// millifraction (0..=1000), raised monotonically by the decoders while
+    /// a chunk (or a single-pass buffer) is being decoded. Decoders report
+    /// through [`DecodeProgress::note_fine_fraction`]; consumers read the
+    /// combined value via [`DecodeProgress::percent`]. A consumer that never
+    /// reports fine fractions keeps pure chunk granularity (fine stays 0).
+    pub fine_milli: Arc<AtomicU32>,
 }
 
 impl DecodeProgress {
@@ -128,14 +140,29 @@ impl DecodeProgress {
             chunks_total,
             chunks_completed: Arc::new(AtomicUsize::new(0)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            fine_milli: Arc::new(AtomicU32::new(0)),
         }
     }
 
+    /// Record a fine-grained stream-position fraction (`0.0..=1.0`) reached
+    /// by the decoder. Monotonic: a lower value never rolls the bar back
+    /// (parallel chunk workers finish out of order).
+    pub fn note_fine_fraction(&self, fraction: f32) {
+        let milli = (fraction.clamp(0.0, 1.0) * 1000.0) as u32;
+        self.fine_milli.fetch_max(milli, Ordering::Relaxed);
+    }
+
+    /// Combined decode fraction (`0.0..=1.0`): the coarser chunk-completion
+    /// fraction and the fine-grained stream-position fraction, whichever is
+    /// further along.
     pub fn percent(&self) -> f32 {
-        if self.chunks_total == 0 {
-            return 1.0;
-        }
-        self.chunks_completed.load(Ordering::Relaxed) as f32 / self.chunks_total as f32
+        let chunk = if self.chunks_total == 0 {
+            1.0
+        } else {
+            self.chunks_completed.load(Ordering::Relaxed) as f32 / self.chunks_total as f32
+        };
+        let fine = self.fine_milli.load(Ordering::Relaxed) as f32 / 1000.0;
+        chunk.max(fine)
     }
 
     pub fn cancel(&self) {

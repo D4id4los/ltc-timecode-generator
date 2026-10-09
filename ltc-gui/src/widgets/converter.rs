@@ -743,8 +743,17 @@ fn render_fps_detect_row(
 
         if any_detecting {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
-            let progress_pct = state.latest.job(JobKind::LtcDecode).fraction();
-            let progress_str = state.latest.job(JobKind::LtcDecode).message().to_string();
+            // Read the fraction from the job that is actually running: a
+            // group detect (LtcGroupDecode) must not render the idle/stale
+            // single-decode job's fraction (and vice versa).
+            let active_kind = if is_detecting {
+                JobKind::LtcDecode
+            } else {
+                JobKind::LtcGroupDecode
+            };
+            let active_job = state.latest.job(active_kind);
+            let progress_pct = active_job.fraction();
+            let progress_str = active_job.message().to_string();
             ui.add(
                 egui::ProgressBar::new(progress_pct)
                     .show_percentage()

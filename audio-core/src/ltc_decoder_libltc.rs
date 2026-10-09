@@ -21,6 +21,18 @@ pub fn decode_ltc_from_wav_libltc(
     drop_frame: bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
+    decode_ltc_from_wav_libltc_with_progress(path, fps, drop_frame, cancel, None)
+}
+
+/// [`decode_ltc_from_wav_libltc`] with a fine-grained progress callback
+/// (feed-loop position per 8192-sample block).
+pub fn decode_ltc_from_wav_libltc_with_progress(
+    path: &Path,
+    fps: f64,
+    drop_frame: bool,
+    cancel: Option<&AtomicBool>,
+    progress: Option<&(dyn Fn(f32) + Send + Sync)>,
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     let start = Instant::now();
 
     let mut reader = hound::WavReader::open(path)
@@ -67,7 +79,7 @@ pub fn decode_ltc_from_wav_libltc(
         return Ok(LtcDetectionResult::error("Audio file contains no samples"));
     }
 
-    decode_ltc_samples_libltc(
+    decode_ltc_samples_libltc_with_progress(
         &sample_data,
         channels,
         sample_rate,
@@ -75,9 +87,12 @@ pub fn decode_ltc_from_wav_libltc(
         drop_frame,
         start,
         cancel,
+        progress,
     )
 }
 
+/// Test-only shim: production callers use [`decode_ltc_samples_libltc_with_progress`].
+#[cfg(test)]
 pub(crate) fn decode_ltc_samples_libltc(
     sample_data: &[i16],
     channels: usize,
@@ -86,6 +101,34 @@ pub(crate) fn decode_ltc_samples_libltc(
     drop_frame: bool,
     start: Instant,
     cancel: Option<&AtomicBool>,
+) -> Result<LtcDetectionResult, LtcDecodeError> {
+    decode_ltc_samples_libltc_with_progress(
+        sample_data,
+        channels,
+        sample_rate,
+        fps,
+        drop_frame,
+        start,
+        cancel,
+        None,
+    )
+}
+/// [`decode_ltc_samples_libltc`] with a fine-grained progress callback: the
+/// libltc feed loop reports the buffer position per 8192-sample block so a
+/// caller can move a progress bar during the decode.
+// The 8-argument list is the long-standing decode-parameter bundle plus the
+// single new optional progress sink; a context struct would churn both
+// decoder backends and every call site for no cohesion gain.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_ltc_samples_libltc_with_progress(
+    sample_data: &[i16],
+    channels: usize,
+    sample_rate: u32,
+    fps: f64,
+    drop_frame: bool,
+    start: Instant,
+    cancel: Option<&AtomicBool>,
+    progress: Option<&(dyn Fn(f32) + Send + Sync)>,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
     let total_samples = sample_data.len() / channels;
     if total_samples == 0 {
@@ -115,6 +158,7 @@ pub(crate) fn decode_ltc_samples_libltc(
         active_channel,
         sample_rate,
         cancel,
+        progress,
     )?;
 
     let total_duration = total_samples as f64 / sample_rate as f64;
@@ -202,11 +246,13 @@ fn decode_all_chunks(
     active_channel: usize,
     sample_rate: u32,
     cancel: Option<&AtomicBool>,
+    progress: Option<&(dyn Fn(f32) + Send + Sync)>,
 ) -> Result<Vec<FrameTimecode>, LtcDecodeError> {
     const CHUNK_SIZE: usize = 8192;
     let mut timecodes: Vec<FrameTimecode> = Vec::new();
     let mut frame_index: u32 = 0;
     let mut sample_pos: i64 = 0;
+    let total_mono = (sample_data.len() / channels.max(1)) as f32;
 
     for chunk_start in (0..sample_data.len()).step_by(CHUNK_SIZE * channels) {
         if let Some(c) = cancel {
@@ -222,6 +268,9 @@ fn decode_all_chunks(
             .collect();
         decoder.write_i16(&mono, sample_pos);
         sample_pos += mono.len() as i64;
+        if let Some(cb) = progress {
+            cb((sample_pos as f32 / total_mono).clamp(0.0, 1.0));
+        }
         while let Some(frame_ext) = decoder.read() {
             timecodes.push(frame_timecode_from(&frame_ext, frame_index, sample_rate));
             frame_index += 1;
@@ -838,5 +887,70 @@ mod tests {
         assert!(result.is_err(), "expected error for non-16-bit WAV");
         let err = result.unwrap_err();
         assert_eq!(err, LtcDecodeError::UnsupportedBitDepth { bits: 32 });
+    }
+
+    // ── fine-grained decode progress ─────────────────────────────────────
+
+    #[test]
+    fn decode_ltc_samples_libltc_with_progress_reports_monotonic_granular_fractions() {
+        let fps = 25.0;
+        let sample_rate = 48000u32;
+        let tcs: Vec<Timecode> = (0..600)
+            .map(|i| Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: i / 25,
+                frames: i % 25,
+            })
+            .collect();
+        let samples = synthesize_ltc_samples_i16(&tcs, fps, false, sample_rate, 0.5);
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<f32>>> = Default::default();
+        let seen_cb = seen.clone();
+        let progress = move |f: f32| {
+            seen_cb.lock().unwrap().push(f.clamp(0.0, 1.0));
+        };
+
+        let result = decode_ltc_samples_libltc_with_progress(
+            &samples,
+            1,
+            sample_rate,
+            fps,
+            false,
+            std::time::Instant::now(),
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+        assert!(
+            result.valid_frames >= 550,
+            "synthetic LTC must still decode (got {} valid frames)",
+            result.valid_frames
+        );
+
+        let s = seen.lock().unwrap();
+        assert!(
+            s.len() >= 10,
+            "libltc must report progress per 8192-sample block over a 24 s \
+             buffer, got {} observations",
+            s.len()
+        );
+        for pair in s.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "progress must be monotonic, got {:?}",
+                *s
+            );
+        }
+        assert!(
+            s.iter().any(|&f| f > 0.0 && f < 1.0),
+            "progress must be granular, got {:?}",
+            *s
+        );
+        assert!(
+            *s.last().unwrap() > 0.9,
+            "progress must terminate near full, got {:?}",
+            *s
+        );
     }
 }
