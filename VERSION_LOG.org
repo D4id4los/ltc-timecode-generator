@@ -2,15 +2,47 @@
 
 * Unreleased
 
-Offloaded card files now keep the recording's original timestamps instead of
-looking freshly created.
+* v0.6.0
+
+Main features are a fully scalable ltc-gui interface — a user-settable text
+size backed by semantic text-style presets and theme-resolved font specs, so
+the whole UI (not just individual labels) adapts cleanly from tablets to
+large monitors — plus genuinely fine-grained, byte-accurate progress reporting
+for decode and offload jobs, and offloaded card files that now keep the
+recording's original timestamps instead of looking freshly created.
 
 List of Changes:
+- GUI/Look-and-feel: ltc-gui gains a text-size setting in the Settings tab
+  (engine-owned, so it persists across sessions). All fixed-size text has
+  been migrated to semantic TextStyle presets with real bold/italic/mono
+  fonts, theme-resolved specs, and scale-aware styles, spacing, and layout
+  gates — headings, body text, the output-folder path display and every
+  previously fixed font(N) site now scale together.
+- Progress: WAV LTC decode now reports smooth, fine-grained progress instead
+  of jumping between chunk boundaries, and the model is work-weighted — the
+  fraction reflects actual decoding effort per chunk rather than byte/leading
+  position. Offload copy jobs forward bytes actually copied as they are
+  written, so per-device progress advances continuously instead of snapping
+  at file boundaries.
+- Testing: a new progress-bar contract suite pins one progress scenario per
+  JobKind (granularity, monotonicity, termination) — adding a job kind
+  without a scenario is now a compile error, so newly added jobs cannot
+  regress to coarse progress.
 - Offload: Copies now preserve the source files' timestamps — modified and
   access time on all platforms, creation time additionally on Windows and
   macOS (Linux has no creation-time API). Preservation is best-effort: a
   filesystem that rejects timestamps logs a warning instead of failing the
   copy.
+- Converter: the ffmpeg conversion log is now forwarded to the GUI log box,
+  and selecting a new recording resets stale conversion job status so the
+  tab no longer shows a previous run's result.
+- GUI: all ltc-gui tabs adopt a shared style/interaction-group layer, and
+  tab content cards are pinned to the shared deck-row width for consistent
+  alignment across tabs.
+- Scripts/CI: new ui-screenshots.sh helper auto-captures per-tab UI
+  screenshots (with text-scale and filename-suffix options); the apt setup
+  step survives azure mirror stalls via bounded retries and an archive
+  cache; engine unit tests now isolate user config from the real one.
 
 * v0.5.5
 
