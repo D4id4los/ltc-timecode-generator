@@ -357,6 +357,9 @@ pub struct AppStateSnapshot {
     // Theme
     pub is_dark_theme: bool,
 
+    // Accessibility: global text scale in percent (100 = default)
+    pub text_scale_percent: u32,
+
     // Status (per-subsystem channels; see `StatusChannels`)
     pub status: StatusChannels,
 
@@ -427,6 +430,7 @@ impl AppStateSnapshot {
                 clap_seq: 0,
             },
             is_dark_theme: false,
+            text_scale_percent: 100,
             status: StatusChannels::initial(),
             decode: DecodeSnapshot {
                 fps_index: 1,

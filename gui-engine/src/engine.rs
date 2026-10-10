@@ -451,6 +451,10 @@ fn process_command(
         GuiCommand::ToggleTheme => {
             els.current.is_dark_theme = !els.current.is_dark_theme;
         }
+        GuiCommand::SetTextScale(percent) => {
+            els.current.text_scale_percent = percent.clamp(50, 400);
+            crate::config::save_text_scale(els.current.text_scale_percent);
+        }
         GuiCommand::ClearLogs => {
             els.current.clapper.logs.clear();
         }
@@ -4103,6 +4107,48 @@ mod tests {
             &mut supervisor,
         );
         assert!(!els.current.is_dark_theme, "toggle again true → false");
+    }
+
+    #[test]
+    fn test_process_command_set_text_scale() {
+        let state = setup_state();
+        let core = audio_core::AudioCore::new();
+        let mut supervisor = JobSupervisor::new();
+        let (event_tx, _event_rx): (
+            std::sync::mpsc::Sender<audio_core::AudioEvent>,
+            std::sync::mpsc::Receiver<audio_core::AudioEvent>,
+        ) = std::sync::mpsc::channel();
+        let mut els = EngineLoopState::new(state);
+
+        process_command(
+            GuiCommand::SetTextScale(150),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
+        assert_eq!(els.current.text_scale_percent, 150);
+
+        process_command(
+            GuiCommand::SetTextScale(10_000),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
+        assert_eq!(els.current.text_scale_percent, 400, "high values clamp");
+
+        process_command(
+            GuiCommand::SetTextScale(1),
+            &core,
+            true,
+            &event_tx,
+            &mut els,
+            &mut supervisor,
+        );
+        assert_eq!(els.current.text_scale_percent, 50, "low values clamp");
     }
 
     #[test]

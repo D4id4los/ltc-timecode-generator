@@ -37,6 +37,10 @@ pub enum GuiCommand {
     SetTheme(bool),
     ToggleTheme,
 
+    // ── Accessibility ───────────────────────────────────────────────────
+    /// Global text scale in percent (e.g. 150 = large-text variant).
+    SetTextScale(u32),
+
     // ── Logs ────────────────────────────────────────────────────────────
     ClearLogs,
 

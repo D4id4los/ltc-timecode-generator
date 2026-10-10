@@ -9,6 +9,9 @@ const CONFIG_FILE: &str = "converter_config.json";
 pub struct ConverterConfig {
     pub last_input_folder: Option<String>,
     pub last_offload_parent: Option<String>,
+    /// Accessibility text scale in percent; `None` = pre-feature config.
+    #[serde(default)]
+    pub text_scale_percent: Option<u32>,
 }
 
 /// Base directory for all persisted config/cache state.
@@ -74,6 +77,12 @@ pub fn save_offload_parent(path: &Path) {
     save(&cfg);
 }
 
+pub fn save_text_scale(percent: u32) {
+    let mut cfg = load();
+    cfg.text_scale_percent = Some(percent);
+    save(&cfg);
+}
+
 /// Seed engine snapshot fields from a loaded config.
 pub fn seed_snapshot_from_config(
     snapshot: &mut crate::state::AppStateSnapshot,
@@ -85,6 +94,10 @@ pub fn seed_snapshot_from_config(
         if p.exists() {
             snapshot.offload.parent_folder = Some(p.to_path_buf());
         }
+    }
+    // Accessibility text scale
+    if let Some(percent) = cfg.text_scale_percent {
+        snapshot.text_scale_percent = percent.clamp(50, 400);
     }
 }
 
@@ -101,6 +114,7 @@ mod tests {
         let original = ConverterConfig {
             last_input_folder: Some("/home/input".into()),
             last_offload_parent: None,
+            text_scale_percent: None,
         };
         save_to(&cfg_path, &original);
 
@@ -120,6 +134,43 @@ mod tests {
     }
 
     #[test]
+    fn text_scale_roundtrips_and_seeds_clamped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg_path = dir.path().join("test_config.json");
+
+        let original = ConverterConfig {
+            last_input_folder: None,
+            last_offload_parent: None,
+            text_scale_percent: Some(150),
+        };
+        save_to(&cfg_path, &original);
+        assert_eq!(load_from(&cfg_path).text_scale_percent, Some(150));
+
+        // Pre-feature config files (field absent) deserialize to None.
+        std::fs::write(
+            &cfg_path,
+            r#"{"last_input_folder": null, "last_offload_parent": null}"#,
+        )
+        .unwrap();
+        assert_eq!(load_from(&cfg_path).text_scale_percent, None);
+
+        let mut snapshot = crate::state::AppStateSnapshot::initial();
+        snapshot.text_scale_percent = 100;
+        seed_snapshot_from_config(
+            &mut snapshot,
+            &ConverterConfig {
+                last_input_folder: None,
+                last_offload_parent: None,
+                text_scale_percent: Some(10_000),
+            },
+        );
+        assert_eq!(
+            snapshot.text_scale_percent, 400,
+            "out-of-range persisted values clamp on seeding",
+        );
+    }
+
+    #[test]
     fn seed_snapshot_from_config_restores_offload_parent_if_exists() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(dir.path().exists());
@@ -127,6 +178,7 @@ mod tests {
         let cfg = ConverterConfig {
             last_input_folder: None,
             last_offload_parent: Some(dir.path().to_string_lossy().to_string()),
+            text_scale_percent: None,
         };
 
         let mut snapshot = crate::state::AppStateSnapshot::initial();
@@ -144,6 +196,7 @@ mod tests {
         let cfg = ConverterConfig {
             last_input_folder: None,
             last_offload_parent: Some("/nonexistent/path/that/does/not/exist_42".into()),
+            text_scale_percent: None,
         };
 
         let mut snapshot = crate::state::AppStateSnapshot::initial();
@@ -160,6 +213,7 @@ mod tests {
         let cfg = ConverterConfig {
             last_input_folder: None,
             last_offload_parent: None,
+            text_scale_percent: None,
         };
 
         let mut snapshot = crate::state::AppStateSnapshot::initial();
@@ -194,6 +248,7 @@ mod tests {
         save(&ConverterConfig {
             last_input_folder: Some("/does/not/matter".into()),
             last_offload_parent: None,
+            text_scale_percent: None,
         });
         let expected = dir.path().join(CONFIG_DIR).join(CONFIG_FILE);
         assert!(
