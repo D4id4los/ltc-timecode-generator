@@ -274,6 +274,24 @@ fn galley_for(
     )
 }
 
+/// Like [`galley_for`], but the galley wraps onto multiple lines at
+/// `wrap_width` instead of extending past it. Used by widgets whose text can
+/// outgrow the widget width (option-card subtitles).
+fn galley_for_wrapped(
+    ui: &Ui,
+    label: &str,
+    font: FontSpec,
+    color: Color32,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    egui::WidgetText::from(font.with(label).color(color)).into_galley(
+        ui,
+        Some(TextWrapMode::Wrap),
+        wrap_width,
+        egui::FontSelection::Default,
+    )
+}
+
 fn paint_surface(
     ui: &Ui,
     rect: egui::Rect,
@@ -401,14 +419,19 @@ pub fn option_card(
     let state = option_state(selected, enabled, false);
     let v = option_visuals(colors, state);
     let title_galley = galley_for(ui, title, crate::text::font(13.0).mono().bold(), v.text);
-    let subtitle_galley = galley_for(
+    let width = ui.available_width();
+    // The subtitle wraps at the card's inner width so long descriptions grow
+    // the card's height instead of being clipped (card padding is 10 px per
+    // side). The height formula below reads the wrapped galley's height, so
+    // extra lines simply make the card taller.
+    let subtitle_galley = galley_for_wrapped(
         ui,
         subtitle,
         TextStyle::Description.font_spec(),
         colors.text_muted,
+        (width - 20.0).max(1.0),
     );
-    let width = ui.available_width();
-    let height = 60.0_f32.max(title_galley.size().y + subtitle_galley.size().y + 20.0);
+    let height = 60.0_f32.max(title_galley.size().y + subtitle_galley.size().y + 22.0);
     let sense = if state == OptionState::Idle {
         Sense::click()
     } else {

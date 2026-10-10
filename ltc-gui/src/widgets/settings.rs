@@ -417,11 +417,18 @@ fn render_routing_and_volume(ui: &mut Ui, state: &mut AppState) {
         .inner_margin(egui::Margin::same(8));
     container.show(ui, |ui| {
         if width > 500.0 {
-            ui.columns(2, |cols| {
-                cols[0].vertical(|ui| {
+            // Unequal split (egui `columns` is always equal-width): the
+            // channel selectors need far less room than the volume sliders,
+            // so the row is carved into explicit 25 % / 75 % panes.
+            ui.horizontal(|ui| {
+                let left_w = ui.available_width() * 0.25;
+                ui.vertical(|ui| {
+                    ui.set_min_width(left_w);
+                    ui.set_max_width(left_w);
                     render_routing_buttons(ui, state);
                 });
-                cols[1].vertical(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(ui.available_width());
                     render_sliders(ui, state);
                 });
             });
@@ -450,7 +457,9 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
 
     ui.label(text(ui, "LTC OUTPUT").style(TextStyle::SequenceHeading, &colors));
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
+    // The chip rows live in the narrow (25 %) routing pane of the wide
+    // layout, so they wrap rather than overflow the pane.
+    ui.horizontal_wrapped(|ui| {
         for (val, lbl) in CHANNEL_CHOICES {
             channel_button(
                 ui,
@@ -468,7 +477,7 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     ui.add_space(8.0);
     ui.label(text(ui, "CLAPPER OUTPUT").style(TextStyle::SequenceHeading, &colors));
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (val, lbl) in CHANNEL_CHOICES {
             channel_button(
                 ui,

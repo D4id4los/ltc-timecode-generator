@@ -15,9 +15,7 @@ use gui_engine::converter::{
 use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::file_pattern::{group_display_key, MatchedGroup};
 use gui_engine::timecode::{self, FPS_OPTIONS};
-use gui_engine::video_codecs::{
-    available_video_codecs, describe_chain, normalize_video_codec, supported_video_codecs,
-};
+use gui_engine::video_codecs::{available_video_codecs, supported_video_codecs};
 use gui_engine::{JobKind, JobPhase, ProbeStatusLabel};
 
 use super::bound;
@@ -1530,6 +1528,7 @@ struct CellPos {
 /// the painter origin).
 struct MatrixLayout {
     cell_size: f32,
+    cell_radius: f32,
     total_width: f32,
     total_height: f32,
     cells: Vec<CellPos>,
@@ -1538,11 +1537,71 @@ struct MatrixLayout {
     row_is_ltc: Vec<bool>,
 }
 
+/// Scaled geometry inputs for [`matrix_layout`] — the design-time pixel
+/// sizes multiplied by the text scale, plus a row-label gutter guaranteed
+/// wide enough for the widest label. The header/row-label fonts grow with
+/// the text scale (`MonoValue` preset), so the geometry must keep pace or
+/// headers overlap and labels run into the radio buttons.
+struct MatrixMetrics {
+    cell_size: f32,
+    header_height: f32,
+    label_width: f32,
+}
+
+#[cfg(test)]
+impl MatrixMetrics {
+    /// Design-time geometry at 100 % text scale (test fixture; production
+    /// callers derive the metrics from the live text scale via
+    /// [`matrix_metrics`]).
+    fn design() -> Self {
+        Self {
+            cell_size: 36.0,
+            header_height: 24.0,
+            label_width: 44.0,
+        }
+    }
+}
+
+/// Scale the design geometry by the text scale and widen the label gutter to
+/// fit the widest `● <label>` row label (measured, not guessed — the label
+/// font scales, so a fixed gutter would clip or collide at higher scales).
+fn matrix_metrics(ui: &Ui, row_labels: &[String]) -> MatrixMetrics {
+    let scale = crate::text::text_scale();
+    let font = crate::text::TextStyle::MonoValue.font_spec();
+    let widest_label = row_labels
+        .iter()
+        // The LTC-row bullet prefix is the wider of the two prefixes used in
+        // `draw_matrix_headers`; measuring all labels with it is a safe bound.
+        .map(|label| {
+            let galley = egui::WidgetText::from(font.with(format!("● {label}"))).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::FontSelection::Default,
+            );
+            galley.size().x
+        })
+        .fold(0.0_f32, f32::max);
+    MatrixMetrics {
+        cell_size: 36.0 * scale,
+        header_height: 24.0 * scale,
+        label_width: (44.0 * scale).max(widest_label + 8.0),
+    }
+}
+
 /// Compute header, row-label and cell positions for an `n × n` matrix.
-fn matrix_layout(n: usize, row_labels: &[String], ltc_row: Option<usize>) -> MatrixLayout {
-    let cell_size = 36.0;
-    let label_width = 44.0;
-    let header_height = 24.0;
+fn matrix_layout(
+    n: usize,
+    row_labels: &[String],
+    ltc_row: Option<usize>,
+    metrics: &MatrixMetrics,
+) -> MatrixLayout {
+    let MatrixMetrics {
+        cell_size,
+        header_height,
+        label_width,
+    } = *metrics;
+    let cell_radius = cell_size * (10.0 / 36.0);
     let total_width = label_width + cell_size * n as f32 + 8.0;
     let total_height = header_height + cell_size * n as f32 + 8.0;
 
@@ -1577,6 +1636,7 @@ fn matrix_layout(n: usize, row_labels: &[String], ltc_row: Option<usize>) -> Mat
 
     MatrixLayout {
         cell_size,
+        cell_radius,
         total_width,
         total_height,
         cells,
@@ -1632,7 +1692,7 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
         None
     };
 
-    let layout = matrix_layout(n, &row_labels, ltc_row);
+    let layout = matrix_layout(n, &row_labels, ltc_row, &matrix_metrics(ui, &row_labels));
 
     // Allocate the entire matrix area
     let (response, painter) = ui.allocate_painter(
@@ -1704,7 +1764,7 @@ fn draw_matrix_cells(
         let is_hovered = cell_hover.get(i).copied().unwrap_or(false) && !is_selected;
 
         let v = style::matrix_cell_visuals(colors, is_selected, is_hovered, is_ltc_row);
-        let radius = 10.0;
+        let radius = layout.cell_radius;
         painter.circle_stroke(egui::pos2(cx, cy), radius, v.ring);
         painter.circle_filled(egui::pos2(cx, cy), radius - 2.0, v.core);
     }
@@ -1993,7 +2053,15 @@ fn render_output_format(
         });
     } else {
         ui.horizontal(|ui| {
+            // Cap the left pane: egui gives unconstrained checkboxes/hint
+            // labels nearly the full row width before wrapping, and the row
+            // (left + separator + right) then inflates the tab card past the
+            // header/footer width. Capped labels break onto new lines
+            // instead (the checkbox label wraps via the vertical layout's
+            // wrap mode).
+            let max_left = (ui.available_width() * 0.5).max(300.0);
             ui.vertical(|ui| {
+                ui.set_max_width(max_left);
                 if state.latest.converter.selected_recording_type()
                     == Some(RecordingType::VideoClipSequence)
                 {
@@ -2034,7 +2102,7 @@ fn render_output_format(
         });
     }
 
-    render_format_warnings(ui, state, sanity, caps_opt.as_ref(), &colors);
+    render_format_warnings(ui, state, sanity, &colors);
     render_caps_error_note(ui, caps_opt.as_ref(), &colors);
 }
 
@@ -2258,41 +2326,21 @@ fn render_warning_note(ui: &mut Ui, text: &str, colors: &crate::theme::ThemeColo
     });
 }
 
-/// Sanity-check outcome, collision and duplicate-output warnings.
+/// Sanity-check failure, collision and duplicate-output warnings. A passing
+/// sanity check renders nothing: the engine never lets the user select an
+/// incompatible format combination, so there is no compatibility feedback
+/// line to show.
 fn render_format_warnings(
     ui: &mut Ui,
     state: &mut AppState,
     sanity: Option<&Result<(), ConversionCheckError>>,
-    caps: Option<&gui_engine::FfmpegCapabilities>,
     colors: &crate::theme::ThemeColors,
 ) {
     // Sanity check (pre-computed in render() — pure, no filesystem IO)
     if let Some(s) = sanity {
-        ui.add_space(4.0);
-        match s {
-            Ok(()) => {
-                if copy_mode_active(state) {
-                    ui.label(
-                        text(ui, "✓ Settings are compatible — video stream will be copied (no re-encode)").size(10.0).color(colors.success_green),
-                    );
-                } else {
-                    if let Some(caps) = caps {
-                        let codec = normalize_video_codec(state.sh.conv.video_encoder.value());
-                        let chain = describe_chain(codec, caps);
-                        ui.label(
-                            text(
-                                ui,
-                                format!("✓ Settings are compatible — {} via {}", codec, chain),
-                            )
-                            .size(10.0)
-                            .color(colors.success_green),
-                        );
-                    }
-                }
-            }
-            Err(msg) => {
-                render_warning_note(ui, &format!("⚠ {}", msg), colors);
-            }
+        if let Err(msg) = s {
+            ui.add_space(4.0);
+            render_warning_note(ui, &format!("⚠ {}", msg), colors);
         }
 
         // Non-blocking collision warning (never disables the Convert button)
@@ -3460,7 +3508,12 @@ mod tests {
 
     #[test]
     fn matrix_layout_geometry_and_ltc_flag() {
-        let layout = super::matrix_layout(2, &["A".to_string(), "B".to_string()], Some(1));
+        let layout = super::matrix_layout(
+            2,
+            &["A".to_string(), "B".to_string()],
+            Some(1),
+            &super::MatrixMetrics::design(),
+        );
         assert_eq!(layout.cells.len(), 4);
         assert_eq!(layout.headers.len(), 2);
         assert_eq!(layout.row_labels.len(), 2);
@@ -3478,13 +3531,79 @@ mod tests {
         assert_eq!((cell.cx, cell.cy), (62.0, 78.0));
         // header y is the header band midpoint
         assert_eq!(layout.headers[0].1, 12.0);
+        // radio radius derives from the cell size (design: 10 px)
+        assert_eq!(layout.cell_radius, 10.0);
     }
 
     #[test]
     fn matrix_layout_falls_back_to_default_row_labels() {
-        let layout = super::matrix_layout(1, &[], None);
+        let layout = super::matrix_layout(1, &[], None, &super::MatrixMetrics::design());
         assert_eq!(layout.row_labels[0].2, "CH 1");
         assert!(!layout.row_is_ltc[0]);
+    }
+
+    #[test]
+    fn matrix_layout_scales_geometry_with_metrics() {
+        let metrics = super::MatrixMetrics {
+            cell_size: 54.0,
+            header_height: 36.0,
+            label_width: 80.0,
+        };
+        let layout = super::matrix_layout(2, &[], None, &metrics);
+        assert_eq!(layout.total_width, 80.0 + 54.0 * 2.0 + 8.0);
+        assert_eq!(layout.total_height, 36.0 + 54.0 * 2.0 + 8.0);
+        let cell = layout
+            .cells
+            .iter()
+            .find(|c| c.row == 1 && c.col == 0)
+            .unwrap();
+        assert_eq!((cell.cx, cell.cy), (80.0 + 27.0, 36.0 + 54.0 + 27.0));
+        // the radio radius tracks the scaled cell size
+        assert_eq!(layout.cell_radius, 54.0 * (10.0 / 36.0));
+    }
+
+    /// Headless egui pass — `Context::run_ui` needs no display backend
+    /// (same harness as `widgets/style.rs` tests). Installs the app fonts so
+    /// the custom mono family used by the matrix labels is measurable.
+    fn run_headless_ui(width: f32, body: impl FnMut(&mut egui::Ui)) {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 400.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, body);
+    }
+
+    #[test]
+    fn matrix_metrics_gutter_grows_to_fit_measured_row_labels() {
+        run_headless_ui(800.0, |ui| {
+            // The design gutter already fits short labels at 100 % scale.
+            let short = super::matrix_metrics(ui, &["CH 1".to_string()]);
+            assert_eq!(short.label_width, 44.0);
+            // A long label must widen the gutter past the design minimum so
+            // it cannot run into the first radio column.
+            let long = super::matrix_metrics(ui, &["S12 C8".to_string(), "T1 L".to_string()]);
+            let widest = {
+                let font = crate::text::TextStyle::MonoValue.font_spec();
+                let galley = egui::WidgetText::from(font.with("● S12 C8")).into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Extend),
+                    f32::INFINITY,
+                    egui::FontSelection::Default,
+                );
+                galley.size().x
+            };
+            assert!(
+                long.label_width >= widest + 8.0,
+                "gutter {} must fit measured label {} + padding",
+                long.label_width,
+                widest
+            );
+        });
     }
 
     #[test]

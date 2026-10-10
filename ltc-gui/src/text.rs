@@ -160,7 +160,10 @@ pub fn set_text_scale(percent: u32) {
     TEXT_SCALE_PERCENT.store(percent.clamp(50, 400), Ordering::Relaxed);
 }
 
-fn text_scale() -> f32 {
+/// The text scale as a multiplier (1.0 = 100 %). Preset font sizes multiply
+/// by this at resolution time; layout code that must keep pace with the
+/// scaled text (content-column width, fluid size clamps) reads it directly.
+pub fn text_scale() -> f32 {
     TEXT_SCALE_PERCENT.load(Ordering::Relaxed) as f32 / 100.0
 }
 

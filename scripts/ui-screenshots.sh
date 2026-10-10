@@ -75,6 +75,8 @@ mod clap_anim;
 mod ids;
 #[path = "../src/shadows.rs"]
 mod shadows;
+#[path = "../src/text.rs"]
+mod text;
 #[path = "../src/theme.rs"]
 mod theme;
 #[path = "../src/widgets/mod.rs"]
@@ -202,7 +204,10 @@ fn main() {
             eframe::run_native(
                 "LTC Timecode Generator",
                 options,
-                Box::new(move |_cc| Ok(Box::new(app))),
+                Box::new(move |cc| {
+                    theme::install_fonts(&cc.egui_ctx);
+                    Ok(Box::new(app))
+                }),
             )
             .expect("eframe error");
         }

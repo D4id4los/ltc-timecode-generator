@@ -30,6 +30,19 @@ const TAB_HOVER_UNDERLINE_H: f32 = 2.0;
 /// Faint accent underline shown on hovered inactive tabs (ACCENT @ ~40 % alpha).
 const TAB_HOVER_UNDERLINE: Color32 = Color32::from_rgba_unmultiplied_const(0xFF, 0x5F, 0x1F, 102);
 
+/// Design width of the centered content column at 100 % text scale. All
+/// sections (header, clock card, tab deck, footer) span this column; at
+/// higher text scales it widens proportionally via [`content_max_width`].
+const BASE_CONTENT_WIDTH: f32 = 720.0;
+
+/// Width cap for the content column: the design width scaled by the text
+/// scale, clamped to the viewport. Scaling (instead of keeping the raw
+/// constant) makes every section grow with the text and lets egui's
+/// `Align::Center` re-center the wider column each frame.
+fn content_max_width(viewport_w: f32, text_scale: f32) -> f32 {
+    viewport_w.min(BASE_CONTENT_WIDTH * text_scale)
+}
+
 // ── GUI-only types ──────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -554,7 +567,8 @@ impl eframe::App for AppState {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(8.0, 8.0);
-                let max_content = ui.available_width().min(720.0);
+                let max_content =
+                    content_max_width(ui.available_width(), crate::text::text_scale());
 
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                     ui.set_max_width(max_content);
@@ -832,15 +846,6 @@ impl AppState {
                         let rate_khz = s.sample_rate as f32 / 1000.0;
                         ui.label(
                             text(ui, format!("{:.1} KHZ", rate_khz))
-                                .style(TextStyle::StatValue, &colors),
-                        );
-                    });
-                    ui.add_space(10.0);
-                    ui.vertical(|ui| {
-                        ui.label(text(ui, "BUFFER").style(TextStyle::Caption, &colors));
-                        let buffer_smp = (s.sample_rate as f64 / s.fps()).round() as u32;
-                        ui.label(
-                            text(ui, format!("{} SMP", buffer_smp))
                                 .style(TextStyle::StatValue, &colors),
                         );
                     });
@@ -1218,6 +1223,23 @@ mod tests {
     use gui_engine::job::{JobStatus, ProgressSnapshot};
     use gui_engine::JobPhase;
     use std::sync::mpsc;
+
+    // ── content_max_width ────────────────────────────────────────────────
+
+    #[test]
+    fn content_max_width_at_100_percent_is_unchanged_design_cap() {
+        assert_eq!(content_max_width(5000.0, 1.0), BASE_CONTENT_WIDTH);
+        // Narrow viewports still clamp to the available width.
+        assert_eq!(content_max_width(500.0, 1.0), 500.0);
+    }
+
+    #[test]
+    fn content_max_width_grows_proportionally_with_text_scale() {
+        assert_eq!(content_max_width(5000.0, 1.5), BASE_CONTENT_WIDTH * 1.5);
+        assert_eq!(content_max_width(5000.0, 2.0), BASE_CONTENT_WIDTH * 2.0);
+        // Below 110 % the design cap still wins at this viewport size.
+        assert_eq!(content_max_width(800.0, 1.5), 800.0);
+    }
 
     fn dummy_state() -> Arc<ArcSwap<AppStateSnapshot>> {
         Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())))
