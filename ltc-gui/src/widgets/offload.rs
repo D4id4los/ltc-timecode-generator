@@ -1,4 +1,4 @@
-use crate::text::text;
+use crate::text::{text, TextStyle};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -53,9 +53,8 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         ui.label(
             text(ui, "Parent:  ")
-                .mono()
-                .size(12.0)
-                .color(colors.text_muted),
+                .style(TextStyle::MonoLabel, &colors)
+                .size(12.0),
         );
         // Show current path + Browse button
         let label = if display.is_empty() {
@@ -72,7 +71,12 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
                 state.send(GuiCommand::Offload(OffloadCommand::SetParentFolder(path)));
             }
         }
-        ui.label(text(ui, label).mono().size(11.0).color(colors.text_main));
+        ui.label(
+            text(ui, label)
+                .style(TextStyle::MonoLabel, &colors)
+                .size(11.0)
+                .color(colors.text_main),
+        );
     });
 
     ui.add_space(4.0);
@@ -82,9 +86,8 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         ui.label(
             text(ui, "Subfolder: ")
-                .mono()
-                .size(12.0)
-                .color(colors.text_muted),
+                .style(TextStyle::MonoLabel, &colors)
+                .size(12.0),
         );
         let truth = state.latest.offload.parent_name.clone();
         bound::text(
@@ -98,12 +101,7 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
                     .desired_width(160.0)
             },
         );
-        ui.label(
-            text(ui, "(date subfolder)")
-                .mono()
-                .size(10.0)
-                .color(colors.text_muted),
-        );
+        ui.label(text(ui, "(date subfolder)").style(TextStyle::MonoLabel, &colors));
     });
 }
 
@@ -122,9 +120,8 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
                 ui,
                 "No removable media detected. Insert an SD card and click Rescan.",
             )
-            .mono()
-            .size(11.0)
-            .color(colors.text_muted),
+            .style(TextStyle::MonoLabel, &colors)
+            .size(11.0),
         );
     }
 
@@ -168,16 +165,13 @@ fn render_card(
             ui.horizontal(|ui| {
                 ui.label(
                     text(ui, format!("💾 {}", card.mount.display()))
-                        .mono()
-                        .size(11.0)
-                        .color(colors.text_muted),
+                        .style(TextStyle::MonoLabel, &colors)
+                        .size(11.0),
                 );
                 if !card.volume_label.is_empty() && card.volume_label != card.device_name {
                     ui.label(
                         text(ui, format!("({})", card.volume_label))
-                            .mono()
-                            .size(10.0)
-                            .color(colors.text_muted),
+                            .style(TextStyle::MonoLabel, &colors),
                     );
                 }
             });
@@ -189,7 +183,12 @@ fn render_card(
             // File count summary (now with selection info).
             ui.horizontal(|ui| {
                 let summary = selection_summary(card);
-                ui.label(text(ui, summary).mono().size(11.0).color(device_color));
+                ui.label(
+                    text(ui, summary)
+                        .style(TextStyle::MonoLabel, &colors)
+                        .size(11.0)
+                        .color(device_color),
+                );
             });
 
             // ── File selection list ──
@@ -237,9 +236,8 @@ fn render_device_name_edit(
     ui.horizontal(|ui| {
         ui.label(
             text(ui, "Device folder: ")
-                .mono()
-                .size(11.0)
-                .color(colors.text_muted),
+                .style(TextStyle::MonoLabel, &colors)
+                .size(11.0),
         );
         bound::text(
             ui,
@@ -301,23 +299,17 @@ fn render_bulk_select_buttons(ui: &mut Ui, state: &mut AppState, idx: usize) {
 fn render_file_column_headers(ui: &mut Ui, colors: &ThemeColors) {
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
-            text(ui, "File").mono().size(10.0).color(colors.text_muted),
+            text(ui, "File").style(TextStyle::MonoLabel, colors),
         ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(egui::Label::new(
-                text(ui, "Size").mono().size(10.0).color(colors.text_muted),
+                text(ui, "Size").style(TextStyle::MonoLabel, colors),
             ));
             ui.add(egui::Label::new(
-                text(ui, "Length  ")
-                    .mono()
-                    .size(10.0)
-                    .color(colors.text_muted),
+                text(ui, "Length  ").style(TextStyle::MonoLabel, colors),
             ));
             ui.add(egui::Label::new(
-                text(ui, "Date           ")
-                    .mono()
-                    .size(10.0)
-                    .color(colors.text_muted),
+                text(ui, "Date           ").style(TextStyle::MonoLabel, colors),
             ));
         });
     });
@@ -335,7 +327,7 @@ fn render_file_row(
     file_durations: &HashMap<PathBuf, Option<f64>>,
 ) {
     let colors = state.theme.colors();
-    let (text_main, text_muted) = (colors.text_main, colors.text_muted);
+    let text_main = colors.text_main;
     let row_height = 20.0;
     let selected = card.selected.get(i).copied().unwrap_or(false);
     let file_key = file.path.clone();
@@ -358,7 +350,12 @@ fn render_file_row(
         );
 
         // Filename
-        ui.label(text(ui, &file.name).mono().size(11.0).color(text_main));
+        ui.label(
+            text(ui, &file.name)
+                .style(TextStyle::MonoLabel, &colors)
+                .size(11.0)
+                .color(text_main),
+        );
 
         // Date, duration, size — right-aligned
         let date_str = file
@@ -369,19 +366,9 @@ fn render_file_row(
         let size_str = format_bytes(file.size_bytes);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(text(ui, size_str).mono().size(10.0).color(text_muted));
-            ui.label(
-                text(ui, format!("  {}", dur_str))
-                    .mono()
-                    .size(10.0)
-                    .color(text_muted),
-            );
-            ui.label(
-                text(ui, format!("  {}", date_str))
-                    .mono()
-                    .size(10.0)
-                    .color(text_muted),
-            );
+            ui.label(text(ui, size_str).style(TextStyle::MonoLabel, &colors));
+            ui.label(text(ui, format!("  {}", dur_str)).style(TextStyle::MonoLabel, &colors));
+            ui.label(text(ui, format!("  {}", date_str)).style(TextStyle::MonoLabel, &colors));
         });
     });
 }
@@ -480,7 +467,7 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
     if let Some(ref err) = off.error {
         ui.label(
             text(ui, format!("Error: {}", err))
-                .mono()
+                .style(TextStyle::MonoLabel, &colors)
                 .size(11.0)
                 .color(colors.error_red),
         );
@@ -510,7 +497,11 @@ fn render_overall_progress(
     };
     ui.horizontal(|ui| {
         if !speed_text.is_empty() {
-            ui.label(text(ui, &speed_text).mono().size(10.0).color(ACCENT));
+            ui.label(
+                text(ui, &speed_text)
+                    .style(TextStyle::MonoLabel, colors)
+                    .color(ACCENT),
+            );
         }
         if copy_running {
             let (done_bytes, total_bytes) = copy_byte_totals(units, device_totals);
@@ -525,9 +516,7 @@ fn render_overall_progress(
                                 format_bytes(total_bytes)
                             ),
                         )
-                        .mono()
-                        .size(10.0)
-                        .color(colors.text_muted),
+                        .style(TextStyle::MonoLabel, colors),
                     );
                 });
             }
@@ -596,7 +585,6 @@ fn render_device_progress_row(
     unit: &gui_engine::job::UnitSnapshot,
     totals: Option<&gui_engine::offload::OffloadDeviceTotals>,
 ) {
-    let text_muted = colors.text_muted;
     let dev_pct = unit.fraction;
     let dev_name = totals.map(|t| t.name.as_str()).unwrap_or(&unit.label);
     let bytes_total = totals.map(|t| t.bytes_total).unwrap_or(0);
@@ -606,13 +594,13 @@ fn render_device_progress_row(
     ui.horizontal(|ui| {
         ui.label(
             text(ui, format!("{} {}", status_icon, dev_name))
-                .mono()
+                .style(TextStyle::MonoLabel, colors)
                 .size(11.0)
                 .color(status_color),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let bytes_str = device_progress_text(unit, totals);
-            ui.label(text(ui, bytes_str).mono().size(10.0).color(text_muted));
+            ui.label(text(ui, bytes_str).style(TextStyle::MonoLabel, colors));
         });
     });
     if files_total > 0 || bytes_total > 0 {
@@ -621,12 +609,7 @@ fn render_device_progress_row(
 
     if let UnitState::Running = unit.state {
         if !unit.message.is_empty() {
-            ui.label(
-                text(ui, format!("  {}", unit.message))
-                    .mono()
-                    .size(9.0)
-                    .color(colors.text_muted),
-            );
+            ui.label(text(ui, format!("  {}", unit.message)).style(TextStyle::MonoValue, colors));
         }
     }
 }
@@ -649,7 +632,7 @@ fn render_completed_devices(
     for name in &off.completed_devices {
         ui.label(
             text(ui, format!("  ✅ {}", name))
-                .mono()
+                .style(TextStyle::MonoLabel, colors)
                 .size(11.0)
                 .color(colors.success_green),
         );
