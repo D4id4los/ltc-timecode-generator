@@ -15,8 +15,9 @@
 //! ```
 
 use crate::theme::families;
-use crate::theme::ThemeColors;
+use crate::theme::{ACCENT, ThemeColors};
 use egui::{Color32, FontFamily, FontId, RichText, Ui, WidgetText};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// egui's default `TextStyle::Body` size (the app does not customize
 /// `text_styles`); used by [`styled`] when no `Ui` is available to query.
@@ -36,6 +37,136 @@ enum Weight {
 enum Slant {
     Upright,
     Italic,
+}
+
+/// Semantic text presets — the app's "CSS classes" for text. One variant per
+/// recurring text appearance; the variant's doc comment names its role and
+/// typical call sites. Resolve via [`StyledText::style`] and chain further
+/// setters *after* it to override individual properties:
+///
+/// ```ignore
+/// ui.label(text(ui, "Folder:").style(TextStyle::Label, &colors));
+/// ui.label(text(ui, &route).style(TextStyle::MonoValue, &colors));
+/// ui.label(text(ui, "ROLL").style(TextStyle::SequenceHeading, &colors));
+/// // per-call overrides compose: fluid clock digits on the Display preset
+/// ui.label(text(ui, "12:34").style(TextStyle::Display, &colors).size(d).color(c));
+/// ```
+///
+/// Sizes resolve through the accessibility text scale
+/// ([`set_text_scale`]); explicit `.size()`/`font()` calls never scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextStyle {
+    /// Form labels and field captions ("Folder:").
+    Label,
+    /// Tiny bold labels above grouped controls ("INTERFACE", "SAMPLE RATE").
+    Caption,
+    /// Muted small print: hint paragraphs, collapsible summaries.
+    Description,
+    /// Section headers and card titles.
+    Heading,
+    /// Navigation tab labels.
+    TabHeading,
+    /// Field legends above value rows ("ROLL", "SCENE", "TAKE").
+    SequenceHeading,
+    /// Status lines; the color is per-call (status/grade colors).
+    Status,
+    /// Monospace labels: table headers, paths, file names.
+    MonoLabel,
+    /// Small monospace readouts and values.
+    MonoValue,
+    /// Monospace group headers.
+    MonoHeading,
+    /// Emphasized stat values ("48.0 KHZ").
+    StatValue,
+    /// Clock digits: fluid display text; size and color are per-call.
+    Display,
+}
+
+/// One preset row: what [`StyledText::style`] applies.
+#[derive(Clone, Copy)]
+struct TextStyleSpec {
+    size: Option<f32>,
+    bold: bool,
+    mono: bool,
+    color: Option<ColorRole>,
+}
+
+/// Palette-backed color roles a preset can carry. Per-call dynamic colors
+/// (status/grade/device) are never presets — they stay explicit `.color()`.
+#[derive(Clone, Copy)]
+enum ColorRole {
+    Main,
+    Title,
+    Muted,
+    Secondary,
+    Accent,
+}
+
+impl ColorRole {
+    fn resolve(self, colors: &ThemeColors) -> Color32 {
+        match self {
+            ColorRole::Main => colors.text_main,
+            ColorRole::Title => colors.text_title,
+            ColorRole::Muted => colors.text_muted,
+            ColorRole::Secondary => colors.text_secondary,
+            ColorRole::Accent => ACCENT,
+        }
+    }
+}
+
+impl TextStyle {
+    /// Single home of the preset table — tweak values here and inspect the UI.
+    fn spec(self) -> TextStyleSpec {
+        use ColorRole as C;
+        let (size, bold, mono, color) = match self {
+            TextStyle::Label => (Some(10.0), false, false, Some(C::Muted)),
+            TextStyle::Caption => (Some(8.0), true, false, Some(C::Muted)),
+            TextStyle::Description => (Some(9.0), false, false, Some(C::Muted)),
+            TextStyle::Heading => (Some(11.0), true, false, Some(C::Muted)),
+            TextStyle::TabHeading => (Some(12.0), true, false, None),
+            TextStyle::SequenceHeading => (Some(9.0), true, false, Some(C::Muted)),
+            TextStyle::Status => (None, true, false, None),
+            TextStyle::MonoLabel => (Some(10.0), false, true, Some(C::Muted)),
+            TextStyle::MonoValue => (Some(9.0), false, true, Some(C::Muted)),
+            TextStyle::MonoHeading => (Some(10.0), false, true, Some(C::Title)),
+            TextStyle::StatValue => (Some(10.0), true, false, Some(C::Title)),
+            TextStyle::Display => (None, true, true, None),
+        };
+        TextStyleSpec {
+            size,
+            bold,
+            mono,
+            color,
+        }
+    }
+
+    /// Font-only view of the preset for widget helpers that take a
+    /// [`FontSpec`] (badges, galleys — those own their text color). Presets
+    /// without a table size fall back to the body size there.
+    pub fn font_spec(self) -> FontSpec {
+        let spec = self.spec();
+        let mut f = font(spec.size.unwrap_or(DEFAULT_BODY_SIZE) * text_scale());
+        if spec.bold {
+            f = f.bold();
+        }
+        if spec.mono {
+            f = f.mono();
+        }
+        f
+    }
+}
+
+/// Global text scale in percent, applied at preset resolution only. Written
+/// once per frame by the GUI from the engine-owned `text_scale_percent`.
+static TEXT_SCALE_PERCENT: AtomicU32 = AtomicU32::new(100);
+
+/// Set the accessibility text scale in percent (clamped 50..=400).
+pub fn set_text_scale(percent: u32) {
+    TEXT_SCALE_PERCENT.store(percent.clamp(50, 400), Ordering::Relaxed);
+}
+
+fn text_scale() -> f32 {
+    TEXT_SCALE_PERCENT.load(Ordering::Relaxed) as f32 / 100.0
 }
 
 /// A text string with optional styling, convertible into `RichText`
@@ -116,16 +247,10 @@ impl StyledText {
         self
     }
 
-    /// Muted small print (9 pt, secondary color) — the dominant recurring
-    /// style for hints, captions and status detail lines.
-    pub fn hint(self, colors: &ThemeColors) -> Self {
-        self.size(9.0).color(colors.text_muted)
-    }
-
-    /// Title-colored text; the size stays unset because titles legitimately
-    /// span several sizes at the call sites.
-    pub fn title(self, colors: &ThemeColors) -> Self {
-        self.color(colors.text_title)
+    /// Apply a text preset; chain further setters *after* it to override
+    /// individual properties (`.style(TextStyle::Display, &colors).size(d)`).
+    pub fn style(self, style: TextStyle, colors: &ThemeColors) -> Self {
+        apply_spec(self, style.spec(), text_scale(), colors)
     }
 
     /// Effective rendered size (smallcaps scale applied).
@@ -176,6 +301,29 @@ impl From<StyledText> for WidgetText {
     fn from(t: StyledText) -> WidgetText {
         WidgetText::from(t.rich())
     }
+}
+
+/// Pure core of [`StyledText::style`] — explicit scale keeps the preset
+/// table tests deterministic regardless of the global atomic.
+fn apply_spec(
+    mut t: StyledText,
+    spec: TextStyleSpec,
+    scale: f32,
+    colors: &ThemeColors,
+) -> StyledText {
+    if let Some(size) = spec.size {
+        t.size = Some(size * scale);
+    }
+    if spec.bold {
+        t.weight = Weight::Bold;
+    }
+    if spec.mono {
+        t.mono = true;
+    }
+    if let Some(role) = spec.color {
+        t.color = Some(role.resolve(colors));
+    }
+    t
 }
 
 /// Font styling without a string — for widget helpers that own their label
@@ -377,25 +525,144 @@ mod tests {
     }
 
     #[test]
-    fn hint_preset_bundles_size_and_muted_color() {
-        let ui = make_ui(DEFAULT_BODY_SIZE);
-        let colors = crate::theme::Theme::Dark.colors();
-        let t = st("x").hint(&colors);
-        assert_eq!(t.font_id().size, 9.0);
-        let colors_seen = vertex_colors(&galley_of(t, &ui));
-        assert!(!colors_seen.is_empty());
-        assert!(colors_seen.iter().all(|c| *c == colors.text_muted));
+    fn presets_resolve_size_family_and_color_for_both_themes() {
+        for theme in [crate::theme::Theme::Dark, crate::theme::Theme::Light] {
+            let colors = theme.colors();
+            let cases = [
+                (TextStyle::Label, Some(10.0), false, false, Some(colors.text_muted)),
+                (TextStyle::Caption, Some(8.0), true, false, Some(colors.text_muted)),
+                (TextStyle::Description, Some(9.0), false, false, Some(colors.text_muted)),
+                (TextStyle::Heading, Some(11.0), true, false, Some(colors.text_muted)),
+                (TextStyle::TabHeading, Some(12.0), true, false, None),
+                (TextStyle::SequenceHeading, Some(9.0), true, false, Some(colors.text_muted)),
+                (TextStyle::Status, None, true, false, None),
+                (TextStyle::MonoLabel, Some(10.0), false, true, Some(colors.text_muted)),
+                (TextStyle::MonoValue, Some(9.0), false, true, Some(colors.text_muted)),
+                (TextStyle::MonoHeading, Some(10.0), false, true, Some(colors.text_title)),
+                (TextStyle::StatValue, Some(10.0), true, false, Some(colors.text_title)),
+                (TextStyle::Display, None, true, true, None),
+            ];
+            for (preset, size, bold, mono, color) in cases {
+                let weight = if bold { Weight::Bold } else { Weight::Regular };
+                let t = apply_spec(st("x"), preset.spec(), 1.0, &colors);
+                assert_eq!(
+                    t.font_id().family,
+                    resolve_family(mono, weight, Slant::Upright),
+                    "{preset:?} family ({theme:?})",
+                );
+                match size {
+                    Some(s) => assert_eq!(t.font_id().size, s, "{preset:?} size ({theme:?})"),
+                    None => assert_eq!(
+                        t.font_id().size,
+                        DEFAULT_BODY_SIZE,
+                        "{preset:?} inherits body size ({theme:?})",
+                    ),
+                }
+                if let Some(expected) = color {
+                    let ui = make_ui(DEFAULT_BODY_SIZE);
+                    let seen = vertex_colors(&galley_of(t, &ui));
+                    assert!(!seen.is_empty(), "{preset:?} color ({theme:?})");
+                    assert!(
+                        seen.iter().all(|&c| c == expected),
+                        "{preset:?} color ({theme:?})",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn title_preset_sets_title_color_only() {
+    fn accent_role_resolves_the_theme_accent_const() {
+        let colors = crate::theme::Theme::Light.colors();
+        let t = apply_spec(
+            st("x"),
+            TextStyleSpec {
+                size: None,
+                bold: false,
+                mono: false,
+                color: Some(ColorRole::Accent),
+            },
+            1.0,
+            &colors,
+        );
+        let ui = make_ui(DEFAULT_BODY_SIZE);
+        let seen = vertex_colors(&galley_of(t, &ui));
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|&c| c == ACCENT));
+    }
+
+    #[test]
+    fn preset_is_overridable_by_later_setters() {
+        let colors = crate::theme::Theme::Dark.colors();
+        let t = apply_spec(st("x"), TextStyle::Heading.spec(), 1.0, &colors)
+            .size(16.0)
+            .color(Color32::RED);
+        assert_eq!(t.font_id().size, 16.0);
+        let ui = make_ui(DEFAULT_BODY_SIZE);
+        let seen = vertex_colors(&galley_of(t, &ui));
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|&c| c == Color32::RED));
+
+        // later weight/family setters upgrade on top of the preset
+        let t = apply_spec(st("x"), TextStyle::Label.spec(), 1.0, &colors).mono().bold();
+        assert_eq!(t.font_id().family, families::mono_bold());
+    }
+
+    #[test]
+    fn font_spec_bridge_resolves_the_same_family_matrix() {
+        for preset in [
+            TextStyle::Label,
+            TextStyle::Caption,
+            TextStyle::Description,
+            TextStyle::Heading,
+            TextStyle::TabHeading,
+            TextStyle::SequenceHeading,
+            TextStyle::Status,
+            TextStyle::MonoLabel,
+            TextStyle::MonoValue,
+            TextStyle::MonoHeading,
+            TextStyle::StatValue,
+            TextStyle::Display,
+        ] {
+            let spec = preset.spec();
+            let weight = if spec.bold { Weight::Bold } else { Weight::Regular };
+            assert_eq!(
+                preset.font_spec().font_id().family,
+                resolve_family(spec.mono, weight, Slant::Upright),
+                "{preset:?} font_spec family",
+            );
+            assert_eq!(
+                preset.font_spec().font_id().size,
+                spec.size.unwrap_or(DEFAULT_BODY_SIZE),
+                "{preset:?} font_spec size",
+            );
+        }
+    }
+
+    #[test]
+    fn text_scale_applies_at_preset_resolution_only_and_clamps() {
         let ui = make_ui(DEFAULT_BODY_SIZE);
         let colors = crate::theme::Theme::Dark.colors();
-        let t = st("x").title(&colors);
-        assert_eq!(t.font_id().size, DEFAULT_BODY_SIZE);
-        let colors_seen = vertex_colors(&galley_of(t, &ui));
-        assert!(!colors_seen.is_empty());
-        assert!(colors_seen.iter().all(|c| *c == colors.text_title));
+        let before = TEXT_SCALE_PERCENT.load(Ordering::Relaxed);
+
+        set_text_scale(150);
+        assert_eq!(
+            text(&ui, "x").style(TextStyle::Label, &colors).font_id().size,
+            15.0,
+            "preset sizes scale",
+        );
+        assert_eq!(TextStyle::MonoValue.font_spec().font_id().size, 13.5);
+        assert_eq!(
+            text(&ui, "x").size(9.0).font_id().size,
+            9.0,
+            "raw sizes never scale",
+        );
+
+        set_text_scale(10_000);
+        assert_eq!(TEXT_SCALE_PERCENT.load(Ordering::Relaxed), 400);
+        set_text_scale(1);
+        assert_eq!(TEXT_SCALE_PERCENT.load(Ordering::Relaxed), 50);
+        set_text_scale(before);
     }
 
     #[test]
