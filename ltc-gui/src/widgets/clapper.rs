@@ -1,4 +1,4 @@
-use crate::text::text;
+use crate::text::{text, TextStyle};
 use egui::{Sense, Ui, Vec2};
 use gui_engine::command::GuiCommand;
 use std::time::Instant;
@@ -27,12 +27,7 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
     super::style::content_area(ui, &colors, |ui| {
         ui.horizontal(|ui| {
-            ui.label(
-                text(ui, "SMART CLAPPER SLATE")
-                    .size(11.0)
-                    .color(colors.text_muted)
-                    .bold(),
-            );
+            ui.label(text(ui, "SMART CLAPPER SLATE").style(TextStyle::Heading, &colors));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let truth = state.latest.clapper.auto_increment_take;
                 bound::checkbox(
@@ -199,7 +194,7 @@ fn render_roll_card(ui: &mut Ui, state: &mut AppState) {
     card.show(ui, |ui| {
         ui.set_min_height(76.0);
         ui.vertical_centered(|ui| {
-            ui.label(text(ui, "ROLL").size(9.0).color(colors.text_muted).bold());
+            ui.label(text(ui, "ROLL").style(TextStyle::SequenceHeading, &colors));
             ui.add_space(4.0);
             let truth = state.latest.clapper.roll.clone();
             bound::text(
@@ -229,7 +224,7 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
     card.show(ui, |ui| {
         ui.set_min_height(76.0);
         ui.vertical_centered(|ui| {
-            ui.label(text(ui, "SCENE").size(9.0).color(colors.text_muted).bold());
+            ui.label(text(ui, "SCENE").style(TextStyle::SequenceHeading, &colors));
             ui.label(
                 text(ui, format!("{}", s.clapper.scene))
                     .mono()
@@ -244,7 +239,7 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
                 if ui
                     .button(
                         text(ui, "-")
-                            .bold()
+                            .style(TextStyle::Status, &colors)
                             .color(ui.style().visuals.strong_text_color()),
                     )
                     .clicked()
@@ -254,7 +249,7 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
                 if ui
                     .button(
                         text(ui, "+")
-                            .bold()
+                            .style(TextStyle::Status, &colors)
                             .color(ui.style().visuals.strong_text_color()),
                     )
                     .clicked()
@@ -277,7 +272,7 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
     card.show(ui, |ui| {
         ui.set_min_height(76.0);
         ui.vertical_centered(|ui| {
-            ui.label(text(ui, "TAKE").size(9.0).color(colors.text_muted).bold());
+            ui.label(text(ui, "TAKE").style(TextStyle::SequenceHeading, &colors));
             ui.label(
                 text(ui, format!("{}", s.clapper.take))
                     .mono()
@@ -292,7 +287,7 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
                 if ui
                     .button(
                         text(ui, "-")
-                            .bold()
+                            .style(TextStyle::Status, &colors)
                             .color(ui.style().visuals.strong_text_color()),
                     )
                     .clicked()
@@ -302,7 +297,7 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
                 if ui
                     .button(
                         text(ui, "+")
-                            .bold()
+                            .style(TextStyle::Status, &colors)
                             .color(ui.style().visuals.strong_text_color()),
                     )
                     .clicked()
@@ -319,12 +314,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
     let s = std::sync::Arc::clone(&state.latest);
     super::style::content_area(ui, &colors, |ui| {
         ui.horizontal(|ui| {
-            ui.label(
-                text(ui, "SYNCHRONIZATION LOGS")
-                    .size(11.0)
-                    .color(colors.text_muted)
-                    .bold(),
-            );
+            ui.label(text(ui, "SYNCHRONIZATION LOGS").style(TextStyle::Heading, &colors));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Clear").clicked() {
                     // Clear is GUI-only (just clear the local view)
@@ -368,8 +358,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                             );
                             ui.label(
                                 text(ui, "Tap CLAP & BEEP to capture markings.")
-                                    .size(10.0)
-                                    .color(colors.text_muted),
+                                    .style(TextStyle::Label, &colors),
                             );
                         });
                     } else {
@@ -382,14 +371,17 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                             item_frame.show(ui, |ui| {
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(text(ui, &log.note).bold().color(ACCENT));
+                                        ui.label(
+                                            text(ui, &log.note)
+                                                .style(TextStyle::Status, &colors)
+                                                .color(ACCENT),
+                                        );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 ui.label(
                                                     text(ui, &log.timestamp)
-                                                        .size(10.0)
-                                                        .color(colors.text_muted),
+                                                        .style(TextStyle::Label, &colors),
                                                 );
                                             },
                                         );
@@ -398,7 +390,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             text(ui, "LTC Timecode:")
-                                                .color(colors.text_muted)
+                                                .style(TextStyle::Label, &colors)
                                                 .size(10.5),
                                         );
                                         ui.with_layout(
@@ -406,7 +398,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                                             |ui| {
                                                 ui.label(
                                                     text(ui, &log.timecode)
-                                                        .bold()
+                                                        .style(TextStyle::Status, &colors)
                                                         .color(colors.text_title),
                                                 );
                                             },
@@ -415,7 +407,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             text(ui, "Milliseconds:")
-                                                .color(colors.text_muted)
+                                                .style(TextStyle::Label, &colors)
                                                 .size(10.5),
                                         );
                                         ui.with_layout(
@@ -423,7 +415,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                                             |ui| {
                                                 ui.label(
                                                     text(ui, &log.milliseconds)
-                                                        .bold()
+                                                        .style(TextStyle::Status, &colors)
                                                         .color(ACCENT),
                                                 );
                                             },

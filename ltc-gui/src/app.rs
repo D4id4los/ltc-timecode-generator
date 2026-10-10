@@ -1,4 +1,4 @@
-use crate::text::text;
+use crate::text::{text, TextStyle};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -425,6 +425,7 @@ impl eframe::App for AppState {
             Theme::Light
         };
         self.theme.apply(ctx);
+        crate::text::set_text_scale(self.latest.text_scale_percent);
 
         // 5. Delta time
         let now = Instant::now();
@@ -799,10 +800,7 @@ impl AppState {
                     );
                 });
                 ui.label(
-                    text(ui, "LINEAR TIMECODE HUB")
-                        .size(9.0)
-                        .color(colors.text_muted)
-                        .bold(),
+                    text(ui, "LINEAR TIMECODE HUB").style(TextStyle::SequenceHeading, &colors),
                 );
             });
 
@@ -810,12 +808,7 @@ impl AppState {
                 ui.horizontal(|ui| {
                     ui.add_space(20.0);
                     ui.vertical(|ui| {
-                        ui.label(
-                            text(ui, "INTERFACE")
-                                .size(8.0)
-                                .color(colors.text_muted)
-                                .bold(),
-                        );
+                        ui.label(text(ui, "INTERFACE").style(TextStyle::Caption, &colors));
                         let status_text = if s.is_playing {
                             "NATIVE ACTIVE"
                         } else {
@@ -826,33 +819,29 @@ impl AppState {
                         } else {
                             Color32::from_rgb(0xF5, 0x9E, 0x0B)
                         };
-                        ui.label(text(ui, status_text).size(10.0).bold().color(status_color));
+                        ui.label(
+                            text(ui, status_text)
+                                .style(TextStyle::Status, &colors)
+                                .size(10.0)
+                                .color(status_color),
+                        );
                     });
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
-                        ui.label(
-                            text(ui, "SAMPLE RATE")
-                                .size(8.0)
-                                .color(colors.text_muted)
-                                .bold(),
-                        );
+                        ui.label(text(ui, "SAMPLE RATE").style(TextStyle::Caption, &colors));
                         let rate_khz = s.sample_rate as f32 / 1000.0;
                         ui.label(
                             text(ui, format!("{:.1} KHZ", rate_khz))
-                                .size(10.0)
-                                .bold()
-                                .color(colors.text_title),
+                                .style(TextStyle::StatValue, &colors),
                         );
                     });
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
-                        ui.label(text(ui, "BUFFER").size(8.0).color(colors.text_muted).bold());
+                        ui.label(text(ui, "BUFFER").style(TextStyle::Caption, &colors));
                         let buffer_smp = (s.sample_rate as f64 / s.fps()).round() as u32;
                         ui.label(
                             text(ui, format!("{} SMP", buffer_smp))
-                                .size(10.0)
-                                .bold()
-                                .color(colors.text_title),
+                                .style(TextStyle::StatValue, &colors),
                         );
                     });
                 });
@@ -867,7 +856,7 @@ impl AppState {
                         .corner_radius(6.0)
                         .inner_margin(egui::Margin::symmetric(8, 4));
                     frame.show(ui, |ui| {
-                        ui.label(text(ui, time_str).mono().size(9.0).color(colors.text_muted));
+                        ui.label(text(ui, time_str).style(TextStyle::MonoValue, &colors));
                     });
                 }
                 if widgets::style::action_button(
@@ -931,14 +920,14 @@ impl AppState {
                             cols[i].vertical(|ui| {
                                 ui.label(text(ui, *title).size(10.0).color(ACCENT).bold());
                                 ui.add_space(4.0);
-                                ui.label(text(ui, *body).size(10.5).color(colors.text_muted));
+                                ui.label(text(ui, *body).style(TextStyle::Description, &colors).size(10.5));
                             });
                         }
                     });
                 } else {
                     for (title, body) in &sections {
                         ui.label(text(ui, *title).size(10.0).color(ACCENT).bold());
-                        ui.label(text(ui, *body).size(10.5).color(colors.text_muted));
+                        ui.label(text(ui, *body).style(TextStyle::Description, &colors).size(10.5));
                         ui.add_space(6.0);
                     }
                 }
@@ -967,9 +956,7 @@ impl AppState {
                 ui.horizontal(|ui| {
                     ui.label(
                         text(ui, "LINEAR TIMECODE STREAM")
-                            .size(9.0)
-                            .color(colors.text_muted)
-                            .bold(),
+                            .style(TextStyle::SequenceHeading, &colors),
                     );
                     let dot_color = if s.is_playing {
                         Color32::from_rgb(0x22, 0xC5, 0x5E)
@@ -999,7 +986,12 @@ impl AppState {
                             .stroke(egui::Stroke::new(1.0, ACCENT))
                             .inner_margin(egui::Margin::symmetric(8, 3));
                         pill.show(ui, |ui| {
-                            ui.label(text(ui, fps_name).mono().size(9.0).color(ACCENT).bold());
+                            ui.label(
+                                text(ui, fps_name)
+                                    .style(TextStyle::MonoValue, &colors)
+                                    .bold()
+                                    .color(ACCENT),
+                            );
                         });
                         let route_pill = egui::Frame::new()
                             .fill(colors.nested_bg)
@@ -1008,7 +1000,11 @@ impl AppState {
                             .inner_margin(egui::Margin::symmetric(8, 3));
                         route_pill.show(ui, |ui| {
                             let route = route_label(s.ltc_channel, s.beep_channel);
-                            ui.label(text(ui, route).mono().size(8.0).color(colors.text_muted));
+                            ui.label(
+                                text(ui, route)
+                                    .style(TextStyle::MonoValue, &colors)
+                                    .size(8.0),
+                            );
                         });
                     });
                 });
@@ -1032,7 +1028,7 @@ impl AppState {
             ui.spacing_mut().item_spacing = egui::Vec2::new(TAB_GAP, 0.0);
             for tab in &[Tab::Clapper, Tab::Settings, Tab::Converter, Tab::Offload] {
                 let is_active = *tab == self.active_tab;
-                let text = text(ui, tab.nav_label(is_wide)).size(12.0).bold();
+                let text = text(ui, tab.nav_label(is_wide)).style(TextStyle::TabHeading, &colors);
                 let text = if is_active { text.color(ACCENT) } else { text };
                 let mut btn = egui::Button::new(text)
                     .stroke(egui::Stroke::new(1.0, colors.border_main))
@@ -1193,9 +1189,7 @@ impl AppState {
                     .show(ui, |ui| {
                         if let Ok(buf) = self.log_buffer.lock() {
                             for entry in buf.entries.iter() {
-                                ui.label(
-                                    text(ui, entry).mono().size(10.0).color(colors.text_muted),
-                                );
+                                ui.label(text(ui, entry).style(TextStyle::MonoLabel, &colors));
                             }
                         }
                     });

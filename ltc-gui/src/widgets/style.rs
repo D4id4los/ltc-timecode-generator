@@ -19,7 +19,7 @@
 //! filled builders here are custom-painted from `Response::hovered()` /
 //! `is_pointer_button_down_on()` (both known before painting).
 
-use crate::text::{text, FontSpec};
+use crate::text::{text, FontSpec, TextStyle};
 use egui::{Color32, Sense, Stroke, TextWrapMode, Ui, Vec2};
 
 use crate::theme::{ThemeColors, ACCENT};
@@ -401,7 +401,12 @@ pub fn option_card(
     let state = option_state(selected, enabled, false);
     let v = option_visuals(colors, state);
     let title_galley = galley_for(ui, title, crate::text::font(13.0).mono().bold(), v.text);
-    let subtitle_galley = galley_for(ui, subtitle, crate::text::font(9.0), colors.text_muted);
+    let subtitle_galley = galley_for(
+        ui,
+        subtitle,
+        TextStyle::Description.font_spec(),
+        colors.text_muted,
+    );
     let width = ui.available_width();
     let height = 60.0_f32.max(title_galley.size().y + subtitle_galley.size().y + 20.0);
     let sense = if state == OptionState::Idle {
@@ -466,7 +471,11 @@ pub fn step_header(ui: &mut Ui, colors: &ThemeColors, number: &str, label: &str)
             number,
             crate::text::font(11.0).mono(),
         );
-        ui.label(text(ui, label).size(12.0).color(colors.text_title).bold());
+        ui.label(
+            text(ui, label)
+                .style(TextStyle::TabHeading, colors)
+                .color(colors.text_title),
+        );
     });
 }
 

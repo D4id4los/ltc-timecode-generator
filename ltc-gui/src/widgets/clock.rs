@@ -1,4 +1,4 @@
-use crate::text::text;
+use crate::text::{text, TextStyle};
 use egui::Ui;
 use gui_engine::timecode;
 
@@ -32,45 +32,55 @@ pub fn render(ui: &mut Ui, state: &AppState) {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(2.0, 0.0);
                 ui.label(
                     text(ui, parts[0])
+                        .style(TextStyle::Display, &colors)
                         .size(digit_font_size)
-                        .color(digit_color)
-                        .bold(),
+                        .color(digit_color),
                 );
                 ui.label(
                     text(ui, sep)
+                        .style(TextStyle::Display, &colors)
                         .size(sep_font_size)
-                        .color(colors.clock_sep)
-                        .bold(),
+                        .color(colors.clock_sep),
                 );
                 ui.label(
                     text(ui, parts[1])
+                        .style(TextStyle::Display, &colors)
                         .size(digit_font_size)
-                        .color(digit_color)
-                        .bold(),
+                        .color(digit_color),
                 );
                 ui.label(
                     text(ui, sep)
+                        .style(TextStyle::Display, &colors)
                         .size(sep_font_size)
-                        .color(colors.clock_sep)
-                        .bold(),
+                        .color(colors.clock_sep),
                 );
                 ui.label(
                     text(ui, parts[2])
+                        .style(TextStyle::Display, &colors)
                         .size(digit_font_size)
-                        .color(digit_color)
-                        .bold(),
+                        .color(digit_color),
                 );
-                ui.label(text(ui, sep).size(sep_font_size).color(ACCENT).bold());
+                ui.label(
+                    text(ui, sep)
+                        .style(TextStyle::Display, &colors)
+                        .size(sep_font_size)
+                        .color(ACCENT),
+                );
                 ui.label(
                     text(ui, parts[3])
+                        .style(TextStyle::Display, &colors)
                         .size(digit_font_size)
-                        .color(ACCENT)
-                        .bold(),
+                        .color(ACCENT),
                 );
             });
         } else {
             centered_horizontal_row(ui, "large_clock_fallback", estimated_digit_width, |ui| {
-                ui.label(text(ui, &tc_str).size(digit_font_size).color(ACCENT).bold());
+                ui.label(
+                    text(ui, &tc_str)
+                        .style(TextStyle::Display, &colors)
+                        .size(digit_font_size)
+                        .color(ACCENT),
+                );
             });
         }
         ui.add_space(4.0);
@@ -78,15 +88,15 @@ pub fn render(ui: &mut Ui, state: &AppState) {
             ui.spacing_mut().item_spacing = egui::Vec2::new(6.0, 0.0);
             ui.label(
                 text(ui, "MS MATCH:")
+                    .style(TextStyle::Status, &colors)
                     .size(ms_font_size)
-                    .color(colors.text_muted)
-                    .bold(),
+                    .color(colors.text_muted),
             );
             ui.label(
                 text(ui, ms_str)
+                    .style(TextStyle::Status, &colors)
                     .size(ms_font_size)
-                    .color(colors.text_title)
-                    .bold(),
+                    .color(colors.text_title),
             );
         });
     });

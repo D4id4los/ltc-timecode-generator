@@ -1,4 +1,4 @@
-use crate::text::text;
+use crate::text::{text, TextStyle};
 use egui::{Color32, Ui};
 use gui_engine::state::AppStateSnapshot;
 
@@ -73,9 +73,7 @@ fn render_wide_status(ui: &mut Ui, s: &AppStateSnapshot, colors: &ThemeColors) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 text(ui, "POWER: AC")
-                    .mono()
-                    .size(10.0)
-                    .color(colors.text_muted)
+                    .style(TextStyle::MonoLabel, colors)
                     .bold(),
             );
         });
@@ -103,9 +101,8 @@ fn render_narrow_status(ui: &mut Ui, s: &AppStateSnapshot, colors: &ThemeColors)
         ui.add_space(4.0);
         ui.label(
             text(ui, "POWER: AC")
-                .mono()
+                .style(TextStyle::MonoValue, colors)
                 .size(9.5)
-                .color(colors.text_muted)
                 .bold(),
         );
     });
@@ -118,10 +115,9 @@ fn dot_label(ui: &mut Ui, text: &str, dot_color: Color32, colors: &crate::theme:
         ui.painter().circle_filled(rect.center(), 2.5, dot_color);
         ui.label(
             crate::text::text(ui, text)
-                .mono()
-                .size(10.0)
-                .color(colors.text_title)
-                .bold(),
+                .style(TextStyle::MonoLabel, colors)
+                .bold()
+                .color(colors.text_title),
         );
     });
 }

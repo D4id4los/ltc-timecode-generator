@@ -15,7 +15,7 @@
 //! ```
 
 use crate::theme::families;
-use crate::theme::{ACCENT, ThemeColors};
+use crate::theme::ThemeColors;
 use egui::{Color32, FontFamily, FontId, RichText, Ui, WidgetText};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -93,23 +93,18 @@ struct TextStyleSpec {
 
 /// Palette-backed color roles a preset can carry. Per-call dynamic colors
 /// (status/grade/device) are never presets — they stay explicit `.color()`.
+/// New roles are added here when a preset first needs them.
 #[derive(Clone, Copy)]
 enum ColorRole {
-    Main,
     Title,
     Muted,
-    Secondary,
-    Accent,
 }
 
 impl ColorRole {
     fn resolve(self, colors: &ThemeColors) -> Color32 {
         match self {
-            ColorRole::Main => colors.text_main,
             ColorRole::Title => colors.text_title,
             ColorRole::Muted => colors.text_muted,
-            ColorRole::Secondary => colors.text_secondary,
-            ColorRole::Accent => ACCENT,
         }
     }
 }
@@ -529,17 +524,71 @@ mod tests {
         for theme in [crate::theme::Theme::Dark, crate::theme::Theme::Light] {
             let colors = theme.colors();
             let cases = [
-                (TextStyle::Label, Some(10.0), false, false, Some(colors.text_muted)),
-                (TextStyle::Caption, Some(8.0), true, false, Some(colors.text_muted)),
-                (TextStyle::Description, Some(9.0), false, false, Some(colors.text_muted)),
-                (TextStyle::Heading, Some(11.0), true, false, Some(colors.text_muted)),
+                (
+                    TextStyle::Label,
+                    Some(10.0),
+                    false,
+                    false,
+                    Some(colors.text_muted),
+                ),
+                (
+                    TextStyle::Caption,
+                    Some(8.0),
+                    true,
+                    false,
+                    Some(colors.text_muted),
+                ),
+                (
+                    TextStyle::Description,
+                    Some(9.0),
+                    false,
+                    false,
+                    Some(colors.text_muted),
+                ),
+                (
+                    TextStyle::Heading,
+                    Some(11.0),
+                    true,
+                    false,
+                    Some(colors.text_muted),
+                ),
                 (TextStyle::TabHeading, Some(12.0), true, false, None),
-                (TextStyle::SequenceHeading, Some(9.0), true, false, Some(colors.text_muted)),
+                (
+                    TextStyle::SequenceHeading,
+                    Some(9.0),
+                    true,
+                    false,
+                    Some(colors.text_muted),
+                ),
                 (TextStyle::Status, None, true, false, None),
-                (TextStyle::MonoLabel, Some(10.0), false, true, Some(colors.text_muted)),
-                (TextStyle::MonoValue, Some(9.0), false, true, Some(colors.text_muted)),
-                (TextStyle::MonoHeading, Some(10.0), false, true, Some(colors.text_title)),
-                (TextStyle::StatValue, Some(10.0), true, false, Some(colors.text_title)),
+                (
+                    TextStyle::MonoLabel,
+                    Some(10.0),
+                    false,
+                    true,
+                    Some(colors.text_muted),
+                ),
+                (
+                    TextStyle::MonoValue,
+                    Some(9.0),
+                    false,
+                    true,
+                    Some(colors.text_muted),
+                ),
+                (
+                    TextStyle::MonoHeading,
+                    Some(10.0),
+                    false,
+                    true,
+                    Some(colors.text_title),
+                ),
+                (
+                    TextStyle::StatValue,
+                    Some(10.0),
+                    true,
+                    false,
+                    Some(colors.text_title),
+                ),
                 (TextStyle::Display, None, true, true, None),
             ];
             for (preset, size, bold, mono, color) in cases {
@@ -572,26 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn accent_role_resolves_the_theme_accent_const() {
-        let colors = crate::theme::Theme::Light.colors();
-        let t = apply_spec(
-            st("x"),
-            TextStyleSpec {
-                size: None,
-                bold: false,
-                mono: false,
-                color: Some(ColorRole::Accent),
-            },
-            1.0,
-            &colors,
-        );
-        let ui = make_ui(DEFAULT_BODY_SIZE);
-        let seen = vertex_colors(&galley_of(t, &ui));
-        assert!(!seen.is_empty());
-        assert!(seen.iter().all(|&c| c == ACCENT));
-    }
-
-    #[test]
     fn preset_is_overridable_by_later_setters() {
         let colors = crate::theme::Theme::Dark.colors();
         let t = apply_spec(st("x"), TextStyle::Heading.spec(), 1.0, &colors)
@@ -604,7 +633,9 @@ mod tests {
         assert!(seen.iter().all(|&c| c == Color32::RED));
 
         // later weight/family setters upgrade on top of the preset
-        let t = apply_spec(st("x"), TextStyle::Label.spec(), 1.0, &colors).mono().bold();
+        let t = apply_spec(st("x"), TextStyle::Label.spec(), 1.0, &colors)
+            .mono()
+            .bold();
         assert_eq!(t.font_id().family, families::mono_bold());
     }
 
@@ -625,7 +656,11 @@ mod tests {
             TextStyle::Display,
         ] {
             let spec = preset.spec();
-            let weight = if spec.bold { Weight::Bold } else { Weight::Regular };
+            let weight = if spec.bold {
+                Weight::Bold
+            } else {
+                Weight::Regular
+            };
             assert_eq!(
                 preset.font_spec().font_id().family,
                 resolve_family(spec.mono, weight, Slant::Upright),
@@ -647,7 +682,10 @@ mod tests {
 
         set_text_scale(150);
         assert_eq!(
-            text(&ui, "x").style(TextStyle::Label, &colors).font_id().size,
+            text(&ui, "x")
+                .style(TextStyle::Label, &colors)
+                .font_id()
+                .size,
             15.0,
             "preset sizes scale",
         );
