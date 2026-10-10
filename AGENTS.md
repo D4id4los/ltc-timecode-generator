@@ -123,7 +123,7 @@ Published each tick as `Arc<ArcSwap<AppStateSnapshot>>`; GUIs `state.load()` loc
 `gui-engine/src/offload.rs`; dedicated **Offload** tab in both GUIs.
 - **Card detection** is platform-specific (Linux `/proc/mounts` + `/sys/class/block` with udisksctl auto-mount; Windows drive APIs; macOS `/Volumes`); the **scan** walks each card (depth ≤ 6, ≤ 10 000 files) classifying media by extension.
 - **Device naming** uses the `device_name.rs` chain (below). **Selection**: all/none/latest-recording-day per card + per-file toggles. **Copy plan**: flat `parent/<ISO-date>/<device>/` layout with `name (2).ext` collision renaming.
-- **Execution** via `spawn_job`: 1 MiB chunked streaming, temporary `.offload_tmp` → atomic rename, size-only verification, idempotent resume (destination with matching size is skipped), `CancelToken` cancellation, per-device state machine `Pending`/`Copying`/`Done`/`Failed`/`Skipped`. Card scans run under `catch_unwind`.
+- **Execution** via `spawn_job`: 1 MiB chunked streaming, temporary `.offload_tmp` → atomic rename, size-only verification, best-effort source-timestamp preservation on the copy (modified + accessed everywhere, created additionally on Windows/macOS via std `FileTimes`; failures warn-logged, never fatal — `apply_source_attributes`), `CancelToken` cancellation, per-device state machine `Pending`/`Copying`/`Done`/`Failed`/`Skipped`. Card scans run under `catch_unwind`.
 - **Config**: parent folder persists via `config::save_offload_parent()`, restored by `seed_snapshot_from_config()`.
 - **Converter handoff**: a `last_offload_parent` change makes ltc-gui auto-switch the converter to the fresh offload destination (`SelectFolder` + `SelectRecording(0)`).
 

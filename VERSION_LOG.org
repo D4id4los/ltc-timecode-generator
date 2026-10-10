@@ -1,5 +1,17 @@
 #+TITLE: Version History for LTC Timecode Generator
 
+* Unreleased
+
+Offloaded card files now keep the recording's original timestamps instead of
+looking freshly created.
+
+List of Changes:
+- Offload: Copies now preserve the source files' timestamps — modified and
+  access time on all platforms, creation time additionally on Windows and
+  macOS (Linux has no creation-time API). Preservation is best-effort: a
+  filesystem that rejects timestamps logs a warning instead of failing the
+  copy.
+
 * v0.5.5
 
 Minor patch to disallow the combination of MOV + AV1 in the conversion GUI, as
