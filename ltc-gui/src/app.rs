@@ -43,6 +43,30 @@ fn content_max_width(viewport_w: f32, text_scale: f32) -> f32 {
     viewport_w.min(BASE_CONTENT_WIDTH * text_scale)
 }
 
+// ── Responsive layout gates ─────────────────────────────────────────────
+// Design thresholds measured at 100 % text scale; each gate compares
+// against the threshold scaled by [`crate::text::layout_scale`] so label-
+// fitting decisions keep working when the text grows.
+
+/// Tab deck: long descriptive nav labels need this much row width.
+const DECK_WIDE_MIN_W: f32 = 500.0;
+/// FAQ card: three guide sections side by side above this width.
+const FAQ_COLUMNS_MIN_W: f32 = 500.0;
+/// Header: the INTERFACE / SAMPLE RATE stat columns need this much width.
+const HEADER_STATS_MIN_W: f32 = 300.0;
+
+pub fn deck_is_wide(row_w: f32) -> bool {
+    row_w > DECK_WIDE_MIN_W * crate::text::layout_scale()
+}
+
+pub fn faq_uses_columns(width: f32) -> bool {
+    width > FAQ_COLUMNS_MIN_W * crate::text::layout_scale()
+}
+
+pub fn header_stats_fit(width: f32) -> bool {
+    width > HEADER_STATS_MIN_W * crate::text::layout_scale()
+}
+
 // ── GUI-only types ──────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,8 +461,10 @@ impl eframe::App for AppState {
         } else {
             Theme::Light
         };
-        self.theme.apply(ctx);
+        // Scale first so Theme::apply below styles this same frame with the
+        // current value (one-frame stale flash otherwise).
         crate::text::set_text_scale(self.latest.text_scale_percent);
+        self.theme.apply(ctx);
 
         // 5. Delta time
         let now = Instant::now();
@@ -800,16 +826,10 @@ impl AppState {
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        text(ui, "LTC ENGINE")
-                            .size(16.0)
-                            .bold()
-                            .color(colors.text_title),
-                    );
+                    ui.label(text(ui, "LTC ENGINE").style(TextStyle::Title, &colors));
                     ui.label(
                         text(ui, format!("v{}", APP_VERSION))
-                            .size(16.0)
-                            .bold()
+                            .style(TextStyle::Title, &colors)
                             .color(ACCENT),
                     );
                 });
@@ -818,7 +838,7 @@ impl AppState {
                 );
             });
 
-            if ui.available_width() > 300.0 {
+            if header_stats_fit(ui.available_width()) {
                 ui.horizontal(|ui| {
                     ui.add_space(20.0);
                     ui.vertical(|ui| {
@@ -836,7 +856,6 @@ impl AppState {
                         ui.label(
                             text(ui, status_text)
                                 .style(TextStyle::Status, &colors)
-                                .size(10.0)
                                 .color(status_color),
                         );
                     });
@@ -911,7 +930,9 @@ impl AppState {
             .stroke(egui::Stroke::new(1.5, colors.border_main));
         frame.show(ui, |ui| {
             ui.vertical(|ui| {
-                ui.label(text(ui, "LTC & MULTI-CAM SYNC - QUICK GUIDE").size(13.0).color(colors.text_title).bold());
+                ui.label(
+                    text(ui, "LTC & MULTI-CAM SYNC - QUICK GUIDE").style(TextStyle::CardTitle, &colors),
+                );
                 ui.add_space(8.0);
                 let width = ui.available_width();
                 let sections = [
@@ -919,20 +940,28 @@ impl AppState {
                     ("Connecting Cameras", "Connect audio output to camera mic input or sync boxes. Set gain manually to a medium level."),
                     ("Synchronizing in Edit", "In DaVinci Resolve or Premiere, right-click files and select 'Update Timecode from Audio Track' to auto-sync."),
                 ];
-                if width > 500.0 {
+                if faq_uses_columns(width) {
                     ui.columns(3, |cols| {
                         for (i, (title, body)) in sections.iter().enumerate() {
                             cols[i].vertical(|ui| {
-                                ui.label(text(ui, *title).size(10.0).color(ACCENT).bold());
+                                ui.label(
+                                    text(ui, *title)
+                                        .style(TextStyle::SequenceHeading, &colors)
+                                        .color(ACCENT),
+                                );
                                 ui.add_space(4.0);
-                                ui.label(text(ui, *body).style(TextStyle::Description, &colors).size(10.5));
+                                ui.label(text(ui, *body).style(TextStyle::Hint, &colors));
                             });
                         }
                     });
                 } else {
                     for (title, body) in &sections {
-                        ui.label(text(ui, *title).size(10.0).color(ACCENT).bold());
-                        ui.label(text(ui, *body).style(TextStyle::Description, &colors).size(10.5));
+                        ui.label(
+                            text(ui, *title)
+                                .style(TextStyle::SequenceHeading, &colors)
+                                .color(ACCENT),
+                        );
+                        ui.label(text(ui, *body).style(TextStyle::Hint, &colors));
                         ui.add_space(6.0);
                     }
                 }
@@ -1005,11 +1034,7 @@ impl AppState {
                             .inner_margin(egui::Margin::symmetric(8, 3));
                         route_pill.show(ui, |ui| {
                             let route = route_label(s.ltc_channel, s.beep_channel);
-                            ui.label(
-                                text(ui, route)
-                                    .style(TextStyle::MonoValue, &colors)
-                                    .size(8.0),
-                            );
+                            ui.label(text(ui, route).style(TextStyle::MonoValue, &colors));
                         });
                     });
                 });
@@ -1026,8 +1051,8 @@ impl AppState {
     fn render_tabbed_deck(&mut self, ui: &mut Ui) {
         let colors = self.theme.colors();
         let row_w = ui.available_width();
-        let is_wide = row_w > 500.0;
-        let tab_w = ((row_w - TAB_GAP * 3.0) / 4.0).max(TAB_MIN_W);
+        let is_wide = deck_is_wide(row_w);
+        let tab_w = ((row_w - TAB_GAP * 3.0) / 4.0).max(TAB_MIN_W * crate::text::layout_scale());
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::Vec2::new(TAB_GAP, 0.0);
@@ -1239,6 +1264,33 @@ mod tests {
         assert_eq!(content_max_width(5000.0, 2.0), BASE_CONTENT_WIDTH * 2.0);
         // Below 110 % the design cap still wins at this viewport size.
         assert_eq!(content_max_width(800.0, 1.5), 800.0);
+    }
+
+    // ── responsive layout gates ──────────────────────────────────────────
+
+    #[test]
+    fn layout_gates_match_design_thresholds_at_100_percent() {
+        let _lock = crate::text::SCALE_LOCK.lock().unwrap();
+        crate::text::set_text_scale(100);
+        assert!(deck_is_wide(501.0));
+        assert!(!deck_is_wide(500.0));
+        assert!(faq_uses_columns(500.1));
+        assert!(!faq_uses_columns(500.0));
+        assert!(header_stats_fit(300.1));
+        assert!(!header_stats_fit(300.0));
+    }
+
+    #[test]
+    fn layout_gates_flip_narrower_as_text_scale_grows() {
+        let _lock = crate::text::SCALE_LOCK.lock().unwrap();
+        crate::text::set_text_scale(150);
+        // 520 px comfortably cleared the 500 px gate at 100 %, but the long
+        // tab labels no longer fit there at 150 % — the gate must flip.
+        assert!(!deck_is_wide(520.0));
+        assert!(!faq_uses_columns(520.0));
+        assert!(deck_is_wide(800.0));
+        assert!(header_stats_fit(500.0));
+        crate::text::set_text_scale(100);
     }
 
     fn dummy_state() -> Arc<ArcSwap<AppStateSnapshot>> {

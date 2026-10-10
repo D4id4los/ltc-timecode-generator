@@ -1,4 +1,4 @@
-use egui::{Color32, FontData, FontFamily, Stroke, Vec2, Visuals};
+use egui::{Color32, FontData, FontFamily, FontId, Stroke, Vec2, Visuals};
 use gui_engine::theme::{self, Rgb};
 use std::sync::Arc;
 
@@ -192,10 +192,101 @@ impl Theme {
         ctx.set_visuals(visuals);
 
         let mut style = (*ctx.global_style()).clone();
-        style.spacing.button_padding = Vec2::new(10.0, 6.0);
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.window_margin = egui::Margin::same(12);
+        let scale = crate::text::text_scale();
+        // Half-pixel resolution keeps odd base values crisp at fractional scales.
+        let px = |v: f32| (v * scale * 2.0).round() / 2.0;
+        style.spacing.button_padding = Vec2::new(px(10.0), px(6.0));
+        style.spacing.item_spacing = Vec2::new(px(8.0), px(6.0));
+        style.spacing.window_margin = egui::Margin::same(px(12.0).round() as i8);
+        // egui built-in text styles (checkbox labels, buttons, ComboBox,
+        // TextEdit, DragValue, …) must keep pace with the accessibility
+        // text scale just like the TextStyle presets do. Base sizes come
+        // from egui's defaults — NOT the current style — so repeated
+        // per-frame applies are idempotent instead of compounding.
+        for (name, base) in egui::Style::default().text_styles {
+            style
+                .text_styles
+                .entry(name)
+                .and_modify(|font_id| font_id.size = px(base.size))
+                .or_insert_with(|| FontId::new(px(base.size), base.family.clone()));
+        }
         ctx.set_global_style(style);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scaled_ctx(percent: u32) -> egui::Context {
+        let _guard = crate::text::SCALE_LOCK.lock().unwrap();
+        crate::text::set_text_scale(percent);
+        let ctx = egui::Context::default();
+        Theme::Dark.apply(&ctx);
+        crate::text::set_text_scale(100);
+        ctx
+    }
+
+    #[test]
+    fn apply_scales_builtin_text_styles() {
+        let defaults = egui::Context::default().global_style().text_styles.clone();
+        let ctx = scaled_ctx(150);
+        let style = ctx.global_style();
+        for (name, font_id) in &defaults {
+            let scaled = style.text_styles.get(name).expect("style preserved");
+            assert_eq!(
+                scaled.size,
+                font_id.size * 1.5,
+                "{name:?} built-in text style must scale"
+            );
+            assert_eq!(scaled.family, font_id.family, "{name:?} family preserved");
+        }
+    }
+
+    #[test]
+    fn apply_scales_global_spacing() {
+        let ctx = scaled_ctx(200);
+        let spacing = &ctx.global_style().spacing;
+        assert_eq!(spacing.button_padding, Vec2::new(20.0, 12.0));
+        assert_eq!(spacing.item_spacing, Vec2::new(16.0, 12.0));
+        assert_eq!(spacing.window_margin, egui::Margin::same(24));
+    }
+
+    #[test]
+    fn apply_at_default_scale_keeps_base_values() {
+        let ctx = scaled_ctx(100);
+        let spacing = &ctx.global_style().spacing;
+        assert_eq!(spacing.button_padding, Vec2::new(10.0, 6.0));
+        assert_eq!(spacing.item_spacing, Vec2::new(8.0, 6.0));
+        assert_eq!(spacing.window_margin, egui::Margin::same(12));
+        let body = ctx
+            .global_style()
+            .text_styles
+            .get(&egui::TextStyle::Body)
+            .expect("body style")
+            .size;
+        assert_eq!(body, 13.0);
+    }
+
+    /// Regression: scaling used to multiply the *current* style each frame,
+    /// so a persisted non-100 % scale compounded every apply (at 50 % the
+    /// text shrank toward zero and default-font widgets rendered blank).
+    #[test]
+    fn repeated_applies_are_idempotent_at_fractional_scales() {
+        let _guard = crate::text::SCALE_LOCK.lock().unwrap();
+        crate::text::set_text_scale(50);
+        let ctx = egui::Context::default();
+        Theme::Dark.apply(&ctx);
+        Theme::Dark.apply(&ctx);
+        Theme::Dark.apply(&ctx);
+        let body = ctx
+            .global_style()
+            .text_styles
+            .get(&egui::TextStyle::Body)
+            .expect("body style")
+            .size;
+        assert_eq!(body, 6.5, "three applies must not compound");
+        crate::text::set_text_scale(100);
     }
 }
 

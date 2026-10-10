@@ -64,20 +64,33 @@ pub enum TextStyle {
     Description,
     /// Section headers and card titles.
     Heading,
+    /// App-header title ("LTC ENGINE") and top-level brand text.
+    Title,
+    /// Card titles ("… - QUICK GUIDE") — one step below [`TextStyle::Title`].
+    CardTitle,
     /// Navigation tab labels.
     TabHeading,
     /// Field legends above value rows ("ROLL", "SCENE", "TAKE").
     SequenceHeading,
     /// Status lines; the color is per-call (status/grade colors).
     Status,
+    /// Big monospace digits: stepper readouts, clapper scene/take values.
+    /// Color is per-call (title/accent).
+    BigValue,
     /// Monospace labels: table headers, paths, file names.
     MonoLabel,
     /// Small monospace readouts and values.
     MonoValue,
+    /// Monospace readout rows at the standard value size, default text
+    /// color (LTC decode report values, dBFS preset buttons).
+    MonoReadout,
     /// Monospace group headers.
     MonoHeading,
     /// Emphasized stat values ("48.0 KHZ").
     StatValue,
+    /// Neutral note text (~10 px): hints, errors, warnings, blockers.
+    /// Dynamic colors (error/warning/accent) are per-call `.color()`.
+    Hint,
     /// Clock digits: fluid display text; size and color are per-call.
     Display,
 }
@@ -118,13 +131,18 @@ impl TextStyle {
             TextStyle::Caption => (Some(8.0), true, false, Some(C::Muted)),
             TextStyle::Description => (Some(9.0), false, false, Some(C::Muted)),
             TextStyle::Heading => (Some(11.0), true, false, Some(C::Muted)),
+            TextStyle::Title => (Some(16.0), true, false, Some(C::Title)),
+            TextStyle::CardTitle => (Some(13.0), true, false, Some(C::Title)),
             TextStyle::TabHeading => (Some(12.0), true, false, None),
             TextStyle::SequenceHeading => (Some(9.0), true, false, Some(C::Muted)),
-            TextStyle::Status => (None, true, false, None),
-            TextStyle::MonoLabel => (Some(10.0), false, true, Some(C::Muted)),
+            TextStyle::Status => (Some(11.0), true, false, None),
+            TextStyle::BigValue => (Some(18.0), true, true, None),
+            TextStyle::MonoLabel => (Some(11.0), false, true, Some(C::Muted)),
             TextStyle::MonoValue => (Some(9.0), false, true, Some(C::Muted)),
+            TextStyle::MonoReadout => (Some(10.0), false, true, None),
             TextStyle::MonoHeading => (Some(10.0), false, true, Some(C::Title)),
             TextStyle::StatValue => (Some(10.0), true, false, Some(C::Title)),
+            TextStyle::Hint => (Some(10.0), false, false, Some(C::Muted)),
             TextStyle::Display => (None, true, true, None),
         };
         TextStyleSpec {
@@ -160,11 +178,24 @@ pub fn set_text_scale(percent: u32) {
     TEXT_SCALE_PERCENT.store(percent.clamp(50, 400), Ordering::Relaxed);
 }
 
+/// Serializes tests that mutate the process-global scale atomic; parallel
+/// test threads would otherwise observe each other's temporary scale.
+#[cfg(test)]
+pub(crate) static SCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The text scale as a multiplier (1.0 = 100 %). Preset font sizes multiply
 /// by this at resolution time; layout code that must keep pace with the
 /// scaled text (content-column width, fluid size clamps) reads it directly.
 pub fn text_scale() -> f32 {
     TEXT_SCALE_PERCENT.load(Ordering::Relaxed) as f32 / 100.0
+}
+
+/// How fixed-px layout thresholds (width gates, global spacing) track the
+/// text scale. Deliberately a separate seam from [`text_scale`]: visual
+/// review at extreme scales may show that gates need damped scaling —
+/// change only this function, never the call sites.
+pub fn layout_scale() -> f32 {
+    text_scale()
 }
 
 /// A text string with optional styling, convertible into `RichText`
@@ -555,6 +586,20 @@ mod tests {
                     false,
                     Some(colors.text_muted),
                 ),
+                (
+                    TextStyle::Title,
+                    Some(16.0),
+                    true,
+                    false,
+                    Some(colors.text_title),
+                ),
+                (
+                    TextStyle::CardTitle,
+                    Some(13.0),
+                    true,
+                    false,
+                    Some(colors.text_title),
+                ),
                 (TextStyle::TabHeading, Some(12.0), true, false, None),
                 (
                     TextStyle::SequenceHeading,
@@ -563,10 +608,11 @@ mod tests {
                     false,
                     Some(colors.text_muted),
                 ),
-                (TextStyle::Status, None, true, false, None),
+                (TextStyle::Status, Some(11.0), true, false, None),
+                (TextStyle::BigValue, Some(18.0), true, true, None),
                 (
                     TextStyle::MonoLabel,
-                    Some(10.0),
+                    Some(11.0),
                     false,
                     true,
                     Some(colors.text_muted),
@@ -578,6 +624,7 @@ mod tests {
                     true,
                     Some(colors.text_muted),
                 ),
+                (TextStyle::MonoReadout, Some(10.0), false, true, None),
                 (
                     TextStyle::MonoHeading,
                     Some(10.0),
@@ -591,6 +638,13 @@ mod tests {
                     true,
                     false,
                     Some(colors.text_title),
+                ),
+                (
+                    TextStyle::Hint,
+                    Some(10.0),
+                    false,
+                    false,
+                    Some(colors.text_muted),
                 ),
                 (TextStyle::Display, None, true, true, None),
             ];
@@ -649,13 +703,18 @@ mod tests {
             TextStyle::Caption,
             TextStyle::Description,
             TextStyle::Heading,
+            TextStyle::Title,
+            TextStyle::CardTitle,
             TextStyle::TabHeading,
             TextStyle::SequenceHeading,
             TextStyle::Status,
+            TextStyle::BigValue,
             TextStyle::MonoLabel,
             TextStyle::MonoValue,
+            TextStyle::MonoReadout,
             TextStyle::MonoHeading,
             TextStyle::StatValue,
+            TextStyle::Hint,
             TextStyle::Display,
         ] {
             let spec = preset.spec();
@@ -679,6 +738,7 @@ mod tests {
 
     #[test]
     fn text_scale_applies_at_preset_resolution_only_and_clamps() {
+        let _lock = SCALE_LOCK.lock().unwrap();
         let ui = make_ui(DEFAULT_BODY_SIZE);
         let colors = crate::theme::Theme::Dark.colors();
         let before = TEXT_SCALE_PERCENT.load(Ordering::Relaxed);
@@ -710,6 +770,68 @@ mod tests {
     fn converts_into_rich_text_and_widget_text() {
         let _: RichText = st("x").bold().into();
         let _: WidgetText = st("x").mono().into();
+    }
+
+    /// Guardrail: explicit `.size(N)` on text never scales with the text
+    /// scale, so every fixed-size text site is a scaling bug waiting to
+    /// happen. All text must resolve through a [`TextStyle`] preset (or a
+    /// documented fluid-size exception). Allowlist entries carry the reason.
+    #[test]
+    fn no_fixed_size_text_sites_outside_the_allowlist() {
+        let allow: &[(&str, &str)] = &[
+            // This module: the `.size()` builder API itself, doc examples, tests.
+            ("text.rs", "styling layer owns the API"),
+            // Fluid clock digits: size derives from card width × text scale.
+            ("clock.rs", "fluid digit sizes are scale-expressed"),
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in walk(&src) {
+            let name = entry.file_name().unwrap().to_string_lossy().to_string();
+            let rel = entry
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            if allow.iter().any(|(f, _)| *f == name) {
+                continue;
+            }
+            for (i, line) in std::fs::read_to_string(&entry).unwrap().lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                // Only flag `.size(<number>)` — the fixed-size text setter —
+                // not geometry reads like `galley.size().x`.
+                if line.contains(".size(")
+                    && line
+                        .split(".size(")
+                        .skip(1)
+                        .any(|rest| rest.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                {
+                    offenders.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "fixed-size text sites bypass the TextStyle presets (add a preset or \
+             allowlist with a reason): {offenders:?}"
+        );
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out.sort();
+        out
     }
 
     #[test]
