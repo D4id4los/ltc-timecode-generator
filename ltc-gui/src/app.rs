@@ -692,7 +692,7 @@ fn transport_button(
         colors,
         style_kind,
         label,
-        crate::text::font(13.0),
+        crate::text::TextStyle::Control.font_spec(),
         egui::vec2(width, 32.0),
         true,
     )
@@ -888,7 +888,7 @@ impl AppState {
                     &colors,
                     widgets::style::ActionStyle::Muted,
                     "?",
-                    crate::text::font(12.0),
+                    crate::text::TextStyle::Control.font_spec(),
                     egui::vec2(24.0, 24.0),
                     true,
                 )
@@ -906,7 +906,7 @@ impl AppState {
                     &colors,
                     widgets::style::ActionStyle::Muted,
                     icon,
-                    crate::text::font(12.0),
+                    crate::text::TextStyle::Control.font_spec(),
                     egui::vec2(24.0, 24.0),
                     true,
                 )
@@ -1138,7 +1138,7 @@ impl AppState {
                     text_pos,
                     egui::Align2::LEFT_TOP,
                     &toast.message,
-                    crate::text::font(14.0).font_id(),
+                    crate::text::TextStyle::Control.font_spec().font_id(),
                     text_c,
                 );
 

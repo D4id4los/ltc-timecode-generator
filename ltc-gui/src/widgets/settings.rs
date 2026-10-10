@@ -65,9 +65,9 @@ fn render_text_scale(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         for &percent in gui_engine::state::TEXT_SCALE_OPTIONS {
             let font = if percent == selected {
-                crate::text::font(12.0).bold()
+                crate::text::TextStyle::Control.font_spec().bold()
             } else {
-                crate::text::font(12.0)
+                crate::text::TextStyle::Control.font_spec()
             };
             if style::option_chip(
                 ui,
@@ -282,7 +282,7 @@ fn sample_rate_button(ui: &mut Ui, state: &mut AppState, selected_rate: u32, rat
         ui,
         &colors,
         &format!("{} Hz", rate),
-        crate::text::font(12.0),
+        crate::text::TextStyle::Control.font_spec(),
         is_selected,
         true,
         Vec2::ZERO,
@@ -506,7 +506,7 @@ fn channel_button(
         ui,
         &colors,
         lbl,
-        crate::text::font(12.0),
+        crate::text::TextStyle::Control.font_spec(),
         selected == val,
         true,
         Vec2::ZERO,

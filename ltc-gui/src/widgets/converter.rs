@@ -764,7 +764,7 @@ fn render_fps_detect_row(
                 colors,
                 style::ActionStyle::Primary,
                 "🔍 Detect LTC All Clips",
-                crate::text::font(11.0),
+                crate::text::TextStyle::Control.font_spec(),
                 egui::vec2(140.0, 24.0),
                 true,
             )
@@ -791,7 +791,7 @@ fn render_fps_detect_row(
                 colors,
                 style::ActionStyle::Primary,
                 "🔍 Detect LTC",
-                crate::text::font(11.0),
+                crate::text::TextStyle::Control.font_spec(),
                 egui::vec2(100.0, 24.0),
                 true,
             )
@@ -2471,7 +2471,7 @@ fn render_naming_template_rows(
             &truth,
             |v| GuiCommand::Converter(ConverterCommand::SetOutputFolder(v)),
             move |edit| {
-                edit.font(crate::text::font(10.0).mono().font_id())
+                edit.font(crate::text::TextStyle::MonoLabel.font_spec().font_id())
                     .desired_width(folder_width)
             },
         );
@@ -2659,7 +2659,7 @@ fn render_convert_button(
             &colors,
             style::ActionStyle::Danger,
             "■ CANCEL CONVERSION",
-            crate::text::font(13.0),
+            crate::text::TextStyle::Control.font_spec(),
             egui::vec2(ui.available_width(), 42.0),
             true,
         )
@@ -2710,7 +2710,7 @@ fn render_convert_button(
             &colors,
             style::ActionStyle::Primary,
             button_label,
-            crate::text::font(13.0),
+            crate::text::TextStyle::Control.font_spec(),
             egui::vec2(ui.available_width(), 42.0),
             can_convert && sanity_ok,
         )

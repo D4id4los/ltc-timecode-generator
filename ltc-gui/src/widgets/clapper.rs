@@ -66,7 +66,7 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
             &colors,
             super::style::ActionStyle::Primary,
             "CLAP & BEEP",
-            crate::text::font(13.0),
+            crate::text::TextStyle::Control.font_spec(),
             egui::vec2(ui.available_width(), 44.0),
             true,
         )
@@ -204,7 +204,7 @@ fn render_roll_card(ui: &mut Ui, state: &mut AppState) {
                 &truth,
                 GuiCommand::SetRoll,
                 |edit| {
-                    edit.font(crate::text::font(14.0).mono().font_id())
+                    edit.font(crate::text::TextStyle::MonoLabel.font_spec().font_id())
                         .text_color(colors.text_title)
                         .margin(egui::Margin::symmetric(4, 4))
                 },

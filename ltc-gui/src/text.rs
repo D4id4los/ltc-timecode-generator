@@ -91,6 +91,9 @@ pub enum TextStyle {
     /// Neutral note text (~10 px): hints, errors, warnings, blockers.
     /// Dynamic colors (error/warning/accent) are per-call `.color()`.
     Hint,
+    /// Control labels: action buttons, option chips, badges, toasts.
+    /// Colors come from the widget visuals / per-call overrides.
+    Control,
     /// Clock digits: fluid display text; size and color are per-call.
     Display,
 }
@@ -143,6 +146,7 @@ impl TextStyle {
             TextStyle::MonoHeading => (Some(10.0), false, true, Some(C::Title)),
             TextStyle::StatValue => (Some(10.0), true, false, Some(C::Title)),
             TextStyle::Hint => (Some(10.0), false, false, Some(C::Muted)),
+            TextStyle::Control => (Some(12.0), false, false, None),
             TextStyle::Display => (None, true, true, None),
         };
         TextStyleSpec {
@@ -646,6 +650,7 @@ mod tests {
                     false,
                     Some(colors.text_muted),
                 ),
+                (TextStyle::Control, Some(12.0), false, false, None),
                 (TextStyle::Display, None, true, true, None),
             ];
             for (preset, size, bold, mono, color) in cases {
@@ -715,6 +720,7 @@ mod tests {
             TextStyle::MonoHeading,
             TextStyle::StatValue,
             TextStyle::Hint,
+            TextStyle::Control,
             TextStyle::Display,
         ] {
             let spec = preset.spec();
@@ -772,14 +778,16 @@ mod tests {
         let _: WidgetText = st("x").mono().into();
     }
 
-    /// Guardrail: explicit `.size(N)` on text never scales with the text
-    /// scale, so every fixed-size text site is a scaling bug waiting to
-    /// happen. All text must resolve through a [`TextStyle`] preset (or a
-    /// documented fluid-size exception). Allowlist entries carry the reason.
+    /// Guardrail: explicit `.size(N)` / `font(N)` on text never scales with
+    /// the text scale, so every fixed-size text site is a scaling bug
+    /// waiting to happen. All text must resolve through a [`TextStyle`]
+    /// preset (or a documented fluid-size exception). Allowlist entries
+    /// carry the reason — they are known debt, not free passes.
     #[test]
     fn no_fixed_size_text_sites_outside_the_allowlist() {
         let allow: &[(&str, &str)] = &[
-            // This module: the `.size()` builder API itself, doc examples, tests.
+            // This module: the `.size()`/`font()` builder API itself, doc
+            // examples, tests.
             ("text.rs", "styling layer owns the API"),
             // Fluid clock digits: size derives from card width × text scale.
             ("clock.rs", "fluid digit sizes are scale-expressed"),
@@ -801,14 +809,17 @@ mod tests {
                 if trimmed.starts_with("//") {
                     continue;
                 }
-                // Only flag `.size(<number>)` — the fixed-size text setter —
-                // not geometry reads like `galley.size().x`.
-                if line.contains(".size(")
-                    && line
-                        .split(".size(")
-                        .skip(1)
-                        .any(|rest| rest.trim_start().starts_with(|c: char| c.is_ascii_digit()))
-                {
+                // Flag the fixed-size text setters — `.size(<number>)` and
+                // `font(<number>)` — not geometry reads like `galley.size().x`
+                // or `galley.size(y)`.
+                let numeric = |pat: &str| {
+                    line.contains(pat)
+                        && line
+                            .split(pat)
+                            .skip(1)
+                            .any(|rest| rest.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                };
+                if numeric(".size(") || numeric("font(") {
                     offenders.push(format!("{rel}:{}", i + 1));
                 }
             }

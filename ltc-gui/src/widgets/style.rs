@@ -418,7 +418,12 @@ pub fn option_card(
 ) -> egui::Response {
     let state = option_state(selected, enabled, false);
     let v = option_visuals(colors, state);
-    let title_galley = galley_for(ui, title, crate::text::font(13.0).mono().bold(), v.text);
+    let title_galley = galley_for(
+        ui,
+        title,
+        crate::text::TextStyle::Control.font_spec().mono().bold(),
+        v.text,
+    );
     let width = ui.available_width();
     // The subtitle wraps at the card's inner width so long descriptions grow
     // the card's height instead of being clipped (card padding is 10 px per
@@ -492,7 +497,7 @@ pub fn step_header(ui: &mut Ui, colors: &ThemeColors, number: &str, label: &str)
             colors,
             BadgeTone::Accent,
             number,
-            crate::text::font(11.0).mono(),
+            crate::text::TextStyle::Control.font_spec().mono(),
         );
         ui.label(
             text(ui, label)

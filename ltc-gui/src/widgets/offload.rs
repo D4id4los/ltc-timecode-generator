@@ -389,7 +389,7 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
                 &colors,
                 style::ActionStyle::Danger,
                 "■ Cancel",
-                crate::text::font(13.0),
+                crate::text::TextStyle::Control.font_spec(),
                 Vec2::new(120.0, 30.0),
                 true,
             )
@@ -402,7 +402,7 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
             &colors,
             style::ActionStyle::Primary,
             "Start Offload",
-            crate::text::font(13.0),
+            crate::text::TextStyle::Control.font_spec(),
             Vec2::new(160.0, 30.0),
             can_start,
         )
