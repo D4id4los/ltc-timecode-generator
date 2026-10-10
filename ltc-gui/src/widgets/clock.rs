@@ -22,8 +22,9 @@ pub fn render(ui: &mut Ui, state: &AppState) {
     let width = ui.available_width();
     // Fluid digit size: grows with the card (whose width tracks the text
     // scale via the content-column cap), so the clock keeps pace when the
-    // rest of the UI scales up.
-    let digit_font_size = (width / 8.0).clamp(24.0, 56.0 * crate::text::text_scale());
+    // rest of the UI scales up. Both clamp bounds are scale-expressed.
+    let scale = crate::text::text_scale();
+    let digit_font_size = (width / 8.0).clamp(24.0 * scale, 56.0 * scale);
     let sep_font_size = digit_font_size;
     let estimated_digit_width = width * 0.7;
 

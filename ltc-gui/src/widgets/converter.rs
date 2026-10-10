@@ -230,7 +230,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                     ui,
                     "No files matching any known pattern were found in this folder.",
                 )
-                .size(10.0)
+                .style(TextStyle::Hint, &colors)
                 .color(colors.error_red),
             );
         }
@@ -241,7 +241,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
                     ui,
                     "No files matching any known pattern were found in this folder.",
                 )
-                .size(10.0)
+                .style(TextStyle::Hint, &colors)
                 .color(colors.error_red),
             );
         } else {
@@ -860,7 +860,6 @@ fn render_group_decode_results(
                                     ui.label(
                                         text(ui, format!("{} {}", header_icon, name))
                                             .style(TextStyle::Status, colors)
-                                            .size(10.0)
                                             .color(header_color),
                                     );
                                     ui.label(
@@ -882,7 +881,7 @@ fn render_group_decode_results(
                             pill_frame.show(ui, |ui| {
                                 ui.label(
                                     text(ui, format!("❌ {}: {}", name, e))
-                                        .size(9.0)
+                                        .style(TextStyle::Hint, colors)
                                         .color(colors.error_red),
                                 );
                             });
@@ -939,7 +938,7 @@ fn render_single_decode_result(
         error_frame.show(ui, |ui| {
             ui.label(
                 text(ui, format!("❌ {}", error))
-                    .size(10.0)
+                    .style(TextStyle::Hint, colors)
                     .color(colors.error_red),
             );
         });
@@ -1090,7 +1089,7 @@ fn render_ltc_result(
             error_frame.show(ui, |ui| {
                 ui.label(
                     text(ui, format!("❌ Detection error: {}", message))
-                        .size(10.0)
+                        .style(TextStyle::Hint, &colors)
                         .color(colors.error_red),
                 );
             });
@@ -1111,7 +1110,6 @@ fn render_ltc_result(
             ui.label(
                 text(ui, format!("{} {}", status_icon, status_text))
                     .style(TextStyle::Status, &colors)
-                    .size(11.0)
                     .color(status_color),
             );
             ui.add_space(4.0);
@@ -1171,8 +1169,7 @@ fn render_result_grid(
         ui.label(text(ui, "Detected rate:").style(TextStyle::Label, colors));
         ui.label(
             text(ui, fps_str)
-                .mono()
-                .size(10.0)
+                .style(TextStyle::MonoReadout, colors)
                 .color(colors.text_title)
                 .bold(),
         );
@@ -1181,8 +1178,7 @@ fn render_result_grid(
         ui.label(text(ui, "Confidence:").style(TextStyle::Label, colors));
         ui.label(
             text(ui, format!("{:.1}%", result.avg_confidence * 100.0))
-                .mono()
-                .size(10.0)
+                .style(TextStyle::MonoReadout, colors)
                 .color(colors.text_title)
                 .bold(),
         );
@@ -1194,8 +1190,7 @@ fn render_result_grid(
                 ui,
                 format!("{} / {}", result.valid_frames, result.total_possible_frames),
             )
-            .mono()
-            .size(10.0)
+            .style(TextStyle::MonoReadout, colors)
             .color(colors.text_title)
             .bold(),
         );
@@ -1204,8 +1199,7 @@ fn render_result_grid(
         ui.label(text(ui, "Timecode range:").style(TextStyle::Label, colors));
         ui.label(
             text(ui, tc_summary)
-                .mono()
-                .size(10.0)
+                .style(TextStyle::MonoReadout, colors)
                 .color(colors.text_title)
                 .bold(),
         );
@@ -1214,8 +1208,7 @@ fn render_result_grid(
         ui.label(text(ui, "Sample rate:").style(TextStyle::Label, colors));
         ui.label(
             text(ui, format!("{} Hz", result.sample_rate))
-                .mono()
-                .size(10.0)
+                .style(TextStyle::MonoReadout, colors)
                 .color(colors.text_title)
                 .bold(),
         );
@@ -1224,8 +1217,7 @@ fn render_result_grid(
         ui.label(text(ui, "Audio duration:").style(TextStyle::Label, colors));
         ui.label(
             text(ui, format!("{:.2}s", result.total_audio_duration_secs))
-                .mono()
-                .size(10.0)
+                .style(TextStyle::MonoReadout, colors)
                 .color(colors.text_title)
                 .bold(),
         );
@@ -1234,8 +1226,7 @@ fn render_result_grid(
         ui.label(text(ui, "Processing time:").style(TextStyle::Label, colors));
         ui.label(
             text(ui, format!("{:.1} ms", result.processing_time_ms))
-                .mono()
-                .size(10.0)
+                .style(TextStyle::MonoReadout, colors)
                 .color(colors.text_title)
                 .bold(),
         );
@@ -1261,11 +1252,15 @@ fn render_quality_badge(
             ui.label(text(ui, "Quality:").style(TextStyle::Description, colors));
             ui.label(
                 text(ui, format!("{:.0}%", q.score * 100.0))
-                    .style(TextStyle::Display, colors)
-                    .size(11.0)
+                    .style(TextStyle::MonoReadout, colors)
+                    .bold()
                     .color(grade_color),
             );
-            ui.label(text(ui, q.grade.as_str()).size(9.0).color(grade_color));
+            ui.label(
+                text(ui, q.grade.as_str())
+                    .style(TextStyle::MonoValue, colors)
+                    .color(grade_color),
+            );
         });
         ui.horizontal(|ui| {
             let issues =
@@ -1275,8 +1270,7 @@ fn render_quality_badge(
                     ui,
                     format!("{:.1}% usable, {}", q.usable_coverage * 100.0, issues),
                 )
-                .style(TextStyle::MonoValue, colors)
-                .size(8.0),
+                .style(TextStyle::MonoValue, colors),
             );
             if q.max_drift_secs > 0.01 {
                 ui.label(
@@ -1284,8 +1278,7 @@ fn render_quality_badge(
                         ui,
                         format!("drift {:.2} frames", q.worst_block_drift_frames),
                     )
-                    .style(TextStyle::MonoValue, colors)
-                    .size(8.0),
+                    .style(TextStyle::MonoValue, colors),
                 );
             }
         });
@@ -1364,11 +1357,7 @@ fn render_debug_details(
     })
     .body(|ui| {
         for detail in &result.details {
-            ui.label(
-                text(ui, detail)
-                    .style(TextStyle::MonoValue, colors)
-                    .size(8.0),
-            );
+            ui.label(text(ui, detail).style(TextStyle::MonoValue, colors));
         }
     });
 }
@@ -1664,7 +1653,11 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
             } else {
                 colors.text_muted
             };
-            ui.label(text(ui, label.to_string()).size(10.0).color(color));
+            ui.label(
+                text(ui, label.to_string())
+                    .style(TextStyle::Hint, &colors)
+                    .color(color),
+            );
         } else {
             let label = ProbeStatusLabel::NoChannels.to_string();
             ui.label(text(ui, label).style(TextStyle::Label, &colors));
@@ -2221,7 +2214,6 @@ fn render_video_format_rows(
     ui.label(
         text(ui, "VIDEO FORMAT")
             .style(TextStyle::Heading, &colors)
-            .size(10.0)
             .color(colors.text_title),
     );
     ui.add_space(4.0);
@@ -2283,7 +2275,6 @@ fn render_audio_format_rows(
     ui.label(
         text(ui, "AUDIO FORMAT")
             .style(TextStyle::Heading, colors)
-            .size(10.0)
             .color(colors.text_title),
     );
     ui.add_space(4.0);
@@ -2320,7 +2311,7 @@ fn render_warning_note(ui: &mut Ui, text: &str, colors: &crate::theme::ThemeColo
     warning_area.show(ui, |ui| {
         ui.label(
             crate::text::text(ui, text)
-                .size(10.0)
+                .style(TextStyle::Hint, colors)
                 .color(colors.warning_amber),
         );
     });
@@ -2375,7 +2366,7 @@ fn render_caps_error_note(
                 if let Some(msg) = &caps.error_message {
                     ui.label(
                         text(ui, format!("✗ {}", msg))
-                            .size(10.0)
+                            .style(TextStyle::Hint, colors)
                             .color(colors.error_red),
                     );
                 }
@@ -2581,8 +2572,7 @@ fn render_output_preview(ui: &mut Ui, state: &mut AppState, colors: &crate::them
                 };
                 ui.label(
                     text(ui, format!("  {} {}", icon, display_name))
-                        .style(TextStyle::MonoValue, colors)
-                        .size(8.5),
+                        .style(TextStyle::MonoValue, colors),
                 );
             }
         }
@@ -2734,14 +2724,14 @@ fn render_convert_button(
         ui.add_space(2.0);
         ui.label(
             text(ui, format_blockers(&readiness.blockers))
-                .size(10.0)
+                .style(TextStyle::Hint, &colors)
                 .color(colors.text_secondary),
         );
     } else if !sanity_ok {
         ui.add_space(2.0);
         ui.label(
             text(ui, "Fix the compatibility issue above before converting.")
-                .size(10.0)
+                .style(TextStyle::Hint, &colors)
                 .color(colors.warning_amber),
         );
     }
@@ -2891,7 +2881,6 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             ui.label(
                 text(ui, "✓ Conversion completed successfully!")
                     .style(TextStyle::Status, &colors)
-                    .size(12.0)
                     .color(colors.success_green),
             );
             ui.add_space(4.0);
@@ -2941,7 +2930,6 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                 ui.label(
                     text(ui, "✗ CONVERSION FAILED")
                         .style(TextStyle::Status, &colors)
-                        .size(12.0)
                         .color(colors.error_red),
                 );
             });
@@ -2978,7 +2966,6 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             ui.label(
                 text(ui, "■ Conversion canceled")
                     .style(TextStyle::Status, &colors)
-                    .size(12.0)
                     .color(colors.warning_amber),
             );
             ui.add_space(4.0);
@@ -3580,6 +3567,10 @@ mod tests {
 
     #[test]
     fn matrix_metrics_gutter_grows_to_fit_measured_row_labels() {
+        // matrix_metrics multiplies by the process-global text scale; pin it
+        // so parallel scale-mutating tests cannot skew the design values.
+        let _lock = crate::text::SCALE_LOCK.lock().unwrap();
+        crate::text::set_text_scale(100);
         run_headless_ui(800.0, |ui| {
             // The design gutter already fits short labels at 100 % scale.
             let short = super::matrix_metrics(ui, &["CH 1".to_string()]);

@@ -102,7 +102,6 @@ fn render_narrow_status(ui: &mut Ui, s: &AppStateSnapshot, colors: &ThemeColors)
         ui.label(
             text(ui, "POWER: AC")
                 .style(TextStyle::MonoValue, colors)
-                .size(9.5)
                 .bold(),
         );
     });

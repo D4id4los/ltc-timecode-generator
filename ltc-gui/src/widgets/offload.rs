@@ -51,11 +51,7 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
     let display = folder_label;
 
     ui.horizontal(|ui| {
-        ui.label(
-            text(ui, "Parent:  ")
-                .style(TextStyle::MonoLabel, &colors)
-                .size(12.0),
-        );
+        ui.label(text(ui, "Parent:  ").style(TextStyle::MonoLabel, &colors));
         // Show current path + Browse button
         let label = if display.is_empty() {
             "Select Folder…".to_string()
@@ -74,7 +70,6 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
         ui.label(
             text(ui, label)
                 .style(TextStyle::MonoLabel, &colors)
-                .size(11.0)
                 .color(colors.text_main),
         );
     });
@@ -84,11 +79,7 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
     // Editable parent name (ISO date) — bound shadow; sends on each change
     // with a non-empty value.
     ui.horizontal(|ui| {
-        ui.label(
-            text(ui, "Subfolder: ")
-                .style(TextStyle::MonoLabel, &colors)
-                .size(12.0),
-        );
+        ui.label(text(ui, "Subfolder: ").style(TextStyle::MonoLabel, &colors));
         let truth = state.latest.offload.parent_name.clone();
         bound::text(
             ui,
@@ -97,7 +88,7 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
             &truth,
             |v| GuiCommand::Offload(OffloadCommand::SetParentName(v)),
             |edit| {
-                edit.font(crate::text::font(14.0).mono().font_id())
+                edit.font(crate::text::TextStyle::MonoLabel.font_spec().font_id())
                     .desired_width(160.0)
             },
         );
@@ -120,8 +111,7 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
                 ui,
                 "No removable media detected. Insert an SD card and click Rescan.",
             )
-            .style(TextStyle::MonoLabel, &colors)
-            .size(11.0),
+            .style(TextStyle::MonoLabel, &colors),
         );
     }
 
@@ -165,8 +155,7 @@ fn render_card(
             ui.horizontal(|ui| {
                 ui.label(
                     text(ui, format!("💾 {}", card.mount.display()))
-                        .style(TextStyle::MonoLabel, &colors)
-                        .size(11.0),
+                        .style(TextStyle::MonoLabel, &colors),
                 );
                 if !card.volume_label.is_empty() && card.volume_label != card.device_name {
                     ui.label(
@@ -186,7 +175,6 @@ fn render_card(
                 ui.label(
                     text(ui, summary)
                         .style(TextStyle::MonoLabel, &colors)
-                        .size(11.0)
                         .color(device_color),
                 );
             });
@@ -234,11 +222,7 @@ fn render_device_name_edit(
     let truth = card.device_name.clone();
     let mount_for_cmd = mount.clone();
     ui.horizontal(|ui| {
-        ui.label(
-            text(ui, "Device folder: ")
-                .style(TextStyle::MonoLabel, &colors)
-                .size(11.0),
-        );
+        ui.label(text(ui, "Device folder: ").style(TextStyle::MonoLabel, &colors));
         bound::text(
             ui,
             state,
@@ -255,7 +239,7 @@ fn render_device_name_edit(
                 ))
             },
             |edit| {
-                edit.font(crate::text::font(14.0).mono().font_id())
+                edit.font(crate::text::TextStyle::MonoLabel.font_spec().font_id())
                     .desired_width(140.0)
             },
         );
@@ -353,7 +337,6 @@ fn render_file_row(
         ui.label(
             text(ui, &file.name)
                 .style(TextStyle::MonoLabel, &colors)
-                .size(11.0)
                 .color(text_main),
         );
 
@@ -468,7 +451,6 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
         ui.label(
             text(ui, format!("Error: {}", err))
                 .style(TextStyle::MonoLabel, &colors)
-                .size(11.0)
                 .color(colors.error_red),
         );
     }
@@ -595,7 +577,6 @@ fn render_device_progress_row(
         ui.label(
             text(ui, format!("{} {}", status_icon, dev_name))
                 .style(TextStyle::MonoLabel, colors)
-                .size(11.0)
                 .color(status_color),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -624,16 +605,11 @@ fn render_completed_devices(
         return;
     }
     ui.add_space(4.0);
-    ui.label(
-        text(ui, "Completed:")
-            .size(12.0)
-            .color(colors.success_green),
-    );
+    ui.label(text(ui, "Completed:").color(colors.success_green));
     for name in &off.completed_devices {
         ui.label(
             text(ui, format!("  ✅ {}", name))
                 .style(TextStyle::MonoLabel, colors)
-                .size(11.0)
                 .color(colors.success_green),
         );
     }

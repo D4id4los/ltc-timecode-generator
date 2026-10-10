@@ -227,10 +227,8 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
             ui.label(text(ui, "SCENE").style(TextStyle::SequenceHeading, &colors));
             ui.label(
                 text(ui, format!("{}", s.clapper.scene))
-                    .mono()
-                    .size(18.0)
-                    .color(colors.text_title)
-                    .bold(),
+                    .style(TextStyle::BigValue, &colors)
+                    .color(colors.text_title),
             );
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -275,10 +273,8 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
             ui.label(text(ui, "TAKE").style(TextStyle::SequenceHeading, &colors));
             ui.label(
                 text(ui, format!("{}", s.clapper.take))
-                    .mono()
-                    .size(18.0)
-                    .color(ACCENT)
-                    .bold(),
+                    .style(TextStyle::BigValue, &colors)
+                    .color(ACCENT),
             );
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -390,8 +386,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             text(ui, "LTC Timecode:")
-                                                .style(TextStyle::Label, &colors)
-                                                .size(10.5),
+                                                .style(TextStyle::Label, &colors),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -407,8 +402,7 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             text(ui, "Milliseconds:")
-                                                .style(TextStyle::Label, &colors)
-                                                .size(10.5),
+                                                .style(TextStyle::Label, &colors),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),

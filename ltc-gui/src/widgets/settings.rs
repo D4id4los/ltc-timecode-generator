@@ -178,13 +178,11 @@ fn stepper_card_col(
             ui.add_space(1.0);
             ui.label(
                 text(ui, format!("{:02}", value))
-                    .mono()
-                    .size(20.0)
-                    .color(colors.text_title)
-                    .bold(),
+                    .style(TextStyle::BigValue, colors)
+                    .color(colors.text_title),
             );
             ui.add_space(1.0);
-            ui.label(text(ui, label).size(7.5).color(colors.text_muted).bold());
+            ui.label(text(ui, label).style(TextStyle::Caption, colors));
             ui.add_space(1.0);
             if ui
                 .button(
@@ -358,8 +356,7 @@ fn render_device_combo(ui: &mut Ui, state: &mut AppState) {
     if device_names.is_empty() {
         ui.label(
             text(ui, "No devices found — using default output")
-                .style(TextStyle::MonoLabel, &colors)
-                .size(12.0),
+                .style(TextStyle::MonoLabel, &colors),
         );
     } else {
         let selected = state.sh.selected_device.value().clone();
@@ -400,8 +397,7 @@ fn render_device_info_note(ui: &mut Ui, colors: &crate::theme::ThemeColors) {
                     ui,
                     "Sends SMPTE Linear Timecode audio to mixers, USB-DAC, or sync adapters.",
                 )
-                .style(TextStyle::Description, colors)
-                .size(10.0),
+                .style(TextStyle::Hint, colors),
             );
         });
     });
@@ -553,7 +549,10 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
         // Calibrated level presets (safe-hot reference levels for camera
         // feeds); each sends the equivalent UI volume through SetLtcVolume.
         for &(label, dbfs) in &[("-18", -18.0f32), ("-12", -12.0), ("-6", -6.0)] {
-            if ui.small_button(text(ui, label).mono().size(9.0)).clicked() {
+            if ui
+                .small_button(text(ui, label).style(TextStyle::MonoReadout, &colors))
+                .clicked()
+            {
                 let v = gui_engine::dbfs_to_ui_volume(dbfs);
                 bound::set_value(state, |s| &mut s.sh.ltc_volume, v, GuiCommand::SetLtcVolume);
             }
