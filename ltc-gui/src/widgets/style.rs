@@ -19,7 +19,8 @@
 //! filled builders here are custom-painted from `Response::hovered()` /
 //! `is_pointer_button_down_on()` (both known before painting).
 
-use egui::{Color32, FontId, RichText, Sense, Stroke, TextWrapMode, Ui, Vec2};
+use crate::text::{text, FontSpec};
+use egui::{Color32, Sense, Stroke, TextWrapMode, Ui, Vec2};
 
 use crate::theme::{ThemeColors, ACCENT};
 
@@ -262,13 +263,10 @@ pub fn nested_frame(colors: &ThemeColors, margin: impl Into<egui::Margin>) -> eg
 fn galley_for(
     ui: &Ui,
     label: &str,
-    font: FontId,
+    font: FontSpec,
     color: Color32,
-    strong: bool,
 ) -> std::sync::Arc<egui::Galley> {
-    let rich = RichText::new(label).font(font).color(color);
-    let rich = if strong { rich.strong() } else { rich };
-    egui::WidgetText::from(rich).into_galley(
+    egui::WidgetText::from(font.with(label).color(color)).into_galley(
         ui,
         Some(TextWrapMode::Extend),
         f32::INFINITY,
@@ -318,12 +316,12 @@ pub fn action_button(
     colors: &ThemeColors,
     style: ActionStyle,
     label: &str,
-    font: FontId,
+    font: FontSpec,
     min_size: Vec2,
     enabled: bool,
 ) -> egui::Response {
     let text = filled_action_visuals(colors, style, false, false, enabled).text;
-    let galley = galley_for(ui, label, font, text, true);
+    let galley = galley_for(ui, label, font.bold(), text);
     let pad = ui.style().spacing.button_padding;
     let desired = Vec2::new(
         (galley.size().x + 2.0 * pad.x).max(min_size.x),
@@ -356,14 +354,15 @@ pub fn option_chip(
     ui: &mut Ui,
     colors: &ThemeColors,
     label: &str,
-    font: FontId,
+    font: FontSpec,
     selected: bool,
     enabled: bool,
     min_size: Vec2,
 ) -> egui::Response {
     let state = option_state(selected, enabled, false);
     let v = option_visuals(colors, state);
-    let galley = galley_for(ui, label, font, v.text, v.strong);
+    let font = if v.strong { font.bold() } else { font };
+    let galley = galley_for(ui, label, font, v.text);
     let pad = ui.style().spacing.button_padding;
     let desired = Vec2::new(
         (galley.size().x + 2.0 * pad.x).max(min_size.x),
@@ -401,14 +400,8 @@ pub fn option_card(
 ) -> egui::Response {
     let state = option_state(selected, enabled, false);
     let v = option_visuals(colors, state);
-    let title_galley = galley_for(ui, title, FontId::monospace(13.0), v.text, true);
-    let subtitle_galley = galley_for(
-        ui,
-        subtitle,
-        FontId::proportional(9.0),
-        colors.text_muted,
-        false,
-    );
+    let title_galley = galley_for(ui, title, crate::text::font(13.0).mono().bold(), v.text);
+    let subtitle_galley = galley_for(ui, subtitle, crate::text::font(9.0), colors.text_muted);
     let width = ui.available_width();
     let height = 60.0_f32.max(title_galley.size().y + subtitle_galley.size().y + 20.0);
     let sense = if state == OptionState::Idle {
@@ -447,10 +440,10 @@ pub fn static_badge(
     colors: &ThemeColors,
     tone: BadgeTone,
     text: &str,
-    font: FontId,
+    font: FontSpec,
 ) -> egui::Response {
     let (fill, stroke, text_color) = badge_colors(colors, tone);
-    let galley = galley_for(ui, text, font, text_color, false);
+    let galley = galley_for(ui, text, font, text_color);
     let margin = egui::Margin::symmetric(8, 4);
     let desired = Vec2::new(
         galley.size().x + f32::from(margin.left) + f32::from(margin.right),
@@ -471,14 +464,9 @@ pub fn step_header(ui: &mut Ui, colors: &ThemeColors, number: &str, label: &str)
             colors,
             BadgeTone::Accent,
             number,
-            FontId::monospace(11.0),
+            crate::text::font(11.0).mono(),
         );
-        ui.label(
-            RichText::new(label)
-                .font(FontId::proportional(12.0))
-                .color(colors.text_title)
-                .strong(),
-        );
+        ui.label(text(ui, label).size(12.0).color(colors.text_title).bold());
     });
 }
 

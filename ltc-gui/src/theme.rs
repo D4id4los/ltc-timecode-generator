@@ -1,8 +1,134 @@
-use egui::{Color32, Stroke, Vec2, Visuals};
+use egui::{Color32, FontData, FontFamily, Stroke, Vec2, Visuals};
 use gui_engine::theme::{self, Rgb};
+use std::sync::Arc;
 
 fn to_color32(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.0, rgb.1, rgb.2)
+}
+
+/// Font-family names registered by [`install_fonts`]; [`crate::text`] resolves
+/// (weight, slant, mono) combos onto these. Functions because
+/// `FontFamily::Name` is not const-constructible.
+pub mod families {
+    use super::FontFamily;
+
+    pub fn regular() -> FontFamily {
+        FontFamily::Name("app-regular".into())
+    }
+    pub fn bold() -> FontFamily {
+        FontFamily::Name("app-bold".into())
+    }
+    pub fn italic() -> FontFamily {
+        FontFamily::Name("app-italic".into())
+    }
+    pub fn bold_italic() -> FontFamily {
+        FontFamily::Name("app-bold-italic".into())
+    }
+    pub fn mono() -> FontFamily {
+        FontFamily::Name("app-mono".into())
+    }
+    pub fn mono_bold() -> FontFamily {
+        FontFamily::Name("app-mono-bold".into())
+    }
+    pub fn mono_italic() -> FontFamily {
+        FontFamily::Name("app-mono-italic".into())
+    }
+}
+
+/// Register the Roboto faces and expose them as named font families so
+/// regular/bold/italic/monospace are all explicitly selectable (egui has no
+/// font-weight concept). The egui defaults stay in every list as glyph
+/// fallbacks so emoji etc. keep rendering.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    macro_rules! face {
+        ($key:literal, $path:literal) => {
+            fonts.font_data.insert(
+                $key.to_owned(),
+                Arc::new(FontData::from_owned(include_bytes!($path).to_vec())),
+            );
+        };
+    }
+    face!("roboto_regular", "../../assets/Roboto-Regular.ttf");
+    face!("roboto_bold", "../../assets/Roboto-Bold.ttf");
+    face!("roboto_italic", "../../assets/Roboto-Italic.ttf");
+    face!("roboto_bold_italic", "../../assets/Roboto-BoldItalic.ttf");
+    face!(
+        "nerd_mono_regular",
+        "../../assets/RobotoMonoNerdFontMono-Regular.ttf"
+    );
+    face!(
+        "nerd_mono_bold",
+        "../../assets/RobotoMonoNerdFontMono-Bold.ttf"
+    );
+    face!(
+        "nerd_mono_italic",
+        "../../assets/RobotoMonoNerdFontMono-Italic.ttf"
+    );
+
+    let default_prop = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let default_mono = fonts
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    let prop_fallback = |names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .map(|n| (*n).to_owned())
+            .chain(default_prop.iter().cloned())
+            .collect()
+    };
+    let mono_fallback = |names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .map(|n| (*n).to_owned())
+            .chain(default_mono.iter().cloned())
+            .collect()
+    };
+
+    fonts.families.insert(
+        families::regular(),
+        prop_fallback(&["roboto_regular", "roboto_bold"]),
+    );
+    fonts
+        .families
+        .insert(families::bold(), prop_fallback(&["roboto_bold"]));
+    fonts
+        .families
+        .insert(families::italic(), prop_fallback(&["roboto_italic"]));
+    fonts.families.insert(
+        families::bold_italic(),
+        prop_fallback(&["roboto_bold_italic"]),
+    );
+    fonts.families.insert(
+        families::mono(),
+        mono_fallback(&["nerd_mono_regular", "nerd_mono_bold"]),
+    );
+    fonts.families.insert(
+        families::mono_bold(),
+        mono_fallback(&["nerd_mono_bold", "nerd_mono_regular"]),
+    );
+    fonts.families.insert(
+        families::mono_italic(),
+        mono_fallback(&["nerd_mono_italic", "nerd_mono_regular"]),
+    );
+
+    if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
+        family.insert(0, "roboto_regular".to_owned());
+        family.insert(1, "roboto_bold".to_owned());
+    }
+    if let Some(family) = fonts.families.get_mut(&FontFamily::Monospace) {
+        family.insert(0, "nerd_mono_regular".to_owned());
+        family.insert(1, "nerd_mono_bold".to_owned());
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 /// Accent color used for highlights, active buttons, clock digits glow.

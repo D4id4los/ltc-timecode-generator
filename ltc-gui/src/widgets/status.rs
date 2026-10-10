@@ -1,4 +1,5 @@
-use egui::{Color32, FontId, RichText, Ui};
+use crate::text::text;
+use egui::{Color32, Ui};
 use gui_engine::state::AppStateSnapshot;
 
 use crate::app::AppState;
@@ -71,10 +72,11 @@ fn render_wide_status(ui: &mut Ui, s: &AppStateSnapshot, colors: &ThemeColors) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                RichText::new("POWER: AC")
-                    .font(FontId::monospace(10.0))
+                text(ui, "POWER: AC")
+                    .mono()
+                    .size(10.0)
                     .color(colors.text_muted)
-                    .strong(),
+                    .bold(),
             );
         });
     });
@@ -100,10 +102,11 @@ fn render_narrow_status(ui: &mut Ui, s: &AppStateSnapshot, colors: &ThemeColors)
         });
         ui.add_space(4.0);
         ui.label(
-            RichText::new("POWER: AC")
-                .font(FontId::monospace(9.5))
+            text(ui, "POWER: AC")
+                .mono()
+                .size(9.5)
                 .color(colors.text_muted)
-                .strong(),
+                .bold(),
         );
     });
 }
@@ -114,10 +117,11 @@ fn dot_label(ui: &mut Ui, text: &str, dot_color: Color32, colors: &crate::theme:
         let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(6.0, 6.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 2.5, dot_color);
         ui.label(
-            RichText::new(text)
-                .font(FontId::monospace(10.0))
+            crate::text::text(ui, text)
+                .mono()
+                .size(10.0)
                 .color(colors.text_title)
-                .strong(),
+                .bold(),
         );
     });
 }

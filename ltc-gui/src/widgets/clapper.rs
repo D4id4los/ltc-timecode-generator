@@ -1,4 +1,5 @@
-use egui::{FontId, RichText, Sense, Ui, Vec2};
+use crate::text::text;
+use egui::{Sense, Ui, Vec2};
 use gui_engine::command::GuiCommand;
 use std::time::Instant;
 
@@ -27,10 +28,10 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
     super::style::content_area(ui, &colors, |ui| {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("SMART CLAPPER SLATE")
-                    .font(FontId::proportional(11.0))
+                text(ui, "SMART CLAPPER SLATE")
+                    .size(11.0)
                     .color(colors.text_muted)
-                    .strong(),
+                    .bold(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let truth = state.latest.clapper.auto_increment_take;
@@ -70,7 +71,7 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
             &colors,
             super::style::ActionStyle::Primary,
             "CLAP & BEEP",
-            FontId::proportional(13.0),
+            crate::text::font(13.0),
             egui::vec2(ui.available_width(), 44.0),
             true,
         )
@@ -198,12 +199,7 @@ fn render_roll_card(ui: &mut Ui, state: &mut AppState) {
     card.show(ui, |ui| {
         ui.set_min_height(76.0);
         ui.vertical_centered(|ui| {
-            ui.label(
-                RichText::new("ROLL")
-                    .font(FontId::proportional(9.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
+            ui.label(text(ui, "ROLL").size(9.0).color(colors.text_muted).bold());
             ui.add_space(4.0);
             let truth = state.latest.clapper.roll.clone();
             bound::text(
@@ -213,7 +209,7 @@ fn render_roll_card(ui: &mut Ui, state: &mut AppState) {
                 &truth,
                 GuiCommand::SetRoll,
                 |edit| {
-                    edit.font(FontId::monospace(14.0))
+                    edit.font(crate::text::font(14.0).mono().font_id())
                         .text_color(colors.text_title)
                         .margin(egui::Margin::symmetric(4, 4))
                 },
@@ -233,26 +229,36 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
     card.show(ui, |ui| {
         ui.set_min_height(76.0);
         ui.vertical_centered(|ui| {
+            ui.label(text(ui, "SCENE").size(9.0).color(colors.text_muted).bold());
             ui.label(
-                RichText::new("SCENE")
-                    .font(FontId::proportional(9.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
-            ui.label(
-                RichText::new(format!("{}", s.clapper.scene))
-                    .font(FontId::monospace(18.0))
+                text(ui, format!("{}", s.clapper.scene))
+                    .mono()
+                    .size(18.0)
                     .color(colors.text_title)
-                    .strong(),
+                    .bold(),
             );
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 0.0);
                 ui.add_space((ui.available_width() - 44.0) / 2.0);
-                if ui.button(RichText::new("-").strong()).clicked() {
+                if ui
+                    .button(
+                        text(ui, "-")
+                            .bold()
+                            .color(ui.style().visuals.strong_text_color()),
+                    )
+                    .clicked()
+                {
                     state.send(GuiCommand::SceneDown);
                 }
-                if ui.button(RichText::new("+").strong()).clicked() {
+                if ui
+                    .button(
+                        text(ui, "+")
+                            .bold()
+                            .color(ui.style().visuals.strong_text_color()),
+                    )
+                    .clicked()
+                {
                     state.send(GuiCommand::SceneUp);
                 }
             });
@@ -271,26 +277,36 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
     card.show(ui, |ui| {
         ui.set_min_height(76.0);
         ui.vertical_centered(|ui| {
+            ui.label(text(ui, "TAKE").size(9.0).color(colors.text_muted).bold());
             ui.label(
-                RichText::new("TAKE")
-                    .font(FontId::proportional(9.0))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
-            ui.label(
-                RichText::new(format!("{}", s.clapper.take))
-                    .font(FontId::monospace(18.0))
+                text(ui, format!("{}", s.clapper.take))
+                    .mono()
+                    .size(18.0)
                     .color(ACCENT)
-                    .strong(),
+                    .bold(),
             );
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 0.0);
                 ui.add_space((ui.available_width() - 44.0) / 2.0);
-                if ui.button(RichText::new("-").strong()).clicked() {
+                if ui
+                    .button(
+                        text(ui, "-")
+                            .bold()
+                            .color(ui.style().visuals.strong_text_color()),
+                    )
+                    .clicked()
+                {
                     state.send(GuiCommand::TakeDown);
                 }
-                if ui.button(RichText::new("+").strong()).clicked() {
+                if ui
+                    .button(
+                        text(ui, "+")
+                            .bold()
+                            .color(ui.style().visuals.strong_text_color()),
+                    )
+                    .clicked()
+                {
                     state.send(GuiCommand::TakeUp);
                 }
             });
@@ -304,10 +320,10 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
     super::style::content_area(ui, &colors, |ui| {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("SYNCHRONIZATION LOGS")
-                    .font(FontId::proportional(11.0))
+                text(ui, "SYNCHRONIZATION LOGS")
+                    .size(11.0)
                     .color(colors.text_muted)
-                    .strong(),
+                    .bold(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Clear").clicked() {
@@ -346,13 +362,13 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
                             ui.label(
-                                RichText::new("No clapper marks recorded yet.")
+                                text(ui, "No clapper marks recorded yet.")
                                     .color(colors.text_muted)
-                                    .strong(),
+                                    .bold(),
                             );
                             ui.label(
-                                RichText::new("Tap CLAP & BEEP to capture markings.")
-                                    .font(FontId::proportional(10.0))
+                                text(ui, "Tap CLAP & BEEP to capture markings.")
+                                    .size(10.0)
                                     .color(colors.text_muted),
                             );
                         });
@@ -366,13 +382,13 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                             item_frame.show(ui, |ui| {
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(RichText::new(&log.note).strong().color(ACCENT));
+                                        ui.label(text(ui, &log.note).bold().color(ACCENT));
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 ui.label(
-                                                    RichText::new(&log.timestamp)
-                                                        .font(FontId::proportional(10.0))
+                                                    text(ui, &log.timestamp)
+                                                        .size(10.0)
                                                         .color(colors.text_muted),
                                                 );
                                             },
@@ -381,16 +397,16 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                                     ui.add_space(4.0);
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new("LTC Timecode:")
+                                            text(ui, "LTC Timecode:")
                                                 .color(colors.text_muted)
-                                                .font(FontId::proportional(10.5)),
+                                                .size(10.5),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 ui.label(
-                                                    RichText::new(&log.timecode)
-                                                        .strong()
+                                                    text(ui, &log.timecode)
+                                                        .bold()
                                                         .color(colors.text_title),
                                                 );
                                             },
@@ -398,16 +414,16 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
                                     });
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new("Milliseconds:")
+                                            text(ui, "Milliseconds:")
                                                 .color(colors.text_muted)
-                                                .font(FontId::proportional(10.5)),
+                                                .size(10.5),
                                         );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 ui.label(
-                                                    RichText::new(&log.milliseconds)
-                                                        .strong()
+                                                    text(ui, &log.milliseconds)
+                                                        .bold()
                                                         .color(ACCENT),
                                                 );
                                             },

@@ -1,7 +1,8 @@
+use crate::text::text;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use egui::{Color32, FontId, RichText, Ui, Vec2};
+use egui::{Color32, Ui, Vec2};
 use gui_engine::command::{GuiCommand, OffloadCommand};
 use gui_engine::duration::format_duration_secs;
 use gui_engine::state::AppStateSnapshot;
@@ -16,17 +17,17 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
     let _s = &state.latest;
 
     style::content_area(ui, &colors, |ui| {
-        step_header(ui, "1", "SELECT PARENT FOLDER", &colors);
+        step_header(ui, "1", "SELECT PARENT FOLDER:", &colors);
 
         render_parent_selection(ui, state);
 
         ui.add_space(12.0);
-        step_header(ui, "2", "DETECTED MEDIA CARDS", &colors);
+        step_header(ui, "2", "DETECTED MEDIA CARDS:", &colors);
 
         render_cards(ui, state);
 
         ui.add_space(12.0);
-        step_header(ui, "3", "COPY FILES", &colors);
+        step_header(ui, "3", "COPY FILES:", &colors);
 
         render_offload_actions(ui, state);
         render_progress(ui, state);
@@ -51,8 +52,9 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
 
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("Parent:  ")
-                .font(FontId::monospace(12.0))
+            text(ui, "Parent:  ")
+                .mono()
+                .size(12.0)
                 .color(colors.text_muted),
         );
         // Show current path + Browse button
@@ -70,11 +72,7 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
                 state.send(GuiCommand::Offload(OffloadCommand::SetParentFolder(path)));
             }
         }
-        ui.label(
-            RichText::new(label)
-                .font(FontId::monospace(11.0))
-                .color(colors.text_main),
-        );
+        ui.label(text(ui, label).mono().size(11.0).color(colors.text_main));
     });
 
     ui.add_space(4.0);
@@ -83,8 +81,9 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
     // with a non-empty value.
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("Subfolder: ")
-                .font(FontId::monospace(12.0))
+            text(ui, "Subfolder: ")
+                .mono()
+                .size(12.0)
                 .color(colors.text_muted),
         );
         let truth = state.latest.offload.parent_name.clone();
@@ -94,11 +93,15 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
             |s| &mut s.sh.parent_name,
             &truth,
             |v| GuiCommand::Offload(OffloadCommand::SetParentName(v)),
-            |edit| edit.font(FontId::monospace(14.0)).desired_width(160.0),
+            |edit| {
+                edit.font(crate::text::font(14.0).mono().font_id())
+                    .desired_width(160.0)
+            },
         );
         ui.label(
-            RichText::new("(date subfolder)")
-                .font(FontId::monospace(10.0))
+            text(ui, "(date subfolder)")
+                .mono()
+                .size(10.0)
                 .color(colors.text_muted),
         );
     });
@@ -113,22 +116,26 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
     let off = &s.offload;
     let scanning = s.job(JobKind::OffloadScan).is_active();
 
-    render_rescan_row(ui, state, &s);
-
-    ui.add_space(4.0);
-
     if off.cards.is_empty() && !scanning {
         ui.label(
-            RichText::new("No removable media detected. Insert an SD card and click Rescan.")
-                .font(FontId::monospace(11.0))
-                .color(colors.text_muted),
+            text(
+                ui,
+                "No removable media detected. Insert an SD card and click Rescan.",
+            )
+            .mono()
+            .size(11.0)
+            .color(colors.text_muted),
         );
     }
+
+    ui.add_space(4.0);
 
     for (idx, card) in off.cards.iter().enumerate() {
         render_card(ui, state, idx, card, &off.file_durations);
         ui.add_space(4.0);
     }
+
+    render_rescan_row(ui, state, &s);
 }
 
 /// Rescan button + active-scan spinner row.
@@ -160,14 +167,16 @@ fn render_card(
         style::nested_frame(&colors, egui::Margin::symmetric(8, 6)).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("💾 {}", card.mount.display()))
-                        .font(FontId::monospace(11.0))
+                    text(ui, format!("💾 {}", card.mount.display()))
+                        .mono()
+                        .size(11.0)
                         .color(colors.text_muted),
                 );
                 if !card.volume_label.is_empty() && card.volume_label != card.device_name {
                     ui.label(
-                        RichText::new(format!("({})", card.volume_label))
-                            .font(FontId::monospace(10.0))
+                        text(ui, format!("({})", card.volume_label))
+                            .mono()
+                            .size(10.0)
                             .color(colors.text_muted),
                     );
                 }
@@ -180,11 +189,7 @@ fn render_card(
             // File count summary (now with selection info).
             ui.horizontal(|ui| {
                 let summary = selection_summary(card);
-                ui.label(
-                    RichText::new(summary)
-                        .font(FontId::monospace(11.0))
-                        .color(device_color),
-                );
+                ui.label(text(ui, summary).mono().size(11.0).color(device_color));
             });
 
             // ── File selection list ──
@@ -231,8 +236,9 @@ fn render_device_name_edit(
     let mount_for_cmd = mount.clone();
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("Device folder: ")
-                .font(FontId::monospace(11.0))
+            text(ui, "Device folder: ")
+                .mono()
+                .size(11.0)
                 .color(colors.text_muted),
         );
         bound::text(
@@ -250,7 +256,10 @@ fn render_device_name_edit(
                     v,
                 ))
             },
-            |edit| edit.font(FontId::monospace(14.0)).desired_width(140.0),
+            |edit| {
+                edit.font(crate::text::font(14.0).mono().font_id())
+                    .desired_width(140.0)
+            },
         );
     });
 }
@@ -292,24 +301,22 @@ fn render_bulk_select_buttons(ui: &mut Ui, state: &mut AppState, idx: usize) {
 fn render_file_column_headers(ui: &mut Ui, colors: &ThemeColors) {
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
-            RichText::new("File")
-                .font(FontId::monospace(10.0))
-                .color(colors.text_muted),
+            text(ui, "File").mono().size(10.0).color(colors.text_muted),
         ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(egui::Label::new(
-                RichText::new("Size")
-                    .font(FontId::monospace(10.0))
+                text(ui, "Size").mono().size(10.0).color(colors.text_muted),
+            ));
+            ui.add(egui::Label::new(
+                text(ui, "Length  ")
+                    .mono()
+                    .size(10.0)
                     .color(colors.text_muted),
             ));
             ui.add(egui::Label::new(
-                RichText::new("Length  ")
-                    .font(FontId::monospace(10.0))
-                    .color(colors.text_muted),
-            ));
-            ui.add(egui::Label::new(
-                RichText::new("Date           ")
-                    .font(FontId::monospace(10.0))
+                text(ui, "Date           ")
+                    .mono()
+                    .size(10.0)
                     .color(colors.text_muted),
             ));
         });
@@ -351,11 +358,7 @@ fn render_file_row(
         );
 
         // Filename
-        ui.label(
-            RichText::new(&file.name)
-                .font(FontId::monospace(11.0))
-                .color(text_main),
-        );
+        ui.label(text(ui, &file.name).mono().size(11.0).color(text_main));
 
         // Date, duration, size — right-aligned
         let date_str = file
@@ -366,19 +369,17 @@ fn render_file_row(
         let size_str = format_bytes(file.size_bytes);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(text(ui, size_str).mono().size(10.0).color(text_muted));
             ui.label(
-                RichText::new(size_str)
-                    .font(FontId::monospace(10.0))
+                text(ui, format!("  {}", dur_str))
+                    .mono()
+                    .size(10.0)
                     .color(text_muted),
             );
             ui.label(
-                RichText::new(format!("  {}", dur_str))
-                    .font(FontId::monospace(10.0))
-                    .color(text_muted),
-            );
-            ui.label(
-                RichText::new(format!("  {}", date_str))
-                    .font(FontId::monospace(10.0))
+                text(ui, format!("  {}", date_str))
+                    .mono()
+                    .size(10.0)
                     .color(text_muted),
             );
         });
@@ -418,7 +419,7 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
                 &colors,
                 style::ActionStyle::Danger,
                 "■ Cancel",
-                egui::FontId::proportional(13.0),
+                crate::text::font(13.0),
                 Vec2::new(120.0, 30.0),
                 true,
             )
@@ -431,7 +432,7 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
             &colors,
             style::ActionStyle::Primary,
             "Start Offload",
-            egui::FontId::proportional(13.0),
+            crate::text::font(13.0),
             Vec2::new(160.0, 30.0),
             can_start,
         )
@@ -478,8 +479,9 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
     // Error message.
     if let Some(ref err) = off.error {
         ui.label(
-            RichText::new(format!("Error: {}", err))
-                .font(FontId::monospace(11.0))
+            text(ui, format!("Error: {}", err))
+                .mono()
+                .size(11.0)
                 .color(colors.error_red),
         );
     }
@@ -508,23 +510,23 @@ fn render_overall_progress(
     };
     ui.horizontal(|ui| {
         if !speed_text.is_empty() {
-            ui.label(
-                RichText::new(&speed_text)
-                    .font(FontId::monospace(10.0))
-                    .color(ACCENT),
-            );
+            ui.label(text(ui, &speed_text).mono().size(10.0).color(ACCENT));
         }
         if copy_running {
             let (done_bytes, total_bytes) = copy_byte_totals(units, device_totals);
             if total_bytes > 0 {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format!(
-                            "{} / {}",
-                            format_bytes(done_bytes),
-                            format_bytes(total_bytes)
-                        ))
-                        .font(FontId::monospace(10.0))
+                        text(
+                            ui,
+                            format!(
+                                "{} / {}",
+                                format_bytes(done_bytes),
+                                format_bytes(total_bytes)
+                            ),
+                        )
+                        .mono()
+                        .size(10.0)
                         .color(colors.text_muted),
                     );
                 });
@@ -603,17 +605,14 @@ fn render_device_progress_row(
     let (status_icon, status_color) = unit_state_icon(unit.state, colors);
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(format!("{} {}", status_icon, dev_name))
-                .font(FontId::monospace(11.0))
+            text(ui, format!("{} {}", status_icon, dev_name))
+                .mono()
+                .size(11.0)
                 .color(status_color),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let bytes_str = device_progress_text(unit, totals);
-            ui.label(
-                RichText::new(bytes_str)
-                    .font(FontId::monospace(10.0))
-                    .color(text_muted),
-            );
+            ui.label(text(ui, bytes_str).mono().size(10.0).color(text_muted));
         });
     });
     if files_total > 0 || bytes_total > 0 {
@@ -623,8 +622,9 @@ fn render_device_progress_row(
     if let UnitState::Running = unit.state {
         if !unit.message.is_empty() {
             ui.label(
-                RichText::new(format!("  {}", unit.message))
-                    .font(FontId::monospace(9.0))
+                text(ui, format!("  {}", unit.message))
+                    .mono()
+                    .size(9.0)
                     .color(colors.text_muted),
             );
         }
@@ -642,14 +642,15 @@ fn render_completed_devices(
     }
     ui.add_space(4.0);
     ui.label(
-        RichText::new("Completed:")
-            .font(FontId::proportional(12.0))
+        text(ui, "Completed:")
+            .size(12.0)
             .color(colors.success_green),
     );
     for name in &off.completed_devices {
         ui.label(
-            RichText::new(format!("  ✅ {}", name))
-                .font(FontId::monospace(11.0))
+            text(ui, format!("  ✅ {}", name))
+                .mono()
+                .size(11.0)
                 .color(colors.success_green),
         );
     }

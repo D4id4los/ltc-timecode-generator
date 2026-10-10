@@ -4,6 +4,7 @@ mod app;
 mod clap_anim;
 mod ids;
 mod shadows;
+mod text;
 mod theme;
 mod widgets;
 
@@ -38,7 +39,10 @@ fn main() {
             eframe::run_native(
                 "LTC Timecode Generator",
                 options,
-                Box::new(move |_cc| Ok(Box::new(app))),
+                Box::new(move |cc| {
+                    crate::theme::install_fonts(&cc.egui_ctx);
+                    Ok(Box::new(app))
+                }),
             )
             .expect("eframe error");
         }

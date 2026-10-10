@@ -1,4 +1,5 @@
-use egui::{FontId, RichText, Ui};
+use crate::text::text;
+use egui::Ui;
 use gui_engine::timecode;
 
 use crate::app::{centered_horizontal_row, AppState};
@@ -30,72 +31,62 @@ pub fn render(ui: &mut Ui, state: &AppState) {
             centered_horizontal_row(ui, "large_clock_row", estimated_digit_width, |ui| {
                 ui.spacing_mut().item_spacing = egui::Vec2::new(2.0, 0.0);
                 ui.label(
-                    RichText::new(parts[0])
-                        .font(FontId::proportional(digit_font_size))
+                    text(ui, parts[0])
+                        .size(digit_font_size)
                         .color(digit_color)
-                        .strong(),
+                        .bold(),
                 );
                 ui.label(
-                    RichText::new(sep)
-                        .font(FontId::proportional(sep_font_size))
+                    text(ui, sep)
+                        .size(sep_font_size)
                         .color(colors.clock_sep)
-                        .strong(),
+                        .bold(),
                 );
                 ui.label(
-                    RichText::new(parts[1])
-                        .font(FontId::proportional(digit_font_size))
+                    text(ui, parts[1])
+                        .size(digit_font_size)
                         .color(digit_color)
-                        .strong(),
+                        .bold(),
                 );
                 ui.label(
-                    RichText::new(sep)
-                        .font(FontId::proportional(sep_font_size))
+                    text(ui, sep)
+                        .size(sep_font_size)
                         .color(colors.clock_sep)
-                        .strong(),
+                        .bold(),
                 );
                 ui.label(
-                    RichText::new(parts[2])
-                        .font(FontId::proportional(digit_font_size))
+                    text(ui, parts[2])
+                        .size(digit_font_size)
                         .color(digit_color)
-                        .strong(),
+                        .bold(),
                 );
+                ui.label(text(ui, sep).size(sep_font_size).color(ACCENT).bold());
                 ui.label(
-                    RichText::new(sep)
-                        .font(FontId::proportional(sep_font_size))
+                    text(ui, parts[3])
+                        .size(digit_font_size)
                         .color(ACCENT)
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(parts[3])
-                        .font(FontId::proportional(digit_font_size))
-                        .color(ACCENT)
-                        .strong(),
+                        .bold(),
                 );
             });
         } else {
             centered_horizontal_row(ui, "large_clock_fallback", estimated_digit_width, |ui| {
-                ui.label(
-                    RichText::new(&tc_str)
-                        .font(FontId::proportional(digit_font_size))
-                        .color(ACCENT)
-                        .strong(),
-                );
+                ui.label(text(ui, &tc_str).size(digit_font_size).color(ACCENT).bold());
             });
         }
         ui.add_space(4.0);
         centered_horizontal_row(ui, "ms_match_row", 200.0, |ui| {
             ui.spacing_mut().item_spacing = egui::Vec2::new(6.0, 0.0);
             ui.label(
-                RichText::new("MS MATCH:")
-                    .font(FontId::proportional(ms_font_size))
+                text(ui, "MS MATCH:")
+                    .size(ms_font_size)
                     .color(colors.text_muted)
-                    .strong(),
+                    .bold(),
             );
             ui.label(
-                RichText::new(ms_str)
-                    .font(FontId::proportional(ms_font_size))
+                text(ui, ms_str)
+                    .size(ms_font_size)
                     .color(colors.text_title)
-                    .strong(),
+                    .bold(),
             );
         });
     });

@@ -1,7 +1,8 @@
+use crate::text::text;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use egui::{Color32, FontId, RichText, Ui};
+use egui::{Color32, Ui};
 use gui_engine::command::{ConverterCommand, GuiCommand};
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers, conversion_sanity_check,
@@ -223,25 +224,31 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
         // Groups async scan in progress or not yet adopted
         if groups_loading {
             ui.label(
-                RichText::new("Scanning folder for recordings…")
-                    .font(FontId::proportional(10.0))
+                text(ui, "Scanning folder for recordings…")
+                    .size(10.0)
                     .color(colors.text_muted),
             );
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(200));
         } else {
             ui.label(
-                RichText::new("No files matching any known pattern were found in this folder.")
-                    .font(FontId::proportional(10.0))
-                    .color(colors.error_red),
+                text(
+                    ui,
+                    "No files matching any known pattern were found in this folder.",
+                )
+                .size(10.0)
+                .color(colors.error_red),
             );
         }
     } else if let Some(ref groups) = groups_clone {
         if groups.is_empty() {
             ui.label(
-                RichText::new("No files matching any known pattern were found in this folder.")
-                    .font(FontId::proportional(10.0))
-                    .color(colors.error_red),
+                text(
+                    ui,
+                    "No files matching any known pattern were found in this folder.",
+                )
+                .size(10.0)
+                .color(colors.error_red),
             );
         } else {
             render_group_combo(ui, state, groups, &colors);
@@ -258,17 +265,13 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
 /// Folder picker row: read-only display of the scanned folder + Browse dialog.
 fn render_folder_row(ui: &mut Ui, state: &mut AppState, colors: &crate::theme::ThemeColors) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Folder:")
-                .font(FontId::proportional(10.0))
-                .color(colors.text_muted),
-        );
+        ui.label(text(ui, "Folder:").size(10.0).color(colors.text_muted));
         let folder_label = folder_display_label(state.latest.converter.groups_folder.as_deref());
         let mut display = folder_label;
         ui.add_sized(
             egui::vec2(ui.available_width() - 90.0, 20.0),
             egui::TextEdit::singleline(&mut display)
-                .font(FontId::monospace(10.0))
+                .font(crate::text::font(10.0).mono().font_id())
                 .interactive(false),
         );
         if ui.button("Browse…").clicked() {
@@ -306,11 +309,7 @@ fn render_group_combo(
     colors: &crate::theme::ThemeColors,
 ) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Recording:")
-                .font(FontId::proportional(10.0))
-                .color(colors.text_muted),
-        );
+        ui.label(text(ui, "Recording:").size(10.0).color(colors.text_muted));
         let selected_text = state
             .latest
             .converter
@@ -359,11 +358,7 @@ fn render_selected_group_pills(
                     .stroke(egui::Stroke::new(0.5, colors.border_main))
                     .inner_margin(egui::Margin::symmetric(6, 2));
                 pill.show(ui, |ui| {
-                    ui.label(
-                        RichText::new(name)
-                            .font(FontId::monospace(9.0))
-                            .color(colors.text_muted),
-                    );
+                    ui.label(text(ui, name).mono().size(9.0).color(colors.text_muted));
                 });
             }
         });
@@ -501,9 +496,7 @@ fn render_ltc_verification(ui: &mut Ui, state: &mut AppState) {
     let colors = state.theme.colors();
 
     ui.label(
-        RichText::new("Select the track that carries the LTC timecode signal, then click \"Detect LTC\" to verify it can be read successfully.")
-            .font(FontId::proportional(9.0))
-            .color(colors.text_secondary),
+        text(ui, "Select the track that carries the LTC timecode signal, then click \"Detect LTC\" to verify it can be read successfully.").size(9.0).color(colors.text_secondary),
     );
     ui.add_space(6.0);
 
@@ -622,11 +615,7 @@ fn render_track_source_row(
     colors: &crate::theme::ThemeColors,
 ) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Source:")
-                .font(FontId::proportional(10.0))
-                .color(colors.text_muted),
-        );
+        ui.label(text(ui, "Source:").size(10.0).color(colors.text_muted));
 
         let current_label = if is_video {
             let sel = (
@@ -707,18 +696,14 @@ fn render_fps_detect_row(
     bound::sync(state, |s| &mut s.sh.decode_fps_index, decode_fps_truth);
     let decode_fps_sel = *state.sh.decode_fps_index.value();
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("FPS:")
-                .font(FontId::proportional(10.0))
-                .color(colors.text_muted),
-        );
+        ui.label(text(ui, "FPS:").size(10.0).color(colors.text_muted));
         for (i, opt) in FPS_OPTIONS.iter().enumerate() {
             let is_sel = i == decode_fps_sel;
             if style::option_chip(
                 ui,
                 colors,
                 opt.name,
-                FontId::monospace(9.0),
+                crate::text::font(9.0).mono(),
                 is_sel,
                 true,
                 egui::vec2(0.0, 22.0),
@@ -761,8 +746,9 @@ fn render_fps_detect_row(
             );
             ui.add_space(2.0);
             ui.label(
-                RichText::new(&progress_str)
-                    .font(FontId::monospace(9.0))
+                text(ui, &progress_str)
+                    .mono()
+                    .size(9.0)
                     .color(colors.text_muted),
             );
             ui.add_space(4.0);
@@ -771,7 +757,7 @@ fn render_fps_detect_row(
                 colors,
                 style::ActionStyle::Danger,
                 "✕ CANCEL",
-                FontId::proportional(10.0),
+                crate::text::font(10.0),
                 egui::vec2(80.0, 22.0),
                 true,
             )
@@ -787,7 +773,7 @@ fn render_fps_detect_row(
                 colors,
                 style::ActionStyle::Primary,
                 "🔍 Detect LTC All Clips",
-                FontId::proportional(11.0),
+                crate::text::font(11.0),
                 egui::vec2(140.0, 24.0),
                 true,
             )
@@ -814,7 +800,7 @@ fn render_fps_detect_row(
                 colors,
                 style::ActionStyle::Primary,
                 "🔍 Detect LTC",
-                FontId::proportional(11.0),
+                crate::text::font(11.0),
                 egui::vec2(100.0, 24.0),
                 true,
             )
@@ -881,14 +867,14 @@ fn render_group_decode_results(
                             .show_header(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(format!("{} {}", header_icon, name))
-                                            .font(FontId::proportional(10.0))
+                                        text(ui, format!("{} {}", header_icon, name))
+                                            .size(10.0)
                                             .color(header_color)
-                                            .strong(),
+                                            .bold(),
                                     );
                                     ui.label(
-                                        RichText::new(format!("  {}", summary))
-                                            .font(FontId::proportional(9.0))
+                                        text(ui, format!("  {}", summary))
+                                            .size(9.0)
                                             .color(colors.text_muted),
                                     );
                                 });
@@ -905,8 +891,8 @@ fn render_group_decode_results(
                                 .inner_margin(egui::Margin::symmetric(6, 3));
                             pill_frame.show(ui, |ui| {
                                 ui.label(
-                                    RichText::new(format!("❌ {}: {}", name, e))
-                                        .font(FontId::proportional(9.0))
+                                    text(ui, format!("❌ {}: {}", name, e))
+                                        .size(9.0)
                                         .color(colors.error_red),
                                 );
                             });
@@ -920,8 +906,8 @@ fn render_group_decode_results(
                                     .inner_margin(egui::Margin::symmetric(6, 3));
                                 pill_frame.show(ui, |ui| {
                                     ui.label(
-                                        RichText::new(format!("⏳ {}: decoding…", name))
-                                            .font(FontId::proportional(9.0))
+                                        text(ui, format!("⏳ {}: decoding…", name))
+                                            .size(9.0)
                                             .color(colors.text_muted),
                                     );
                                 });
@@ -933,8 +919,8 @@ fn render_group_decode_results(
                                     .inner_margin(egui::Margin::symmetric(6, 3));
                                 pill_frame.show(ui, |ui| {
                                     ui.label(
-                                        RichText::new(format!("❓ {}: no result", name))
-                                            .font(FontId::proportional(9.0))
+                                        text(ui, format!("❓ {}: no result", name))
+                                            .size(9.0)
                                             .color(colors.text_muted),
                                     );
                                 });
@@ -964,8 +950,8 @@ fn render_single_decode_result(
             .inner_margin(egui::Margin::symmetric(10, 6));
         error_frame.show(ui, |ui| {
             ui.label(
-                RichText::new(format!("❌ {}", error))
-                    .font(FontId::proportional(10.0))
+                text(ui, format!("❌ {}", error))
+                    .size(10.0)
                     .color(colors.error_red),
             );
         });
@@ -1115,8 +1101,8 @@ fn render_ltc_result(
                 .inner_margin(egui::Margin::symmetric(10, 6));
             error_frame.show(ui, |ui| {
                 ui.label(
-                    RichText::new(format!("❌ Detection error: {}", message))
-                        .font(FontId::proportional(10.0))
+                    text(ui, format!("❌ Detection error: {}", message))
+                        .size(10.0)
                         .color(colors.error_red),
                 );
             });
@@ -1135,10 +1121,10 @@ fn render_ltc_result(
     result_frame.show(ui, |ui| {
         ui.vertical(|ui| {
             ui.label(
-                RichText::new(format!("{} {}", status_icon, status_text))
-                    .font(FontId::proportional(11.0))
+                text(ui, format!("{} {}", status_icon, status_text))
+                    .size(11.0)
                     .color(status_color)
-                    .strong(),
+                    .bold(),
             );
             ui.add_space(4.0);
 
@@ -1195,96 +1181,95 @@ fn render_result_grid(
         .striped(false);
     grid.show(ui, |ui| {
         ui.label(
-            RichText::new("Detected rate:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Detected rate:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         ui.label(
-            RichText::new(fps_str)
-                .font(FontId::monospace(10.0))
+            text(ui, fps_str)
+                .mono()
+                .size(10.0)
                 .color(colors.text_title)
-                .strong(),
+                .bold(),
+        );
+        ui.end_row();
+
+        ui.label(text(ui, "Confidence:").size(10.0).color(colors.text_muted));
+        ui.label(
+            text(ui, format!("{:.1}%", result.avg_confidence * 100.0))
+                .mono()
+                .size(10.0)
+                .color(colors.text_title)
+                .bold(),
         );
         ui.end_row();
 
         ui.label(
-            RichText::new("Confidence:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Valid frames:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         ui.label(
-            RichText::new(format!("{:.1}%", result.avg_confidence * 100.0))
-                .font(FontId::monospace(10.0))
-                .color(colors.text_title)
-                .strong(),
-        );
-        ui.end_row();
-
-        ui.label(
-            RichText::new("Valid frames:")
-                .font(FontId::proportional(10.0))
-                .color(colors.text_muted),
-        );
-        ui.label(
-            RichText::new(format!(
-                "{} / {}",
-                result.valid_frames, result.total_possible_frames
-            ))
-            .font(FontId::monospace(10.0))
+            text(
+                ui,
+                format!("{} / {}", result.valid_frames, result.total_possible_frames),
+            )
+            .mono()
+            .size(10.0)
             .color(colors.text_title)
-            .strong(),
+            .bold(),
         );
         ui.end_row();
 
         ui.label(
-            RichText::new("Timecode range:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Timecode range:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         ui.label(
-            RichText::new(tc_summary)
-                .font(FontId::monospace(10.0))
+            text(ui, tc_summary)
+                .mono()
+                .size(10.0)
                 .color(colors.text_title)
-                .strong(),
+                .bold(),
+        );
+        ui.end_row();
+
+        ui.label(text(ui, "Sample rate:").size(10.0).color(colors.text_muted));
+        ui.label(
+            text(ui, format!("{} Hz", result.sample_rate))
+                .mono()
+                .size(10.0)
+                .color(colors.text_title)
+                .bold(),
         );
         ui.end_row();
 
         ui.label(
-            RichText::new("Sample rate:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Audio duration:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         ui.label(
-            RichText::new(format!("{} Hz", result.sample_rate))
-                .font(FontId::monospace(10.0))
+            text(ui, format!("{:.2}s", result.total_audio_duration_secs))
+                .mono()
+                .size(10.0)
                 .color(colors.text_title)
-                .strong(),
+                .bold(),
         );
         ui.end_row();
 
         ui.label(
-            RichText::new("Audio duration:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Processing time:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         ui.label(
-            RichText::new(format!("{:.2}s", result.total_audio_duration_secs))
-                .font(FontId::monospace(10.0))
+            text(ui, format!("{:.1} ms", result.processing_time_ms))
+                .mono()
+                .size(10.0)
                 .color(colors.text_title)
-                .strong(),
-        );
-        ui.end_row();
-
-        ui.label(
-            RichText::new("Processing time:")
-                .font(FontId::proportional(10.0))
-                .color(colors.text_muted),
-        );
-        ui.label(
-            RichText::new(format!("{:.1} ms", result.processing_time_ms))
-                .font(FontId::monospace(10.0))
-                .color(colors.text_title)
-                .strong(),
+                .bold(),
         );
         ui.end_row();
     });
@@ -1305,40 +1290,37 @@ fn render_quality_badge(
         .inner_margin(egui::Margin::symmetric(8, 4));
     quality_frame.show(ui, |ui| {
         ui.horizontal(|ui| {
+            ui.label(text(ui, "Quality:").size(9.0).color(colors.text_muted));
             ui.label(
-                RichText::new("Quality:")
-                    .font(FontId::proportional(9.0))
-                    .color(colors.text_muted),
-            );
-            ui.label(
-                RichText::new(format!("{:.0}%", q.score * 100.0))
-                    .font(FontId::monospace(11.0))
+                text(ui, format!("{:.0}%", q.score * 100.0))
+                    .mono()
+                    .size(11.0)
                     .color(grade_color)
-                    .strong(),
+                    .bold(),
             );
-            ui.label(
-                RichText::new(q.grade.as_str())
-                    .font(FontId::proportional(9.0))
-                    .color(grade_color),
-            );
+            ui.label(text(ui, q.grade.as_str()).size(9.0).color(grade_color));
         });
         ui.horizontal(|ui| {
             let issues =
                 quality_issues_text(q.edit_count, q.glitch_count, q.gap_count, q.missing_frames);
             ui.label(
-                RichText::new(format!(
-                    "{:.1}% usable, {}",
-                    q.usable_coverage * 100.0,
-                    issues
-                ))
-                .font(FontId::monospace(8.0))
+                text(
+                    ui,
+                    format!("{:.1}% usable, {}", q.usable_coverage * 100.0, issues),
+                )
+                .mono()
+                .size(8.0)
                 .color(colors.text_muted),
             );
             if q.max_drift_secs > 0.01 {
                 ui.label(
-                    RichText::new(format!("drift {:.2} frames", q.worst_block_drift_frames))
-                        .font(FontId::monospace(8.0))
-                        .color(colors.text_muted),
+                    text(
+                        ui,
+                        format!("drift {:.2} frames", q.worst_block_drift_frames),
+                    )
+                    .mono()
+                    .size(8.0)
+                    .color(colors.text_muted),
                 );
             }
         });
@@ -1359,9 +1341,12 @@ fn render_timecode_list(
     )
     .show_header(ui, |ui| {
         ui.label(
-            RichText::new(format!("Show {} decoded timecodes", result.timecodes.len()))
-                .font(FontId::proportional(9.0))
-                .color(colors.text_muted),
+            text(
+                ui,
+                format!("Show {} decoded timecodes", result.timecodes.len()),
+            )
+            .size(9.0)
+            .color(colors.text_muted),
         );
     })
     .body(|ui| {
@@ -1378,16 +1363,20 @@ fn render_timecode_list(
                     for ftc in &result.timecodes {
                         let sep = if result.drop_frame { ";" } else { ":" };
                         ui.label(
-                            RichText::new(format!(
-                                "[{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  (+{:.3}s)",
-                                ftc.frame_index,
-                                ftc.timecode.hours,
-                                ftc.timecode.minutes,
-                                ftc.timecode.seconds,
-                                ftc.timecode.frames,
-                                ftc.timecode_secs,
-                            ))
-                            .font(FontId::monospace(9.0))
+                            text(
+                                ui,
+                                format!(
+                                    "[{:4}] {:02}{sep}{:02}{sep}{:02}{sep}{:02}  (+{:.3}s)",
+                                    ftc.frame_index,
+                                    ftc.timecode.hours,
+                                    ftc.timecode.minutes,
+                                    ftc.timecode.seconds,
+                                    ftc.timecode.frames,
+                                    ftc.timecode_secs,
+                                ),
+                            )
+                            .mono()
+                            .size(9.0)
                             .color(colors.text_muted),
                         );
                     }
@@ -1410,18 +1399,14 @@ fn render_debug_details(
     )
     .show_header(ui, |ui| {
         ui.label(
-            RichText::new("Show debug details")
-                .font(FontId::proportional(9.0))
+            text(ui, "Show debug details")
+                .size(9.0)
                 .color(colors.text_muted),
         );
     })
     .body(|ui| {
         for detail in &result.details {
-            ui.label(
-                RichText::new(detail)
-                    .font(FontId::monospace(8.0))
-                    .color(colors.text_muted),
-            );
+            ui.label(text(ui, detail).mono().size(8.0).color(colors.text_muted));
         }
     });
 }
@@ -1655,23 +1640,15 @@ fn render_channel_matrix(ui: &mut Ui, state: &mut AppState) {
             } else {
                 colors.text_muted
             };
-            ui.label(
-                RichText::new(label.to_string())
-                    .font(FontId::proportional(10.0))
-                    .color(color),
-            );
+            ui.label(text(ui, label.to_string()).size(10.0).color(color));
         } else {
             let label = ProbeStatusLabel::NoChannels.to_string();
-            ui.label(
-                RichText::new(label)
-                    .font(FontId::proportional(10.0))
-                    .color(colors.text_muted),
-            );
+            ui.label(text(ui, label).size(10.0).color(colors.text_muted));
         }
         return;
     }
 
-    ui.label(RichText::new("Click a radio button to swap the input channel (row) with the channel currently mapped to the selected output (column).").font(FontId::proportional(9.0)).color(colors.text_secondary));
+    ui.label(text(ui, "Click a radio button to swap the input channel (row) with the channel currently mapped to the selected output (column).").size(9.0).color(colors.text_secondary));
     ui.add_space(6.0);
 
     let row_labels = channel_row_labels(state);
@@ -1718,7 +1695,7 @@ fn draw_matrix_headers(
             egui::pos2(origin.x + x, origin.y + y),
             egui::Align2::CENTER_CENTER,
             text.as_str(),
-            FontId::monospace(9.0),
+            crate::text::font(9.0).mono().font_id(),
             colors.text_muted,
         );
     }
@@ -1734,7 +1711,7 @@ fn draw_matrix_headers(
             egui::pos2(origin.x + x, origin.y + y),
             egui::Align2::LEFT_CENTER,
             format!("{}{}", prefix, text),
-            FontId::monospace(9.0),
+            crate::text::font(9.0).mono().font_id(),
             color,
         );
     }
@@ -1874,28 +1851,27 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
         });
         if *state.sh.conv.concat_audio.value() {
             ui.label(
-                RichText::new("ℹ Audio from all clips will be joined into one file per track (in clip order).")
-                    .font(FontId::proportional(9.0))
-                    .color(colors.text_secondary),
+                text(ui, "ℹ Audio from all clips will be joined into one file per track (in clip order).").size(9.0).color(colors.text_secondary),
             );
         }
     }
     if *state.sh.conv.split_tracks.value() {
         ui.label(
-            RichText::new("ℹ Each input track will be written to its own file. Channel mapping greets are preserved.")
-                .font(FontId::proportional(9.0))
-                .color(colors.text_secondary),
+            text(ui, "ℹ Each input track will be written to its own file. Channel mapping greets are preserved.").size(9.0).color(colors.text_secondary),
         );
     }
     if *state.sh.conv.drop_ltc_track.value()
         && *state.sh.conv.ltc_file_idx.value() < state.sh.conv.channel_map.value().num_channels()
     {
         ui.label(
-            RichText::new(format!(
-                "ℹ LTC track (channel {}) will be excluded from all output.",
-                state.sh.conv.ltc_file_idx.value() + 1
-            ))
-            .font(FontId::proportional(9.0))
+            text(
+                ui,
+                format!(
+                    "ℹ LTC track (channel {}) will be excluded from all output.",
+                    state.sh.conv.ltc_file_idx.value() + 1
+                ),
+            )
+            .size(9.0)
             .color(colors.text_secondary),
         );
     }
@@ -1977,8 +1953,8 @@ fn render_output_format(
     // While the ffmpeg capability probe is still running, show a placeholder.
     if caps_opt.is_none() && state.latest.job(JobKind::FfmpegCapProbe).is_active() {
         ui.label(
-            RichText::new("Probing ffmpeg capabilities…")
-                .font(FontId::proportional(10.0))
+            text(ui, "Probing ffmpeg capabilities…")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         if state.latest.converter.selected_recording_type()
@@ -2108,9 +2084,7 @@ fn render_copy_video_checkbox(ui: &mut Ui, state: &mut AppState) {
     );
     if copy_mode_active(state) {
         ui.label(
-            RichText::new("Video is copied without re-encoding (much faster). Cuts snap to the nearest keyframe before the trim point.")
-                .font(FontId::proportional(9.0))
-                .color(state.theme.colors().text_muted),
+            text(ui, "Video is copied without re-encoding (much faster). Cuts snap to the nearest keyframe before the trim point.").size(9.0).color(state.theme.colors().text_muted),
         );
     }
 }
@@ -2149,9 +2123,7 @@ fn render_metadata_only_checkbox(
     );
     if *state.sh.conv.metadata_only.value() {
         ui.label(
-            RichText::new("Originals are tagged in place with the start timecode and renamed. Audio is extracted to the output folder. No re-encoding.")
-                .font(FontId::proportional(9.0))
-                .color(colors.text_muted),
+            text(ui, "Originals are tagged in place with the start timecode and renamed. Audio is extracted to the output folder. No re-encoding.").size(9.0).color(colors.text_muted),
         );
         ui.add_space(4.0);
     }
@@ -2191,11 +2163,7 @@ fn render_camera_metadata_desc(
             (None, None) => String::new(),
         };
         if !desc.is_empty() {
-            ui.label(
-                RichText::new(desc)
-                    .font(FontId::proportional(9.0))
-                    .color(colors.text_muted),
-            );
+            ui.label(text(ui, desc).size(9.0).color(colors.text_muted));
         }
     }
 }
@@ -2212,10 +2180,10 @@ fn render_video_format_rows(
 ) {
     let colors = state.theme.colors();
     ui.label(
-        RichText::new("VIDEO FORMAT")
-            .font(FontId::proportional(10.0))
+        text(ui, "VIDEO FORMAT")
+            .size(10.0)
             .color(colors.text_title)
-            .strong(),
+            .bold(),
     );
     ui.add_space(4.0);
     ui.add_enabled_ui(enabled, |ui| {
@@ -2274,10 +2242,10 @@ fn render_audio_format_rows(
     colors: &crate::theme::ThemeColors,
 ) {
     ui.label(
-        RichText::new("AUDIO FORMAT")
-            .font(FontId::proportional(10.0))
+        text(ui, "AUDIO FORMAT")
+            .size(10.0)
             .color(colors.text_title)
-            .strong(),
+            .bold(),
     );
     ui.add_space(4.0);
     ui.add_enabled_ui(enabled, |ui| {
@@ -2312,8 +2280,8 @@ fn render_warning_note(ui: &mut Ui, text: &str, colors: &crate::theme::ThemeColo
         .inner_margin(egui::Margin::symmetric(10, 6));
     warning_area.show(ui, |ui| {
         ui.label(
-            RichText::new(text)
-                .font(FontId::proportional(10.0))
+            crate::text::text(ui, text)
+                .size(10.0)
                 .color(colors.warning_amber),
         );
     });
@@ -2334,20 +2302,18 @@ fn render_format_warnings(
             Ok(()) => {
                 if copy_mode_active(state) {
                     ui.label(
-                        RichText::new("✓ Settings are compatible — video stream will be copied (no re-encode)")
-                            .font(FontId::proportional(10.0))
-                            .color(colors.success_green),
+                        text(ui, "✓ Settings are compatible — video stream will be copied (no re-encode)").size(10.0).color(colors.success_green),
                     );
                 } else {
                     if let Some(caps) = caps {
                         let codec = normalize_video_codec(state.sh.conv.video_encoder.value());
                         let chain = describe_chain(codec, caps);
                         ui.label(
-                            RichText::new(format!(
-                                "✓ Settings are compatible — {} via {}",
-                                codec, chain
-                            ))
-                            .font(FontId::proportional(10.0))
+                            text(
+                                ui,
+                                format!("✓ Settings are compatible — {} via {}", codec, chain),
+                            )
+                            .size(10.0)
                             .color(colors.success_green),
                         );
                     }
@@ -2389,8 +2355,8 @@ fn render_caps_error_note(
             error_frame.show(ui, |ui| {
                 if let Some(msg) = &caps.error_message {
                     ui.label(
-                        RichText::new(format!("✗ {}", msg))
-                            .font(FontId::proportional(10.0))
+                        text(ui, format!("✗ {}", msg))
+                            .size(10.0)
                             .color(colors.error_red),
                     );
                 }
@@ -2409,8 +2375,8 @@ fn render_format_row(
 ) {
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(format!("{}:", label))
-                .font(FontId::proportional(10.0))
+            text(ui, format!("{}:", label))
+                .size(10.0)
                 .color(colors.text_muted),
         );
         egui::ComboBox::from_id_salt(format!("fmt_{}_{}", label, options.len()))
@@ -2490,8 +2456,8 @@ fn render_naming_template_rows(
     // Output folder — bound text field + Browse dialog (programmatic write)
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("Output folder:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Output folder:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         let truth = state.latest.converter.settings.output_folder.clone();
@@ -2503,7 +2469,7 @@ fn render_naming_template_rows(
             &truth,
             |v| GuiCommand::Converter(ConverterCommand::SetOutputFolder(v)),
             move |edit| {
-                edit.font(FontId::monospace(10.0))
+                edit.font(crate::text::font(10.0).mono().font_id())
                     .desired_width(folder_width)
             },
         );
@@ -2526,8 +2492,8 @@ fn render_naming_template_rows(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("Filename prefix:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Filename prefix:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         let truth = state.latest.converter.settings.filename_prefix.clone();
@@ -2537,7 +2503,7 @@ fn render_naming_template_rows(
             |s| &mut s.sh.conv.filename_prefix,
             &truth,
             |v| GuiCommand::Converter(ConverterCommand::SetFilenamePrefix(v)),
-            |edit| edit.font(FontId::monospace(10.0)),
+            |edit| edit.font(crate::text::font(10.0).mono().font_id()),
         );
     });
 
@@ -2545,8 +2511,8 @@ fn render_naming_template_rows(
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("Audio suffix:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Audio suffix:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         let truth = state
@@ -2561,7 +2527,7 @@ fn render_naming_template_rows(
             |s| &mut s.sh.conv.audio_suffix_template,
             &truth,
             |v| GuiCommand::Converter(ConverterCommand::SetAudioSuffixTemplate(v)),
-            |edit| edit.font(FontId::monospace(10.0)),
+            |edit| edit.font(crate::text::font(10.0).mono().font_id()),
         );
     });
 
@@ -2569,8 +2535,8 @@ fn render_naming_template_rows(
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("Video suffix:")
-                .font(FontId::proportional(10.0))
+            text(ui, "Video suffix:")
+                .size(10.0)
                 .color(colors.text_muted),
         );
         let truth = state
@@ -2585,7 +2551,7 @@ fn render_naming_template_rows(
             |s| &mut s.sh.conv.video_suffix_template,
             &truth,
             |v| GuiCommand::Converter(ConverterCommand::SetVideoSuffixTemplate(v)),
-            |edit| edit.font(FontId::monospace(10.0)),
+            |edit| edit.font(crate::text::font(10.0).mono().font_id()),
         );
     });
 }
@@ -2601,8 +2567,8 @@ fn render_output_preview(ui: &mut Ui, state: &mut AppState, colors: &crate::them
         if !previews.is_empty() {
             let count = previews.len();
             ui.label(
-                RichText::new(format!("↳ {} output file(s):", count))
-                    .font(FontId::proportional(9.0))
+                text(ui, format!("↳ {} output file(s):", count))
+                    .size(9.0)
                     .color(colors.text_secondary),
             );
             for preview in &previews {
@@ -2615,8 +2581,9 @@ fn render_output_preview(ui: &mut Ui, state: &mut AppState, colors: &crate::them
                     OutputKind::Audio => "🔊",
                 };
                 ui.label(
-                    RichText::new(format!("  {} {}", icon, display_name))
-                        .font(FontId::monospace(8.5))
+                    text(ui, format!("  {} {}", icon, display_name))
+                        .mono()
+                        .size(8.5)
                         .color(colors.text_muted),
                 );
             }
@@ -2667,16 +2634,16 @@ fn render_set_start_row(
             };
             if !tc_text.is_empty() {
                 ui.label(
-                    RichText::new(format!("(no cut; starts at {})", tc_text))
-                        .font(FontId::proportional(10.0))
+                    text(ui, format!("(no cut; starts at {})", tc_text))
+                        .size(10.0)
                         .color(colors.text_muted),
                 );
             }
         }
         if !ltc_available && !state.latest.job(JobKind::LtcDecode).is_active() {
             ui.label(
-                RichText::new("(Detect LTC first)")
-                    .font(FontId::proportional(10.0))
+                text(ui, "(Detect LTC first)")
+                    .size(10.0)
                     .color(colors.text_muted),
             );
         }
@@ -2709,7 +2676,7 @@ fn render_convert_button(
             &colors,
             style::ActionStyle::Danger,
             "■ CANCEL CONVERSION",
-            FontId::proportional(13.0),
+            crate::text::font(13.0),
             egui::vec2(ui.available_width(), 42.0),
             true,
         )
@@ -2760,7 +2727,7 @@ fn render_convert_button(
             &colors,
             style::ActionStyle::Primary,
             button_label,
-            FontId::proportional(13.0),
+            crate::text::font(13.0),
             egui::vec2(ui.available_width(), 42.0),
             can_convert && sanity_ok,
         )
@@ -2773,15 +2740,15 @@ fn render_convert_button(
     if !can_convert {
         ui.add_space(2.0);
         ui.label(
-            RichText::new(format_blockers(&readiness.blockers))
-                .font(FontId::proportional(10.0))
+            text(ui, format_blockers(&readiness.blockers))
+                .size(10.0)
                 .color(colors.text_secondary),
         );
     } else if !sanity_ok {
         ui.add_space(2.0);
         ui.label(
-            RichText::new("Fix the compatibility issue above before converting.")
-                .font(FontId::proportional(10.0))
+            text(ui, "Fix the compatibility issue above before converting.")
+                .size(10.0)
                 .color(colors.warning_amber),
         );
     }
@@ -2897,10 +2864,10 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
             ui.label(
-                RichText::new("Converting…")
-                    .font(FontId::proportional(11.0))
+                text(ui, "Converting…")
+                    .size(11.0)
                     .color(colors.text_title)
-                    .strong(),
+                    .bold(),
             );
             ui.add_space(4.0);
             let pb = egui::ProgressBar::new(job.fraction())
@@ -2921,8 +2888,9 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(job.log())
-                                .font(FontId::monospace(9.0))
+                            text(ui, job.log())
+                                .mono()
+                                .size(9.0)
                                 .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
                         );
                     });
@@ -2930,19 +2898,22 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
         }
         JobPhase::Succeeded => {
             ui.label(
-                RichText::new("✓ Conversion completed successfully!")
-                    .font(FontId::proportional(12.0))
+                text(ui, "✓ Conversion completed successfully!")
+                    .size(12.0)
                     .color(colors.success_green)
-                    .strong(),
+                    .bold(),
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new(format!(
-                    "Files saved to: {}/{}",
-                    state.sh.conv.output_folder.value().display(),
-                    state.sh.conv.filename_prefix.value(),
-                ))
-                .font(FontId::proportional(10.0))
+                text(
+                    ui,
+                    format!(
+                        "Files saved to: {}/{}",
+                        state.sh.conv.output_folder.value().display(),
+                        state.sh.conv.filename_prefix.value(),
+                    ),
+                )
+                .size(10.0)
                 .color(colors.text_muted),
             );
             ui.add_space(4.0);
@@ -2959,8 +2930,9 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(job.log())
-                                .font(FontId::monospace(9.0))
+                            text(ui, job.log())
+                                .mono()
+                                .size(9.0)
                                 .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
                         );
                     });
@@ -2978,10 +2950,10 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                 .inner_margin(egui::Margin::symmetric(10, 6));
             error_frame.show(ui, |ui| {
                 ui.label(
-                    RichText::new("✗ CONVERSION FAILED")
-                        .font(FontId::proportional(12.0))
+                    text(ui, "✗ CONVERSION FAILED")
+                        .size(12.0)
                         .color(colors.error_red)
-                        .strong(),
+                        .bold(),
                 );
             });
 
@@ -2999,8 +2971,9 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     .stick_to_bottom(false)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(&error_text)
-                                .font(FontId::monospace(9.0))
+                            text(ui, &error_text)
+                                .mono()
+                                .size(9.0)
                                 .color(Color32::from_rgb(0xFF, 0x66, 0x66)),
                         );
                     });
@@ -3015,10 +2988,10 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
         }
         JobPhase::Cancelled => {
             ui.label(
-                RichText::new("■ Conversion canceled")
-                    .font(FontId::proportional(12.0))
+                text(ui, "■ Conversion canceled")
+                    .size(12.0)
                     .color(colors.warning_amber)
-                    .strong(),
+                    .bold(),
             );
             ui.add_space(4.0);
 
@@ -3034,8 +3007,9 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(job.log())
-                                .font(FontId::monospace(9.0))
+                            text(ui, job.log())
+                                .mono()
+                                .size(9.0)
                                 .color(Color32::from_rgb(0x88, 0xCC, 0x88)),
                         );
                     });

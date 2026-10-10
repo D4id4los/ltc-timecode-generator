@@ -1,4 +1,5 @@
-use egui::{FontId, RichText, Sense, Ui, Vec2};
+use crate::text::text;
+use egui::{Sense, Ui, Vec2};
 use gui_engine::command::GuiCommand;
 use gui_engine::{timecode::FPS_OPTIONS, ChannelSel};
 
@@ -14,10 +15,10 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
         // 1. Start Timecode
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("SET STARTING TIMECODE")
-                    .font(FontId::proportional(11.0))
+                text(ui, "SET STARTING TIMECODE")
+                    .size(11.0)
                     .color(colors.text_muted)
-                    .strong(),
+                    .bold(),
             );
             if playing {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -26,7 +27,7 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
                         &colors,
                         style::BadgeTone::Warning,
                         "STOP STREAM TO EDIT",
-                        egui::FontId::proportional(9.0),
+                        crate::text::font(9.0),
                     );
                 });
             }
@@ -36,40 +37,40 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
         ui.add_space(16.0);
 
         ui.label(
-            RichText::new("SELECT FRAME RATE")
-                .font(FontId::proportional(11.0))
+            text(ui, "SELECT FRAME RATE")
+                .size(11.0)
                 .color(colors.text_muted)
-                .strong(),
+                .bold(),
         );
         ui.add_space(8.0);
         render_frame_rate(ui, state);
         ui.add_space(16.0);
 
         ui.label(
-            RichText::new("SAMPLE RATE")
-                .font(FontId::proportional(11.0))
+            text(ui, "SAMPLE RATE")
+                .size(11.0)
                 .color(colors.text_muted)
-                .strong(),
+                .bold(),
         );
         ui.add_space(8.0);
         render_sample_rate(ui, state);
         ui.add_space(16.0);
 
         ui.label(
-            RichText::new("OUTPUT AUDIO INTERFACE SELECTION")
-                .font(FontId::proportional(11.0))
+            text(ui, "OUTPUT AUDIO INTERFACE SELECTION")
+                .size(11.0)
                 .color(colors.text_muted)
-                .strong(),
+                .bold(),
         );
         ui.add_space(8.0);
         render_audio_device(ui, state);
         ui.add_space(16.0);
 
         ui.label(
-            RichText::new("AUDIO ROUTING & SETTINGS")
-                .font(FontId::proportional(11.0))
+            text(ui, "AUDIO ROUTING & SETTINGS")
+                .size(11.0)
                 .color(colors.text_muted)
-                .strong(),
+                .bold(),
         );
         ui.add_space(8.0);
         render_routing_and_volume(ui, state);
@@ -155,25 +156,35 @@ fn stepper_card_col(
         .inner_margin(egui::Margin::symmetric(10, 8));
     card.show(ui, |ui| {
         ui.vertical_centered(|ui| {
-            if ui.button(RichText::new("^").strong()).clicked() {
+            if ui
+                .button(
+                    text(ui, "^")
+                        .bold()
+                        .color(ui.style().visuals.strong_text_color()),
+                )
+                .clicked()
+            {
                 state.send(cmd_up);
             }
             ui.add_space(1.0);
             ui.label(
-                RichText::new(format!("{:02}", value))
-                    .font(FontId::monospace(20.0))
+                text(ui, format!("{:02}", value))
+                    .mono()
+                    .size(20.0)
                     .color(colors.text_title)
-                    .strong(),
+                    .bold(),
             );
             ui.add_space(1.0);
-            ui.label(
-                RichText::new(label)
-                    .font(FontId::proportional(7.5))
-                    .color(colors.text_muted)
-                    .strong(),
-            );
+            ui.label(text(ui, label).size(7.5).color(colors.text_muted).bold());
             ui.add_space(1.0);
-            if ui.button(RichText::new("v").strong()).clicked() {
+            if ui
+                .button(
+                    text(ui, "v")
+                        .bold()
+                        .color(ui.style().visuals.strong_text_color()),
+                )
+                .clicked()
+            {
                 state.send(cmd_down);
             }
         });
@@ -264,7 +275,7 @@ fn sample_rate_button(ui: &mut Ui, state: &mut AppState, selected_rate: u32, rat
         ui,
         &colors,
         &format!("{} Hz", rate),
-        egui::FontId::proportional(12.0),
+        crate::text::font(12.0),
         is_selected,
         true,
         Vec2::ZERO,
@@ -337,18 +348,19 @@ fn render_device_combo(ui: &mut Ui, state: &mut AppState) {
         .collect();
     if device_names.is_empty() {
         ui.label(
-            RichText::new("No devices found — using default output")
-                .font(FontId::monospace(12.0))
+            text(ui, "No devices found — using default output")
+                .mono()
+                .size(12.0)
                 .color(colors.text_muted),
         );
     } else {
         let selected = state.sh.selected_device.value().clone();
         let selected_text = selected_device_text(selected.as_ref(), &state.latest.devices);
         ui.label(
-            RichText::new("Interface:")
-                .font(FontId::proportional(11.0))
+            text(ui, "Interface:")
+                .size(11.0)
                 .color(colors.text_muted)
-                .strong(),
+                .bold(),
         );
         egui::ComboBox::from_id_salt("settings_device_combo")
             .selected_text(&selected_text)
@@ -381,10 +393,11 @@ fn render_device_info_note(ui: &mut Ui, colors: &crate::theme::ThemeColors) {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(6.0, 6.0), Sense::hover());
             ui.painter().circle_filled(rect.center(), 3.0, ACCENT);
             ui.label(
-                RichText::new(
+                text(
+                    ui,
                     "Sends SMPTE Linear Timecode audio to mixers, USB-DAC, or sync adapters.",
                 )
-                .font(FontId::proportional(10.0))
+                .size(10.0)
                 .color(colors.text_muted),
             );
         });
@@ -433,10 +446,10 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
     ];
 
     ui.label(
-        RichText::new("LTC OUTPUT")
-            .font(FontId::proportional(9.0))
+        text(ui, "LTC OUTPUT")
+            .size(9.0)
             .color(colors.text_muted)
-            .strong(),
+            .bold(),
     );
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -456,10 +469,10 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
 
     ui.add_space(8.0);
     ui.label(
-        RichText::new("CLAPPER OUTPUT")
-            .font(FontId::proportional(9.0))
+        text(ui, "CLAPPER OUTPUT")
+            .size(9.0)
             .color(colors.text_muted)
-            .strong(),
+            .bold(),
     );
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -495,7 +508,7 @@ fn channel_button(
         ui,
         &colors,
         lbl,
-        egui::FontId::proportional(12.0),
+        crate::text::font(12.0),
         selected == val,
         true,
         Vec2::ZERO,
@@ -512,8 +525,9 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
     let truth = state.latest.ltc_volume;
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("LTC VOL")
-                .font(FontId::monospace(9.0))
+            text(ui, "LTC VOL")
+                .mono()
+                .size(9.0)
                 .color(colors.text_muted),
         );
         bound::slider(
@@ -527,8 +541,9 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
         );
         let shown = *state.sh.ltc_volume.value();
         ui.label(
-            RichText::new(format!("{}%", (shown * 100.0).round()))
-                .font(FontId::monospace(10.0))
+            text(ui, format!("{}%", (shown * 100.0).round()))
+                .mono()
+                .size(10.0)
                 .color(colors.text_title),
         );
         // Live dBFS readout: the peak level the shown UI volume produces.
@@ -538,18 +553,11 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
         } else {
             "silence".to_string()
         };
-        ui.label(
-            RichText::new(readout)
-                .font(FontId::monospace(9.0))
-                .color(colors.text_muted),
-        );
+        ui.label(text(ui, readout).mono().size(9.0).color(colors.text_muted));
         // Calibrated level presets (safe-hot reference levels for camera
         // feeds); each sends the equivalent UI volume through SetLtcVolume.
         for &(label, dbfs) in &[("-18", -18.0f32), ("-12", -12.0), ("-6", -6.0)] {
-            if ui
-                .small_button(RichText::new(label).font(FontId::monospace(9.0)))
-                .clicked()
-            {
+            if ui.small_button(text(ui, label).mono().size(9.0)).clicked() {
                 let v = gui_engine::dbfs_to_ui_volume(dbfs);
                 bound::set_value(state, |s| &mut s.sh.ltc_volume, v, GuiCommand::SetLtcVolume);
             }
@@ -559,8 +567,9 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
     let truth = state.latest.beep_volume;
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("BEEP VOL")
-                .font(FontId::monospace(9.0))
+            text(ui, "BEEP VOL")
+                .mono()
+                .size(9.0)
                 .color(colors.text_muted),
         );
         bound::slider(
@@ -574,19 +583,16 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
         );
         let shown = *state.sh.beep_volume.value();
         ui.label(
-            RichText::new(format!("{}%", (shown * 100.0).round()))
-                .font(FontId::monospace(10.0))
+            text(ui, format!("{}%", (shown * 100.0).round()))
+                .mono()
+                .size(10.0)
                 .color(colors.text_title),
         );
     });
 
     let truth = state.latest.beep_frequency;
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("PITCH")
-                .font(FontId::monospace(9.0))
-                .color(colors.text_muted),
-        );
+        ui.label(text(ui, "PITCH").mono().size(9.0).color(colors.text_muted));
         bound::slider(
             ui,
             state,
@@ -598,19 +604,16 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
         );
         let shown = *state.sh.beep_frequency.value();
         ui.label(
-            RichText::new(format!("{} Hz", shown.round()))
-                .font(FontId::monospace(10.0))
+            text(ui, format!("{} Hz", shown.round()))
+                .mono()
+                .size(10.0)
                 .color(colors.text_title),
         );
     });
 
     let truth = state.latest.beep_duration;
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("DUR")
-                .font(FontId::monospace(9.0))
-                .color(colors.text_muted),
-        );
+        ui.label(text(ui, "DUR").mono().size(9.0).color(colors.text_muted));
         bound::slider(
             ui,
             state,
@@ -622,8 +625,9 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
         );
         let shown = *state.sh.beep_duration.value();
         ui.label(
-            RichText::new(format!("{:.0} ms", shown * 1000.0))
-                .font(FontId::monospace(10.0))
+            text(ui, format!("{:.0} ms", shown * 1000.0))
+                .mono()
+                .size(10.0)
                 .color(colors.text_title),
         );
     });
