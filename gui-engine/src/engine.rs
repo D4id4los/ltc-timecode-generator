@@ -2824,6 +2824,53 @@ mod tests {
     use crate::file_pattern::MatchedGroup;
     use audio_core::ChannelSel;
     use std::path::PathBuf;
+    use std::sync::Once;
+    use std::sync::OnceLock;
+
+    /// Isolates the config dir for the whole unit-test module. Several
+    /// commands (`SetTextScale`, `SetInputFolder`, `SetOffloadParent`) persist
+    /// through `config::save_*` on processing — without this override every
+    /// `cargo test` run wrote into the real user config (a `SetTextScale(1)`
+    /// clamp test persisted `text_scale_percent: 50`). Same pattern as
+    /// `init_test_config` in `tests/integration.rs`.
+    static CONFIG_GUARD: Once = Once::new();
+    static TEST_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    fn init_test_config() {
+        CONFIG_GUARD.call_once(|| {
+            let dir = tempfile::TempDir::new().expect("tempdir for test config");
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            // Windows ignores XDG_CONFIG_HOME (dirs uses SHGVirtualStore),
+            // so tests isolate via this override instead.
+            std::env::set_var("LTC_CONFIG_HOME", dir.path());
+            TEST_CONFIG_DIR.set(dir.path().to_path_buf()).ok();
+            Box::leak(Box::new(dir));
+        });
+    }
+
+    /// The config layer must resolve inside the test tempdir once the guard
+    /// ran — catches any future test-path regression that writes the real
+    /// user config.
+    /// `EngineLoopState` for tests — plants the config-isolation guard
+    /// before any state is built, so command processing in tests can never
+    /// reach the real user config.
+    fn test_els(state: AppStateSnapshot) -> EngineLoopState {
+        init_test_config();
+        EngineLoopState::new(state)
+    }
+
+    #[test]
+    fn test_commands_resolve_config_inside_the_test_config_home() {
+        init_test_config();
+        let base = crate::config::config_base_dir().expect("isolated config dir must resolve");
+        let isolated = TEST_CONFIG_DIR
+            .get()
+            .expect("guard must have planted the tempdir");
+        assert!(
+            base.starts_with(isolated),
+            "config writes must stay inside the test config home, got {base:?}"
+        );
+    }
 
     // ── re-decode after cancel (one-tick reaping window) ─────────────────
 
@@ -2872,7 +2919,7 @@ mod tests {
         );
         let parked_id = *sup.latest_job.get(&crate::job::JobKind::LtcDecode).unwrap();
 
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         // The engine published the terminal Cancelled phase for the previous job.
         let mut status = JobStatus::running("decode");
         status.progress.phase = JobPhase::Cancelled;
@@ -2972,7 +3019,7 @@ mod tests {
 
     #[test]
     fn engine_loop_state_defaults() {
-        let els = EngineLoopState::new(AppStateSnapshot::initial());
+        let els = test_els(AppStateSnapshot::initial());
         assert_eq!(els.recovery_attempts, 0);
         assert_eq!(els.log_id_counter, 0);
         assert_eq!(els.last_device_id, None);
@@ -3126,7 +3173,7 @@ mod tests {
 
     #[test]
     fn on_conversion_finished_consumes_encoder_used() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::Conversion, JobStatus::running("conversion"));
@@ -3152,7 +3199,7 @@ mod tests {
 
     #[test]
     fn on_conversion_finished_encoder_none_keeps_plain_message() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::Conversion, JobStatus::running("conversion"));
@@ -3178,7 +3225,7 @@ mod tests {
 
     #[test]
     fn on_conversion_finished_failed_sets_error() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::Conversion, JobStatus::running("conversion"));
@@ -3206,7 +3253,7 @@ mod tests {
 
     #[test]
     fn on_ltc_decode_finished_applies_once_per_generation() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current.converter.groups = vec![MatchedGroup {
             prefix: "T".into(),
             rel_dir: String::new(),
@@ -3249,7 +3296,7 @@ mod tests {
 
     #[test]
     fn on_ltc_decode_finished_cancel_error_clears_result() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::LtcDecode, JobStatus::running("decoding"));
@@ -3276,7 +3323,7 @@ mod tests {
 
     #[test]
     fn on_ltc_decode_finished_failed_error_surfaces() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current.decode.result = Some(make_ltc_result());
         on_ltc_decode_finished(
             &mut els,
@@ -3345,7 +3392,7 @@ mod tests {
     }
 
     fn els_with_video_group() -> EngineLoopState {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current.converter.probes_generation = 1;
         els.current.converter.selected_group_idx = Some(0);
         els.current.converter.groups.push(MatchedGroup {
@@ -3485,7 +3532,7 @@ mod tests {
 
     #[test]
     fn handle_job_event_ignores_wrong_payload_without_panicking() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::Conversion, JobStatus::running("conversion"));
@@ -3514,7 +3561,7 @@ mod tests {
 
     #[test]
     fn handle_job_event_item_mismatch_is_ignored_safely() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         handle_job_event(
             &mut els,
             &mut JobSupervisor::new(),
@@ -3590,6 +3637,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn setup_state() -> AppStateSnapshot {
+        init_test_config();
         AppStateSnapshot::initial()
     }
 
@@ -3927,7 +3975,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         // ToggleLock on: false → true
         process_command(
@@ -3950,7 +3998,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::ToggleLock,
@@ -3980,7 +4028,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetFpsIndex(4),
@@ -4004,7 +4052,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetFpsIndex(3),
@@ -4028,7 +4076,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetFpsIndex(99),
@@ -4051,7 +4099,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetTheme(true),
@@ -4083,7 +4131,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::ToggleTheme,
@@ -4118,7 +4166,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetTextScale(150),
@@ -4174,7 +4222,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::ClearLogs,
@@ -4196,7 +4244,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetLtcChannel(ChannelSel::Both),
@@ -4218,7 +4266,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetBeepVolume(0.75),
@@ -4240,7 +4288,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetBeepChannel(ChannelSel::Right),
@@ -4262,7 +4310,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetLtcVolume(0.4),
@@ -4284,7 +4332,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetBeepFrequency(1200.0),
@@ -4306,7 +4354,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetBeepDuration(0.8),
@@ -4328,7 +4376,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetLtcDecodeStream(2),
@@ -4350,7 +4398,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetLtcDecodeChannel(1),
@@ -4372,7 +4420,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         els.current.current_timecode = Timecode {
             hours: 5,
@@ -4400,7 +4448,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetAutoIncrement(false),
@@ -4447,7 +4495,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(setup_state());
+        let mut els = test_els(setup_state());
 
         assert_eq!(els.current.clapper.clap_seq, 0, "no clap yet");
         process_command(
@@ -4482,7 +4530,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
         let tc = Timecode {
             hours: 10,
             minutes: 20,
@@ -4510,7 +4558,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetScene(42),
@@ -4552,7 +4600,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         els.current.clapper.scene = 5;
         process_command(
@@ -4585,7 +4633,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         els.current.clapper.take = 3;
         process_command(
@@ -4618,7 +4666,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         els.current.clapper.scene = 0;
         process_command(
@@ -4641,7 +4689,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         els.current.clapper.take = 0;
         process_command(
@@ -4664,7 +4712,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetSampleRate(48000),
@@ -4686,7 +4734,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetAutoIncrement(false),
@@ -4718,7 +4766,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetDecodeFpsIndex(4),
@@ -4742,7 +4790,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetDecodeFpsIndex(3),
@@ -4765,7 +4813,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::SetDecodeFpsIndex(99),
@@ -4844,7 +4892,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::ClearRecordingDecodeState,
@@ -4878,7 +4926,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::ClearRecordingDecodeState,
@@ -4923,7 +4971,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::Converter(ConverterCommand::SelectRecording(0)),
@@ -4956,7 +5004,7 @@ mod tests {
             std::sync::mpsc::Sender<audio_core::AudioEvent>,
             std::sync::mpsc::Receiver<audio_core::AudioEvent>,
         ) = std::sync::mpsc::channel();
-        let mut els = EngineLoopState::new(state);
+        let mut els = test_els(state);
 
         process_command(
             GuiCommand::ClearRecordingDecodeState,
@@ -5054,7 +5102,7 @@ mod tests {
     /// Helper: call `apply_recording_selection` with minimal argument
     /// plumbing.
     fn apply_sel(state: &mut AppStateSnapshot, idx: usize) {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         std::mem::swap(&mut els.current, state);
         let mut supervisor = JobSupervisor::new();
         apply_recording_selection(&mut els, &mut supervisor, idx);
@@ -5333,7 +5381,7 @@ mod tests {
 
     #[test]
     fn on_ffmpeg_caps_finished_publishes_caps_and_succeeds() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::FfmpegCapProbe, JobStatus::running("probe"));
@@ -5359,7 +5407,7 @@ mod tests {
 
     #[test]
     fn on_ffmpeg_caps_finished_none_and_wrong_payload_still_terminate() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::FfmpegCapProbe, JobStatus::running("probe"));
@@ -5391,7 +5439,7 @@ mod tests {
 
     #[test]
     fn on_hw_validate_finished_untouched_latch_upgrades_defaults() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::HwValidate, JobStatus::running("hw-validate"));
@@ -5422,7 +5470,7 @@ mod tests {
 
     #[test]
     fn on_hw_validate_finished_touched_latch_never_flips() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::HwValidate, JobStatus::running("hw-validate"));
@@ -5447,7 +5495,7 @@ mod tests {
 
     #[test]
     fn on_video_probe_finished_ok_seeds_decode_state() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::VideoProbe, JobStatus::running("probe"));
@@ -5471,7 +5519,7 @@ mod tests {
 
     #[test]
     fn on_video_probe_finished_err_surfaces_decode_error() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::VideoProbe, JobStatus::running("probe"));
@@ -5494,7 +5542,7 @@ mod tests {
 
     #[test]
     fn on_offload_scan_finished_applies_default_selection_and_spawns_duration_probe() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::OffloadScan, JobStatus::running("scan"));
@@ -5528,7 +5576,7 @@ mod tests {
 
     #[test]
     fn on_offload_scan_finished_empty_cards_spawns_nothing() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::OffloadScan, JobStatus::running("scan"));
@@ -5550,7 +5598,7 @@ mod tests {
 
     #[test]
     fn on_duration_result_updates_both_maps_and_bumps_version() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         let pre_version = els.current.offload.durations_version;
         let path = PathBuf::from("/media/card/clip.MP4");
 
@@ -5566,7 +5614,7 @@ mod tests {
 
     #[test]
     fn on_duration_probe_finished_applies_outcome() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::DurationProbe, JobStatus::running("durations"));
@@ -5581,7 +5629,7 @@ mod tests {
 
     #[test]
     fn on_offload_copy_finished_success_records_handoff_once() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::OffloadCopy, JobStatus::running("copy"));
@@ -5619,7 +5667,7 @@ mod tests {
 
     #[test]
     fn on_offload_copy_finished_empty_completion_never_yanks_converter() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::OffloadCopy, JobStatus::running("copy"));
@@ -5641,7 +5689,7 @@ mod tests {
 
     #[test]
     fn on_offload_copy_finished_cancelled_sets_error_not_handoff() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::OffloadCopy, JobStatus::running("copy"));
@@ -5668,7 +5716,7 @@ mod tests {
 
     #[test]
     fn on_group_clip_result_replaces_pending_and_ignores_out_of_range() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current.decode.group_paths = vec![PathBuf::from("a"), PathBuf::from("b")];
         els.current.decode.group_results = vec![ClipDecodeState::Pending, ClipDecodeState::Pending];
 
@@ -5688,7 +5736,7 @@ mod tests {
 
     #[test]
     fn on_group_decode_finished_applies_once_per_generation() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current
             .jobs
             .insert(JobKind::LtcGroupDecode, JobStatus::running("group"));
@@ -5773,7 +5821,7 @@ mod tests {
 
     #[test]
     fn sync_job_statuses_empty_supervisor_leaves_jobs_untouched() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         let mut status = JobStatus::running("conversion");
         status.progress.phase = JobPhase::Failed;
         els.current.jobs.insert(JobKind::Conversion, status);
@@ -5807,7 +5855,7 @@ mod tests {
             },
         );
 
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             sync_job_statuses(&mut els, &mut sup);
@@ -5833,7 +5881,7 @@ mod tests {
     fn publish_if_changed_stores_only_on_change() {
         let shared: Arc<ArcSwap<AppStateSnapshot>> =
             Arc::new(ArcSwap::from_pointee(AppStateSnapshot::initial()));
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
 
         publish_if_changed(&mut els, &shared);
         let first = els.last_published.clone().unwrap();
@@ -5857,7 +5905,7 @@ mod tests {
 
     #[test]
     fn offload_device_name_commands_update_card_by_index_and_mount() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current.offload.cards = vec![
             sd_card("CAM-A", vec![offload_file("a.MP4", 10)]),
             sd_card("CAM-B", vec![offload_file("b.MP4", 20)]),
@@ -5895,7 +5943,7 @@ mod tests {
 
     #[test]
     fn offload_selection_commands_update_counts_and_bytes() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current.offload.cards = vec![sd_card(
             "CAM-A",
             vec![offload_file("a.MP4", 10), offload_file("b.MP4", 30)],
@@ -5942,7 +5990,7 @@ mod tests {
 
     #[test]
     fn offload_start_guard_rejects_no_cards_then_no_parent() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         let mut sup = JobSupervisor::new();
 
         handle_offload_command(
@@ -5970,7 +6018,7 @@ mod tests {
 
     #[test]
     fn offload_start_guard_rejects_no_files_selected() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         els.current.offload.cards = vec![sd_card("CAM-A", vec![offload_file("a.MP4", 10)])];
         els.current.offload.parent_folder = Some(PathBuf::from("/parent"));
         let mut sup = JobSupervisor::new();
@@ -5989,7 +6037,7 @@ mod tests {
 
     #[test]
     fn offload_scan_cards_ignores_duplicate_while_running() {
-        let mut els = EngineLoopState::new(AppStateSnapshot::initial());
+        let mut els = test_els(AppStateSnapshot::initial());
         let cancel = CancelToken::new();
         let parked = cancel.clone();
         els.scan_cards = Arc::new(move |_cancel, _progress| {
