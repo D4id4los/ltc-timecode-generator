@@ -1089,7 +1089,8 @@ fn resolve_collision(name: &str, used: &mut HashMap<String, u32>) -> String {
 /// Copy a single file with 1 MiB chunked IO.
 ///
 /// Reads the source in `COPY_BUF_SIZE` chunks, writes each chunk to a
-/// `.offload_tmp` file beside the destination, then atomically renames.
+/// `.offload_tmp` file beside the destination, preserves the source's
+/// timestamps, then atomically renames.
 /// Checks `cancel` per chunk and calls `on_progress` with the cumulative
 /// bytes written so far.
 fn copy_file(
@@ -1100,6 +1101,9 @@ fn copy_file(
 ) -> Result<(), CopyError> {
     let src_file =
         fs::File::open(src).map_err(|e| CopyError::Io(format!("Cannot open {:?}: {}", src, e)))?;
+    // Stat before the read loop: reading the source can bump its access
+    // time, and the pre-read value is the one worth preserving.
+    let src_meta = src_file.metadata().ok();
     let mut src_file = std::io::BufReader::with_capacity(COPY_BUF_SIZE, src_file);
 
     let tmp = dst.with_extension("offload_tmp");
@@ -1132,10 +1136,42 @@ fn copy_file(
     dst_file
         .sync_all()
         .map_err(|e| CopyError::Io(format!("Sync error on {:?}: {}", tmp, e)))?;
+    if let Some(meta) = &src_meta {
+        apply_source_attributes(&dst_file, meta);
+    }
     drop(dst_file);
     fs::rename(&tmp, dst)
         .map_err(|e| CopyError::Io(format!("Rename {:?} → {:?}: {}", tmp, dst, e)))?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+use std::os::macos::fs::FileTimesExt;
+/// Best-effort preservation of the source file's timestamps on the freshly
+/// written copy: modified + accessed on every platform, created additionally
+/// where std supports setting it (Windows, macOS — Linux has no creation-time
+/// API in std). Failures are warn-logged, never fail the copy: a byte-verified
+/// file with a wrong timestamp beats a failed offload on a filesystem that
+/// rejects timestamps (exFAT, network mounts). Applied to the temp file
+/// before the atomic rename, so the destination is never visible with copy
+/// timestamps; rename carries the times across unchanged.
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::FileTimesExt;
+fn apply_source_attributes(dst_file: &fs::File, src_meta: &fs::Metadata) {
+    let mut times = fs::FileTimes::new();
+    if let Ok(t) = src_meta.modified() {
+        times = times.set_modified(t);
+    }
+    if let Ok(t) = src_meta.accessed() {
+        times = times.set_accessed(t);
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    if let Ok(t) = src_meta.created() {
+        times = times.set_created(t);
+    }
+    if let Err(e) = dst_file.set_times(times) {
+        warn!("Could not preserve timestamps: {}", e);
+    }
 }
 
 // ── Verification ────────────────────────────────────────────────────────
@@ -1560,6 +1596,7 @@ mod tests {
     };
     use std::fs;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
     // ── default_parent_name ──────────────────────────────────────────
@@ -1887,6 +1924,78 @@ mod tests {
         assert!(matches!(result, Err(CopyError::Cancelled)));
         // Destination should not exist.
         assert!(!dst.exists());
+    }
+
+    // ── copy_file attribute preservation ──────────────────────────────
+
+    /// Whole-second `SystemTime` `ago` seconds in the past. Subsecond
+    /// precision is truncated so exact-equality assertions survive
+    /// filesystem timestamp granularity (e.g. exFAT rounds to 2 s).
+    fn whole_seconds_ago(ago: Duration) -> SystemTime {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        UNIX_EPOCH + Duration::from_secs(now_secs - ago.as_secs())
+    }
+
+    /// Backdate a file's modified time (needs a writable open).
+    fn backdate_mtime(path: &Path, past: SystemTime) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+
+    #[test]
+    fn copy_file_preserves_source_modified_time() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        fs::write(&src, vec![0x42u8; 64 * 1024]).unwrap();
+        let past = whole_seconds_ago(Duration::from_secs(2 * 24 * 3600));
+        backdate_mtime(&src, past);
+
+        let cancel = AtomicBool::new(false);
+        copy_file(&src, &dst, &cancel, &mut |_| {}).unwrap();
+
+        let dst_mtime = fs::metadata(&dst).unwrap().modified().unwrap();
+        assert_eq!(
+            dst_mtime, past,
+            "copied file must carry the source's modified time, not the copy time"
+        );
+    }
+
+    // Windows is the only platform CI runs tests on where std supports
+    // setting/reading the creation time (macOS support stays best-effort
+    // by design and is not pinned by an unvalidatable test).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn copy_file_preserves_source_created_time() {
+        use std::fs::FileTimes;
+
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        fs::write(&src, vec![0x42u8; 64 * 1024]).unwrap();
+        let past = whole_seconds_ago(Duration::from_secs(3 * 24 * 3600));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_times(FileTimes::new().set_created(past).set_modified(past))
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        copy_file(&src, &dst, &cancel, &mut |_| {}).unwrap();
+
+        let dst_created = fs::metadata(&dst).unwrap().created().unwrap();
+        assert_eq!(
+            dst_created, past,
+            "copied file must carry the source's creation time"
+        );
     }
 
     // ── detect_cards_from_mounts ──────────────────────────────────────
@@ -2562,6 +2671,55 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
             );
         }
         let _ = tracker; // progress tracker exercised by other copy tests
+    }
+
+    #[test]
+    fn copy_job_preserves_source_modified_times() {
+        let dir = TempDir::new().unwrap();
+
+        let src_a = dir.path().join("clip_a.bin");
+        let src_b = dir.path().join("clip_b.bin");
+        fs::write(&src_a, vec![0x11u8; 64 * 1024]).unwrap();
+        fs::write(&src_b, vec![0x22u8; 64 * 1024]).unwrap();
+        let past_a = whole_seconds_ago(Duration::from_secs(5 * 24 * 3600));
+        let past_b = whole_seconds_ago(Duration::from_secs(24 * 3600));
+        backdate_mtime(&src_a, past_a);
+        backdate_mtime(&src_b, past_b);
+
+        let dst_a = dir.path().join("out_a.bin");
+        let dst_b = dir.path().join("out_b.bin");
+        let (ctx, _tracker) = test_job_context();
+        let plans = vec![vec![
+            CopyPlanItem {
+                src: src_a,
+                dst: dst_a.clone(),
+                size: 64 * 1024,
+            },
+            CopyPlanItem {
+                src: src_b,
+                dst: dst_b.clone(),
+                size: 64 * 1024,
+            },
+        ]];
+
+        // Real copy backend: attribute preservation lives inside copy_file.
+        let result = run_offload_copy_job(
+            &ctx,
+            plans,
+            vec!["DEVICE".to_string()],
+            dir.path().to_path_buf(),
+        );
+        assert!(result.is_ok(), "copy job should succeed");
+
+        for (dst, expected) in [(&dst_a, past_a), (&dst_b, past_b)] {
+            let mtime = fs::metadata(dst).unwrap().modified().unwrap();
+            assert_eq!(
+                mtime,
+                expected,
+                "destination {} must carry its source's modified time",
+                dst.display()
+            );
+        }
     }
 
     // ── Byte-granular progress contract of run_offload_copy_job_with ────
