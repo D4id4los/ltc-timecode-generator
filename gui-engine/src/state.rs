@@ -307,6 +307,10 @@ impl StatusChannels {
 
 // ── Application state snapshot ─────────────────────────────────────────
 
+/// Selectable accessibility text scales in percent (see
+/// `GuiCommand::SetTextScale`; 100 = default size).
+pub const TEXT_SCALE_OPTIONS: &[u32] = &[100, 110, 125, 150, 175, 200];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppStateSnapshot {
     // Command acknowledgement counter — bumped by the engine once per
