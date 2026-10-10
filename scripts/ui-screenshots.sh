@@ -15,8 +15,9 @@
 #   scripts/ui-screenshots.sh --out /tmp/shots     # different output dir
 #   scripts/ui-screenshots.sh --tabs clapper,offload
 #   scripts/ui-screenshots.sh --width 1280 --height 900 --dwell 4
+#   scripts/ui-screenshots.sh --text-scale 150 --suffix -150pct
 #
-# Output naming: <out>/ltc-timecode-generator-<tab>-tab.png
+# Output naming: <out>/ltc-timecode-generator-<tab><suffix>.png
 
 set -euo pipefail
 
@@ -27,6 +28,8 @@ WIDTH=1000
 HEIGHT=800
 DWELL=3      # seconds per tab inside the app
 SETTLE=1.2   # seconds after a tab switch before capturing (let a frame draw)
+TEXT_SCALE=100  # accessibility text scale in percent (50..400)
+SUFFIX=""    # output filename suffix, e.g. "-150pct"
 EXAMPLE="ltc-gui/examples/ui_screenshots.rs"
 
 while [[ $# -gt 0 ]]; do
@@ -36,7 +39,9 @@ while [[ $# -gt 0 ]]; do
         --width) WIDTH="$2"; shift 2 ;;
         --height) HEIGHT="$2"; shift 2 ;;
         --dwell) DWELL="$2"; shift 2 ;;
-        -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --text-scale) TEXT_SCALE="$2"; shift 2 ;;
+        --suffix) SUFFIX="$2"; shift 2 ;;
+        -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -109,6 +114,9 @@ struct CycleApp {
     switched_at: Instant,
     dwell: Duration,
     announced: bool,
+    /// Snapshot text-scale override (LTC_SNAPSHOT_TEXT_SCALE), re-applied
+    /// after AppState::logic each frame.
+    scale_override: Option<u32>,
     /// Tabs the driver wants (LTC_SNAPSHOT_TABS); the app exits once each
     /// has been shown for one full dwell.
     wanted: HashSet<String>,
@@ -147,6 +155,11 @@ impl eframe::App for CycleApp {
             self.switch();
         }
         AppState::logic(&mut self.inner, ctx, frame);
+        // The app re-applies the engine-owned scale every frame; pin the
+        // snapshot override so captures can use a different scale.
+        if let Some(percent) = self.scale_override {
+            text::set_text_scale(percent);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -163,6 +176,9 @@ fn main() {
     let dwell = Duration::from_secs(
         std::env::var("LTC_SNAPSHOT_DWELL").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
     );
+    if let Ok(percent) = std::env::var("LTC_SNAPSHOT_TEXT_SCALE") {
+        text::set_text_scale(percent.trim().parse().expect("bad LTC_SNAPSHOT_TEXT_SCALE"));
+    }
     let wanted: HashSet<String> = std::env::var("LTC_SNAPSHOT_TABS")
         .unwrap_or_else(|_| "clapper,settings,converter,offload".into())
         .split(',')
@@ -187,6 +203,9 @@ fn main() {
                 switched_at: Instant::now(),
                 dwell,
                 announced: false,
+                scale_override: std::env::var("LTC_SNAPSHOT_TEXT_SCALE")
+                    .ok()
+                    .map(|p| p.trim().parse().expect("bad LTC_SNAPSHOT_TEXT_SCALE")),
                 wanted,
                 shown: HashSet::new(),
                 all_shown: false,
@@ -221,8 +240,9 @@ echo ">> building screenshot harness ..."
 (cd "$REPO_ROOT" && cargo build -p ltc-gui --example ui_screenshots >/dev/null)
 
 LOG="$(mktemp)"
-echo ">> running app (dwell ${DWELL}s/tab), capturing to $OUT_DIR"
+echo ">> running app (dwell ${DWELL}s/tab, text-scale ${TEXT_SCALE}%), capturing to $OUT_DIR"
 LIBGL_ALWAYS_SOFTWARE=1 LTC_SNAPSHOT_DWELL="$DWELL" LTC_SNAPSHOT_SIZE="${WIDTH}x${HEIGHT}" \
+    LTC_SNAPSHOT_TEXT_SCALE="$TEXT_SCALE" \
     LTC_SNAPSHOT_TABS="$(IFS=,; echo "${TABS[*]}")" \
     "$REPO_ROOT/target/debug/examples/ui_screenshots" > "$LOG" 2>&1 &
 APP_PID=$!
@@ -244,7 +264,7 @@ while [[ $SECONDS -lt $deadline ]]; do
                 tab="${line#SNAPSHOT-TAB }"
                 if [[ "$wanted" != *" $tab "* ]]; then continue; fi
                 sleep "$SETTLE"
-                dest="$OUT_DIR/ltc-timecode-generator-$tab-tab.png"
+                dest="$OUT_DIR/ltc-timecode-generator-$tab${SUFFIX}-tab.png"
                 if capture_shot "$dest" && [[ -s "$dest" ]]; then
                     captured+=("$tab")
                     echo "   captured $tab -> $dest"
