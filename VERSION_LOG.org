@@ -1,6 +1,15 @@
 #+TITLE: Version History for LTC Timecode Generator
 
-* Unreleased
+* v0.7.0
+
+Main features are recording sessions — named sessions that persist fps,
+drop-frame, start timecode and the last emitted timecode across launches,
+with one-click "Continue…" resume at last-emitted-plus-gap and a
+one-click session default conversion of every recording in the session's
+offload destinations — plus corrected offload progress reporting
+(fresh status per run, durable 100%, typed cancellation, honest partial
+outcomes), resume-from-pause transport behaviour, per-file convert
+selection, and hover tooltips throughout ltc-gui.
 
 List of Changes:
 - Convert: session default conversion (Phase 4) — one-click "Convert
