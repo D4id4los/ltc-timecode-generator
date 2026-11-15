@@ -196,6 +196,10 @@ pub struct OffloadSnapshot {
     /// Outcome summary of the most recent copy run; `None` while no run has
     /// finished since the last `StartOffload`.
     pub run_summary: Option<OffloadRunSummary>,
+    /// The recording day (ISO date) the post-scan default selection covers,
+    /// if any — explains to the user why only part of a card's files are
+    /// pre-selected. Cleared when the user overrides the selection manually.
+    pub selected_day: Option<String>,
 }
 
 impl OffloadSnapshot {
@@ -213,6 +217,7 @@ impl OffloadSnapshot {
             file_durations: HashMap::new(),
             durations_version: 0,
             run_summary: None,
+            selected_day: None,
         }
     }
 }

@@ -1977,6 +1977,19 @@ fn on_offload_scan_finished(
         crate::offload::apply_selection(card, sel);
     }
     els.current.offload.cards = cards;
+    // Explain the day-filter default: which recording day the pre-selection
+    // covers (selection-defect E in the phase-1 plan — a partial 0/N
+    // pre-selection is otherwise unexplained in the tab).
+    els.current.offload.selected_day = els
+        .current
+        .offload
+        .cards
+        .iter()
+        .flat_map(|c| c.files.iter())
+        .filter_map(|f| f.modified)
+        .map(|dt| dt.date_naive())
+        .max()
+        .map(|d| d.format("%Y-%m-%d").to_string());
     els.current.offload.file_durations.clear();
     els.current.offload.durations_version = els.current.offload.durations_version.wrapping_add(1);
 
@@ -2429,6 +2442,9 @@ fn handle_offload_command(
                         .filter(|(_, &sel)| sel)
                         .map(|(f, _)| f.size_bytes)
                         .sum();
+                    // Manual override: the day-filter explanation no longer
+                    // describes the selection.
+                    state.offload.selected_day = None;
                 }
             }
         }
@@ -2437,6 +2453,7 @@ fn handle_offload_command(
             if let Some(card) = state.offload.cards.get_mut(card_idx) {
                 let sel = vec![selected; card.files.len()];
                 crate::offload::apply_selection(card, sel);
+                state.offload.selected_day = None;
             }
         }
 
@@ -2444,6 +2461,8 @@ fn handle_offload_command(
             if let Some(card) = state.offload.cards.get_mut(card_idx) {
                 let sel = crate::offload::default_selection(&card.files);
                 crate::offload::apply_selection(card, sel);
+                state.offload.selected_day = crate::offload::latest_recording_date(&card.files)
+                    .map(|d| d.format("%Y-%m-%d").to_string());
             }
         }
 
