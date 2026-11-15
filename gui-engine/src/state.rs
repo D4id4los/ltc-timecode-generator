@@ -9,6 +9,9 @@ use crate::file_pattern::MatchedGroup;
 use crate::job::{JobKind, JobStatus};
 use crate::naming::{DEFAULT_AUDIO_SUFFIX, DEFAULT_PREFIX, DEFAULT_VIDEO_SUFFIX};
 use crate::offload::OffloadSnapshot;
+use crate::session_conversion::{
+    SessionConversionDefaults, SessionPreflightReport, SessionRunSummary,
+};
 use crate::timecode::FPS_OPTIONS;
 use audio_core::{AudioDeviceInfo, ChannelSel, LtcDetectionResult, Timecode};
 
@@ -262,6 +265,26 @@ pub struct SessionListItem {
     pub drop_frame: bool,
 }
 
+// ── Session default conversion snapshot (engine-owned) ─────────────────
+
+/// Engine-managed session-conversion state: the persisted defaults
+/// profile (mirrored for rendering), the preflight report, and the last
+/// run summary. GUIs render this verbatim.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SessionConversionSnapshot {
+    /// The persisted `SessionConversionDefaults` profile. Engine-owned;
+    /// setters persist on change.
+    pub defaults: SessionConversionDefaults,
+    /// Last preflight report; `None` until the first preflight ran.
+    /// Failures block the run until cleared (`ClearPreflight`).
+    pub preflight: Option<SessionPreflightReport>,
+    /// Summary of the last conversion run (honest partial: `partial`
+    /// true with per-group failures).
+    pub run: Option<SessionRunSummary>,
+    /// Lifecycle error (no active session, empty destinations, …).
+    pub error: Option<String>,
+}
+
 // ── Status channels ─────────────────────────────────────────────────────
 
 /// Which subsystem last wrote to [`StatusChannels`].
@@ -430,6 +453,8 @@ pub struct AppStateSnapshot {
     pub session: Option<ActiveSessionView>,
     /// All persisted sessions, newest-active first (the "Continue" list).
     pub available_sessions: Vec<SessionListItem>,
+    /// Session default conversion (defaults profile, preflight, run).
+    pub session_conversion: SessionConversionSnapshot,
 }
 
 impl AppStateSnapshot {
@@ -509,6 +534,7 @@ impl AppStateSnapshot {
             offload: OffloadSnapshot::initial(),
             session: None,
             available_sessions: Vec::new(),
+            session_conversion: SessionConversionSnapshot::default(),
         }
     }
 

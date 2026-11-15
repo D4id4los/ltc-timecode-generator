@@ -129,6 +129,23 @@ pub fn decode_ltc_chunked(
     config: DecodeConfig,
     progress: &DecodeProgress,
 ) -> Result<LtcDetectionResult, LtcDecodeError> {
+    decode_ltc_chunked_channel(path, use_libltc, fps, drop_frame, config, progress, None)
+}
+
+/// Like [`decode_ltc_chunked`] but with an explicit channel selection.
+///
+/// `channel = Some(n)` pins the decode channel (no auto-pick) — the session
+/// preflight decodes candidate channels of multi-track location WAVs this
+/// way. `channel = None` restores the auto-pick behaviour above.
+pub fn decode_ltc_chunked_channel(
+    path: &Path,
+    use_libltc: bool,
+    fps: f64,
+    drop_frame: bool,
+    config: DecodeConfig,
+    progress: &DecodeProgress,
+    channel: Option<usize>,
+) -> Result<LtcDetectionResult, LtcDecodeError> {
     let (mut chunk_reader, overall_start) =
         WavChunkReader::open(path).map_err(LtcDecodeError::Failed)?;
     let mut plan = plan_chunks(&chunk_reader, &config);
@@ -144,18 +161,27 @@ pub fn decode_ltc_chunked(
     }
 
     // Pick the decode channel once per file, before chunk planning, so every
-    // chunk decodes the same channel: if channel 0 is (near-)silent, the
-    // channel carrying signal is decoded instead.
-    let peaks = chunk_reader
-        .scan_channel_peaks()
-        .map_err(LtcDecodeError::Failed)?;
-    plan.active_channel = crate::ltc_decoder::pick_active_channel(&peaks);
-    if plan.active_channel != 0 {
-        info!(
-            "decode_ltc_chunked: channel 0 is silent, decoding channel {}",
-            plan.active_channel
-        );
-    }
+    // chunk decodes the same channel: explicit pin when given, otherwise
+    // auto-pick (channel 0 unless near-silent, then the loudest channel).
+    plan.active_channel = match channel {
+        Some(ch) => {
+            info!("decode_ltc_chunked_channel: pinned channel {}", ch);
+            ch
+        }
+        None => {
+            let peaks = chunk_reader
+                .scan_channel_peaks()
+                .map_err(LtcDecodeError::Failed)?;
+            let picked = crate::ltc_decoder::pick_active_channel(&peaks);
+            if picked != 0 {
+                info!(
+                    "decode_ltc_chunked: channel 0 is silent, decoding channel {}",
+                    picked
+                );
+            }
+            picked
+        }
+    };
 
     let num_chunks = plan.boundaries.len();
     info!(

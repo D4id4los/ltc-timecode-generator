@@ -85,6 +85,11 @@ pub enum GuiCommand {
     /// Manage the recording-session lifecycle (create/load/close/gap).
     Session(SessionCommand),
 
+    // ── Session default conversion (engine-owned) ──────────────────────
+    /// Preflight + one-click conversion of all session recordings using
+    /// the persisted `SessionConversionDefaults` profile.
+    SessionConversion(SessionConversionCommand),
+
     // ── Shutdown ────────────────────────────────────────────────────────
     CancelDecode,
     Shutdown,
@@ -219,4 +224,36 @@ pub enum SessionCommand {
     Close,
     /// Set the per-session continue gap in seconds (applied on load).
     SetContinueGapSeconds(u64),
+}
+
+/// Commands for the session default conversion subsystem (phase 4):
+/// preflight-decode every recording in the active session's offload
+/// destinations, report per-file resolved LTC channels, and run the
+/// owner's default pipelines. Never auto-run — button + preflight report.
+#[derive(Debug, Clone)]
+pub enum SessionConversionCommand {
+    /// Preflight-decode every recording of the active session's offload
+    /// destinations (channel resolution: configured → pinned → scan).
+    RunPreflight,
+    /// Run the default pipelines over the preflight-validated groups.
+    /// Ignored while preflight failures are unresolved (missing LTC is a
+    /// real error — fix channel defaults or convert that recording
+    /// manually).
+    StartRun,
+    /// Cancel the in-flight preflight or run.
+    Cancel,
+    /// Clear the preflight report (unblocks the UI after acknowledging).
+    ClearPreflight,
+    // ── Defaults setters (persisted profile) ────────────────────────────
+    SetAudioLtcChannelOverride(Option<usize>),
+    SetVideoLtcStream(usize),
+    SetVideoLtcChannel(usize),
+    SetAudioLtcFileIdx(usize),
+    SetVideoContainerOverride(Option<String>),
+    SetVideoCodecOverride(Option<String>),
+    SetAudioEncoderOverride(Option<String>),
+    SetSplitTracks(bool),
+    SetDropLtcTrack(bool),
+    SetStartFromLtc(bool),
+    SetEmbedCameraMetadata(bool),
 }

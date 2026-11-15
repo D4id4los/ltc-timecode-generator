@@ -278,6 +278,9 @@ fn engine_main_loop(
     // Sessions are never auto-activated at startup (restart keeps the
     // reset-to-default behaviour) — only listed for the Continue picker.
     els.sessions = config::load_sessions();
+    // Session-conversion defaults profile: persisted, loaded once at
+    // startup; setters re-persist on change.
+    els.current.session_conversion.defaults = crate::session_conversion::load_session_defaults();
     sync_session_state(&mut els);
     els.scan_cards = seams.scan_cards;
     els.offload_copy = seams.offload_copy;
@@ -625,6 +628,10 @@ fn process_command(
 
         GuiCommand::Session(cmd) => {
             handle_session_command(cmd, core, els);
+        }
+
+        GuiCommand::SessionConversion(cmd) => {
+            handle_session_conversion_command(cmd, els, supervisor);
         }
 
         GuiCommand::Shutdown => {
@@ -1815,6 +1822,8 @@ fn handle_job_event(els: &mut EngineLoopState, supervisor: &mut JobSupervisor, e
             JobKind::LtcDecode => on_ltc_decode_finished(els, outcome, payload),
             JobKind::LtcGroupDecode => on_group_decode_finished(els, outcome, payload),
             JobKind::ClipProbe => on_clip_probes_finished(els, outcome, payload),
+            JobKind::SessionPreflight => on_session_preflight_finished(els, outcome, payload),
+            JobKind::SessionConversion => on_session_conversion_finished(els, outcome, payload),
         },
         JobEvent::Item { kind, item, .. } => match (kind, item) {
             (JobKind::DurationProbe, JobItem::DurationResult { path, secs }) => {
@@ -2869,6 +2878,300 @@ fn cmd_session_set_gap(gap: u64, els: &mut EngineLoopState) {
     save_session_logged(&snapshot);
     upsert_session(&mut els.sessions, snapshot);
     sync_session_state(els);
+}
+
+// ── Session default conversion command handlers ─────────────────────────
+
+/// Apply a defaults setter and persist the profile (failures are logged,
+/// never fatal — the snapshot stays authoritative).
+fn set_session_defaults(
+    els: &mut EngineLoopState,
+    f: impl FnOnce(&mut crate::session_conversion::SessionConversionDefaults),
+) {
+    let state = &mut els.current.session_conversion;
+    let mut defaults = state.defaults.clone();
+    f(&mut defaults);
+    if defaults != state.defaults {
+        if let Err(e) = crate::session_conversion::save_session_defaults(&defaults) {
+            warn!("Failed to persist session defaults: {}", e);
+        }
+        state.defaults = defaults;
+    }
+}
+
+fn handle_session_conversion_command(
+    cmd: crate::command::SessionConversionCommand,
+    els: &mut EngineLoopState,
+    supervisor: &mut JobSupervisor,
+) {
+    use crate::command::SessionConversionCommand as C;
+    let state = &mut els.current;
+    match cmd {
+        C::SetAudioLtcChannelOverride(ch) => {
+            set_session_defaults(els, |d| d.channels.audio_ltc_channel_override = ch)
+        }
+        C::SetVideoLtcStream(v) => set_session_defaults(els, |d| d.channels.video_ltc_stream = v),
+        C::SetVideoLtcChannel(v) => set_session_defaults(els, |d| d.channels.video_ltc_channel = v),
+        C::SetAudioLtcFileIdx(v) => set_session_defaults(els, |d| d.audio.ltc_file_idx = v),
+        C::SetVideoContainerOverride(v) => {
+            set_session_defaults(els, |d| d.video.container_override = v)
+        }
+        C::SetVideoCodecOverride(v) => {
+            set_session_defaults(els, |d| d.video.video_codec_override = v)
+        }
+        C::SetAudioEncoderOverride(v) => {
+            set_session_defaults(els, |d| d.video.audio_encoder_override = v)
+        }
+        C::SetSplitTracks(v) => set_session_defaults(els, |d| d.video.split_tracks = v),
+        C::SetDropLtcTrack(v) => set_session_defaults(els, |d| d.video.drop_ltc_track = v),
+        C::SetStartFromLtc(v) => set_session_defaults(els, |d| d.video.set_start_from_ltc = v),
+        C::SetEmbedCameraMetadata(v) => {
+            set_session_defaults(els, |d| d.video.embed_camera_metadata = v)
+        }
+        C::ClearPreflight => {
+            state.session_conversion.preflight = None;
+            state.session_conversion.error = None;
+        }
+        C::RunPreflight => cmd_session_preflight(els, supervisor),
+        C::StartRun => cmd_session_run(els, supervisor),
+        C::Cancel => {
+            supervisor.cancel(JobKind::SessionPreflight);
+            supervisor.cancel(JobKind::SessionConversion);
+            state.status.set_converter("Session conversion canceled");
+        }
+    }
+}
+
+fn cmd_session_preflight(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
+    let state = &mut els.current;
+    if supervisor.is_running(JobKind::SessionPreflight)
+        || supervisor.is_running(JobKind::SessionConversion)
+    {
+        info!("Session preflight/conversion already running — ignoring duplicate");
+        return;
+    }
+    let Some(session) = els.active_session.clone() else {
+        let msg = "Session conversion: no active session — create or load one first";
+        state.session_conversion.error = Some(msg.to_string());
+        state.status.set_converter(msg);
+        warn!("{}", msg);
+        return;
+    };
+    if session.offload_destinations.is_empty() {
+        let msg = "Session conversion: the session has no offload destinations yet";
+        state.session_conversion.error = Some(msg.to_string());
+        state.status.set_converter(msg);
+        warn!("{}", msg);
+        return;
+    }
+    let destinations: Vec<PathBuf> = session
+        .offload_destinations
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    let groups = crate::session_conversion::collect_preflight_groups(
+        &destinations,
+        state.session_conversion.defaults.audio.ltc_file_idx,
+    );
+    if groups.is_empty() {
+        let msg = "Session conversion: no recordings found in the session destinations";
+        state.session_conversion.error = Some(msg.to_string());
+        state.status.set_converter(msg);
+        warn!("{}", msg);
+        return;
+    }
+    let units = crate::session_conversion::session_unit_specs(&groups);
+    let defaults = state.session_conversion.defaults.clone();
+    let fps = state.fps();
+    let drop_frame = state.drop_frame();
+    state.session_conversion.error = None;
+    state.session_conversion.preflight = None;
+    state.session_conversion.run = None;
+    state.jobs.insert(
+        JobKind::SessionPreflight,
+        JobStatus::running("Preflight: decoding session LTC…"),
+    );
+    state.status.set_converter("Session preflight started…");
+
+    let spec = job::JobSpec {
+        kind: JobKind::SessionPreflight,
+        name: "session-preflight",
+        units,
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        let mut decode = |req: &crate::session_conversion::PreflightDecodeRequest<'_>| {
+            crate::session_conversion::preflight_decode_real(req)
+        };
+        let device_of =
+            |files: &[PathBuf]| crate::device_name::resolve_device_name(files, "", None).0;
+        crate::session_conversion::run_session_preflight_with(
+            ctx,
+            &groups,
+            &defaults,
+            fps,
+            drop_frame,
+            &mut decode,
+            &device_of,
+        )
+    });
+}
+
+fn on_session_preflight_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::SessionPreflight) {
+        status.apply_outcome(&outcome);
+    }
+    let JobFinal::SessionPreflight { report } = payload else {
+        if !matches!(payload, JobFinal::NoPayload) {
+            warn!(
+                "JobKind::SessionPreflight finished with unexpected payload: {:?}",
+                payload
+            );
+        }
+        return;
+    };
+    let state = &mut els.current;
+    if report.has_failures() {
+        let msg = format!(
+            "Preflight FAILED for {} recording(s): LTC not found after trying all \
+             candidate channels. Fix channel defaults or convert those recordings \
+             manually — the run is blocked.",
+            report.failures.len()
+        );
+        state.session_conversion.preflight = Some((*report).clone());
+        state.status.set_converter(msg.clone());
+        warn!("{}", msg);
+    } else {
+        let msg = format!(
+            "Preflight complete: {} recording(s), LTC resolved on all files",
+            report.groups.len()
+        );
+        state.session_conversion.preflight = Some((*report).clone());
+        state.status.set_converter(msg.clone());
+        info!("{}", msg);
+    }
+}
+
+fn cmd_session_run(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
+    let state = &mut els.current;
+    if supervisor.is_running(JobKind::SessionPreflight)
+        || supervisor.is_running(JobKind::SessionConversion)
+    {
+        info!("Session conversion already running — ignoring duplicate StartRun");
+        return;
+    }
+    let Some(report) = state.session_conversion.preflight.clone() else {
+        let msg = "Session conversion: run the preflight first";
+        state.session_conversion.error = Some(msg.to_string());
+        state.status.set_converter(msg);
+        return;
+    };
+    if report.has_failures() {
+        let msg = "Session conversion blocked: unresolved preflight failures (missing LTC)";
+        state.session_conversion.error = Some(msg.to_string());
+        state.status.set_converter(msg);
+        warn!("{}", msg);
+        return;
+    }
+    let resolved = select_best_combination_caps(&state.ffmpeg_caps);
+    let jobs: Vec<crate::session_conversion::SessionGroupJob> = report
+        .groups
+        .iter()
+        .map(|group| crate::session_conversion::SessionGroupJob {
+            settings: crate::session_conversion::assemble_session_group_settings(
+                group,
+                &state.session_conversion.defaults,
+                resolved.clone(),
+            ),
+            group: group.clone(),
+        })
+        .collect();
+    let caps = state.ffmpeg_caps.clone();
+    let units = crate::session_conversion::session_unit_specs(
+        &report
+            .groups
+            .iter()
+            .map(|g| crate::session_conversion::PreflightGroup {
+                dest: g.dest.clone(),
+                prefix: g.prefix.clone(),
+                kind: g.kind.clone(),
+                files: g.files.iter().map(|f| f.path.clone()).collect(),
+                ltc_file_idx: 0,
+            })
+            .collect::<Vec<_>>(),
+    );
+    state.session_conversion.error = None;
+    state.session_conversion.run = None;
+    state.jobs.insert(
+        JobKind::SessionConversion,
+        JobStatus::running("Converting session recordings…"),
+    );
+    state.status.set_converter("Session conversion started…");
+
+    let spec = job::JobSpec {
+        kind: JobKind::SessionConversion,
+        name: "session-conversion",
+        units,
+    };
+    spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
+        let mut run = crate::session_conversion::session_group_runner_real(ctx);
+        crate::session_conversion::run_session_conversion_with(ctx, jobs, caps, &mut run)
+    });
+}
+
+/// `select_best_combination` over possibly-absent caps (callers without a
+/// probe get the interactive pipeline's static defaults).
+fn select_best_combination_caps(
+    caps: &Option<FfmpegCapabilities>,
+) -> (String, String, String) {
+    match caps {
+        Some(c) => select_best_combination(c),
+        None => (
+            "mov".to_string(),
+            "h265".to_string(),
+            "pcm_s24le".to_string(),
+        ),
+    }
+}
+
+fn on_session_conversion_finished(
+    els: &mut EngineLoopState,
+    outcome: JobOutcome,
+    payload: JobFinal,
+) {
+    if let Some(status) = els.current.jobs.get_mut(&JobKind::SessionConversion) {
+        status.apply_outcome(&outcome);
+    }
+    let JobFinal::SessionConversion { summary } = payload else {
+        if !matches!(payload, JobFinal::NoPayload) {
+            warn!(
+                "JobKind::SessionConversion finished with unexpected payload: {:?}",
+                payload
+            );
+        }
+        return;
+    };
+    let state = &mut els.current;
+    let ok = summary.completed_count();
+    let total = summary.outcomes.len();
+    let msg = if summary.partial {
+        format!(
+            "Session conversion PARTIAL: {}/{} recording(s) converted — see the \
+             report for the failed groups",
+            ok, total
+        )
+    } else {
+        format!(
+            "Session conversion complete: {}/{} recording(s) converted",
+            ok, total
+        )
+    };
+    state.session_conversion.run = Some((*summary).clone());
+    state.status.set_converter(msg.clone());
+    if summary.partial {
+        warn!("{}", msg);
+    } else {
+        info!("{}", msg);
+    }
 }
 
 // ── Converter helper functions ─────────────────────────────────────────

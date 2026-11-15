@@ -26,7 +26,7 @@ pub use types::{
 
 // ── Chunked LTC decode ────────────────────────────────────────────────────
 
-pub use chunked_decode::{count_chunks, count_chunks_in_wav, decode_ltc_chunked};
+pub use chunked_decode::{count_chunks, count_chunks_in_wav, decode_ltc_chunked, decode_ltc_chunked_channel};
 pub use wav_chunk_reader::WavChunkReader;
 
 // ── LTC encoder ───────────────────────────────────────────────────────────

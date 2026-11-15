@@ -1382,6 +1382,7 @@ mod tests {
             1,
             0,
             out,
+            ExtractSampleFormat::PcmS24le,
             Some(10.0),
             &|f| {
                 let mut p = fracs.lock().unwrap();

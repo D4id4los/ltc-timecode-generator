@@ -37,6 +37,12 @@ use gui_engine::job::{
 use gui_engine::offload::{
     run_offload_copy_job_with, run_offload_scan_job_with, CopyError, CopyPlanItem, SdCardInfo,
 };
+use gui_engine::session_conversion::{
+    run_session_conversion_with, run_session_preflight_with, PreflightDecodeRequest,
+    PreflightGroup, PreflightGroupResult, PreflightFileResult, SessionGroupJob,
+    ChannelCandidate, ChannelSource, SessionConversionDefaults,
+};
+use gui_engine::{JobError, RecordingType, UnitProgress};
 use tempfile::TempDir;
 
 // ── Shared helpers ───────────────────────────────────────────────────────
@@ -106,7 +112,9 @@ fn has_registered_contract(kind: JobKind) -> bool {
         | JobKind::VideoProbe
         | JobKind::DurationProbe
         | JobKind::FfmpegCapProbe
-        | JobKind::HwValidate => true,
+        | JobKind::HwValidate
+        | JobKind::SessionPreflight
+        | JobKind::SessionConversion => true,
     }
 }
 
@@ -124,13 +132,15 @@ const ALL_KINDS: &[JobKind] = &[
     JobKind::DurationProbe,
     JobKind::FfmpegCapProbe,
     JobKind::HwValidate,
+    JobKind::SessionPreflight,
+    JobKind::SessionConversion,
 ];
 
 #[test]
 fn every_job_kind_has_a_registered_progress_contract_scenario() {
     assert_eq!(
         ALL_KINDS.len(),
-        11,
+        13,
         "a JobKind was added — register a contract scenario for it in progress_contract.rs"
     );
     for kind in ALL_KINDS {
@@ -492,4 +502,196 @@ fn ffmpeg_cap_probe_contract_is_registered_indeterminate_class() {
 #[test]
 fn hw_validate_contract_is_registered_indeterminate_class() {
     indeterminate_class_contract(JobKind::HwValidate, "contract-hw-validate");
+}
+
+// ── SessionPreflight ─────────────────────────────────────────────────────
+
+/// The preflight runner forwards the decode seam's in-seam fraction updates
+/// into the group's unit while the decode is still running (here: sampled
+/// inside the injected fake), and terminates full.
+#[test]
+fn session_preflight_forwards_decode_granularity_and_terminates() {
+    let dir = TempDir::new().unwrap();
+    let groups = vec![PreflightGroup {
+        dest: dir.path().to_path_buf(),
+        prefix: "grp".into(),
+        kind: RecordingType::MultiTrackAudio,
+        files: vec![dir.path().join("a.wav"), dir.path().join("b.wav")],
+        ltc_file_idx: 1,
+    }];
+    // Real multi-channel WAV headers so the channel probe sees candidates.
+    let spec = hound::WavSpec {
+        channels: 4,
+        sample_rate: 48000,
+        bits_per_sample: 24,
+        sample_format: hound::SampleFormat::Int,
+    };
+    for name in ["a.wav", "b.wav"] {
+        let mut w = hound::WavWriter::create(dir.path().join(name), spec).unwrap();
+        for _ in 0..64 {
+            for ch in 0..4 {
+                w.write_sample((50 * ch) as i32).unwrap();
+            }
+        }
+        w.flush().unwrap();
+    }
+
+    let (ctx, tracker) = job_context(vec![UnitSpec {
+        weight: 1.0,
+        label: "grp".into(),
+    }]);
+    let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let samples_for_fake = Arc::clone(&samples);
+    let tracker_for_fake = tracker.clone();
+
+    let mut decode = |req: &PreflightDecodeRequest<'_>| {
+        // Fake decode workload: advance the group unit *inside* the seam
+        // (the deterministic sampling point) and record tracker fractions.
+        if let Some(unit) = &req.unit {
+            unit.set_fraction(0.4);
+            unit.set_fraction(0.8);
+            samples_for_fake
+                .lock()
+                .unwrap()
+                .push(tracker_for_fake.snapshot().fraction);
+        }
+        let mut r = audio_core::LtcDetectionResult::error("");
+        r.status = audio_core::LtcDecodeStatus::Success;
+        r.detected_fps = req.fps as f32;
+        r.valid_frames = 10;
+        r.timecodes = vec![audio_core::FrameTimecode {
+            frame_index: 0,
+            timecode: audio_core::Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            timecode_secs: 0.0,
+        }];
+        Ok(r)
+    };
+    let device_of = |_: &[PathBuf]| "DEV".to_string();
+    let defaults = SessionConversionDefaults::default();
+
+    let out = run_session_preflight_with(&ctx, &groups, &defaults, 25.0, false, &mut decode, &device_of)
+        .expect("preflight completes");
+    assert!(matches!(out, JobFinal::SessionPreflight { .. }));
+    assert_progress_contract(&samples.lock().unwrap(), &tracker, "session-preflight");
+}
+
+// ── SessionConversion ───────────────────────────────────────────────────
+
+/// The session run forwards each group's in-seam encode fractions into that
+/// group's unit while the encode runs, and terminates full across all
+/// groups (equal-weight fake: two groups, both succeed).
+#[test]
+fn session_conversion_forwards_group_encode_granularity_and_terminates() {
+    let dir = TempDir::new().unwrap();
+    let mk_group = |prefix: &str, files: &[&str]| PreflightGroupResult {
+        dest: dir.path().to_path_buf(),
+        prefix: prefix.into(),
+        kind: RecordingType::MultiTrackAudio,
+        ltc_carrier: dir.path().join(files[0]),
+        detected_fps: 25.0,
+        drop_frame: false,
+        files: files
+            .iter()
+            .map(|f| PreflightFileResult {
+                path: dir.path().join(f),
+                device: "DEV".into(),
+                resolved: ChannelCandidate { stream: 0, channel: 1 },
+                source: ChannelSource::Pinned,
+                start_timecode: Some(audio_core::Timecode {
+                    hours: 1,
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 0,
+                }),
+                confidence: Some(0.9),
+                valid_frames: 10,
+            })
+            .collect(),
+    };
+    let jobs = vec![
+        SessionGroupJob { group: mk_group("g1", &["a.wav"]), settings: test_settings() },
+        SessionGroupJob { group: mk_group("g2", &["b.wav"]), settings: test_settings() },
+    ];
+
+    let (ctx, tracker) = job_context(vec![
+        UnitSpec { weight: 0.5, label: "g1".into() },
+        UnitSpec { weight: 0.5, label: "g2".into() },
+    ]);
+    let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let samples_for_fake = Arc::clone(&samples);
+    let tracker_for_fake = tracker.clone();
+
+    let mut run = |_idx: usize,
+                   _unit: &UnitProgress,
+                   _settings: &gui_engine::ConverterSettings,
+                   _caps: Option<&gui_engine::FfmpegCapabilities>|
+     -> Result<Option<String>, JobError> {
+        // Fake encode work recorded through the tracker (inside the seam).
+        // The unit fraction is set via the tracker's per-unit snapshot to
+        // keep sampling deterministic.
+        let mut s = samples_for_fake.lock().unwrap();
+        s.push(tracker_for_fake.snapshot().fraction);
+        drop(s);
+        Ok(Some("h264".into()))
+    };
+    // Granularity: the two groups' fractions only become distinguishable
+    // through their units — sample the first unit's in-flight fraction by
+    // advancing it inside the seam via the ctx units. Simpler and faithful:
+    // drive fraction advancement on the group's unit through the closure's
+    // `_unit` parameter.
+    let mut run = |_idx: usize,
+                   unit: &UnitProgress,
+                   _settings: &gui_engine::ConverterSettings,
+                   _caps: Option<&gui_engine::FfmpegCapabilities>|
+     -> Result<Option<String>, JobError> {
+        unit.set_fraction(0.5);
+        samples_for_fake
+            .lock()
+            .unwrap()
+            .push(tracker_for_fake.snapshot().fraction);
+        unit.set_fraction(1.0);
+        samples_for_fake
+            .lock()
+            .unwrap()
+            .push(tracker_for_fake.snapshot().fraction);
+        Ok(Some("h264".into()))
+    };
+
+    let out = run_session_conversion_with(&ctx, jobs, None, &mut run).expect("run completes");
+    assert!(matches!(out, JobFinal::SessionConversion { .. }));
+    assert_progress_contract(&samples.lock().unwrap(), &tracker, "session-conversion");
+}
+
+/// Minimal ConverterSettings for the fake group jobs (the real pipeline is
+/// never invoked — the group runner is injected).
+fn test_settings() -> gui_engine::ConverterSettings {
+    gui_engine::ConverterSettings {
+        pipeline: gui_engine::ConversionPipeline::AudioOnly {
+            generate_synthetic_video: false,
+        },
+        input_files: Vec::new(),
+        recording_type: RecordingType::MultiTrackAudio,
+        ltc_track_channel_index: 0,
+        channel_map: gui_engine::ChannelMap::identity(1),
+        split_tracks: true,
+        drop_ltc_track: true,
+        ltc_video_source: None,
+        container: "wav".into(),
+        copy_video: false,
+        video_encoder: "h265".into(),
+        audio_encoder: "pcm_s24le".into(),
+        resolved_video_encoder: String::new(),
+        resolved_hw_device: None,
+        output_folder: PathBuf::from("/tmp/contract-session"),
+        filename_prefix: "{device}".into(),
+        audio_suffix_template: "_tr{track:01d}".into(),
+        video_suffix_template: "_clip{clip:01d}".into(),
+        set_start_from_ltc: true,
+        embed_camera_metadata: true,
+        trim_offsets_secs: vec![0.0],
+        timecode_meta_per_file: vec![None],
+        camera_meta_per_file: vec![None],
+        device_name: None,
+        concat_audio: false,
+    }
 }

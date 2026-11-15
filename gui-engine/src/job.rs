@@ -29,6 +29,8 @@ pub struct JobId(pub JobIdValue);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JobKind {
     Conversion,
+    SessionPreflight,
+    SessionConversion,
     OffloadCopy,
     OffloadScan,
     LtcDecode,
@@ -552,6 +554,12 @@ pub enum JobFinal {
         device_name: Option<String>,
     },
     DurationsDone,
+    SessionPreflight {
+        report: std::sync::Arc<crate::session_conversion::SessionPreflightReport>,
+    },
+    SessionConversion {
+        summary: std::sync::Arc<crate::session_conversion::SessionRunSummary>,
+    },
     FfmpegCaps {
         caps: Option<FfmpegCapabilities>,
     },

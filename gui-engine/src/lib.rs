@@ -19,6 +19,7 @@ pub mod log_buffer;
 pub mod media_ext;
 pub mod naming;
 pub mod offload;
+pub mod session_conversion;
 pub mod state;
 pub mod subprocess;
 pub mod tagger;
@@ -78,6 +79,20 @@ pub use duration::{file_duration_secs, format_duration_secs, group_duration_secs
 pub use hw_cache::{
     cache_key_for, publish_stage1_caps, validate_hw_encoders_cached_with, CacheKey,
     HwValidationCache,
+};
+
+// Re-export session-conversion types
+pub use session_conversion::{
+    assemble_session_group_settings, channel_candidate_order, collect_preflight_groups,
+    load_session_defaults, preflight_decode_real, record_channel_pin, run_session_conversion_with,
+    run_session_preflight_with, save_session_defaults, session_group_runner_real, session_unit_specs,
+    AudioDefaults,
+    ChannelCandidate, ChannelDefaults, ChannelSource, PreflightDecodeError, PreflightDecodeRequest,
+    PreflightFailure,
+    PreflightFileResult, PreflightGroup, PreflightGroupResult, SessionConversionDefaults,
+    SessionGroupJob,
+    SessionPreflightReport, SessionRunGroupOutcome, SessionRunSummary, VideoDefaults,
+    SESSION_DEFAULTS_SCHEMA,
 };
 
 // Re-export job types
