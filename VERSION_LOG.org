@@ -2,6 +2,37 @@
 
 * Unreleased
 
+List of Changes:
+- Offload: fixed the "100% / Completed while still copying" bug class.
+  Starting a second offload in the same session no longer shows the
+  previous run's completion state — the copy job's status and the
+  completed-device list reset on start, so the progress bar and the
+  Start/Cancel button reflect the run actually in progress.
+- Offload: the progress bar no longer reaches 100% before the last file
+  is durable; in-flight device progress is capped below full until each
+  device's copy is verified and renamed, and only a truly finished run
+  reports the exact 100%.
+- Offload: cancelling an offload now ends it as Cancelled (orange
+  summary) instead of silently reporting success — no converter
+  auto-switch happens on cancel, devices that finished before the cancel
+  stay visible, and no temporary .offload_tmp files are left behind.
+- Offload: a partially failed offload (a device that fails mid-copy) is
+  now shown as a partial outcome with the failed device names, instead
+  of an all-green "complete" summary.
+- Offload: the tab explains the post-scan pre-selection — a hint names
+  the recording day the default selection covers (cleared when you
+  override the selection manually), and the stale red error line from an
+  earlier failed start no longer survives into later runs.
+- Offload/GUI: with multiple cards, every card's file list is now
+  rendered at full height instead of all but the first collapsing to a
+  few rows.
+- Testing: new engine-level regression tests drive offload runs through
+  the engine loop via an injectable copy runner (second-run freshness,
+  typed cancel, partial failure, durable-progress fraction), and a new
+  local stress runner (cargo run --release -p gui-engine --example
+  offload-progress-stress) continuously checks the published progress
+  snapshot's invariants against real copies on disk.
+
 * v0.6.0
 
 Main features are a fully scalable ltc-gui interface — a user-settable text

@@ -1607,7 +1607,7 @@ fn offload_cancel_ends_cancelled_and_cleans_up() {
         .send(GuiCommand::Offload(OffloadCommand::StartOffload))
         .unwrap();
     // Let the copy reach the in-flight gate (DEV1's temp file present)…
-    wait_for_snapshot(&engine.state, "copy in flight", |s| {
+    wait_for_snapshot(&engine.state, "copy in flight", |_s| {
         dest.join("day1")
             .join("DEV1")
             .join("b.offload_tmp")
