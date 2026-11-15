@@ -65,6 +65,32 @@ pub fn chrono_now_string() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
+// ── Session continue math ───────────────────────────────────────────────
+
+/// Advance a timecode by a whole number of seconds (DF-aware), the
+/// session "continue at last emitted + gap" computation. Frame counts
+/// are rounded from `seconds * fps`; wrapping past 24 h follows
+/// `increment_timecode`.
+pub fn advance_timecode_by_seconds(
+    tc: Timecode,
+    seconds: u64,
+    fps: f64,
+    drop_frame: bool,
+) -> Timecode {
+    let frames = (seconds as f64 * fps).round() as u64;
+    let mut out = tc;
+    for _ in 0..frames {
+        out = audio_core::increment_timecode(&out, fps, drop_frame);
+    }
+    out
+}
+
+/// Local date (ISO-8601, YYYY-MM-DD) — the session id's date prefix and
+/// the `last_active_date` stamp.
+pub fn local_today_string() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,4 +333,73 @@ mod tests {
     }
 
     // ── Timecode struct ───────────────────────────────────────────────────
+
+    // ── advance_timecode_by_seconds (session continue math) ──────────────
+
+    fn tc(h: u32, m: u32, s: u32, f: u32) -> Timecode {
+        Timecode {
+            hours: h,
+            minutes: m,
+            seconds: s,
+            frames: f,
+        }
+    }
+
+    #[test]
+    fn advance_by_seconds_zero_gap_is_identity() {
+        let t = tc(1, 47, 13, 20);
+        assert_eq!(advance_timecode_by_seconds(t, 0, 25.0, false), t);
+    }
+
+    #[test]
+    fn advance_by_seconds_60s_at_25fps() {
+        assert_eq!(
+            advance_timecode_by_seconds(tc(1, 47, 13, 20), 60, 25.0, false),
+            tc(1, 48, 13, 20)
+        );
+    }
+
+    #[test]
+    fn advance_by_seconds_rounds_frames() {
+        // 29.97 × 1 s = 29.97 → rounds to 30 frames → exactly one second.
+        assert_eq!(
+            advance_timecode_by_seconds(tc(0, 0, 0, 0), 1, 29.97, false),
+            tc(0, 0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn advance_by_seconds_wraps_past_24h() {
+        assert_eq!(
+            advance_timecode_by_seconds(tc(23, 59, 0, 0), 120, 24.0, false),
+            tc(0, 1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn advance_by_seconds_is_drop_frame_aware() {
+        // 29.97 DF × 60 s = 1798.2 → 1798 frames; 59 full seconds take
+        // 1770 increments, the remaining 28 land on frame 28 of second 59
+        // (the minute-boundary skip only fires at second 60).
+        assert_eq!(
+            advance_timecode_by_seconds(tc(0, 0, 0, 0), 60, 29.97, true),
+            tc(0, 0, 59, 28)
+        );
+    }
+
+    #[test]
+    fn local_today_string_is_iso_date() {
+        let s = local_today_string();
+        assert_eq!(s.len(), 10, "expected YYYY-MM-DD, got '{}'", s);
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+        for ch in s.chars().filter(|&c| c != '-') {
+            assert!(
+                ch.is_ascii_digit(),
+                "expected digit, got '{}' in '{}'",
+                ch,
+                s
+            );
+        }
+    }
 }

@@ -3,6 +3,18 @@
 * Unreleased
 
 List of Changes:
+- Sessions: recording sessions (Phase 3 foundation) — named sessions on
+  the Clapper tab persist fps, drop-frame, start timecode and the last
+  emitted timecode across launches (JSON, one file per session under the
+  config directory). "Continue…" resumes a saved session at its last
+  emitted TC plus a configurable gap (default 60 s), and the offload tab
+  defaults its destination folder to the session id, recording each
+  completed offload destination on the session. The last emitted TC is
+  persisted on stop, on shutdown, and periodically while playing.
+- Convert: per-file selection — the file pills in the Convert tab are now
+  checkboxes with per-group All/None controls; deselected files are
+  excluded from the conversion, and deselecting everything raises a
+  "select at least one file" blocker.
 - Transport: pressing START now resumes from the paused timecode instead
   of restarting from the configured start TC. Editing the start timecode
   (steppers) while stopped moves the resume position to the new start TC;

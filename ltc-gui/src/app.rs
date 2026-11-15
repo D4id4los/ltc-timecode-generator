@@ -164,6 +164,12 @@ pub struct AppState {
     /// Last `clapper.clap_seq` observed (seeded from the snapshot at startup
     /// so a mid-session GUI start doesn't animate for an old clap).
     clap_last_seen: u64,
+
+    // Session bar GUI-local state (engine owns the session itself)
+    /// New-session name text buffer (sent on Create).
+    pub session_name_buf: String,
+    /// Whether the "Continue" session picker is expanded.
+    pub session_picker_open: bool,
 }
 
 impl AppState {
@@ -216,6 +222,8 @@ impl AppState {
             offload_last_version: 0,
             clap_anim: None,
             clap_last_seen: initial.clapper.clap_seq,
+            session_name_buf: String::new(),
+            session_picker_open: false,
         };
 
         // Tell the engine to scan the restored input folder and auto-select
@@ -1078,7 +1086,11 @@ impl AppState {
 
         ui.add_space(4.0);
         match self.active_tab {
-            Tab::Clapper => widgets::clapper::render(ui, self),
+            Tab::Clapper => {
+                widgets::clapper::render_session_bar(ui, self);
+                ui.add_space(8.0);
+                widgets::clapper::render(ui, self);
+            }
             Tab::Settings => widgets::settings::render(ui, self),
             Tab::Converter => widgets::converter::render(ui, self),
             Tab::Offload => widgets::offload::render(ui, self),

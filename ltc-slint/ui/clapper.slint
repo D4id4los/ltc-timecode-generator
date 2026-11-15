@@ -3,6 +3,7 @@ import { LogEntry } from "./types.slint";
 import { ListView } from "std-widgets.slint";
 
 export component ClapperSection {
+    in-out property <string> session-name: "";
     in-out property <int> scene;
     in-out property <int> take;
     in-out property <string> roll;
@@ -25,6 +26,34 @@ export component ClapperSection {
     callback clap-beep;
     callback clear-logs;
     callback copy-logs;
+
+    // Recording-session bar (minimal compile-compat rendering; full session
+    // UI parity lives in ltc-gui).
+    if root.session-name != "" : Rectangle {
+        height: 28px;
+        background: AppColors.nested-bg;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: AppColors.border-main;
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            alignment: start;
+            Text {
+                text: "SESSION";
+                color: AppColors.text-muted;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.session-name;
+                color: AppColors.accent;
+                font-size: 13px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
+    }
 
     if root.window-width >= 600px : HorizontalLayout {
         spacing: 12px;

@@ -81,6 +81,10 @@ pub enum GuiCommand {
     /// Manage offload state in the engine.
     Offload(OffloadCommand),
 
+    // ── Recording sessions (engine-owned) ──────────────────────────────
+    /// Manage the recording-session lifecycle (create/load/close/gap).
+    Session(SessionCommand),
+
     // ── Shutdown ────────────────────────────────────────────────────────
     CancelDecode,
     Shutdown,
@@ -137,6 +141,18 @@ pub enum ConverterCommand {
     /// Swap two cells in the channel map.
     SwapChannelMapCells(usize, usize),
 
+    // ── Per-file selection ─────────────────────────────────────────────
+    /// Toggle selection of one file in a recording group. Deselected files
+    /// are excluded from the conversion (they flow through
+    /// `plan_output_paths` via the assembled settings' input subset).
+    SetFileSelected {
+        group: usize,
+        path: PathBuf,
+        selected: bool,
+    },
+    /// Select or deselect all files of a recording group.
+    SetAllGroupFiles { group: usize, selected: bool },
+
     // ── Format / Codec ──────────────────────────────────────────────────
     /// Set the output container id (e.g. "mov", "mkv", "mp4").
     SetContainer(String),
@@ -187,4 +203,20 @@ pub enum OffloadCommand {
     StartOffload,
     /// Cancel an in-flight copy operation.
     CancelOffload,
+}
+
+/// Commands for the engine-owned recording-session lifecycle.
+#[derive(Debug, Clone)]
+pub enum SessionCommand {
+    /// Create a session from the current transport state: records fps,
+    /// drop-frame and the current start TC; makes it the active session.
+    Create { name: String },
+    /// Load a persisted session: stops playback, applies the session's
+    /// fps/drop-frame, and sets start/resume TC to last emitted + gap.
+    Load { id: String },
+    /// Close the active session (persists last-emitted first). Playback
+    /// state itself is untouched; a playing stream keeps playing.
+    Close,
+    /// Set the per-session continue gap in seconds (applied on load).
+    SetContinueGapSeconds(u64),
 }

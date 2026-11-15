@@ -1,6 +1,7 @@
 use crate::text::{text, TextStyle};
 use egui::{Sense, Ui, Vec2};
-use gui_engine::command::GuiCommand;
+use gui_engine::command::{GuiCommand, SessionCommand};
+use gui_engine::timecode::timecode_to_string;
 use std::time::Instant;
 
 use super::bound;
@@ -20,6 +21,160 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
             ui.add_space(12.0);
             render_logs_card(ui, state);
         });
+    }
+}
+
+// ── Recording-session bar ───────────────────────────────────────────────
+
+/// Session bar at the top of the Clapper tab: the active session (name,
+/// continue preview, gap editor, Close) or the no-session view (name
+/// entry + Create, Continue picker listing persisted sessions).
+pub fn render_session_bar(ui: &mut Ui, state: &mut AppState) {
+    let colors = state.theme.colors();
+    super::style::content_area(ui, &colors, |ui| match state.latest.session.clone() {
+        Some(view) => render_session_active(ui, state, &view, &colors),
+        None => render_session_idle(ui, state, &colors),
+    });
+}
+
+fn render_session_active(
+    ui: &mut Ui,
+    state: &mut AppState,
+    view: &gui_engine::state::ActiveSessionView,
+    colors: &crate::theme::ThemeColors,
+) {
+    ui.horizontal(|ui| {
+        ui.label(text(ui, "SESSION").style(TextStyle::SequenceHeading, colors));
+        ui.label(
+            text(ui, &view.name)
+                .style(TextStyle::Status, colors)
+                .color(ACCENT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button("Close Session")
+                .on_hover_text("Close the session (keeps its saved progress for the next day)")
+                .clicked()
+            {
+                state.send(GuiCommand::Session(SessionCommand::Close));
+            }
+            // Continue gap editor (truth lives in the engine; re-seeded
+            // each frame and echoed back after the command lands).
+            let mut gap = view.continue_gap_seconds;
+            let resp = ui
+                .add(
+                    egui::DragValue::new(&mut gap)
+                        .range(0..=gui_engine::config::MAX_CONTINUE_GAP_SECONDS)
+                        .suffix(" s gap"),
+                )
+                .on_hover_text(
+                    "Seconds added after the last emitted timecode when the session is loaded",
+                );
+            if resp.changed() {
+                state.send(GuiCommand::Session(SessionCommand::SetContinueGapSeconds(
+                    gap,
+                )));
+            }
+            ui.label(
+                text(
+                    ui,
+                    format!(
+                        "Next day continues at {}",
+                        timecode_to_string(view.continue_timecode, false)
+                    ),
+                )
+                .style(TextStyle::Label, colors)
+                .color(colors.text_title),
+            );
+        });
+    });
+}
+
+fn render_session_idle(ui: &mut Ui, state: &mut AppState, colors: &crate::theme::ThemeColors) {
+    ui.horizontal(|ui| {
+        ui.label(text(ui, "SESSION").style(TextStyle::SequenceHeading, colors));
+        ui.label(
+            text(ui, "No active session")
+                .style(TextStyle::Label, colors)
+                .color(colors.text_muted),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let name = state.session_name_buf.trim().to_string();
+            if ui
+                .add_enabled(!name.is_empty(), egui::Button::new("New Session"))
+                .on_hover_text("Start a recording session from the current fps and start timecode")
+                .clicked()
+            {
+                state.send(GuiCommand::Session(SessionCommand::Create {
+                    name: name.clone(),
+                }));
+                state.session_name_buf.clear();
+                state.session_picker_open = false;
+            }
+            if ui
+                .button("Continue…")
+                .on_hover_text("Resume a saved session at its last timecode plus gap")
+                .clicked()
+            {
+                state.session_picker_open = !state.session_picker_open;
+            }
+            let mut buf = state.session_name_buf.clone();
+            let resp = ui.add_sized(
+                egui::vec2(160.0, 20.0),
+                egui::TextEdit::singleline(&mut buf).hint_text("Session name…"),
+            );
+            if resp.changed() {
+                state.session_name_buf = buf;
+            }
+        });
+    });
+    // Slug preview for the name being typed.
+    let slug = gui_engine::config::slugify_session_name(&state.session_name_buf);
+    if !state.session_name_buf.trim().is_empty() {
+        ui.label(
+            text(ui, format!("Will be stored as: {slug}"))
+                .style(TextStyle::Hint, colors)
+                .color(colors.text_muted),
+        );
+    }
+    // Continue picker: persisted sessions, newest-active first.
+    if state.session_picker_open {
+        let sessions = state.latest.available_sessions.clone();
+        if sessions.is_empty() {
+            ui.label(
+                text(ui, "No saved sessions yet.")
+                    .style(TextStyle::Label, colors)
+                    .color(colors.text_muted),
+            );
+        } else {
+            let frame = egui::Frame::new()
+                .fill(colors.nested_bg)
+                .corner_radius(6.0)
+                .stroke(egui::Stroke::new(1.0, colors.border_main))
+                .inner_margin(egui::Margin::same(6));
+            frame.show(ui, |ui| {
+                for s in &sessions {
+                    ui.horizontal(|ui| {
+                        let label = format!(
+                            "{} — saved {} · continue at {}",
+                            s.name,
+                            s.last_active_date,
+                            timecode_to_string(s.continue_timecode, s.drop_frame),
+                        );
+                        if ui
+                            .selectable_label(false, label)
+                            .on_hover_text("Load this session: applies its fps and continues at the shown timecode")
+                            .clicked()
+                        {
+                            state.send(GuiCommand::Session(SessionCommand::Load {
+                                id: s.id.clone(),
+                            }));
+                            state.session_picker_open = false;
+                        }
+                    });
+                }
+            });
+        }
     }
 }
 

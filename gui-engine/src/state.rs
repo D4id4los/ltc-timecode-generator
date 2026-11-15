@@ -120,6 +120,12 @@ pub struct ConverterSnapshot {
     pub collision_warning: Option<String>,
     /// Warning when two or more planned output files share the same name.
     pub duplicate_output_warning: Option<String>,
+    /// Per-group file selection, keyed by group index. Absent entry = all
+    /// files of the group selected (the default). A present entry lists the
+    /// selected file paths (possibly empty — an empty selection raises the
+    /// `ConvertBlocker::NoFilesSelected` blocker). Reset on recording
+    /// selection and folder scans.
+    pub group_file_selection: HashMap<usize, std::collections::BTreeSet<PathBuf>>,
 }
 
 impl ConverterSnapshot {
@@ -226,6 +232,34 @@ pub struct ClapperSnapshot {
     /// between frames it animates once for `seq != last` — acceptable
     /// because claps are human-paced and the animation is cosmetic.
     pub clap_seq: u64,
+}
+
+// ── Recording-session snapshot (engine-owned) ───────────────────────────
+
+/// The currently active session as rendered by the GUIs: identity plus the
+/// continue-preview timecode (`last_emitted + gap`). `None` = no active
+/// session (every launch starts session-less).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveSessionView {
+    pub id: String,
+    pub name: String,
+    /// Where loading would resume generation: `last_emitted + gap`.
+    pub continue_timecode: Timecode,
+    pub last_active_date: String,
+    pub continue_gap_seconds: u64,
+}
+
+/// One entry of the session picker ("Continue" list), newest-active first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionListItem {
+    pub id: String,
+    pub name: String,
+    pub last_active_date: String,
+    /// Saved TC the session last emitted.
+    pub last_emitted_timecode: Timecode,
+    /// `last_emitted + gap` — the TC loading would resume at.
+    pub continue_timecode: Timecode,
+    pub drop_frame: bool,
 }
 
 // ── Status channels ─────────────────────────────────────────────────────
@@ -390,6 +424,12 @@ pub struct AppStateSnapshot {
 
     // Engine-owned offload / file-ingestion state
     pub offload: OffloadSnapshot,
+
+    // Recording session (engine-owned; see `config::SessionRecord`)
+    /// Currently active session, `None` until Create/Load.
+    pub session: Option<ActiveSessionView>,
+    /// All persisted sessions, newest-active first (the "Continue" list).
+    pub available_sessions: Vec<SessionListItem>,
 }
 
 impl AppStateSnapshot {
@@ -464,8 +504,11 @@ impl AppStateSnapshot {
                 readiness: Vec::new(),
                 collision_warning: None,
                 duplicate_output_warning: None,
+                group_file_selection: HashMap::new(),
             },
             offload: OffloadSnapshot::initial(),
+            session: None,
+            available_sessions: Vec::new(),
         }
     }
 

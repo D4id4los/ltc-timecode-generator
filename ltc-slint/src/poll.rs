@@ -396,6 +396,11 @@ fn sync_clapper_metadata(
             .sync_and_push(&s.clapper.roll, ui.get_roll_editing(), applied_seq, now)
     {
         ui.set_roll(SharedString::from(roll));
+        // Recording-session bar (minimal rendering): active session name,
+        // empty when no session is active.
+        ui.set_session_name(SharedString::from(
+            s.session.as_ref().map(|v| v.name.as_str()).unwrap_or(""),
+        ));
     }
     ui.set_scene(s.clapper.scene as i32);
     ui.set_take(s.clapper.take as i32);

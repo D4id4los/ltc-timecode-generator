@@ -32,6 +32,7 @@ export component AppWindow inherits Window {
     in-out property <int> scene: 1;
     in-out property <int> take: 1;
     in-out property <string> roll: "A001";
+    in-out property <string> session-name: "";
     in-out property <bool> auto-increment: true;
     in-out property <[LogEntry]> logs: [];
     in-out property <float> arm-angle: -0.43633;
@@ -672,6 +673,7 @@ export component AppWindow inherits Window {
 
                 // Tab content (stretches to fill remaining height)
                 if (root.active-tab == 0) : ClapperSection {
+                    session-name: root.session-name;
                     scene: root.scene;
                     take: root.take;
                     roll <=> root.roll;

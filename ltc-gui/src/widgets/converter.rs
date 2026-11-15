@@ -249,7 +249,7 @@ fn render_file_selection(ui: &mut Ui, state: &mut AppState) {
 
             if let Some(idx) = state.latest.converter.selected_group_idx {
                 if let Some(group) = groups.get(idx) {
-                    render_selected_group_pills(ui, group, &colors);
+                    render_selected_group_pills(ui, state, group, &colors);
                 }
             }
         }
@@ -334,13 +334,40 @@ fn render_group_combo(
     });
 }
 
-/// Pills listing the files of the selected recording group.
+/// Checkboxes listing the files of the selected recording group with
+/// per-group Select All / None controls (per-file convert selection; the
+/// engine assembles the conversion from the selected subset).
 fn render_selected_group_pills(
     ui: &mut Ui,
+    state: &mut AppState,
     group: &MatchedGroup,
     colors: &crate::theme::ThemeColors,
 ) {
+    let group_idx = state.latest.converter.selected_group_idx.unwrap_or(0);
     ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(text(ui, "Files:").style(TextStyle::Label, colors));
+        if ui
+            .small_button("All")
+            .on_hover_text("Select every file for conversion")
+            .clicked()
+        {
+            state.send(GuiCommand::Converter(ConverterCommand::SetAllGroupFiles {
+                group: group_idx,
+                selected: true,
+            }));
+        }
+        if ui
+            .small_button("None")
+            .on_hover_text("Deselect every file (conversion blocked until one is selected)")
+            .clicked()
+        {
+            state.send(GuiCommand::Converter(ConverterCommand::SetAllGroupFiles {
+                group: group_idx,
+                selected: false,
+            }));
+        }
+    });
     let pill_frame = egui::Frame::new()
         .fill(colors.deep_bg)
         .corner_radius(6.0)
@@ -348,15 +375,37 @@ fn render_selected_group_pills(
     pill_frame.show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 2.0);
+            let selection = state
+                .latest
+                .converter
+                .group_file_selection
+                .get(&group_idx)
+                .cloned();
             for f in &group.files {
+                // Absent selection entry = all files selected (the default).
+                let is_selected = selection.as_ref().map(|s| s.contains(f)).unwrap_or(true);
                 let name = f.file_name().and_then(|s| s.to_str()).unwrap_or("?");
                 let pill = egui::Frame::new()
                     .fill(colors.card_bg)
                     .corner_radius(4.0)
                     .stroke(egui::Stroke::new(0.5, colors.border_main))
-                    .inner_margin(egui::Margin::symmetric(6, 2));
+                    .inner_margin(egui::Margin::symmetric(2, 2));
                 pill.show(ui, |ui| {
-                    ui.label(text(ui, name).style(TextStyle::MonoValue, colors));
+                    ui.horizontal(|ui| {
+                        // Truth lives in the engine; the checkbox's local
+                        // value is re-seeded from the snapshot each frame and
+                        // a click sends the new selection (echoed next tick).
+                        let mut shown = is_selected;
+                        let resp = ui.checkbox(&mut shown, "");
+                        if resp.changed() {
+                            state.send(GuiCommand::Converter(ConverterCommand::SetFileSelected {
+                                group: group_idx,
+                                path: f.clone(),
+                                selected: shown,
+                            }));
+                        }
+                        ui.label(text(ui, name).style(TextStyle::MonoValue, colors));
+                    });
                 });
             }
         });
@@ -2709,10 +2758,17 @@ fn render_convert_button(
 
     let caps_opt = state.latest.ffmpeg_caps.clone();
 
+    let selection_empty = state
+        .latest
+        .converter
+        .selected_group_idx
+        .and_then(|idx| state.latest.converter.group_file_selection.get(&idx))
+        .is_some_and(|s| s.is_empty());
     let readiness = evaluate_readiness(
         state.latest.converter.selected_group_idx.is_some(),
         state.sh.conv.filename_prefix.value().is_empty(),
         state.sh.conv.output_folder.value().as_os_str().is_empty(),
+        selection_empty,
         caps_opt.as_ref(),
     );
     let can_convert = readiness.can_convert;

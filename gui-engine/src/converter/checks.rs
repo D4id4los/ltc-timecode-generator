@@ -367,6 +367,9 @@ pub enum ConvertBlocker {
     NoRecording,
     NoPrefix,
     NoOutputFolder,
+    /// Every file of the selected recording was deselected — there is
+    /// nothing to convert.
+    NoFilesSelected,
     FfmpegNotQueried,
     FfmpegMissing(Option<String>),
 }
@@ -381,6 +384,7 @@ pub fn evaluate_readiness(
     has_group: bool,
     prefix_empty: bool,
     output_folder_empty: bool,
+    selection_empty: bool,
     caps: Option<&FfmpegCapabilities>,
 ) -> ConvertReadiness {
     let mut blockers = Vec::new();
@@ -392,6 +396,9 @@ pub fn evaluate_readiness(
     }
     if output_folder_empty {
         blockers.push(ConvertBlocker::NoOutputFolder);
+    }
+    if has_group && selection_empty {
+        blockers.push(ConvertBlocker::NoFilesSelected);
     }
     match caps {
         None => blockers.push(ConvertBlocker::FfmpegNotQueried),
@@ -413,6 +420,7 @@ pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
             ConvertBlocker::NoRecording => Some("select a recording"),
             ConvertBlocker::NoPrefix => Some("set a filename prefix"),
             ConvertBlocker::NoOutputFolder => Some("choose an output folder"),
+            ConvertBlocker::NoFilesSelected => Some("select at least one file"),
             ConvertBlocker::FfmpegNotQueried | ConvertBlocker::FfmpegMissing(_) => None,
         })
         .collect();
@@ -422,7 +430,8 @@ pub fn format_blockers(blockers: &[ConvertBlocker]) -> String {
         .filter_map(|b| match b {
             ConvertBlocker::NoRecording
             | ConvertBlocker::NoPrefix
-            | ConvertBlocker::NoOutputFolder => None,
+            | ConvertBlocker::NoOutputFolder
+            | ConvertBlocker::NoFilesSelected => None,
             ConvertBlocker::FfmpegNotQueried => {
                 Some("ffmpeg availability is being checked…".to_string())
             }
@@ -561,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_readiness_unqueried_caps_is_not_missing() {
-        let r = evaluate_readiness(true, false, false, None);
+        let r = evaluate_readiness(true, false, false, false, None);
         assert!(!r.can_convert);
         assert!(r.blockers.contains(&ConvertBlocker::FfmpegNotQueried));
         assert!(!r.blockers.contains(&ConvertBlocker::FfmpegMissing(None)));
@@ -570,7 +579,7 @@ mod tests {
     #[test]
     fn test_readiness_ready_when_all_met() {
         let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
-        let r = evaluate_readiness(true, false, false, Some(&caps));
+        let r = evaluate_readiness(true, false, false, false, Some(&caps));
         assert!(r.can_convert);
         assert!(r.blockers.is_empty());
     }
@@ -578,7 +587,7 @@ mod tests {
     #[test]
     fn test_readiness_missing_ffmpeg() {
         let caps = make_caps(false, BTreeSet::new(), BTreeSet::new());
-        let r = evaluate_readiness(true, false, false, Some(&caps));
+        let r = evaluate_readiness(true, false, false, false, Some(&caps));
         assert!(!r.can_convert);
         assert!(r.blockers.contains(&ConvertBlocker::FfmpegMissing(None)));
     }
@@ -587,7 +596,7 @@ mod tests {
     fn test_readiness_missing_ffmpeg_with_error() {
         let mut caps = make_caps(false, BTreeSet::new(), BTreeSet::new());
         caps.error_message = Some("permission denied".into());
-        let r = evaluate_readiness(true, false, false, Some(&caps));
+        let r = evaluate_readiness(true, false, false, false, Some(&caps));
         assert!(!r.can_convert);
         assert_eq!(
             r.blockers,
@@ -600,7 +609,7 @@ mod tests {
     #[test]
     fn test_readiness_no_group() {
         let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
-        let r = evaluate_readiness(false, false, false, Some(&caps));
+        let r = evaluate_readiness(false, false, false, false, Some(&caps));
         assert!(!r.can_convert);
         assert!(r.blockers.contains(&ConvertBlocker::NoRecording));
     }
@@ -608,7 +617,7 @@ mod tests {
     #[test]
     fn test_readiness_no_prefix() {
         let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
-        let r = evaluate_readiness(true, true, false, Some(&caps));
+        let r = evaluate_readiness(true, true, false, false, Some(&caps));
         assert!(!r.can_convert);
         assert!(r.blockers.contains(&ConvertBlocker::NoPrefix));
     }
@@ -616,7 +625,7 @@ mod tests {
     #[test]
     fn test_readiness_no_output_folder() {
         let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
-        let r = evaluate_readiness(true, false, true, Some(&caps));
+        let r = evaluate_readiness(true, false, true, false, Some(&caps));
         assert!(!r.can_convert);
         assert!(r.blockers.contains(&ConvertBlocker::NoOutputFolder));
     }
@@ -624,7 +633,7 @@ mod tests {
     #[test]
     fn test_readiness_multiple_blockers() {
         let caps = make_caps(true, BTreeSet::new(), BTreeSet::new());
-        let r = evaluate_readiness(false, true, true, Some(&caps));
+        let r = evaluate_readiness(false, true, true, false, Some(&caps));
         assert!(!r.can_convert);
         // Order is deterministic in evaluate_readiness: recording, prefix,
         // output folder.

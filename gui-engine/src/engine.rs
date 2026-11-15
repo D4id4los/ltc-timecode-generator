@@ -31,6 +31,11 @@ const TICK_INTERVAL: Duration = Duration::from_millis(40);
 const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 const MAX_CLAP_LOGS: usize = 1000;
 const BUFFER_SIZE: u32 = 0;
+/// While a session is active and LTC is playing, the last-emitted TC is
+/// persisted every this many ticks (~60 s at 40 ms ticks). A field on
+/// `EngineLoopState` (initialised from this const) so tests can shrink it
+/// for deterministic coverage of the periodic persist — no wall-clock.
+const SESSION_PERSIST_EVERY_TICKS: u64 = 1500;
 
 pub fn engine_main(
     cmd_rx: Receiver<GuiCommand>,
@@ -183,6 +188,17 @@ struct EngineLoopState {
     /// container/encoder/audio-encoder; once armed, the stage-2 arrival
     /// never auto-upgrades the default combination this session.
     encoder_touched: bool,
+    /// All persisted sessions (loaded at startup, upserted on create/load).
+    sessions: Vec<config::SessionRecord>,
+    /// The active session record; mirrored into the snapshot as
+    /// `AppStateSnapshot::session` (view). `None` = no active session.
+    active_session: Option<config::SessionRecord>,
+    /// Tick counter of the playing-state session persist (reset when not
+    /// playing or after a persist).
+    session_progress_ticks: u64,
+    /// Persist interval for the playing-state session persist in ticks
+    /// (initialised from `SESSION_PERSIST_EVERY_TICKS`; tests shrink it).
+    session_persist_every_ticks: u64,
 }
 
 impl EngineLoopState {
@@ -210,6 +226,10 @@ impl EngineLoopState {
             }),
             hw_validate: None,
             encoder_touched: false,
+            sessions: Vec::new(),
+            active_session: None,
+            session_progress_ticks: 0,
+            session_persist_every_ticks: SESSION_PERSIST_EVERY_TICKS,
         }
     }
 }
@@ -255,6 +275,10 @@ fn engine_main_loop(
 
     let core = AudioCore::new();
     let mut els = EngineLoopState::new(initial);
+    // Sessions are never auto-activated at startup (restart keeps the
+    // reset-to-default behaviour) — only listed for the Continue picker.
+    els.sessions = config::load_sessions();
+    sync_session_state(&mut els);
     els.scan_cards = seams.scan_cards;
     els.offload_copy = seams.offload_copy;
     els.audio_init = seams.init_output;
@@ -290,6 +314,7 @@ fn engine_main_loop(
         loop {
             match cmd_rx.try_recv() {
                 Ok(GuiCommand::Shutdown) => {
+                    persist_session_progress_if_playing(&mut els);
                     let _ = core.stop_ltc();
                     let _ = core.stop_output();
                     info!("Engine shutdown via Shutdown command");
@@ -302,6 +327,7 @@ fn engine_main_loop(
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     info!("Engine shutdown via channel disconnect");
+                    persist_session_progress_if_playing(&mut els);
                     let _ = core.stop_ltc();
                     let _ = core.stop_output();
                     break 'engine;
@@ -324,6 +350,9 @@ fn engine_main_loop(
         if els.current.is_playing {
             els.current.current_timecode = core.current_timecode();
         }
+        // 2.1 Session progress: periodically persist the last-emitted TC
+        //     while a session is active and playing (tick-counter driven).
+        maybe_persist_session_progress(&mut els);
 
         // 3. Drain events from AudioCore and deliver them to the GUI
         // through the audio-event channel.  Events are a one-shot mailbox,
@@ -405,6 +434,9 @@ fn process_command(
         GuiCommand::StartLtc => cmd_start_ltc(core, els, event_tx),
 
         GuiCommand::StopLtc => {
+            // Stamp the emitted TC while is_playing still holds true (the
+            // persist helper gates on it), then stop.
+            persist_session_progress_if_playing(els);
             let _ = core.stop_ltc();
             els.current.is_playing = false;
             els.current.status.set_audio("Stopped");
@@ -589,6 +621,10 @@ fn process_command(
 
         GuiCommand::Offload(cmd) => {
             handle_offload_command(cmd, els, supervisor);
+        }
+
+        GuiCommand::Session(cmd) => {
+            handle_session_command(cmd, core, els);
         }
 
         GuiCommand::Shutdown => {
@@ -780,6 +816,66 @@ fn handle_converter_command(
     }
     match cmd {
         C::SelectFolder(path) => cmd_select_folder(els, supervisor, path),
+        C::SetFileSelected {
+            group,
+            path,
+            selected,
+        } => {
+            if els.current.converter.selected_group_idx == Some(group) {
+                let files: Vec<PathBuf> = els
+                    .current
+                    .converter
+                    .groups
+                    .get(group)
+                    .map(|g| g.files.clone())
+                    .unwrap_or_default();
+                // Absent entry means "all selected"; the first toggle
+                // materializes the full set so the edit is a delta on it.
+                let entry = els
+                    .current
+                    .converter
+                    .group_file_selection
+                    .entry(group)
+                    .or_insert_with(|| files.iter().cloned().collect());
+                if selected {
+                    entry.insert(path);
+                } else {
+                    entry.remove(&path);
+                }
+                // Normalize: a set equal to the full file list is the
+                // default and is stored as such (no entry).
+                if files.iter().all(|f| entry.contains(f)) {
+                    els.current.converter.group_file_selection.remove(&group);
+                }
+                recompute_converter_derived(&mut els.current);
+            } else {
+                warn!(
+                    "SetFileSelected ignored — group {} is not the selected recording",
+                    group
+                );
+            }
+        }
+        C::SetAllGroupFiles { group, selected } => {
+            if els.current.converter.selected_group_idx == Some(group) {
+                if selected {
+                    // Absent entry = all selected (the default representation).
+                    els.current.converter.group_file_selection.remove(&group);
+                } else {
+                    // Deselect everything: an empty set (the empty selection
+                    // engages the NoFilesSelected blocker).
+                    els.current
+                        .converter
+                        .group_file_selection
+                        .insert(group, std::collections::BTreeSet::new());
+                }
+                recompute_converter_derived(&mut els.current);
+            } else {
+                warn!(
+                    "SetAllGroupFiles ignored — group {} is not the selected recording",
+                    group
+                );
+            }
+        }
         C::SelectRecording(idx) => {
             if supervisor.is_running(JobKind::FolderScan) {
                 info!(
@@ -859,6 +955,8 @@ fn cmd_select_folder(els: &mut EngineLoopState, supervisor: &mut JobSupervisor, 
     current.converter.selected_group_idx = None;
     current.converter.probes.clear();
     current.converter.probes_generation = 0;
+    // A fresh scan invalidates all per-group file selections.
+    current.converter.group_file_selection.clear();
     current
         .jobs
         .entry(JobKind::Conversion)
@@ -911,6 +1009,12 @@ fn cmd_start_conversion(els: &mut EngineLoopState, supervisor: &mut JobSuperviso
         warn!("{}", msg);
         return;
     };
+    if settings.input_files.is_empty() {
+        let msg = "Cannot start conversion — no files selected";
+        els.current.status.set_converter(msg);
+        warn!("{}", msg);
+        return;
+    }
     let caps = els.current.ffmpeg_caps.clone();
     // Cancel any previous conversion job first
     supervisor.cancel(JobKind::Conversion);
@@ -2135,6 +2239,24 @@ fn on_offload_copy_finished(els: &mut EngineLoopState, outcome: JobOutcome, payl
         els.current.offload.last_offload_parent = target;
         els.current.offload.last_offload_version =
             els.current.offload.last_offload_version.wrapping_add(1);
+        // Session link: record the destination on the active session so
+        // phase 4's session-default conversion can find the media.
+        if let (Some(dest), Some(rec)) = (
+            els.current
+                .offload
+                .last_offload_parent
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            &mut els.active_session,
+        ) {
+            if !rec.offload_destinations.contains(&dest) {
+                rec.offload_destinations.push(dest);
+                let snapshot = rec.clone();
+                save_session_logged(&snapshot);
+                upsert_session(&mut els.sessions, snapshot);
+                sync_session_state(els);
+            }
+        }
     }
     els.current.status.set_offload(format!(
         "Offload complete: {} device(s) copied",
@@ -2562,6 +2684,193 @@ fn handle_offload_command(
     }
 }
 
+// ── Recording-session command handlers ─────────────────────────────────
+
+fn handle_session_command(
+    cmd: crate::command::SessionCommand,
+    core: &AudioCore,
+    els: &mut EngineLoopState,
+) {
+    use crate::command::SessionCommand;
+    match cmd {
+        SessionCommand::Create { name } => cmd_session_create(name, els),
+        SessionCommand::Load { id } => cmd_session_load(id, core, els),
+        SessionCommand::Close => cmd_session_close(core, els),
+        SessionCommand::SetContinueGapSeconds(gap) => cmd_session_set_gap(gap, els),
+    }
+}
+
+/// Persist a session record to disk; failures are logged, never fatal
+/// (the session keeps working in memory, the snapshot stays authoritative).
+fn save_session_logged(rec: &config::SessionRecord) {
+    if let Err(e) = config::save_session(rec) {
+        warn!("Failed to persist session '{}': {}", rec.id, e);
+    }
+}
+
+fn upsert_session(sessions: &mut Vec<config::SessionRecord>, rec: config::SessionRecord) {
+    match sessions.iter_mut().find(|r| r.id == rec.id) {
+        Some(slot) => *slot = rec,
+        None => sessions.push(rec),
+    }
+}
+
+/// Mirror engine-owned session state into the published snapshot:
+/// the active-session view and the "Continue" picker list.
+fn sync_session_state(els: &mut EngineLoopState) {
+    els.current.session = els
+        .active_session
+        .as_ref()
+        .map(|rec| crate::state::ActiveSessionView {
+            id: rec.id.clone(),
+            name: rec.name.clone(),
+            continue_timecode: rec.continue_timecode(),
+            last_active_date: rec.last_active_date.clone(),
+            continue_gap_seconds: rec.continue_gap_seconds,
+        });
+    els.current.available_sessions = els
+        .sessions
+        .iter()
+        .map(|rec| crate::state::SessionListItem {
+            id: rec.id.clone(),
+            name: rec.name.clone(),
+            last_active_date: rec.last_active_date.clone(),
+            last_emitted_timecode: rec.last_emitted_timecode,
+            continue_timecode: rec.continue_timecode(),
+            drop_frame: rec.drop_frame,
+        })
+        .collect();
+}
+
+/// Stamp the last-emitted TC into the active session and persist it.
+/// Only meaningful while playing (the resume position is not "emitted").
+fn persist_session_progress_if_playing(els: &mut EngineLoopState) {
+    if !els.current.is_playing {
+        return;
+    }
+    let Some(rec) = &mut els.active_session else {
+        return;
+    };
+    rec.last_emitted_timecode = els.current.current_timecode;
+    let snapshot = rec.clone();
+    save_session_logged(&snapshot);
+    upsert_session(&mut els.sessions, snapshot);
+    sync_session_state(els);
+}
+
+/// Periodic playing-state persist — tick-counter driven, deterministic in
+/// tests via `session_persist_every_ticks`.
+fn maybe_persist_session_progress(els: &mut EngineLoopState) {
+    if !els.current.is_playing || els.active_session.is_none() {
+        els.session_progress_ticks = 0;
+        return;
+    }
+    els.session_progress_ticks += 1;
+    if els.session_progress_ticks >= els.session_persist_every_ticks {
+        els.session_progress_ticks = 0;
+        persist_session_progress_if_playing(els);
+    }
+}
+
+fn cmd_session_create(name: String, els: &mut EngineLoopState) {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        warn!("Session create ignored — empty name");
+        return;
+    }
+    // Switching sessions: stamp the outgoing one's progress first.
+    persist_session_progress_if_playing(els);
+    let date = crate::timecode::local_today_string();
+    let existing: Vec<String> = els.sessions.iter().map(|r| r.id.clone()).collect();
+    let id = config::make_session_id(&name, &date, &existing);
+    let mut rec = config::SessionRecord::new(
+        id.clone(),
+        name,
+        date,
+        els.current.fps(),
+        els.current.drop_frame(),
+        els.current.start_timecode,
+    );
+    rec.last_emitted_timecode = els.current.start_timecode;
+    save_session_logged(&rec);
+    upsert_session(&mut els.sessions, rec.clone());
+    els.active_session = Some(rec);
+    // Session-linked offload default: the destination folder for this shoot.
+    els.current.offload.parent_name = id.clone();
+    sync_session_state(els);
+    info!("Session created: {}", id);
+}
+
+fn cmd_session_load(id: String, core: &AudioCore, els: &mut EngineLoopState) {
+    // Refresh from disk once if the id is unknown to the startup list.
+    if !els.sessions.iter().any(|r| r.id == id) {
+        els.sessions = config::load_sessions();
+    }
+    let Some(mut rec) = els.sessions.iter().find(|r| r.id == id).cloned() else {
+        warn!("Session load ignored — unknown id '{}'", id);
+        return;
+    };
+    // Loading overwrites the transport state (settled Q-rule): stamp the
+    // outgoing session's progress first (while still active + playing),
+    // then stop playback and apply fps/DF and the continuation TC.
+    let was_playing = els.current.is_playing;
+    if was_playing {
+        persist_session_progress_if_playing(els);
+    }
+    let _ = core.stop_ltc();
+    els.current.is_playing = false;
+    if let Some(idx) = crate::timecode::FPS_OPTIONS
+        .iter()
+        .position(|o| o.drop_frame == rec.drop_frame && (o.fps - rec.fps).abs() < 0.01)
+    {
+        els.current.fps_index = idx;
+    }
+    let resume = rec.continue_timecode();
+    els.current.start_timecode = resume;
+    els.current.current_timecode = resume;
+    rec.last_active_date = crate::timecode::local_today_string();
+    save_session_logged(&rec);
+    upsert_session(&mut els.sessions, rec.clone());
+    els.active_session = Some(rec);
+    els.current.offload.parent_name = id.clone();
+    sync_session_state(els);
+    info!(
+        "Session loaded: {} — resume at {}",
+        id,
+        crate::timecode::timecode_to_string(resume, els.current.drop_frame())
+    );
+}
+
+fn cmd_session_close(core: &AudioCore, els: &mut EngineLoopState) {
+    let Some(rec) = els.active_session.take() else {
+        return;
+    };
+    if els.current.is_playing {
+        let mut closing = rec.clone();
+        closing.last_emitted_timecode = els.current.current_timecode;
+        save_session_logged(&closing);
+        upsert_session(&mut els.sessions, closing);
+        let _ = core.stop_ltc();
+        els.current.is_playing = false;
+    }
+    els.current.offload.parent_name = crate::offload::default_parent_name();
+    sync_session_state(els);
+    info!("Session closed: {}", rec.id);
+}
+
+fn cmd_session_set_gap(gap: u64, els: &mut EngineLoopState) {
+    let gap = gap.min(config::MAX_CONTINUE_GAP_SECONDS);
+    let Some(rec) = &mut els.active_session else {
+        warn!("SetContinueGapSeconds ignored — no active session");
+        return;
+    };
+    rec.continue_gap_seconds = gap;
+    let snapshot = rec.clone();
+    save_session_logged(&snapshot);
+    upsert_session(&mut els.sessions, snapshot);
+    sync_session_state(els);
+}
+
 // ── Converter helper functions ─────────────────────────────────────────
 
 /// Recompute derived converter UI data (readiness, collision warning,
@@ -2579,8 +2888,15 @@ fn recompute_converter_derived(state: &mut AppStateSnapshot) {
     let caps = state.ffmpeg_caps.clone();
 
     // Readiness — no mutable borrow of converter yet
-    let blockers =
-        evaluate_readiness(has_group, prefix_empty, output_empty, caps.as_ref()).blockers;
+    let selection_empty = selected_group_file_indices(state).is_empty();
+    let blockers = evaluate_readiness(
+        has_group,
+        prefix_empty,
+        output_empty,
+        selection_empty,
+        caps.as_ref(),
+    )
+    .blockers;
 
     // Compute warnings via a temporary settings assembly. The output preview
     // is only needed here (as input to the duplicate-name warning); the GUIs
@@ -2605,6 +2921,29 @@ fn recompute_converter_derived(state: &mut AppStateSnapshot) {
     c.duplicate_output_warning = duplicate_warning;
 }
 
+/// Ordered indices into the selected group's files that take part in the
+/// conversion — the per-file selection subset. Absent selection entry =
+/// all files. `plan_output_paths` (the single enumeration home) sees the
+/// subset through the assembled settings' `input_files`.
+fn selected_group_file_indices(state: &AppStateSnapshot) -> Vec<usize> {
+    let Some(idx) = state.converter.selected_group_idx else {
+        return Vec::new();
+    };
+    let Some(group) = state.converter.groups.get(idx) else {
+        return Vec::new();
+    };
+    match state.converter.group_file_selection.get(&idx) {
+        None => (0..group.files.len()).collect(),
+        Some(sel) => group
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| sel.contains(*f))
+            .map(|(i, _)| i)
+            .collect(),
+    }
+}
+
 /// Assemble a `ConverterSettings` from the engine's current state snapshot.
 /// Returns `None` when no recording group is selected.
 fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSettings> {
@@ -2612,6 +2951,9 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
     let group = state.converter.groups.get(idx)?;
 
     let s = &state.converter.settings;
+    // Per-file selection subset (default = all files).
+    let sel_idx = selected_group_file_indices(state);
+    let input_files: Vec<PathBuf> = sel_idx.iter().map(|&i| group.files[i].clone()).collect();
 
     let pipeline = if s.metadata_only {
         crate::converter::ConversionPipeline::MetadataOnly
@@ -2706,12 +3048,23 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
         None
     };
 
+    // Subset the per-file vecs to the selection (keeps every per-input index
+    // aligned with the subset `input_files`).
+    let timecode_meta_per_file: Vec<Option<crate::converter::TimecodeMetadata>> = sel_idx
+        .iter()
+        .map(|&i| timecode_meta_per_file[i].clone())
+        .collect();
+    let camera_meta_per_file: Vec<Option<crate::camera_meta::CameraInfo>> = sel_idx
+        .iter()
+        .map(|&i| state.converter.camera_meta.get(i).cloned().flatten())
+        .collect();
+
     // Defensive repair: for MultiTrackAudio groups the channel map dimension
     // must equal the number of input files (each file = one track). If the
     // stored map has a different size (e.g. from stale probe-based resize or
     // identity(0) after selection), rebuild the correct identity permutation.
     let channel_map = if matches!(pipeline, ConversionPipeline::AudioOnly { .. }) {
-        let correct_n = group.files.len();
+        let correct_n = input_files.len();
         if s.channel_map.num_channels() != correct_n {
             log::info!(
                 "Repaired stale channel map: identity({}) → identity({}) \
@@ -2731,9 +3084,15 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
 
     Some(ConverterSettings {
         pipeline,
-        input_files: group.files.clone(),
+        input_files,
         recording_type: group.recording_type.clone(),
-        ltc_track_channel_index: s.ltc_file_idx,
+        // The LTC track index is a group-file index; remap it into the
+        // selection subset (falls back to track 0 when the LTC carrier was
+        // deselected).
+        ltc_track_channel_index: sel_idx
+            .iter()
+            .position(|&i| i == s.ltc_file_idx)
+            .unwrap_or(0),
         channel_map,
         split_tracks: s.split_tracks,
         drop_ltc_track: s.drop_ltc_track,
@@ -2750,9 +3109,9 @@ fn assemble_converter_settings(state: &AppStateSnapshot) -> Option<ConverterSett
         video_suffix_template: s.video_suffix_template.clone(),
         set_start_from_ltc: s.set_start_from_ltc,
         embed_camera_metadata: s.embed_camera_metadata,
-        trim_offsets_secs: vec![0.0; group.files.len()],
+        trim_offsets_secs: vec![0.0; sel_idx.len()],
         timecode_meta_per_file,
-        camera_meta_per_file: state.converter.camera_meta.clone(),
+        camera_meta_per_file,
         device_name: state.converter.device_name.clone(),
         concat_audio: s.concat_audio,
     })
@@ -2790,6 +3149,8 @@ fn apply_recording_selection(
     state.converter.camera_meta.clear();
     state.converter.device_name = None;
     state.converter.probes_generation += 1;
+    // Per-file selection resets to all-selected (absent entry = default).
+    state.converter.group_file_selection.clear();
     // Reset unconditionally: `or_insert_with` preserved a stale terminal
     // status (e.g. Succeeded), keeping the "Conversion completed" banner and
     // its ffmpeg log visible for the newly selected recording. A job still
@@ -2922,6 +3283,14 @@ fn auto_apply_group_ltc_to_settings(state: &mut AppStateSnapshot) {
     state.converter.settings.split_tracks = true;
     state.converter.settings.drop_ltc_track = true;
     state.converter.settings.set_start_from_ltc = true;
+}
+
+/// Single-receiver event channel placeholder for unit tests that call
+/// `process_command` without audio-event forwarding.
+#[cfg(test)]
+fn event_tx_unused() -> std::sync::mpsc::Sender<AudioEvent> {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    tx
 }
 
 #[cfg(test)]
@@ -6212,6 +6581,458 @@ mod tests {
             state.converter.readiness.is_empty(),
             "all blockers satisfied → readiness empty, got {:?}",
             state.converter.readiness
+        );
+    }
+
+    // ── Recording sessions ───────────────────────────────────────────────
+
+    fn session_test_els() -> EngineLoopState {
+        let mut els = test_els(AppStateSnapshot::initial());
+        els.sessions = config::load_sessions();
+        els
+    }
+
+    #[test]
+    fn session_create_records_transport_state_and_defaults_offload_parent() {
+        let mut els = session_test_els();
+        els.current.start_timecode = Timecode {
+            hours: 2,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
+        els.current.fps_index = 0; // 24 fps
+
+        handle_session_command(
+            crate::command::SessionCommand::Create {
+                name: "Forest Shoot".into(),
+            },
+            &AudioCore::new(),
+            &mut els,
+        );
+
+        let view = els
+            .current
+            .session
+            .as_ref()
+            .expect("created session must be active");
+        assert_eq!(view.name, "Forest Shoot");
+        assert!(view.id.ends_with("-forest-shoot"), "id must slug the name");
+        assert_eq!(
+            view.continue_gap_seconds,
+            config::DEFAULT_CONTINUE_GAP_SECONDS
+        );
+        // Created from the current transport state: last emitted starts at
+        // the start TC, so the continue preview is start TC + default gap.
+        let preview = config::SessionRecord::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            els.current.fps(),
+            els.current.drop_frame(),
+            els.current.start_timecode,
+        )
+        .continue_timecode();
+        assert_eq!(view.continue_timecode, preview);
+        // Offload destination default follows the session id.
+        assert_eq!(els.current.offload.parent_name, view.id);
+        // Persisted to disk and listed.
+        assert!(els
+            .current
+            .available_sessions
+            .iter()
+            .any(|s| s.id == view.id));
+        let on_disk = config::load_sessions();
+        assert!(on_disk.iter().any(|r| r.id == view.id));
+    }
+
+    #[test]
+    fn session_create_ignores_empty_name() {
+        let mut els = session_test_els();
+        handle_session_command(
+            crate::command::SessionCommand::Create { name: "   ".into() },
+            &AudioCore::new(),
+            &mut els,
+        );
+        assert!(els.current.session.is_none());
+        assert!(els.current.available_sessions.is_empty());
+    }
+
+    #[test]
+    fn session_load_resumes_at_last_emitted_plus_gap_and_applies_fps() {
+        let mut els = session_test_els();
+        // Persist a session with 24 fps and an emitted TC of 02:00:00:00.
+        let mut rec = config::SessionRecord::new(
+            "2026-11-05-day1".into(),
+            "Day 1".into(),
+            "2026-11-05".into(),
+            24.0,
+            false,
+            Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
+        );
+        rec.last_emitted_timecode = Timecode {
+            hours: 2,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
+        config::save_session(&rec).expect("seed session file");
+        els.sessions = vec![rec];
+        els.current.fps_index = 1; // 25 fps — must be overwritten by the load
+
+        handle_session_command(
+            crate::command::SessionCommand::Load {
+                id: "2026-11-05-day1".into(),
+            },
+            &AudioCore::new(),
+            &mut els,
+        );
+
+        assert_eq!(els.current.fps_index, 0, "session fps (24) must be applied");
+        let expected = Timecode {
+            hours: 2,
+            minutes: 1,
+            seconds: 0,
+            frames: 0,
+        };
+        assert_eq!(
+            els.current.start_timecode, expected,
+            "resume = last emitted + 60 s"
+        );
+        assert_eq!(
+            els.current.current_timecode, expected,
+            "position follows start"
+        );
+        assert!(!els.current.is_playing);
+        assert_eq!(
+            els.current
+                .session
+                .as_ref()
+                .expect("active")
+                .continue_timecode,
+            expected
+        );
+        assert_eq!(els.current.offload.parent_name, "2026-11-05-day1");
+    }
+
+    #[test]
+    fn session_load_unknown_id_is_ignored() {
+        let mut els = session_test_els();
+        handle_session_command(
+            crate::command::SessionCommand::Load { id: "nope".into() },
+            &AudioCore::new(),
+            &mut els,
+        );
+        assert!(els.current.session.is_none());
+    }
+
+    #[test]
+    fn session_close_deactivates_and_restores_offload_default() {
+        let mut els = session_test_els();
+        handle_session_command(
+            crate::command::SessionCommand::Create {
+                name: "Temp".into(),
+            },
+            &AudioCore::new(),
+            &mut els,
+        );
+        assert!(els.current.session.is_some());
+
+        handle_session_command(
+            crate::command::SessionCommand::Close,
+            &AudioCore::new(),
+            &mut els,
+        );
+
+        assert!(els.current.session.is_none());
+        assert_eq!(
+            els.current.offload.parent_name,
+            crate::offload::default_parent_name()
+        );
+    }
+
+    #[test]
+    fn session_stop_ltc_persists_last_emitted() {
+        let mut els = session_test_els();
+        handle_session_command(
+            crate::command::SessionCommand::Create { name: "Rec".into() },
+            &AudioCore::new(),
+            &mut els,
+        );
+        // Simulate playback having advanced the position.
+        els.current.is_playing = true;
+        els.current.current_timecode = Timecode {
+            hours: 3,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
+
+        process_command(
+            GuiCommand::StopLtc,
+            &AudioCore::new(),
+            false,
+            &event_tx_unused(),
+            &mut els,
+            &mut JobSupervisor::new(),
+        );
+
+        assert!(!els.current.is_playing);
+        let rec = &els.active_session.as_ref().expect("still active");
+        assert_eq!(
+            rec.last_emitted_timecode,
+            Timecode {
+                hours: 3,
+                minutes: 0,
+                seconds: 0,
+                frames: 0
+            },
+            "stop must stamp the last-emitted TC"
+        );
+        let on_disk = config::load_sessions();
+        assert_eq!(
+            on_disk
+                .iter()
+                .find(|r| r.id == rec.id)
+                .map(|r| r.last_emitted_timecode),
+            Some(Timecode {
+                hours: 3,
+                minutes: 0,
+                seconds: 0,
+                frames: 0
+            }),
+            "last-emitted stamp must reach the session file"
+        );
+    }
+
+    #[test]
+    fn session_periodic_persist_is_tick_counter_driven() {
+        let mut els = session_test_els();
+        handle_session_command(
+            crate::command::SessionCommand::Create {
+                name: "Tick".into(),
+            },
+            &AudioCore::new(),
+            &mut els,
+        );
+        els.session_persist_every_ticks = 3;
+        els.current.is_playing = true;
+        els.current.current_timecode = Timecode {
+            hours: 5,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        };
+
+        maybe_persist_session_progress(&mut els);
+        maybe_persist_session_progress(&mut els);
+        assert_eq!(
+            els.active_session.as_ref().unwrap().last_emitted_timecode,
+            els.current.start_timecode,
+            "below the tick threshold nothing is persisted yet"
+        );
+        maybe_persist_session_progress(&mut els);
+        assert_eq!(
+            els.active_session.as_ref().unwrap().last_emitted_timecode,
+            Timecode {
+                hours: 5,
+                minutes: 0,
+                seconds: 0,
+                frames: 0
+            },
+            "reaching the tick threshold stamps the emitted TC"
+        );
+        assert_eq!(
+            els.session_progress_ticks, 0,
+            "counter resets after persist"
+        );
+    }
+
+    #[test]
+    fn session_gap_change_updates_preview_and_file() {
+        let mut els = session_test_els();
+        handle_session_command(
+            crate::command::SessionCommand::Create { name: "Gap".into() },
+            &AudioCore::new(),
+            &mut els,
+        );
+        handle_session_command(
+            crate::command::SessionCommand::SetContinueGapSeconds(120),
+            &AudioCore::new(),
+            &mut els,
+        );
+        assert_eq!(
+            els.current.session.as_ref().unwrap().continue_gap_seconds,
+            120
+        );
+        let id = els.current.session.as_ref().unwrap().id.clone();
+        let on_disk = config::load_sessions();
+        assert_eq!(
+            on_disk
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.continue_gap_seconds)
+                .expect("session file present"),
+            120,
+            "gap change must reach the session file"
+        );
+        // Oversized gaps clamp to the documented maximum.
+        handle_session_command(
+            crate::command::SessionCommand::SetContinueGapSeconds(u64::MAX),
+            &AudioCore::new(),
+            &mut els,
+        );
+        assert_eq!(
+            els.current.session.as_ref().unwrap().continue_gap_seconds,
+            config::MAX_CONTINUE_GAP_SECONDS
+        );
+    }
+
+    // ── Per-file convert selection ───────────────────────────────────────
+
+    fn els_with_audio_group() -> EngineLoopState {
+        let mut els = test_els(AppStateSnapshot::initial());
+        els.current.converter.selected_group_idx = Some(0);
+        els.current.converter.groups.push(MatchedGroup {
+            prefix: "T".into(),
+            rel_dir: String::new(),
+            recording_type: crate::converter::RecordingType::MultiTrackAudio,
+            files: vec![
+                PathBuf::from("/tmp/T_S01.wav"),
+                PathBuf::from("/tmp/T_S02.wav"),
+                PathBuf::from("/tmp/T_S03.wav"),
+            ],
+        });
+        els
+    }
+
+    #[test]
+    fn file_selection_default_is_all_files() {
+        let els = els_with_audio_group();
+        assert_eq!(selected_group_file_indices(&els.current), vec![0, 1, 2]);
+        let settings = assemble_converter_settings(&els.current).expect("assembles");
+        assert_eq!(settings.input_files.len(), 3);
+    }
+
+    #[test]
+    fn file_selection_deselect_excludes_file_from_assembled_settings() {
+        let mut els = els_with_audio_group();
+        handle_converter_command(
+            ConverterCommand::SetFileSelected {
+                group: 0,
+                path: PathBuf::from("/tmp/T_S02.wav"),
+                selected: false,
+            },
+            &mut els,
+            &mut JobSupervisor::new(),
+        );
+
+        assert_eq!(selected_group_file_indices(&els.current), vec![0, 2]);
+        let settings = assemble_converter_settings(&els.current).expect("assembles");
+        assert_eq!(
+            settings.input_files,
+            vec![
+                PathBuf::from("/tmp/T_S01.wav"),
+                PathBuf::from("/tmp/T_S03.wav"),
+            ],
+            "deselected file must not flow into the conversion input"
+        );
+        assert_eq!(settings.trim_offsets_secs.len(), 2);
+        // Channel map repaired to the subset dimension.
+        assert_eq!(settings.channel_map.num_channels(), 2);
+    }
+
+    #[test]
+    fn file_selection_empty_selection_raises_no_files_selected_blocker() {
+        let mut els = els_with_audio_group();
+        handle_converter_command(
+            ConverterCommand::SetAllGroupFiles {
+                group: 0,
+                selected: false,
+            },
+            &mut els,
+            &mut JobSupervisor::new(),
+        );
+
+        assert!(selected_group_file_indices(&els.current).is_empty());
+        assert!(
+            els.current
+                .converter
+                .readiness
+                .iter()
+                .any(|b| matches!(b, crate::converter::ConvertBlocker::NoFilesSelected)),
+            "all-deselected must engage the NoFilesSelected blocker"
+        );
+    }
+
+    #[test]
+    fn file_selection_select_all_restores_default() {
+        let mut els = els_with_audio_group();
+        handle_converter_command(
+            ConverterCommand::SetAllGroupFiles {
+                group: 0,
+                selected: false,
+            },
+            &mut els,
+            &mut JobSupervisor::new(),
+        );
+        handle_converter_command(
+            ConverterCommand::SetAllGroupFiles {
+                group: 0,
+                selected: true,
+            },
+            &mut els,
+            &mut JobSupervisor::new(),
+        );
+
+        assert_eq!(selected_group_file_indices(&els.current), vec![0, 1, 2]);
+        assert!(!els
+            .current
+            .converter
+            .readiness
+            .iter()
+            .any(|b| matches!(b, crate::converter::ConvertBlocker::NoFilesSelected)));
+    }
+
+    #[test]
+    fn file_selection_is_reset_by_recording_selection() {
+        let mut els = els_with_audio_group();
+        handle_converter_command(
+            ConverterCommand::SetAllGroupFiles {
+                group: 0,
+                selected: false,
+            },
+            &mut els,
+            &mut JobSupervisor::new(),
+        );
+        apply_recording_selection(&mut els, &mut JobSupervisor::new(), 0);
+        assert!(
+            els.current.converter.group_file_selection.is_empty(),
+            "recording selection resets to all-selected"
+        );
+        assert_eq!(selected_group_file_indices(&els.current), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn file_selection_for_other_group_is_ignored() {
+        let mut els = els_with_audio_group();
+        handle_converter_command(
+            ConverterCommand::SetFileSelected {
+                group: 3,
+                path: PathBuf::from("/tmp/T_S01.wav"),
+                selected: false,
+            },
+            &mut els,
+            &mut JobSupervisor::new(),
+        );
+        assert!(
+            els.current.converter.group_file_selection.is_empty(),
+            "commands for non-selected groups must not create selection state"
         );
     }
 }
