@@ -23,9 +23,7 @@ use crate::job::CancelToken;
 use crate::job::{
     self, spawn_job, JobEvent, JobFinal, JobItem, JobKind, JobOutcome, JobStatus, JobSupervisor,
 };
-use crate::offload::{
-    run_offload_copy_job, run_offload_scan_job_with, DeviceNameSource, ScanProgress, SdCardInfo,
-};
+use crate::offload::{run_offload_scan_job_with, DeviceNameSource, ScanProgress, SdCardInfo};
 use crate::state::{AppStateSnapshot, ClapLogItem, ClipDecodeState};
 use crate::timecode;
 
@@ -56,6 +54,22 @@ pub type ScanCardsFn = Arc<
     dyn Fn(&CancelToken, Option<&ScanProgress>) -> Result<Vec<SdCardInfo>, String> + Send + Sync,
 >;
 
+/// Offload copy runner for `StartOffload` jobs. Mirrors
+/// [`crate::offload::run_offload_copy_job`]'s signature so tests can inject
+/// a fake runner (full replacement) or a `run_offload_copy_job_with`
+/// delegation with an injectable copy backend. May block and poll
+/// `ctx.cancel`.
+pub type OffloadCopyFn = Arc<
+    dyn Fn(
+            &crate::job::JobContext,
+            Vec<Vec<crate::offload::CopyPlanItem>>,
+            Vec<String>,
+            std::path::PathBuf,
+        ) -> Result<crate::job::JobFinal, crate::job::JobError>
+        + Send
+        + Sync,
+>;
+
 /// Audio-event source drained once per engine tick. The default is
 /// AudioCore's own event queue; tests inject a queue they can push to.
 pub type AudioEventsFn = Box<dyn Fn(&AudioCore) -> Vec<AudioEvent> + Send>;
@@ -81,6 +95,11 @@ pub struct EngineSeams {
     /// implementation walks `/proc/mounts` / `/sys/class/block`; tests
     /// hand-build `SdCardInfo` values. May block and poll `cancel`.
     pub scan_cards: ScanCardsFn,
+    /// Offload copy runner for `StartOffload` jobs. The default is the real
+    /// `offload::run_offload_copy_job`; tests inject fakes (stalling
+    /// runners, cancel gates, per-device failures). May block and poll
+    /// `ctx.cancel`.
+    pub offload_copy: OffloadCopyFn,
     /// Audio-event source drained once per engine tick (the recovery-ladder
     /// seam). The default drains AudioCore's own event queue; tests inject
     /// a shared queue they can push `AudioEvent`s into.
@@ -96,6 +115,9 @@ impl Default for EngineSeams {
             ffmpeg_caps: Box::new(query_ffmpeg_capabilities),
             scan_cards: Arc::new(|_cancel, progress| {
                 Ok(crate::offload::detect_cards_with_progress(progress))
+            }),
+            offload_copy: Arc::new(|ctx, plans, names, dest| {
+                crate::offload::run_offload_copy_job(ctx, plans, names, dest)
             }),
             audio_events: Box::new(|core| core.drain_events()),
             init_output: Box::new(|core, device_id, sample_rate, buffer_size| {
@@ -148,6 +170,9 @@ struct EngineLoopState {
     /// Card-detection seam for offload `ScanCards` jobs (default = real
     /// detector; tests inject hand-built cards).
     scan_cards: ScanCardsFn,
+    /// Offload copy runner seam (default = real `run_offload_copy_job`;
+    /// tests inject fakes through `EngineSeams`).
+    offload_copy: OffloadCopyFn,
     /// Audio-output initializer (default = real `AudioCore::init_output`;
     /// tests inject failure for deterministic recovery-ladder behavior).
     audio_init: AudioInitFn,
@@ -176,6 +201,9 @@ impl EngineLoopState {
             applied_command_seq: 0,
             scan_cards: Arc::new(|_cancel, progress| {
                 Ok(crate::offload::detect_cards_with_progress(progress))
+            }),
+            offload_copy: Arc::new(|ctx, plans, names, dest| {
+                crate::offload::run_offload_copy_job(ctx, plans, names, dest)
             }),
             audio_init: Box::new(|core, device_id, sample_rate, buffer_size| {
                 core.init_output(device_id, sample_rate, buffer_size)
@@ -228,6 +256,7 @@ fn engine_main_loop(
     let core = AudioCore::new();
     let mut els = EngineLoopState::new(initial);
     els.scan_cards = seams.scan_cards;
+    els.offload_copy = seams.offload_copy;
     els.audio_init = seams.init_output;
     els.hw_validate = Some(seams.hw_validate);
     let audio_events = seams.audio_events;
@@ -2435,6 +2464,7 @@ fn handle_offload_command(
             let names_job = plan.device_names.clone();
             let units = crate::offload::offload_copy_unit_specs(&plan.device_plans, &names_job);
             let plans_job = plan.device_plans;
+            let copy_seam = els.offload_copy.clone();
 
             let spec = job::JobSpec {
                 kind: JobKind::OffloadCopy,
@@ -2442,7 +2472,7 @@ fn handle_offload_command(
                 units,
             };
             spawn_job::<JobFinal, _>(supervisor, spec, move |ctx| {
-                run_offload_copy_job(ctx, plans_job, names_job, dest_parent_job)
+                copy_seam(ctx, plans_job, names_job, dest_parent_job)
             });
         }
 
