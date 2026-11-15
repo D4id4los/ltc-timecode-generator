@@ -2033,52 +2033,82 @@ fn on_duration_probe_finished(els: &mut EngineLoopState, outcome: JobOutcome, pa
 }
 
 fn on_offload_copy_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
-    if let Some(status) = els.current.jobs.get_mut(&JobKind::OffloadCopy) {
+    let cancelled = matches!(outcome, JobOutcome::Cancelled { .. });
+    let (completed_devices, failed_devices, cancelled) = {
+        let status = match els.current.jobs.get_mut(&JobKind::OffloadCopy) {
+            Some(status) => status,
+            None => return,
+        };
         status.apply_outcome(&outcome);
-    }
-    let completed_devices = match payload {
-        JobFinal::OffloadCopy { completed_devices } => completed_devices,
-        other => {
-            warn!(
-                "JobKind::OffloadCopy finished with unexpected payload: {:?}",
-                other
-            );
-            return;
-        }
+        // Compose the run summary from the unit states — the per-device
+        // state machine is the source of truth. On cancellation the payload
+        // is `NoPayload` (typed cancellation, job.rs), so the Done units are
+        // the only record of devices that finished before the cancel.
+        let units = status.units().to_vec();
+        let completed_from_units: Vec<String> = units
+            .iter()
+            .filter(|u| u.state == job::UnitState::Done)
+            .map(|u| u.label.clone())
+            .collect();
+        let failed: Vec<String> = units
+            .iter()
+            .filter(|u| u.state == job::UnitState::Failed)
+            .map(|u| u.label.clone())
+            .collect();
+        let completed = match &payload {
+            JobFinal::OffloadCopy { completed_devices } if !cancelled => completed_devices.clone(),
+            _ => completed_from_units,
+        };
+        (completed, failed, cancelled)
     };
-    if matches!(outcome, JobOutcome::Cancelled { .. }) {
+
+    for name in &completed_devices {
+        if !els.current.offload.completed_devices.contains(name) {
+            els.current.offload.completed_devices.push(name.clone());
+        }
+    }
+    els.current.offload.run_summary = Some(crate::offload::OffloadRunSummary {
+        completed_devices: completed_devices.clone(),
+        failed_devices,
+        cancelled,
+    });
+
+    if cancelled {
         info!(
-            "Offload copy was cancelled by user: {} device(s) completed",
+            "Offload copy was cancelled by user: {} device(s) completed before cancel",
             completed_devices.len(),
         );
         els.current.offload.error = Some("Canceled by user".to_string());
         els.current.status.set_offload("Offload canceled");
-    } else {
-        info!(
-            "Offload copy complete: {} device(s) offloaded of {}",
-            completed_devices.len(),
-            els.current.offload.device_totals.len(),
-        );
-        let parent = els.current.offload.parent_folder.clone();
-        for name in &completed_devices {
-            if !els.current.offload.completed_devices.contains(name) {
-                els.current.offload.completed_devices.push(name.clone());
-            }
-        }
-        // The offload→converter handoff (version + parent) must only fire
-        // when the destination actually received files: a fully-failed or
-        // empty offload must not yank the converter to an empty folder.
-        if !completed_devices.is_empty() {
-            let target = parent.map(|p| p.join(&els.current.offload.parent_name));
-            els.current.offload.last_offload_parent = target;
-            els.current.offload.last_offload_version =
-                els.current.offload.last_offload_version.wrapping_add(1);
-        }
-        els.current.status.set_offload(format!(
-            "Offload complete: {} device(s) copied",
-            completed_devices.len(),
-        ));
+        // No converter handoff on cancel: the destination is partial.
+        return;
     }
+
+    info!(
+        "Offload copy finished: {} device(s) copied, {} failed of {}",
+        completed_devices.len(),
+        els.current
+            .offload
+            .run_summary
+            .as_ref()
+            .map(|s| s.failed_devices.len())
+            .unwrap_or(0),
+        els.current.offload.device_totals.len(),
+    );
+    let parent = els.current.offload.parent_folder.clone();
+    // The offload→converter handoff (version + parent) must only fire
+    // when the destination actually received files: a fully-failed or
+    // empty offload must not yank the converter to an empty folder.
+    if !completed_devices.is_empty() {
+        let target = parent.map(|p| p.join(&els.current.offload.parent_name));
+        els.current.offload.last_offload_parent = target;
+        els.current.offload.last_offload_version =
+            els.current.offload.last_offload_version.wrapping_add(1);
+    }
+    els.current.status.set_offload(format!(
+        "Offload complete: {} device(s) copied",
+        completed_devices.len(),
+    ));
 }
 
 fn on_ltc_decode_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
@@ -2451,6 +2481,17 @@ fn handle_offload_command(
 
             state.offload.error = None;
             state.offload.plan_error = None;
+            // Fresh-run reset: `sync_job_statuses` refuses to overwrite a
+            // terminal phase with polled Running snapshots, so a stale
+            // Succeeded/Cancelled/Failed status from a previous run would
+            // otherwise stick for the entire new run (the GUIs render
+            // `jobs[OffloadCopy]` verbatim). Same rationale as the
+            // Conversion reset in `apply_recording_selection`.
+            state
+                .jobs
+                .insert(JobKind::OffloadCopy, JobStatus::running("Copying media…"));
+            state.offload.completed_devices.clear();
+            state.offload.run_summary = None;
             info!(
                 "Offload started: {} device(s), {} file(s), {} MB → {:?}",
                 plan.device_names.len(),

@@ -149,6 +149,19 @@ pub struct OffloadDeviceTotals {
     pub bytes_total: u64,
 }
 
+/// Outcome summary of the most recent offload run, composed by the engine
+/// when the copy job finishes. Distinguishes full success from partial
+/// (per-device failures) and from user cancellation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OffloadRunSummary {
+    /// Devices whose files were fully copied and verified.
+    pub completed_devices: Vec<String>,
+    /// Devices that failed mid-copy (named, in plan order).
+    pub failed_devices: Vec<String>,
+    /// True when the run ended because the user cancelled it.
+    pub cancelled: bool,
+}
+
 /// Published snapshot of the entire offload subsystem.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OffloadSnapshot {
@@ -180,6 +193,9 @@ pub struct OffloadSnapshot {
     pub file_durations: HashMap<PathBuf, Option<f64>>,
     /// Monotonically increasing version — incremented on each duration insertion.
     pub durations_version: u64,
+    /// Outcome summary of the most recent copy run; `None` while no run has
+    /// finished since the last `StartOffload`.
+    pub run_summary: Option<OffloadRunSummary>,
 }
 
 impl OffloadSnapshot {
@@ -196,6 +212,7 @@ impl OffloadSnapshot {
             plan_error: None,
             file_durations: HashMap::new(),
             durations_version: 0,
+            run_summary: None,
         }
     }
 }
@@ -1459,7 +1476,10 @@ pub fn run_offload_copy_job_with(
                 // the file is still copying, so the device fraction and
                 // the speed readout advance with the bytes actually
                 // moved — not once per completed file.
-                unit_for_chunks.set_bytes(dev_done_before_item + total, dev_bytes_total);
+                unit_for_chunks.set_bytes(
+                    cap_in_flight(dev_done_before_item + total, dev_bytes_total),
+                    dev_bytes_total,
+                );
                 let speed = speed_meter.update(
                     (done_before_item + total) as usize,
                     std::time::Instant::now(),
@@ -1470,9 +1490,16 @@ pub fn run_offload_copy_job_with(
                 Ok(()) => {
                     cumulative_bytes += bytes_copied;
                     dev_done_bytes += bytes_copied;
-                    // Pin the byte-exact device fraction after each file
-                    // (covers zero-byte files, whose copy never reports).
-                    dev_unit.set_bytes(dev_done_bytes, dev_bytes_total);
+                    // Pin the device fraction after each file (covers
+                    // zero-byte files, whose copy never reports). Still
+                    // capped below full while in flight: bytes being
+                    // reported is not bytes being durable — the file is
+                    // only synced and renamed after verify passes, and
+                    // `finish()` below is what publishes the exact 1.0.
+                    dev_unit.set_bytes(
+                        cap_in_flight(dev_done_bytes, dev_bytes_total),
+                        dev_bytes_total,
+                    );
                     if verify_copy(&item.src, &item.dst, &verify_mode).is_ok() {
                         // Fraction is already byte-exact; nothing more to do.
                     } else {
@@ -1504,9 +1531,31 @@ pub fn run_offload_copy_job_with(
         }
     }
 
+    if ctx.cancel.is_cancelled() {
+        // Typed cancellation (Error-Handling R2): a cancelled offload must
+        // never be recorded as a successful run — the engine's Cancelled
+        // branch keys on this variant. Devices completed before the cancel
+        // remain visible via their Done unit states.
+        return Err(JobError::Cancelled);
+    }
+
     Ok(JobFinal::OffloadCopy {
         completed_devices: completed,
     })
+}
+
+/// Keep the *in-flight* device byte count below the device total: a full
+/// byte report from the copy backend means the bytes left the write buffer,
+/// not that the file is synced, verified and renamed. The exact full
+/// fraction is published only by `UnitProgress::finish()` after the device
+/// actually completed. A zero-byte total needs no cap (finish() follows
+/// immediately).
+fn cap_in_flight(bytes: u64, total: u64) -> u64 {
+    if total > 0 {
+        bytes.min(total - 1)
+    } else {
+        bytes
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -2796,8 +2845,10 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
             );
         }
         assert!(
-            (recorded[3] - 1.0).abs() < 0.001,
-            "last in-file sample must be the full device fraction, samples={recorded:?}"
+            recorded[3] > 0.9 && recorded[3] < 1.0,
+            "last in-file sample must be near-full but below 1.0: bytes reported is not \
+             bytes durable — the exact full fraction is published by finish(), \
+             samples={recorded:?}"
         );
         let final_snap = tracker.snapshot();
         assert!(
@@ -2849,8 +2900,9 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
             );
         }
         assert!(
-            (recorded[7] - 1.0).abs() < 0.001,
-            "final in-file sample must be full, samples={recorded:?}"
+            recorded[7] > 0.9 && recorded[7] < 1.0,
+            "final in-file sample must be near-full but below 1.0 (durable-1.0 belongs to \
+             finish()), samples={recorded:?}"
         );
     }
 
@@ -2918,8 +2970,9 @@ gvfsd-fuse /run/user/1000/gvfs fuse rw 0 0
             );
         }
         assert!(
-            (recorded[7] - 1.0).abs() < 0.001,
-            "final sample must be full, samples={recorded:?}"
+            recorded[7] > 0.9 && recorded[7] < 1.0,
+            "final in-flight sample must be near-full but below 1.0 (durable-1.0 belongs to \
+             finish()), samples={recorded:?}"
         );
     }
 

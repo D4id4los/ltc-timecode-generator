@@ -1346,8 +1346,7 @@ fn test_start_offload_guard_branches() {
 // ── Offload progress/status correctness (plan 2026-11-06 phase 1) ─────────
 
 use gui_engine::engine::OffloadCopyFn;
-use gui_engine::job::{JobContext, JobError, JobFinal};
-use gui_engine::offload::{CopyPlanItem, OffloadRunSummary};
+use gui_engine::job::{JobError, JobFinal};
 
 /// Spawn the engine with the default seams except `scan_cards` and
 /// `offload_copy` (the engine-level copy runner seam).
@@ -1418,20 +1417,22 @@ fn start_offload_run(engine: &TestEngine, dest: &Path, parent_name: &str) {
 fn two_run_stall_runner(device: &str) -> OffloadCopyFn {
     let run = std::sync::atomic::AtomicUsize::new(0);
     let device = device.to_string();
-    Arc::new(move |ctx: &JobContext, _plans, _names, _dest| {
-        if run.swap(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            return Ok(JobFinal::OffloadCopy {
-                completed_devices: vec![device.clone()],
-            });
-        }
-        // Second run: stall mid-copy until cancelled.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !ctx.cancel.is_cancelled() {
-            assert!(Instant::now() < deadline, "stall runner never cancelled");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Err(JobError::Cancelled)
-    })
+    Arc::new(
+        move |ctx: &gui_engine::job::JobContext, _plans, _names, _dest| {
+            if run.swap(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok(JobFinal::OffloadCopy {
+                    completed_devices: vec![device.clone()],
+                });
+            }
+            // Second run: stall mid-copy until cancelled.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !ctx.cancel.is_cancelled() {
+                assert!(Instant::now() < deadline, "stall runner never cancelled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(JobError::Cancelled)
+        },
+    )
 }
 
 /// Defect A: after a first offload ends, a second run must publish a fresh
@@ -1444,10 +1445,8 @@ fn offload_second_run_publishes_fresh_progress() {
     let mount = make_persistent_dir("offload-a-mount");
     let dest = make_persistent_dir("offload-a-dest");
     let card = make_card(&mount, "TESTCAM", &["a.wav"]);
-    let engine = spawn_engine_with_copy_seam(
-        static_scan_seam(card),
-        two_run_stall_runner("TESTCAM"),
-    );
+    let engine =
+        spawn_engine_with_copy_seam(static_scan_seam(card), two_run_stall_runner("TESTCAM"));
     start_offload_run(&engine, &dest, "day1");
 
     // Run 1 completes (fake) and marks the session list.
@@ -1466,8 +1465,10 @@ fn offload_second_run_publishes_fresh_progress() {
         .unwrap();
     let snap = wait_for_snapshot(&engine.state, "run 2 fresh running status", |s| {
         let copy = s.jobs.get(&JobKind::OffloadCopy);
-        matches!(copy.map(|j| j.phase()), Some(JobPhase::Running) | Some(JobPhase::Indeterminate))
-            && s.offload.completed_devices.is_empty()
+        matches!(
+            copy.map(|j| j.phase()),
+            Some(JobPhase::Running) | Some(JobPhase::Indeterminate)
+        ) && s.offload.completed_devices.is_empty()
             && copy.map(|j| j.fraction() < 1.0).unwrap_or(false)
             && s.offload.run_summary.is_none()
     });
@@ -1481,8 +1482,6 @@ fn offload_second_run_publishes_fresh_progress() {
         snap.offload.run_summary.is_none(),
         "StartOffload must clear the previous run's summary"
     );
-    let dev_dir = dest.join("day1").join("TESTCAM");
-    assert!(dev_dir.is_dir(), "run 1 output still on disk (sanity)");
 
     // Cancel ends the stalled run with a typed Cancelled phase.
     engine
@@ -1515,41 +1514,48 @@ fn offload_cancel_ends_cancelled_and_cleans_up() {
 
     // Copy backend: first file copies for real; second file simulates an
     // in-flight copy (temp file present, final file absent) that blocks until
-    // cancel, then fails with the typed CopyError::Cancelled.
-    let calls = AtomicUsize::new(0);
-    let cancelled_seen = AtomicBool::new(false);
-    let copy: gui_engine::offload::CopyFileFn = &mut |src, dst, cancel, on_progress| {
-        match calls.fetch_add(1, Ordering::SeqCst) {
-            0 => {
-                std::fs::copy(src, dst).map_err(|e| {
-                    gui_engine::offload::CopyError::Io(format!("fake copy failed: {e}"))
-                })?;
-                on_progress(std::fs::metadata(src).map(|m| m.len()).unwrap_or(0));
-                Ok(())
-            }
-            _ => {
-                let tmp = dst.with_extension("offload_tmp");
-                std::fs::write(&tmp, b"in-flight").map_err(|e| {
-                    gui_engine::offload::CopyError::Io(format!("tmp write failed: {e}"))
-                })?;
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while !cancel.load(Ordering::Relaxed) {
-                    assert!(Instant::now() < deadline, "copy seam never cancelled");
-                    std::thread::sleep(Duration::from_millis(10));
+    // cancel, then fails with the typed CopyError::Cancelled. Built inside
+    // the seam closure: `CopyFileFn` is a `&mut dyn FnMut` (not Send/Sync as
+    // a trait object), so it cannot outlive the seam call.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled_seen = Arc::new(AtomicBool::new(false));
+    let calls_for_seam = Arc::clone(&calls);
+    let cancelled_for_seam = Arc::clone(&cancelled_seen);
+    let copy_seam: OffloadCopyFn = Arc::new(move |ctx, plans, names, dest_parent| {
+        let calls = Arc::clone(&calls_for_seam);
+        let cancelled_seen = Arc::clone(&cancelled_for_seam);
+        let mut copy = move |src: &Path,
+                             dst: &Path,
+                             cancel: &std::sync::atomic::AtomicBool,
+                             on_progress: &mut dyn FnMut(u64)| {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    std::fs::copy(src, dst).map_err(|e| {
+                        gui_engine::offload::CopyError::Io(format!("fake copy failed: {e}"))
+                    })?;
+                    on_progress(std::fs::metadata(src).map(|m| m.len()).unwrap_or(0));
+                    Ok(())
                 }
-                cancelled_seen.store(true, Ordering::SeqCst);
-                Err(gui_engine::offload::CopyError::Cancelled)
+                _ => {
+                    let tmp = dst.with_extension("offload_tmp");
+                    std::fs::write(&tmp, b"in-flight").map_err(|e| {
+                        gui_engine::offload::CopyError::Io(format!("tmp write failed: {e}"))
+                    })?;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !cancel.load(Ordering::Relaxed) {
+                        assert!(Instant::now() < deadline, "copy seam never cancelled");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    cancelled_seen.store(true, Ordering::SeqCst);
+                    // Mirror the real `copy_file` cancel semantics: remove
+                    // the in-flight temp before reporting typed cancel.
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(gui_engine::offload::CopyError::Cancelled)
+                }
             }
-        }
-    };
-    let copy_arc: Arc<
-        dyn Fn(&JobContext, Vec<Vec<CopyPlanItem>>, Vec<String>, PathBuf) -> Result<JobFinal, JobError>
-            + Send
-            + Sync,
-    > = Arc::new(move |ctx, plans, names, dest_parent| {
-        gui_engine::offload::run_offload_copy_job_with(ctx, plans, names, dest_parent, copy)
+        };
+        gui_engine::offload::run_offload_copy_job_with(ctx, plans, names, dest_parent, &mut copy)
     });
-    let copy_seam: OffloadCopyFn = copy_arc;
 
     // Two cards → ScanCards seam must return both; build it here (the
     // static_scan_seam helper takes a single card).
@@ -1600,6 +1606,18 @@ fn offload_cancel_ends_cancelled_and_cleans_up() {
         .tx
         .send(GuiCommand::Offload(OffloadCommand::StartOffload))
         .unwrap();
+    // Let the copy reach the in-flight gate (DEV1's temp file present)…
+    wait_for_snapshot(&engine.state, "copy in flight", |s| {
+        dest.join("day1")
+            .join("DEV1")
+            .join("b.offload_tmp")
+            .is_file()
+    });
+    // …then cancel.
+    engine
+        .tx
+        .send(GuiCommand::Offload(OffloadCommand::CancelOffload))
+        .unwrap();
 
     let snap = wait_for_snapshot(&engine.state, "copy cancelled", |s| {
         matches!(
@@ -1612,9 +1630,7 @@ fn offload_cancel_ends_cancelled_and_cleans_up() {
         "test reached the cancel gate (sanity)"
     );
     assert_eq!(
-        snap.jobs
-            .get(&JobKind::OffloadCopy)
-            .map(|j| j.phase()),
+        snap.jobs.get(&JobKind::OffloadCopy).map(|j| j.phase()),
         Some(JobPhase::Cancelled),
         "a cancelled offload must publish the Cancelled phase, not Succeeded"
     );
@@ -1628,7 +1644,11 @@ fn offload_cancel_ends_cancelled_and_cleans_up() {
     );
 
     // Devices completed before the cancel stay visible (unit Done + summary).
-    let summary = snap.offload.run_summary.clone().expect("run summary present");
+    let summary = snap
+        .offload
+        .run_summary
+        .clone()
+        .expect("run summary present");
     assert!(summary.cancelled);
     assert_eq!(summary.completed_devices, vec!["DEV0".to_string()]);
     assert!(summary.failed_devices.is_empty());
@@ -1649,7 +1669,11 @@ fn offload_cancel_ends_cancelled_and_cleans_up() {
                 if has_tmp(&path) {
                     return true;
                 }
-            } else if path.extension().map(|e| e == "offload_tmp").unwrap_or(false) {
+            } else if path
+                .extension()
+                .map(|e| e == "offload_tmp")
+                .unwrap_or(false)
+            {
                 return true;
             }
         }
@@ -1683,35 +1707,41 @@ fn offload_partial_failure_reports_partial_summary() {
     let card1 = make_card(&mount1, "DEV1", &["b.wav"]);
 
     // DEV0 copies fine; DEV1 produces a truncated copy so size verify fails.
-    let calls = AtomicUsize::new(0);
-    let copy: gui_engine::offload::CopyFileFn = &mut |src, dst, _cancel, on_progress| {
-        match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-            0 => {
-                std::fs::copy(src, dst).map_err(|e| {
-                    gui_engine::offload::CopyError::Io(format!("fake copy failed: {e}"))
-                })?;
-                on_progress(std::fs::metadata(src).map(|m| m.len()).unwrap_or(0));
-                Ok(())
-            }
-            _ => {
-                let payload = std::fs::read(src).map_err(|e| {
-                    gui_engine::offload::CopyError::Io(format!("src read failed: {e}")
-                )})?;
-                let truncated: &[u8] = if payload.len() > 2 {
-                    &payload[..payload.len() / 2]
-                } else {
-                    &payload[..1.min(payload.len())]
-                };
-                std::fs::write(dst, truncated).map_err(|e| {
-                    gui_engine::offload::CopyError::Io(format!("dst write failed: {e}"))
-                })?;
-                on_progress(truncated.len() as u64);
-                Ok(())
-            }
-        }
-    };
+    // Built inside the seam closure (see cancel-test note on CopyFileFn).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_seam = Arc::clone(&calls);
     let copy_seam: OffloadCopyFn = Arc::new(move |ctx, plans, names, dest_parent| {
-        gui_engine::offload::run_offload_copy_job_with(ctx, plans, names, dest_parent, copy)
+        let calls = Arc::clone(&calls_for_seam);
+        let mut copy = move |src: &Path,
+                             dst: &Path,
+                             _cancel: &std::sync::atomic::AtomicBool,
+                             on_progress: &mut dyn FnMut(u64)| {
+            match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => {
+                    std::fs::copy(src, dst).map_err(|e| {
+                        gui_engine::offload::CopyError::Io(format!("fake copy failed: {e}"))
+                    })?;
+                    on_progress(std::fs::metadata(src).map(|m| m.len()).unwrap_or(0));
+                    Ok(())
+                }
+                _ => {
+                    let payload = std::fs::read(src).map_err(|e| {
+                        gui_engine::offload::CopyError::Io(format!("src read failed: {e}"))
+                    })?;
+                    let truncated: &[u8] = if payload.len() > 2 {
+                        &payload[..payload.len() / 2]
+                    } else {
+                        &payload[..1.min(payload.len())]
+                    };
+                    std::fs::write(dst, truncated).map_err(|e| {
+                        gui_engine::offload::CopyError::Io(format!("dst write failed: {e}"))
+                    })?;
+                    on_progress(truncated.len() as u64);
+                    Ok(())
+                }
+            }
+        };
+        gui_engine::offload::run_offload_copy_job_with(ctx, plans, names, dest_parent, &mut copy)
     });
     let both_cards: ScanCardsFn = {
         let c0 = card0.clone();
@@ -1728,7 +1758,11 @@ fn offload_partial_failure_reports_partial_summary() {
         )
     });
     let snap = engine.state.load().as_ref().clone();
-    let summary = snap.offload.run_summary.clone().expect("run summary present");
+    let summary = snap
+        .offload
+        .run_summary
+        .clone()
+        .expect("run summary present");
     assert!(!summary.cancelled);
     assert_eq!(summary.completed_devices, vec!["DEV0".to_string()]);
     assert_eq!(
@@ -1797,27 +1831,28 @@ fn offload_fraction_stays_below_one_until_durable() {
             std::fs::copy(src, &tmp).map_err(|e| {
                 gui_engine::offload::CopyError::Io(format!("fake copy failed: {e}"))
             })?;
-            std::fs::rename(&tmp, dst).map_err(|e| {
-                gui_engine::offload::CopyError::Io(format!("rename failed: {e}"))
-            })?;
+            std::fs::rename(&tmp, dst)
+                .map_err(|e| gui_engine::offload::CopyError::Io(format!("rename failed: {e}")))?;
             Ok(())
         };
-        gui_engine::offload::run_offload_copy_job_with(
-            ctx,
-            plans,
-            names,
-            dest_parent,
-            &mut copy,
-        )
+        gui_engine::offload::run_offload_copy_job_with(ctx, plans, names, dest_parent, &mut copy)
     });
     let engine = spawn_engine_with_copy_seam(static_scan_seam(card), copy_seam);
     start_offload_run(&engine, &dest, "day1");
 
-    // While the copy backend holds the gate after reporting all bytes,
-    // the published fraction must still be below 1.0.
+    // While the copy backend holds the gate after reporting all bytes, the
+    // published overall fraction must still be below 1.0. The unit fraction
+    // floor (> 0.9) proves the bytes were actually reported — without it the
+    // predicate could race the pre-copy Running state at fraction 0.
     wait_for_snapshot(&engine.state, "in-flight fraction below 1.0", |s| {
         let copy_job = s.jobs.get(&JobKind::OffloadCopy);
-        matches!(copy_job.map(|j| j.phase()), Some(JobPhase::Running) | Some(JobPhase::Indeterminate))
+        let unit_reported = copy_job
+            .map(|j| j.units().iter().any(|u| u.fraction > 0.9))
+            .unwrap_or(false);
+        matches!(
+            copy_job.map(|j| j.phase()),
+            Some(JobPhase::Running) | Some(JobPhase::Indeterminate)
+        ) && unit_reported
             && copy_job.map(|j| j.fraction() < 1.0).unwrap_or(false)
     });
 
