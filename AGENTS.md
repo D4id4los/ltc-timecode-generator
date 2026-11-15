@@ -375,6 +375,8 @@ All AI-generated non-code artifacts live in two local, gitignored parent dirs at
 
 **Handoff discipline**: reference prior artifacts by exact filename (e.g. "Read `plans/2026-10-05-wp-dr-decoder-robustness-improvements-plan.md` and execute steps 1–3") — never let the model re-invent the sequence.
 
+**Backlog (`backlog.md`, repo root)** — follow-up candidates and out-of-scope future work discovered by agents (implementation or review) are **automatically appended** there, one bullet each, with context + pointer to the originating plan/report and date — without asking the user. They are never expanded into the current diff. Lifecycle: `backlog.md` lists **open work only**; when an idea is picked up, replace its bullet with a link to the plan that owns it; when it is resolved/decided/closed by a landed change, move the bullet — verbatim, with its resolution note — to the end of `backlog_archive.md` (append-only). An item with a still-open remainder stays in `backlog.md`.
+
 **Commits & branches**: commit style `<type>(<module>): <short_desc>` with a body detailing the changes. Work packages run on feature branches. Merging uses the double rebase style: rebase `feature_x` on `main`, fix conflicts, re-run tests if code changed, then rebase `main` on `feature_x` — no merge commits end up on main.
 
 ## CI & SonarQube Cloud
