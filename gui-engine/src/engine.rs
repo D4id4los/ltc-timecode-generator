@@ -424,6 +424,7 @@ fn process_command(
 
         GuiCommand::SetStartTimecode(tc) => {
             els.current.start_timecode = tc;
+            sync_resume_position(&mut els.current);
         }
 
         GuiCommand::SetFpsIndex(index) => {
@@ -610,8 +611,12 @@ fn cmd_start_ltc(core: &AudioCore, els: &mut EngineLoopState, event_tx: &Sender<
         return;
     }
     let state = &mut els.current;
+    // Q4: start from the frozen resume position (current_timecode), not
+    // from start_timecode — a plain stop keeps the position so Start
+    // resumes. Start-TC edits while stopped re-sync the position (see
+    // `sync_resume_position`); Reset returns to start_timecode.
     match core.start_ltc(
-        state.start_timecode,
+        state.current_timecode,
         state.fps(),
         state.drop_frame(),
         state.ltc_channel,
@@ -620,7 +625,6 @@ fn cmd_start_ltc(core: &AudioCore, els: &mut EngineLoopState, event_tx: &Sender<
         Ok(()) => {
             state.is_playing = true;
             state.status.set_audio("Streaming LTC");
-            state.current_timecode = state.start_timecode;
         }
         Err(e) => {
             error!("Failed to start LTC: {}", e);
@@ -1397,22 +1401,35 @@ fn cmd_parse_ltc_wav_file(
 
 // ── Stepper helpers ─────────────────────────────────────────────────────
 
+/// Q4 resume rule: any start-TC mutation while NOT playing also moves the
+/// resume position (`current_timecode`) to the new start TC, so the next
+/// `StartLtc` begins there. While playing the steppers are locked in the
+/// GUIs and the position is owned by the running stream — never touched.
+fn sync_resume_position(state: &mut AppStateSnapshot) {
+    if !state.is_playing {
+        state.current_timecode = state.start_timecode;
+    }
+}
+
 fn stepper_hour(state: &mut AppStateSnapshot, delta: i32) {
     let mut tc = state.start_timecode;
     tc.hours = (tc.hours as i32 + delta).rem_euclid(24) as u32;
     state.start_timecode = tc;
+    sync_resume_position(state);
 }
 
 fn stepper_minute(state: &mut AppStateSnapshot, delta: i32) {
     let mut tc = state.start_timecode;
     tc.minutes = (tc.minutes as i32 + delta).rem_euclid(60) as u32;
     state.start_timecode = tc;
+    sync_resume_position(state);
 }
 
 fn stepper_second(state: &mut AppStateSnapshot, delta: i32) {
     let mut tc = state.start_timecode;
     tc.seconds = (tc.seconds as i32 + delta).rem_euclid(60) as u32;
     state.start_timecode = tc;
+    sync_resume_position(state);
 }
 
 fn stepper_frame(state: &mut AppStateSnapshot, delta: i32) {
@@ -1420,6 +1437,7 @@ fn stepper_frame(state: &mut AppStateSnapshot, delta: i32) {
     let max_frame = (state.fps().round() as u32).saturating_sub(1);
     tc.frames = (tc.frames as i32 + delta).rem_euclid(max_frame as i32 + 1) as u32;
     state.start_timecode = tc;
+    sync_resume_position(state);
 }
 
 // ── Audio init ──────────────────────────────────────────────────────────

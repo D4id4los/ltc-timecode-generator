@@ -2330,3 +2330,239 @@ fn test_cache_vouch_publishes_hw_encoder_at_stage1_and_reconciles() {
 
     eng.shutdown();
 }
+
+// ── Transport resume semantics (Q4 — backlog phase 2) ────────────────────
+//
+// Q4: StartLtc resumes from the frozen current_timecode; any start-TC
+// mutation while NOT playing also moves the resume position to the new
+// start TC; Reset is unchanged. Floors and monotonicity only — no
+// success ceilings (Test Quality Rules).
+
+/// Field-wise tuple comparison — Timecode has no `PartialOrd` impl and a
+/// short test never wraps midnight, so lexicographic field order is safe.
+fn tc_ge(a: gui_engine::Timecode, b: gui_engine::Timecode) -> bool {
+    (a.hours, a.minutes, a.seconds, a.frames) >= (b.hours, b.minutes, b.seconds, b.frames)
+}
+
+fn tc_gt(a: gui_engine::Timecode, b: gui_engine::Timecode) -> bool {
+    (a.hours, a.minutes, a.seconds, a.frames) > (b.hours, b.minutes, b.seconds, b.frames)
+}
+
+fn tc_lt(a: gui_engine::Timecode, b: gui_engine::Timecode) -> bool {
+    (a.hours, a.minutes, a.seconds, a.frames) < (b.hours, b.minutes, b.seconds, b.frames)
+}
+
+fn audio_available() -> bool {
+    audio_core::list_audio_devices().map(|d| !d.is_empty()).unwrap_or(false)
+}
+
+/// Engine with default seams except the ffmpeg probe (fake). The audio
+/// init seam is the real one, so transport tests exercise actual playback
+/// on audio-equipped machines.
+fn spawn_default_engine() -> TestEngine {
+    init_test_config();
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(ArcSwap::new(Arc::new(AppStateSnapshot::initial())));
+    let state_clone = Arc::clone(&state);
+    let (event_tx, event_rx) = mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("gui-engine-transport-test".into())
+        .spawn(move || {
+            let seams = EngineSeams {
+                ffmpeg_caps: Box::new(fake_probe),
+                ..EngineSeams::default()
+            };
+            engine_main_with_seams(rx, state_clone, false, event_tx, seams);
+        })
+        .expect("failed to spawn engine thread");
+    TestEngine {
+        tx,
+        state,
+        handle,
+        event_rx,
+    }
+}
+
+/// Q4 rule (deviceless-safe): a start-TC mutation while stopped must move
+/// the resume position (current_timecode) to the new start TC, so the next
+/// Start begins there.
+#[test]
+fn start_tc_edit_while_stopped_moves_resume_position() {
+    let eng = spawn_default_engine();
+    let edited = gui_engine::Timecode {
+        hours: 2,
+        minutes: 34,
+        seconds: 56,
+        frames: 12,
+    };
+
+    // SetStartTimecode + two steppers, then an ack marker in a later tick.
+    eng.tx.send(GuiCommand::SetStartTimecode(edited)).unwrap();
+    eng.tx.send(GuiCommand::MinuteUp).unwrap();
+    eng.tx.send(GuiCommand::FrameDown).unwrap();
+    eng.tx.send(GuiCommand::SetFpsIndex(1)).unwrap();
+
+    let snap = wait_for_snapshot(&eng.state, "start-TC edits to be applied", |s| {
+        s.applied_command_seq >= 4
+            && s.fps_index == 1
+            && s.start_timecode == gui_engine::Timecode {
+                hours: 2,
+                minutes: 35,
+                seconds: 56,
+                frames: 11,
+            }
+    });
+    assert_eq!(
+        snap.current_timecode, snap.start_timecode,
+        "a start-TC edit while stopped must move the resume position to the new start TC"
+    );
+
+    // The plain-stop variant of the rule: after Stop, editing start TC
+    // still syncs the resume position (engine is not playing here either,
+    // but exercise the post-Stop state explicitly).
+    eng.tx.send(GuiCommand::StartLtc).unwrap();
+    eng.tx.send(GuiCommand::SetFpsIndex(2)).unwrap();
+    wait_for_snapshot(&eng.state, "start command to be applied", |s| {
+        s.applied_command_seq >= 2 && s.fps_index == 2
+    });
+    if audio_available() {
+        eng.tx.send(GuiCommand::StopLtc).unwrap();
+        eng.tx.send(GuiCommand::SecondUp).unwrap();
+        eng.tx.send(GuiCommand::SetFpsIndex(3)).unwrap();
+        let snap = wait_for_snapshot(&eng.state, "post-stop start-TC edit to land", |s| {
+            s.applied_command_seq >= 3 && s.fps_index == 3 && !s.is_playing
+        });
+        assert_eq!(
+            snap.current_timecode, snap.start_timecode,
+            "a start-TC edit after a stop must move the resume position to the new start TC"
+        );
+    } else {
+        eprintln!(
+            "--- SKIPPED: post-stop edit variant needs a real audio output device (deviceless host)"
+        );
+    }
+
+    eng.shutdown();
+}
+
+/// Q4: start → let TC advance → stop → start resumes at or beyond the
+/// frozen position and stays monotonic. Floor-only assertions.
+#[test]
+fn start_resumes_from_frozen_timecode_after_stop() {
+    if !audio_available() {
+        eprintln!("--- SKIPPED: resume test needs a real audio output device (deviceless host)");
+        return;
+    }
+    let eng = spawn_default_engine();
+    eng.tx.send(GuiCommand::SetLtcVolume(0.0)).unwrap();
+    eng.tx.send(GuiCommand::StartLtc).unwrap();
+
+    // Let the TC actually advance past the start point.
+    let advanced = wait_for_snapshot(&eng.state, "timecode to advance while playing", |s| {
+        s.is_playing && tc_gt(s.current_timecode, s.start_timecode)
+    });
+
+    // Stop and freeze; the ack marker proves the snapshot postdates Stop.
+    eng.tx.send(GuiCommand::StopLtc).unwrap();
+    // Ack marker: 3 differs from the initial fps_index (1) and from the
+    // restart marker below, so matching proves the snapshot postdates Stop.
+    eng.tx.send(GuiCommand::SetFpsIndex(3)).unwrap();
+    let stopped = wait_for_snapshot(&eng.state, "stop to land with frozen position", |s| {
+        s.applied_command_seq >= 2 && s.fps_index == 3 && !s.is_playing
+    });
+    let frozen = stopped.current_timecode;
+    assert!(
+        tc_ge(frozen, advanced.current_timecode),
+        "the frozen position must be at or beyond the last advanced position"
+    );
+
+    // Restart: playback must resume at or beyond the frozen position —
+    // restarting from start_timecode (the pre-Q4 bug) would land below it.
+    eng.tx.send(GuiCommand::StartLtc).unwrap();
+    eng.tx.send(GuiCommand::SetFpsIndex(4)).unwrap();
+    let resumed = wait_for_snapshot(&eng.state, "resumed playback at or beyond frozen TC", |s| {
+        s.applied_command_seq >= 2 && s.fps_index == 4 && s.is_playing
+    });
+    assert!(
+        tc_ge(resumed.current_timecode, frozen),
+        "Start after a stop must resume at or beyond the frozen timecode (got {:?}, frozen {:?})",
+        resumed.current_timecode,
+        frozen
+    );
+
+    // Monotonic from there: later samples never go backwards.
+    let mut last = resumed.current_timecode;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let s = eng.state.load().as_ref().clone();
+        if s.is_playing {
+            assert!(
+                tc_ge(s.current_timecode, last),
+                "timecode must stay monotonic after resume"
+            );
+            last = s.current_timecode;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    eng.shutdown();
+}
+
+/// Reset is unchanged: while playing, it jumps the position back to the
+/// start TC and playback continues (monotonic from the reset point).
+#[test]
+fn reset_while_playing_jumps_back_to_start_and_continues() {
+    if !audio_available() {
+        eprintln!("--- SKIPPED: reset test needs a real audio output device (deviceless host)");
+        return;
+    }
+    let eng = spawn_default_engine();
+    eng.tx.send(GuiCommand::SetLtcVolume(0.0)).unwrap();
+    eng.tx.send(GuiCommand::StartLtc).unwrap();
+
+    // Run at least one full second past the start TC so "back inside the
+    // start second" after Reset can only mean a genuine jump backwards.
+    wait_for_snapshot(&eng.state, "timecode to advance past one second", |s| {
+        s.is_playing && s.current_timecode.seconds >= 1
+    });
+
+    eng.tx.send(GuiCommand::Reset).unwrap();
+    // Ack marker: 3 differs from the initial fps_index (1), so satisfying
+    // this predicate proves the snapshot postdates the Reset's tick.
+    eng.tx.send(GuiCommand::SetFpsIndex(3)).unwrap();
+    let reset = wait_for_snapshot(&eng.state, "reset to jump back to start TC", |s| {
+        s.applied_command_seq >= 2 && s.fps_index == 3 && s.is_playing
+    });
+    assert!(
+        (reset.current_timecode.hours, reset.current_timecode.minutes, reset.current_timecode.seconds)
+            == (
+                reset.start_timecode.hours,
+                reset.start_timecode.minutes,
+                reset.start_timecode.seconds
+            ),
+        "Reset while playing must jump the position back into the start second (got {:?}, start {:?})",
+        reset.current_timecode,
+        reset.start_timecode
+    );
+    assert!(
+        tc_ge(reset.current_timecode, reset.start_timecode),
+        "the reset position must be at or beyond the start TC"
+    );
+
+    // Playback continues: monotonic non-decreasing afterwards.
+    let mut last = reset.current_timecode;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let s = eng.state.load().as_ref().clone();
+        if s.is_playing {
+            assert!(
+                tc_ge(s.current_timecode, last),
+                "timecode must stay monotonic after reset"
+            );
+            last = s.current_timecode;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    eng.shutdown();
+}
