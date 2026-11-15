@@ -139,9 +139,10 @@ fn tc_gt(a: Timecode, b: Timecode) -> bool {
 }
 
 fn audio_available() -> bool {
-    audio_core::list_audio_devices()
-        .map(|d| !d.is_empty())
-        .unwrap_or(false)
+    // Enumeration alone is not enough: cpal's ALSA host exposes
+    // pseudo-devices on deviceless CI, so the gate must actually build an
+    // output stream (and drop it) to prove playback can be initialized.
+    audio_core::default_output_stream_available()
 }
 
 fn make_card(mount: &Path, device_name: &str, file_names: &[&str]) -> SdCardInfo {

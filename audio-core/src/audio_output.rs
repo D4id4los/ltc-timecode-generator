@@ -1008,6 +1008,18 @@ fn probe_device(
     ))
 }
 
+/// Cheap real-init probe for deviceless-host detection: enumeration can
+/// succeed on hosts that have no usable output (cpal's ALSA host exposes
+/// pseudo-devices like `default` even where the card is missing), so the
+/// only reliable check is to actually build an output stream. This goes
+/// through the production [`AudioCore::init_output`] path on the default
+/// device and drops the stream immediately; it allocates the ring buffers
+/// but never starts playback. Returns `true` only if the stream was
+/// constructed successfully.
+pub fn default_output_stream_available() -> bool {
+    AudioCore::new().init_output("default", 48_000, 512).is_ok()
+}
+
 pub fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     let host = cpal::default_host();
     let host_id = host.id();

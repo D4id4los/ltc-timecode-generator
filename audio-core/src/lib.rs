@@ -42,8 +42,8 @@ pub use ltc_encoder::{
 // ── Audio output ──────────────────────────────────────────────────────────
 
 pub use audio_output::{
-    is_permanent_device_error, list_audio_devices, suggest_sample_rate, AudioCore,
-    SAMPLE_RATE_OPTIONS,
+    default_output_stream_available, is_permanent_device_error, list_audio_devices,
+    suggest_sample_rate, AudioCore, SAMPLE_RATE_OPTIONS,
 };
 
 // ── LTC decoder re-exports ────────────────────────────────────────────────
