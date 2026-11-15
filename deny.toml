@@ -20,4 +20,22 @@ ignore = [
     # Transitive via the Slint text stack; advisory states no safe upgrade.
     # Revisit: next slint bump.
     "RUSTSEC-2026-0192",
+    # RUSTSEC-2026-0441 — pin-utils unmaintained (absorbed into futures-rs).
+    # Transitive via the futures/async stack; no safe upgrade available; a
+    # no-op utility crate with no runtime attack surface. Revisit: next
+    # futures/egui/slint bump that drops it.
+    "RUSTSEC-2026-0441",
+    # RUSTSEC-2026-0371 — zbus_names unmaintained. Transitive via the
+    # zbus D-Bus stack (keepawake → audio-core; atspi → accessibility);
+    # advisory states no safe upgrade; internal name types only.
+    # Revisit: next keepawake/atspi bump.
+    "RUSTSEC-2026-0371",
+    # RUSTSEC-2026-0370 — zvariant unmaintained. Same zbus stack as
+    # RUSTSEC-2026-0371; no safe upgrade; serde marshalling types only.
+    # Revisit: next keepawake/atspi bump.
+    "RUSTSEC-2026-0370",
+    # RUSTSEC-2026-0372 — zvariant_derive unmaintained. Same zbus stack;
+    # build-time proc macro only, no runtime attack surface.
+    # Revisit: next keepawake/atspi bump.
+    "RUSTSEC-2026-0372",
 ]

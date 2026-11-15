@@ -864,11 +864,10 @@ fn probe_all_video_audio(
 ) -> Vec<Option<VideoAudioProbe>> {
     let mut probes: Vec<Option<VideoAudioProbe>> = Vec::new();
 
-    for file_idx in 0..settings.input_files.len() {
+    for input in &settings.input_files {
         if report.is_cancelled() {
             break;
         }
-        let input = &settings.input_files[file_idx];
         match crate::ffprobe::probe_video_audio(input) {
             Ok(probe) => {
                 probes.push(Some(probe));
