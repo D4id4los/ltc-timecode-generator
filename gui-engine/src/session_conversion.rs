@@ -33,7 +33,7 @@ use crate::converter::{
     DEFAULT_AUDIO_SUFFIX, DEFAULT_PREFIX, DEFAULT_VIDEO_SUFFIX,
 };
 use crate::job::{JobContext, JobError, UnitProgress};
-use audio_core::{LtcDetectionResult, LtcDecodeStatus, Timecode};
+use audio_core::{LtcDecodeStatus, LtcDetectionResult, Timecode};
 
 // ── Persisted defaults profile ──────────────────────────────────────────
 
@@ -90,15 +90,13 @@ impl Default for AudioDefaults {
 
 /// Channel defaults used as the first candidate in the resolution order
 /// (configured → pinned → scan).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct ChannelDefaults {
     /// LTC channel within the audio group's designated LTC file.
     pub audio_ltc_channel_override: Option<usize>,
     pub video_ltc_stream: usize,
     pub video_ltc_channel: usize,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SessionConversionDefaults {
@@ -120,8 +118,10 @@ impl Default for SessionConversionDefaults {
 }
 
 fn defaults_path() -> Option<PathBuf> {
-    crate::config::config_base_dir()
-        .map(|base| base.join(crate::config::CONFIG_DIR).join(SESSION_DEFAULTS_FILE))
+    crate::config::config_base_dir().map(|base| {
+        base.join(crate::config::CONFIG_DIR)
+            .join(SESSION_DEFAULTS_FILE)
+    })
 }
 
 /// Load the persisted defaults profile; missing or corrupt files fall back
@@ -255,16 +255,10 @@ pub fn channel_candidate_order(
             }
         }
         RecordingType::MultiTrackAudio => {
-            let channels = stream_channels
-                .first()
-                .map(|&(_, ch)| ch)
-                .unwrap_or(0);
+            let channels = stream_channels.first().map(|&(_, ch)| ch).unwrap_or(0);
             for channel in 0..channels {
                 push(
-                    ChannelCandidate {
-                        stream: 0,
-                        channel,
-                    },
+                    ChannelCandidate { stream: 0, channel },
                     ChannelSource::Scanned,
                     &mut out,
                 );
@@ -345,10 +339,7 @@ pub enum PreflightFailure {
         tried: Vec<ChannelCandidate>,
     },
     /// The file could not be probed/decoded at all.
-    Decode {
-        file: PathBuf,
-        error: String,
-    },
+    Decode { file: PathBuf, error: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Default)]
@@ -394,13 +385,17 @@ pub struct PreflightDecodeRequest<'a> {
 }
 
 pub type PreflightDecodeFn<'a> =
-    &'a mut dyn FnMut(&PreflightDecodeRequest<'_>) -> Result<LtcDetectionResult, PreflightDecodeError>;
+    &'a mut dyn FnMut(
+        &PreflightDecodeRequest<'_>,
+    ) -> Result<LtcDetectionResult, PreflightDecodeError>;
 
 /// Real decode work: audio WAVs decode stream 0 with a pinned channel via
 /// the builtin chunked decoder (24-bit location WAVs cannot cross the libltc
 /// 16-bit boundary); video files extract the candidate channel at 16-bit and
 /// decode via libltc (fast bulk path — the step-0 extraction mode).
-pub fn preflight_decode_real(req: &PreflightDecodeRequest<'_>) -> Result<LtcDetectionResult, PreflightDecodeError> {
+pub fn preflight_decode_real(
+    req: &PreflightDecodeRequest<'_>,
+) -> Result<LtcDetectionResult, PreflightDecodeError> {
     match req.kind {
         RecordingType::MultiTrackAudio => {
             let path = req.path.to_path_buf();
@@ -647,7 +642,7 @@ pub fn probe_stream_channels(path: &Path, kind: &RecordingType) -> Vec<(usize, u
         RecordingType::MultiTrackAudio => {
             match audio_core::WavChunkReader::open(path) {
                 Ok((reader, _start)) => {
-                    let channels = reader.channels() as usize;
+                    let channels = reader.channels();
                     // The WAV decodes directly (no stream selection): a
                     // single synthetic stream 0 with N channels.
                     vec![(0, channels)]
@@ -655,16 +650,14 @@ pub fn probe_stream_channels(path: &Path, kind: &RecordingType) -> Vec<(usize, u
                 Err(_) => Vec::new(),
             }
         }
-        RecordingType::VideoClipSequence => {
-            match crate::ffprobe::probe_video_audio(path) {
-                Ok(probe) => probe
-                    .streams
-                    .iter()
-                    .map(|s| (s.stream_index, s.channels))
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
-        }
+        RecordingType::VideoClipSequence => match crate::ffprobe::probe_video_audio(path) {
+            Ok(probe) => probe
+                .streams
+                .iter()
+                .map(|s| (s.stream_index, s.channels))
+                .collect(),
+            Err(_) => Vec::new(),
+        },
     }
 }
 
@@ -689,10 +682,7 @@ pub fn run_session_preflight_with(
 
     for (unit_idx, group) in groups.iter().enumerate() {
         let device = device_of(&group.files);
-        let stream_channels = probe_stream_channels(
-            carrier_of(group),
-            &group.kind,
-        );
+        let stream_channels = probe_stream_channels(carrier_of(group), &group.kind);
         let configured = configured_candidate(defaults, &group.kind);
         let pinned = pins.get(&device).copied();
         ctx.progress
@@ -1032,8 +1022,7 @@ fn run_session_group_real(
     caps: Option<&crate::converter::FfmpegCapabilities>,
 ) -> (Option<String>, Result<(), String>) {
     let report = GroupedConversionReport::new(ctx, unit_idx);
-    let (encoder_used, _metadata_only) =
-        crate::converter::run_conversion(&report, settings, caps);
+    let (encoder_used, _metadata_only) = crate::converter::run_conversion(&report, settings, caps);
     if report.is_failed() {
         let reason = report
             .failure
@@ -1120,7 +1109,8 @@ pub fn session_group_runner_real(
     &UnitProgress,
     &ConverterSettings,
     Option<&crate::converter::FfmpegCapabilities>,
-) -> Result<Option<String>, JobError> + '_ {
+) -> Result<Option<String>, JobError>
+       + '_ {
     move |unit_idx, _unit, settings, caps| {
         let (encoder, result) = run_session_group_real(ctx, unit_idx, settings.clone(), caps);
         result.map(|()| encoder).map_err(JobError::Failed)

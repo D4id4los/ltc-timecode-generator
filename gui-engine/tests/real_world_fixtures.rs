@@ -134,8 +134,7 @@ fn test_real_world_video_pipeline_libltc_16bit_mode_success() {
     }
     let path = fixture("ltc-rw-a6100-mp4-20s.mp4");
 
-    let builtin =
-        decode_video_file(&path, 0, 0, false, 25.0, false, None).expect("builtin decode");
+    let builtin = decode_video_file(&path, 0, 0, false, 25.0, false, None).expect("builtin decode");
 
     let result =
         decode_video_file(&path, 0, 0, true, 25.0, false, None).expect("libltc 16-bit decode");

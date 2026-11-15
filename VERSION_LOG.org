@@ -3,6 +3,26 @@
 * Unreleased
 
 List of Changes:
+- Convert: session default conversion (Phase 4) — one-click "Convert
+  Session" on the Convert tab: a preflight decodes the LTC carrier of
+  every recording in the active session's offload destinations (channel
+  resolution: configured default → per-device pin → auto-scan), reports
+  each recording's resolved LTC channel and start timecode, and blocks
+  the run with a prominent red report when any recording's LTC cannot be
+  found. The run applies the owner's default pipelines: video recordings
+  are fully re-encoded with split tracks, dropped LTC track and TC
+  metadata from LTC (no trim); TASCAM per-track audio sets convert the
+  non-LTC tracks (the LTC file is the timecode source only and produces
+  no output). An encoder failure mid-run continues with the remaining
+  recordings and ends in an honest orange partial summary. The defaults
+  (persisted `session_defaults.json` profile in the config directory) are
+  editable in the new Convert-tab section; the interactive per-recording
+  converter settings keep their per-recording reset behaviour.
+- Decode: video extraction now emits 16-bit PCM when the libltc decoder
+  backend is active (libltc's whole-file WAV reader requires 16-bit int),
+  so `--decoder libltc` works on video files; the builtin decoder keeps
+  the full-precision 24-bit extraction. WAV decodes accept an explicit
+  channel pin (used by the session preflight to scan multi-track audio).
 - Sessions: recording sessions (Phase 3 foundation) — named sessions on
   the Clapper tab persist fps, drop-frame, start timecode and the last
   emitted timecode across launches (JSON, one file per session under the

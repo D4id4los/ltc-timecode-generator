@@ -8,37 +8,26 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use gui_engine::command::{GuiCommand, SessionCommand, SessionConversionCommand};
-use gui_engine::engine::{engine_main_with_probe, EngineSeams};
+use gui_engine::engine::engine_main_with_probe;
 use gui_engine::job::{JobFinal, JobKind, JobPhase};
 use gui_engine::session_conversion::{
     collect_preflight_groups, preflight_decode_real, run_session_conversion_with,
-    run_session_preflight_with, session_group_runner_real, ChannelSource,
-    PreflightDecodeRequest, PreflightFailure, PreflightGroup,
-    SessionConversionDefaults, SessionGroupJob, SessionPreflightReport,
+    run_session_preflight_with, session_group_runner_real, ChannelSource, PreflightDecodeRequest,
+    PreflightFailure, PreflightGroup, SessionConversionDefaults, SessionGroupJob,
+    SessionPreflightReport,
 };
 use gui_engine::state::AppStateSnapshot;
 use gui_engine::{FfmpegCapabilities, HwDeviceCapabilities, RecordingType};
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-fn wait_until(pred: impl Fn() -> bool) -> bool {
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    while Instant::now() < deadline {
-        if pred() {
-            return true;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-    pred()
-}
 
 fn ffmpeg_tooling_available() -> bool {
     let run = |bin: &str| {
@@ -144,9 +133,16 @@ fn mux_video_fixture(dir: &Path, name: &str, tone_wav: &Path, ltc_wav: &Path) ->
     let out = dir.join(name);
     let status = Command::new("ffmpeg")
         .args(["-y", "-v", "error"])
-        .args(["-f", "lavfi", "-i", "testsrc=duration=2:size=128x72:rate=25"])
-        .arg("-i").arg(tone_wav)
-        .arg("-i").arg(ltc_wav)
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=128x72:rate=25",
+        ])
+        .arg("-i")
+        .arg(tone_wav)
+        .arg("-i")
+        .arg(ltc_wav)
         .args(["-map", "0:v", "-map", "1:a", "-map", "2:a"])
         .args(["-c:v", "mpeg4", "-q:v", "8", "-pix_fmt", "yuv420p"])
         .args(["-c:a", "aac", "-b:a", "192k", "-t", "2"])
@@ -184,17 +180,9 @@ fn audio_group(dest: &Path, tag: &str) -> PreflightGroup {
     }
 }
 
-fn video_group(dest: &Path) -> PreflightGroup {
-    PreflightGroup {
-        dest: dest.to_path_buf(),
-        prefix: "C0001".into(),
-        kind: RecordingType::VideoClipSequence,
-        files: vec![dest.join("C0001.MP4")],
-        ltc_file_idx: 0,
-    }
-}
-
-fn real_decode(req: &PreflightDecodeRequest<'_>) -> Result<audio_core::LtcDetectionResult, gui_engine::session_conversion::PreflightDecodeError> {
+fn real_decode(
+    req: &PreflightDecodeRequest<'_>,
+) -> Result<audio_core::LtcDetectionResult, gui_engine::session_conversion::PreflightDecodeError> {
     preflight_decode_real(req)
 }
 
@@ -221,8 +209,14 @@ fn preflight_happy_path_resolves_both_media_types() {
     assert_eq!(groups.len(), 2, "audio + video group discovered");
 
     let tracker = gui_engine::ProgressTracker::new(vec![
-        gui_engine::UnitSpec { weight: 0.5, label: "audio".into() },
-        gui_engine::UnitSpec { weight: 0.5, label: "video".into() },
+        gui_engine::UnitSpec {
+            weight: 0.5,
+            label: "audio".into(),
+        },
+        gui_engine::UnitSpec {
+            weight: 0.5,
+            label: "video".into(),
+        },
     ]);
     let ctx = gui_engine::JobContext {
         progress: tracker,
@@ -231,8 +225,16 @@ fn preflight_happy_path_resolves_both_media_types() {
     };
     let defaults = SessionConversionDefaults::default();
 
-    let out = run_session_preflight_with(&ctx, &groups, &defaults, 25.0, false, &mut real_decode, &device_of)
-        .expect("preflight completes");
+    let out = run_session_preflight_with(
+        &ctx,
+        &groups,
+        &defaults,
+        25.0,
+        false,
+        &mut real_decode,
+        &device_of,
+    )
+    .expect("preflight completes");
     let JobFinal::SessionPreflight { report } = out else {
         panic!("expected preflight final");
     };
@@ -249,9 +251,14 @@ fn preflight_happy_path_resolves_both_media_types() {
         .find(|g| g.kind == RecordingType::MultiTrackAudio)
         .expect("audio group result");
     assert_eq!(audio.files.len(), 4);
-    assert_eq!(audio.files[0].resolved.channel, 0, "mono LTC carrier on ch0");
     assert_eq!(
-        audio.start_timecode().map(|t| (t.hours, t.minutes, t.seconds, t.frames)),
+        audio.files[0].resolved.channel, 0,
+        "mono LTC carrier on ch0"
+    );
+    assert_eq!(
+        audio
+            .start_timecode()
+            .map(|t| (t.hours, t.minutes, t.seconds, t.frames)),
         Some((1, 0, 0, 0)),
         "start TC from the generated 01:00:00:00 signal"
     );
@@ -281,7 +288,9 @@ fn preflight_aborts_on_ltc_less_recording() {
     let _cfg = take_config_lock();
     init_test_config();
     if !ffmpeg_tooling_available() {
-        eprintln!("--- SKIPPED: ffmpeg/ffprobe not available (preflight_aborts_on_ltc_less_recording)");
+        eprintln!(
+            "--- SKIPPED: ffmpeg/ffprobe not available (preflight_aborts_on_ltc_less_recording)"
+        );
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -301,8 +310,16 @@ fn preflight_aborts_on_ltc_less_recording() {
     };
     let defaults = SessionConversionDefaults::default();
 
-    let out = run_session_preflight_with(&ctx, &groups, &defaults, 25.0, false, &mut real_decode, &device_of)
-        .expect("preflight completes");
+    let out = run_session_preflight_with(
+        &ctx,
+        &groups,
+        &defaults,
+        25.0,
+        false,
+        &mut real_decode,
+        &device_of,
+    )
+    .expect("preflight completes");
     let JobFinal::SessionPreflight { report } = out else {
         panic!("expected preflight final");
     };
@@ -311,7 +328,7 @@ fn preflight_aborts_on_ltc_less_recording() {
     match &report.failures[0] {
         PreflightFailure::NoLtc { tried, .. } => {
             assert!(
-                tried.len() >= 1,
+                !tried.is_empty(),
                 "the scan must have attempted the carrier's channels"
             );
         }
@@ -342,8 +359,14 @@ fn session_conversion_end_to_end_produces_q2_deliverables() {
 
     let groups = collect_preflight_groups(&[dir.path().to_path_buf()], 1);
     let tracker = gui_engine::ProgressTracker::new(vec![
-        gui_engine::UnitSpec { weight: 0.5, label: "audio".into() },
-        gui_engine::UnitSpec { weight: 0.5, label: "video".into() },
+        gui_engine::UnitSpec {
+            weight: 0.5,
+            label: "audio".into(),
+        },
+        gui_engine::UnitSpec {
+            weight: 0.5,
+            label: "video".into(),
+        },
     ]);
     let ctx = gui_engine::JobContext {
         progress: tracker,
@@ -351,15 +374,27 @@ fn session_conversion_end_to_end_produces_q2_deliverables() {
         emit: Box::new(|_| {}),
     };
     let defaults = SessionConversionDefaults::default();
-    let pre = run_session_preflight_with(&ctx, &groups, &defaults, 25.0, false, &mut real_decode, &device_of)
-        .expect("preflight completes");
+    let pre = run_session_preflight_with(
+        &ctx,
+        &groups,
+        &defaults,
+        25.0,
+        false,
+        &mut real_decode,
+        &device_of,
+    )
+    .expect("preflight completes");
     let JobFinal::SessionPreflight { report } = pre else {
         panic!("expected preflight final");
     };
     assert!(!report.has_failures());
 
     let caps = gui_engine::query_ffmpeg_capabilities();
-    let resolved = ("mov".to_string(), "h265".to_string(), "pcm_s24le".to_string());
+    let resolved = (
+        "mov".to_string(),
+        "h265".to_string(),
+        "pcm_s24le".to_string(),
+    );
     let jobs: Vec<SessionGroupJob> = report
         .groups
         .iter()
@@ -370,8 +405,14 @@ fn session_conversion_end_to_end_produces_q2_deliverables() {
         .collect();
 
     let run_tracker = gui_engine::ProgressTracker::new(vec![
-        gui_engine::UnitSpec { weight: 0.5, label: "audio".into() },
-        gui_engine::UnitSpec { weight: 0.5, label: "video".into() },
+        gui_engine::UnitSpec {
+            weight: 0.5,
+            label: "audio".into(),
+        },
+        gui_engine::UnitSpec {
+            weight: 0.5,
+            label: "video".into(),
+        },
     ]);
     let run_ctx = gui_engine::JobContext {
         progress: run_tracker,
@@ -448,19 +489,16 @@ fn spawn_engine() -> TestEngine {
         .name("engine-session-conv".into())
         .spawn(move || {
             let (event_tx, _event_rx) = mpsc::channel();
-            engine_main_with_probe(
-                rx,
-                state_clone,
-                false,
-                event_tx,
-                fake_probe,
-            );
+            engine_main_with_probe(rx, state_clone, false, event_tx, fake_probe);
         })
         .expect("engine thread");
     TestEngine { tx, state, handle }
 }
 
-fn poll_snapshot(state: &Arc<ArcSwap<AppStateSnapshot>>, pred: impl Fn(&AppStateSnapshot) -> bool) -> AppStateSnapshot {
+fn poll_snapshot(
+    state: &Arc<ArcSwap<AppStateSnapshot>>,
+    pred: impl Fn(&AppStateSnapshot) -> bool,
+) -> AppStateSnapshot {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         let snap = state.load().as_ref().clone();
@@ -468,7 +506,10 @@ fn poll_snapshot(state: &Arc<ArcSwap<AppStateSnapshot>>, pred: impl Fn(&AppState
             return snap;
         }
         if Instant::now() > deadline {
-            panic!("engine did not reach expected state in time; last error={:?}", snap.session_conversion.error);
+            panic!(
+                "engine did not reach expected state in time; last error={:?}",
+                snap.session_conversion.error
+            );
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -497,15 +538,30 @@ fn engine_session_conversion_command_path_preflight_then_run() {
         "2026-11-15".to_string(),
         25.0,
         false,
-        gui_engine::Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+        gui_engine::Timecode {
+            hours: 1,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+        },
     );
     let mut rec = rec;
     rec.offload_destinations = vec![dir.path().to_string_lossy().to_string()];
     gui_engine::config::save_session(&rec).expect("seed session");
 
     let engine = spawn_engine();
-    engine.tx.send(GuiCommand::Session(SessionCommand::Load { id: rec.id.clone() })).unwrap();
-    engine.tx.send(GuiCommand::SessionConversion(SessionConversionCommand::RunPreflight)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::Session(SessionCommand::Load {
+            id: rec.id.clone(),
+        }))
+        .unwrap();
+    engine
+        .tx
+        .send(GuiCommand::SessionConversion(
+            SessionConversionCommand::RunPreflight,
+        ))
+        .unwrap();
 
     let state = Arc::clone(&engine.state);
     let snap = poll_snapshot(&state, |s| {
@@ -520,13 +576,22 @@ fn engine_session_conversion_command_path_preflight_then_run() {
     );
     assert_eq!(report.groups.len(), 2);
 
-    engine.tx.send(GuiCommand::SessionConversion(SessionConversionCommand::StartRun)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::SessionConversion(
+            SessionConversionCommand::StartRun,
+        ))
+        .unwrap();
     let snap = poll_snapshot(&state, |s| {
         s.session_conversion.run.is_some()
             && s.job(JobKind::SessionConversion).phase() != JobPhase::Running
     });
     let summary = snap.session_conversion.run.as_ref().unwrap();
-    assert!(!summary.partial, "synthetic session must convert fully: {:?}", summary.outcomes);
+    assert!(
+        !summary.partial,
+        "synthetic session must convert fully: {:?}",
+        summary.outcomes
+    );
     assert_eq!(summary.completed_count(), 2);
 
     engine.shutdown();
@@ -539,7 +604,12 @@ fn engine_preflight_without_session_is_refused() {
     let _cfg = take_config_lock();
     init_test_config();
     let engine = spawn_engine();
-    engine.tx.send(GuiCommand::SessionConversion(SessionConversionCommand::RunPreflight)).unwrap();
+    engine
+        .tx
+        .send(GuiCommand::SessionConversion(
+            SessionConversionCommand::RunPreflight,
+        ))
+        .unwrap();
     let state = Arc::clone(&engine.state);
     let snap = poll_snapshot(&state, |s| s.session_conversion.error.is_some());
     assert!(snap.session_conversion.preflight.is_none());
@@ -580,7 +650,15 @@ fn preflight_honours_cancellation() {
         Err(gui_engine::session_conversion::PreflightDecodeError::Cancelled)
     };
     let _ = flags;
-    let result = run_session_preflight_with(&ctx, &groups, &defaults, 25.0, false, &mut decode, &device_of);
+    let result = run_session_preflight_with(
+        &ctx,
+        &groups,
+        &defaults,
+        25.0,
+        false,
+        &mut decode,
+        &device_of,
+    );
     assert!(
         matches!(result, Err(gui_engine::JobError::Cancelled)),
         "cancelled preflight must surface the typed cancellation, got {result:?}"

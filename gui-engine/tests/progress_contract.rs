@@ -38,9 +38,9 @@ use gui_engine::offload::{
     run_offload_copy_job_with, run_offload_scan_job_with, CopyError, CopyPlanItem, SdCardInfo,
 };
 use gui_engine::session_conversion::{
-    run_session_conversion_with, run_session_preflight_with, PreflightDecodeRequest,
-    PreflightGroup, PreflightGroupResult, PreflightFileResult, SessionGroupJob,
-    ChannelCandidate, ChannelSource, SessionConversionDefaults,
+    run_session_conversion_with, run_session_preflight_with, ChannelCandidate, ChannelSource,
+    PreflightDecodeRequest, PreflightFileResult, PreflightGroup, PreflightGroupResult,
+    SessionConversionDefaults, SessionGroupJob,
 };
 use gui_engine::{JobError, RecordingType, UnitProgress};
 use tempfile::TempDir;
@@ -561,7 +561,12 @@ fn session_preflight_forwards_decode_granularity_and_terminates() {
         r.valid_frames = 10;
         r.timecodes = vec![audio_core::FrameTimecode {
             frame_index: 0,
-            timecode: audio_core::Timecode { hours: 1, minutes: 0, seconds: 0, frames: 0 },
+            timecode: audio_core::Timecode {
+                hours: 1,
+                minutes: 0,
+                seconds: 0,
+                frames: 0,
+            },
             timecode_secs: 0.0,
         }];
         Ok(r)
@@ -569,8 +574,16 @@ fn session_preflight_forwards_decode_granularity_and_terminates() {
     let device_of = |_: &[PathBuf]| "DEV".to_string();
     let defaults = SessionConversionDefaults::default();
 
-    let out = run_session_preflight_with(&ctx, &groups, &defaults, 25.0, false, &mut decode, &device_of)
-        .expect("preflight completes");
+    let out = run_session_preflight_with(
+        &ctx,
+        &groups,
+        &defaults,
+        25.0,
+        false,
+        &mut decode,
+        &device_of,
+    )
+    .expect("preflight completes");
     assert!(matches!(out, JobFinal::SessionPreflight { .. }));
     assert_progress_contract(&samples.lock().unwrap(), &tracker, "session-preflight");
 }
@@ -595,7 +608,10 @@ fn session_conversion_forwards_group_encode_granularity_and_terminates() {
             .map(|f| PreflightFileResult {
                 path: dir.path().join(f),
                 device: "DEV".into(),
-                resolved: ChannelCandidate { stream: 0, channel: 1 },
+                resolved: ChannelCandidate {
+                    stream: 0,
+                    channel: 1,
+                },
                 source: ChannelSource::Pinned,
                 start_timecode: Some(audio_core::Timecode {
                     hours: 1,
@@ -609,13 +625,25 @@ fn session_conversion_forwards_group_encode_granularity_and_terminates() {
             .collect(),
     };
     let jobs = vec![
-        SessionGroupJob { group: mk_group("g1", &["a.wav"]), settings: test_settings() },
-        SessionGroupJob { group: mk_group("g2", &["b.wav"]), settings: test_settings() },
+        SessionGroupJob {
+            group: mk_group("g1", &["a.wav"]),
+            settings: test_settings(),
+        },
+        SessionGroupJob {
+            group: mk_group("g2", &["b.wav"]),
+            settings: test_settings(),
+        },
     ];
 
     let (ctx, tracker) = job_context(vec![
-        UnitSpec { weight: 0.5, label: "g1".into() },
-        UnitSpec { weight: 0.5, label: "g2".into() },
+        UnitSpec {
+            weight: 0.5,
+            label: "g1".into(),
+        },
+        UnitSpec {
+            weight: 0.5,
+            label: "g2".into(),
+        },
     ]);
     let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let samples_for_fake = Arc::clone(&samples);

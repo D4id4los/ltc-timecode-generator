@@ -344,19 +344,15 @@ pub fn extract_audio_channel(
     target: ExtractChannelTarget<'_>,
     sample_format: ExtractSampleFormat,
 ) -> Result<(), ExtractError> {
-    extract_audio_channel_with(
-        target,
-        sample_format,
-        &mut |args: &[String]| {
-            run_output_with_timeout(
-                no_window_command("ffmpeg")
-                    .args(args)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped()),
-                EXTRACT_TIMEOUT,
-            )
-        },
-    )
+    extract_audio_channel_with(target, sample_format, &mut |args: &[String]| {
+        run_output_with_timeout(
+            no_window_command("ffmpeg")
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped()),
+            EXTRACT_TIMEOUT,
+        )
+    })
 }
 
 /// Injectable-runner variant of [`extract_audio_channel`] for testability.
@@ -383,7 +379,13 @@ pub fn extract_audio_channel_with(
         output_wav.display()
     );
 
-    let args = build_extract_args(path, absolute_stream_index, channel_index, output_wav, sample_format);
+    let args = build_extract_args(
+        path,
+        absolute_stream_index,
+        channel_index,
+        output_wav,
+        sample_format,
+    );
 
     let output = runner(&args).map_err(|e| {
         let _ = std::fs::remove_file(output_wav);
@@ -591,7 +593,13 @@ pub fn extract_audio_channel_with_progress_with(
         stall,
         spawner,
     } = seam;
-    let mut args = build_extract_args(path, absolute_stream_index, channel_index, output_wav, sample_format);
+    let mut args = build_extract_args(
+        path,
+        absolute_stream_index,
+        channel_index,
+        output_wav,
+        sample_format,
+    );
     args.push("-progress".to_string());
     args.push("pipe:2".to_string());
 
@@ -1238,7 +1246,16 @@ mod tests {
     fn test_extract_audio_channel_with_success() {
         let path = Path::new("test.mp4");
         let out = Path::new("/tmp/_unused_test_extract.wav");
-        let result = extract_audio_channel_with(ExtractChannelTarget { path, stream_index: 1, channel_index: 0, output_wav: out }, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut extract_success_runner);
+        let result = extract_audio_channel_with(
+            ExtractChannelTarget {
+                path,
+                stream_index: 1,
+                channel_index: 0,
+                output_wav: out,
+            },
+            crate::ffprobe::ExtractSampleFormat::PcmS24le,
+            &mut extract_success_runner,
+        );
         assert!(result.is_ok());
     }
 
@@ -1247,7 +1264,16 @@ mod tests {
         let mut runner = |_: &[String]| Err(SubprocessFailure::TimedOut);
         let path = Path::new("corrupt.mp4");
         let out = Path::new("/tmp/_test_extract_timeout.wav");
-        let result = extract_audio_channel_with(ExtractChannelTarget { path, stream_index: 1, channel_index: 0, output_wav: out }, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut runner);
+        let result = extract_audio_channel_with(
+            ExtractChannelTarget {
+                path,
+                stream_index: 1,
+                channel_index: 0,
+                output_wav: out,
+            },
+            crate::ffprobe::ExtractSampleFormat::PcmS24le,
+            &mut runner,
+        );
         assert!(
             matches!(result, Err(ExtractError::TimedOut)),
             "timeout must map to ExtractError::TimedOut, got {:?}",
@@ -1260,7 +1286,16 @@ mod tests {
         let mut runner = |_: &[String]| Err(SubprocessFailure::Io("binary not found".into()));
         let path = Path::new("missing.mp4");
         let out = Path::new("/tmp/_test_extract_io.wav");
-        let result = extract_audio_channel_with(ExtractChannelTarget { path, stream_index: 1, channel_index: 0, output_wav: out }, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut runner);
+        let result = extract_audio_channel_with(
+            ExtractChannelTarget {
+                path,
+                stream_index: 1,
+                channel_index: 0,
+                output_wav: out,
+            },
+            crate::ffprobe::ExtractSampleFormat::PcmS24le,
+            &mut runner,
+        );
         assert!(
             matches!(
                 result,

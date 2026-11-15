@@ -556,12 +556,13 @@ impl eframe::App for AppState {
                     "Offload completed — auto-switching converter folder to {:?}",
                     path
                 );
-                // Preset the LTC source to the second track, mirroring the
-                // previous merge-buffer behavior, then switch the folder.
+                // Preset the interactive LTC source from the persisted
+                // session-defaults profile (phase 4), then switch the folder.
+                let preset = self.latest.session_conversion.defaults.audio.ltc_file_idx;
                 widgets::bound::set_value(
                     self,
                     |s| &mut s.sh.conv.ltc_file_idx,
-                    1,
+                    preset,
                     |v| GuiCommand::Converter(ConverterCommand::SetLtcFileIndex(v)),
                 );
                 self.send(GuiCommand::Converter(

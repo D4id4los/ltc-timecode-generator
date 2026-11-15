@@ -3016,7 +3016,11 @@ fn cmd_session_preflight(els: &mut EngineLoopState, supervisor: &mut JobSupervis
     });
 }
 
-fn on_session_preflight_finished(els: &mut EngineLoopState, outcome: JobOutcome, payload: JobFinal) {
+fn on_session_preflight_finished(
+    els: &mut EngineLoopState,
+    outcome: JobOutcome,
+    payload: JobFinal,
+) {
     if let Some(status) = els.current.jobs.get_mut(&JobKind::SessionPreflight) {
         status.apply_outcome(&outcome);
     }
@@ -3120,9 +3124,7 @@ fn cmd_session_run(els: &mut EngineLoopState, supervisor: &mut JobSupervisor) {
 
 /// `select_best_combination` over possibly-absent caps (callers without a
 /// probe get the interactive pipeline's static defaults).
-fn select_best_combination_caps(
-    caps: &Option<FfmpegCapabilities>,
-) -> (String, String, String) {
+fn select_best_combination_caps(caps: &Option<FfmpegCapabilities>) -> (String, String, String) {
     match caps {
         Some(c) => select_best_combination(c),
         None => (

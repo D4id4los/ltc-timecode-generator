@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use egui::{Color32, Ui};
-use gui_engine::command::{ConverterCommand, GuiCommand};
+use gui_engine::command::{ConverterCommand, GuiCommand, SessionConversionCommand};
 use gui_engine::converter::{
     available_audio_encoders_for_container, available_containers, conversion_sanity_check,
     conversion_sanity_check_metadata_only, conversion_sanity_check_metadata_only_pure,
@@ -16,7 +16,7 @@ use gui_engine::duration::{format_duration_secs, group_duration_secs};
 use gui_engine::file_pattern::{group_display_key, MatchedGroup};
 use gui_engine::timecode::{self, FPS_OPTIONS};
 use gui_engine::video_codecs::{available_video_codecs, supported_video_codecs};
-use gui_engine::{JobKind, JobPhase, ProbeStatusLabel};
+use gui_engine::{ChannelSource, JobKind, JobPhase, PreflightFailure, ProbeStatusLabel};
 
 use super::bound;
 use crate::app::AppState;
@@ -97,7 +97,324 @@ pub fn render(ui: &mut Ui, state: &mut AppState) {
         ui.add_space(12.0);
 
         render_conversion_progress(ui, state);
+        ui.add_space(24.0);
+
+        step_header(ui, "5", "CONVERT SESSION (ALL RECORDINGS)", &colors);
+        ui.add_space(8.0);
+        render_session_conversion(ui, state);
     });
+}
+
+// ── Session default conversion (phase 4) ────────────────────────────────
+
+fn session_conv_cmd(cmd: SessionConversionCommand) -> GuiCommand {
+    GuiCommand::SessionConversion(cmd)
+}
+
+/// The Convert-Session section: defaults profile editors (engine-owned,
+/// persisted), the preflight report, and the one-click run. Rendered
+/// verbatim from the engine snapshot — no GUI-local shadow state (the
+/// defaults are low-frequency persisted settings, not per-frame edits).
+fn render_session_conversion(ui: &mut Ui, state: &mut AppState) {
+    let colors = state.theme.colors();
+    let snap = state.latest.clone();
+    let sc = &snap.session_conversion;
+    let preflight_running = snap.job(JobKind::SessionPreflight).phase() == JobPhase::Running;
+    let run_running = snap.job(JobKind::SessionConversion).phase() == JobPhase::Running;
+    let busy = preflight_running || run_running;
+
+    // Session context line.
+    match &snap.session {
+        Some(s) => {
+            ui.label(
+                text(ui, format!("Session: {} ({})", s.name, s.id))
+                    .style(TextStyle::Description, &colors),
+            );
+        }
+        None => {
+            ui.label(
+                text(ui, "No active session — create or load one on the Clapper tab to convert a whole session.")
+                    .style(TextStyle::Description, &colors),
+            );
+        }
+    }
+    if let Some(err) = &sc.error {
+        ui.label(text(ui, err).style(TextStyle::Description, &colors));
+    }
+    ui.add_space(8.0);
+
+    // Defaults profile editors.
+    ui.horizontal(|ui| {
+        ui.label("Audio LTC file index:");
+        let mut idx = sc.defaults.audio.ltc_file_idx;
+        if ui
+            .add(egui::DragValue::new(&mut idx).range(0..=15))
+            .changed()
+        {
+            state.send(session_conv_cmd(
+                SessionConversionCommand::SetAudioLtcFileIdx(idx),
+            ));
+        }
+        ui.separator();
+        ui.label("Audio LTC channel override:");
+        let mut ch = sc.defaults.channels.audio_ltc_channel_override;
+        let before = ch;
+        egui::ComboBox::from_id_salt("session-audio-ch")
+            .selected_text(match ch {
+                Some(c) => format!("channel {c}"),
+                None => "auto-scan".to_string(),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut ch, None, "auto-scan");
+                for c in 0..8 {
+                    ui.selectable_value(&mut ch, Some(c), format!("channel {c}"));
+                }
+            });
+        if ch != before {
+            state.send(session_conv_cmd(
+                SessionConversionCommand::SetAudioLtcChannelOverride(ch),
+            ));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Video LTC stream:");
+        let mut stream = sc.defaults.channels.video_ltc_stream;
+        if ui
+            .add(egui::DragValue::new(&mut stream).range(0..=7))
+            .changed()
+        {
+            state.send(session_conv_cmd(
+                SessionConversionCommand::SetVideoLtcStream(stream),
+            ));
+        }
+        ui.separator();
+        ui.label("channel:");
+        let mut channel = sc.defaults.channels.video_ltc_channel;
+        if ui
+            .add(egui::DragValue::new(&mut channel).range(0..=15))
+            .changed()
+        {
+            state.send(session_conv_cmd(
+                SessionConversionCommand::SetVideoLtcChannel(channel),
+            ));
+        }
+    });
+    for (label, value, mk) in [
+        (
+            "Split tracks",
+            sc.defaults.video.split_tracks,
+            SessionConversionCommand::SetSplitTracks as fn(bool) -> _,
+        ),
+        (
+            "Drop LTC track",
+            sc.defaults.video.drop_ltc_track,
+            SessionConversionCommand::SetDropLtcTrack,
+        ),
+        (
+            "Start TC from LTC",
+            sc.defaults.video.set_start_from_ltc,
+            SessionConversionCommand::SetStartFromLtc,
+        ),
+        (
+            "Embed camera metadata",
+            sc.defaults.video.embed_camera_metadata,
+            SessionConversionCommand::SetEmbedCameraMetadata,
+        ),
+    ] {
+        let mut v = value;
+        if ui.checkbox(&mut v, label).changed() {
+            state.send(session_conv_cmd(mk(v)));
+        }
+    }
+    ui.add_space(8.0);
+
+    let blocked = sc
+        .preflight
+        .as_ref()
+        .map(|r| r.has_failures())
+        .unwrap_or(true);
+
+    // Buttons.
+    ui.horizontal(|ui| {
+        let can_preflight = snap.session.is_some() && !busy;
+        if ui
+            .add_enabled(
+                can_preflight,
+                egui::Button::new(if preflight_running {
+                    "Preflighting…"
+                } else {
+                    "Preflight Session Recordings"
+                }),
+            )
+            .clicked()
+        {
+            state.send(session_conv_cmd(SessionConversionCommand::RunPreflight));
+        }
+        if ui
+            .add_enabled(
+                !blocked && !busy,
+                egui::Button::new(if run_running {
+                    "Converting…"
+                } else {
+                    "Convert Session"
+                }),
+            )
+            .clicked()
+        {
+            state.send(session_conv_cmd(SessionConversionCommand::StartRun));
+        }
+        if (sc.preflight.is_some() || sc.run.is_some()) && ui.button("Clear Report").clicked() {
+            state.send(session_conv_cmd(SessionConversionCommand::ClearPreflight));
+        }
+        if busy && ui.button("Cancel").clicked() {
+            state.send(session_conv_cmd(SessionConversionCommand::Cancel));
+        }
+    });
+    if blocked && sc.preflight.is_some() {
+        ui.add_space(4.0);
+        ui.label(
+            text(ui, "Convert Session is blocked by preflight failures — fix the channel defaults above or convert those recordings manually.")
+                .style(TextStyle::Description, &colors),
+        );
+    }
+
+    // Preflight report.
+    if let Some(report) = &sc.preflight {
+        ui.add_space(8.0);
+        egui::Grid::new("session-preflight-report")
+            .num_columns(6)
+            .striped(true)
+            .show(ui, |ui| {
+                for col in [
+                    "Recording",
+                    "Type",
+                    "LTC channel",
+                    "Resolved via",
+                    "Start TC",
+                    "Confidence",
+                ] {
+                    ui.label(text(ui, col).style(TextStyle::Caption, &colors));
+                }
+                ui.end_row();
+                for g in &report.groups {
+                    let Some(f) = g.files.first() else { continue };
+                    ui.label(text(ui, g.prefix.clone()).style(TextStyle::Description, &colors));
+                    ui.label(
+                        text(
+                            ui,
+                            match g.kind {
+                                RecordingType::MultiTrackAudio => "audio".to_string(),
+                                RecordingType::VideoClipSequence => "video".to_string(),
+                            },
+                        )
+                        .style(TextStyle::Description, &colors),
+                    );
+                    ui.label(
+                        text(
+                            ui,
+                            format!("stream {} ch {}", f.resolved.stream, f.resolved.channel),
+                        )
+                        .style(TextStyle::Description, &colors),
+                    );
+                    ui.label(
+                        text(
+                            ui,
+                            match f.source {
+                                ChannelSource::Configured => "configured".to_string(),
+                                ChannelSource::Pinned => format!("pinned ({})", f.device),
+                                ChannelSource::Scanned => "auto-scan".to_string(),
+                            },
+                        )
+                        .style(TextStyle::Description, &colors),
+                    );
+                    ui.label(
+                        text(
+                            ui,
+                            f.start_timecode
+                                .map(|t| {
+                                    format!(
+                                        "{:02}:{:02}:{:02}:{:02}",
+                                        t.hours, t.minutes, t.seconds, t.frames
+                                    )
+                                })
+                                .unwrap_or_else(|| "—".to_string()),
+                        )
+                        .style(TextStyle::Description, &colors),
+                    );
+                    ui.label(
+                        text(
+                            ui,
+                            f.confidence
+                                .map(|c| format!("{:.0}%", c * 100.0))
+                                .unwrap_or_else(|| "—".to_string()),
+                        )
+                        .style(TextStyle::Description, &colors),
+                    );
+                    ui.end_row();
+                }
+            });
+        for failure in &report.failures {
+            ui.add_space(4.0);
+            let msg = match failure {
+                PreflightFailure::NoLtc { file, tried } => format!(
+                    "NO LTC FOUND: {} — tried {} candidate channel(s).",
+                    file.display(),
+                    tried.len()
+                ),
+                PreflightFailure::Decode { file, error } => {
+                    format!("DECODE FAILED: {} — {}.", file.display(), error)
+                }
+            };
+            ui.colored_label(colors.error_red, msg);
+        }
+        if report.has_failures() {
+            ui.colored_label(
+                colors.error_red,
+                "Fix channel defaults or convert this recording manually.",
+            );
+        }
+    }
+
+    // Run summary: green complete, orange partial (honest state).
+    if let Some(summary) = &sc.run {
+        ui.add_space(8.0);
+        let (color, msg) = if summary.partial {
+            (
+                egui::Color32::from_rgb(0xE0, 0xA5, 0x00),
+                format!(
+                    "PARTIAL: {}/{} recording(s) converted — failed groups kept their errors below.",
+                    summary.completed_count(),
+                    summary.outcomes.len()
+                ),
+            )
+        } else {
+            (
+                colors.success_green,
+                format!(
+                    "Complete: {}/{} recording(s) converted.",
+                    summary.completed_count(),
+                    summary.outcomes.len()
+                ),
+            )
+        };
+        ui.colored_label(color, msg);
+        for o in &summary.outcomes {
+            let line = if o.ok {
+                format!("✓ {} → {}", o.prefix, o.dest.display())
+            } else {
+                format!(
+                    "✗ {} — {}",
+                    o.prefix,
+                    o.error.as_deref().unwrap_or("failed")
+                )
+            };
+            if o.ok {
+                ui.label(text(ui, line).style(TextStyle::Description, &colors));
+            } else {
+                ui.colored_label(color, line);
+            }
+        }
+    }
 }
 
 fn step_header(ui: &mut Ui, number: &str, label: &str, colors: &crate::theme::ThemeColors) {

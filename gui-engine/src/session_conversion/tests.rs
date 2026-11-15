@@ -8,12 +8,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::job::{CancelToken, JobContext, JobFinal, ProgressTracker, UnitSpec};
 use crate::converter::RecordingType;
+use crate::job::{CancelToken, JobContext, JobFinal, ProgressTracker, UnitSpec};
 use audio_core::Timecode;
 
 fn tc(h: u32, m: u32, s: u32, f: u32) -> Timecode {
-    Timecode { hours: h, minutes: m, seconds: s, frames: f }
+    Timecode {
+        hours: h,
+        minutes: m,
+        seconds: s,
+        frames: f,
+    }
 }
 
 // ── Defaults store ──────────────────────────────────────────────────────
@@ -39,7 +44,9 @@ fn defaults_missing_file_yields_schema_tagged_default() {
     assert_eq!(loaded, SessionConversionDefaults::default());
     assert_eq!(loaded.schema, SESSION_DEFAULTS_SCHEMA);
     assert_eq!(loaded.audio.ltc_file_idx, 1, "owner's TASCAM rig default");
-    assert!(loaded.video.split_tracks && loaded.video.drop_ltc_track && loaded.video.set_start_from_ltc);
+    assert!(
+        loaded.video.split_tracks && loaded.video.drop_ltc_track && loaded.video.set_start_from_ltc
+    );
 }
 
 #[test]
@@ -156,9 +163,10 @@ fn pin_map_is_keyed_by_device_and_overwritten_by_newer_hits() {
 // ── Preflight runner (injected decode seam) ─────────────────────────────
 
 fn job_ctx(units: usize) -> (JobContext, ProgressTracker) {
-    let tracker = ProgressTracker::new(
-        (0..units).map(|i| UnitSpec { weight: 1.0 / units.max(1) as f32, label: format!("u{i}") }),
-    );
+    let tracker = ProgressTracker::new((0..units).map(|i| UnitSpec {
+        weight: 1.0 / units.max(1) as f32,
+        label: format!("u{i}"),
+    }));
     let ctx = JobContext {
         progress: tracker.clone(),
         cancel: CancelToken::new(),
@@ -225,21 +233,32 @@ fn preflight_resolves_via_scan_and_pins_for_siblings() {
     let dir = tempfile::TempDir::new().unwrap();
     write_multichannel_wavs(dir.path(), &["a.wav", "b.wav", "c.wav", "d.wav"], 4);
     let groups = vec![
-        group(RecordingType::MultiTrackAudio, dir.path(), &["a.wav", "b.wav"], 1),
-        group(RecordingType::MultiTrackAudio, dir.path(), &["c.wav", "d.wav"], 1),
+        group(
+            RecordingType::MultiTrackAudio,
+            dir.path(),
+            &["a.wav", "b.wav"],
+            1,
+        ),
+        group(
+            RecordingType::MultiTrackAudio,
+            dir.path(),
+            &["c.wav", "d.wav"],
+            1,
+        ),
     ];
     let (ctx, tracker) = job_ctx(groups.len());
     // No configured override: group 1 must find LTC by scanning (ch 0 and
     // ch 1 silent), group 2 must reuse the device pin from group 1's hit.
     let defaults = SessionConversionDefaults::default();
 
-    let mut decode = |req: &PreflightDecodeRequest<'_>| -> Result<LtcDetectionResult, PreflightDecodeError> {
-        if req.channel == 2 {
-            Ok(ok_result(2))
-        } else {
-            Ok(sink_result())
-        }
-    };
+    let mut decode =
+        |req: &PreflightDecodeRequest<'_>| -> Result<LtcDetectionResult, PreflightDecodeError> {
+            if req.channel == 2 {
+                Ok(ok_result(2))
+            } else {
+                Ok(sink_result())
+            }
+        };
     let device_of = |_: &[PathBuf]| "DR70D".to_string();
 
     let out = run_session_preflight_with(
@@ -271,7 +290,11 @@ fn preflight_resolves_via_scan_and_pins_for_siblings() {
     }
     // Both units terminated full.
     let snap = tracker.snapshot();
-    assert!((snap.fraction - 1.0).abs() < 0.01, "termination: {}", snap.fraction);
+    assert!(
+        (snap.fraction - 1.0).abs() < 0.01,
+        "termination: {}",
+        snap.fraction
+    );
 }
 
 /// Any file still failing after candidate exhaustion → typed `NoLtc`
@@ -280,15 +303,28 @@ fn preflight_resolves_via_scan_and_pins_for_siblings() {
 fn preflight_aborts_with_typed_noltc_after_candidate_exhaustion() {
     let dir = tempfile::TempDir::new().unwrap();
     write_multichannel_wavs(dir.path(), &["a.wav", "b.wav"], 4);
-    let groups = vec![group(RecordingType::MultiTrackAudio, dir.path(), &["a.wav", "b.wav"], 1)];
+    let groups = vec![group(
+        RecordingType::MultiTrackAudio,
+        dir.path(),
+        &["a.wav", "b.wav"],
+        1,
+    )];
     let (ctx, _tracker) = job_ctx(groups.len());
     let defaults = SessionConversionDefaults::default();
 
     let mut decode = |_req: &PreflightDecodeRequest<'_>| Ok(sink_result());
-    let device_of =|_: &[PathBuf]| "DR70D".to_string();
+    let device_of = |_: &[PathBuf]| "DR70D".to_string();
 
-    let out = run_session_preflight_with(&ctx, &groups, &defaults, 25.0, false, &mut decode, &device_of)
-        .expect("preflight completes");
+    let out = run_session_preflight_with(
+        &ctx,
+        &groups,
+        &defaults,
+        25.0,
+        false,
+        &mut decode,
+        &device_of,
+    )
+    .expect("preflight completes");
     let JobFinal::SessionPreflight { report } = &out else {
         panic!("expected preflight final, got {out:?}");
     };
@@ -308,7 +344,12 @@ fn preflight_aborts_with_typed_noltc_after_candidate_exhaustion() {
 fn preflight_reports_typed_decode_failure() {
     let dir = tempfile::TempDir::new().unwrap();
     write_multichannel_wavs(dir.path(), &["a.wav"], 2);
-    let groups = vec![group(RecordingType::MultiTrackAudio, dir.path(), &["a.wav"], 0)];
+    let groups = vec![group(
+        RecordingType::MultiTrackAudio,
+        dir.path(),
+        &["a.wav"],
+        0,
+    )];
     let (ctx, _tracker) = job_ctx(groups.len());
     let defaults = SessionConversionDefaults::default();
 
@@ -316,19 +357,34 @@ fn preflight_reports_typed_decode_failure() {
         |_req: &PreflightDecodeRequest<'_>| -> Result<LtcDetectionResult, PreflightDecodeError> {
             Err(PreflightDecodeError::Failed("boom".to_string()))
         };
-    let device_of =|_: &[PathBuf]| "DEV".to_string();
+    let device_of = |_: &[PathBuf]| "DEV".to_string();
 
-    let out = run_session_preflight_with(&ctx, &groups, &defaults, 25.0, false, &mut decode, &device_of)
-        .expect("preflight completes");
+    let out = run_session_preflight_with(
+        &ctx,
+        &groups,
+        &defaults,
+        25.0,
+        false,
+        &mut decode,
+        &device_of,
+    )
+    .expect("preflight completes");
     let JobFinal::SessionPreflight { report } = &out else {
         panic!("expected preflight final, got {out:?}");
     };
-    assert!(matches!(&report.failures[0], PreflightFailure::Decode { .. }));
+    assert!(matches!(
+        &report.failures[0],
+        PreflightFailure::Decode { .. }
+    ));
 }
 
 // ── Session settings assembly ───────────────────────────────────────────
 
-fn preflight_group_result(kind: RecordingType, dest: &Path, files: &[&str]) -> PreflightGroupResult {
+fn preflight_group_result(
+    kind: RecordingType,
+    dest: &Path,
+    files: &[&str],
+) -> PreflightGroupResult {
     PreflightGroupResult {
         dest: dest.to_path_buf(),
         prefix: "TASCAM_0098".to_string(),
@@ -363,9 +419,16 @@ fn audio_session_settings_exclude_the_ltc_file_from_outputs() {
         &["S1.wav", "S2.wav", "S3.wav", "S4.wav"],
     );
     let defaults = SessionConversionDefaults::default(); // ltc_file_idx = 1
-    let s = assemble_session_group_settings(&g, &defaults, ("wav".into(), "h265".into(), "pcm_s24le".into()));
+    let s = assemble_session_group_settings(
+        &g,
+        &defaults,
+        ("wav".into(), "h265".into(), "pcm_s24le".into()),
+    );
 
-    assert!(s.drop_ltc_track, "audio pipeline always drops the LTC track");
+    assert!(
+        s.drop_ltc_track,
+        "audio pipeline always drops the LTC track"
+    );
     assert!(s.split_tracks);
     assert!(s.set_start_from_ltc);
     assert_eq!(s.ltc_track_channel_index, 1);
@@ -383,16 +446,27 @@ fn video_session_settings_use_defaults_and_resolved_channel() {
     let mut defaults = SessionConversionDefaults::default();
     defaults.video.container_override = Some("mp4".into());
     defaults.video.video_codec_override = Some("h264".into());
-    let s = assemble_session_group_settings(&g, &defaults, ("mov".into(), "h265".into(), "aac".into()));
+    let s =
+        assemble_session_group_settings(&g, &defaults, ("mov".into(), "h265".into(), "aac".into()));
 
     assert!(matches!(s.pipeline, ConversionPipeline::VideoPassthrough));
     assert!(!s.copy_video, "session default is full re-encode");
     assert_eq!(s.container, "mp4", "override wins");
     assert_eq!(s.video_encoder, "h264", "override wins");
     assert_eq!(s.audio_encoder, "aac", "absent override → live combination");
-    assert_eq!(s.ltc_video_source, Some((0, 1)), "resolved channel from preflight");
-    assert!(s.trim_offsets_secs.iter().all(|t| *t == 0.0), "no trim in session pipeline");
-    assert_eq!(s.output_folder, g.dest, "deliverables written next to sources");
+    assert_eq!(
+        s.ltc_video_source,
+        Some((0, 1)),
+        "resolved channel from preflight"
+    );
+    assert!(
+        s.trim_offsets_secs.iter().all(|t| *t == 0.0),
+        "no trim in session pipeline"
+    );
+    assert_eq!(
+        s.output_folder, g.dest,
+        "deliverables written next to sources"
+    );
     assert_eq!(
         s.timecode_meta_per_file[0].as_ref().unwrap().start,
         tc(11, 22, 33, 0),
@@ -405,7 +479,11 @@ fn video_session_settings_fall_back_to_live_combination() {
     let dir = tempfile::TempDir::new().unwrap();
     let g = preflight_group_result(RecordingType::VideoClipSequence, dir.path(), &["C0001.MP4"]);
     let defaults = SessionConversionDefaults::default();
-    let s = assemble_session_group_settings(&g, &defaults, ("mov".into(), "h265".into(), "pcm_s24le".into()));
+    let s = assemble_session_group_settings(
+        &g,
+        &defaults,
+        ("mov".into(), "h265".into(), "pcm_s24le".into()),
+    );
     assert_eq!(s.container, "mov");
     assert_eq!(s.video_encoder, "h265");
 }
@@ -416,10 +494,20 @@ fn video_session_settings_fall_back_to_live_combination() {
 fn session_run_continues_after_encode_failure_and_reports_partial() {
     let dir = tempfile::TempDir::new().unwrap();
     let g1 = preflight_group_result(RecordingType::VideoClipSequence, dir.path(), &["C0001.MP4"]);
-    let g2 = preflight_group_result(RecordingType::MultiTrackAudio, dir.path(), &["S1.wav", "S2.wav"]);
+    let g2 = preflight_group_result(
+        RecordingType::MultiTrackAudio,
+        dir.path(),
+        &["S1.wav", "S2.wav"],
+    );
     let jobs = vec![
-        SessionGroupJob { group: g1, settings: crate::converter::test_fixtures::make_settings_audio_only() },
-        SessionGroupJob { group: g2, settings: crate::converter::test_fixtures::make_settings_audio_only() },
+        SessionGroupJob {
+            group: g1,
+            settings: crate::converter::test_fixtures::make_settings_audio_only(),
+        },
+        SessionGroupJob {
+            group: g2,
+            settings: crate::converter::test_fixtures::make_settings_audio_only(),
+        },
     ];
     let (ctx, tracker) = job_ctx(jobs.len());
 
@@ -431,7 +519,7 @@ fn session_run_continues_after_encode_failure_and_reports_partial() {
                         unit: &UnitProgress,
                         _settings: &ConverterSettings,
                         _caps: Option<&crate::converter::FfmpegCapabilities>|
-     -> Result<Option<String>, JobError> {
+          -> Result<Option<String>, JobError> {
         let n = calls.fetch_add(1, Ordering::SeqCst);
         unit.set_fraction(0.5);
         unit.set_fraction(1.0);
@@ -446,22 +534,35 @@ fn session_run_continues_after_encode_failure_and_reports_partial() {
     let JobFinal::SessionConversion { summary } = &out else {
         panic!("expected session conversion final, got {out:?}");
     };
-    assert!(summary.partial, "encode failure = honest partial, not whole-run failure");
+    assert!(
+        summary.partial,
+        "encode failure = honest partial, not whole-run failure"
+    );
     assert_eq!(summary.outcomes.len(), 2);
     assert!(!summary.outcomes[0].ok);
     assert!(summary.outcomes[0].error.is_some());
     assert!(summary.outcomes[1].ok);
-    assert_eq!(summary.outcomes[1].encoder_used.as_deref(), Some("h264_qsv"));
+    assert_eq!(
+        summary.outcomes[1].encoder_used.as_deref(),
+        Some("h264_qsv")
+    );
     assert_eq!(summary.completed_count(), 1);
     let snap = tracker.snapshot();
-    assert!((snap.fraction - 1.0).abs() < 0.01, "termination: {}", snap.fraction);
+    assert!(
+        (snap.fraction - 1.0).abs() < 0.01,
+        "termination: {}",
+        snap.fraction
+    );
 }
 
 #[test]
 fn session_run_all_success_is_not_partial() {
     let dir = tempfile::TempDir::new().unwrap();
     let g = preflight_group_result(RecordingType::VideoClipSequence, dir.path(), &["C0001.MP4"]);
-    let jobs = vec![SessionGroupJob { group: g, settings: crate::converter::test_fixtures::make_settings_audio_only() }];
+    let jobs = vec![SessionGroupJob {
+        group: g,
+        settings: crate::converter::test_fixtures::make_settings_audio_only(),
+    }];
     let (ctx, _tracker) = job_ctx(jobs.len());
     let mut run = |_idx: usize,
                    unit: &UnitProgress,
@@ -504,8 +605,18 @@ fn unit_specs_are_byte_weighted_and_cover_every_group() {
 
 #[test]
 fn unit_specs_fall_back_to_equal_weights_without_sizes() {
-    let g1 = group(RecordingType::MultiTrackAudio, Path::new("/nonexistent"), &["a.wav"], 0);
-    let g2 = group(RecordingType::MultiTrackAudio, Path::new("/nonexistent"), &["b.wav"], 0);
+    let g1 = group(
+        RecordingType::MultiTrackAudio,
+        Path::new("/nonexistent"),
+        &["a.wav"],
+        0,
+    );
+    let g2 = group(
+        RecordingType::MultiTrackAudio,
+        Path::new("/nonexistent"),
+        &["b.wav"],
+        0,
+    );
     let specs = session_unit_specs(&[g1, g2]);
     assert_eq!(specs[0].weight, specs[1].weight);
     assert!((specs[0].weight + specs[1].weight - 1.0).abs() < 1e-4);
@@ -558,7 +669,10 @@ fn probe_stream_channels_video_requires_ffprobe_or_degrades_empty() {
     // is the portable assertion.
     let missing = Path::new("/nonexistent/no-such-file.mp4");
     let ch = probe_stream_channels(missing, &RecordingType::VideoClipSequence);
-    assert!(ch.is_empty(), "unprobeable file must degrade to no candidates");
+    assert!(
+        ch.is_empty(),
+        "unprobeable file must degrade to no candidates"
+    );
 }
 
 // Silence unused-import warnings for helpers used conditionally.
