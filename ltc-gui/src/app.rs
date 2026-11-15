@@ -77,11 +77,12 @@ pub enum Tab {
 
 impl Tab {
     /// Navigation label: full descriptive form on wide layouts (row > 500 px),
-    /// short form on narrow ones.
+    /// short form on narrow ones. The Settings tab intentionally uses the
+    /// same short label on both layouts (backlog phase 2 rename).
     pub fn nav_label(self, wide: bool) -> &'static str {
         match (self, wide) {
             (Tab::Clapper, true) => "Clapper Slate & Logs",
-            (Tab::Settings, true) => "Signal & Audio Settings",
+            (Tab::Settings, true) => "Settings",
             (Tab::Converter, true) => "File Converter & Export",
             (Tab::Offload, true) => "Offload & Ingest",
             (Tab::Clapper, false) => "Clapper",
@@ -661,15 +662,17 @@ fn route_label(ltc: gui_engine::ChannelSel, beep: gui_engine::ChannelSel) -> Str
 }
 
 /// One transport button with the shared size/fill shape; returns whether it
-/// was clicked. Collapses the four near-identical button blocks.
+/// was clicked. Collapses the four near-identical button blocks. `tooltip`
+/// is attached as hover text (backlog phase 2 tooltip sweep).
 fn transport_button(
     ui: &mut Ui,
     width: f32,
     colors: &ThemeColors,
     style_kind: widgets::style::ActionStyle,
     label: &str,
+    tooltip: &str,
 ) -> bool {
-    widgets::style::action_button(
+    let response = widgets::style::action_button(
         ui,
         colors,
         style_kind,
@@ -677,8 +680,8 @@ fn transport_button(
         crate::text::TextStyle::Control.font_spec(),
         egui::vec2(width, 32.0),
         true,
-    )
-    .clicked()
+    );
+    response.on_hover_text(tooltip).clicked()
 }
 
 /// Start/Stop button: green while stopped, red while playing. Gated by the
@@ -692,6 +695,7 @@ fn render_start_stop(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, bt
             &colors,
             widgets::style::ActionStyle::Danger,
             "■ STOP",
+            "Stop LTC generation; the timecode stays where it is, so START resumes from here",
         ) && !s.is_locked
         {
             state.send(GuiCommand::StopLtc);
@@ -703,6 +707,7 @@ fn render_start_stop(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, bt
             &colors,
             widgets::style::ActionStyle::Success,
             "▶ START",
+            "Start LTC generation, resuming from the current timecode (Reset returns to the start TC)",
         ) && !s.is_locked
         {
             state.send(GuiCommand::StartLtc);
@@ -719,6 +724,7 @@ fn render_clap_button(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot, b
         &colors,
         widgets::style::ActionStyle::Primary,
         "CLAP & BEEP",
+        "Play the sync beep and log a clapper take at the current timecode",
     ) && !s.is_locked
     {
         state.send(GuiCommand::Clap);
@@ -733,7 +739,14 @@ fn render_reset_button(
     s: &AppStateSnapshot,
     btn_w: f32,
 ) {
-    if transport_button(ui, btn_w, &colors, widgets::style::ActionStyle::Muted, "↺") && !s.is_locked
+    if transport_button(
+        ui,
+        btn_w,
+        &colors,
+        widgets::style::ActionStyle::Muted,
+        "↺",
+        "Reset the timecode to the configured start TC",
+    ) && !s.is_locked
     {
         state.send(GuiCommand::Reset);
     }
@@ -754,6 +767,7 @@ fn render_lock_button(
         &colors,
         widgets::style::ActionStyle::Muted,
         lock_icon,
+        "Lock or unlock the transport and metadata controls",
     ) {
         state.send(GuiCommand::ToggleLock);
     }
@@ -1796,7 +1810,7 @@ mod tests {
     #[test]
     fn nav_label_wide_uses_full_names() {
         assert_eq!(Tab::Clapper.nav_label(true), "Clapper Slate & Logs");
-        assert_eq!(Tab::Settings.nav_label(true), "Signal & Audio Settings");
+        assert_eq!(Tab::Settings.nav_label(true), "Settings");
         assert_eq!(Tab::Converter.nav_label(true), "File Converter & Export");
         assert_eq!(Tab::Offload.nav_label(true), "Offload & Ingest");
     }

@@ -78,6 +78,7 @@ fn render_text_scale(ui: &mut Ui, state: &mut AppState) {
                 true,
                 Vec2::ZERO,
             )
+            .on_hover_text(format!("Scale all interface text to {}%", percent))
             .clicked()
             {
                 state.send(GuiCommand::SetTextScale(percent));
@@ -171,6 +172,7 @@ fn stepper_card_col(
                         .bold()
                         .color(ui.style().visuals.strong_text_color()),
                 )
+                .on_hover_text(format!("Increase {} while stopped", label.to_lowercase()))
                 .clicked()
             {
                 state.send(cmd_up);
@@ -190,6 +192,7 @@ fn stepper_card_col(
                         .bold()
                         .color(ui.style().visuals.strong_text_color()),
                 )
+                .on_hover_text(format!("Decrease {} while stopped", label.to_lowercase()))
                 .clicked()
             {
                 state.send(cmd_down);
@@ -246,7 +249,10 @@ fn frame_rate_card(
         is_selected,
         !is_playing,
     );
-    if response.clicked() {
+    if response
+        .on_hover_text(format!("Generate LTC at {} frames per second", opt.name))
+        .clicked()
+    {
         state.send(GuiCommand::SetFpsIndex(index));
     }
 }
@@ -287,6 +293,10 @@ fn sample_rate_button(ui: &mut Ui, state: &mut AppState, selected_rate: u32, rat
         true,
         Vec2::ZERO,
     )
+    .on_hover_text(format!(
+        "Generate and play audio at {} Hz sample rate",
+        rate
+    ))
     .clicked()
     {
         bound::select_value(
@@ -311,7 +321,11 @@ fn render_audio_device(ui: &mut Ui, state: &mut AppState) {
             ui.horizontal(|ui| {
                 render_device_combo(ui, state);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Refresh List").clicked() {
+                    if ui
+                        .button("Refresh List")
+                        .on_hover_text("Re-scan the system for audio output devices")
+                        .clicked()
+                    {
                         state.send(GuiCommand::RefreshDevices);
                     }
                 });
@@ -466,6 +480,7 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
                 val,
                 lbl,
                 GuiCommand::SetLtcChannel,
+                "LTC timecode",
             );
         }
     });
@@ -484,6 +499,7 @@ fn render_routing_buttons(ui: &mut Ui, state: &mut AppState) {
                 val,
                 lbl,
                 GuiCommand::SetBeepChannel,
+                "clapper beep",
             );
         }
     });
@@ -500,6 +516,7 @@ fn channel_button(
     val: ChannelSel,
     lbl: &str,
     make_cmd: fn(ChannelSel) -> GuiCommand,
+    signal: &str,
 ) {
     let colors = state.theme.colors();
     if style::option_chip(
@@ -511,6 +528,10 @@ fn channel_button(
         true,
         Vec2::ZERO,
     )
+    .on_hover_text(format!(
+        "Route the {signal} signal to the {} channel(s)",
+        lbl.to_lowercase()
+    ))
     .clicked()
     {
         bound::select_value(state, shadow, truth, val, make_cmd);
@@ -531,7 +552,8 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
             0.0..=1.0,
             Some(0.01),
             GuiCommand::SetLtcVolume,
-        );
+        )
+        .on_hover_text("LTC output level (dBFS readout shows the peak level)");
         let shown = *state.sh.ltc_volume.value();
         ui.label(
             text(ui, format!("{}%", (shown * 100.0).round()))
@@ -551,6 +573,7 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
         for &(label, dbfs) in &[("-18", -18.0f32), ("-12", -12.0), ("-6", -6.0)] {
             if ui
                 .small_button(text(ui, label).style(TextStyle::MonoReadout, &colors))
+                .on_hover_text(format!("Preset: set the LTC level to {label} dBFS"))
                 .clicked()
             {
                 let v = gui_engine::dbfs_to_ui_volume(dbfs);
@@ -570,7 +593,8 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
             0.0..=1.0,
             Some(0.01),
             GuiCommand::SetBeepVolume,
-        );
+        )
+        .on_hover_text("Clapper beep output level");
         let shown = *state.sh.beep_volume.value();
         ui.label(
             text(ui, format!("{}%", (shown * 100.0).round()))
@@ -590,7 +614,8 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
             400.0..=2000.0,
             None,
             GuiCommand::SetBeepFrequency,
-        );
+        )
+        .on_hover_text("Clapper beep pitch in hertz");
         let shown = *state.sh.beep_frequency.value();
         ui.label(
             text(ui, format!("{} Hz", shown.round()))
@@ -610,7 +635,8 @@ fn render_sliders(ui: &mut Ui, state: &mut AppState) {
             0.05..=2.0,
             Some(0.05),
             GuiCommand::SetBeepDuration,
-        );
+        )
+        .on_hover_text("Clapper beep length in seconds");
         let shown = *state.sh.beep_duration.value();
         ui.label(
             text(ui, format!("{:.0} ms", shown * 1000.0))

@@ -58,7 +58,11 @@ fn render_parent_selection(ui: &mut Ui, state: &mut AppState) {
         } else {
             display.clone()
         };
-        if ui.button("Browse…").clicked() {
+        if ui
+            .button("Browse…")
+            .on_hover_text("Pick the parent folder the card contents are copied into")
+            .clicked()
+        {
             let mut dialog = rfd::FileDialog::new();
             if !display.is_empty() {
                 dialog = dialog.set_directory(&display);
@@ -144,7 +148,11 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
 /// Rescan button + active-scan spinner row.
 fn render_rescan_row(ui: &mut Ui, state: &mut AppState, s: &AppStateSnapshot) {
     ui.horizontal(|ui| {
-        if ui.button("Rescan").clicked() {
+        if ui
+            .button("Rescan")
+            .on_hover_text("Re-detect mounted cards and scan them for recordings")
+            .clicked()
+        {
             state.send(GuiCommand::Offload(OffloadCommand::ScanCards));
         }
         if s.job(JobKind::OffloadScan).is_active() {
@@ -414,6 +422,7 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
                 Vec2::new(120.0, 30.0),
                 true,
             )
+            .on_hover_text("Cancel the running offload copy")
             .clicked()
             {
                 state.send(GuiCommand::Offload(OffloadCommand::CancelOffload));
@@ -427,6 +436,7 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
             Vec2::new(160.0, 30.0),
             can_start,
         )
+        .on_hover_text("Copy the selected card files into the destination folder")
         .clicked()
         {
             state.send(GuiCommand::Offload(OffloadCommand::StartOffload));

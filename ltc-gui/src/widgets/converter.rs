@@ -268,7 +268,11 @@ fn render_folder_row(ui: &mut Ui, state: &mut AppState, colors: &crate::theme::T
                 .font(crate::text::TextStyle::MonoLabel.font_spec().font_id())
                 .interactive(false),
         );
-        if ui.button("Browse…").clicked() {
+        if ui
+            .button("Browse…")
+            .on_hover_text("Pick the folder holding the recordings to convert")
+            .clicked()
+        {
             let mut dialog = rfd::FileDialog::new();
             if let Some(ref last) = state.latest.converter.groups_folder {
                 dialog = dialog.set_directory(last);
@@ -646,7 +650,12 @@ fn render_track_source_row(
                     );
                     for opt in channel_options {
                         let is_sel = (opt.stream, opt.channel) == sel;
-                        if ui.selectable_label(is_sel, &opt.label).clicked() && !opt.disabled {
+                        if ui
+                            .selectable_label(is_sel, &opt.label)
+                            .on_hover_text("Audio stream/channel that carries the LTC signal")
+                            .clicked()
+                            && !opt.disabled
+                        {
                             bound::set_value(
                                 state,
                                 |s| &mut s.sh.decode_stream,
@@ -664,7 +673,11 @@ fn render_track_source_row(
                 } else {
                     let cur = *state.sh.conv.ltc_file_idx.value();
                     for (i, opt) in channel_options.iter().enumerate() {
-                        if ui.selectable_label(i == cur, &opt.label).clicked() {
+                        if ui
+                            .selectable_label(i == cur, &opt.label)
+                            .on_hover_text("File in this set that carries the LTC track")
+                            .clicked()
+                        {
                             bound::select_value(
                                 state,
                                 |s| &mut s.sh.conv.ltc_file_idx,
@@ -704,6 +717,10 @@ fn render_fps_detect_row(
                 true,
                 egui::vec2(0.0, 22.0),
             )
+            .on_hover_text(format!(
+                "Frame rate used when decoding the LTC signal ({})",
+                opt.name
+            ))
             .clicked()
             {
                 bound::select_value(
@@ -752,6 +769,7 @@ fn render_fps_detect_row(
                 egui::vec2(80.0, 22.0),
                 true,
             )
+            .on_hover_text("Cancel the running LTC detection")
             .clicked()
             {
                 state.send(GuiCommand::CancelDecode);
@@ -768,6 +786,7 @@ fn render_fps_detect_row(
                 egui::vec2(140.0, 24.0),
                 true,
             )
+            .on_hover_text("Decode the LTC timecode from every clip in this recording")
             .clicked()
             {
                 let paths: Vec<String> = group
@@ -795,6 +814,7 @@ fn render_fps_detect_row(
                 egui::vec2(100.0, 24.0),
                 true,
             )
+            .on_hover_text("Decode the LTC timecode from the selected LTC file")
             .clicked()
             {
                 state.send(GuiCommand::ParseLtcWavFile(file_path));
@@ -1137,7 +1157,11 @@ fn render_ltc_result(
             // Copy Report button
             if !result.timecodes.is_empty() {
                 ui.add_space(4.0);
-                if ui.button("📋 Copy Report").clicked() {
+                if ui
+                    .button("📋 Copy Report")
+                    .on_hover_text("Copy the LTC quality report to the clipboard")
+                    .clicked()
+                {
                     let report = format_ltc_report_text(result);
                     ui.ctx().copy_text(report);
                 }
@@ -1835,7 +1859,8 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
             "Split tracks into separate files",
             true,
             |v| GuiCommand::Converter(ConverterCommand::SetSplitTracks(v)),
-        );
+        )
+        .on_hover_text("Write each audio channel of the recording to its own output file");
         // Cascade: unchecking split also unchecks concatenate.
         if split_resp.changed()
             && !*state.sh.conv.split_tracks.value()
@@ -1856,7 +1881,8 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
             "Drop LTC track",
             ltc_available,
             |v| GuiCommand::Converter(ConverterCommand::SetDropLtcTrack(v)),
-        );
+        )
+        .on_hover_text("Exclude the LTC timecode track from the converted output");
     });
     if is_video && *state.sh.conv.split_tracks.value() {
         ui.horizontal(|ui| {
@@ -1868,7 +1894,8 @@ fn render_split_options(ui: &mut Ui, state: &mut AppState) {
                 "Concatenate audio tracks across clips (one file per track)",
                 true,
                 |v| GuiCommand::Converter(ConverterCommand::SetConcatAudio(v)),
-            );
+            )
+            .on_hover_text("Join the audio of all clips into one file per track, in clip order");
         });
         if *state.sh.conv.concat_audio.value() {
             ui.label(
@@ -2110,7 +2137,8 @@ fn render_copy_video_checkbox(ui: &mut Ui, state: &mut AppState) {
         "Leave video encoding untouched (stream copy)",
         true,
         |v| GuiCommand::Converter(ConverterCommand::SetCopyVideo(v)),
-    );
+    )
+    .on_hover_text("Remux the video without re-encoding — much faster, cuts snap to keyframes");
     if copy_mode_active(state) {
         let colors = state.theme.colors();
         ui.label(
@@ -2132,7 +2160,8 @@ fn render_generate_synthetic_checkbox(ui: &mut Ui, state: &mut AppState, label: 
         label,
         true,
         |v| GuiCommand::Converter(ConverterCommand::SetGenerateSyntheticVideo(v)),
-    );
+    )
+    .on_hover_text("Add a synthetic video track to the audio-only recording");
 }
 
 /// "Metadata only" bound checkbox with the in-place-tagging hint (wide
@@ -2151,7 +2180,8 @@ fn render_metadata_only_checkbox(
         "Metadata only (tag + rename, extract audio)",
         true,
         |v| GuiCommand::Converter(ConverterCommand::SetMetadataOnly(v)),
-    );
+    )
+    .on_hover_text("Tag and rename the originals in place instead of re-encoding");
     if *state.sh.conv.metadata_only.value() {
         ui.label(
             text(ui, "Originals are tagged in place with the start timecode and renamed. Audio is extracted to the output folder. No re-encoding.")
@@ -2172,7 +2202,8 @@ fn render_embed_camera_checkbox(ui: &mut Ui, state: &mut AppState) {
         "Embed camera metadata (make/model, lens, serial, timestamp, gamma, exposure)",
         true,
         |v| GuiCommand::Converter(ConverterCommand::SetEmbedCameraMetadata(v)),
-    );
+    )
+    .on_hover_text("Write the probed camera make/model into the output file metadata");
 }
 
 /// One-line make/model description of the probed camera, if any.
@@ -2475,7 +2506,11 @@ fn render_naming_template_rows(
                     .desired_width(folder_width)
             },
         );
-        if ui.button("Browse…").clicked() {
+        if ui
+            .button("Browse…")
+            .on_hover_text("Pick the output folder for converted files")
+            .clicked()
+        {
             let folder = rfd::FileDialog::new()
                 .set_directory(state.sh.conv.output_folder.value())
                 .pick_folder();
@@ -2598,7 +2633,8 @@ fn render_set_start_row(
             "Set Start Time from LTC",
             ltc_available,
             |v| GuiCommand::Converter(ConverterCommand::SetStartFromLtc(v)),
-        );
+        )
+        .on_hover_text("Embed the decoded LTC start timecode as the output timecode metadata");
         if *state.sh.conv.set_start_from_ltc.value() {
             let tc_text = if is_video_group {
                 state
@@ -2663,6 +2699,7 @@ fn render_convert_button(
             egui::vec2(ui.available_width(), 42.0),
             true,
         )
+        .on_hover_text("Cancel the running conversion")
         .clicked()
         {
             state.send(GuiCommand::Converter(ConverterCommand::CancelConversion));
@@ -2714,6 +2751,7 @@ fn render_convert_button(
             egui::vec2(ui.available_width(), 42.0),
             can_convert && sanity_ok,
         )
+        .on_hover_text("Convert the selected recording with the settings above")
         .clicked()
         {
             start_conversion(state);
@@ -2916,7 +2954,11 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
                     });
             });
 
-            if ui.button("Start New Conversion").clicked() {}
+            if ui
+                .button("Start New Conversion")
+                .on_hover_text("Close this result view and configure a new conversion")
+                .clicked()
+            {}
         }
         JobPhase::Failed => {
             let error_text = job.error.clone().unwrap_or_else(|| job.log().to_string());
@@ -2956,10 +2998,18 @@ fn render_conversion_progress(ui: &mut Ui, state: &mut AppState) {
             });
 
             ui.horizontal(|ui| {
-                if ui.button("Copy Error Log").clicked() {
+                if ui
+                    .button("Copy Error Log")
+                    .on_hover_text("Copy the ffmpeg error log to the clipboard")
+                    .clicked()
+                {
                     ui.ctx().copy_text(error_text.clone());
                 }
-                if ui.button("Try Again").clicked() {}
+                if ui
+                    .button("Try Again")
+                    .on_hover_text("Close this result view so the conversion can be restarted")
+                    .clicked()
+                {}
             });
         }
         JobPhase::Cancelled => {

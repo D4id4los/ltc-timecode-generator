@@ -3,6 +3,15 @@
 * Unreleased
 
 List of Changes:
+- Transport: pressing START now resumes from the paused timecode instead
+  of restarting from the configured start TC. Editing the start timecode
+  (steppers) while stopped moves the resume position to the new start TC;
+  Reset still returns to the start TC.
+- GUI: the Settings tab now shows the short label "Settings" on wide
+  layouts too.
+- GUI: hover tooltips added to the transport buttons, clapper controls,
+  settings steppers/sliders/chips, converter checkboxes and action
+  buttons, and offload actions.
 - Offload: fixed the "100% / Completed while still copying" bug class.
   Starting a second offload in the same session no longer shows the
   previous run's completion state — the copy job's status and the

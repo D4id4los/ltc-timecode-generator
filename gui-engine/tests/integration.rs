@@ -2348,12 +2348,10 @@ fn tc_gt(a: gui_engine::Timecode, b: gui_engine::Timecode) -> bool {
     (a.hours, a.minutes, a.seconds, a.frames) > (b.hours, b.minutes, b.seconds, b.frames)
 }
 
-fn tc_lt(a: gui_engine::Timecode, b: gui_engine::Timecode) -> bool {
-    (a.hours, a.minutes, a.seconds, a.frames) < (b.hours, b.minutes, b.seconds, b.frames)
-}
-
 fn audio_available() -> bool {
-    audio_core::list_audio_devices().map(|d| !d.is_empty()).unwrap_or(false)
+    audio_core::list_audio_devices()
+        .map(|d| !d.is_empty())
+        .unwrap_or(false)
 }
 
 /// Engine with default seams except the ffmpeg probe (fake). The audio
@@ -2405,12 +2403,13 @@ fn start_tc_edit_while_stopped_moves_resume_position() {
     let snap = wait_for_snapshot(&eng.state, "start-TC edits to be applied", |s| {
         s.applied_command_seq >= 4
             && s.fps_index == 1
-            && s.start_timecode == gui_engine::Timecode {
-                hours: 2,
-                minutes: 35,
-                seconds: 56,
-                frames: 11,
-            }
+            && s.start_timecode
+                == gui_engine::Timecode {
+                    hours: 2,
+                    minutes: 35,
+                    seconds: 56,
+                    frames: 11,
+                }
     });
     assert_eq!(
         snap.current_timecode, snap.start_timecode,

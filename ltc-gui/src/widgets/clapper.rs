@@ -38,7 +38,8 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
                     "Auto-Increment Take",
                     true,
                     GuiCommand::SetAutoIncrement,
-                );
+                )
+                .on_hover_text("Automatically bump the take number after every clap");
             });
         });
         ui.add_space(8.0);
@@ -70,6 +71,7 @@ fn render_slate_card(ui: &mut Ui, state: &mut AppState) {
             egui::vec2(ui.available_width(), 44.0),
             true,
         )
+        .on_hover_text("Play the sync beep and log a clapper take at the current timecode")
         .clicked()
             && !state.latest.is_locked
         {
@@ -83,7 +85,9 @@ fn render_clapper_board_drawing(ui: &mut Ui, state: &mut AppState) {
     let s = std::sync::Arc::clone(&state.latest);
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 100.0), Sense::click());
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Tap the clapper board to clap and beep");
     if response.clicked() && !s.is_locked {
         state.send(GuiCommand::Clap);
     }
@@ -240,6 +244,7 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
                             .style(TextStyle::Status, &colors)
                             .color(ui.style().visuals.strong_text_color()),
                     )
+                    .on_hover_text("Previous scene")
                     .clicked()
                 {
                     state.send(GuiCommand::SceneDown);
@@ -250,6 +255,7 @@ fn render_scene_card(ui: &mut Ui, state: &mut AppState) {
                             .style(TextStyle::Status, &colors)
                             .color(ui.style().visuals.strong_text_color()),
                     )
+                    .on_hover_text("Next scene")
                     .clicked()
                 {
                     state.send(GuiCommand::SceneUp);
@@ -286,6 +292,7 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
                             .style(TextStyle::Status, &colors)
                             .color(ui.style().visuals.strong_text_color()),
                     )
+                    .on_hover_text("Previous take")
                     .clicked()
                 {
                     state.send(GuiCommand::TakeDown);
@@ -296,6 +303,7 @@ fn render_take_card(ui: &mut Ui, state: &mut AppState) {
                             .style(TextStyle::Status, &colors)
                             .color(ui.style().visuals.strong_text_color()),
                     )
+                    .on_hover_text("Next take")
                     .clicked()
                 {
                     state.send(GuiCommand::TakeUp);
@@ -312,10 +320,18 @@ fn render_logs_card(ui: &mut Ui, state: &mut AppState) {
         ui.horizontal(|ui| {
             ui.label(text(ui, "SYNCHRONIZATION LOGS").style(TextStyle::Heading, &colors));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Clear").clicked() {
+                if ui
+                    .button("Clear")
+                    .on_hover_text("Clear the log view (GUI only)")
+                    .clicked()
+                {
                     // Clear is GUI-only (just clear the local view)
                 }
-                if ui.button("Copy").clicked() {
+                if ui
+                    .button("Copy")
+                    .on_hover_text("Copy all clapper log entries to the clipboard")
+                    .clicked()
+                {
                     let text = s
                         .clapper
                         .logs
