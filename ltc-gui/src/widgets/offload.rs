@@ -122,6 +122,22 @@ fn render_cards(ui: &mut Ui, state: &mut AppState) {
         ui.add_space(4.0);
     }
 
+    // Day-filter hint: explains why the post-scan pre-selection covers only
+    // part of a card's files (newest recording day). The engine clears the
+    // field when the selection is overridden manually.
+    if let Some(ref day) = off.selected_day {
+        if !off.cards.is_empty() {
+            ui.label(
+                text(
+                    ui,
+                    format!("Pre-selected: recordings from {day} (newest recording day)"),
+                )
+                .style(TextStyle::MonoLabel, &colors)
+                .color(colors.text_muted),
+            );
+        }
+    }
+
     render_rescan_row(ui, state, &s);
 }
 
@@ -190,7 +206,12 @@ fn render_card(
                 egui::ScrollArea::vertical()
                     .id_salt(crate::ids::offload_card_files_scroll(&card.mount))
                     .max_height(240.0)
-                    .auto_shrink([false; 2])
+                    // Vertical auto-shrink off makes the inner ScrollArea
+                    // fill the *remaining viewport* height; nested in the
+                    // tab's outer ScrollArea, card 2+ collapse to egui's
+                    // ~64 px clamp. Content-sized vertically (max_height
+                    // still caps) keeps every card's list usable.
+                    .auto_shrink([false, true])
                     .show_rows(ui, row_height, total, |ui, range| {
                         for i in range {
                             render_file_row(
@@ -408,7 +429,6 @@ fn render_offload_actions(ui: &mut Ui, state: &mut AppState) {
         )
         .clicked()
         {
-            state.mark_offload_start_pending();
             state.send(GuiCommand::Offload(OffloadCommand::StartOffload));
         }
     });
@@ -445,6 +465,40 @@ fn render_progress(ui: &mut Ui, state: &mut AppState) {
     }
 
     render_completed_devices(ui, &colors, off);
+
+    // Partial-failure summary (orange, not red): the run finished, but not
+    // every device made it — that is a warning-grade outcome, distinct from
+    // both full success (green) and a hard error.
+    if let Some(ref summary) = off.run_summary {
+        if !summary.cancelled && !summary.failed_devices.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                text(
+                    ui,
+                    format!(
+                        "⚠ Partial: {} device(s) failed — {}",
+                        summary.failed_devices.len(),
+                        summary.failed_devices.join(", ")
+                    ),
+                )
+                .style(TextStyle::MonoLabel, &colors)
+                .color(colors.warning_amber),
+            );
+        } else if summary.cancelled {
+            ui.add_space(4.0);
+            ui.label(
+                text(
+                    ui,
+                    format!(
+                        "⚠ Offload cancelled — {} device(s) copied before cancel",
+                        summary.completed_devices.len()
+                    ),
+                )
+                .style(TextStyle::MonoLabel, &colors)
+                .color(colors.warning_amber),
+            );
+        }
+    }
 
     // Error message.
     if let Some(ref err) = off.error {

@@ -19,8 +19,6 @@ use crate::widgets;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const OFFLOAD_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// Tab bar geometry (deck tab affordance redesign, plans/2026-10-07-ltc-gui-tab-bar-affordance-plan.md)
 const TAB_GAP: f32 = 6.0;
 const TAB_MIN_W: f32 = 90.0;
@@ -157,10 +155,6 @@ pub struct AppState {
     /// Last seen offload version — detects when a copy finishes so we can
     /// auto‑switch the converter folder.
     pub offload_last_version: u64,
-    /// When the user clicks Start Offload, set to `Instant::now()` so the
-    /// next frame forces a fast repaint until the engine publishes
-    /// `job(JobKind::OffloadCopy).is_active()`. Resets once active is visible.
-    offload_start_pending: Option<Instant>,
 
     /// GUI-local clap animation, started when `clapper.clap_seq` moves past
     /// [`Self::clap_last_seen`]. Owns the flash/arm decay so the values are
@@ -172,12 +166,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Mark the offload start as pending so the next frame forces a fast repaint
-    /// until the engine publishes `job(JobKind::OffloadCopy).is_active()`.
-    pub fn mark_offload_start_pending(&mut self) {
-        self.offload_start_pending = Some(Instant::now());
-    }
-
     pub fn new(
         cmd_tx: Sender<GuiCommand>,
         event_rx: Receiver<AudioEvent>,
@@ -225,7 +213,6 @@ impl AppState {
             awaiting_echo: false,
             last_logged_group_decode_gen: 0,
             offload_last_version: 0,
-            offload_start_pending: None,
             clap_anim: None,
             clap_last_seen: initial.clapper.clap_seq,
         };
@@ -513,17 +500,12 @@ impl eframe::App for AppState {
             }
         }
 
-        // 7b. Offload start-pending latch: force fast repaints until the engine
-        //     publishes is_active() (or timeout) so the Start→Cancel button
-        //     switch appears on the very next frame after engine publish.
-        if let Some(pending_since) = self.offload_start_pending {
-            let offload_running = self.latest.job(JobKind::OffloadCopy).is_active();
-            if offload_running || now.duration_since(pending_since) >= OFFLOAD_PENDING_TIMEOUT {
-                self.offload_start_pending = None;
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(40));
-            }
-        }
+        // 7b. (removed) The offload start-pending latch existed only because
+        //     the engine could fail to publish a Running status for a new
+        //     offload run (stale-terminal-status defect A, fixed 2026-11:
+        //     StartOffload resets jobs[OffloadCopy] on spawn). StartOffload
+        //     now publishes a fresh Running status on the next tick, so the
+        //     Start→Cancel switch needs no GUI-local forcing.
 
         // 8. Keyboard shortcuts
         let any_focused = ctx.memory(|m| m.focused().is_some());
