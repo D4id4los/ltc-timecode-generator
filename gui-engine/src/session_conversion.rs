@@ -224,7 +224,7 @@ pub fn channel_candidate_order(
     kind: RecordingType,
     configured: Option<ChannelCandidate>,
     pinned: Option<ChannelCandidate>,
-    stream_channels: &[usize],
+    stream_channels: &[(usize, usize)],
 ) -> Vec<(ChannelCandidate, ChannelSource)> {
     let mut out: Vec<(ChannelCandidate, ChannelSource)> = Vec::new();
     let push = |c: ChannelCandidate, s: ChannelSource, out: &mut Vec<_>| {
@@ -240,7 +240,11 @@ pub fn channel_candidate_order(
     }
     match kind {
         RecordingType::VideoClipSequence => {
-            for (stream, &channels) in stream_channels.iter().enumerate() {
+            // `stream_channels` carries (absolute ffprobe stream index,
+            // channel count) pairs in stream order — candidates use the
+            // absolute index, the same numbering the extractor maps via
+            // `-map 0:{n}`.
+            for &(stream, channels) in stream_channels.iter() {
                 for channel in 0..channels {
                     push(
                         ChannelCandidate { stream, channel },
@@ -251,7 +255,10 @@ pub fn channel_candidate_order(
             }
         }
         RecordingType::MultiTrackAudio => {
-            let channels = stream_channels.first().copied().unwrap_or(0);
+            let channels = stream_channels
+                .first()
+                .map(|&(_, ch)| ch)
+                .unwrap_or(0);
             for channel in 0..channels {
                 push(
                     ChannelCandidate {
@@ -506,21 +513,36 @@ pub fn session_unit_specs(groups: &[PreflightGroup]) -> Vec<crate::job::UnitSpec
         .collect()
 }
 
+/// Everything one group's candidate decode needs, resolved by the caller
+/// (probe + configured/pinned lookup) — keeps `decode_group` within the
+/// argument-count gate and the decision inputs in one place.
+struct GroupDecodeInput<'a> {
+    device: &'a str,
+    configured: Option<ChannelCandidate>,
+    pinned: Option<ChannelCandidate>,
+    stream_channels: &'a [(usize, usize)],
+    fps: f64,
+    drop_frame: bool,
+}
+
 /// Decode one group's LTC carrier across the candidate order. Returns the
 /// per-file results (the group's files share the resolved channel) or the
 /// typed failure after candidate exhaustion.
 fn decode_group(
     group: &PreflightGroup,
-    device: &str,
-    configured: Option<ChannelCandidate>,
-    pinned: Option<ChannelCandidate>,
-    stream_channels: &[usize],
+    input: &GroupDecodeInput<'_>,
     ctx: &JobContext,
     unit_idx: usize,
-    fps: f64,
-    drop_frame: bool,
     decode: PreflightDecodeFn<'_>,
 ) -> Result<(Vec<PreflightFileResult>, f32), PreflightFailure> {
+    let GroupDecodeInput {
+        device,
+        configured,
+        pinned,
+        stream_channels,
+        fps,
+        drop_frame,
+    } = *input;
     let carrier = match group.kind {
         RecordingType::MultiTrackAudio => group
             .files
@@ -554,11 +576,6 @@ fn decode_group(
             });
         }
         tried.push(*candidate);
-        let carrier_channels = stream_channels
-            .get(candidate.stream)
-            .copied()
-            .unwrap_or(0);
-        let _ = carrier_channels;
         let req = PreflightDecodeRequest {
             path: &carrier,
             kind: group.kind.clone(),
@@ -607,13 +624,15 @@ fn decode_group(
             }
         }
     }
-    if !any_decode_ran && last_hard_error.is_some() {
-        // Every candidate hard-failed (unreadable/corrupt) — a different
-        // failure class from "decoded fine but no LTC present".
-        return Err(PreflightFailure::Decode {
-            file: carrier,
-            error: last_hard_error.unwrap(),
-        });
+    if !any_decode_ran {
+        if let Some(e) = last_hard_error {
+            // Every candidate hard-failed (unreadable/corrupt) — a different
+            // failure class from "decoded fine but no LTC present".
+            return Err(PreflightFailure::Decode {
+                file: carrier,
+                error: e,
+            });
+        }
     }
     Err(PreflightFailure::NoLtc {
         file: carrier,
@@ -621,23 +640,28 @@ fn decode_group(
     })
 }
 
-/// Probe helper: channel count per stream for a file (pure I/O shell —
-/// WAV header read for audio, ffprobe for video).
-pub fn probe_stream_channels(path: &Path, kind: &RecordingType) -> Vec<usize> {
+/// Probe helper: (absolute stream index, channel count) per stream for a
+/// file (pure I/O shell — WAV header read for audio, ffprobe for video).
+pub fn probe_stream_channels(path: &Path, kind: &RecordingType) -> Vec<(usize, usize)> {
     match kind {
         RecordingType::MultiTrackAudio => {
             match audio_core::WavChunkReader::open(path) {
                 Ok((reader, _start)) => {
-                    let channels = reader.channels();
-                    // The WAV decodes as one implicit stream with N channels.
-                    vec![channels]
+                    let channels = reader.channels() as usize;
+                    // The WAV decodes directly (no stream selection): a
+                    // single synthetic stream 0 with N channels.
+                    vec![(0, channels)]
                 }
                 Err(_) => Vec::new(),
             }
         }
         RecordingType::VideoClipSequence => {
             match crate::ffprobe::probe_video_audio(path) {
-                Ok(probe) => probe.streams.iter().map(|s| s.channels).collect(),
+                Ok(probe) => probe
+                    .streams
+                    .iter()
+                    .map(|s| (s.stream_index, s.channels))
+                    .collect(),
                 Err(_) => Vec::new(),
             }
         }
@@ -675,18 +699,15 @@ pub fn run_session_preflight_with(
             .unit(unit_idx)
             .set_message(format!("decoding LTC ({})", group.prefix));
 
-        match decode_group(
-            group,
-            &device,
+        let input = GroupDecodeInput {
+            device: &device,
             configured,
             pinned,
-            &stream_channels,
-            ctx,
-            unit_idx,
+            stream_channels: &stream_channels,
             fps,
             drop_frame,
-            decode,
-        ) {
+        };
+        match decode_group(group, &input, ctx, unit_idx, decode) {
             Ok((files, detected)) => {
                 if let Some(first) = files.first() {
                     record_channel_pin(&mut pins, &device, first.resolved);

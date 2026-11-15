@@ -530,7 +530,7 @@ fn session_preflight_forwards_decode_granularity_and_terminates() {
         let mut w = hound::WavWriter::create(dir.path().join(name), spec).unwrap();
         for _ in 0..64 {
             for ch in 0..4 {
-                w.write_sample((50 * ch) as i32).unwrap();
+                w.write_sample(50 * ch).unwrap();
             }
         }
         w.flush().unwrap();
@@ -621,24 +621,6 @@ fn session_conversion_forwards_group_encode_granularity_and_terminates() {
     let samples_for_fake = Arc::clone(&samples);
     let tracker_for_fake = tracker.clone();
 
-    let mut run = |_idx: usize,
-                   _unit: &UnitProgress,
-                   _settings: &gui_engine::ConverterSettings,
-                   _caps: Option<&gui_engine::FfmpegCapabilities>|
-     -> Result<Option<String>, JobError> {
-        // Fake encode work recorded through the tracker (inside the seam).
-        // The unit fraction is set via the tracker's per-unit snapshot to
-        // keep sampling deterministic.
-        let mut s = samples_for_fake.lock().unwrap();
-        s.push(tracker_for_fake.snapshot().fraction);
-        drop(s);
-        Ok(Some("h264".into()))
-    };
-    // Granularity: the two groups' fractions only become distinguishable
-    // through their units — sample the first unit's in-flight fraction by
-    // advancing it inside the seam via the ctx units. Simpler and faithful:
-    // drive fraction advancement on the group's unit through the closure's
-    // `_unit` parameter.
     let mut run = |_idx: usize,
                    unit: &UnitProgress,
                    _settings: &gui_engine::ConverterSettings,

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use crate::job::{CancelToken, JobContext, JobFinal, ProgressTracker, UnitSpec};
@@ -80,18 +80,21 @@ fn channel_order_pin_then_configured_then_scan_video() {
         RecordingType::VideoClipSequence,
         Some(cand(0, 0)),
         Some(cand(1, 2)),
-        &[2, 4],
+        &[(1, 2), (2, 4)],
     );
     assert_eq!(
         order,
         vec![
             (cand(1, 2), ChannelSource::Pinned),
             (cand(0, 0), ChannelSource::Configured),
-            // Scan: stream-major, channels within stream, deduped.
-            (cand(0, 1), ChannelSource::Scanned),
+            // Scan: stream-major (absolute indices), channels within
+            // stream, deduped. Streams here: (1, 2ch), (2, 4ch).
             (cand(1, 0), ChannelSource::Scanned),
             (cand(1, 1), ChannelSource::Scanned),
-            (cand(1, 3), ChannelSource::Scanned),
+            (cand(2, 0), ChannelSource::Scanned),
+            (cand(2, 1), ChannelSource::Scanned),
+            (cand(2, 2), ChannelSource::Scanned),
+            (cand(2, 3), ChannelSource::Scanned),
         ]
     );
 }
@@ -102,7 +105,7 @@ fn channel_order_audio_scans_stream_zero_channels() {
         RecordingType::MultiTrackAudio,
         Some(cand(0, 2)),
         None,
-        &[4],
+        &[(0, 4)],
     );
     assert_eq!(
         order,
@@ -117,7 +120,7 @@ fn channel_order_audio_scans_stream_zero_channels() {
 
 #[test]
 fn channel_order_no_config_no_pin_scans_everything() {
-    let order = channel_candidate_order(RecordingType::MultiTrackAudio, None, None, &[3]);
+    let order = channel_candidate_order(RecordingType::MultiTrackAudio, None, None, &[(0, 3)]);
     assert_eq!(order.len(), 3);
     assert!(order.iter().all(|(_, s)| *s == ChannelSource::Scanned));
 }
@@ -420,19 +423,9 @@ fn session_run_continues_after_encode_failure_and_reports_partial() {
     ];
     let (ctx, tracker) = job_ctx(jobs.len());
 
-    let mut run = |_idx: usize,
-                   unit: &UnitProgress,
-                   _settings: &ConverterSettings,
-                   _caps: Option<&crate::converter::FfmpegCapabilities>|
-     -> Result<Option<String>, JobError> {
-        // Fake encode work: advance the fraction *inside* the seam (the
-        // granularity contract's sampling point), then fail the first group.
-        unit.set_fraction(0.5);
-        unit.set_fraction(1.0);
-        Err(JobError::Failed("encoder init failed".to_string()))
-    };
-    // Second group succeeds — needs a different closure behaviour; emulate
-    // by counting calls.
+    // Fake encode work: advance the fraction *inside* the seam (the
+    // granularity contract's sampling point); the first group fails, the
+    // second succeeds (counted by call order).
     let calls = AtomicUsize::new(0);
     let mut run = move |_idx: usize,
                         unit: &UnitProgress,
@@ -549,13 +542,13 @@ fn probe_stream_channels_counts_wav_channels() {
     let mut w = hound::WavWriter::create(&wav, spec).unwrap();
     for _ in 0..16 {
         for ch in 0..4 {
-            w.write_sample((100 * ch) as i32).unwrap();
+            w.write_sample(100 * ch).unwrap();
         }
     }
     w.flush().unwrap();
     assert_eq!(
         probe_stream_channels(&wav, &RecordingType::MultiTrackAudio),
-        vec![4]
+        vec![(0, 4)]
     );
 }
 

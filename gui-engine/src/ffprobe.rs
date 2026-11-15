@@ -322,23 +322,30 @@ fn build_extract_args(
 /// wait and produces a clear error instead of blocking the CLI forever.
 pub const EXTRACT_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Which channel of which container file to extract, and where to put the
+/// mono PCM WAV. Cohesive bundle keeping the extract entry points within
+/// the argument-count gate (`clippy::too_many_arguments`).
+#[derive(Clone, Copy, Debug)]
+pub struct ExtractChannelTarget<'a> {
+    /// Container file.
+    pub path: &'a Path,
+    /// Absolute stream index inside the container (ffprobe's `index` field,
+    /// as stored in [`AudioStreamInfo::stream_index`]).
+    pub stream_index: usize,
+    /// Channel within the stream.
+    pub channel_index: usize,
+    /// Mono PCM WAV output path.
+    pub output_wav: &'a Path,
+}
+
 /// Extract a single channel of one audio stream from a container file into a
 /// mono PCM WAV of the requested [`ExtractSampleFormat`].
-///
-/// `absolute_stream_index` is the absolute stream index inside the container
-/// (ffprobe's `index` field, as stored in [`AudioStreamInfo::stream_index`]).
 pub fn extract_audio_channel(
-    path: &Path,
-    absolute_stream_index: usize,
-    channel_index: usize,
-    output_wav: &Path,
+    target: ExtractChannelTarget<'_>,
     sample_format: ExtractSampleFormat,
 ) -> Result<(), ExtractError> {
     extract_audio_channel_with(
-        path,
-        absolute_stream_index,
-        channel_index,
-        output_wav,
+        target,
         sample_format,
         &mut |args: &[String]| {
             run_output_with_timeout(
@@ -358,13 +365,16 @@ pub fn extract_audio_channel(
 /// output WAV path) and must return the subprocess [`Output`] (with
 /// timed-out/killed handled as `Err(SubprocessFailure::TimedOut)`).
 pub fn extract_audio_channel_with(
-    path: &Path,
-    absolute_stream_index: usize,
-    channel_index: usize,
-    output_wav: &Path,
+    target: ExtractChannelTarget<'_>,
     sample_format: ExtractSampleFormat,
     runner: &mut dyn FnMut(&[String]) -> Result<Output, SubprocessFailure>,
 ) -> Result<(), ExtractError> {
+    let ExtractChannelTarget {
+        path,
+        stream_index: absolute_stream_index,
+        channel_index,
+        output_wav,
+    } = target;
     info!(
         "Extracting audio: stream={}, channel={} from '{}' → '{}'",
         absolute_stream_index,
@@ -520,10 +530,7 @@ pub fn probe_stream_duration_secs_with(
 /// returned.  If ffmpeg hangs silently for 30 s, it is killed with a stall
 /// error.
 pub fn extract_audio_channel_with_progress(
-    path: &Path,
-    absolute_stream_index: usize,
-    channel_index: usize,
-    output_wav: &Path,
+    target: ExtractChannelTarget<'_>,
     sample_format: ExtractSampleFormat,
     total_duration_secs: Option<f64>,
     cancel: Option<&AtomicBool>,
@@ -537,10 +544,7 @@ pub fn extract_audio_channel_with_progress(
             .spawn()
     };
     extract_audio_channel_with_progress_with(
-        path,
-        absolute_stream_index,
-        channel_index,
-        output_wav,
+        target,
         sample_format,
         total_duration_secs,
         on_frac,
@@ -570,15 +574,18 @@ pub struct ExtractSeam<'a> {
 /// the spawned child with stderr piped. `seam.stall` is the no-output
 /// timeout; the public variant uses [`FFMPEG_STALL_TIMEOUT`] (30 s).
 pub fn extract_audio_channel_with_progress_with(
-    path: &Path,
-    absolute_stream_index: usize,
-    channel_index: usize,
-    output_wav: &Path,
+    target: ExtractChannelTarget<'_>,
     sample_format: ExtractSampleFormat,
     total_duration_secs: Option<f64>,
     on_frac: &impl Fn(f32),
     seam: &mut ExtractSeam<'_>,
 ) -> Result<(), ExtractError> {
+    let ExtractChannelTarget {
+        path,
+        stream_index: absolute_stream_index,
+        channel_index,
+        output_wav,
+    } = target;
     let ExtractSeam {
         cancel,
         stall,
@@ -1231,7 +1238,7 @@ mod tests {
     fn test_extract_audio_channel_with_success() {
         let path = Path::new("test.mp4");
         let out = Path::new("/tmp/_unused_test_extract.wav");
-        let result = extract_audio_channel_with(path, 1, 0, out, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut extract_success_runner);
+        let result = extract_audio_channel_with(ExtractChannelTarget { path, stream_index: 1, channel_index: 0, output_wav: out }, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut extract_success_runner);
         assert!(result.is_ok());
     }
 
@@ -1240,7 +1247,7 @@ mod tests {
         let mut runner = |_: &[String]| Err(SubprocessFailure::TimedOut);
         let path = Path::new("corrupt.mp4");
         let out = Path::new("/tmp/_test_extract_timeout.wav");
-        let result = extract_audio_channel_with(path, 1, 0, out, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut runner);
+        let result = extract_audio_channel_with(ExtractChannelTarget { path, stream_index: 1, channel_index: 0, output_wav: out }, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut runner);
         assert!(
             matches!(result, Err(ExtractError::TimedOut)),
             "timeout must map to ExtractError::TimedOut, got {:?}",
@@ -1253,7 +1260,7 @@ mod tests {
         let mut runner = |_: &[String]| Err(SubprocessFailure::Io("binary not found".into()));
         let path = Path::new("missing.mp4");
         let out = Path::new("/tmp/_test_extract_io.wav");
-        let result = extract_audio_channel_with(path, 1, 0, out, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut runner);
+        let result = extract_audio_channel_with(ExtractChannelTarget { path, stream_index: 1, channel_index: 0, output_wav: out }, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut runner);
         assert!(
             matches!(
                 result,
@@ -1289,10 +1296,12 @@ mod tests {
         let start = std::time::Instant::now();
 
         let result = extract_audio_channel_with_progress_with(
-            Path::new("dummy.mp4"),
-            1,
-            0,
-            out,
+            ExtractChannelTarget {
+                path: Path::new("dummy.mp4"),
+                stream_index: 1,
+                channel_index: 0,
+                output_wav: out,
+            },
             ExtractSampleFormat::PcmS24le,
             None,
             &|f| {
@@ -1324,10 +1333,12 @@ mod tests {
         let start = std::time::Instant::now();
 
         let result = extract_audio_channel_with_progress_with(
-            Path::new("dummy.mp4"),
-            1,
-            0,
-            out,
+            ExtractChannelTarget {
+                path: Path::new("dummy.mp4"),
+                stream_index: 1,
+                channel_index: 0,
+                output_wav: out,
+            },
             ExtractSampleFormat::PcmS24le,
             None,
             &|_| {},
@@ -1378,10 +1389,12 @@ mod tests {
         let out = Path::new("/tmp/_test_extract_lines.wav");
 
         let result = extract_audio_channel_with_progress_with(
-            Path::new("dummy.mp4"),
-            1,
-            0,
-            out,
+            ExtractChannelTarget {
+                path: Path::new("dummy.mp4"),
+                stream_index: 1,
+                channel_index: 0,
+                output_wav: out,
+            },
             ExtractSampleFormat::PcmS24le,
             Some(10.0),
             &|f| {

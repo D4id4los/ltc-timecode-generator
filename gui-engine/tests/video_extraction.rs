@@ -399,10 +399,8 @@ fn test_extract_audio_channel_with_progress_reports_fraction() {
     let progress = std::sync::Mutex::new(Vec::new());
 
     let result = gui_engine::extract_audio_channel_with_progress(
-        &mp4,
-        1,
-        0,
-        &out,
+        t(&mp4, 1, 0, &out),
+        gui_engine::ffprobe::ExtractSampleFormat::PcmS24le,
         Some(duration),
         Some(&cancel),
         &|frac| {
@@ -659,7 +657,7 @@ fn test_extract_first_audio_stream_by_absolute_index() {
     let mp4 = mux_video_fixture(dir.path(), "video_1audio.mp4", &ltc_wav, false);
 
     let out = dir.path().join("extract_c0.wav");
-    extract_audio_channel(&mp4, 1, 0, &out).expect("extraction of absolute stream 1 must succeed");
+    extract_audio_channel(t(&mp4, 1, 0, &out), gui_engine::ffprobe::ExtractSampleFormat::PcmS24le).expect("extraction of absolute stream 1 must succeed");
     assert!(out.exists(), "extracted wav must exist");
 
     let reader = hound::WavReader::open(&out).expect("extracted wav must be readable");
@@ -687,7 +685,7 @@ fn test_probe_then_extract_ltc_roundtrip() {
     let stream_index = probe.streams[0].stream_index;
 
     let out = dir.path().join("roundtrip.wav");
-    extract_audio_channel(&mp4, stream_index, 0, &out)
+    extract_audio_channel(t(&mp4, stream_index, 0, &out), gui_engine::ffprobe::ExtractSampleFormat::PcmS24le)
         .expect("extraction with probed stream index must succeed");
     assert_decodes_ltc(&out, 40);
 }
@@ -709,14 +707,14 @@ fn test_extract_second_audio_stream_selects_ltc_stream() {
 
     // LTC stream (absolute index 2), right channel.
     let ltc_out = dir.path().join("extract_s2_c1.wav");
-    extract_audio_channel(&mp4, 2, 1, &ltc_out)
+    extract_audio_channel(t(&mp4, 2, 1, &ltc_out), gui_engine::ffprobe::ExtractSampleFormat::PcmS24le)
         .expect("extraction of absolute stream 2 must succeed");
     assert_decodes_ltc(&ltc_out, 40);
 
     // Negative control: the silent stream (absolute index 1) must extract
     // fine but contain no decodable LTC.
     let silent_out = dir.path().join("extract_s1_c0.wav");
-    extract_audio_channel(&mp4, 1, 0, &silent_out)
+    extract_audio_channel(t(&mp4, 1, 0, &silent_out), gui_engine::ffprobe::ExtractSampleFormat::PcmS24le)
         .expect("extraction of the silent stream must succeed");
     match decode_ltc_from_wav(&silent_out, 25.0, false, None) {
         Err(_) => {} // no LTC found — acceptable
@@ -739,7 +737,7 @@ fn test_extract_stereo_channel_1() {
     let mp4 = mux_video_fixture(dir.path(), "video_1audio.mp4", &ltc_wav, false);
 
     let out = dir.path().join("extract_c1.wav");
-    extract_audio_channel(&mp4, 1, 1, &out).expect("extraction of channel 1 must succeed");
+    extract_audio_channel(t(&mp4, 1, 1, &out), gui_engine::ffprobe::ExtractSampleFormat::PcmS24le).expect("extraction of channel 1 must succeed");
     assert_decodes_ltc(&out, 40);
 }
 
@@ -756,7 +754,7 @@ fn test_extract_invalid_stream_error_includes_ffmpeg_stderr() {
     let mp4 = mux_video_fixture(dir.path(), "video_1audio.mp4", &ltc_wav, false);
 
     let out = dir.path().join("should_not_exist.wav");
-    let err = extract_audio_channel(&mp4, 9, 0, &out)
+    let err = extract_audio_channel(t(&mp4, 9, 0, &out), gui_engine::ffprobe::ExtractSampleFormat::PcmS24le)
         .expect_err("extraction of a nonexistent stream must fail");
     assert!(
         matches!(err, gui_engine::ExtractError::Exit { ref stderr_tail, .. }
@@ -1097,4 +1095,19 @@ fn test_select_recording_without_folder_does_not_probe() {
 
     drop(tx);
     handle.join().expect("engine thread panicked");
+}
+
+/// Test helper: build an [`gui_engine::ffprobe::ExtractChannelTarget`].
+fn t<'a>(
+    path: &'a std::path::Path,
+    stream_index: usize,
+    channel_index: usize,
+    output_wav: &'a std::path::Path,
+) -> gui_engine::ffprobe::ExtractChannelTarget<'a> {
+    gui_engine::ffprobe::ExtractChannelTarget {
+        path,
+        stream_index,
+        channel_index,
+        output_wav,
+    }
 }

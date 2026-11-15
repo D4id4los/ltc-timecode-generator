@@ -63,10 +63,12 @@ pub fn decode_video_channel<F: Fn(f32)>(
     let duration = ffprobe::probe_stream_duration_secs(Path::new(path), stream_index);
 
     ffprobe::extract_audio_channel_with_progress(
-        Path::new(path),
-        stream_index,
-        channel_index,
-        &tmp_wav,
+        ffprobe::ExtractChannelTarget {
+            path: Path::new(path),
+            stream_index,
+            channel_index,
+            output_wav: &tmp_wav,
+        },
         // libltc's whole-file WAV reader requires 16-bit int PCM; the
         // builtin decoder extracts at the full-precision 24-bit default.
         ffprobe::ExtractSampleFormat::for_decoder(use_libltc),
