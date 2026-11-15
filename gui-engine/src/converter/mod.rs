@@ -21,6 +21,7 @@ pub use capabilities::{
 pub(crate) mod formats;
 pub use formats::{
     apply_available_defaults, available_audio_encoders_for_container, available_containers,
+    container_supports_audio_encoder, container_to_ffmpeg_format, extension_for_container,
     select_best_combination, supported_audio_encoders, supported_containers,
 };
 
