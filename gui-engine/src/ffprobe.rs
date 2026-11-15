@@ -253,8 +253,39 @@ pub fn probe_video_audio_with(
     })
 }
 
+/// PCM sample format of the extracted mono WAV (R1-typed flag: the choice
+/// branches on the decoder backend, so it is an enum, not a bool).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtractSampleFormat {
+    /// Default extraction format — full precision for the builtin decoder.
+    PcmS24le,
+    /// 16-bit signed int — required by the libltc binding's whole-file
+    /// WAV reader (`audio-core/src/ltc_decoder_libltc.rs`).
+    PcmS16le,
+}
+
+impl ExtractSampleFormat {
+    /// The ffmpeg `-c:a` codec name for this format.
+    pub fn codec_name(self) -> &'static str {
+        match self {
+            ExtractSampleFormat::PcmS24le => "pcm_s24le",
+            ExtractSampleFormat::PcmS16le => "pcm_s16le",
+        }
+    }
+
+    /// Sample format for a decoder backend: libltc needs 16-bit, everything
+    /// else extracts at the full 24-bit default.
+    pub fn for_decoder(use_libltc: bool) -> Self {
+        if use_libltc {
+            ExtractSampleFormat::PcmS16le
+        } else {
+            ExtractSampleFormat::PcmS24le
+        }
+    }
+}
+
 /// Build the ffmpeg argument vector used to extract one audio channel from a
-/// container file into a mono 24-bit PCM WAV.
+/// container file into a mono PCM WAV of the requested sample format.
 ///
 /// `absolute_stream_index` is the **absolute** stream index within the
 /// container — the same numbering as ffprobe's `index` field (e.g. `1` for the
@@ -266,6 +297,7 @@ fn build_extract_args(
     absolute_stream_index: usize,
     channel_index: usize,
     output_wav: &Path,
+    sample_format: ExtractSampleFormat,
 ) -> Vec<String> {
     let channel_filter = format!("pan=mono|FC=c{}", channel_index);
 
@@ -278,7 +310,7 @@ fn build_extract_args(
         "-af".into(),
         channel_filter,
         "-c:a".into(),
-        "pcm_s24le".into(),
+        sample_format.codec_name().into(),
         "-f".into(),
         "wav".into(),
         output_wav.to_string_lossy().to_string(),
@@ -291,7 +323,7 @@ fn build_extract_args(
 pub const EXTRACT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Extract a single channel of one audio stream from a container file into a
-/// mono 24-bit PCM WAV.
+/// mono PCM WAV of the requested [`ExtractSampleFormat`].
 ///
 /// `absolute_stream_index` is the absolute stream index inside the container
 /// (ffprobe's `index` field, as stored in [`AudioStreamInfo::stream_index`]).
@@ -300,12 +332,14 @@ pub fn extract_audio_channel(
     absolute_stream_index: usize,
     channel_index: usize,
     output_wav: &Path,
+    sample_format: ExtractSampleFormat,
 ) -> Result<(), ExtractError> {
     extract_audio_channel_with(
         path,
         absolute_stream_index,
         channel_index,
         output_wav,
+        sample_format,
         &mut |args: &[String]| {
             run_output_with_timeout(
                 no_window_command("ffmpeg")
@@ -328,6 +362,7 @@ pub fn extract_audio_channel_with(
     absolute_stream_index: usize,
     channel_index: usize,
     output_wav: &Path,
+    sample_format: ExtractSampleFormat,
     runner: &mut dyn FnMut(&[String]) -> Result<Output, SubprocessFailure>,
 ) -> Result<(), ExtractError> {
     info!(
@@ -338,7 +373,7 @@ pub fn extract_audio_channel_with(
         output_wav.display()
     );
 
-    let args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
+    let args = build_extract_args(path, absolute_stream_index, channel_index, output_wav, sample_format);
 
     let output = runner(&args).map_err(|e| {
         let _ = std::fs::remove_file(output_wav);
@@ -489,6 +524,7 @@ pub fn extract_audio_channel_with_progress(
     absolute_stream_index: usize,
     channel_index: usize,
     output_wav: &Path,
+    sample_format: ExtractSampleFormat,
     total_duration_secs: Option<f64>,
     cancel: Option<&AtomicBool>,
     on_frac: &impl Fn(f32),
@@ -505,6 +541,7 @@ pub fn extract_audio_channel_with_progress(
         absolute_stream_index,
         channel_index,
         output_wav,
+        sample_format,
         total_duration_secs,
         on_frac,
         &mut ExtractSeam {
@@ -537,6 +574,7 @@ pub fn extract_audio_channel_with_progress_with(
     absolute_stream_index: usize,
     channel_index: usize,
     output_wav: &Path,
+    sample_format: ExtractSampleFormat,
     total_duration_secs: Option<f64>,
     on_frac: &impl Fn(f32),
     seam: &mut ExtractSeam<'_>,
@@ -546,7 +584,7 @@ pub fn extract_audio_channel_with_progress_with(
         stall,
         spawner,
     } = seam;
-    let mut args = build_extract_args(path, absolute_stream_index, channel_index, output_wav);
+    let mut args = build_extract_args(path, absolute_stream_index, channel_index, output_wav, sample_format);
     args.push("-progress".to_string());
     args.push("pipe:2".to_string());
 
@@ -761,7 +799,13 @@ mod tests {
 
     #[test]
     fn test_build_extract_args_maps_absolute_stream_index() {
-        let args = build_extract_args(&p("/in/c0003.mp4"), 1, 0, &p("/tmp/out.wav"));
+        let args = build_extract_args(
+            &p("/in/c0003.mp4"),
+            1,
+            0,
+            &p("/tmp/out.wav"),
+            ExtractSampleFormat::PcmS24le,
+        );
         let map_pos = args.iter().position(|a| a == "-map").expect("-map present");
         assert_eq!(
             args[map_pos + 1],
@@ -774,7 +818,13 @@ mod tests {
 
     #[test]
     fn test_build_extract_args_channel_filter_and_pcm() {
-        let args = build_extract_args(&p("/in/c0003.mp4"), 2, 1, &p("/tmp/out.wav"));
+        let args = build_extract_args(
+            &p("/in/c0003.mp4"),
+            2,
+            1,
+            &p("/tmp/out.wav"),
+            ExtractSampleFormat::PcmS24le,
+        );
         let af_pos = args.iter().position(|a| a == "-af").expect("-af present");
         assert_eq!(args[af_pos + 1], "pan=mono|FC=c1");
         let codec_pos = args.iter().position(|a| a == "-c:a").expect("-c:a present");
@@ -785,11 +835,39 @@ mod tests {
 
     #[test]
     fn test_build_extract_args_stream_zero() {
-        let args = build_extract_args(&p("/in/a.mkv"), 0, 3, &p("/tmp/o.wav"));
+        let args = build_extract_args(
+            &p("/in/a.mkv"),
+            0,
+            3,
+            &p("/tmp/o.wav"),
+            ExtractSampleFormat::PcmS24le,
+        );
         let map_pos = args.iter().position(|a| a == "-map").unwrap();
         assert_eq!(args[map_pos + 1], "0:0");
         let af_pos = args.iter().position(|a| a == "-af").unwrap();
         assert_eq!(args[af_pos + 1], "pan=mono|FC=c3");
+    }
+
+    #[test]
+    fn test_build_extract_args_sample_format_selection() {
+        for (fmt, codec) in [
+            (ExtractSampleFormat::PcmS24le, "pcm_s24le"),
+            (ExtractSampleFormat::PcmS16le, "pcm_s16le"),
+        ] {
+            let args = build_extract_args(&p("/in/c.mp4"), 1, 0, &p("/tmp/o.wav"), fmt);
+            let codec_pos = args.iter().position(|a| a == "-c:a").expect("-c:a present");
+            assert_eq!(args[codec_pos + 1], codec);
+        }
+        assert_eq!(
+            ExtractSampleFormat::for_decoder(true),
+            ExtractSampleFormat::PcmS16le,
+            "libltc backend must extract 16-bit"
+        );
+        assert_eq!(
+            ExtractSampleFormat::for_decoder(false),
+            ExtractSampleFormat::PcmS24le,
+            "builtin backend keeps the 24-bit default"
+        );
     }
 
     #[test]
@@ -1153,7 +1231,7 @@ mod tests {
     fn test_extract_audio_channel_with_success() {
         let path = Path::new("test.mp4");
         let out = Path::new("/tmp/_unused_test_extract.wav");
-        let result = extract_audio_channel_with(path, 1, 0, out, &mut extract_success_runner);
+        let result = extract_audio_channel_with(path, 1, 0, out, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut extract_success_runner);
         assert!(result.is_ok());
     }
 
@@ -1162,7 +1240,7 @@ mod tests {
         let mut runner = |_: &[String]| Err(SubprocessFailure::TimedOut);
         let path = Path::new("corrupt.mp4");
         let out = Path::new("/tmp/_test_extract_timeout.wav");
-        let result = extract_audio_channel_with(path, 1, 0, out, &mut runner);
+        let result = extract_audio_channel_with(path, 1, 0, out, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut runner);
         assert!(
             matches!(result, Err(ExtractError::TimedOut)),
             "timeout must map to ExtractError::TimedOut, got {:?}",
@@ -1175,7 +1253,7 @@ mod tests {
         let mut runner = |_: &[String]| Err(SubprocessFailure::Io("binary not found".into()));
         let path = Path::new("missing.mp4");
         let out = Path::new("/tmp/_test_extract_io.wav");
-        let result = extract_audio_channel_with(path, 1, 0, out, &mut runner);
+        let result = extract_audio_channel_with(path, 1, 0, out, crate::ffprobe::ExtractSampleFormat::PcmS24le, &mut runner);
         assert!(
             matches!(
                 result,
@@ -1215,6 +1293,7 @@ mod tests {
             1,
             0,
             out,
+            ExtractSampleFormat::PcmS24le,
             None,
             &|f| {
                 let mut p = fracs.lock().unwrap();
@@ -1249,6 +1328,7 @@ mod tests {
             1,
             0,
             out,
+            ExtractSampleFormat::PcmS24le,
             None,
             &|_| {},
             &mut ExtractSeam {

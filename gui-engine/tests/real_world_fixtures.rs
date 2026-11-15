@@ -119,29 +119,41 @@ fn test_real_world_m4v_aac_fixture() {
     );
 }
 
-/// Pipeline backend contract: video extraction produces mono **24-bit**
-/// PCM WAV (`pcm_s24le`, ffprobe.rs), which the libltc binding cannot read
-/// — so `--decoder libltc` on a video file surfaces the typed
-/// `UnsupportedBitDepth` error instead of a decode. This pins the
-/// error's propagation through the engine pipeline (known libltc
-/// limitation; cross-backend *agreement* is covered on the 16-bit fixture
-/// in audio-core's `test_decoder_contract_confidence_scale`). If extraction
-/// ever gains a 16-bit mode, this test fails and the cross-backend
-/// agreement belongs here.
+/// Pipeline backend contract (16-bit mode, phase-4 step 0): when the libltc
+/// backend is active, extraction emits 16-bit PCM (`pcm_s16le`) so libltc
+/// can serve the whole-file decode; the pipeline then **succeeds** on this
+/// fixture. Cross-backend agreement belongs here since the tripwire this
+/// test replaced (`UnsupportedBitDepth { bits: 24 }`) was retired by
+/// exactly this change — the builtin result above supplies the reference
+/// first TC.
 #[test]
-fn test_real_world_video_pipeline_libltc_unsupported_bit_depth() {
+fn test_real_world_video_pipeline_libltc_16bit_mode_success() {
     if !ffmpeg_available() {
-        eprintln!("--- SKIPPED: ffmpeg not available (test_real_world_video_pipeline_libltc_unsupported_bit_depth)");
+        eprintln!("--- SKIPPED: ffmpeg not available (test_real_world_video_pipeline_libltc_16bit_mode_success)");
         return;
     }
     let path = fixture("ltc-rw-a6100-mp4-20s.mp4");
 
-    let err = decode_video_file(&path, 0, 0, true, 25.0, false, None)
-        .expect_err("libltc must reject the 24-bit extracted WAV");
+    let builtin =
+        decode_video_file(&path, 0, 0, false, 25.0, false, None).expect("builtin decode");
+
+    let result =
+        decode_video_file(&path, 0, 0, true, 25.0, false, None).expect("libltc 16-bit decode");
 
     assert!(
-        matches!(err, LtcDecodeError::UnsupportedBitDepth { bits: 24 }),
-        "expected typed UnsupportedBitDepth(24), got {err:?}"
+        matches!(result.status, LtcDecodeStatus::Success),
+        "libltc must decode the 16-bit extracted WAV to Success, got {:?}",
+        result.status
+    );
+    assert!(
+        result.valid_frames >= 450,
+        "expected ≥450 valid frames via libltc, got {}",
+        result.valid_frames,
+    );
+    assert_eq!(
+        result.timecodes.first().map(|t| t.timecode),
+        builtin.timecodes.first().map(|t| t.timecode),
+        "backends must agree on the first timecode"
     );
 }
 

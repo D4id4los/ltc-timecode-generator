@@ -67,6 +67,9 @@ pub fn decode_video_channel<F: Fn(f32)>(
         stream_index,
         channel_index,
         &tmp_wav,
+        // libltc's whole-file WAV reader requires 16-bit int PCM; the
+        // builtin decoder extracts at the full-precision 24-bit default.
+        ffprobe::ExtractSampleFormat::for_decoder(use_libltc),
         duration,
         Some(cancel),
         on_extract_progress,
